@@ -2176,10 +2176,17 @@ fn lower_collection_foreach_in_scope(
     });
 
     let offset = collection_offset_rvalue(index_local);
-    let key = definition
-        .key
-        .map(|key_type| collection_key_at_rvalue(collection, offset.clone(), key_type))
-        .transpose()?;
+    // The key is only read when something actually consumes it. Computing it for
+    // every dictionary iteration costs a read per element that a values-only
+    // walk never uses.
+    let key = if key_local.is_some() || projection == CollectionForeachProjection::Keys {
+        definition
+            .key
+            .map(|key_type| collection_key_at_rvalue(collection, offset.clone(), key_type))
+            .transpose()?
+    } else {
+        None
+    };
     context.current_block = Some(body_block);
     if let (Some(target), Some(key)) = (key_local, key.clone()) {
         context.push_statement(mir::Statement::AssignLocal { target, value: key });
@@ -2189,11 +2196,17 @@ fn lower_collection_foreach_in_scope(
             .clone()
             .expect("a dictionary collection type must produce a key"),
         CollectionForeachProjection::Main | CollectionForeachProjection::Values => {
+            // Read the element at the position being iterated. Looking it up by
+            // its key instead would binary search an ordered dictionary and scan
+            // an unordered one, once per element, for a value already known to
+            // sit at this index: keys and values are parallel arrays and every
+            // mutation moves them together.
             collection_value_rvalue(
                 collection,
-                key.clone().unwrap_or_else(|| offset.clone()),
+                offset.clone(),
                 offset.clone(),
                 definition.value,
+                true,
             )?
         }
     };
@@ -2225,6 +2238,7 @@ fn lower_collection_foreach_in_scope(
             | mir::Type::NullableScalar(_)
             | mir::Type::NullableString => {
                 context.push_statement(mir::Statement::AssignCollectionIndex {
+                    positional: false,
                     collection,
                     index: key.unwrap_or_else(|| offset.clone()),
                     value: foreach_local_rvalue(value_local, definition.value)?,
@@ -2313,11 +2327,13 @@ fn collection_value_rvalue(
     index: mir::Rvalue,
     offset: mir::Rvalue,
     ty: mir::Type,
+    positional: bool,
 ) -> DiagnosticResult<mir::Rvalue> {
     match ty {
         mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
             scalar,
             mir::Operand::CollectionIndex {
+                positional,
                 collection,
                 index: Box::new(index),
                 remove: false,
@@ -2325,6 +2341,7 @@ fn collection_value_rvalue(
         ))),
         mir::Type::String => Ok(mir::Rvalue::String(
             mir::StringExpression::CollectionIndex {
+                positional,
                 collection,
                 index: Box::new(index),
                 remove: false,
@@ -2346,6 +2363,7 @@ fn collection_value_rvalue(
             },
         )),
         mir::Type::Class(class) => Ok(mir::Rvalue::Class(mir::ClassExpression::CollectionIndex {
+            positional,
             class,
             collection,
             index: Box::new(index),
@@ -2361,6 +2379,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::SharedReference(class) => Ok(mir::Rvalue::SharedReference(
             mir::SharedReferenceExpression::CollectionIndex {
+                positional,
                 class,
                 collection,
                 index: Box::new(index),
@@ -2369,6 +2388,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::WeakReference(class) => Ok(mir::Rvalue::WeakReference(
             mir::WeakReferenceExpression::CollectionIndex {
+                positional,
                 class,
                 collection,
                 index: Box::new(index),
@@ -2377,6 +2397,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::NullableSharedReference(class) => Ok(mir::Rvalue::NullableSharedReference(
             mir::NullableSharedReferenceExpression::CollectionIndex {
+                positional,
                 class,
                 collection,
                 index: Box::new(index),
@@ -2385,6 +2406,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::NullableWeakReference(class) => Ok(mir::Rvalue::NullableWeakReference(
             mir::NullableWeakReferenceExpression::CollectionIndex {
+                positional,
                 class,
                 collection,
                 index: Box::new(index),
@@ -2393,6 +2415,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::WritableSharedReference(payload) => Ok(mir::Rvalue::WritableSharedReference(
             mir::WritableSharedReferenceExpression::CollectionIndex {
+                positional,
                 payload,
                 collection,
                 index: Box::new(index),
@@ -2401,6 +2424,7 @@ fn collection_value_rvalue(
         )),
         mir::Type::WritableWeakReference(payload) => Ok(mir::Rvalue::WritableWeakReference(
             mir::WritableWeakReferenceExpression::CollectionIndex {
+                positional,
                 payload,
                 collection,
                 index: Box::new(index),
@@ -2408,6 +2432,7 @@ fn collection_value_rvalue(
             },
         )),
         mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::CollectionIndex {
+            positional,
             collection,
             index: Box::new(index),
             transfer: false,
@@ -2415,6 +2440,7 @@ fn collection_value_rvalue(
         })),
         mir::Type::Collection(nested) => {
             Ok(mir::Rvalue::Collection(mir::CollectionExpression::Index {
+                positional,
                 collection: nested,
                 source: collection,
                 index: Box::new(index),
@@ -4149,6 +4175,7 @@ impl ScalarPlace {
             },
             Self::Static(id) => mir::Operand::Static(*id),
             Self::CollectionIndex { collection, index } => mir::Operand::CollectionIndex {
+                positional: false,
                 collection: *collection,
                 index: Box::new(index.clone()),
                 remove: false,
@@ -4176,6 +4203,7 @@ impl ScalarPlace {
                 value: mir::Rvalue::Value(value),
             },
             Self::CollectionIndex { collection, index } => mir::Statement::AssignCollectionIndex {
+                positional: false,
                 collection,
                 index,
                 value: mir::Rvalue::Value(value),
@@ -4323,6 +4351,7 @@ fn lower_assignment(
         let index = lower_rvalue_as_expected(index, index_type, context)?;
         let value = lower_rvalue_as_expected(&assignment.value, info.value, context)?;
         context.push_statement(mir::Statement::AssignCollectionIndex {
+            positional: false,
             collection,
             index,
             value,
@@ -4620,6 +4649,7 @@ fn lower_string_expression(
             )]);
         }
         return Ok(mir::StringExpression::CollectionIndex {
+            positional: false,
             collection,
             index: Box::new(index),
             remove: true,
@@ -4675,6 +4705,7 @@ fn lower_string_expression(
             let (collection, index) =
                 lower_collection_index_operand(collection, index, mir::Type::String, context)?;
             Ok(mir::StringExpression::CollectionIndex {
+                positional: false,
                 collection,
                 index: Box::new(index),
                 remove: false,
@@ -7280,6 +7311,7 @@ fn lower_condition(
             )?;
             Ok(mir::BoolExpression::Use {
                 operand: mir::Operand::CollectionIndex {
+                    positional: false,
                     collection,
                     index: Box::new(index),
                     remove: false,
@@ -7399,6 +7431,7 @@ fn lower_condition(
                 }
                 return Ok(mir::BoolExpression::Use {
                     operand: mir::Operand::CollectionIndex {
+                        positional: false,
                         collection,
                         index: Box::new(index),
                         remove: true,
@@ -8257,6 +8290,7 @@ fn lower_mixed_expression(
             )]);
         }
         return Ok(mir::MixedExpression::CollectionIndex {
+            positional: false,
             collection,
             index: Box::new(index),
             transfer: true,
@@ -8294,6 +8328,7 @@ fn lower_mixed_expression(
         let (collection, index) =
             lower_collection_index_operand(collection, index, mir::Type::Mixed, context)?;
         return Ok(mir::MixedExpression::CollectionIndex {
+            positional: false,
             collection,
             index: Box::new(index),
             transfer,
@@ -8558,6 +8593,7 @@ fn lower_collection_expression(
             )]);
         }
         return Ok(mir::CollectionExpression::Index {
+            positional: false,
             collection: expected,
             source: collection,
             index: Box::new(index),
@@ -8835,6 +8871,7 @@ fn lower_collection_expression(
                         IntegerType::Int64,
                     )));
             Ok(mir::CollectionExpression::Index {
+                positional: false,
                 collection: expected,
                 source,
                 index: Box::new(lower_rvalue_as_expected(index, index_type, context)?),
@@ -9088,6 +9125,7 @@ fn collection_remove_at_rvalue(
         mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
             scalar,
             mir::Operand::CollectionIndex {
+                positional: false,
                 collection,
                 index: Box::new(index),
                 remove: true,
@@ -9095,12 +9133,14 @@ fn collection_remove_at_rvalue(
         ))),
         mir::Type::String => Ok(mir::Rvalue::String(
             mir::StringExpression::CollectionIndex {
+                positional: false,
                 collection,
                 index: Box::new(index),
                 remove: true,
             },
         )),
         mir::Type::Class(class) => Ok(mir::Rvalue::Class(mir::ClassExpression::CollectionIndex {
+            positional: false,
             class,
             collection,
             index: Box::new(index),
@@ -9108,6 +9148,7 @@ fn collection_remove_at_rvalue(
         })),
         mir::Type::SharedReference(class) => Ok(mir::Rvalue::SharedReference(
             mir::SharedReferenceExpression::CollectionIndex {
+                positional: false,
                 class,
                 collection,
                 index: Box::new(index),
@@ -9116,6 +9157,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::WeakReference(class) => Ok(mir::Rvalue::WeakReference(
             mir::WeakReferenceExpression::CollectionIndex {
+                positional: false,
                 class,
                 collection,
                 index: Box::new(index),
@@ -9124,6 +9166,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::NullableSharedReference(class) => Ok(mir::Rvalue::NullableSharedReference(
             mir::NullableSharedReferenceExpression::CollectionIndex {
+                positional: false,
                 class,
                 collection,
                 index: Box::new(index),
@@ -9132,6 +9175,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::NullableWeakReference(class) => Ok(mir::Rvalue::NullableWeakReference(
             mir::NullableWeakReferenceExpression::CollectionIndex {
+                positional: false,
                 class,
                 collection,
                 index: Box::new(index),
@@ -9140,6 +9184,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::WritableSharedReference(payload) => Ok(mir::Rvalue::WritableSharedReference(
             mir::WritableSharedReferenceExpression::CollectionIndex {
+                positional: false,
                 payload,
                 collection,
                 index: Box::new(index),
@@ -9148,6 +9193,7 @@ fn collection_remove_at_rvalue(
         )),
         mir::Type::WritableWeakReference(payload) => Ok(mir::Rvalue::WritableWeakReference(
             mir::WritableWeakReferenceExpression::CollectionIndex {
+                positional: false,
                 payload,
                 collection,
                 index: Box::new(index),
@@ -9159,6 +9205,7 @@ fn collection_remove_at_rvalue(
             let writable = matches!(ty, mir::Type::WritableSharedReferenceAccess(_));
             Ok(mir::Rvalue::SharedReferenceAccess(
                 mir::SharedReferenceAccessExpression::CollectionIndex {
+                    positional: false,
                     payload,
                     collection,
                     index: Box::new(index),
@@ -9172,6 +9219,7 @@ fn collection_remove_at_rvalue(
             let writable = matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_));
             Ok(mir::Rvalue::NullableSharedReferenceAccess(
                 mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                    positional: false,
                     payload,
                     collection,
                     index: Box::new(index),
@@ -9181,6 +9229,7 @@ fn collection_remove_at_rvalue(
             ))
         }
         mir::Type::Mixed => Ok(mir::Rvalue::Mixed(mir::MixedExpression::CollectionIndex {
+            positional: false,
             collection,
             index: Box::new(index),
             transfer: true,
@@ -9188,6 +9237,7 @@ fn collection_remove_at_rvalue(
         })),
         mir::Type::Collection(nested) => {
             Ok(mir::Rvalue::Collection(mir::CollectionExpression::Index {
+                positional: false,
                 collection: nested,
                 source: collection,
                 index: Box::new(index),
@@ -9745,6 +9795,7 @@ impl NullableCollectionScalarOperation<'_> {
                     value_expression_from_operand(
                         expected,
                         mir::Operand::CollectionIndex {
+                            positional: false,
                             collection,
                             index: Box::new(index),
                             remove: true,
@@ -10397,6 +10448,7 @@ fn lower_class_expression(
             )]);
         }
         return Ok(mir::ClassExpression::CollectionIndex {
+            positional: false,
             class: expected,
             collection,
             index: Box::new(index),
@@ -10524,6 +10576,7 @@ fn lower_class_expression(
                 context,
             )?;
             Ok(mir::ClassExpression::CollectionIndex {
+                positional: false,
                 class: expected,
                 collection,
                 index: Box::new(index),
@@ -10674,6 +10727,7 @@ fn lower_shared_reference_expression(
             )]);
         }
         return Ok(mir::SharedReferenceExpression::CollectionIndex {
+            positional: false,
             class: expected,
             collection,
             index: Box::new(index),
@@ -10867,6 +10921,7 @@ fn lower_shared_reference_expression(
                 context,
             )?;
             Ok(mir::SharedReferenceExpression::CollectionIndex {
+                positional: false,
                 class: expected,
                 collection,
                 index: Box::new(index),
@@ -11518,6 +11573,7 @@ fn lower_shared_reference_access_expression(
             )]);
         }
         return Ok(mir::SharedReferenceAccessExpression::CollectionIndex {
+            positional: false,
             payload: expected,
             collection,
             index: Box::new(index),
@@ -11614,6 +11670,7 @@ fn lower_shared_reference_access_expression(
             let (collection, index) =
                 lower_collection_index_operand(collection, index, expected_ty, context)?;
             Ok(mir::SharedReferenceAccessExpression::CollectionIndex {
+                positional: false,
                 payload: expected,
                 collection,
                 index: Box::new(index),
@@ -11744,6 +11801,7 @@ fn lower_nullable_shared_reference_access_expression(
         }
         return Ok(
             mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                positional: false,
                 payload: expected,
                 collection,
                 index: Box::new(index),
@@ -11805,6 +11863,7 @@ fn lower_nullable_shared_reference_access_expression(
                 lower_collection_index_operand(collection, index, nullable_ty, context)?;
             Ok(
                 mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                    positional: false,
                     payload: expected,
                     collection,
                     index: Box::new(index),
@@ -11978,6 +12037,7 @@ fn lower_weak_reference_expression(
             )]);
         }
         return Ok(mir::WeakReferenceExpression::CollectionIndex {
+            positional: false,
             class: expected,
             collection,
             index: Box::new(index),
@@ -12171,6 +12231,7 @@ fn lower_nullable_shared_reference_expression(
             )]);
         }
         return Ok(mir::NullableSharedReferenceExpression::CollectionIndex {
+            positional: false,
             class: expected,
             collection,
             index: Box::new(index),
@@ -12448,6 +12509,7 @@ fn lower_nullable_shared_reference_expression(
                 context,
             )?;
             Ok(mir::NullableSharedReferenceExpression::CollectionIndex {
+                positional: false,
                 class: expected,
                 collection,
                 index: Box::new(index),
@@ -12501,6 +12563,7 @@ fn lower_nullable_weak_reference_expression(
             )]);
         }
         return Ok(mir::NullableWeakReferenceExpression::CollectionIndex {
+            positional: false,
             class: expected,
             collection,
             index: Box::new(index),
@@ -12752,6 +12815,7 @@ fn lower_nullable_weak_reference_expression(
                 context,
             )?;
             Ok(mir::NullableWeakReferenceExpression::CollectionIndex {
+                positional: false,
                 class: expected,
                 collection,
                 index: Box::new(index),
@@ -13078,6 +13142,7 @@ fn lower_float_expression(
         return Ok(mir::FloatExpression::Use {
             ty,
             operand: mir::Operand::CollectionIndex {
+                positional: false,
                 collection,
                 index: Box::new(index),
                 remove: true,
@@ -13169,6 +13234,7 @@ fn lower_float_expression(
             Ok(mir::FloatExpression::Use {
                 ty,
                 operand: mir::Operand::CollectionIndex {
+                    positional: false,
                     collection,
                     index: Box::new(index),
                     remove: false,
@@ -13354,6 +13420,7 @@ fn lower_integer_expression(
         return Ok(mir::IntegerExpression::Use {
             ty,
             operand: mir::Operand::CollectionIndex {
+                positional: false,
                 collection,
                 index: Box::new(index),
                 remove: true,
@@ -13492,6 +13559,7 @@ fn lower_integer_expression(
             Ok(mir::IntegerExpression::Use {
                 ty,
                 operand: mir::Operand::CollectionIndex {
+                    positional: false,
                     collection,
                     index: Box::new(index),
                     remove: false,

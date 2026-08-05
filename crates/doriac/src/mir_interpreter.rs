@@ -452,6 +452,7 @@ enum EvaluationTask {
         collection: mir::LocalId,
         index_span: Span,
         transfer: bool,
+        positional: bool,
     },
     CollectionAdd {
         collection: mir::LocalId,
@@ -459,7 +460,7 @@ enum EvaluationTask {
         has_index: bool,
     },
     CollectionSet(mir::LocalId),
-    AssignCollectionIndex(mir::LocalId),
+    AssignCollectionIndex(mir::LocalId, bool),
     CollectionHas {
         collection: mir::LocalId,
         op: mir::CollectionMembershipOp,
@@ -467,7 +468,7 @@ enum EvaluationTask {
     },
     CollectionIsEmpty(mir::LocalId),
     CollectionLength(mir::LocalId),
-    CollectionIndexScalar(mir::LocalId),
+    CollectionIndexScalar(mir::LocalId, bool),
     CollectionKeyScalar(mir::LocalId),
     CollectionKeyString(mir::LocalId),
     DictionaryGet {
@@ -479,6 +480,7 @@ enum EvaluationTask {
         collection: mir::LocalId,
         class: crate::class_layout::ClassId,
         transfer: bool,
+        positional: bool,
     },
     CollectionIndexShared {
         collection: mir::LocalId,
@@ -486,6 +488,7 @@ enum EvaluationTask {
         weak: bool,
         nullable: bool,
         transfer: bool,
+        positional: bool,
     },
     CollectionIndexWritableShared {
         collection: mir::LocalId,
@@ -493,6 +496,7 @@ enum EvaluationTask {
         weak: bool,
         nullable: bool,
         transfer: bool,
+        positional: bool,
     },
     CollectionIndexSharedAccess {
         collection: mir::LocalId,
@@ -500,6 +504,7 @@ enum EvaluationTask {
         writable: bool,
         nullable: bool,
         remove: bool,
+        positional: bool,
     },
     BuildClassNew {
         class: crate::class_layout::ClassId,
@@ -1491,14 +1496,15 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Rvalue(key));
             }
             mir::Statement::AssignCollectionIndex {
+                positional,
                 collection,
                 index,
                 value,
             } => {
                 let frame = self.current_frame_mut()?;
-                frame
-                    .tasks
-                    .push(EvaluationTask::AssignCollectionIndex(collection));
+                frame.tasks.push(EvaluationTask::AssignCollectionIndex(
+                    collection, positional,
+                ));
                 frame.tasks.push(EvaluationTask::Rvalue(value));
                 frame.tasks.push(EvaluationTask::Rvalue(index));
             }
@@ -2478,9 +2484,11 @@ impl Interpreter<'_> {
                 collection,
                 index_span,
                 transfer,
+                positional,
             } => {
                 let index = self.pop_local_value()?;
-                let value = match self.collection_value_at(collection, &index, transfer) {
+                let value = match self.collection_value_at(collection, &index, transfer, positional)
+                {
                     Ok(value) => value,
                     Err(error) => return self.collection_access_panic_step_at(error, index_span),
                 };
@@ -2594,14 +2602,14 @@ impl Interpreter<'_> {
                     order_collection_entries(definition, &mut collection.entries_mut())?;
                 }
             }
-            EvaluationTask::AssignCollectionIndex(collection) => {
+            EvaluationTask::AssignCollectionIndex(collection, positional) => {
                 let value = self.pop_local_value()?;
                 let index = self.pop_local_value()?;
                 let keyed = {
                     let collection = self.collection_local(collection)?;
                     self.program.collection_types[collection.ty.0].key.is_some()
                 };
-                match self.collection_position(collection, &index) {
+                match self.collection_position(collection, &index, positional) {
                     Ok(position) => {
                         let current = self.collection_local(collection)?;
                         let old = std::mem::replace(&mut current.entries_mut()[position].1, value);
@@ -2706,9 +2714,9 @@ impl Interpreter<'_> {
                         .expect("collection length fits interpreter address space"),
                 ))?;
             }
-            EvaluationTask::CollectionIndexScalar(collection) => {
+            EvaluationTask::CollectionIndexScalar(collection, positional) => {
                 let index = self.pop_local_value()?;
-                let value = match self.collection_value_at(collection, &index, false) {
+                let value = match self.collection_value_at(collection, &index, false, positional) {
                     Ok(value) => value,
                     Err(error) => return self.collection_access_panic_step(error),
                 };
@@ -3066,9 +3074,11 @@ impl Interpreter<'_> {
                 collection,
                 class,
                 transfer,
+                positional,
             } => {
                 let index = self.pop_local_value()?;
-                let value = match self.collection_value_at(collection, &index, transfer) {
+                let value = match self.collection_value_at(collection, &index, transfer, positional)
+                {
                     Ok(value) => value,
                     Err(error) => return self.collection_access_panic_step(error),
                 };
@@ -3096,9 +3106,11 @@ impl Interpreter<'_> {
                 weak,
                 nullable,
                 transfer,
+                positional,
             } => {
                 let index = self.pop_local_value()?;
-                let value = match self.collection_value_at(collection, &index, transfer) {
+                let value = match self.collection_value_at(collection, &index, transfer, positional)
+                {
                     Ok(value) => value,
                     Err(error) => return self.collection_access_panic_step(error),
                 };
@@ -3153,9 +3165,11 @@ impl Interpreter<'_> {
                 weak,
                 nullable,
                 transfer,
+                positional,
             } => {
                 let index = self.pop_local_value()?;
-                let value = match self.collection_value_at(collection, &index, transfer) {
+                let value = match self.collection_value_at(collection, &index, transfer, positional)
+                {
                     Ok(value) => value,
                     Err(error) => return self.collection_access_panic_step(error),
                 };
@@ -3214,9 +3228,10 @@ impl Interpreter<'_> {
                 writable,
                 nullable,
                 remove,
+                positional,
             } => {
                 let index = self.pop_local_value()?;
-                let value = match self.collection_value_at(collection, &index, remove) {
+                let value = match self.collection_value_at(collection, &index, remove, positional) {
                     Ok(value) => value,
                     Err(error) => return self.collection_access_panic_step(error),
                 };
@@ -5198,12 +5213,14 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableString(*left));
             }
             mir::StringExpression::CollectionIndex {
+                positional,
                 collection,
                 index,
                 remove,
             } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    positional,
                     collection,
                     index_span: Span::default(),
                     transfer: remove,
@@ -5397,6 +5414,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Class(value));
             }
             mir::MixedExpression::CollectionIndex {
+                positional,
                 collection,
                 index,
                 transfer,
@@ -5410,6 +5428,7 @@ impl Interpreter<'_> {
                     frame.tasks.push(EvaluationTask::OwnMixed);
                 }
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    positional,
                     collection,
                     index_span: Span::default(),
                     transfer: remove,
@@ -5781,6 +5800,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::NullableClass(*left));
             }
             mir::ClassExpression::CollectionIndex {
+                positional,
                 class,
                 collection,
                 index,
@@ -5788,6 +5808,7 @@ impl Interpreter<'_> {
             } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::CollectionIndexClass {
+                    positional,
                     collection,
                     class,
                     transfer,
@@ -6044,6 +6065,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableSharedReference(*left));
             }
             mir::SharedReferenceExpression::CollectionIndex {
+                positional,
                 class,
                 collection,
                 index,
@@ -6051,6 +6073,7 @@ impl Interpreter<'_> {
             } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::CollectionIndexShared {
+                    positional,
                     collection,
                     class,
                     weak: false,
@@ -6177,6 +6200,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableWeakReference(*left));
             }
             mir::WeakReferenceExpression::CollectionIndex {
+                positional,
                 class,
                 collection,
                 index,
@@ -6184,6 +6208,7 @@ impl Interpreter<'_> {
             } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::CollectionIndexShared {
+                    positional,
                     collection,
                     class,
                     weak: true,
@@ -6342,6 +6367,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
             mir::NullableSharedReferenceExpression::CollectionIndex {
+                positional,
                 class,
                 collection,
                 index,
@@ -6349,6 +6375,7 @@ impl Interpreter<'_> {
             } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::CollectionIndexShared {
+                    positional,
                     collection,
                     class,
                     weak: false,
@@ -6487,6 +6514,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
             mir::NullableWeakReferenceExpression::CollectionIndex {
+                positional,
                 class,
                 collection,
                 index,
@@ -6494,6 +6522,7 @@ impl Interpreter<'_> {
             } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::CollectionIndexShared {
+                    positional,
                     collection,
                     class,
                     weak: true,
@@ -6634,6 +6663,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableWritableSharedReference(*left));
             }
             mir::WritableSharedReferenceExpression::CollectionIndex {
+                positional,
                 payload,
                 collection,
                 index,
@@ -6643,6 +6673,7 @@ impl Interpreter<'_> {
                 frame
                     .tasks
                     .push(EvaluationTask::CollectionIndexWritableShared {
+                        positional,
                         collection,
                         payload,
                         weak: false,
@@ -6774,6 +6805,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableWritableWeakReference(*left));
             }
             mir::WritableWeakReferenceExpression::CollectionIndex {
+                positional,
                 payload,
                 collection,
                 index,
@@ -6783,6 +6815,7 @@ impl Interpreter<'_> {
                 frame
                     .tasks
                     .push(EvaluationTask::CollectionIndexWritableShared {
+                        positional,
                         collection,
                         payload,
                         weak: true,
@@ -7192,6 +7225,7 @@ impl Interpreter<'_> {
                     });
             }
             mir::SharedReferenceAccessExpression::CollectionIndex {
+                positional,
                 payload,
                 collection,
                 index,
@@ -7202,6 +7236,7 @@ impl Interpreter<'_> {
                 frame
                     .tasks
                     .push(EvaluationTask::CollectionIndexSharedAccess {
+                        positional,
                         collection,
                         payload,
                         writable,
@@ -7333,6 +7368,7 @@ impl Interpreter<'_> {
                 );
             }
             mir::NullableSharedReferenceAccessExpression::CollectionIndex {
+                positional,
                 payload,
                 collection,
                 index,
@@ -7343,6 +7379,7 @@ impl Interpreter<'_> {
                 frame
                     .tasks
                     .push(EvaluationTask::CollectionIndexSharedAccess {
+                        positional,
                         collection,
                         payload,
                         writable,
@@ -7482,10 +7519,12 @@ impl Interpreter<'_> {
                 index,
                 index_span,
                 transfer,
+                positional,
                 ..
             } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    positional,
                     collection: source,
                     index_span,
                     transfer,
@@ -8853,6 +8892,7 @@ impl Interpreter<'_> {
                 Ok(true)
             }
             mir::Operand::CollectionIndex {
+                positional,
                 collection,
                 index,
                 remove,
@@ -8860,14 +8900,16 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 if *remove {
                     frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                        positional: *positional,
                         collection: *collection,
                         index_span: Span::default(),
                         transfer: true,
                     });
                 } else {
-                    frame
-                        .tasks
-                        .push(EvaluationTask::CollectionIndexScalar(*collection));
+                    frame.tasks.push(EvaluationTask::CollectionIndexScalar(
+                        *collection,
+                        *positional,
+                    ));
                 }
                 frame.tasks.push(EvaluationTask::Rvalue((**index).clone()));
                 Ok(true)
@@ -9911,6 +9953,7 @@ impl Interpreter<'_> {
         &self,
         local: mir::LocalId,
         index: &LocalValue,
+        positional: bool,
     ) -> Result<usize, CollectionAccessError> {
         let collection = self
             .collection_local(local)
@@ -9920,7 +9963,7 @@ impl Interpreter<'_> {
             .collection_types
             .get(collection.ty.0)
             .ok_or(CollectionAccessError::Catalogued("P1001"))?;
-        if definition.key.is_some() {
+        if definition.key.is_some() && !positional {
             collection
                 .entries()
                 .iter()
@@ -9962,8 +10005,9 @@ impl Interpreter<'_> {
         local: mir::LocalId,
         index: &LocalValue,
         transfer: bool,
+        positional: bool,
     ) -> Result<LocalValue, CollectionAccessError> {
-        let position = self.collection_position(local, index)?;
+        let position = self.collection_position(local, index, positional)?;
         if transfer {
             self.collection_local(local)
                 .map(|collection| collection.entries_mut().remove(position).1)

@@ -1279,6 +1279,7 @@ fn validate_statement(
             validate_rvalue(program, function, value)
         }
         mir::Statement::AssignCollectionIndex {
+            positional: _,
             collection,
             index,
             value,
@@ -2898,6 +2899,7 @@ fn validate_mixed_expression(
             validate_class_expression(program, function, value)
         }
         mir::MixedExpression::CollectionIndex {
+            positional,
             collection,
             index,
             transfer: _,
@@ -2918,6 +2920,7 @@ fn validate_mixed_expression(
                 collection_type,
                 index,
                 false,
+                *positional,
             )
         }
     }
@@ -3050,6 +3053,7 @@ fn validate_collection_expression(
             source,
             index,
             transfer,
+            positional,
             ..
         } => {
             let source = local_in(function, *source)?;
@@ -3065,7 +3069,7 @@ fn validate_collection_expression(
                     "collection value transfer requires a writable List source",
                 ));
             }
-            validate_collection_index(program, function, source_type, index)
+            validate_collection_index(program, function, source_type, index, *positional)
         }
         mir::CollectionExpression::Property {
             object, property, ..
@@ -3608,12 +3612,20 @@ fn validate_collection_index(
     function: &mir::Function,
     collection: &mir::CollectionType,
     index: &mir::Rvalue,
+    positional: bool,
 ) -> Result<(), BackendError> {
-    let expected = collection
-        .key
-        .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
-            IntegerType::Int64,
-        )));
+    // A positional index addresses a slot, so it is an offset even when the
+    // collection is keyed. Requiring the key type here would reject the only
+    // form that reads an element without searching for it.
+    let expected = if positional {
+        mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
+    } else {
+        collection
+            .key
+            .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                IntegerType::Int64,
+            )))
+    };
     if index.ty() != expected {
         return Err(malformed_mir(format!(
             "collection index has type {}, expected {expected}",
@@ -3630,13 +3642,14 @@ fn validate_collection_element_access(
     collection: &mir::CollectionType,
     index: &mir::Rvalue,
     remove: bool,
+    positional: bool,
 ) -> Result<(), BackendError> {
     if remove && (collection.kind != mir::CollectionKind::List || !local.writable) {
         return Err(malformed_mir(
             "element removal requires a writable List source",
         ));
     }
-    validate_collection_index(program, function, collection, index)
+    validate_collection_index(program, function, collection, index, positional)
 }
 
 fn validate_collection_key_at(
@@ -6931,6 +6944,7 @@ fn validate_class_expression(
             collection,
             index,
             transfer,
+            positional,
             ..
         } => {
             let local = local_in(function, *collection)?;
@@ -6948,6 +6962,7 @@ fn validate_class_expression(
                 collection_type,
                 index,
                 *transfer,
+                *positional,
             )
         }
         mir::ClassExpression::MixedPayload { mixed, .. } => validate_mixed_payload_operand(
@@ -8811,6 +8826,7 @@ fn validate_condition(
                 mir::Type::Scalar(mir::ScalarType::Bool),
             ),
             mir::Operand::CollectionIndex {
+                positional,
                 collection,
                 index,
                 remove,
@@ -8830,6 +8846,7 @@ fn validate_condition(
                     collection_type,
                     index,
                     *remove,
+                    *positional,
                 )
             }
             _ => Err(malformed_mir("bool expression has an incompatible operand")),
@@ -9028,6 +9045,7 @@ fn validate_integer_operand(
             Ok(())
         }
         mir::Operand::CollectionIndex {
+            positional,
             collection,
             index,
             remove,
@@ -9047,6 +9065,7 @@ fn validate_integer_operand(
                 collection_type,
                 index,
                 *remove,
+                *positional,
             )
         }
         mir::Operand::CollectionKeyAt { collection, offset } => validate_collection_key_at(
@@ -9122,6 +9141,7 @@ fn validate_string_expression(
             validate_property_operand(program, function, *object, *property, mir::Type::String)
         }
         mir::StringExpression::CollectionIndex {
+            positional,
             collection,
             index,
             remove,
@@ -9141,6 +9161,7 @@ fn validate_string_expression(
                 collection_type,
                 index,
                 *remove,
+                *positional,
             )
         }
         mir::StringExpression::CollectionKeyAt { collection, offset } => {

@@ -1838,6 +1838,7 @@ fn lower_statement(
             value,
         }
         | mir::Statement::AssignCollectionIndex {
+            positional: _,
             collection,
             index: key,
             value,
@@ -2704,10 +2705,11 @@ fn lower_collection_expression(
             index,
             index_span,
             transfer,
+            positional,
             ..
         } => {
             set_active_panic_site(builder, *index_span, resources);
-            lower_collection_index(builder, *source, index, *transfer, resources)
+            lower_collection_index(builder, *source, index, *transfer, *positional, resources)
         }
         mir::CollectionExpression::Property {
             object, property, ..
@@ -2891,6 +2893,7 @@ fn lower_collection_index(
     collection: mir::LocalId,
     index: &mir::Rvalue,
     remove: bool,
+    positional: bool,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
@@ -2920,7 +2923,7 @@ fn lower_collection_index(
         )?
         .ok_or_else(|| backend_failure("Bytes index read produced no result"));
     }
-    let word = if definition.key.is_some() {
+    let word = if definition.key.is_some() && !positional {
         if remove {
             return Err(malformed_mir(
                 "dictionary indexed removal must use Dictionary::remove",
@@ -4126,8 +4129,16 @@ fn lower_class_expression(
             collection,
             index,
             transfer,
+            positional,
             ..
-        } => lower_collection_index(builder, *collection, index, *transfer, resources),
+        } => lower_collection_index(
+            builder,
+            *collection,
+            index,
+            *transfer,
+            *positional,
+            resources,
+        ),
         mir::ClassExpression::MixedPayload {
             mixed,
             class,
@@ -4313,8 +4324,9 @@ fn lower_shared_reference_expression(
             collection,
             index,
             remove,
+            positional,
             ..
-        } => lower_collection_index(builder, *collection, index, *remove, resources),
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
     }
 }
 
@@ -4424,8 +4436,9 @@ fn lower_weak_reference_expression(
             collection,
             index,
             remove,
+            positional,
             ..
-        } => lower_collection_index(builder, *collection, index, *remove, resources),
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
     }
 }
 
@@ -4589,8 +4602,9 @@ fn lower_nullable_shared_reference_expression(
             collection,
             index,
             remove,
+            positional,
             ..
-        } => lower_collection_index(builder, *collection, index, *remove, resources),
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
     }
 }
 
@@ -4752,8 +4766,9 @@ fn lower_nullable_weak_reference_expression(
             collection,
             index,
             remove,
+            positional,
             ..
-        } => lower_collection_index(builder, *collection, index, *remove, resources),
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
     }
 }
 
@@ -4853,8 +4868,9 @@ fn lower_writable_shared_reference_expression(
             collection,
             index,
             remove,
+            positional,
             ..
-        } => lower_collection_index(builder, *collection, index, *remove, resources),
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
     }
 }
 
@@ -4920,8 +4936,9 @@ fn lower_writable_weak_reference_expression(
             collection,
             index,
             remove,
+            positional,
             ..
-        } => lower_collection_index(builder, *collection, index, *remove, resources),
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
     }
 }
 
@@ -5157,8 +5174,9 @@ fn lower_shared_reference_access_expression(
             collection,
             index,
             remove,
+            positional,
             ..
-        } => lower_collection_index(builder, *collection, index, *remove, resources),
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
         mir::SharedReferenceAccessExpression::Call { function, args, .. } => {
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("shared access call produced no result"))?
@@ -5223,8 +5241,9 @@ fn lower_nullable_shared_reference_access_expression(
             collection,
             index,
             remove,
+            positional,
             ..
-        } => lower_collection_index(builder, *collection, index, *remove, resources),
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
         mir::NullableSharedReferenceAccessExpression::CollectionGet {
             collection,
             key,
@@ -6327,12 +6346,20 @@ fn lower_mixed_expression(
             )
         }
         mir::MixedExpression::CollectionIndex {
+            positional,
             collection,
             index,
             transfer,
             remove,
         } => {
-            let value = lower_collection_index(builder, *collection, index, *remove, resources)?;
+            let value = lower_collection_index(
+                builder,
+                *collection,
+                index,
+                *remove,
+                *positional,
+                resources,
+            )?;
             if *transfer && !*remove {
                 // Owning index read (`mixed $x = $items[0]`): clone the collection's box
                 // into an owned handle that shares the payload owner with the element that
@@ -6707,11 +6734,19 @@ fn lower_string_expression(
             )
         }
         mir::StringExpression::CollectionIndex {
+            positional,
             collection,
             index,
             remove,
         } => {
-            let value = lower_collection_index(builder, *collection, index, *remove, resources)?;
+            let value = lower_collection_index(
+                builder,
+                *collection,
+                index,
+                *remove,
+                *positional,
+                resources,
+            )?;
             if *remove {
                 Ok(value)
             } else {
@@ -7946,10 +7981,11 @@ fn lower_integer_operand(
             .ok_or_else(|| backend_failure("collection length produced no result"))
         }
         mir::Operand::CollectionIndex {
+            positional,
             collection,
             index,
             remove,
-        } => lower_collection_index(builder, *collection, index, *remove, resources),
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
         mir::Operand::CollectionKeyAt { collection, offset } => lower_collection_key_at(
             builder,
             *collection,
@@ -8039,10 +8075,13 @@ fn lower_float_expression(
                 ))
             }
             mir::Operand::CollectionIndex {
+                positional,
                 collection,
                 index,
                 remove,
-            } => lower_collection_index(builder, *collection, index, *remove, resources),
+            } => {
+                lower_collection_index(builder, *collection, index, *remove, *positional, resources)
+            }
             mir::Operand::CollectionKeyAt { collection, offset } => lower_collection_key_at(
                 builder,
                 *collection,
@@ -9359,10 +9398,11 @@ fn lower_bool_operand(
             ))
         }
         mir::Operand::CollectionIndex {
+            positional,
             collection,
             index,
             remove,
-        } => lower_collection_index(builder, *collection, index, *remove, resources),
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
         mir::Operand::CollectionKeyAt { collection, offset } => lower_collection_key_at(
             builder,
             *collection,

@@ -370,6 +370,8 @@ pub enum Operand {
     CollectionIndex {
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         remove: bool,
     },
     CollectionKeyAt {
@@ -806,6 +808,8 @@ pub enum SharedReferenceExpression {
         class: ClassId,
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         remove: bool,
     },
 }
@@ -897,6 +901,8 @@ pub enum WeakReferenceExpression {
         class: ClassId,
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         remove: bool,
     },
 }
@@ -999,6 +1005,8 @@ pub enum NullableSharedReferenceExpression {
         class: ClassId,
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         remove: bool,
     },
 }
@@ -1114,6 +1122,8 @@ pub enum NullableWeakReferenceExpression {
         class: ClassId,
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         remove: bool,
     },
 }
@@ -1224,6 +1234,8 @@ pub enum WritableSharedReferenceExpression {
         payload: WritableSharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         remove: bool,
     },
 }
@@ -1292,6 +1304,8 @@ pub enum WritableWeakReferenceExpression {
         payload: WritableSharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         remove: bool,
     },
 }
@@ -1500,6 +1514,8 @@ pub enum SharedReferenceAccessExpression {
         payload: WritableSharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         writable: bool,
         remove: bool,
     },
@@ -1541,6 +1557,8 @@ pub enum NullableSharedReferenceAccessExpression {
         payload: WritableSharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         writable: bool,
         remove: bool,
     },
@@ -1684,6 +1702,8 @@ pub enum CollectionExpression {
         collection: CollectionTypeId,
         source: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         index_span: Span,
         transfer: bool,
     },
@@ -1948,6 +1968,8 @@ pub enum MixedExpression {
     CollectionIndex {
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         transfer: bool,
         remove: bool,
     },
@@ -2146,6 +2168,8 @@ pub enum ClassExpression {
         class: ClassId,
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         transfer: bool,
     },
     MixedPayload {
@@ -2532,6 +2556,8 @@ pub enum StringExpression {
     CollectionIndex {
         collection: LocalId,
         index: Box<Rvalue>,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         remove: bool,
     },
     CollectionKeyAt {
@@ -2941,6 +2967,8 @@ pub enum Statement {
     AssignCollectionIndex {
         collection: LocalId,
         index: Rvalue,
+        /// True when `index` is a position in the collection rather than a key.
+        positional: bool,
         value: Rvalue,
     },
     DropCollection {
@@ -4064,6 +4092,7 @@ impl fmt::Display for ClassExpression {
             ),
             Self::Coalesce { left, right, .. } => write!(formatter, "({left} ?? {right})"),
             Self::CollectionIndex {
+                positional: _,
                 class,
                 collection,
                 index,
@@ -4260,6 +4289,7 @@ impl fmt::Display for MixedExpression {
             Self::BoxString { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxClass { value, .. } => write!(formatter, "mixed({value})"),
             Self::CollectionIndex {
+                positional: _,
                 collection,
                 index,
                 transfer,
@@ -4944,6 +4974,7 @@ impl fmt::Display for Statement {
                 value,
             } => write!(formatter, "local{}.set({key}, {value})", collection.0),
             Statement::AssignCollectionIndex {
+                positional: _,
                 collection,
                 index,
                 value,

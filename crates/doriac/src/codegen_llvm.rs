@@ -1301,6 +1301,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 value,
             }
             | mir::Statement::AssignCollectionIndex {
+                positional: _,
                 collection,
                 index: key,
                 value,
@@ -2163,11 +2164,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 index,
                 index_span,
                 transfer,
+                positional,
                 ..
             } => {
                 self.set_active_panic_site(*index_span)?;
                 Ok(self
-                    .lower_collection_index(*source, index, *transfer)?
+                    .lower_collection_index(*source, index, *transfer, *positional)?
                     .into_pointer_value())
             }
             mir::CollectionExpression::Property {
@@ -2349,6 +2351,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         collection: mir::LocalId,
         index: &mir::Rvalue,
         remove: bool,
+        positional: bool,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
@@ -2382,7 +2385,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 IntegerType::Int64,
             )));
         let index_value = self.lower_rvalue(index)?;
-        let word = if definition.key.is_some() {
+        let word = if definition.key.is_some() && !positional {
             if remove {
                 return Err(malformed_mir(
                     "dictionary indexed removal must use Dictionary::remove",
@@ -3863,9 +3866,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 transfer,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *transfer)?
+                .lower_collection_index(*collection, index, *transfer, *positional)?
                 .into_pointer_value()),
             mir::ClassExpression::MixedPayload {
                 mixed,
@@ -4014,9 +4018,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4130,9 +4135,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4295,9 +4301,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4487,9 +4494,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4628,9 +4636,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4688,9 +4697,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4889,9 +4899,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
             mir::SharedReferenceAccessExpression::Call { function, args, .. } => Ok(self
                 .lower_call(*function, args, true)?
@@ -4947,9 +4958,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
             mir::NullableSharedReferenceAccessExpression::CollectionGet {
                 collection,
@@ -6442,13 +6454,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.lower_mixed_box(mir::MixedTag::Class(class), payload.into(), *payload_owned)
             }
             mir::MixedExpression::CollectionIndex {
+                positional,
                 collection,
                 index,
                 transfer,
                 remove,
             } => {
                 let value = self
-                    .lower_collection_index(*collection, index, *remove)?
+                    .lower_collection_index(*collection, index, *remove, *positional)?
                     .into_pointer_value();
                 if *transfer && !*remove {
                     // Owning index read (`mixed $x = $items[0]`): clone the collection's box
@@ -7536,12 +7549,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into_pointer_value())
             }
             mir::StringExpression::CollectionIndex {
+                positional,
                 collection,
                 index,
                 remove,
             } => {
                 let value = self
-                    .lower_collection_index(*collection, index, *remove)?
+                    .lower_collection_index(*collection, index, *remove, *positional)?
                     .into_pointer_value();
                 if *remove {
                     Ok(value)
@@ -8360,11 +8374,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into_int_value())
             }
             mir::Operand::CollectionIndex {
+                positional,
                 collection,
                 index,
                 remove,
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_int_value()),
             mir::Operand::CollectionKeyAt { collection, offset } => Ok(self
                 .lower_collection_key_at(
@@ -8438,11 +8453,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?
                 .into_float_value()),
                 mir::Operand::CollectionIndex {
+                    positional,
                     collection,
                     index,
                     remove,
                 } => Ok(self
-                    .lower_collection_index(*collection, index, *remove)?
+                    .lower_collection_index(*collection, index, *remove, *positional)?
                     .into_float_value()),
                 mir::Operand::CollectionKeyAt { collection, offset } => Ok(self
                     .lower_collection_key_at(
@@ -9352,11 +9368,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             ))?
             .into_int_value()),
             mir::Operand::CollectionIndex {
+                positional,
                 collection,
                 index,
                 remove,
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_int_value()),
             mir::Operand::CollectionKeyAt { collection, offset } => Ok(self
                 .lower_collection_key_at(

@@ -388,3 +388,107 @@ done:                                             ; preds = %body
         placement.escaped[0]
     );
 }
+/// Iterating a dictionary must read each element at the position being walked,
+/// not look it up by its key.
+///
+/// Reading by key costs a binary search per element on an ordered dictionary and
+/// a linear scan per element on an unordered one, for a value already known to
+/// sit at that index. Before this was fixed a `foreach` over a 1024-entry
+/// SortedDictionary ran 9.5 times an equivalent walk over a SortedSet, and
+/// iterating a plain Dictionary was quadratic in the entry count.
+#[test]
+fn dictionary_iteration_reads_elements_positionally() {
+    let sources: [(&str, &str); 4] = [
+        (
+            "sorted dictionary, values projection",
+            r#"
+function main(): void
+{
+    writable SortedDictionary<int, int> $values = SortedDictionary::from([]);
+    for (let writable $index = 0; $index < 8; $index++) { $values->set($index, $index); }
+    let writable $total = 0;
+    foreach ($values->values as int $value) { $total = $total + $value; }
+    echo "{$total}\n";
+}
+"#,
+        ),
+        (
+            "sorted dictionary, key and value bound",
+            r#"
+function main(): void
+{
+    writable SortedDictionary<int, int> $values = SortedDictionary::from([]);
+    for (let writable $index = 0; $index < 8; $index++) { $values->set($index, $index); }
+    let writable $total = 0;
+    foreach ($values as int $key => int $value) { $total = $total + $key + $value; }
+    echo "{$total}\n";
+}
+"#,
+        ),
+        (
+            "unordered dictionary, values projection",
+            r#"
+function main(): void
+{
+    writable Dictionary<int, int> $values = [];
+    for (let writable $index = 0; $index < 8; $index++) { $values->set($index, $index); }
+    let writable $total = 0;
+    foreach ($values->values as int $value) { $total = $total + $value; }
+    echo "{$total}\n";
+}
+"#,
+        ),
+        (
+            "string-keyed dictionary with string values",
+            r#"
+function main(): void
+{
+    writable Dictionary<string, string> $values = [];
+    for (let writable $index = 0; $index < 8; $index++) { $values->set("k{$index}", "v{$index}"); }
+    let writable $total = 0;
+    foreach ($values->values as string $value) { $total = $total + $value->length; }
+    echo "{$total}\n";
+}
+"#,
+        ),
+    ];
+
+    for (label, source) in sources {
+        let program = doriac::lower_source_to_mir("llvm-test.doria", source)
+            .unwrap_or_else(|error| panic!("{label} should lower to MIR: {error:?}"));
+        let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
+            .unwrap_or_else(|error| panic!("{label} should lower to LLVM IR: {error:?}"));
+
+        // The keyed lookup is the defect: it searches for an element already
+        // known to sit at the index being walked. Ordered collections read
+        // positionally through the runtime; an unordered dictionary lowers to an
+        // inline bounds-checked load and emits no call at all, so the absence of
+        // the keyed lookup is what both shapes have in common.
+        assert!(
+            !ir.contains("dr_v1_collection_keyed_get"),
+            "{label}: iteration still looks values up by key"
+        );
+    }
+}
+
+/// The key is only read when something consumes it. A values-only walk that
+/// still called `key_at` per element would pay for a read it never uses.
+#[test]
+fn a_values_only_walk_does_not_read_keys() {
+    let source = r#"
+function main(): void
+{
+    writable SortedDictionary<int, int> $values = SortedDictionary::from([]);
+    for (let writable $index = 0; $index < 8; $index++) { $values->set($index, $index); }
+    let writable $total = 0;
+    foreach ($values->values as int $value) { $total = $total + $value; }
+    echo "{$total}\n";
+}
+"#;
+    let program = doriac::lower_source_to_mir("llvm-test.doria", source).expect("lowers to MIR");
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program).expect("lowers to LLVM IR");
+    assert!(
+        !ir.contains("dr_v2_collection_key_at"),
+        "a values-only walk read the key it never uses"
+    );
+}
