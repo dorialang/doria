@@ -34,7 +34,11 @@ function relative_path(string $root, string $path): string
 
 function is_skipped_path(string $path): bool
 {
-    foreach (['.git/', 'target/', 'node_modules/'] as $skip) {
+    // `.claude/worktrees/` holds transient checkouts of this same repository, so
+    // every document in it is a duplicate of one already checked at the root.
+    // Without this the guard reports each finding once per live worktree, and a
+    // document fixed at the root keeps failing until every worktree is removed.
+    foreach (['.git/', 'target/', 'node_modules/', '.claude/worktrees/'] as $skip) {
         if (str_contains($path, $skip)) {
             return true;
         }
