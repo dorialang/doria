@@ -1,0 +1,12 @@
+// String::indexOf in a loop body. It returns `?int` through an out-parameter
+// slot, so it carries the same scratch allocation the dictionary path does.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    let $haystack = "the quick brown fox jumps over the lazy dog";
+    let writable $checksum = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        $checksum = ($checksum + (String::indexOf($haystack, "fox") ?? 0)) % 1000003;
+    }
+    echo "{$checksum}\n";
+}

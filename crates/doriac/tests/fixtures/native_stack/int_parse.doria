@@ -1,0 +1,11 @@
+// Int::parse in a loop body. It reports success through a scratch flag slot,
+// which grew the frame on every pass before the entry-block fix.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    let writable $checksum = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        $checksum = ($checksum + (Int::parse("1234") ?? 0)) % 1000003;
+    }
+    echo "{$checksum}\n";
+}

@@ -1,0 +1,18 @@
+// Dictionary::get in a loop body, the construct that first exposed the
+// per-iteration stack leak in the LLVM release profile.
+//
+// The iteration count arrives as an argument so one test constant drives every
+// fixture in this directory.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    writable Dictionary<string, int> $values = [];
+    for (let writable $index = 0; $index < 64; $index++) {
+        $values->set("key{$index}", $index);
+    }
+    let writable $checksum = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        $checksum = ($checksum + ($values->get("key{$index % 64}") ?? 0)) % 1000003;
+    }
+    echo "{$checksum}\n";
+}

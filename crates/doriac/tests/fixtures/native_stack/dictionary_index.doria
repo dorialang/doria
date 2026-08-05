@@ -1,0 +1,16 @@
+// Nullable dictionary indexing in a loop body. `$values[$key]` on a nullable
+// value type lowers through a different nullable-access path than
+// Dictionary::get and allocates a scratch slot of its own.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    writable Dictionary<int, ?int> $values = [];
+    for (let writable $index = 0; $index < 64; $index++) {
+        $values->set($index, $index);
+    }
+    let writable $checksum = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        $checksum = ($checksum + ($values[$index % 64] ?? 0)) % 1000003;
+    }
+    echo "{$checksum}\n";
+}

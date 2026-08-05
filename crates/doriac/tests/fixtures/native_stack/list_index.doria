@@ -1,0 +1,14 @@
+// List indexing in a loop body.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    writable List<int> $values = [];
+    for (let writable $index = 0; $index < 64; $index++) {
+        $values->add($index);
+    }
+    let writable $checksum = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        $checksum = ($checksum + $values[$index % 64]) % 1000003;
+    }
+    echo "{$checksum}\n";
+}
