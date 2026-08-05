@@ -463,11 +463,11 @@ pub unsafe fn remove_at(
     collection: *mut DrCollectionV1,
     index: usize,
 ) -> u64 {
-    index_discard(collection);
     if index >= (*collection).length {
         collection_bounds_panic(frame, index, (*collection).length);
     }
     let removed = read_value(collection, index);
+    index_note_removal(collection, index);
     let tail = (*collection).length - index - 1;
     if tail != 0 {
         ptr::copy(
@@ -988,6 +988,71 @@ unsafe fn index_position(
     }
 }
 
+/// Removes the entry at `position` from the index and renumbers the rest.
+///
+/// **Must be called before the caller shifts the entries down**, because the
+/// slot holding `position` can only be located by hashing the word still stored
+/// there, and the shift overwrites it.
+///
+/// Renumbering is what lets the index survive a removal instead of being thrown
+/// away. The stored position is not part of the hash, so decrementing it never
+/// moves an entry to a different slot.
+unsafe fn index_note_removal(collection: *mut DrCollectionV1, position: usize) {
+    if (*collection).index.is_null() {
+        return;
+    }
+    let table = (*collection).index;
+    let slots = (*collection).index_slots;
+    let mask = slots - 1;
+    let kind = (*collection).index_kind;
+    let keyed = (*collection).index_keyed != 0;
+
+    let word = indexed_word(collection, position, keyed);
+    let mut hole = hash_word(word, kind) & mask;
+    loop {
+        let stored = *table.add(hole);
+        if stored == INDEX_EMPTY {
+            // Not indexed, which a List holding duplicates can produce. Nothing
+            // reliable to patch, so fall back rather than corrupt the table.
+            index_discard(collection);
+            return;
+        }
+        if stored == position {
+            break;
+        }
+        hole = (hole + 1) & mask;
+    }
+
+    // Backward-shift deletion. Linear probing cannot simply blank a slot: any
+    // entry that probed past it would become unreachable. Each following entry
+    // moves back into the hole when its ideal slot does not lie within the
+    // stretch being closed, which keeps every probe chain intact and leaves no
+    // tombstones behind.
+    *table.add(hole) = INDEX_EMPTY;
+    let mut scan = (hole + 1) & mask;
+    loop {
+        let stored = *table.add(scan);
+        if stored == INDEX_EMPTY {
+            break;
+        }
+        let ideal = hash_word(indexed_word(collection, stored, keyed), kind) & mask;
+        if ((scan.wrapping_sub(ideal)) & mask) >= ((scan.wrapping_sub(hole)) & mask) {
+            *table.add(hole) = stored;
+            *table.add(scan) = INDEX_EMPTY;
+            hole = scan;
+        }
+        scan = (scan + 1) & mask;
+    }
+
+    // Everything after the removed entry shifts down one place.
+    for slot in 0..slots {
+        let stored = *table.add(slot);
+        if stored != INDEX_EMPTY && stored > position {
+            *table.add(slot) = stored - 1;
+        }
+    }
+}
+
 /// Records an appended entry, keeping the index usable across a build loop so
 /// constructing a set or dictionary of K entries stays linear rather than
 /// quadratic. Discards the index instead of growing past its load factor.
@@ -1219,6 +1284,8 @@ pub unsafe fn keyed_remove(
     *found = 1;
     *removed_key = *(*collection).keys.add(index);
     let removed_value = read_value(collection, index);
+    // Before the shift, while the key at `index` can still be hashed.
+    index_note_removal(collection, index);
     let tail = (*collection).length - index - 1;
     if tail != 0 {
         ptr::copy(
@@ -1233,9 +1300,6 @@ pub unsafe fn keyed_remove(
         );
     }
     (*collection).length -= 1;
-    // After the shift, not before it. Discarding on entry would only force the
-    // `find` above to rebuild an index that this shift then invalidates.
-    index_discard(collection);
     removed_value
 }
 
@@ -1367,14 +1431,18 @@ pub unsafe fn remove_value(
     value_kind: u8,
     removed: *mut u64,
 ) -> bool {
-    index_discard(collection);
-    let Some(index) = (0..(*collection).length)
-        .find(|index| keys_equal(read_value(collection, *index), value, value_kind))
-    else {
+    let found = if index_ready(collection, value_kind, false) {
+        index_position(collection, value, value_kind, false)
+    } else {
+        (0..(*collection).length)
+            .find(|index| keys_equal(read_value(collection, *index), value, value_kind))
+    };
+    let Some(index) = found else {
         *removed = 0;
         return false;
     };
     *removed = read_value(collection, index);
+    index_note_removal(collection, index);
     let tail = (*collection).length - index - 1;
     if tail != 0 {
         ptr::copy(
@@ -1447,6 +1515,50 @@ fn collection_panic_with_frame(frame: *const DrStackFrameV2, code: &'static [u8]
 
 fn collection_bounds_panic(frame: *const DrStackFrameV2, index: usize, length: usize) -> ! {
     unsafe { dr_v2_panic_index_out_of_bounds(frame, b"P1310".as_ptr(), 5, index as i64, length) }
+}
+
+#[cfg(test)]
+/// Checks the index against the entries it claims to describe.
+///
+/// Backward-shift deletion is the part of this that is easy to get subtly
+/// wrong: a mis-closed probe chain leaves a live entry unreachable while every
+/// other entry still answers correctly, so a black box comparison can pass for
+/// a long time before the one unlucky key is queried. This asserts the
+/// structure instead of the symptom.
+unsafe fn index_is_consistent(collection: *mut DrCollectionV1, kind: u8, keyed: bool) -> bool {
+    if (*collection).index.is_null() {
+        return true;
+    }
+    let table = (*collection).index;
+    let slots = (*collection).index_slots;
+    let mut occupied = 0usize;
+    for slot in 0..slots {
+        let stored = *table.add(slot);
+        if stored == INDEX_EMPTY {
+            continue;
+        }
+        occupied += 1;
+        // No stale position may survive a removal.
+        if stored >= (*collection).length {
+            return false;
+        }
+    }
+    if occupied != (*collection).length {
+        return false;
+    }
+    // Every live entry must still be reachable through its probe chain.
+    for position in 0..(*collection).length {
+        let word = indexed_word(collection, position, keyed);
+        match index_position(collection, word, kind, keyed) {
+            Some(found) => {
+                if !keys_equal(indexed_word(collection, found, keyed), word, kind) {
+                    return false;
+                }
+            }
+            None => return false,
+        }
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1542,6 +1654,10 @@ mod tests {
                         }
                     }
                 }
+                assert!(
+                    index_is_consistent(collection, COMPARE_UNSIGNED_64, true),
+                    "step {step}: the index no longer describes the entries"
+                );
                 assert_eq!((*collection).length, expected.len(), "step {step}: length");
                 for (position, (key, value)) in expected.iter().enumerate() {
                     assert_eq!(
@@ -1596,6 +1712,10 @@ mod tests {
                         }
                     }
                 }
+                assert!(
+                    index_is_consistent(collection, COMPARE_UNSIGNED_64, false),
+                    "step {step}: the index no longer describes the entries"
+                );
                 assert_eq!((*collection).length, expected.len(), "step {step}: length");
                 for (position, value) in expected.iter().enumerate() {
                     assert_eq!(
