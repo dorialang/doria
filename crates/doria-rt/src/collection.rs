@@ -42,6 +42,19 @@ pub struct DrCollectionV1 {
     finalized: u8,
     value_nullable: u8,
     head: usize,
+    // Membership acceleration. Purely an optimization: every read that consults
+    // it falls back to the linear scan when it is absent, so nothing depends on
+    // it for correctness. Built on first membership query rather than on
+    // construction, so a List that never asks about membership never pays for
+    // one. `index_slots` is a power of two holding entry positions, with
+    // INDEX_EMPTY marking a free slot.
+    index: *mut usize,
+    index_slots: usize,
+    /// The comparison kind the index was hashed with; a query using a different
+    /// kind discards it rather than trusting it.
+    index_kind: u8,
+    /// 1 when the index maps keys, 0 when it maps values.
+    index_keyed: u8,
 }
 
 pub const DR_COLLECTION_LENGTH_OFFSET: usize = mem::offset_of!(DrCollectionV1, length);
@@ -266,6 +279,10 @@ unsafe fn new_with_frame(
             finalized: 1,
             value_nullable: 0,
             head: 0,
+            index: ptr::null_mut(),
+            index_slots: 0,
+            index_kind: 0,
+            index_keyed: 0,
         },
     );
     collection
@@ -337,6 +354,9 @@ pub unsafe fn free(collection: *mut DrCollectionV1) {
     if !(*collection).values.is_null() {
         deallocate((*collection).values.cast::<u8>());
     }
+    if !(*collection).index.is_null() {
+        deallocate((*collection).index.cast::<u8>());
+    }
     deallocate(collection.cast::<u8>());
 }
 
@@ -350,6 +370,11 @@ pub unsafe fn push(collection: *mut DrCollectionV1, value: u64) {
     }
     write_value(collection, (*collection).length, value);
     (*collection).length += 1;
+    // Appending leaves every existing position where it was, so the index only
+    // needs the new entry. This is what keeps building a set linear: push_unique
+    // asks contains first, and that query is answered from the index instead of
+    // scanning everything added so far.
+    index_note_append(collection, (*collection).length - 1);
     restore_priority_queue_order(collection);
 }
 
@@ -359,6 +384,7 @@ pub unsafe fn push_nullable(collection: *mut DrCollectionV1, present: bool, valu
     }
     write_nullable_value(collection, (*collection).length, present, value);
     (*collection).length += 1;
+    index_note_append(collection, (*collection).length - 1);
     restore_priority_queue_order(collection);
 }
 
@@ -387,6 +413,7 @@ pub unsafe fn insert_at(
     index: usize,
     value: u64,
 ) {
+    index_discard(collection);
     if index > (*collection).length {
         collection_bounds_panic(frame, index, (*collection).length);
     }
@@ -412,6 +439,7 @@ pub unsafe fn insert_at_nullable(
     present: bool,
     value: u64,
 ) {
+    index_discard(collection);
     if index > (*collection).length {
         collection_bounds_panic(frame, index, (*collection).length);
     }
@@ -435,6 +463,7 @@ pub unsafe fn remove_at(
     collection: *mut DrCollectionV1,
     index: usize,
 ) -> u64 {
+    index_discard(collection);
     if index >= (*collection).length {
         collection_bounds_panic(frame, index, (*collection).length);
     }
@@ -452,6 +481,7 @@ pub unsafe fn remove_at(
 }
 
 pub unsafe fn pop(collection: *mut DrCollectionV1, found: *mut u8) -> u64 {
+    index_discard(collection);
     if (*collection).length == 0 {
         *found = 0;
         return 0;
@@ -603,6 +633,7 @@ unsafe fn deduplicate_sorted_set(collection: *mut DrCollectionV1) {
 }
 
 pub unsafe fn finalize_stage26(collection: *mut DrCollectionV1) {
+    index_discard(collection);
     match (*collection).kind {
         KIND_SORTED_DICTIONARY => sort_ordered(collection, true),
         KIND_SORTED_SET => {
@@ -668,10 +699,12 @@ unsafe fn push_stored_value(collection: *mut DrCollectionV1, present: bool, valu
 }
 
 pub unsafe fn push_front(collection: *mut DrCollectionV1, value: u64) {
+    index_discard(collection);
     push_front_value(collection, true, value, false);
 }
 
 pub unsafe fn push_front_nullable(collection: *mut DrCollectionV1, present: bool, value: u64) {
+    index_discard(collection);
     push_front_value(collection, present, value, true);
 }
 
@@ -701,6 +734,7 @@ unsafe fn push_front_value(
 }
 
 pub unsafe fn pop_front(collection: *mut DrCollectionV1, found: *mut u8) -> u64 {
+    index_discard(collection);
     if (*collection).kind != KIND_DEQUE {
         collection_panic(b"P1001");
     }
@@ -746,6 +780,7 @@ pub unsafe fn set_at(
     index: usize,
     value: u64,
 ) -> u64 {
+    index_discard(collection);
     if index >= (*collection).length {
         collection_bounds_panic(frame, index, (*collection).length);
     }
@@ -762,6 +797,7 @@ pub unsafe fn set_at_nullable(
     value: u64,
     previous_present: *mut u8,
 ) -> u64 {
+    index_discard(collection);
     if index >= (*collection).length {
         collection_bounds_panic(frame, index, (*collection).length);
     }
@@ -769,6 +805,212 @@ pub unsafe fn set_at_nullable(
     let previous = read_value(collection, index);
     write_nullable_value(collection, index, present, value);
     previous
+}
+
+const INDEX_EMPTY: usize = usize::MAX;
+const INDEX_MIN_SLOTS: usize = 16;
+
+/// Hashes a key or value word the same way `keys_equal` compares one.
+///
+/// The two must agree exactly: any pair `keys_equal` calls equal has to hash
+/// alike, or equal entries land in different buckets and a lookup misses one
+/// that is present. Three cases need care.
+///
+/// `COMPARE_FLOAT32` compares only the low 32 bits, so the high half must not
+/// reach the hash. Both float kinds compare by value, where `-0.0 == 0.0` while
+/// the bit patterns differ, so negative zero is normalized first. NaN is never
+/// equal to itself under either comparison, so it is hashed by bits and simply
+/// never matches, which is what the linear scan already did.
+unsafe fn hash_word(word: u64, kind: u8) -> usize {
+    let bits = match kind {
+        COMPARE_STRING => return hash_string(word as *const DrStringV1),
+        COMPARE_FLOAT32 => {
+            let value = f32::from_bits(word as u32);
+            u64::from(if value == 0.0 { 0.0f32 } else { value }.to_bits())
+        }
+        COMPARE_FLOAT64 => {
+            let value = f64::from_bits(word);
+            if value == 0.0 { 0.0f64 } else { value }.to_bits()
+        }
+        // Every other kind compares as a plain word, so the word is the hash
+        // input. Note this differs from `compare_words`, which truncates by
+        // width for ordering; equality does not truncate, and this follows
+        // equality.
+        _ => word,
+    };
+    mix_bits(bits)
+}
+
+/// `string_equal` treats two null pointers as equal, so they must hash alike.
+unsafe fn hash_string(string: *const DrStringV1) -> usize {
+    if string.is_null() {
+        return mix_bits(0);
+    }
+    let length = (*string).byte_length;
+    let bytes = core::slice::from_raw_parts(crate::string_bytes(string), length);
+    let mut hash = 1469598103934665603u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    mix_bits(hash)
+}
+
+fn mix_bits(mut value: u64) -> usize {
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xff51afd7ed558ccd);
+    value ^= value >> 33;
+    value = value.wrapping_mul(0xc4ceb9fe1a85ec53);
+    value ^= value >> 33;
+    value as usize
+}
+
+/// The word an index entry compares against: the key for a dictionary, the
+/// value for a set.
+unsafe fn indexed_word(collection: *const DrCollectionV1, position: usize, keyed: bool) -> u64 {
+    if keyed {
+        *(*collection).keys.add(position)
+    } else {
+        read_value(collection, position)
+    }
+}
+
+/// Discards the index. Called by every mutation that is not a plain append, so
+/// correctness never depends on enumerating those mutations correctly: the
+/// worst outcome of forgetting one would be a rebuild, and the worst outcome of
+/// an unnecessary call is a rebuild too.
+unsafe fn index_discard(collection: *mut DrCollectionV1) {
+    if !(*collection).index.is_null() {
+        deallocate((*collection).index.cast::<u8>());
+        (*collection).index = ptr::null_mut();
+    }
+    (*collection).index_slots = 0;
+}
+
+unsafe fn index_slot_count(entries: usize) -> usize {
+    let mut slots = INDEX_MIN_SLOTS;
+    // Keep the load factor at or below three quarters.
+    while slots * 3 < (entries + 1) * 4 {
+        let Some(next) = slots.checked_mul(2) else {
+            return slots;
+        };
+        slots = next;
+    }
+    slots
+}
+
+/// Places `position` in the table. The caller guarantees the word is not
+/// already present, which every caller can: appends are only indexed after a
+/// membership check, and a rebuild walks distinct entries.
+unsafe fn index_place(
+    table: *mut usize,
+    slots: usize,
+    collection: *const DrCollectionV1,
+    position: usize,
+    kind: u8,
+    keyed: bool,
+) {
+    let word = indexed_word(collection, position, keyed);
+    let mut slot = hash_word(word, kind) & (slots - 1);
+    while *table.add(slot) != INDEX_EMPTY {
+        slot = (slot + 1) & (slots - 1);
+    }
+    *table.add(slot) = position;
+}
+
+/// Builds the index over the current entries, or leaves the collection without
+/// one if it cannot. Returns whether an index is now available.
+unsafe fn index_build(collection: *mut DrCollectionV1, kind: u8, keyed: bool) -> bool {
+    index_discard(collection);
+    let slots = index_slot_count((*collection).length);
+    let table = allocate(slots * mem::size_of::<usize>()).cast::<usize>();
+    if table.is_null() {
+        // Out of memory for an optimization is not a failure: the caller scans.
+        return false;
+    }
+    for slot in 0..slots {
+        *table.add(slot) = INDEX_EMPTY;
+    }
+    for position in 0..(*collection).length {
+        index_place(table, slots, collection, position, kind, keyed);
+    }
+    (*collection).index = table;
+    (*collection).index_slots = slots;
+    (*collection).index_kind = kind;
+    (*collection).index_keyed = u8::from(keyed);
+    true
+}
+
+/// Whether this collection is eligible for an index at all.
+///
+/// Ordered collections binary search, which is already logarithmic and depends
+/// on a sort order an index would not maintain. A deque renumbers positions
+/// through `head`, so a position table would not survive its rotations.
+unsafe fn index_eligible(collection: *const DrCollectionV1) -> bool {
+    (*collection).kind == KIND_LEGACY
+}
+
+/// Returns the index, building it on first use, or None to scan instead.
+unsafe fn index_ready(collection: *mut DrCollectionV1, kind: u8, keyed: bool) -> bool {
+    if !index_eligible(collection) {
+        return false;
+    }
+    if !(*collection).index.is_null()
+        && (*collection).index_kind == kind
+        && (*collection).index_keyed == u8::from(keyed)
+    {
+        return true;
+    }
+    index_build(collection, kind, keyed)
+}
+
+/// Finds the position holding `word`, using the index.
+unsafe fn index_position(
+    collection: *const DrCollectionV1,
+    word: u64,
+    kind: u8,
+    keyed: bool,
+) -> Option<usize> {
+    let slots = (*collection).index_slots;
+    let table = (*collection).index;
+    let mut slot = hash_word(word, kind) & (slots - 1);
+    loop {
+        let position = *table.add(slot);
+        if position == INDEX_EMPTY {
+            return None;
+        }
+        if position < (*collection).length
+            && keys_equal(indexed_word(collection, position, keyed), word, kind)
+        {
+            return Some(position);
+        }
+        slot = (slot + 1) & (slots - 1);
+    }
+}
+
+/// Records an appended entry, keeping the index usable across a build loop so
+/// constructing a set or dictionary of K entries stays linear rather than
+/// quadratic. Discards the index instead of growing past its load factor.
+unsafe fn index_note_append(collection: *mut DrCollectionV1, position: usize) {
+    if (*collection).index.is_null() {
+        return;
+    }
+    if (*collection).index_slots * 3 < ((*collection).length + 1) * 4 {
+        let kind = (*collection).index_kind;
+        let keyed = (*collection).index_keyed != 0;
+        index_build(collection, kind, keyed);
+        return;
+    }
+    let kind = (*collection).index_kind;
+    let keyed = (*collection).index_keyed != 0;
+    index_place(
+        (*collection).index,
+        (*collection).index_slots,
+        collection,
+        position,
+        kind,
+        keyed,
+    );
 }
 
 unsafe fn keys_equal(left: u64, right: u64, key_kind: u8) -> bool {
@@ -831,6 +1073,14 @@ unsafe fn ordered_position(
 unsafe fn find(collection: *const DrCollectionV1, key: u64, key_kind: u8) -> Option<usize> {
     if (*collection).kind == KIND_SORTED_DICTIONARY && (*collection).finalized != 0 {
         return ordered_position(collection, key, true).ok();
+    }
+    // The collection owns its index and this runtime is single threaded, so
+    // building one through a shared pointer mutates nothing another holder can
+    // observe. The index is an accelerator only: when it cannot be built the
+    // scan below still answers the question.
+    let mutable = collection as *mut DrCollectionV1;
+    if index_ready(mutable, key_kind, true) {
+        return index_position(collection, key, key_kind, true);
     }
     (0..(*collection).length)
         .find(|index| keys_equal(*(*collection).keys.add(*index), key, key_kind))
@@ -941,6 +1191,12 @@ unsafe fn insert_keyed_value(
         write_value(collection, index, value);
     }
     (*collection).length += 1;
+    if index == (*collection).length - 1 {
+        index_note_append(collection, index);
+    } else {
+        // A mid-array insert renumbers everything after it.
+        index_discard(collection);
+    }
     0
 }
 
@@ -977,6 +1233,9 @@ pub unsafe fn keyed_remove(
         );
     }
     (*collection).length -= 1;
+    // After the shift, not before it. Discarding on entry would only force the
+    // `find` above to rebuild an index that this shift then invalidates.
+    index_discard(collection);
     removed_value
 }
 
@@ -988,6 +1247,11 @@ pub unsafe fn nullable_access(
     found: *mut u8,
     removed_key: *mut u64,
 ) -> u64 {
+    // No discard here: most accesses only read, and case 0 is the nullable
+    // dictionary read. Discarding on entry would rebuild the index on every
+    // `get`, which is the operation this index exists to make constant time.
+    // The mutating cases delegate to `keyed_remove` and `nullable_pop`, which
+    // invalidate for themselves.
     *removed_key = 0;
     match access {
         0 => {
@@ -1062,6 +1326,11 @@ pub unsafe fn contains(collection: *const DrCollectionV1, value: u64, value_kind
     if (*collection).kind == KIND_SORTED_SET && (*collection).finalized != 0 {
         return ordered_position(collection, value, false).is_ok();
     }
+    // See `find` for why building through a shared pointer is sound here.
+    let mutable = collection as *mut DrCollectionV1;
+    if index_ready(mutable, value_kind, false) {
+        return index_position(collection, value, value_kind, false).is_some();
+    }
     (0..(*collection).length)
         .any(|index| keys_equal(read_value(collection, index), value, value_kind))
 }
@@ -1098,6 +1367,7 @@ pub unsafe fn remove_value(
     value_kind: u8,
     removed: *mut u64,
 ) -> bool {
+    index_discard(collection);
     let Some(index) = (0..(*collection).length)
         .find(|index| keys_equal(read_value(collection, *index), value, value_kind))
     else {
@@ -1198,6 +1468,212 @@ mod tests {
 
         fn signed(&mut self) -> i64 {
             (self.next() % 97) as i64 - 48
+        }
+    }
+
+    /// Random op sequences against a reference model that preserves insertion
+    /// order, checking results *and* positional order after every step.
+    ///
+    /// The membership index is maintained incrementally on append and discarded
+    /// on every other mutation. Whether every such mutation actually discards it
+    /// is the one thing that cannot be established by reading the code with
+    /// confidence, so it is established here instead: a missed discard leaves a
+    /// stale position behind and this diverges from the model.
+    #[test]
+    fn unordered_dictionary_matches_insertion_ordered_reference_model() {
+        unsafe {
+            let collection = new(0, true, false, 8);
+            let mut expected: Vec<(u64, u64)> = Vec::new();
+            let mut random = Generator(0x0d10_7a17);
+            for step in 0..2048u64 {
+                let key = random.next() % 64;
+                match random.next() % 5 {
+                    0 | 1 => {
+                        let value = step + 1000;
+                        let mut replaced = 0u8;
+                        let previous =
+                            keyed_set(collection, key, value, COMPARE_UNSIGNED_64, &mut replaced);
+                        match expected.iter().position(|(existing, _)| *existing == key) {
+                            Some(position) => {
+                                assert_eq!(replaced, 1, "step {step}: expected a replacement");
+                                assert_eq!(previous, expected[position].1, "step {step}");
+                                expected[position].1 = value;
+                            }
+                            None => {
+                                assert_eq!(replaced, 0, "step {step}: expected an insertion");
+                                expected.push((key, value));
+                            }
+                        }
+                    }
+                    2 => {
+                        let mut found = 0u8;
+                        let got = keyed_get(collection, key, COMPARE_UNSIGNED_64, &mut found);
+                        match expected.iter().find(|(existing, _)| *existing == key) {
+                            Some((_, value)) => {
+                                assert_eq!(found, 1, "step {step}: {key} should be present");
+                                assert_eq!(got, *value, "step {step}");
+                            }
+                            None => assert_eq!(found, 0, "step {step}: {key} should be absent"),
+                        }
+                    }
+                    3 => {
+                        assert_eq!(
+                            keyed_has(collection, key, COMPARE_UNSIGNED_64),
+                            expected.iter().any(|(existing, _)| *existing == key),
+                            "step {step}: membership disagreed for {key}"
+                        );
+                    }
+                    _ => {
+                        let mut found = 0u8;
+                        let mut removed_key = 0u64;
+                        keyed_remove(
+                            collection,
+                            key,
+                            COMPARE_UNSIGNED_64,
+                            &mut found,
+                            &mut removed_key,
+                        );
+                        match expected.iter().position(|(existing, _)| *existing == key) {
+                            Some(position) => {
+                                assert_eq!(found, 1, "step {step}");
+                                expected.remove(position);
+                            }
+                            None => assert_eq!(found, 0, "step {step}"),
+                        }
+                    }
+                }
+                assert_eq!((*collection).length, expected.len(), "step {step}: length");
+                for (position, (key, value)) in expected.iter().enumerate() {
+                    assert_eq!(
+                        *(*collection).keys.add(position),
+                        *key,
+                        "step {step}: key order at {position}"
+                    );
+                    assert_eq!(
+                        read_value(collection, position),
+                        *value,
+                        "step {step}: value order at {position}"
+                    );
+                }
+            }
+            free(collection);
+        }
+    }
+
+    #[test]
+    fn unordered_set_matches_insertion_ordered_reference_model() {
+        unsafe {
+            let collection = new(0, false, false, 8);
+            let mut expected: Vec<u64> = Vec::new();
+            let mut random = Generator(0x5e7_0bad);
+            for step in 0..2048u64 {
+                let value = random.next() % 64;
+                match random.next() % 4 {
+                    0 | 1 => {
+                        let added = push_unique(collection, value, COMPARE_UNSIGNED_64);
+                        if expected.contains(&value) {
+                            assert!(!added, "step {step}: {value} was already a member");
+                        } else {
+                            assert!(added, "step {step}: {value} should have been added");
+                            expected.push(value);
+                        }
+                    }
+                    2 => assert_eq!(
+                        contains(collection, value, COMPARE_UNSIGNED_64),
+                        expected.contains(&value),
+                        "step {step}: membership disagreed for {value}"
+                    ),
+                    _ => {
+                        let mut removed = 0u64;
+                        let did =
+                            remove_value(collection, value, COMPARE_UNSIGNED_64, &mut removed);
+                        match expected.iter().position(|existing| *existing == value) {
+                            Some(position) => {
+                                assert!(did, "step {step}");
+                                expected.remove(position);
+                            }
+                            None => assert!(!did, "step {step}"),
+                        }
+                    }
+                }
+                assert_eq!((*collection).length, expected.len(), "step {step}: length");
+                for (position, value) in expected.iter().enumerate() {
+                    assert_eq!(
+                        read_value(collection, position),
+                        *value,
+                        "step {step}: order at {position}"
+                    );
+                }
+            }
+            free(collection);
+        }
+    }
+
+    /// Hashing has to agree with `keys_equal` exactly, and float equality is
+    /// where the two most easily part company.
+    #[test]
+    fn float_keys_hash_the_way_they_compare() {
+        unsafe {
+            // -0.0 and 0.0 compare equal but have different bit patterns, so a
+            // hash over raw bits would file them separately and admit a duplicate.
+            let collection = new(0, true, false, 8);
+            let mut replaced = 0u8;
+            keyed_set(
+                collection,
+                0.0f64.to_bits(),
+                10,
+                COMPARE_FLOAT64,
+                &mut replaced,
+            );
+            keyed_set(
+                collection,
+                (-0.0f64).to_bits(),
+                20,
+                COMPARE_FLOAT64,
+                &mut replaced,
+            );
+            assert_eq!(
+                replaced, 1,
+                "negative zero should have replaced positive zero"
+            );
+            assert_eq!((*collection).length, 1, "the two zeroes are one key");
+            let mut found = 0u8;
+            assert_eq!(
+                keyed_get(collection, 0.0f64.to_bits(), COMPARE_FLOAT64, &mut found),
+                20
+            );
+            assert_eq!(found, 1);
+            free(collection);
+
+            // float32 compares only the low half, so two words that differ above
+            // it are the same key and must hash alike.
+            let collection = new(0, true, false, 8);
+            let low = u64::from(1.5f32.to_bits());
+            let mut replaced = 0u8;
+            keyed_set(collection, low, 1, COMPARE_FLOAT32, &mut replaced);
+            keyed_set(
+                collection,
+                low | (0xdead_beef << 32),
+                2,
+                COMPARE_FLOAT32,
+                &mut replaced,
+            );
+            assert_eq!(replaced, 1, "the high half must not reach the hash");
+            assert_eq!((*collection).length, 1);
+            free(collection);
+
+            // NaN is equal to nothing, including itself, so it is never found.
+            // The scan behaved this way already; the index must not differ.
+            let collection = new(0, true, false, 8);
+            let mut replaced = 0u8;
+            let nan = f64::NAN.to_bits();
+            keyed_set(collection, nan, 1, COMPARE_FLOAT64, &mut replaced);
+            keyed_set(collection, nan, 2, COMPARE_FLOAT64, &mut replaced);
+            assert_eq!((*collection).length, 2, "each NaN insert is a new entry");
+            let mut found = 0u8;
+            keyed_get(collection, nan, COMPARE_FLOAT64, &mut found);
+            assert_eq!(found, 0, "NaN is never found");
+            free(collection);
         }
     }
 

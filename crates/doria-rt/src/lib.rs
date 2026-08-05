@@ -3137,7 +3137,7 @@ fn unsigned_decimal(mut value: u64, buffer: &mut [u8; 20]) -> (usize, usize) {
     (cursor, buffer.len() - cursor)
 }
 
-unsafe fn string_bytes(string: *const DrStringV1) -> *const u8 {
+pub(crate) unsafe fn string_bytes(string: *const DrStringV1) -> *const u8 {
     string.cast::<u8>().add(STRING_HEADER_SIZE)
 }
 
