@@ -8957,6 +8957,9 @@ fn validate_condition(
                 (
                     mir::CollectionMembershipOp::Contains,
                     mir::CollectionKind::List
+                    | mir::CollectionKind::TypedArray
+                    | mir::CollectionKind::PriorityQueue
+                    | mir::CollectionKind::Deque
                     | mir::CollectionKind::Dictionary
                     | mir::CollectionKind::SortedDictionary
                     | mir::CollectionKind::Set

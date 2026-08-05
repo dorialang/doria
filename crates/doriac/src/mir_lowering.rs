@@ -7447,9 +7447,12 @@ fn lower_condition(
                 let info = context.collection_type(collection_type).clone();
                 let op = match (info.kind, method.as_str()) {
                     (mir::CollectionKind::List, "contains")
+                    | (mir::CollectionKind::TypedArray, "contains")
+                    | (mir::CollectionKind::PriorityQueue, "contains")
+                    | (mir::CollectionKind::Deque, "contains")
                     | (
                         mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary,
-                        "has",
+                        "containsKey",
                     )
                     | (mir::CollectionKind::Set | mir::CollectionKind::SortedSet, "contains") => {
                         Some(mir::CollectionMembershipOp::Contains)
@@ -9689,11 +9692,14 @@ impl NullableCollectionScalarOperation<'_> {
                     && matches!(
                         definition.kind,
                         mir::CollectionKind::List
+                            | mir::CollectionKind::TypedArray
+                            | mir::CollectionKind::PriorityQueue
+                            | mir::CollectionKind::Deque
                             | mir::CollectionKind::Set
                             | mir::CollectionKind::SortedSet
                     )
             }
-            Self::Method("has", [_]) => {
+            Self::Method("containsKey", [_]) => {
                 expected == mir::ScalarType::Bool
                     && matches!(
                         definition.kind,
@@ -9810,7 +9816,7 @@ impl NullableCollectionScalarOperation<'_> {
             }
             Self::Method(method, [argument]) => {
                 let op = match *method {
-                    "contains" | "has" => mir::CollectionMembershipOp::Contains,
+                    "contains" | "containsKey" => mir::CollectionMembershipOp::Contains,
                     "add" => mir::CollectionMembershipOp::Add,
                     "remove" => mir::CollectionMembershipOp::Remove,
                     _ => unreachable!("operation was checked before lowering"),

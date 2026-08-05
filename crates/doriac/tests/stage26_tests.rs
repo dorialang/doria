@@ -37,7 +37,7 @@ function main(): void
     $map[1] = "ONE";
     $map->set(3, "three");
     let $removed = $map->remove(2) ?? "none";
-    echo "{$map[-1]} {$map->has(2)} {$removed}\n";
+    echo "{$map[-1]} {$map->containsKey(2)} {$removed}\n";
 
     writable SortedSet<int> $left = SortedSet::from([3, -1, 1, 3]);
     SortedSet<int> $right = SortedSet::from([1, 2, 3]);

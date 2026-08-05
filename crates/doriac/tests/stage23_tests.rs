@@ -576,7 +576,8 @@ function main(): void
 "#,
         "E0521",
     );
-    assert!(family.message.contains("Decision 0100"));
+    // 0113 amends 0100 and is now the record the surface gate names.
+    assert!(family.message.contains("Decision 0113"));
 }
 
 #[test]

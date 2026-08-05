@@ -24,7 +24,7 @@ function main(): void
     ?int $bea = $scores->get("Bea");
     ?int $cal = $scores->remove("Cal");
     if ($bea != null && $cal != null) {
-        echo "dictionary {$bea} {$cal} {$scores["Ada"]} {$scores->has("Cal")} {$scores->count} {$scores->isEmpty}\n";
+        echo "dictionary {$bea} {$cal} {$scores["Ada"]} {$scores->containsKey("Cal")} {$scores->count} {$scores->isEmpty}\n";
     }
     foreach ($scores->keys as string $name) {
         echo "key {$name}\n";
