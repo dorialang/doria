@@ -46,9 +46,14 @@ pub struct DrCollectionV1 {
     // it falls back to the linear scan when it is absent, so nothing depends on
     // it for correctness. Built on first membership query rather than on
     // construction, so a List that never asks about membership never pays for
-    // one. `index_slots` is a power of two holding entry positions, with
-    // INDEX_EMPTY marking a free slot.
-    index: *mut usize,
+    // one.
+    //
+    // `index_slots` is a power of two. Each slot is two words, the indexed word
+    // followed by its entry position, with INDEX_EMPTY in the position marking a
+    // free slot. Carrying the word in the table is what keeps probing cheap:
+    // comparing it needs neither a second cache line in the values array nor the
+    // width and kind dispatch that reading an entry back would go through.
+    index: *mut u64,
     index_slots: usize,
     /// The comparison kind the index was hashed with; a query using a different
     /// kind discards it rather than trusting it.
@@ -856,13 +861,25 @@ unsafe fn hash_string(string: *const DrStringV1) -> usize {
     mix_bits(hash)
 }
 
+/// One multiply, which is the same finalizer the C peer uses. The full
+/// two-multiply murmur mix scatters marginally better but the second multiply
+/// sits on the critical path of every lookup, and the probe lengths measured
+/// with this one do not justify it.
 fn mix_bits(mut value: u64) -> usize {
     value ^= value >> 33;
     value = value.wrapping_mul(0xff51afd7ed558ccd);
     value ^= value >> 33;
-    value = value.wrapping_mul(0xc4ceb9fe1a85ec53);
-    value ^= value >> 33;
     value as usize
+}
+
+/// True when equality for this kind is plain word equality, so a probe can
+/// compare the stored word directly instead of calling `keys_equal`.
+///
+/// Strings compare by content rather than by pointer, and the float kinds
+/// compare by value, where -0.0 and 0.0 are equal with different bit patterns
+/// and NaN is equal to nothing at all.
+fn word_equality_is_exact(kind: u8) -> bool {
+    !matches!(kind, COMPARE_STRING | COMPARE_FLOAT32 | COMPARE_FLOAT64)
 }
 
 /// The word an index entry compares against: the key for a dictionary, the
@@ -887,6 +904,23 @@ unsafe fn index_discard(collection: *mut DrCollectionV1) {
     (*collection).index_slots = 0;
 }
 
+/// The position stored in `slot`, or INDEX_EMPTY.
+#[inline(always)]
+unsafe fn index_slot_position(table: *const u64, slot: usize) -> usize {
+    *table.add(slot * 2 + 1) as usize
+}
+
+#[inline(always)]
+unsafe fn index_slot_word(table: *const u64, slot: usize) -> u64 {
+    *table.add(slot * 2)
+}
+
+#[inline(always)]
+unsafe fn index_write_slot(table: *mut u64, slot: usize, word: u64, position: usize) {
+    *table.add(slot * 2) = word;
+    *table.add(slot * 2 + 1) = position as u64;
+}
+
 unsafe fn index_slot_count(entries: usize) -> usize {
     let mut slots = INDEX_MIN_SLOTS;
     // Keep the load factor at or below three quarters.
@@ -903,7 +937,7 @@ unsafe fn index_slot_count(entries: usize) -> usize {
 /// already present, which every caller can: appends are only indexed after a
 /// membership check, and a rebuild walks distinct entries.
 unsafe fn index_place(
-    table: *mut usize,
+    table: *mut u64,
     slots: usize,
     collection: *const DrCollectionV1,
     position: usize,
@@ -912,10 +946,10 @@ unsafe fn index_place(
 ) {
     let word = indexed_word(collection, position, keyed);
     let mut slot = hash_word(word, kind) & (slots - 1);
-    while *table.add(slot) != INDEX_EMPTY {
+    while index_slot_position(table, slot) != INDEX_EMPTY {
         slot = (slot + 1) & (slots - 1);
     }
-    *table.add(slot) = position;
+    index_write_slot(table, slot, word, position);
 }
 
 /// Builds the index over the current entries, or leaves the collection without
@@ -923,13 +957,16 @@ unsafe fn index_place(
 unsafe fn index_build(collection: *mut DrCollectionV1, kind: u8, keyed: bool) -> bool {
     index_discard(collection);
     let slots = index_slot_count((*collection).length);
-    let table = allocate(slots * mem::size_of::<usize>()).cast::<usize>();
+    let Some(bytes) = slots.checked_mul(2 * mem::size_of::<u64>()) else {
+        return false;
+    };
+    let table = allocate(bytes).cast::<u64>();
     if table.is_null() {
         // Out of memory for an optimization is not a failure: the caller scans.
         return false;
     }
     for slot in 0..slots {
-        *table.add(slot) = INDEX_EMPTY;
+        *table.add(slot * 2 + 1) = INDEX_EMPTY as u64;
     }
     for position in 0..(*collection).length {
         index_place(table, slots, collection, position, kind, keyed);
@@ -969,22 +1006,34 @@ unsafe fn index_position(
     collection: *const DrCollectionV1,
     word: u64,
     kind: u8,
-    keyed: bool,
+    _keyed: bool,
 ) -> Option<usize> {
     let slots = (*collection).index_slots;
-    let table = (*collection).index;
-    let mut slot = hash_word(word, kind) & (slots - 1);
+    let table: *const u64 = (*collection).index;
+    let mask = slots - 1;
+    // Hoisted: the kind cannot change while probing, so the choice between an
+    // exact word compare and a call into `keys_equal` is made once.
+    let exact = word_equality_is_exact(kind);
+    let mut slot = hash_word(word, kind) & mask;
     loop {
-        let position = *table.add(slot);
+        let position = index_slot_position(table, slot);
         if position == INDEX_EMPTY {
             return None;
         }
-        if position < (*collection).length
-            && keys_equal(indexed_word(collection, position, keyed), word, kind)
-        {
+        let stored = index_slot_word(table, slot);
+        // No bit-equality fast path for the inexact kinds: NaN has identical
+        // bits and must still compare unequal, so a shortcut here would make a
+        // NaN key find itself. `string_equal` already checks pointer identity
+        // first, so nothing is lost by going through `keys_equal`.
+        let matched = if exact {
+            stored == word
+        } else {
+            keys_equal(stored, word, kind)
+        };
+        if matched {
             return Some(position);
         }
-        slot = (slot + 1) & (slots - 1);
+        slot = (slot + 1) & mask;
     }
 }
 
@@ -1010,7 +1059,7 @@ unsafe fn index_note_removal(collection: *mut DrCollectionV1, position: usize) {
     let word = indexed_word(collection, position, keyed);
     let mut hole = hash_word(word, kind) & mask;
     loop {
-        let stored = *table.add(hole);
+        let stored = index_slot_position(table, hole);
         if stored == INDEX_EMPTY {
             // Not indexed, which a List holding duplicates can produce. Nothing
             // reliable to patch, so fall back rather than corrupt the table.
@@ -1028,17 +1077,19 @@ unsafe fn index_note_removal(collection: *mut DrCollectionV1, position: usize) {
     // moves back into the hole when its ideal slot does not lie within the
     // stretch being closed, which keeps every probe chain intact and leaves no
     // tombstones behind.
-    *table.add(hole) = INDEX_EMPTY;
+    *table.add(hole * 2 + 1) = INDEX_EMPTY as u64;
     let mut scan = (hole + 1) & mask;
     loop {
-        let stored = *table.add(scan);
+        let stored = index_slot_position(table, scan);
         if stored == INDEX_EMPTY {
             break;
         }
-        let ideal = hash_word(indexed_word(collection, stored, keyed), kind) & mask;
+        // The word travels with its position, so the ideal slot comes straight
+        // from the table rather than from the entries.
+        let ideal = hash_word(index_slot_word(table, scan), kind) & mask;
         if ((scan.wrapping_sub(ideal)) & mask) >= ((scan.wrapping_sub(hole)) & mask) {
-            *table.add(hole) = stored;
-            *table.add(scan) = INDEX_EMPTY;
+            index_write_slot(table, hole, index_slot_word(table, scan), stored);
+            *table.add(scan * 2 + 1) = INDEX_EMPTY as u64;
             hole = scan;
         }
         scan = (scan + 1) & mask;
@@ -1046,9 +1097,9 @@ unsafe fn index_note_removal(collection: *mut DrCollectionV1, position: usize) {
 
     // Everything after the removed entry shifts down one place.
     for slot in 0..slots {
-        let stored = *table.add(slot);
+        let stored = index_slot_position(table, slot);
         if stored != INDEX_EMPTY && stored > position {
-            *table.add(slot) = stored - 1;
+            *table.add(slot * 2 + 1) = (stored - 1) as u64;
         }
     }
 }
@@ -1529,15 +1580,23 @@ unsafe fn index_is_consistent(collection: *mut DrCollectionV1, kind: u8, keyed: 
     if (*collection).index.is_null() {
         return true;
     }
-    let table = (*collection).index;
+    let table: *const u64 = (*collection).index;
     let slots = (*collection).index_slots;
     let mut occupied = 0usize;
     for slot in 0..slots {
-        let stored = *table.add(slot);
+        let stored = index_slot_position(table, slot);
         if stored == INDEX_EMPTY {
             continue;
         }
         occupied += 1;
+        // The word carried in the slot must still describe the entry it points at.
+        if !keys_equal(
+            index_slot_word(table, slot),
+            indexed_word(collection, stored, keyed),
+            kind,
+        ) {
+            return false;
+        }
         // No stale position may survive a removal.
         if stored >= (*collection).length {
             return false;
