@@ -2237,10 +2237,15 @@ fn lower_collection_foreach_in_scope(
             | mir::Type::String
             | mir::Type::NullableScalar(_)
             | mir::Type::NullableString => {
+                // Write back to the slot being iterated, matching the
+                // positional read above. Resolving by key here would search for
+                // the element again, and for a values-only pass there is no key
+                // to search with: `key` is None, so the offset would arrive
+                // where the key type is expected.
                 context.push_statement(mir::Statement::AssignCollectionIndex {
-                    positional: false,
+                    positional: true,
                     collection,
-                    index: key.unwrap_or_else(|| offset.clone()),
+                    index: offset.clone(),
                     value: foreach_local_rvalue(value_local, definition.value)?,
                 });
             }

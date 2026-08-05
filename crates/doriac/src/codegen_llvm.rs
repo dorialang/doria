@@ -1299,13 +1299,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 key,
                 value,
-            }
-            | mir::Statement::AssignCollectionIndex {
-                positional: _,
+            } => self.lower_collection_set(*collection, key, value, false)?,
+            mir::Statement::AssignCollectionIndex {
+                positional,
                 collection,
                 index: key,
                 value,
-            } => self.lower_collection_set(*collection, key, value)?,
+            } => self.lower_collection_set(*collection, key, value, *positional)?,
             mir::Statement::DropCollection { local, collection } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let slot = local_slot(&self.local_slots, *local)?;
@@ -2835,6 +2835,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         collection: mir::LocalId,
         index: &mir::Rvalue,
         value: &mir::Rvalue,
+        positional: bool,
     ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
@@ -2849,7 +2850,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             let (present, value, actual_payload_ty) =
                 self.lower_nullable_collection_parts(value, definition.value)?;
             debug_assert_eq!(payload_ty, actual_payload_ty);
-            if let Some(key_type) = definition.key {
+            if let Some(key_type) = definition.key.filter(|_| !positional) {
                 self.lower_dictionary_set_nullable_value(
                     collection_value,
                     index,
@@ -2916,7 +2917,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
             return Ok(());
         }
-        if let Some(key_type) = definition.key {
+        if let Some(key_type) = definition.key.filter(|_| !positional) {
             self.lower_dictionary_set_value(
                 collection_value,
                 index,

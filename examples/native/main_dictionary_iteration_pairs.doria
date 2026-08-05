@@ -1,0 +1,100 @@
+// Dictionary iteration reads values by storage position instead of looking each
+// one up by key. Keys and values are parallel arrays, so every iteration form
+// must still pair key i with value i, in the collection's own order.
+
+function main(): void
+{
+    Dictionary<string, int> $scores = ["charlie" => 3, "alice" => 1, "bob" => 2];
+
+    foreach ($scores as string $name => int $score) {
+        echo "{$name}={$score} ";
+    }
+    echo "\n";
+
+    foreach ($scores->keys as string $name) {
+        echo "{$name} ";
+    }
+    echo "\n";
+
+    foreach ($scores->values as int $score) {
+        echo "{$score} ";
+    }
+    echo "\n";
+
+    // Insertion order survives a removal that shifts the tail of both arrays.
+    writable Dictionary<string, int> $mutable = ["a" => 1, "b" => 2, "c" => 3, "d" => 4];
+    let $removed = $mutable->remove("b") ?? 0;
+    $mutable->set("e", 5);
+    $mutable["a"] = 10;
+    echo "removed {$removed}\n";
+
+    foreach ($mutable as string $key => int $value) {
+        echo "{$key}={$value} ";
+    }
+    echo "\n";
+
+    foreach ($mutable as writable int $value) {
+        $value = $value * 2;
+    }
+
+    foreach ($mutable as string $key => int $value) {
+        echo "{$key}={$value} ";
+    }
+    echo "\n";
+
+    // Sorted keys reorder both arrays together during finalization.
+    SortedDictionary<int, string> $sorted =
+        SortedDictionary::from([30 => "thirty", 10 => "ten", 20 => "twenty"]);
+
+    foreach ($sorted as int $key => string $label) {
+        echo "{$key}:{$label} ";
+    }
+    echo "\n";
+
+    foreach ($sorted->keys as int $key) {
+        echo "{$key} ";
+    }
+    echo "\n";
+
+    foreach ($sorted->values as string $label) {
+        echo "{$label} ";
+    }
+    echo "\n";
+
+    // Nullable values occupy a wider slot carrying a presence flag, so a stored
+    // null must stay distinguishable from a missing key under positional reads.
+    Dictionary<string, ?int> $nullableSource = ["x" => 4, "y" => null, "z" => 0];
+    writable SortedDictionary<string, ?int> $nullable =
+        SortedDictionary::from($nullableSource);
+
+    foreach ($nullable as string $key => ?int $value) {
+        echo "{$key}:{$value ?? -1} ";
+    }
+    echo "\n";
+
+    foreach ($nullable->values as ?int $value) {
+        echo "{$value ?? -1} ";
+    }
+    echo "\n";
+
+    foreach ($nullable as writable ?int $value) {
+        $value = ($value ?? -1) + 1;
+    }
+
+    foreach ($nullable as string $key => ?int $value) {
+        echo "{$key}:{$value ?? -1} ";
+    }
+    echo "\n";
+
+    // A string value type is refcounted, so a positional read must retain the
+    // element exactly as a keyed read did.
+    writable Dictionary<int, string> $labels = [2 => "two", 1 => "one"];
+    foreach ($labels as writable string $label) {
+        $label = "{$label}!";
+    }
+
+    foreach ($labels as int $key => string $label) {
+        echo "{$key}:{$label} ";
+    }
+    echo "\n";
+}

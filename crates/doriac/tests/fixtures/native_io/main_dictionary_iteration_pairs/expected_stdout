@@ -1,0 +1,13 @@
+charlie=3 alice=1 bob=2 
+charlie alice bob 
+3 1 2 
+removed 2
+a=10 c=3 d=4 e=5 
+a=20 c=6 d=8 e=10 
+10:ten 20:twenty 30:thirty 
+10 20 30 
+ten twenty thirty 
+x:4 y:-1 z:0 
+4 -1 0 
+x:5 y:0 z:1 
+2:two! 1:one! 

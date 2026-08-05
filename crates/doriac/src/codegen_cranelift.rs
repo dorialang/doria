@@ -1836,14 +1836,16 @@ fn lower_statement(
             collection,
             key,
             value,
+        } => {
+            lower_collection_set(builder, *collection, key, value, false, resources)?;
         }
-        | mir::Statement::AssignCollectionIndex {
-            positional: _,
+        mir::Statement::AssignCollectionIndex {
+            positional,
             collection,
             index: key,
             value,
         } => {
-            lower_collection_set(builder, *collection, key, value, resources)?;
+            lower_collection_set(builder, *collection, key, value, *positional, resources)?;
         }
         mir::Statement::DropCollection { local, collection } => {
             let pointer = resources.module.target_config().pointer_type();
@@ -3295,6 +3297,7 @@ fn lower_collection_set(
     collection: mir::LocalId,
     index: &mir::Rvalue,
     value: &mir::Rvalue,
+    positional: bool,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     let pointer = resources.module.target_config().pointer_type();
@@ -3309,7 +3312,7 @@ fn lower_collection_set(
         let (present, value, actual_payload_ty) =
             lower_nullable_collection_parts(builder, value, definition.value, resources)?;
         debug_assert_eq!(payload_ty, actual_payload_ty);
-        if let Some(key_type) = definition.key {
+        if let Some(key_type) = definition.key.filter(|_| !positional) {
             lower_dictionary_set_nullable_value(
                 builder,
                 collection_value,
@@ -3367,7 +3370,7 @@ fn lower_collection_set(
         return Ok(());
     }
     let value_word = value_to_collection_word(builder, value, definition.value, pointer)?;
-    if let Some(key_type) = definition.key {
+    if let Some(key_type) = definition.key.filter(|_| !positional) {
         lower_dictionary_set_value(
             builder,
             collection_value,

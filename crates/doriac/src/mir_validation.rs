@@ -1279,7 +1279,7 @@ fn validate_statement(
             validate_rvalue(program, function, value)
         }
         mir::Statement::AssignCollectionIndex {
-            positional: _,
+            positional,
             collection,
             index,
             value,
@@ -1297,11 +1297,17 @@ fn validate_statement(
                     local.id.0
                 )));
             }
-            let index_type = definition
-                .key
-                .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
-                    IntegerType::Int64,
-                )));
+            // A positional assignment addresses a slot, so its index is an
+            // offset even when the collection is keyed.
+            let index_type = if *positional {
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
+            } else {
+                definition
+                    .key
+                    .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                        IntegerType::Int64,
+                    )))
+            };
             if index.ty() != index_type || value.ty() != definition.value {
                 return Err(malformed_mir("indexed assignment type mismatch"));
             }
