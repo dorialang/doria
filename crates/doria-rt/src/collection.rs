@@ -316,6 +316,59 @@ pub unsafe fn new_stage26(
     collection
 }
 
+/// Writes `value` into the first `count` slots of a collection's storage.
+///
+/// `write_value` re-reads `value_width` from the header for every element, and
+/// `value_address` re-reads `kind` and `capacity` on top of that, so filling
+/// through it turns a bulk write into a per-element dispatch. Nothing it
+/// dispatches on changes during a fill, so the width is switched on once here
+/// and each arm is a plain typed store: width 1 becomes `memset`, and the
+/// wider arms become store loops the optimizer can widen.
+///
+/// Only valid on storage that is laid out from the base of the values buffer,
+/// which means a collection `new_with_frame` just produced — it is `KIND_LEGACY`
+/// with `head` at zero, so no `Deque` rotation applies.
+unsafe fn fill_values(collection: *mut DrCollectionV1, value: u64, count: usize) {
+    debug_assert!((*collection).kind != KIND_DEQUE && (*collection).head == 0);
+    // A zero-length collection has no values buffer at all, and a null pointer
+    // is not a valid destination even for a zero-byte write.
+    if count == 0 {
+        return;
+    }
+    let base = (*collection).values;
+    match (*collection).value_width {
+        1 => ptr::write_bytes(base, value as u8, count),
+        2 => {
+            let slots = base.cast::<u16>();
+            for index in 0..count {
+                *slots.add(index) = value as u16;
+            }
+        }
+        4 => {
+            let slots = base.cast::<u32>();
+            for index in 0..count {
+                *slots.add(index) = value as u32;
+            }
+        }
+        8 => {
+            let slots = base.cast::<u64>();
+            for index in 0..count {
+                *slots.add(index) = value;
+            }
+        }
+        // A nullable payload stores its presence word ahead of the value, and a
+        // filled element is always present.
+        16 => {
+            for index in 0..count {
+                let slot = base.add(index * 16);
+                *slot.cast::<u64>() = 1;
+                *slot.add(8).cast::<u64>() = value;
+            }
+        }
+        _ => collection_panic(b"P1001"),
+    }
+}
+
 pub unsafe fn fill_word(
     frame: *const DrStackFrameV2,
     value: u64,
@@ -324,9 +377,7 @@ pub unsafe fn fill_word(
     value_width: u8,
 ) -> *mut DrCollectionV1 {
     let collection = new_with_frame(frame, count, false, true, value_width);
-    for index in 0..count {
-        write_value(collection, index, value);
-    }
+    fill_values(collection, value, count);
     (*collection).fixed = u8::from(fixed);
     collection
 }
@@ -1628,6 +1679,60 @@ mod tests {
     use super::*;
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+
+    /// `fill_values` replaced a `write_value` loop, so it has to agree with one
+    /// element for element at every width.
+    ///
+    /// Width 16 matters most here: it is the only width no Doria program can
+    /// reach, because E0528 refuses to replicate a move-type element until
+    /// `Cloneable` lands, so the example fixtures cannot cover it. The values
+    /// are chosen to have distinct bytes, which is what catches a fill that
+    /// writes the right number of bytes at the wrong stride.
+    #[test]
+    fn fill_values_writes_every_width_the_way_write_value_did() {
+        for (width, value) in [
+            (1u8, 0xA5u64),
+            (2, 0xA5C3),
+            (4, 0xA5C3_1E7B),
+            (8, 0xA5C3_1E7B_2D4F_6081),
+            (16, 0xA5C3_1E7B_2D4F_6081),
+        ] {
+            for count in [0usize, 1, 2, 7, 64] {
+                unsafe {
+                    let bulk = new_with_frame(ptr::null(), count, false, true, width);
+                    fill_values(bulk, value, count);
+
+                    let reference = new_with_frame(ptr::null(), count, false, true, width);
+                    for index in 0..count {
+                        write_value(reference, index, value);
+                    }
+
+                    for index in 0..count {
+                        assert_eq!(
+                            read_value(bulk, index),
+                            read_value(reference, index),
+                            "width {width} value at {index} of {count}"
+                        );
+                        assert_eq!(
+                            read_present(bulk, index),
+                            read_present(reference, index),
+                            "width {width} presence at {index} of {count}"
+                        );
+                    }
+                    if count != 0 {
+                        let bytes = count * usize::from(width);
+                        assert_eq!(
+                            std::slice::from_raw_parts((*bulk).values, bytes),
+                            std::slice::from_raw_parts((*reference).values, bytes),
+                            "width {width} storage bytes for {count} elements"
+                        );
+                    }
+                    free(bulk);
+                    free(reference);
+                }
+            }
+        }
+    }
 
     struct Generator(u64);
 

@@ -1,0 +1,53 @@
+function main(): void
+{
+    // Constructing `[value; count]` fills the storage in bulk, switching on the
+    // element width once instead of per element. Every width the representation
+    // uses needs to survive that: one byte, two, four, eight, and the sixteen a
+    // nullable payload takes for its presence word plus its value.
+    bool[] $flags = [true; 3];
+    echo "{$flags->length}:{$flags[0]}:{$flags[2]}\n";
+
+    uint8[] $bytes = [200; 3];
+    echo "{$bytes->length}:{$bytes[0]}:{$bytes[2]}\n";
+
+    int16[] $shorts = [-300; 3];
+    echo "{$shorts->length}:{$shorts[0]}:{$shorts[2]}\n";
+
+    uint16[] $ushorts = [65535; 3];
+    echo "{$ushorts->length}:{$ushorts[0]}:{$ushorts[2]}\n";
+
+    int32[] $ints = [-70000; 3];
+    echo "{$ints->length}:{$ints[0]}:{$ints[2]}\n";
+
+    uint32[] $uints = [4294967295; 3];
+    echo "{$uints->length}:{$uints[0]}:{$uints[2]}\n";
+
+    int[] $longs = [-5000000000; 3];
+    echo "{$longs->length}:{$longs[0]}:{$longs[2]}\n";
+
+    // float32 and float share widths 4 and 8 with the integers above, so the
+    // fill arms are covered. They are not read back here because reading a float
+    // element out of any collection currently fails MIR validation, which is a
+    // separate pre-existing defect.
+    //
+    // A nullable payload is the widest element, but E0528 refuses to replicate a
+    // move-type element until `Cloneable` lands, so no fill reaches that width
+    // from Doria yet. `fill_values_writes_every_width` covers it directly.
+
+    // A zero-length fill has no storage at all, so the fill must not touch it.
+    bool[] $empty = [true; 0];
+    echo "{$empty->length}\n";
+
+    int[] $emptyInts = [9; 0];
+    echo "{$emptyInts->length}\n";
+
+    // A single element exercises the boundary between "nothing to write" and a
+    // loop that runs more than once.
+    int16[] $one = [-1; 1];
+    echo "{$one->length}:{$one[0]}\n";
+
+    // Filling then writing has to leave the untouched slots at the fill value.
+    writable int32[] $mixed = [11; 4];
+    $mixed[1] = 22;
+    echo "{$mixed[0]}:{$mixed[1]}:{$mixed[2]}:{$mixed[3]}\n";
+}
