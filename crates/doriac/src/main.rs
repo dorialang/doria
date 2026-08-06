@@ -160,12 +160,22 @@ fn version_command(args: &[OsString]) -> Result<ExitCode, String> {
                 normalized_platform(std::env::consts::OS),
                 normalized_architecture(std::env::consts::ARCH)
             );
+            // Which backends this binary was compiled with. Tooling that
+            // orchestrates doriac (the benchmark harness, editors) reads this
+            // to decide up front whether a build can serve `--release`,
+            // instead of discovering the answer from a failed compile. The
+            // LLVM backend is a build-time feature, so the binary itself is
+            // the only authority on whether it is present.
+            let mut backends = vec!["interpreter", "cranelift", "php"];
+            #[cfg(feature = "llvm-backend")]
+            backends.push("llvm");
             let identity = serde_json::json!({
                 "schema": 1,
                 "component": "doriac",
                 "toolchainVersion": doriac::TOOLCHAIN_VERSION,
                 "target": target,
                 "commit": doriac::BUILD_COMMIT,
+                "backends": backends,
             });
             println!(
                 "{}",
