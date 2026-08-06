@@ -1,0 +1,74 @@
+function main(): void
+{
+    // A membership query builds a lookup index over the entries. A positional
+    // write changes an entry underneath it, so the index has to stop being
+    // consulted or `contains` keeps answering for the value that used to be
+    // there. The write path is inlined when the element is a scalar, which is
+    // exactly the path that must not skip the invalidation.
+    writable int[] $values = [10, 20, 30];
+    if ($values->contains(20)) {
+        echo "array-before-true\n";
+    }
+    $values[1] = 99;
+    if (!$values->contains(20)) {
+        echo "array-stale-gone\n";
+    }
+    if ($values->contains(99)) {
+        echo "array-new-found\n";
+    }
+
+    // Same shape through a List, whose storage grows rather than being fixed.
+    writable List<int> $list = [];
+    $list->add(1);
+    $list->add(2);
+    $list->add(3);
+    if ($list->contains(2)) {
+        echo "list-before-true\n";
+    }
+    $list[1] = 42;
+    if (!$list->contains(2)) {
+        echo "list-stale-gone\n";
+    }
+    if ($list->contains(42)) {
+        echo "list-new-found\n";
+    }
+
+    // Repeated writes after the first: the first write drops the index and the
+    // rest take the inlined path with none present.
+    $list[0] = 7;
+    $list[2] = 8;
+    if (!$list->contains(1)) {
+        echo "list-first-gone\n";
+    }
+    if (!$list->contains(3)) {
+        echo "list-third-gone\n";
+    }
+    if ($list->contains(7) && $list->contains(8) && $list->contains(42)) {
+        echo "list-all-current\n";
+    }
+
+    // Rebuilding the index after writes, then writing again, has to invalidate
+    // the second index too rather than only the one built before any write.
+    $list[1] = 55;
+    if (!$list->contains(42)) {
+        echo "list-rebuilt-gone\n";
+    }
+    if ($list->contains(55)) {
+        echo "list-rebuilt-found\n";
+    }
+
+    // Booleans are the sieve's element type and the narrowest storage width.
+    writable bool[] $flags = [true, true, true];
+    if ($flags->contains(true)) {
+        echo "bool-before-true\n";
+    }
+    $flags[0] = false;
+    $flags[1] = false;
+    $flags[2] = false;
+    if (!$flags->contains(true)) {
+        echo "bool-all-cleared\n";
+    }
+    if ($flags->contains(false)) {
+        echo "bool-false-found\n";
+    }
+}

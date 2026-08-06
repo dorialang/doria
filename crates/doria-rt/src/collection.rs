@@ -69,6 +69,9 @@ pub const DR_COLLECTION_VALUES_OFFSET: usize = mem::offset_of!(DrCollectionV1, v
 pub const DR_COLLECTION_KEYED_OFFSET: usize = mem::offset_of!(DrCollectionV1, keyed);
 pub const DR_COLLECTION_FIXED_OFFSET: usize = mem::offset_of!(DrCollectionV1, fixed);
 pub const DR_COLLECTION_VALUE_WIDTH_OFFSET: usize = mem::offset_of!(DrCollectionV1, value_width);
+pub const DR_COLLECTION_KIND_OFFSET: usize = mem::offset_of!(DrCollectionV1, kind);
+pub const DR_COLLECTION_HEAD_OFFSET: usize = mem::offset_of!(DrCollectionV1, head);
+pub const DR_COLLECTION_INDEX_OFFSET: usize = mem::offset_of!(DrCollectionV1, index);
 
 fn valid_value_width(width: u8) -> bool {
     matches!(width, 1 | 2 | 4 | 8 | 16)

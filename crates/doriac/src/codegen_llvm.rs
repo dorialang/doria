@@ -28,22 +28,23 @@ use crate::native_abi::{
     BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
     CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
     COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
-    COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE, COLLECTION_KEYED_GET,
-    COLLECTION_KEYED_GET_NULLABLE, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET,
-    COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT, COLLECTION_LENGTH, COLLECTION_LENGTH_FIELD,
-    COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_FRONT,
-    COLLECTION_PUSH_FRONT_NULLABLE, COLLECTION_PUSH_NULLABLE, COLLECTION_PUSH_UNIQUE,
-    COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
-    COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY,
-    COLLECTION_STAGE26_NEW, COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32,
-    FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE,
-    MIXED_NEW, MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
-    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
-    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
-    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
-    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE,
-    SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK,
-    SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    COLLECTION_FREE, COLLECTION_INDEX_FIELD, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE,
+    COLLECTION_KEYED_GET, COLLECTION_KEYED_GET_NULLABLE, COLLECTION_KEYED_HAS,
+    COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT, COLLECTION_LENGTH,
+    COLLECTION_LENGTH_FIELD, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
+    COLLECTION_PUSH_FRONT, COLLECTION_PUSH_FRONT_NULLABLE, COLLECTION_PUSH_NULLABLE,
+    COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
+    COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE,
+    COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW, COLLECTION_VALUES_FIELD,
+    COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
+    FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED,
+    MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS,
+    MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64,
+    MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64,
+    MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE,
+    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE,
+    SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
+    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
     STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
     STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
     STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
@@ -2925,6 +2926,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 value,
                 definition.value,
             )?;
+        } else if matches!(definition.value, mir::Type::Scalar(_))
+            && stage26_collection_kind(definition.kind).is_none()
+        {
+            self.lower_positional_scalar_store(
+                collection_value,
+                index.into_int_value(),
+                value,
+                definition.value,
+            )?;
         } else {
             let value_word = self.value_to_collection_word(value, definition.value)?;
             let old_word = self
@@ -2949,6 +2959,95 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             let old_value = self.collection_word_to_value(old_word, definition.value)?;
             self.drop_stored_value(old_value, definition.value)?;
         }
+        Ok(())
+    }
+
+    /// Stores a scalar at a position without calling the runtime.
+    ///
+    /// `dr_v2_collection_set_at` exists to do three things a general element
+    /// write needs: drop the value being replaced, dispatch on the element
+    /// width recorded in the header, and invalidate any membership index. A
+    /// scalar has no drop, and the width is a static property of the element
+    /// type here, so the first two are dead. Only the index has to be dealt
+    /// with, and it is null unless something asked this collection about
+    /// membership — so the write becomes a bounds check and a store, matching
+    /// the read path in `lower_collection_index`.
+    ///
+    /// The indexed case still goes through the runtime rather than open-coding
+    /// the discard, which keeps the one path that has to stay in step with the
+    /// index's internals inside the runtime that owns them. It runs at most
+    /// once per index, because the call leaves the index null.
+    ///
+    /// Stage 26 kinds are excluded: `Deque` addresses elements through `head`,
+    /// which `checked_collection_value_address` does not apply.
+    fn lower_positional_scalar_store(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        value_type: mir::Type,
+    ) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let header = collection_header_type(self.context, self.target_data);
+        let function = current_function(&self.builder)?;
+        let indexed_block = self
+            .context
+            .append_basic_block(function, "collection.store.indexed");
+        let direct_block = self
+            .context
+            .append_basic_block(function, "collection.store.direct");
+        let done_block = self
+            .context
+            .append_basic_block(function, "collection.store.done");
+
+        let index_address = build(self.builder.build_struct_gep(
+            header,
+            collection,
+            COLLECTION_INDEX_FIELD,
+            "collection.index.address",
+        ))?;
+        let membership_index = build(self.builder.build_load(
+            pointer,
+            index_address,
+            "collection.membership.index",
+        ))?
+        .into_pointer_value();
+        let indexed = build(
+            self.builder
+                .build_is_not_null(membership_index, "collection.indexed"),
+        )?;
+        build(
+            self.builder
+                .build_conditional_branch(indexed, indexed_block, direct_block),
+        )?;
+
+        self.builder.position_at_end(indexed_block);
+        let value_word = self.value_to_collection_word(value, value_type)?;
+        let _ = self.call_runtime(
+            COLLECTION_SET_AT,
+            &[
+                pointer.into(),
+                pointer.into(),
+                usize_type.into(),
+                self.context.i64_type().into(),
+            ],
+            Some(self.context.i64_type().into()),
+            &[
+                self.current_frame.into(),
+                collection.into(),
+                index.into(),
+                value_word.into(),
+            ],
+        )?;
+        build(self.builder.build_unconditional_branch(done_block))?;
+
+        self.builder.position_at_end(direct_block);
+        let address = self.checked_collection_value_address(collection, index, value_type)?;
+        build(self.builder.build_store(address, value))?;
+        build(self.builder.build_unconditional_branch(done_block))?;
+
+        self.builder.position_at_end(done_block);
         Ok(())
     }
 
@@ -9812,15 +9911,27 @@ fn collection_header_type<'ctx>(
 ) -> StructType<'ctx> {
     let word = context.ptr_sized_int_type(target_data, None);
     let pointer = context.ptr_type(AddressSpace::default());
+    let byte = context.i8_type();
+    // Mirrors `#[repr(C)] DrCollectionV1` through the membership index pointer.
+    // Only the fields codegen reads have named constants, but every field up to
+    // the last one read has to be present or the offsets shift. The tail beyond
+    // `index` stays runtime-only. `collection_header_offsets_match_runtime`
+    // pins this against the runtime's own `offset_of!`.
     context.struct_type(
         &[
-            word.into(),
-            word.into(),
-            pointer.into(),
-            pointer.into(),
-            context.i8_type().into(),
-            context.i8_type().into(),
-            context.i8_type().into(),
+            word.into(),    // length
+            word.into(),    // capacity
+            pointer.into(), // keys
+            pointer.into(), // values
+            byte.into(),    // keyed
+            byte.into(),    // fixed
+            byte.into(),    // value_width
+            byte.into(),    // kind
+            byte.into(),    // comparator
+            byte.into(),    // finalized
+            byte.into(),    // value_nullable
+            word.into(),    // head
+            pointer.into(), // index
         ],
         false,
     )
@@ -10226,6 +10337,20 @@ mod tests {
             (
                 crate::native_abi::COLLECTION_VALUE_WIDTH_FIELD,
                 doria_rt::DR_COLLECTION_VALUE_WIDTH_OFFSET,
+            ),
+            (
+                crate::native_abi::COLLECTION_KIND_FIELD,
+                doria_rt::DR_COLLECTION_KIND_OFFSET,
+            ),
+            // `head` follows four bytes of tail flags, so it is the field that
+            // catches a padding disagreement between LLVM and repr(C).
+            (
+                crate::native_abi::COLLECTION_HEAD_FIELD,
+                doria_rt::DR_COLLECTION_HEAD_OFFSET,
+            ),
+            (
+                crate::native_abi::COLLECTION_INDEX_FIELD,
+                doria_rt::DR_COLLECTION_INDEX_OFFSET,
             ),
         ] {
             assert_eq!(
