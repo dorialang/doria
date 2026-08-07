@@ -20,12 +20,22 @@ for ($index = 1; $index < count($argv); $index++) {
     $languageServerRoot = absolute_path($argv[$index], getcwd() ?: $root);
 }
 
+// Repository layout is still never inferred. When `--language-server` is
+// omitted the path comes from `doria.languageServerPath` in this checkout's
+// local Git config, which a developer recorded there explicitly. That keeps the
+// routine refresh a bare command instead of an absolute path retyped every
+// time, which is what makes it get skipped.
 if ($languageServerRoot === null) {
-    fail(
-        "missing --language-server <path>\n\n"
-            . 'Repository layout is not inferred; provide the Doria language-server '
-            . 'repository used in this environment.'
-    );
+    $configured = configured_language_server_path($root);
+    if ($configured === null) {
+        fail(
+            "missing --language-server <path>\n\n"
+                . "Repository layout is not inferred; provide the Doria language-server\n"
+                . "repository used in this environment, or record it once with:\n\n"
+                . "    git config --local doria.languageServerPath /absolute/path/to/doria-language-server"
+        );
+    }
+    $languageServerRoot = absolute_path($configured, $root);
 }
 $languageServerRoot = realpath($languageServerRoot) ?: $languageServerRoot;
 if (!is_file($languageServerRoot . DIRECTORY_SEPARATOR . 'scripts' . DIRECTORY_SEPARATOR . 'build.php')) {
@@ -173,6 +183,38 @@ function capture(array $command, string $workingDirectory): string
     }
 
     return $stdout === false ? '' : $stdout;
+}
+
+/**
+ * Reads the explicitly recorded language-server checkout for this repository.
+ * Returns null when nothing was recorded, so the caller still reports a missing
+ * path rather than guessing one.
+ */
+function configured_language_server_path(string $root): ?string
+{
+    $process = proc_open(
+        ['git', 'config', '--local', '--get', 'doria.languageServerPath'],
+        [
+            0 => ['file', PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null', 'r'],
+            1 => ['pipe', 'w'],
+            2 => ['pipe', 'w'],
+        ],
+        $pipes,
+        $root,
+    );
+    if (!is_resource($process)) {
+        return null;
+    }
+    $stdout = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $status = proc_close($process);
+    if ($status !== 0) {
+        return null;
+    }
+    $value = trim($stdout === false ? '' : $stdout);
+
+    return $value === '' ? null : $value;
 }
 
 function cargo_install_root(): string
