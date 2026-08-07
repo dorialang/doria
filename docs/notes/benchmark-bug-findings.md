@@ -1,7 +1,7 @@
 # Benchmark-driven bug findings
 
-> Documentation role: working note / bug handoff. Two reproducible defects and one
-> feature gap surfaced while writing the cross-language benchmark suite
+> Documentation role: working note / bug handoff. Three reproducible defects and
+> one feature gap surfaced while writing the cross-language benchmark suite
 > (`languages/benchmarks/`, Stage 23). This is a to-do handoff for a fixing agent,
 > not a decision record. Each item has a minimal repro, observed vs expected
 > behavior, scope, and severity. Verify the repros before fixing; fix globally,
@@ -18,7 +18,13 @@ omitted `mir::Operand::CollectionIndex` (present for the integer operand), so a
 `CollectionIndex` arm to the bool operand validation (the interpreter and both
 native backends already lowered it). Regression coverage:
 `examples/native/main_stage23_bool_collections.doria` (parity manifest) plus a
-`stage23_tests` lowering test.
+`stage23_tests` test.
+
+The bool operand match kept its catch-all arm after that fix, and the same gap
+was still open for floats — see Bug 3, which closed it for both by making the
+matches exhaustive. That `stage23_tests` case also only called
+`lower_source_to_mir`, which does not run `validate_program`, so it did not
+actually guard the fix until Bug 3 added the validation call.
 
 **Severity: high.** Any `bool` element stored in a collection or array is unusable
 in native code, so `bool` collections are effectively broken. This blocks the
@@ -97,6 +103,54 @@ with `Error[E0420]: equality operands must have compatible types, got Unknown an
 `Float::parse`) through resolution, typing, MIR, and the runtime, returning the
 nullable per the companion contract. Add fixtures for parse-success and
 parse-failure (`null`) across the three backends.
+
+## Bug 3 — `float`-typed collection element and static reads are miscompiled (B0001) — RESOLVED
+
+**RESOLVED.** The same defect as Bug 1, one scalar family over: the shared MIR
+`FloatExpression::Use` operand match accepted `Property`, `CollectionKeyAt`, and
+`MixedPayload` but ended in a catch-all, so `mir::Operand::CollectionIndex` —
+which the interpreter and both native backends already lowered — was reported as
+malformed MIR. Reading a `float`/`float32` element out of any indexable
+collection failed before any backend ran.
+
+**Minimal repro:**
+```doria
+function main(): void {
+    float[] $s = [2.5, 1.5];
+    float $v = $s[0];
+    echo "{$v}\n";
+}
+```
+**Expected:** prints `2.5`.
+**Actual:** `Error[B0001]: backend emission failure: malformed MIR: float expression has an incompatible operand`.
+
+**Second gap, found by enumerating rather than patching the reported case:** the
+same match also omitted `mir::Operand::Static`, so `Config::ratio` on a
+`static float` property failed identically while the `bool` and `int` statics
+beside it compiled. It was not in the bug report.
+
+**Fix.** Both the float and bool operand surfaces became exhaustive
+`validate_float_operand` / `validate_bool_operand` functions modelled on
+`validate_integer_operand`, which never had a catch-all and never had this bug.
+A future `mir::Operand` variant is now a compile error in all three, not a
+runtime B0001. Each previously-unreachable variant reports what is actually
+wrong (`collection length is used as float instead of int/int64`) instead of the
+one generic message.
+
+**Scope (every combination compiled and run on Cranelift and LLVM, 270 cases,
+byte-identical output):** `bool`, `int8/16/32/64`, `uint8/16/32/64`, `float32`,
+`float` × typed array, `List`, `Dictionary` value, `SortedDictionary` value ×
+bound-to-local, interpolation, concat, arithmetic, comparison. `Deque` is not
+indexable (E0520) and is read by iteration and `popFront`; `Set`, `SortedSet`,
+and `PriorityQueue` refuse float elements by design (E0523 — floats are not
+`Hashable`, and NaN/signed zero deny the total order). Both were verified
+separately and pass.
+
+Regression coverage: `examples/native/main_float_collection_elements.doria`
+(parity manifest, with an `expected_stdout` fixture), restored `float32`/`float`
+lines in `examples/native/main_collection_fill_widths.doria`, and
+`mir_validation_tests` cases that run `validate_program` over the accepted
+surface and over a deliberately mistyped element read.
 
 ## Resolved — runtime-sized sequence fill
 

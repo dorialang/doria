@@ -25,11 +25,15 @@ function main(): void
     int[] $longs = [-5000000000; 3];
     echo "{$longs->length}:{$longs[0]}:{$longs[2]}\n";
 
-    // float32 and float share widths 4 and 8 with the integers above, so the
-    // fill arms are covered. They are not read back here because reading a float
-    // element out of any collection currently fails MIR validation, which is a
-    // separate pre-existing defect.
-    //
+    // float32 and float share widths 4 and 8 with the integers above, but a
+    // float fill writes a different bit pattern into those widths, so each is
+    // read back rather than left to the integer arms.
+    float32[] $narrow = [2.5; 3];
+    echo "{$narrow->length}:{$narrow[0]}:{$narrow[2]}\n";
+
+    float[] $wide = [-1.25; 3];
+    echo "{$wide->length}:{$wide[0]}:{$wide[2]}\n";
+
     // A nullable payload is the widest element, but E0528 refuses to replicate a
     // move-type element until `Cloneable` lands, so no fill reaches that width
     // from Doria yet. `fill_values_writes_every_width` covers it directly.

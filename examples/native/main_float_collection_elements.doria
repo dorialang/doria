@@ -1,0 +1,70 @@
+class Ratios
+{
+    static float $wide = 2.5;
+    static float32 $narrow = 1.25;
+}
+
+function main(): void
+{
+    // Reading a float element out of a collection must produce a well-formed
+    // float operand in every position it can appear: bound to a local, inside
+    // an interpolation, concatenated, in arithmetic, and in a comparison.
+    float[] $array = [2.5, 1.5];
+    float $bound = $array[0];
+    echo "array-bound:{$bound}\n";
+    echo "array-interp:{$array[1]}\n";
+    string $joined = "array-concat:" . "{$array[0]}";
+    echo "{$joined}\n";
+    float $sum = $array[0] + 1.0;
+    echo "array-arith:{$sum}\n";
+    if ($array[0] > $array[1]) {
+        echo "array-compare:ordered\n";
+    }
+
+    // float32 is the narrower width and lowers to a different LLVM/Cranelift
+    // type, so it needs the same coverage rather than standing in for float.
+    float32[] $narrow = [2.5, 1.5];
+    float32 $narrowBound = $narrow[0];
+    echo "narrow-bound:{$narrowBound}\n";
+    float32 $narrowSum = $narrow[1] + 1.0;
+    echo "narrow-arith:{$narrowSum}\n";
+
+    List<float> $list = [3.5, 4.5];
+    float $listBound = $list[0];
+    echo "list-bound:{$listBound}\n";
+    echo "list-interp:{$list[1]}\n";
+
+    Dictionary<int, float> $dictionary = [1 => 6.5, 2 => 7.5];
+    float $dictionaryBound = $dictionary[1];
+    echo "dictionary-bound:{$dictionaryBound}\n";
+    if ($dictionary[2] > 7.0) {
+        echo "dictionary-compare:above\n";
+    }
+
+    Dictionary<int, float> $sortedSource = [2 => 9.5, 1 => 8.5];
+    SortedDictionary<int, float> $sorted = SortedDictionary::from($sortedSource);
+    echo "sorted-interp:{$sorted[1]}\n";
+
+    // A Deque is not indexable, so its elements are read by iteration and by
+    // removal, which take the key-at and nullable-payload operands instead.
+    float[] $dequeSource = [10.5, 11.5];
+    writable Deque<float> $deque = Deque::from($dequeSource);
+    foreach ($deque as float $element) {
+        echo "deque-each:{$element}\n";
+    }
+    ?float $front = $deque->popFront();
+    if ($front != null) {
+        float $frontValue = $front;
+        echo "deque-front:{$frontValue}\n";
+    }
+
+    // A static float property reads through the static operand, which shares
+    // the float operand surface with the element reads above.
+    float $staticWide = Ratios::wide;
+    float32 $staticNarrow = Ratios::narrow;
+    echo "static:{$staticWide}:{$staticNarrow}\n";
+
+    // `Set`, `SortedSet`, and `PriorityQueue` deliberately refuse float
+    // elements (E0523: floats are not `Hashable` and NaN/signed zero deny the
+    // total order those collections need), so there is nothing to read there.
+}

@@ -177,3 +177,4 @@ examples/native/main_writable_local_42.doria
 examples/native/main_dictionary_iteration_pairs.doria
 examples/native/main_collection_membership_after_write.doria
 examples/native/main_collection_fill_widths.doria
+examples/native/main_float_collection_elements.doria
