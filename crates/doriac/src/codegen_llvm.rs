@@ -13,8 +13,9 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, StructType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FloatValue as LlvmFloatValue, FunctionValue,
-    GlobalValue, IntValue, PointerValue, StructValue, UnnamedAddress,
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue as LlvmFloatValue,
+    FunctionValue, GlobalValue, InstructionValue, IntValue, PointerValue, StructValue,
+    UnnamedAddress,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
@@ -828,6 +829,12 @@ struct FunctionLowerer<'ctx, 'program> {
 }
 
 #[derive(Clone, Copy)]
+enum CollectionMemoryRegion {
+    Header,
+    Values,
+}
+
+#[derive(Clone, Copy)]
 enum DeferredOwnedTemporary {
     Class(crate::class_layout::ClassId),
     Collection(mir::CollectionTypeId),
@@ -837,6 +844,65 @@ enum DeferredOwnedTemporary {
 }
 
 impl<'ctx> FunctionLowerer<'ctx, '_> {
+    /// Marks accesses using the runtime invariant that a collection header and
+    /// its value buffer are separate allocations. Header fields remain one
+    /// conservative alias class, as do all elements within the value buffer.
+    fn tag_collection_memory_access(
+        &self,
+        instruction: InstructionValue<'ctx>,
+        region: CollectionMemoryRegion,
+    ) -> Result<(), BackendError> {
+        let zero = self.context.i64_type().const_zero();
+        let root = self.context.metadata_node(&[self
+            .context
+            .metadata_string("Doria collection memory")
+            .into()]);
+        let name = match region {
+            CollectionMemoryRegion::Header => "Doria collection header",
+            CollectionMemoryRegion::Values => "Doria collection values",
+        };
+        let scalar = self.context.metadata_node(&[
+            self.context.metadata_string(name).into(),
+            root.into(),
+            zero.into(),
+        ]);
+        let access = self
+            .context
+            .metadata_node(&[scalar.into(), scalar.into(), zero.into()]);
+        instruction
+            .set_metadata(access, self.context.get_kind_id("tbaa"))
+            .map_err(|error| {
+                backend_failure(format!(
+                    "failed to attach collection alias metadata: {error}"
+                ))
+            })
+    }
+
+    fn load_collection_memory<T: BasicType<'ctx>>(
+        &self,
+        ty: T,
+        address: PointerValue<'ctx>,
+        name: &str,
+        region: CollectionMemoryRegion,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let value = build(self.builder.build_load(ty, address, name))?;
+        let instruction = value
+            .as_instruction_value()
+            .ok_or_else(|| backend_failure("collection load did not produce an instruction"))?;
+        self.tag_collection_memory_access(instruction, region)?;
+        Ok(value)
+    }
+
+    fn store_collection_memory(
+        &self,
+        address: PointerValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        region: CollectionMemoryRegion,
+    ) -> Result<(), BackendError> {
+        let instruction = build(self.builder.build_store(address, value))?;
+        self.tag_collection_memory_access(instruction, region)
+    }
+
     /// Allocates a scratch slot in the function's entry block.
     ///
     /// LLVM only treats an `alloca` as part of the fixed frame when it sits in
@@ -1786,12 +1852,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             COLLECTION_LENGTH_FIELD,
             "collection.length.address",
         ))?;
-        let length = build(self.builder.build_load(
-            usize_type,
-            length_address,
-            "collection.length",
-        ))?
-        .into_int_value();
+        let length = self
+            .load_collection_memory(
+                usize_type,
+                length_address,
+                "collection.length",
+                CollectionMemoryRegion::Header,
+            )?
+            .into_int_value();
         let (comparable_index, comparable_length) = match index
             .get_type()
             .get_bit_width()
@@ -1852,12 +1920,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             COLLECTION_VALUES_FIELD,
             "collection.values.address",
         ))?;
-        let values = build(self.builder.build_load(
-            self.context.ptr_type(AddressSpace::default()),
-            values_address,
-            "collection.values",
-        ))?
-        .into_pointer_value();
+        let values = self
+            .load_collection_memory(
+                self.context.ptr_type(AddressSpace::default()),
+                values_address,
+                "collection.values",
+                CollectionMemoryRegion::Header,
+            )?
+            .into_pointer_value();
         build(unsafe {
             self.builder.build_in_bounds_gep(
                 collection_storage_type(self.context, self.target_data, value_type)?,
@@ -2464,9 +2534,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 index_value.into_int_value(),
                 definition.value,
             )?;
-            let value = build(
-                self.builder
-                    .build_load(storage_type, address, "collection.value"),
+            let value = self.load_collection_memory(
+                storage_type,
+                address,
+                "collection.value",
+                CollectionMemoryRegion::Values,
             )?;
             if matches!(definition.value, mir::Type::Scalar(_)) {
                 return Ok(value);
@@ -3007,12 +3079,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             COLLECTION_INDEX_FIELD,
             "collection.index.address",
         ))?;
-        let membership_index = build(self.builder.build_load(
-            pointer,
-            index_address,
-            "collection.membership.index",
-        ))?
-        .into_pointer_value();
+        let membership_index = self
+            .load_collection_memory(
+                pointer,
+                index_address,
+                "collection.membership.index",
+                CollectionMemoryRegion::Header,
+            )?
+            .into_pointer_value();
         let indexed = build(
             self.builder
                 .build_is_not_null(membership_index, "collection.indexed"),
@@ -3044,7 +3118,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
         self.builder.position_at_end(direct_block);
         let address = self.checked_collection_value_address(collection, index, value_type)?;
-        build(self.builder.build_store(address, value))?;
+        self.store_collection_memory(address, value, CollectionMemoryRegion::Values)?;
         build(self.builder.build_unconditional_branch(done_block))?;
 
         self.builder.position_at_end(done_block);

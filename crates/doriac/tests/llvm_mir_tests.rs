@@ -492,3 +492,69 @@ function main(): void
         "a values-only walk read the key it never uses"
     );
 }
+
+/// Collection headers and their value buffers are separate runtime
+/// allocations. The LLVM fast path records that fact so a value write inside a
+/// loop cannot force invariant header fields to be reloaded on every pass.
+#[test]
+fn collection_fast_path_carries_disjoint_alias_metadata() {
+    let source = r#"
+function main(): void
+{
+    writable bool[] $flags = [true; 8];
+    let writable $index = 0;
+    while ($index < $flags->length) {
+        $flags[$index] = false;
+        $index++;
+    }
+    if ($flags[0]) { panic("flag was not cleared"); }
+}
+"#;
+    let program = doriac::lower_source_to_mir("llvm-test.doria", source).expect("lowers to MIR");
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program).expect("lowers to LLVM IR");
+
+    let tagged_line = |name: &str| {
+        ir.lines()
+            .find(|line| line.contains(name) && line.contains("!tbaa !"))
+            .unwrap_or_else(|| panic!("{name} was not tagged with TBAA:\n{ir}"))
+    };
+    let tag = |line: &str| {
+        line.split_once("!tbaa !")
+            .map(|(_, id)| {
+                id.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+            })
+            .filter(|id| !id.is_empty())
+            .expect("tagged line should carry a TBAA id")
+    };
+
+    let header_tag = tag(tagged_line("collection.length = load"));
+    assert_eq!(
+        tag(tagged_line("collection.values = load")),
+        header_tag.clone(),
+        "all collection-header fields should share the header alias type"
+    );
+    assert_eq!(
+        tag(tagged_line("collection.membership.index = load")),
+        header_tag.clone(),
+        "the membership index is part of the collection header"
+    );
+
+    let values_tag = tag(tagged_line("collection.value = load"));
+    let value_store = ir
+        .lines()
+        .find(|line| line.trim_start().starts_with("store ") && line.contains("!tbaa !"))
+        .unwrap_or_else(|| panic!("collection value store was not tagged with TBAA:\n{ir}"));
+    assert_eq!(
+        tag(value_store),
+        values_tag.clone(),
+        "collection element reads and writes should share the values alias type"
+    );
+    assert_ne!(
+        header_tag, values_tag,
+        "collection headers and value buffers must remain disjoint alias types"
+    );
+    assert!(ir.contains("Doria collection header"));
+    assert!(ir.contains("Doria collection values"));
+}

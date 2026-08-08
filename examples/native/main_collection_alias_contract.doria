@@ -1,0 +1,24 @@
+function main(): void
+{
+    writable bool[] $flags = [true; 64];
+
+    // Build the optional membership index before the loop. The first write
+    // must discard it through the runtime; later writes take the inline path.
+    if (!$flags->contains(true)) {
+        panic("membership index was not built over the initial values");
+    }
+
+    let writable $index = 0;
+    while ($index < $flags->length) {
+        $flags[$index] = false;
+        $index++;
+    }
+
+    if ($flags->contains(true)) {
+        panic("a stale membership index survived positional writes");
+    }
+    if (!$flags->contains(false)) {
+        panic("the written values were not visible");
+    }
+    echo "collection alias contract\n";
+}
