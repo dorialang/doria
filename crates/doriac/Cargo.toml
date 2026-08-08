@@ -28,13 +28,13 @@ serde_json = "1"
 unicode-width = "0.2"
 ryu.workspace = true
 
-[build-dependencies]
-# build.rs links the bundled runtime with rustc directly, so every runtime
-# extern it locates must also be ready before the build script runs.
-doria-diagnostic-catalogue = { path = "../doria-diagnostic-catalogue" }
-doria-unicode = { path = "../doria-unicode" }
-ryu.workspace = true
-unicode-width = { version = "=0.2.2", default-features = false, features = ["cjk", "no_std"] }
+# There are deliberately no `[build-dependencies]`. build.rs used to declare the
+# runtime's dependencies here so they would be "ready" before it ran, but cargo
+# builds build-dependencies as host units under the build-override profile
+# (`opt-level=0`, `panic=unwind`). That ordered the wrong copies while leaving a
+# second, correct copy of each crate beside them, which is what made the
+# runtime's dependency selection ambiguous. build.rs now asks cargo to build
+# `doria-rt` from its own manifest instead.
 
 [dev-dependencies]
 doria-rt = { path = "../doria-rt", default-features = false }

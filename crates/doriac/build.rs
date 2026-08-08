@@ -28,10 +28,33 @@ fn main() {
 
     let runtime_dir = manifest_dir.join("../doria-rt");
     let runtime_source_dir = runtime_dir.join("src");
-    let runtime_source = runtime_source_dir.join("lib.rs");
     let runtime_manifest = runtime_dir.join("Cargo.toml");
     println!("cargo:rerun-if-changed={}", runtime_source_dir.display());
     println!("cargo:rerun-if-changed={}", runtime_manifest.display());
+
+    // The bundled archive is now built from `doria-rt`'s whole dependency graph,
+    // so every input to that graph has to retrigger this script. Watching only
+    // the runtime's own sources would leave a stale archive bundled after an edit
+    // to a crate the runtime links, which is the same class of mistake as
+    // selecting a stale rlib.
+    for sibling in ["doria-unicode", "doria-diagnostic-catalogue"] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest_dir.join("..").join(sibling).join("src").display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            manifest_dir
+                .join("..")
+                .join(sibling)
+                .join("Cargo.toml")
+                .display()
+        );
+    }
+    println!(
+        "cargo:rerun-if-changed={}",
+        repository_dir.join("Cargo.lock").display()
+    );
 
     // The ABI version is a single plain-text authority read here rather than a
     // constant duplicated between the runtime and the compiler. It is emitted
@@ -60,70 +83,107 @@ fn main() {
     if env::var_os("CARGO_FEATURE_BUNDLED_RUNTIME").is_none() {
         return;
     }
+    assert!(
+        matches!(profile.as_str(), "debug" | "release"),
+        "unsupported Cargo artifact profile `{profile}`"
+    );
 
     let filename = if target.ends_with("windows-msvc") {
         "doria_rt.lib"
     } else {
         "libdoria_rt.a"
     };
-    let output =
-        PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory")).join(filename);
-    let dependency_dir = output
-        .parent()
-        .and_then(|path| path.parent())
-        .and_then(|path| path.parent())
-        .and_then(|path| path.parent())
-        .expect("Cargo build directory")
-        .join("deps");
-    let ryu = find_rlib(&dependency_dir, "ryu");
-    let doria_diagnostic_catalogue = find_rlib(&dependency_dir, "doria_diagnostic_catalogue");
-    let doria_unicode = find_rlib(&dependency_dir, "doria_unicode");
-    let unicode_width = find_rlib(&dependency_dir, "unicode_width");
-    let rustc = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
-    let mut command = Command::new(rustc);
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory"));
+    let output = out_dir.join(filename);
+
+    // The runtime is built by cargo, from `doria-rt`'s own manifest, rather than
+    // by invoking `rustc` here with hand-picked dependency rlibs.
+    //
+    // The previous approach could not be made correct. A build script has no
+    // supported way to depend on, order, or locate its own package's *normal*
+    // dependencies: the `[build-dependencies]` that existed to make the runtime's
+    // externs "ready" only ever ordered the **host** copies of those crates,
+    // which cargo builds with the build-override profile — `opt-level=0` and
+    // `panic=unwind`. Cargo therefore left two rlibs for every runtime
+    // dependency in one directory, differing in optimisation level, panic
+    // strategy, and feature set, and the selector picked between them by
+    // modification time. Which runtime a compiler bundled was decided by which
+    // rlib cargo happened to finish writing last: a scheduling race, not a build
+    // input. Picking the host copies produced an 18.0 MB archive whose
+    // dependencies were entirely unoptimised; picking the target copies produced
+    // the correct 12.7 MB one.
+    //
+    // Letting cargo resolve the runtime removes the guess rather than improving
+    // it. Cargo knows the features `doria-rt` declares and the profile in force,
+    // and it writes the archive to exactly one path.
+    let runtime_target_dir = out_dir.join("doria-rt-target");
+    let profile_directory = if profile == "release" {
+        "release"
+    } else {
+        "debug"
+    };
+    let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let mut command = Command::new(cargo);
     command
-        .arg("--crate-name")
-        .arg("doria_rt")
-        .arg("--edition=2021")
-        .arg("--crate-type=staticlib")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&runtime_manifest)
+        .arg("--package")
+        .arg("doria-rt")
+        .arg("--locked")
         .arg("--target")
         .arg(&target)
-        .arg("--cfg")
-        .arg("feature=\"standalone-windows-support\"")
-        .arg("-L")
-        .arg(format!("dependency={}", dependency_dir.display()))
-        .arg("--extern")
-        .arg(format!("ryu={}", ryu.display()))
-        .arg("--extern")
-        .arg(format!(
-            "doria_diagnostic_catalogue={}",
-            doria_diagnostic_catalogue.display()
-        ))
-        .arg("--extern")
-        .arg(format!("doria_unicode={}", doria_unicode.display()))
-        .arg("--extern")
-        .arg(format!("unicode_width={}", unicode_width.display()))
-        .arg("-C")
-        .arg(format!(
-            "opt-level={}",
-            env::var("OPT_LEVEL").unwrap_or_else(|_| "0".to_string())
-        ));
-    if let Some(encoded_flags) = env::var_os("CARGO_ENCODED_RUSTFLAGS") {
-        for flag in encoded_flags.to_string_lossy().split('\u{1f}') {
-            if !flag.is_empty() {
-                command.arg(flag);
-            }
-        }
+        // A nested cargo must not share the target directory of the build that
+        // invoked it: cargo takes an exclusive lock on it and the two would
+        // deadlock waiting for each other.
+        .env("CARGO_TARGET_DIR", &runtime_target_dir)
+        // `cargo clippy` sets this to `clippy-driver` for workspace members, and
+        // `doria-rt` is a workspace member. Inherited, it builds the runtime
+        // through a lint driver and yields a different archive than `cargo
+        // build` does from the same revision — measured, not feared. Nobody
+        // asked for the shipped runtime to depend on which cargo subcommand ran
+        // last, so the wrapper is dropped. `RUSTC_WRAPPER` is deliberately kept:
+        // it is set by the operator, applies to every unit alike, and is how
+        // caches such as sccache are configured.
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        // Incremental compilation makes the archive nondeterministic: two dev
+        // builds of one revision, from scratch, in one directory, produce
+        // different bytes. It exists to speed up editing the code being built,
+        // which is not what this is — the runtime is an artifact whose digest is
+        // recorded and compared. Release was already unaffected because cargo
+        // leaves incremental off there; this extends the guarantee to every
+        // profile rather than to the one that happened to be safe.
+        .env("CARGO_INCREMENTAL", "0");
+    if profile == "release" {
+        command.arg("--release");
+    }
+    if env::var("CARGO_NET_OFFLINE").is_ok_and(|value| value == "true") {
+        command.arg("--offline");
     }
     let status = command
-        .arg("-C")
-        .arg("panic=abort")
-        .arg("-o")
-        .arg(&output)
-        .arg(&runtime_source)
         .status()
-        .expect("failed to invoke rustc for doria-rt");
+        .expect("failed to invoke cargo for doria-rt");
     assert!(status.success(), "failed to build doria-rt static library");
+
+    // Exactly one path, derived from what was asked for rather than searched
+    // for. If cargo did not put the archive here, that is a fact worth failing
+    // on: the alternative is to go looking, which is the defect this replaced.
+    let built = runtime_target_dir
+        .join(&target)
+        .join(profile_directory)
+        .join(filename);
+    assert!(
+        built.is_file(),
+        "cargo did not produce the doria-rt static library at {}",
+        built.display()
+    );
+    std::fs::copy(&built, &output).unwrap_or_else(|error| {
+        panic!(
+            "copying runtime archive {} to {}: {error}",
+            built.display(),
+            output.display()
+        )
+    });
 
     println!("cargo:rustc-env=DORIA_RT_BUILT_PATH={}", output.display());
 
@@ -213,25 +273,6 @@ fn escape_json(value: &str) -> String {
         }
     }
     escaped
-}
-
-fn find_rlib(dependency_dir: &Path, crate_name: &str) -> PathBuf {
-    let prefix = format!("lib{crate_name}-");
-    std::fs::read_dir(dependency_dir)
-        .expect("Cargo dependency directory")
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let modified = entry.metadata().ok()?.modified().ok()?;
-            Some((modified, entry.path()))
-        })
-        .filter(|(_, path)| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".rlib"))
-        })
-        .max_by_key(|(modified, _)| *modified)
-        .map(|(_, path)| path)
-        .unwrap_or_else(|| panic!("compiled {crate_name} dependency"))
 }
 
 fn watch_git_identity(repository_dir: &Path) {
