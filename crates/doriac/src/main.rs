@@ -166,9 +166,13 @@ fn version_command(args: &[OsString]) -> Result<ExitCode, String> {
             // instead of discovering the answer from a failed compile. The
             // LLVM backend is a build-time feature, so the binary itself is
             // the only authority on whether it is present.
-            let mut backends = vec!["interpreter", "cranelift", "php"];
-            #[cfg(feature = "llvm-backend")]
-            backends.push("llvm");
+            let backends = [
+                "interpreter",
+                "cranelift",
+                "php",
+                #[cfg(feature = "llvm-backend")]
+                "llvm",
+            ];
             let identity = serde_json::json!({
                 "schema": 1,
                 "component": "doriac",
