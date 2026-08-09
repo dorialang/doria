@@ -6721,7 +6721,13 @@ impl<'program> Checker<'program> {
     ) {
         if let StaticQualifier::Class(collection) = access.qualifier {
             if matches!(collection.as_str(), "List" | "Dictionary") && access.member == "from" {
-                self.report_withdrawn_collection_from(collection, access, args);
+                self.report_withdrawn_collection_from(
+                    collection,
+                    access,
+                    args,
+                    scopes,
+                    method_context,
+                );
                 return;
             }
         }
@@ -7033,6 +7039,8 @@ impl<'program> Checker<'program> {
         collection: &str,
         access: StaticAccess<'_>,
         args: &[Argument],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
     ) {
         let mut diagnostic = Diagnostic::new(
             "E0558",
@@ -7057,19 +7065,34 @@ impl<'program> Checker<'program> {
             }] => Some((elements, *span)),
             _ => None,
         };
+        let expected_matches_collection = expected.is_none_or(|target| {
+            matches!(
+                (collection, self.types.kind(target)),
+                ("List", TypeKind::List(_)) | ("Dictionary", TypeKind::Dictionary(_, _))
+            )
+        });
+        let literal_matches_context = match (expected, direct_literal) {
+            (Some(target), Some((elements, _))) => {
+                self.is_array_literal_assignable(target, elements, scopes, method_context)
+            }
+            (None, Some((elements, _))) if !elements.is_empty() => {
+                let inferred = self.infer_array_type(elements, scopes, method_context);
+                !matches!(
+                    self.types.kind(inferred),
+                    TypeKind::Heterogeneous | TypeKind::Unknown
+                )
+            }
+            _ => false,
+        };
         let safe_literal = direct_literal.is_some_and(|(elements, _)| {
-            if elements.is_empty() {
-                expected.is_some_and(|target| {
-                    matches!(
-                        (collection, self.types.kind(target)),
-                        ("List", TypeKind::List(_)) | ("Dictionary", TypeKind::Dictionary(_, _))
-                    )
-                })
+            let shape_matches = if elements.is_empty() {
+                expected.is_some()
             } else if collection == "List" {
                 elements.iter().all(|element| element.key.is_none())
             } else {
                 elements.iter().all(|element| element.key.is_some())
-            }
+            };
+            expected_matches_collection && literal_matches_context && shape_matches
         });
 
         if safe_literal {
@@ -7089,6 +7112,11 @@ impl<'program> Checker<'program> {
             } else {
                 diagnostic = diagnostic.with_help("use the bracket literal directly");
             }
+        } else if expected.is_some() && !expected_matches_collection {
+            diagnostic = diagnostic.with_help(format!(
+                "`{collection}::from` does not match the contextual type `{}`; use that type's bracket-literal shape",
+                self.types.display(expected.expect("mismatched contextual type exists"))
+            ));
         } else if direct_literal.is_some_and(|(elements, _)| elements.is_empty()) {
             diagnostic = diagnostic.with_help(format!(
                 "declare the element types explicitly, for example `{collection}<...> $values = []`"

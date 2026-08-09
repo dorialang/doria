@@ -213,6 +213,10 @@ fn withdrawn_literal_constructors_preserve_source_and_context() {
         "function main(): void { let $v = List::from([]); }",
         "function main(): void { List<int> $source = [1]; let $v = List::from($source); }",
         "function main(): void { Dictionary<string, int> $source = []; let $v = Dictionary::from($source); }",
+        "function main(): void { Dictionary<int, int> $v = List::from([1, 2]); }",
+        "function main(): void { List<int> $v = Dictionary::from([1 => 2]); }",
+        "function main(): void { List<int> $v = List::from([1, \"two\"]); }",
+        "function main(): void { Dictionary<string, int> $v = Dictionary::from([\"one\" => \"two\"]); }",
     ] {
         assert!(diagnostic(source, "E0558").fixes.is_empty());
     }
