@@ -7,6 +7,8 @@ use crate::diagnostics::Diagnostic;
 use crate::runtime_digest::sha256_hex;
 use crate::source::Span;
 
+const RUNTIME_METADATA_SCHEMA_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchiveFormat {
     Gnu,
@@ -72,12 +74,10 @@ pub struct RuntimeExpectation {
 }
 
 impl RuntimeExpectation {
-    /// The expectation baked in when this compiler was built.
-    ///
-    /// Both native profiles share one expectation because both link the same
-    /// bundled archive. Cranelift and LLVM deliberately do not get separate
-    /// identity rules.
-    pub fn current() -> Self {
+    /// The identity this compiler requires for one requested native profile.
+    /// Cranelift and LLVM share the ABI, target, and revision rules, while each
+    /// selects the runtime built with its own optimization profile.
+    pub fn current(profile: NativeProfile) -> Self {
         Self {
             abi_version: option_env!("DORIA_RT_ABI_VERSION")
                 .unwrap_or("")
@@ -85,9 +85,7 @@ impl RuntimeExpectation {
             target_triple: option_env!("DORIA_RT_EXPECTED_TARGET")
                 .unwrap_or("")
                 .to_string(),
-            profile: option_env!("DORIA_RT_EXPECTED_PROFILE")
-                .unwrap_or("")
-                .to_string(),
+            profile: profile_directory(profile).to_string(),
             revision: option_env!("DORIA_RT_EXPECTED_REVISION")
                 .unwrap_or("")
                 .to_string(),
@@ -129,11 +127,9 @@ pub struct RuntimeProvenance {
 impl RuntimeArtifact {
     /// Read the archive and describe it completely.
     ///
-    /// This hashes the archive, so it is called when a performance report is
-    /// requested rather than on every compilation. Ordinary builds pay nothing
-    /// for it. The digest is taken from the bytes on disk rather than copied
-    /// from the sidecar, so a sidecar that no longer describes its archive is
-    /// visible instead of believed.
+    /// Selection already verifies identified archives before linking. A
+    /// performance report reads the bytes again so it records the artifact that
+    /// exists at reporting time rather than copying the sidecar's claim.
     pub fn provenance(&self) -> RuntimeProvenance {
         let archive = std::fs::read(&self.path).ok();
         let sha256 = archive.as_ref().map(|bytes| sha256_hex(bytes));
@@ -174,7 +170,7 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
     resolve(
         env::var_os("DORIA_RT_PATH").as_deref(),
         &current_executable,
-        option_env!("DORIA_RT_BUILT_PATH").map(Path::new),
+        compiler_built_runtime(profile),
         workspace,
         target_override.as_deref(),
         if cfg!(all(windows, target_env = "msvc")) {
@@ -183,8 +179,15 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
             ArchiveFormat::Gnu
         },
         profile_directory(profile),
-        &RuntimeExpectation::current(),
+        &RuntimeExpectation::current(profile),
     )
+}
+
+fn compiler_built_runtime(profile: NativeProfile) -> Option<&'static Path> {
+    match profile {
+        NativeProfile::Fast => option_env!("DORIA_RT_BUILT_DEBUG_PATH").map(Path::new),
+        NativeProfile::Release => option_env!("DORIA_RT_BUILT_RELEASE_PATH").map(Path::new),
+    }
 }
 
 const fn profile_directory(profile: NativeProfile) -> &'static str {
@@ -196,7 +199,7 @@ const fn profile_directory(profile: NativeProfile) -> &'static str {
 
 /// Candidate archives in priority order.
 ///
-/// The compiler-owned archive is preferred on every profile. An earlier version
+/// The matching compiler-owned archive is preferred on every profile. An earlier version
 /// of this function pushed the ambient workspace `target/release` archive ahead
 /// of it for the release profile only, which let a stale file from an unrelated
 /// build shadow the correct runtime and fail the link with an unexplained
@@ -280,7 +283,10 @@ fn resolve(
         if !candidate.is_file() {
             return Err(not_found_error(Some(&candidate)));
         }
-        return accept(candidate, RuntimeOrigin::ExplicitOverride, expectation);
+        let origin = RuntimeOrigin::ExplicitOverride;
+        let metadata = load_metadata(&candidate)
+            .map_err(|detail| invalid_metadata_error(&candidate, origin, &detail))?;
+        return accept(candidate, origin, expectation, metadata);
     }
 
     for (candidate, origin) in candidates(
@@ -294,13 +300,13 @@ fn resolve(
         if !candidate.is_file() {
             continue;
         }
-        let metadata = read_metadata(&candidate);
-        // An ambient archive with no identity never outranks the
-        // compiler-owned runtime; it is skipped rather than trusted.
+        let metadata = load_metadata(&candidate)
+            .map_err(|detail| invalid_metadata_error(&candidate, origin, &detail))?;
+        // An ambient archive with no identity is skipped rather than trusted.
         if metadata.is_none() && !origin.is_deliberate() {
             continue;
         }
-        return accept(candidate, origin, expectation);
+        return accept(candidate, origin, expectation, metadata);
     }
     Err(not_found_error(None))
 }
@@ -315,11 +321,13 @@ fn accept(
     path: PathBuf,
     origin: RuntimeOrigin,
     expectation: &RuntimeExpectation,
+    metadata: Option<RuntimeMetadata>,
 ) -> Result<RuntimeArtifact, BackendError> {
-    let metadata = read_metadata(&path);
     if let Some(metadata) = &metadata {
-        if let Some(mismatch) = incompatibility(metadata, expectation) {
-            return Err(incompatible_runtime_error(&path, origin, &mismatch));
+        let mut mismatches = incompatibility(metadata, expectation).unwrap_or_default();
+        mismatches.extend(archive_integrity_mismatches(&path, origin, metadata)?);
+        if !mismatches.is_empty() {
+            return Err(incompatible_runtime_error(&path, origin, &mismatches));
         }
     }
     Ok(RuntimeArtifact {
@@ -339,7 +347,10 @@ fn incompatibility(
     metadata: &RuntimeMetadata,
     expectation: &RuntimeExpectation,
 ) -> Option<Vec<Mismatch>> {
+    let expected_schema = RUNTIME_METADATA_SCHEMA_VERSION.to_string();
+    let found_schema = metadata.schema_version.to_string();
     let comparisons = [
+        ("metadata schema", &expected_schema, &found_schema),
         ("ABI", &expectation.abi_version, &metadata.abi_version),
         (
             "target",
@@ -364,6 +375,38 @@ fn incompatibility(
         })
         .collect();
     (!mismatches.is_empty()).then_some(mismatches)
+}
+
+fn archive_integrity_mismatches(
+    path: &Path,
+    origin: RuntimeOrigin,
+    metadata: &RuntimeMetadata,
+) -> Result<Vec<Mismatch>, BackendError> {
+    let archive = std::fs::read(path).map_err(|error| {
+        invalid_metadata_error(
+            path,
+            origin,
+            &format!("failed to read archive bytes: {error}"),
+        )
+    })?;
+    let actual_bytes = archive.len() as u64;
+    let actual_sha256 = sha256_hex(&archive);
+    let mut mismatches = Vec::new();
+    if metadata.bytes != actual_bytes {
+        mismatches.push(Mismatch {
+            field: "archive bytes",
+            expected: metadata.bytes.to_string(),
+            found: actual_bytes.to_string(),
+        });
+    }
+    if metadata.sha256 != actual_sha256 {
+        mismatches.push(Mismatch {
+            field: "archive SHA-256",
+            expected: metadata.sha256.clone(),
+            found: actual_sha256,
+        });
+    }
+    Ok(mismatches)
 }
 
 #[derive(Debug, Clone)]
@@ -403,14 +446,38 @@ fn incompatible_runtime_error(
         )])
 }
 
+fn invalid_metadata_error(path: &Path, origin: RuntimeOrigin, detail: &str) -> BackendError {
+    BackendError::from_diagnostics(vec![Diagnostic::new(
+        "B0003",
+        format!(
+            "the selected runtime artifact has invalid identity metadata\nselected runtime: {}\norigin: {}\n{detail}",
+            path.display(),
+            origin.as_str()
+        ),
+        Span::default(),
+    )
+    .with_note("runtime identity must be readable and complete before the archive is linked")
+    .with_help(
+        "rebuild the compiler so it bundles a matching runtime, or replace the archive and its .doria-runtime.json sidecar together",
+    )])
+}
+
 /// Read the sidecar written beside an archive by the build script.
 ///
-/// A missing or unreadable sidecar is absence of identity, not an error: some
-/// archives legitimately predate the sidecar. Callers decide what absence
-/// means, and an ambient archive without identity is skipped rather than used.
-fn read_metadata(archive: &Path) -> Option<RuntimeMetadata> {
-    let raw = std::fs::read_to_string(metadata_path(archive)).ok()?;
+/// A missing sidecar is absence of identity: deliberate archives may predate
+/// the sidecar, while ambient archives without identity are skipped. A sidecar
+/// that exists but cannot be read or parsed is different: it is broken identity
+/// evidence and must never be silently treated as no evidence.
+fn load_metadata(archive: &Path) -> Result<Option<RuntimeMetadata>, String> {
+    let path = metadata_path(archive);
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("failed to read {}: {error}", path.display())),
+    };
     parse_metadata(&raw)
+        .map(Some)
+        .ok_or_else(|| format!("{} is malformed or incomplete", path.display()))
 }
 
 pub fn metadata_path(archive: &Path) -> PathBuf {
@@ -503,7 +570,8 @@ mod tests {
     fn write_archive(path: &Path, overrides: &[(&str, &str)]) {
         fs::create_dir_all(path.parent().expect("archive should have a parent"))
             .expect("archive directory should be created");
-        fs::write(path, b"archive").expect("archive fixture should be written");
+        let archive = b"archive";
+        fs::write(path, archive).expect("archive fixture should be written");
         let expectation = expectation();
         let mut abi = expectation.abi_version;
         let mut target = expectation.target_triple;
@@ -519,7 +587,9 @@ mod tests {
             }
         }
         let document = format!(
-            "{{\n  \"schemaVersion\": 1,\n  \"abiVersion\": \"{abi}\",\n  \"runtimeRevision\": \"{revision}\",\n  \"targetTriple\": \"{target}\",\n  \"profile\": \"{profile}\",\n  \"featureSet\": [\"standalone-windows-support\"],\n  \"bytes\": 7,\n  \"sha256\": \"abc123\"\n}}\n"
+            "{{\n  \"schemaVersion\": 1,\n  \"abiVersion\": \"{abi}\",\n  \"runtimeRevision\": \"{revision}\",\n  \"targetTriple\": \"{target}\",\n  \"profile\": \"{profile}\",\n  \"featureSet\": [\"standalone-windows-support\"],\n  \"bytes\": {},\n  \"sha256\": \"{}\"\n}}\n",
+            archive.len(),
+            sha256_hex(archive),
         );
         fs::write(metadata_path(path), document).expect("sidecar should be written");
     }
@@ -658,6 +728,50 @@ mod tests {
         let error = resolve_in(&directory, None, Some(&compiler_built), "release")
             .expect_err("a revision mismatch must be rejected");
         assert!(error.message.contains("deadbeef"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn replaced_archive_bytes_are_rejected_before_linking() {
+        let directory = temp_directory("integrity-size");
+        let compiler_built = directory.join("build/libdoria_rt.a");
+        write_archive(&compiler_built, &[]);
+        fs::write(&compiler_built, b"different bytes entirely")
+            .expect("archive should be replaced");
+
+        let error = resolve_in(&directory, None, Some(&compiler_built), "release")
+            .expect_err("a stale sidecar must not authenticate replaced bytes");
+        assert!(error.message.contains("archive bytes"));
+        assert!(error.message.contains("archive SHA-256"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn same_size_replacement_is_rejected_by_digest_before_linking() {
+        let directory = temp_directory("integrity-digest");
+        let compiler_built = directory.join("build/libdoria_rt.a");
+        write_archive(&compiler_built, &[]);
+        fs::write(&compiler_built, b"ARCHIVE").expect("archive should be replaced");
+
+        let error = resolve_in(&directory, None, Some(&compiler_built), "release")
+            .expect_err("equal size must not bypass digest verification");
+        assert!(!error.message.contains("archive bytes"));
+        assert!(error.message.contains("archive SHA-256"));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn malformed_present_metadata_is_rejected() {
+        let directory = temp_directory("malformed-metadata");
+        let compiler_built = directory.join("build/libdoria_rt.a");
+        write_archive(&compiler_built, &[]);
+        fs::write(metadata_path(&compiler_built), "not metadata")
+            .expect("sidecar should be replaced");
+
+        let error = resolve_in(&directory, None, Some(&compiler_built), "release")
+            .expect_err("present malformed identity must not become absent identity");
+        assert!(error.message.contains("invalid identity metadata"));
+        assert!(error.message.contains("malformed or incomplete"));
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -836,13 +950,11 @@ mod tests {
         assert_eq!(provenance.runtime_revision.as_deref(), Some("cafebabe"));
         assert!(provenance.metadata_path.is_some());
         assert_eq!(provenance.bytes, Some(7));
-        // The digest is of the bytes on disk, not the sidecar's claim, so a
-        // sidecar that no longer describes its archive is visible.
         assert_eq!(
             provenance.sha256.as_deref(),
             Some(sha256_hex(b"archive").as_str())
         );
-        assert_eq!(provenance.digest_matches_metadata, Some(false));
+        assert_eq!(provenance.digest_matches_metadata, Some(true));
         let _ = fs::remove_dir_all(directory);
     }
 
@@ -872,14 +984,55 @@ mod tests {
         let directory = temp_directory("provenance-drift");
         let compiler_built = directory.join("build/libdoria_rt.a");
         write_archive(&compiler_built, &[]);
-        // The sidecar keeps claiming the original digest while the archive
-        // changes underneath it.
+        let metadata = load_metadata(&compiler_built)
+            .expect("metadata should be readable")
+            .expect("metadata should exist");
+        // Provenance still compares current disk bytes even though normal
+        // selection would now reject this artifact before linking.
         fs::write(&compiler_built, b"different bytes entirely")
             .expect("archive should be rewritten");
-        let resolved = resolve_in(&directory, None, Some(&compiler_built), "release")
-            .expect("runtime should resolve");
-        assert_eq!(resolved.provenance().digest_matches_metadata, Some(false));
+        let artifact = RuntimeArtifact {
+            path: compiler_built,
+            origin: RuntimeOrigin::CompilerBundled,
+            metadata: Some(metadata),
+        };
+        assert_eq!(artifact.provenance().digest_matches_metadata, Some(false));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn requested_native_profile_selects_its_matching_bundled_runtime() {
+        assert_eq!(
+            RuntimeExpectation::current(NativeProfile::Fast).profile,
+            "debug"
+        );
+        assert_eq!(
+            RuntimeExpectation::current(NativeProfile::Release).profile,
+            "release"
+        );
+        if !cfg!(feature = "bundled-runtime") {
+            return;
+        }
+
+        let debug = compiler_built_runtime(NativeProfile::Fast)
+            .expect("a bundled build should carry a debug runtime");
+        let release = compiler_built_runtime(NativeProfile::Release)
+            .expect("a bundled build should carry a release runtime");
+        assert_ne!(debug, release);
+        assert_eq!(
+            load_metadata(debug)
+                .expect("debug metadata should parse")
+                .expect("debug metadata should exist")
+                .profile,
+            "debug"
+        );
+        assert_eq!(
+            load_metadata(release)
+                .expect("release metadata should parse")
+                .expect("release metadata should exist")
+                .profile,
+            "release"
+        );
     }
 
     #[test]

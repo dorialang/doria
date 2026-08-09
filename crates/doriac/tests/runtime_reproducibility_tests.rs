@@ -24,10 +24,6 @@ fn target_triple() -> &'static str {
     env!("DORIA_RT_EXPECTED_TARGET")
 }
 
-fn profile() -> &'static str {
-    env!("DORIA_RT_EXPECTED_PROFILE")
-}
-
 fn archive_filename() -> &'static str {
     if target_triple().ends_with("windows-msvc") {
         "doria_rt.lib"
@@ -36,7 +32,7 @@ fn archive_filename() -> &'static str {
     }
 }
 
-fn build_runtime_into(target_dir: &Path) -> PathBuf {
+fn build_runtime_into(target_dir: &Path, profile: &str) -> PathBuf {
     let root = workspace_root();
     let mut command = Command::new(env!("CARGO"));
     command
@@ -51,7 +47,7 @@ fn build_runtime_into(target_dir: &Path) -> PathBuf {
         .env("CARGO_TARGET_DIR", target_dir)
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env("CARGO_INCREMENTAL", "0");
-    if profile() == "release" {
+    if profile == "release" {
         command.arg("--release");
     }
     if std::env::var("CARGO_NET_OFFLINE").is_ok_and(|value| value == "true") {
@@ -68,7 +64,7 @@ fn build_runtime_into(target_dir: &Path) -> PathBuf {
 
     let archive = target_dir
         .join(target_triple())
-        .join(profile())
+        .join(profile)
         .join(archive_filename());
     assert!(
         archive.is_file(),
@@ -88,34 +84,50 @@ fn identity(archive: &Path) -> (Option<u64>, Option<String>) {
     (provenance.bytes, provenance.sha256)
 }
 
+fn bundled_runtime(profile: &str) -> PathBuf {
+    let path = match profile {
+        "debug" => option_env!("DORIA_RT_BUILT_DEBUG_PATH"),
+        "release" => option_env!("DORIA_RT_BUILT_RELEASE_PATH"),
+        other => panic!("unknown runtime profile {other}"),
+    };
+    path.map(PathBuf::from)
+        .unwrap_or_else(|| panic!("a bundled-runtime build must record its {profile} archive"))
+}
+
 #[test]
 fn one_revision_produces_one_runtime_archive() {
     if !cfg!(feature = "bundled-runtime") {
         return;
     }
 
-    let bundled = option_env!("DORIA_RT_BUILT_PATH")
-        .map(PathBuf::from)
-        .expect("a bundled-runtime build must record its archive path");
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"));
-    let first = build_runtime_into(&scratch.join("runtime-reproducibility-first"));
-    let second = build_runtime_into(&scratch.join("runtime-reproducibility-second"));
+    for profile in ["debug", "release"] {
+        let bundled = bundled_runtime(profile);
+        let first = build_runtime_into(
+            &scratch.join(format!("runtime-reproducibility-{profile}-first")),
+            profile,
+        );
+        let second = build_runtime_into(
+            &scratch.join(format!("runtime-reproducibility-{profile}-second")),
+            profile,
+        );
 
-    let bundled_identity = identity(&bundled);
-    let first_identity = identity(&first);
-    let second_identity = identity(&second);
-    assert!(
-        bundled_identity.1.is_some(),
-        "bundled runtime was unreadable"
-    );
-    assert_eq!(
-        bundled_identity, first_identity,
-        "the compiler-bundled runtime differs from a clean build"
-    );
-    assert_eq!(
-        first_identity, second_identity,
-        "one revision produced different runtime archives in clean directories"
-    );
+        let bundled_identity = identity(&bundled);
+        let first_identity = identity(&first);
+        let second_identity = identity(&second);
+        assert!(
+            bundled_identity.1.is_some(),
+            "bundled {profile} runtime was unreadable"
+        );
+        assert_eq!(
+            bundled_identity, first_identity,
+            "the compiler-bundled {profile} runtime differs from a clean build"
+        );
+        assert_eq!(
+            first_identity, second_identity,
+            "one revision produced different {profile} runtime archives in clean directories"
+        );
+    }
 }
 
 #[test]
@@ -124,21 +136,22 @@ fn bundled_runtime_sidecar_describes_the_archive() {
         return;
     }
 
-    let bundled = option_env!("DORIA_RT_BUILT_PATH")
-        .map(PathBuf::from)
-        .expect("a bundled-runtime build must record its archive path");
-    let mut metadata_name = bundled
-        .file_name()
-        .expect("runtime archive filename")
-        .to_os_string();
-    metadata_name.push(".doria-runtime.json");
-    let metadata_path = bundled.with_file_name(metadata_name);
-    let document = std::fs::read_to_string(&metadata_path)
-        .unwrap_or_else(|error| panic!("reading {}: {error}", metadata_path.display()));
-    let (bytes, sha256) = identity(&bundled);
-    let bytes = bytes.expect("runtime archive size");
-    let sha256 = sha256.expect("runtime archive digest");
+    for profile in ["debug", "release"] {
+        let bundled = bundled_runtime(profile);
+        let mut metadata_name = bundled
+            .file_name()
+            .expect("runtime archive filename")
+            .to_os_string();
+        metadata_name.push(".doria-runtime.json");
+        let metadata_path = bundled.with_file_name(metadata_name);
+        let document = std::fs::read_to_string(&metadata_path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", metadata_path.display()));
+        let (bytes, sha256) = identity(&bundled);
+        let bytes = bytes.expect("runtime archive size");
+        let sha256 = sha256.expect("runtime archive digest");
 
-    assert!(document.contains(&format!("\"bytes\": {bytes}")));
-    assert!(document.contains(&format!("\"sha256\": \"{sha256}\"")));
+        assert!(document.contains(&format!("\"profile\": \"{profile}\"")));
+        assert!(document.contains(&format!("\"bytes\": {bytes}")));
+        assert!(document.contains(&format!("\"sha256\": \"{sha256}\"")));
+    }
 }

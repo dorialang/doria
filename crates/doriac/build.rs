@@ -75,18 +75,12 @@ fn main() {
     println!("cargo:rustc-env=DORIA_RT_ABI_VERSION={runtime_abi_version}");
 
     let target = env::var("TARGET").expect("Cargo target triple");
-    let profile = env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
     println!("cargo:rustc-env=DORIA_RT_EXPECTED_TARGET={target}");
-    println!("cargo:rustc-env=DORIA_RT_EXPECTED_PROFILE={profile}");
     println!("cargo:rustc-env=DORIA_RT_EXPECTED_REVISION={build_commit}");
 
     if env::var_os("CARGO_FEATURE_BUNDLED_RUNTIME").is_none() {
         return;
     }
-    assert!(
-        matches!(profile.as_str(), "debug" | "release"),
-        "unsupported Cargo artifact profile `{profile}`"
-    );
 
     let filename = if target.ends_with("windows-msvc") {
         "doria_rt.lib"
@@ -94,10 +88,12 @@ fn main() {
         "libdoria_rt.a"
     };
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory"));
-    let output = out_dir.join(filename);
 
-    // The runtime is built by cargo, from `doria-rt`'s own manifest, rather than
-    // by invoking `rustc` here with hand-picked dependency rlibs.
+    // Both native profiles are built by cargo from `doria-rt`'s own manifest,
+    // rather than by invoking `rustc` here with hand-picked dependency rlibs.
+    // The profile used to build doriac cannot decide which runtime a later
+    // `doriac compile --release` invocation needs, so a compiler carries one
+    // identified archive for each selectable Doria native profile.
     //
     // The previous approach could not be made correct. A build script has no
     // supported way to depend on, order, or locate its own package's *normal*
@@ -114,29 +110,57 @@ fn main() {
     // the correct 12.7 MB one.
     //
     // Letting cargo resolve the runtime removes the guess rather than improving
-    // it. Cargo knows the features `doria-rt` declares and the profile in force,
-    // and it writes the archive to exactly one path.
+    // it. Cargo knows the features `doria-rt` declares and the explicitly
+    // requested profile, and it writes each archive to exactly one path.
     let runtime_target_dir = out_dir.join("doria-rt-target");
-    let profile_directory = if profile == "release" {
-        "release"
-    } else {
-        "debug"
-    };
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    for profile in ["debug", "release"] {
+        let output = out_dir.join("doria-rt").join(profile).join(filename);
+        build_runtime_profile(
+            &cargo,
+            &runtime_manifest,
+            &runtime_target_dir,
+            &target,
+            profile,
+            filename,
+            &output,
+            &runtime_abi_version,
+            &build_commit,
+        );
+        println!(
+            "cargo:rustc-env=DORIA_RT_BUILT_{}_PATH={}",
+            profile.to_ascii_uppercase(),
+            output.display()
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_runtime_profile(
+    cargo: &OsString,
+    runtime_manifest: &Path,
+    runtime_target_dir: &Path,
+    target: &str,
+    profile: &str,
+    filename: &str,
+    output: &Path,
+    runtime_abi_version: &str,
+    build_commit: &str,
+) {
     let mut command = Command::new(cargo);
     command
         .arg("build")
         .arg("--manifest-path")
-        .arg(&runtime_manifest)
+        .arg(runtime_manifest)
         .arg("--package")
         .arg("doria-rt")
         .arg("--locked")
         .arg("--target")
-        .arg(&target)
+        .arg(target)
         // A nested cargo must not share the target directory of the build that
         // invoked it: cargo takes an exclusive lock on it and the two would
         // deadlock waiting for each other.
-        .env("CARGO_TARGET_DIR", &runtime_target_dir)
+        .env("CARGO_TARGET_DIR", runtime_target_dir)
         // `cargo clippy` sets this to `clippy-driver` for workspace members, and
         // `doria-rt` is a workspace member. Inherited, it builds the runtime
         // through a lint driver and yields a different archive than `cargo
@@ -168,16 +192,24 @@ fn main() {
     // Exactly one path, derived from what was asked for rather than searched
     // for. If cargo did not put the archive here, that is a fact worth failing
     // on: the alternative is to go looking, which is the defect this replaced.
-    let built = runtime_target_dir
-        .join(&target)
-        .join(profile_directory)
-        .join(filename);
+    let built = runtime_target_dir.join(target).join(profile).join(filename);
     assert!(
         built.is_file(),
         "cargo did not produce the doria-rt static library at {}",
         built.display()
     );
-    std::fs::copy(&built, &output).unwrap_or_else(|error| {
+    std::fs::create_dir_all(
+        output
+            .parent()
+            .expect("bundled runtime output must have a parent"),
+    )
+    .unwrap_or_else(|error| {
+        panic!(
+            "creating bundled runtime directory for {}: {error}",
+            output.display()
+        )
+    });
+    std::fs::copy(&built, output).unwrap_or_else(|error| {
         panic!(
             "copying runtime archive {} to {}: {error}",
             built.display(),
@@ -185,20 +217,18 @@ fn main() {
         )
     });
 
-    println!("cargo:rustc-env=DORIA_RT_BUILT_PATH={}", output.display());
-
     // Identity for the archive just produced. Without this the compiler can
     // only compare paths and modification times, which is how a stale archive
     // from an unrelated build previously shadowed the correct runtime and
     // failed the link with an unexplained missing symbol.
-    let archive = std::fs::read(&output)
+    let archive = std::fs::read(output)
         .unwrap_or_else(|error| panic!("runtime archive at {}: {error}", output.display()));
-    let metadata_path = runtime_metadata_path(&output);
+    let metadata_path = runtime_metadata_path(output);
     let document = runtime_metadata_document(
-        &runtime_abi_version,
-        &build_commit,
-        &target,
-        &profile,
+        runtime_abi_version,
+        build_commit,
+        target,
+        profile,
         archive.len(),
         &sha256_hex(&archive),
     );
@@ -208,10 +238,6 @@ fn main() {
             metadata_path.display()
         )
     });
-    println!(
-        "cargo:rustc-env=DORIA_RT_BUILT_METADATA_PATH={}",
-        metadata_path.display()
-    );
 }
 
 /// Sidecar path for a runtime archive: the archive path plus a fixed suffix, so

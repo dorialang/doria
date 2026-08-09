@@ -14,7 +14,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  DORIA_RT_PATH: ${{ github.workspace }}/target/debug/libdoria_rt.a
 
 jobs:
   parser-fuzz:
