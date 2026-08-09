@@ -576,7 +576,8 @@ function main(): void
 "#,
         "E0521",
     );
-    assert!(family.message.contains("Decision 0100"));
+    // 0113 amends 0100 and is now the record the surface gate names.
+    assert!(family.message.contains("Decision 0113"));
 }
 
 #[test]
@@ -701,8 +702,10 @@ function main(): void
 fn bool_collection_element_read_lowers_without_malformed_mir() {
     // Regression: reading a `bool` element out of a collection/array used to fail
     // shared MIR validation ("bool expression has an incompatible operand") because
-    // the bool operand surface omitted `Operand::CollectionIndex`.
-    doriac::lower_source_to_mir(
+    // the bool operand surface omitted `Operand::CollectionIndex`. The defect was
+    // in validation, not lowering, so the validator has to run for this to guard
+    // anything.
+    let program = doriac::lower_source_to_mir(
         "stage23-bool-collection.doria",
         r#"
 function main(): void
@@ -723,7 +726,10 @@ function main(): void
 }
 "#,
     )
-    .expect("bool collection/array element reads must lower to well-formed MIR");
+    .expect("bool collection/array element reads must lower");
+
+    doriac::mir_validation::validate_program(&program)
+        .expect("bool collection/array element reads must pass shared MIR validation");
 }
 
 #[test]

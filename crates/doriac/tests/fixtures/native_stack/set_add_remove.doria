@@ -1,0 +1,17 @@
+// Set::add and Set::remove in a loop body. Each iteration adds a value the set
+// does not hold and removes it again, so both calls report a change.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    writable Set<int> $values = Set::from([]);
+    let writable $changes = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        if ($values->add($index % 64)) {
+            $changes = ($changes + 1) % 1000003;
+        }
+        if ($values->remove($index % 64)) {
+            $changes = ($changes + 2) % 1000003;
+        }
+    }
+    echo "{$changes}:{$values->count}\n";
+}

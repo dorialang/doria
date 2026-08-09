@@ -1,7 +1,9 @@
 # Decision 0100: Collection method surface
 
-**Status:** Accepted (the method surface, receiver/ownership modes, and
-missing-element contract for the whole collection family are settled here).
+**Status:** Accepted, **amended by [0113](0113-collection-surface-completion.md)**
+(the receiver/ownership modes and missing-element contract settled here stand;
+0113 replaces this record's membership naming, adds the members left out, and
+settles its deferrals).
 Consumes decision 0092's type inventory; feeds the Stage 23 collections-runtime
 implementation.
 
@@ -181,8 +183,7 @@ Bracket literals build `List`/`Dictionary`/`T[]` by context typing (§4.9). `::f
 is the explicit constructor from an existing sequence, and it is **required** for
 **every collection with no bracket-literal form** — `Set`, `SortedSet`,
 `SortedDictionary`, `PriorityQueue`, and `Deque` — because for those it is the only
-construction path. It is also **available** as the equivalent explicit form for the
-literal-constructible types (`List`/`Dictionary`/`T[]`). Each `::from` accepts the
+construction path. Each `::from` accepts the
 element (or key/value pair, for the map types) sequence its own type expects — e.g.
 `Set::from([...])`, `PriorityQueue::from([...])`, `Deque::from([...])`, and
 `SortedDictionary::from(["k" => v, ...])`. Existing-source `::from` preserves
@@ -219,9 +220,12 @@ with the runtime representation (0092).
 - **Fluent (`writable self`) built-in mutators.** Rejected for v1.0 — statement
   mutation is the idiom the stage needs, and userland fluent APIs are already
   served by 0088. Deferred, not precluded.
-- **Uniform `has` / uniform `contains`.** Rejected — `contains(value)` for the
-  sequence/set membership and `has(key)` for the map read differently on purpose:
-  the verb signals value-membership versus key-presence.
+- **Uniform `has` / uniform `contains`.** Rejected here, **reversed by 0113**.
+  The argument below was that the differing verb signals value-membership versus
+  key-presence. 0113 found the opposite in practice: `has` is undiscoverable
+  precisely because it is the family's only membership spelling that is not
+  `contains`. The axis is now carried by a suffix rather than by a different
+  root, so a map spells it `containsKey` / `containsValue`.
 - **Two-parameter `PriorityQueue<TElement, TPriority>` and max-first polarity.**
   Rejected per 0092 (single `Comparable` parameter) and above (min-first for the
   target workloads).

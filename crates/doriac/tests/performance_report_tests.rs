@@ -75,6 +75,21 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
     );
     assert_eq!(report["phases"]["llvmCodeGeneration"]["available"], false);
     assert_eq!(report["phases"]["link"]["available"], true);
+    let linker = report["linker"]["executable"]
+        .as_str()
+        .expect("linker executable");
+    let link_command = report["linker"]["command"]
+        .as_array()
+        .expect("link command");
+    assert!(!linker.is_empty());
+    assert_eq!(
+        link_command.first().and_then(|value| value.as_str()),
+        Some(linker)
+    );
+    assert!(
+        link_command.len() >= 4,
+        "link command should retain its inputs"
+    );
     assert!(report["metrics"]["outputBytes"]
         .as_u64()
         .is_some_and(|value| value > 0));
@@ -102,6 +117,7 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
     assert!(report["artifacts"]["runtime"]["path"]
         .as_str()
         .is_some_and(|path| !path.is_empty()));
+    assert_eq!(report["artifacts"]["runtime"]["profile"], "debug");
     assert_eq!(
         report["artifacts"]["runtime"]["bytes"],
         report["metrics"]["runtimeArtifactBytes"]
@@ -475,6 +491,7 @@ fn release_report_identifies_llvm_without_cranelift_phase_data() {
         serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
             .expect("JSON");
     assert_eq!(report["backend"], "llvm");
+    assert_eq!(report["artifacts"]["runtime"]["profile"], "release");
     assert_eq!(report["phases"]["llvmCodeGeneration"]["available"], true);
     assert_eq!(
         report["phases"]["craneliftCodeGeneration"]["available"],

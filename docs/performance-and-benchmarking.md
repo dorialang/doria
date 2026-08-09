@@ -32,8 +32,8 @@ eligible for ordinary optimization; no group value survives in generated code.
 
 ## Stage 26b performance baseline foundation
 
-Stage 26b is in progress. Decision 0112 accepts the repository-owned measurement,
-provenance, and regression contract. Slices 1 and 2 are complete: the sibling benchmark
+Stage 26b is complete. Decision 0112 accepts the repository-owned measurement,
+provenance, and regression contract. All three slices are complete: the sibling benchmark
 repository has a strict manifest, versioned JSON schema, committed correctness
 fixtures, round-robin sampling, explicit toolchain selection, complete available
 provenance, and the first three diagnostic pairs. `doriac compile
@@ -42,8 +42,53 @@ evidence without changing the ordinary compile path. Slice 2 records the initial
 compiler/generated/runtime/diagnostic matrix, deterministic source scaling,
 process resource counters, separate optional Callgrind/DHAT evidence, candidate
 evidence, and an exact structural baseline without timing thresholds. Slice 3
-adds peers for the new cases and accepts controlled timing thresholds. This is not an
-unlimited optimization campaign and does not displace Stage 36a's stream gate.
+adds peers for the new cases, the exact native acceptance policy, and controlled
+measurement and promotion workflows. Timing thresholds still require a separate
+review of eligible evidence. This is not an unlimited optimization campaign and
+does not displace Stage 36a's stream gate.
+
+Eligible physical-host timing is a release-evidence gate, not a compiler-stage
+gate. Docker, WSL, containers, and virtual machines may run the suite for
+correctness, workflow rehearsal, optimization guidance, and local regression
+investigation; their timing remains Inconclusive and cannot promote a baseline
+or support a release/public performance claim. Missing qualifying hardware does
+not halt language or compiler development. The exact state until a runner is
+available is `Measurement Status: Pending Available Runner`.
+
+Portable closure requires benchmark correctness, interpreter/Cranelift/LLVM
+parity, exact compiler/runtime provenance, deterministic runtime selection,
+workload scaling, peer-equivalence metadata, the exact `1.30` rule, structural
+baselines, portable smoke validation, the failure/scheduled-work register, and
+controlled-runner commands/report schemas. Controlled Linux timing, verified
+affinity, Callgrind, DHAT, hardware counters, and cross-platform timing baselines
+are not Stage 26b or Stage 27 closure conditions.
+
+Slice 3 Part 1 is delivered. C, C++, Rust, and PHP peers cover the comparative
+generated-program and runtime-subsystem cases, and every comparative case that
+ranks Doria against another language now carries a peer equivalence record that
+the manifest loader enforces: what each peer does, every known semantic
+difference, and which side it favours. Peers use idiomatic constructs and are not
+handicapped to match stricter Doria defaults, so differences favouring the peer
+stay visible.
+
+Two controlled candidate sessions across five targets, covering both the
+Cranelift and LLVM backends, produced a timing threshold proposal that accepts
+nothing. Its finding is that seventy-nine of eighty case and target pairs are
+dominated by process startup rather than by their workload, so those cases
+cannot carry a timing threshold until their workloads are scaled. The one pair
+above the floor threshold clears it by about 2.6 ms, which is too small a margin
+to build a threshold on. Neither session is timing baseline eligible because CPU
+affinity cannot be verified on macOS; both are structurally eligible.
+
+The slice also produced a provenance finding that outlives its numbers. An
+earlier write-up reported `string_search` on Cranelift at 6.6 times its startup
+floor; that result did not survive a compiler rebuild and is withdrawn. The
+compiler now closes the underlying defect by building and bundling one
+deterministic runtime artifact for the selected target/profile and recording its
+SHA-256, ABI, revision, target, profile, origin, and path. Cross-session analysis
+also records the compiled `doriac` SHA-256 and refuses mismatched compiler or
+runtime identity. The historical measurements remain ineligible; fixing
+provenance does not retroactively validate them.
 
 The runner has three separate tracks:
 
@@ -91,9 +136,9 @@ Initial executable cases are `hello_world`, `startup`, `fibonacci`, `primes`,
 JSON, routing, templating, raylib, async, networking, or streams join only when
 their owning stages land.
 
-The initial comparison set is C, Rust, and PHP: C and Rust are native baselines;
-PHP is the central adoption comparison. C++, Java, C#, JavaScript, and Python may
-join after the runner and fairness rules stabilize. The project-owned runner
+The native acceptance peer set is C, C++, and Rust. PHP remains the central
+adoption comparison but never participates in the native pass/fail calculation.
+Java, C#, JavaScript, and Python remain supplemental evidence. The project-owned runner
 uses the existing sibling `benchmarks` repository's `bench.php` entry point and
 flat peer-source case layout; a future `baton bench` orchestrates the same
 benchmark engine instead of creating another one.
@@ -103,7 +148,7 @@ before timing is accepted; no target supplies an implicit reference. Every repor
 flags, machine, inputs, runner identity, and profile. Cold startup remains
 separate from hot throughput, compile time remains separate from runtime, and
 unfavorable results remain visible. Controlled runs default to five warmups and
-at least ten measured rounds, interleaved across targets with rotating order.
+at least fifteen measured rounds, interleaved across targets with rotating order.
 Quick reports are explicitly baseline-ineligible. Curated reports may be committed; raw
 generated results normally are not. Shared CI owns deterministic structural
 checks; controlled runners own timing thresholds. Public claims remain specific
@@ -134,6 +179,13 @@ Target:
 - Doria should be far faster than PHP and Python for CPU-bound userland code, and must never treat that comparison as evidence of good performance.
 - Performance work is continuous. As the language matures, keep looking for headroom rather than settling at a benchmark ranking.
 ```
+
+The minimum passing native runtime result is a median no more than 30% slower
+than the fastest valid C, C++, or Rust peer for that workload: `ratio <= 1.30`.
+A larger ratio is Fail. Inadequate or incomparable evidence is Inconclusive,
+never Pass, and planned future optimization does not relabel a failure. Only
+Andrew may change this boundary. Doria's own regression thresholds are separate;
+they prevent backsliding but cannot weaken the cross-language result.
 
 The shared-backend limit is real and should be reasoned about rather than wished away. Doria, Clang, and rustc all lower through LLVM, so on scalar code LLVM already optimizes well, parity is the realistic ceiling. Beating C therefore means emitting information a C compiler cannot derive: aliasing facts implied by ownership, whole-program monomorphization and devirtualization, guaranteed alignment and dereferenceability, escape analysis into stack or arena allocation, and profile-guided layout by default. Those are the sanctioned routes to a win, and each is a compiler capability rather than a benchmark trick.
 

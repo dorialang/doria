@@ -2,7 +2,18 @@
 
 declare(strict_types=1);
 
-/** @return list<string> */
+/**
+ * Validate the pinned benchmark revision against the optional sibling checkout.
+ *
+ * This answers "is the checkout next to me the one I pinned", which is a local
+ * question. It deliberately does not answer "can anyone else obtain this
+ * revision": a sibling sitting on unpushed work satisfies every check here while
+ * the pin names a commit that exists on no remote. Reachability from a published
+ * ref is proven separately by scripts/check_cross_repo_pins.php, and this
+ * function is not a substitute for it.
+ *
+ * @return list<string>
+ */
 function check_benchmark_revision(string $root): array
 {
     $pinPath = $root . '/benchmarks-revision.json';

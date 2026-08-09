@@ -1,0 +1,14 @@
+// Dictionary::set and Dictionary::remove in a loop body. Both lower through
+// scratch slots of their own, so both grew the frame on every pass before the
+// entry-block fix.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    writable Dictionary<int, int> $values = [];
+    let writable $checksum = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        $values->set($index % 64, $index);
+        $checksum = ($checksum + ($values->remove($index % 64) ?? 0)) % 1000003;
+    }
+    echo "{$checksum}:{$values->count}\n";
+}

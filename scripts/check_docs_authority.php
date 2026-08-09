@@ -34,7 +34,11 @@ function relative_path(string $root, string $path): string
 
 function is_skipped_path(string $path): bool
 {
-    foreach (['.git/', 'target/', 'node_modules/'] as $skip) {
+    // `.claude/worktrees/` holds transient checkouts of this same repository, so
+    // every document in it is a duplicate of one already checked at the root.
+    // Without this the guard reports each finding once per live worktree, and a
+    // document fixed at the root keeps failing until every worktree is removed.
+    foreach (['.git/', 'target/', 'node_modules/', '.claude/worktrees/'] as $skip) {
         if (str_contains($path, $skip)) {
             return true;
         }
@@ -717,12 +721,13 @@ if ($namingAuthority !== false) {
         || !str_contains($pipeline, 'Stage 43 later')
         || !str_contains($pipeline, 'Stage 26 — Complete')
         || !str_contains($pipeline, 'Stage 26a — Complete')
-        || !str_contains($pipeline, 'Stage 26b — Performance Baseline Foundation — In Progress')
-        || !str_contains($pipeline, 'Stage 27 — Blocked Until Stage 26b Completes')
+        || !str_contains($pipeline, 'Stage 26b — Performance Baseline Foundation — Complete')
+        || !str_contains($pipeline, 'Measurement Status: Pending Available Runner')
+        || !str_contains($pipeline, 'Stage 27 — Sequenced After Decision 0113; No Performance-Evidence Dependency')
         || !str_contains($pipeline, 'Stage 36a Public Spellings — Deferred')
         || !str_contains($pipeline, 'Stage 36a — Not Implemented')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 and 26a complete, Stage 26b Slices 1 and 2 complete with Slice 3 next, Stage 27 blocked until 26b, and Stage 36a scheduled but not implemented with public spellings deferred";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 through 26b complete, performance measurement pending an available runner without blocking development, Decision 0113 Slices 2-4 next, Stage 27 sequenced after Decision 0113 without a performance dependency, and Stage 36a scheduled but not implemented with public spellings deferred";
     }
 
     if (

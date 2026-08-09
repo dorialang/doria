@@ -6716,7 +6716,7 @@ impl<'program> Checker<'program> {
                 self.diagnostics.push(Diagnostic::unsupported_stage(
                     "E0521",
                     format!(
-                        "collection method `Set::{}` is not part of the Stage 23 surface settled by Decision 0100",
+                        "collection method `Set::{}` is not part of the collection surface settled by Decision 0113",
                         access.member
                     ),
                     access.span,
@@ -10879,14 +10879,17 @@ impl<'program> Checker<'program> {
             | (TypeKind::Deque(_), "pushFront" | "pushBack") => Some(void),
             (TypeKind::List(value), "removeAt") => Some(value),
             (TypeKind::List(value), "pop") => Some(self.types.intern(TypeKind::Nullable(value))),
-            (TypeKind::List(_), "contains") => Some(bool_ty),
+            (TypeKind::List(_), "contains")
+            | (TypeKind::TypedArray(_), "contains")
+            | (TypeKind::PriorityQueue(_), "contains")
+            | (TypeKind::Deque(_), "contains") => Some(bool_ty),
             (TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value), "get") => {
                 Some(self.types.intern(TypeKind::Nullable(value)))
             }
             (TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value), "remove") => {
                 Some(self.types.intern(TypeKind::Nullable(value)))
             }
-            (TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _), "has")
+            (TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _), "containsKey")
             | (TypeKind::Set(_) | TypeKind::SortedSet(_), "add" | "remove" | "contains") => {
                 Some(bool_ty)
             }
@@ -11012,7 +11015,7 @@ impl<'program> Checker<'program> {
             self.diagnostics.push(Diagnostic::unsupported_stage(
                 "E0521",
                 format!(
-                    "collection property `{property}` is not part of the Stage 23 surface settled by Decision 0100"
+                    "collection property `{property}` is not part of the collection surface settled by Decision 0113"
                 ),
                 span,
             ));
@@ -11051,7 +11054,14 @@ impl<'program> Checker<'program> {
         }
 
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
-        if let (TypeKind::List(value), "contains") = (&kind, method) {
+        if let (
+            TypeKind::List(value)
+            | TypeKind::TypedArray(value)
+            | TypeKind::PriorityQueue(value)
+            | TypeKind::Deque(value),
+            "contains",
+        ) = (&kind, method)
+        {
             self.check_stage23_equatable_type(*value, span);
         }
         let (expected, mutating): (Vec<TypeId>, bool) = match (kind, method) {
@@ -11060,11 +11070,14 @@ impl<'program> Checker<'program> {
             (TypeKind::List(_), "removeAt") => (vec![int], true),
             (TypeKind::List(_), "pop") => (vec![], true),
             (TypeKind::List(value), "contains") => (vec![value], false),
+            (TypeKind::TypedArray(value), "contains") => (vec![value], false),
+            (TypeKind::PriorityQueue(value), "contains") => (vec![value], false),
+            (TypeKind::Deque(value), "contains") => (vec![value], false),
             (TypeKind::Dictionary(key, value), "set") => (vec![key, value], true),
-            (TypeKind::Dictionary(key, _), "get" | "has") => (vec![key], false),
+            (TypeKind::Dictionary(key, _), "get" | "containsKey") => (vec![key], false),
             (TypeKind::Dictionary(key, _), "remove") => (vec![key], true),
             (TypeKind::SortedDictionary(key, value), "set") => (vec![key, value], true),
-            (TypeKind::SortedDictionary(key, _), "get" | "has") => (vec![key], false),
+            (TypeKind::SortedDictionary(key, _), "get" | "containsKey") => (vec![key], false),
             (TypeKind::SortedDictionary(key, _), "remove") => (vec![key], true),
             (TypeKind::Set(value), "add" | "remove") => (vec![value], true),
             (TypeKind::Set(value), "contains") => (vec![value], false),
@@ -11130,7 +11143,7 @@ impl<'program> Checker<'program> {
                 self.diagnostics.push(Diagnostic::unsupported_stage(
                     "E0521",
                     format!(
-                        "collection method `{method}` is not part of the Stage 23 surface settled by Decision 0100"
+                        "collection method `{method}` is not part of the collection surface settled by Decision 0113"
                     ),
                     span,
                 ));

@@ -1,0 +1,11 @@
+// String interpolation in a loop body, building a fresh string every pass.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    let writable $lengths = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        let $text = "value {$index} of {$n}";
+        $lengths = ($lengths + $text->length) % 1000003;
+    }
+    echo "{$lengths}\n";
+}

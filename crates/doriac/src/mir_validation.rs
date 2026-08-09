@@ -1279,6 +1279,7 @@ fn validate_statement(
             validate_rvalue(program, function, value)
         }
         mir::Statement::AssignCollectionIndex {
+            positional,
             collection,
             index,
             value,
@@ -1296,11 +1297,17 @@ fn validate_statement(
                     local.id.0
                 )));
             }
-            let index_type = definition
-                .key
-                .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
-                    IntegerType::Int64,
-                )));
+            // A positional assignment addresses a slot, so its index is an
+            // offset even when the collection is keyed.
+            let index_type = if *positional {
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
+            } else {
+                definition
+                    .key
+                    .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                        IntegerType::Int64,
+                    )))
+            };
             if index.ty() != index_type || value.ty() != definition.value {
                 return Err(malformed_mir("indexed assignment type mismatch"));
             }
@@ -2898,6 +2905,7 @@ fn validate_mixed_expression(
             validate_class_expression(program, function, value)
         }
         mir::MixedExpression::CollectionIndex {
+            positional,
             collection,
             index,
             transfer: _,
@@ -2918,6 +2926,7 @@ fn validate_mixed_expression(
                 collection_type,
                 index,
                 false,
+                *positional,
             )
         }
     }
@@ -3050,6 +3059,7 @@ fn validate_collection_expression(
             source,
             index,
             transfer,
+            positional,
             ..
         } => {
             let source = local_in(function, *source)?;
@@ -3065,7 +3075,7 @@ fn validate_collection_expression(
                     "collection value transfer requires a writable List source",
                 ));
             }
-            validate_collection_index(program, function, source_type, index)
+            validate_collection_index(program, function, source_type, index, *positional)
         }
         mir::CollectionExpression::Property {
             object, property, ..
@@ -3608,12 +3618,20 @@ fn validate_collection_index(
     function: &mir::Function,
     collection: &mir::CollectionType,
     index: &mir::Rvalue,
+    positional: bool,
 ) -> Result<(), BackendError> {
-    let expected = collection
-        .key
-        .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
-            IntegerType::Int64,
-        )));
+    // A positional index addresses a slot, so it is an offset even when the
+    // collection is keyed. Requiring the key type here would reject the only
+    // form that reads an element without searching for it.
+    let expected = if positional {
+        mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
+    } else {
+        collection
+            .key
+            .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                IntegerType::Int64,
+            )))
+    };
     if index.ty() != expected {
         return Err(malformed_mir(format!(
             "collection index has type {}, expected {expected}",
@@ -3630,13 +3648,14 @@ fn validate_collection_element_access(
     collection: &mir::CollectionType,
     index: &mir::Rvalue,
     remove: bool,
+    positional: bool,
 ) -> Result<(), BackendError> {
     if remove && (collection.kind != mir::CollectionKind::List || !local.writable) {
         return Err(malformed_mir(
             "element removal requires a writable List source",
         ));
     }
-    validate_collection_index(program, function, collection, index)
+    validate_collection_index(program, function, collection, index, positional)
 }
 
 fn validate_collection_key_at(
@@ -6931,6 +6950,7 @@ fn validate_class_expression(
             collection,
             index,
             transfer,
+            positional,
             ..
         } => {
             let local = local_in(function, *collection)?;
@@ -6948,6 +6968,7 @@ fn validate_class_expression(
                 collection_type,
                 index,
                 *transfer,
+                *positional,
             )
         }
         mir::ClassExpression::MixedPayload { mixed, .. } => validate_mixed_payload_operand(
@@ -8153,44 +8174,9 @@ fn validate_float_expression(
     expression: &mir::FloatExpression,
 ) -> Result<(), BackendError> {
     match expression {
-        mir::FloatExpression::Use { ty, operand } => match operand {
-            mir::Operand::Scalar(mir::ScalarValue::Float(value)) if value.ty == *ty => Ok(()),
-            mir::Operand::Local(local)
-                if local_in(function, *local)?.ty
-                    == mir::Type::Scalar(mir::ScalarType::Float(*ty)) =>
-            {
-                Ok(())
-            }
-            mir::Operand::NullablePayload(local)
-                if local_in(function, *local)?.ty
-                    == mir::Type::NullableScalar(mir::ScalarType::Float(*ty)) =>
-            {
-                Ok(())
-            }
-            mir::Operand::Property { object, property } => validate_property_operand(
-                program,
-                function,
-                *object,
-                *property,
-                mir::Type::Scalar(mir::ScalarType::Float(*ty)),
-            ),
-            mir::Operand::CollectionKeyAt { collection, offset } => validate_collection_key_at(
-                program,
-                function,
-                *collection,
-                mir::Type::Scalar(mir::ScalarType::Float(*ty)),
-                offset,
-            ),
-            mir::Operand::MixedPayload { mixed, tag } => validate_mixed_payload_operand(
-                function,
-                *mixed,
-                *tag,
-                mir::Type::Scalar(mir::ScalarType::Float(*ty)),
-            ),
-            _ => Err(malformed_mir(
-                "float expression has an incompatible operand",
-            )),
-        },
+        mir::FloatExpression::Use { ty, operand } => {
+            validate_float_operand(program, function, *ty, operand)
+        }
         mir::FloatExpression::Negate { ty, operand } => {
             if operand.ty() != *ty {
                 return Err(malformed_mir(format!(
@@ -8768,72 +8754,7 @@ fn validate_condition(
     condition: &mir::BoolExpression,
 ) -> Result<(), BackendError> {
     match condition {
-        mir::BoolExpression::Use { operand } => match operand {
-            mir::Operand::Scalar(mir::ScalarValue::Bool(_)) => Ok(()),
-            mir::Operand::Local(local)
-                if local_in(function, *local)?.ty == mir::Type::Scalar(mir::ScalarType::Bool) =>
-            {
-                Ok(())
-            }
-            mir::Operand::NullablePayload(local)
-                if local_in(function, *local)?.ty
-                    == mir::Type::NullableScalar(mir::ScalarType::Bool) =>
-            {
-                Ok(())
-            }
-            mir::Operand::Static(id) => {
-                validate_static_operand(program, *id, mir::Type::Scalar(mir::ScalarType::Bool))
-            }
-            mir::Operand::Property { object, property } => validate_property_operand(
-                program,
-                function,
-                *object,
-                *property,
-                mir::Type::Scalar(mir::ScalarType::Bool),
-            ),
-            mir::Operand::CollectionKeyAt { collection, offset } => validate_collection_key_at(
-                program,
-                function,
-                *collection,
-                mir::Type::Scalar(mir::ScalarType::Bool),
-                offset,
-            ),
-            mir::Operand::MixedPayload { mixed, tag } => validate_mixed_payload_operand(
-                function,
-                *mixed,
-                *tag,
-                mir::Type::Scalar(mir::ScalarType::Bool),
-            ),
-            mir::Operand::StringIntrinsic(call) => validate_string_intrinsic(
-                program,
-                function,
-                call,
-                mir::Type::Scalar(mir::ScalarType::Bool),
-            ),
-            mir::Operand::CollectionIndex {
-                collection,
-                index,
-                remove,
-            } => {
-                let local = local_in(function, *collection)?;
-                let mir::Type::Collection(collection_type) = local.ty else {
-                    return Err(malformed_mir("bool index source is not a collection"));
-                };
-                let collection_type = collection_in(program, collection_type)?;
-                if collection_type.value != mir::Type::Scalar(mir::ScalarType::Bool) {
-                    return Err(malformed_mir("bool index element type mismatch"));
-                }
-                validate_collection_element_access(
-                    program,
-                    function,
-                    local,
-                    collection_type,
-                    index,
-                    *remove,
-                )
-            }
-            _ => Err(malformed_mir("bool expression has an incompatible operand")),
-        },
+        mir::BoolExpression::Use { operand } => validate_bool_operand(program, function, operand),
         mir::BoolExpression::Compare { left, right, .. } => {
             if left.ty() != right.ty() {
                 return Err(malformed_mir(format!(
@@ -8934,6 +8855,9 @@ fn validate_condition(
                 (
                     mir::CollectionMembershipOp::Contains,
                     mir::CollectionKind::List
+                    | mir::CollectionKind::TypedArray
+                    | mir::CollectionKind::PriorityQueue
+                    | mir::CollectionKind::Deque
                     | mir::CollectionKind::Dictionary
                     | mir::CollectionKind::SortedDictionary
                     | mir::CollectionKind::Set
@@ -9028,6 +8952,7 @@ fn validate_integer_operand(
             Ok(())
         }
         mir::Operand::CollectionIndex {
+            positional,
             collection,
             index,
             remove,
@@ -9047,6 +8972,7 @@ fn validate_integer_operand(
                 collection_type,
                 index,
                 *remove,
+                *positional,
             )
         }
         mir::Operand::CollectionKeyAt { collection, offset } => validate_collection_key_at(
@@ -9068,6 +8994,171 @@ fn validate_integer_operand(
             call,
             mir::Type::Scalar(mir::ScalarType::Integer(ty)),
         ),
+    }
+}
+
+/// Validates every operand a `bool` value can be read from.
+///
+/// Exhaustive for the same reason as [`validate_integer_operand`]: the
+/// catch-all arm this replaced is what rejected `Operand::CollectionIndex`
+/// bool element reads until they were reported as a bug.
+fn validate_bool_operand(
+    program: &mir::Program,
+    function: &mir::Function,
+    operand: &mir::Operand,
+) -> Result<(), BackendError> {
+    let expected = mir::Type::Scalar(mir::ScalarType::Bool);
+    match operand {
+        mir::Operand::Scalar(mir::ScalarValue::Bool(_)) => Ok(()),
+        mir::Operand::Scalar(_) => Err(malformed_mir(
+            "bool expression contains a non-bool constant",
+        )),
+        mir::Operand::Local(local) => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != expected {
+                return Err(malformed_mir(format!(
+                    "bool expression uses local{} with type {}",
+                    local.0, definition.ty
+                )));
+            }
+            Ok(())
+        }
+        mir::Operand::NullablePayload(local) => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::NullableScalar(mir::ScalarType::Bool) {
+                return Err(malformed_mir(format!(
+                    "bool expression uses nullable payload local{} with type {}",
+                    local.0, definition.ty
+                )));
+            }
+            Ok(())
+        }
+        mir::Operand::Static(id) => validate_static_operand(program, *id, expected),
+        mir::Operand::Property { object, property } => {
+            validate_property_operand(program, function, *object, *property, expected)
+        }
+        mir::Operand::CollectionLength(_) => Err(malformed_mir(
+            "collection length is used as bool instead of int/int64",
+        )),
+        mir::Operand::CollectionIndex {
+            positional,
+            collection,
+            index,
+            remove,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir("bool index source is not a collection"));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            if collection_type.value != expected {
+                return Err(malformed_mir("bool index element type mismatch"));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection_type,
+                index,
+                *remove,
+                *positional,
+            )
+        }
+        mir::Operand::CollectionKeyAt { collection, offset } => {
+            validate_collection_key_at(program, function, *collection, expected, offset)
+        }
+        mir::Operand::MixedPayload { mixed, tag } => {
+            validate_mixed_payload_operand(function, *mixed, *tag, expected)
+        }
+        mir::Operand::StringIntrinsic(call) => {
+            validate_string_intrinsic(program, function, call, expected)
+        }
+    }
+}
+
+/// Validates every operand a `float32`/`float` value can be read from.
+///
+/// The match is deliberately exhaustive, like [`validate_integer_operand`]: a
+/// catch-all arm here reports a well-formed read as malformed MIR, which is how
+/// `Operand::CollectionIndex` and `Operand::Static` stayed rejected for floats
+/// long after both native backends and the interpreter lowered them.
+fn validate_float_operand(
+    program: &mir::Program,
+    function: &mir::Function,
+    ty: FloatType,
+    operand: &mir::Operand,
+) -> Result<(), BackendError> {
+    let expected = mir::Type::Scalar(mir::ScalarType::Float(ty));
+    match operand {
+        mir::Operand::Scalar(mir::ScalarValue::Float(value)) if value.ty != ty => Err(
+            malformed_mir(format!("{ty} expression contains {} constant", value.ty)),
+        ),
+        mir::Operand::Scalar(mir::ScalarValue::Float(_)) => Ok(()),
+        mir::Operand::Scalar(_) => Err(malformed_mir(format!(
+            "{ty} expression contains a non-float constant"
+        ))),
+        mir::Operand::Local(local) => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != expected {
+                return Err(malformed_mir(format!(
+                    "{ty} expression uses local{} with type {}",
+                    local.0, definition.ty
+                )));
+            }
+            Ok(())
+        }
+        mir::Operand::NullablePayload(local) => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::NullableScalar(mir::ScalarType::Float(ty)) {
+                return Err(malformed_mir(format!(
+                    "{ty} expression uses nullable payload local{} with type {}",
+                    local.0, definition.ty
+                )));
+            }
+            Ok(())
+        }
+        mir::Operand::Static(id) => validate_static_operand(program, *id, expected),
+        mir::Operand::Property { object, property } => {
+            validate_property_operand(program, function, *object, *property, expected)
+        }
+        mir::Operand::CollectionLength(_) => Err(malformed_mir(format!(
+            "collection length is used as {ty} instead of int/int64"
+        ))),
+        mir::Operand::CollectionIndex {
+            positional,
+            collection,
+            index,
+            remove,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir(format!(
+                    "{ty} index source is not a collection"
+                )));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            if collection_type.value != expected {
+                return Err(malformed_mir(format!("{ty} index element type mismatch")));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection_type,
+                index,
+                *remove,
+                *positional,
+            )
+        }
+        mir::Operand::CollectionKeyAt { collection, offset } => {
+            validate_collection_key_at(program, function, *collection, expected, offset)
+        }
+        mir::Operand::MixedPayload { mixed, tag } => {
+            validate_mixed_payload_operand(function, *mixed, *tag, expected)
+        }
+        mir::Operand::StringIntrinsic(call) => {
+            validate_string_intrinsic(program, function, call, expected)
+        }
     }
 }
 
@@ -9122,6 +9213,7 @@ fn validate_string_expression(
             validate_property_operand(program, function, *object, *property, mir::Type::String)
         }
         mir::StringExpression::CollectionIndex {
+            positional,
             collection,
             index,
             remove,
@@ -9141,6 +9233,7 @@ fn validate_string_expression(
                 collection_type,
                 index,
                 *remove,
+                *positional,
             )
         }
         mir::StringExpression::CollectionKeyAt { collection, offset } => {

@@ -926,3 +926,333 @@ function main(): void
         );
     }
 }
+
+/// How many passes each stack-growth fixture makes over its loop.
+///
+/// A scratch slot emitted outside its function's entry block is a dynamic stack
+/// allocation: it moves the stack pointer when it executes and is not reclaimed
+/// until the function returns, so a loop carrying one walks the stack down until
+/// it strikes the guard page. The defect that prompted these fixtures cost
+/// between 15 and 44 bytes per pass, which on a default 8 MB stack killed them
+/// between roughly 173,000 and 533,000 iterations. This count clears the most
+/// forgiving of those by nearly four times, so it still fails on a leak a
+/// quarter that size.
+///
+/// Each fixture's checksum accumulates over every pass, so the exact-output
+/// assertions below also prove the loop ran this many times: a fixture that
+/// stopped early would report a different number rather than pass quietly.
+const STACK_GROWTH_ITERATIONS: u64 = 2_000_000;
+
+const STACK_GROWTH_MODULUS: u64 = 1_000_003;
+
+/// Loop bodies whose lowering allocates a scratch slot, run far past the point
+/// where a per-iteration leak exhausts the stack.
+///
+/// This asserts the behaviour a user sees — status and bytes on stdout — rather
+/// than the shape of the emitted IR, and it asserts it on every native profile
+/// the build enables. `llvm_mir_tests::allocates_every_scratch_slot_in_the_entry_block`
+/// covers the same invariant structurally, on the module the backend emits
+/// before optimization; this covers the program that reaches the user.
+///
+/// The expected output comes from an independent Rust model of each loop rather
+/// than from a Doria backend, so a backend cannot supply the value it is checked
+/// against. The MIR interpreter is not used as the oracle here because these
+/// counts are far beyond what it can execute in test time.
+#[test]
+fn native_profiles_keep_loop_body_stack_use_constant() {
+    if !host_linker_is_available() {
+        let message = format!(
+            "native stack-growth coverage requires host linker {}",
+            host_linker()
+        );
+        if std::env::var_os("CI").is_some() {
+            panic!("{message}; CI must not skip the stack-growth matrix");
+        }
+        eprintln!("{message}; skipping local stack-growth coverage");
+        return;
+    }
+
+    let iterations = STACK_GROWTH_ITERATIONS;
+    let cases = [
+        (
+            "dictionary_get",
+            include_str!("fixtures/native_stack/dictionary_get.doria"),
+            expected_dictionary_get(iterations),
+        ),
+        (
+            "dictionary_set_remove",
+            include_str!("fixtures/native_stack/dictionary_set_remove.doria"),
+            expected_dictionary_set_remove(iterations),
+        ),
+        (
+            "set_add_remove",
+            include_str!("fixtures/native_stack/set_add_remove.doria"),
+            expected_set_add_remove(iterations),
+        ),
+        (
+            "set_contains",
+            include_str!("fixtures/native_stack/set_contains.doria"),
+            expected_set_contains(iterations),
+        ),
+        (
+            "list_pop",
+            include_str!("fixtures/native_stack/list_pop.doria"),
+            expected_list_pop(iterations),
+        ),
+        (
+            "list_index",
+            include_str!("fixtures/native_stack/list_index.doria"),
+            expected_list_index(iterations),
+        ),
+        (
+            "string_search",
+            include_str!("fixtures/native_stack/string_search.doria"),
+            expected_string_search(iterations),
+        ),
+        (
+            "string_interpolation",
+            include_str!("fixtures/native_stack/string_interpolation.doria"),
+            expected_string_interpolation(iterations),
+        ),
+        (
+            "int_parse",
+            include_str!("fixtures/native_stack/int_parse.doria"),
+            expected_int_parse(iterations),
+        ),
+        (
+            "dictionary_index",
+            include_str!("fixtures/native_stack/dictionary_index.doria"),
+            expected_dictionary_index(iterations),
+        ),
+        (
+            "list_first",
+            include_str!("fixtures/native_stack/list_first.doria"),
+            expected_list_first(iterations),
+        ),
+    ];
+
+    #[cfg(feature = "llvm-backend")]
+    let profiles = [NativeProfile::Fast, NativeProfile::Release];
+    #[cfg(not(feature = "llvm-backend"))]
+    let profiles = [NativeProfile::Fast];
+
+    for (name, source, expected) in cases {
+        let mir = doriac::lower_source_to_mir(format!("{name}.doria"), source)
+            .unwrap_or_else(|error| panic!("stack-growth fixture {name} should lower: {error:?}"));
+
+        for profile in profiles {
+            let backend = match profile {
+                NativeProfile::Fast => "Cranelift fast",
+                NativeProfile::Release => "LLVM release",
+            };
+            let output = run_stack_growth_fixture(&mir, profile, backend, name, iterations);
+
+            assert!(
+                output.status.success(),
+                "{backend} exited {} after {iterations} passes over the {name} loop; \
+                 a scratch slot allocated outside the entry block grows the frame on \
+                 every pass until the stack is exhausted\nstderr:\n{}",
+                describe_exit_status(&output.status),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                expected,
+                "{backend} produced unexpected output for {name}"
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "{backend} produced unexpected stderr for {name}:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+fn run_stack_growth_fixture(
+    mir: &doriac::mir::Program,
+    profile: NativeProfile,
+    backend: &str,
+    name: &str,
+    iterations: u64,
+) -> Output {
+    let bytes = doriac::codegen_native::generate_executable(mir, profile).unwrap_or_else(|error| {
+        panic!("{backend} rejected stack-growth fixture {name}: {error:?}")
+    });
+    let directory = temp_working_directory(&format!("stack-growth-{name}-{backend}"));
+    fs::create_dir_all(&directory)
+        .unwrap_or_else(|error| panic!("failed to create working directory for {name}: {error}"));
+    let executable = directory.join(if cfg!(windows) {
+        "program.exe"
+    } else {
+        "program"
+    });
+    fs::write(&executable, bytes)
+        .unwrap_or_else(|error| panic!("failed to write {backend} executable for {name}: {error}"));
+    make_executable(&executable);
+
+    let output = run_native_executable(&executable, &directory, &[], &[iterations.to_string()])
+        .unwrap_or_else(|error| panic!("failed to run {backend} executable for {name}: {error}"));
+
+    fs::remove_dir_all(&directory)
+        .unwrap_or_else(|error| panic!("failed to clean working directory for {name}: {error}"));
+    output
+}
+
+/// Names the way a process ended. A stack-exhausted program dies by signal and
+/// reports no exit code at all, so a bare code would print `None` for exactly
+/// the failure these fixtures guard.
+fn describe_exit_status(status: &std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        return format!("with status {code}");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            let name = match signal {
+                6 => " (SIGABRT)",
+                11 => " (SIGSEGV)",
+                _ => "",
+            };
+            return format!("by signal {signal}{name}");
+        }
+    }
+    "for an unknown reason".to_string()
+}
+
+// Independent Rust models of the fixture loops. Each mirrors the Doria source
+// statement for statement so the expected output is derived from the loop the
+// fixture spells, not from a backend's answer to it.
+
+fn expected_dictionary_get(iterations: u64) -> String {
+    // The fixture fills the dictionary so that "key{j}" maps to j for j < 64.
+    let mut checksum = 0;
+    for index in 0..iterations {
+        checksum = (checksum + index % 64) % STACK_GROWTH_MODULUS;
+    }
+    format!("{checksum}\n")
+}
+
+fn expected_dictionary_set_remove(iterations: u64) -> String {
+    let mut values: BTreeMap<u64, u64> = BTreeMap::new();
+    let mut checksum = 0;
+    for index in 0..iterations {
+        values.insert(index % 64, index);
+        checksum = (checksum + values.remove(&(index % 64)).unwrap_or(0)) % STACK_GROWTH_MODULUS;
+    }
+    format!("{checksum}:{}\n", values.len())
+}
+
+fn expected_set_add_remove(iterations: u64) -> String {
+    let mut members: BTreeSet<u64> = BTreeSet::new();
+    let mut changes = 0;
+    for index in 0..iterations {
+        if members.insert(index % 64) {
+            changes = (changes + 1) % STACK_GROWTH_MODULUS;
+        }
+        if members.remove(&(index % 64)) {
+            changes = (changes + 2) % STACK_GROWTH_MODULUS;
+        }
+    }
+    format!("{changes}:{}\n", members.len())
+}
+
+fn expected_set_contains(iterations: u64) -> String {
+    let members: BTreeSet<u64> = (0..64).map(|index| index * 2).collect();
+    let mut hits = 0;
+    for index in 0..iterations {
+        if members.contains(&(index % 16)) {
+            hits = (hits + 1) % STACK_GROWTH_MODULUS;
+        }
+    }
+    format!("{hits}\n")
+}
+
+fn expected_list_pop(iterations: u64) -> String {
+    let mut values: Vec<u64> = Vec::new();
+    let mut checksum = 0;
+    for index in 0..iterations {
+        values.push(index % 97);
+        checksum = (checksum + values.pop().unwrap_or(0)) % STACK_GROWTH_MODULUS;
+    }
+    format!("{checksum}:{}\n", values.len())
+}
+
+fn expected_list_index(iterations: u64) -> String {
+    let values: Vec<u64> = (0..64).collect();
+    let mut checksum = 0;
+    for index in 0..iterations {
+        checksum = (checksum + values[(index % 64) as usize]) % STACK_GROWTH_MODULUS;
+    }
+    format!("{checksum}\n")
+}
+
+fn expected_dictionary_index(iterations: u64) -> String {
+    // The fixture maps every key j to j for j < 64, so no lookup is missing and
+    // the `?? 0` fallback never applies.
+    let values: BTreeMap<u64, u64> = (0..64).map(|index| (index, index)).collect();
+    let mut checksum = 0;
+    for index in 0..iterations {
+        checksum =
+            (checksum + values.get(&(index % 64)).copied().unwrap_or(0)) % STACK_GROWTH_MODULUS;
+    }
+    format!("{checksum}\n")
+}
+
+fn expected_list_first(iterations: u64) -> String {
+    let values: Vec<u64> = (0..64).collect();
+    let first = values.first().copied().unwrap_or(0);
+    let last = values.last().copied().unwrap_or(0);
+    let mut checksum = 0;
+    for _ in 0..iterations {
+        checksum = (checksum + first + last) % STACK_GROWTH_MODULUS;
+    }
+    format!("{checksum}\n")
+}
+
+fn expected_string_search(iterations: u64) -> String {
+    // The fixture's haystack and needle are ASCII, so the byte offset Rust
+    // reports is also the grapheme index Doria reports.
+    const HAYSTACK: &str = "the quick brown fox jumps over the lazy dog";
+    const NEEDLE: &str = "fox";
+    let position = HAYSTACK
+        .find(NEEDLE)
+        .expect("the fixture needle occurs in its haystack") as u64;
+    let mut checksum = 0;
+    for _ in 0..iterations {
+        checksum = (checksum + position) % STACK_GROWTH_MODULUS;
+    }
+    format!("{checksum}\n")
+}
+
+fn expected_string_interpolation(iterations: u64) -> String {
+    // "value {index} of {iterations}" is ASCII, so its grapheme length is the
+    // literal text plus the digits of each interpolated number.
+    let literal_text = "value ".len() as u64 + " of ".len() as u64;
+    let trailing = literal_text + decimal_digits(iterations);
+    let mut lengths = 0;
+    for index in 0..iterations {
+        lengths = (lengths + decimal_digits(index) + trailing) % STACK_GROWTH_MODULUS;
+    }
+    format!("{lengths}\n")
+}
+
+fn expected_int_parse(iterations: u64) -> String {
+    let parsed: u64 = "1234".parse().expect("the fixture literal parses");
+    let mut checksum = 0;
+    for _ in 0..iterations {
+        checksum = (checksum + parsed) % STACK_GROWTH_MODULUS;
+    }
+    format!("{checksum}\n")
+}
+
+fn decimal_digits(value: u64) -> u64 {
+    let mut digits = 1;
+    let mut remaining = value;
+    while remaining >= 10 {
+        remaining /= 10;
+        digits += 1;
+    }
+    digits
+}

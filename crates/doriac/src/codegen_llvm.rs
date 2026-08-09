@@ -13,8 +13,9 @@ use inkwell::targets::{
 };
 use inkwell::types::{BasicMetadataTypeEnum, BasicType, BasicTypeEnum, IntType, StructType};
 use inkwell::values::{
-    BasicMetadataValueEnum, BasicValueEnum, FloatValue as LlvmFloatValue, FunctionValue,
-    GlobalValue, IntValue, PointerValue, StructValue, UnnamedAddress,
+    BasicMetadataValueEnum, BasicValue, BasicValueEnum, FloatValue as LlvmFloatValue,
+    FunctionValue, GlobalValue, InstructionValue, IntValue, PointerValue, StructValue,
+    UnnamedAddress,
 };
 use inkwell::{AddressSpace, FloatPredicate, IntPredicate, OptimizationLevel};
 
@@ -28,22 +29,23 @@ use crate::native_abi::{
     BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
     CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
     COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
-    COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE, COLLECTION_KEYED_GET,
-    COLLECTION_KEYED_GET_NULLABLE, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET,
-    COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT, COLLECTION_LENGTH, COLLECTION_LENGTH_FIELD,
-    COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_FRONT,
-    COLLECTION_PUSH_FRONT_NULLABLE, COLLECTION_PUSH_NULLABLE, COLLECTION_PUSH_UNIQUE,
-    COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
-    COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY,
-    COLLECTION_STAGE26_NEW, COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32,
-    FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE,
-    MIXED_NEW, MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
-    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
-    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
-    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
-    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE,
-    SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK,
-    SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    COLLECTION_FREE, COLLECTION_INDEX_FIELD, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE,
+    COLLECTION_KEYED_GET, COLLECTION_KEYED_GET_NULLABLE, COLLECTION_KEYED_HAS,
+    COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT, COLLECTION_LENGTH,
+    COLLECTION_LENGTH_FIELD, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
+    COLLECTION_PUSH_FRONT, COLLECTION_PUSH_FRONT_NULLABLE, COLLECTION_PUSH_NULLABLE,
+    COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
+    COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE,
+    COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW, COLLECTION_VALUES_FIELD,
+    COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
+    FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED,
+    MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS,
+    MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64,
+    MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64,
+    MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE,
+    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE,
+    SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
+    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
     STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
     STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
     STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
@@ -68,15 +70,26 @@ pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendErr
     lower_validated_mir_to_object(program)
 }
 
-pub(crate) fn lower_validated_mir_to_object(
-    program: &mir::Program,
-) -> Result<Vec<u8>, BackendError> {
-    initialize_native_target()?;
+/// Emits the LLVM IR this backend produces for `program`, before any
+/// optimization pass has run.
+///
+/// Tests assert structural properties of the code the compiler itself emits
+/// with this. Reading the optimized module instead would measure what LLVM
+/// happened to tidy up, which can mask a defect in what we emit.
+pub fn lower_mir_to_llvm_ir(program: &mir::Program) -> Result<String, BackendError> {
+    mir_validation::validate_program(program)?;
+    let target_machine = host_target_machine()?;
+    let context = Context::create();
+    let module = build_module(&context, &target_machine, program)?;
+    Ok(module.print_to_string().to_string())
+}
 
+fn host_target_machine() -> Result<TargetMachine, BackendError> {
+    initialize_native_target()?;
     let triple = TargetMachine::get_default_triple();
     let target = Target::from_triple(&triple)
         .map_err(|error| backend_failure(format!("failed to select host LLVM target: {error}")))?;
-    let target_machine = target
+    target
         .create_target_machine(
             &triple,
             "generic",
@@ -85,47 +98,16 @@ pub(crate) fn lower_validated_mir_to_object(
             RelocMode::PIC,
             CodeModel::Default,
         )
-        .ok_or_else(|| backend_failure("failed to create host LLVM target machine"))?;
+        .ok_or_else(|| backend_failure("failed to create host LLVM target machine"))
+}
 
+pub(crate) fn lower_validated_mir_to_object(
+    program: &mir::Program,
+) -> Result<Vec<u8>, BackendError> {
+    let target_machine = host_target_machine()?;
     let context = Context::create();
-    let module = context.create_module("doria_stage_15");
-    module.set_triple(&triple);
-    let target_data = target_machine.get_target_data();
-    module.set_data_layout(&target_data.get_data_layout());
+    let module = build_module(&context, &target_machine, program)?;
 
-    let functions = declare_functions(&context, &module, &target_data, program)?;
-    let class_drop_functions = declare_class_drop_functions(&context, &module, program);
-    let collection_drop_functions = declare_collection_drop_functions(&context, &module, program);
-    let statics = declare_statics(&context, &module, &target_data, program)?;
-    let declarations = DeclaredProgram {
-        functions,
-        class_drop_functions,
-        collection_drop_functions,
-        statics,
-    };
-    for function in &program.functions {
-        define_function(
-            &context,
-            &module,
-            &target_data,
-            program,
-            function,
-            &declarations,
-        )?;
-    }
-    define_class_drop_functions(&context, &module, &target_data, program, &declarations)?;
-    define_collection_drop_functions(&context, &module, &target_data, program, &declarations)?;
-    define_process_main(
-        &context,
-        &module,
-        &target_data,
-        program,
-        &declarations.functions,
-    )?;
-
-    module
-        .verify()
-        .map_err(|error| backend_failure(format!("LLVM verification failed: {error}")))?;
     let pass_options = PassBuilderOptions::create();
     pass_options.set_verify_each(true);
     module
@@ -139,6 +121,53 @@ pub(crate) fn lower_validated_mir_to_object(
         .write_to_memory_buffer(&module, FileType::Object)
         .map_err(|error| backend_failure(format!("LLVM object emission failed: {error}")))?;
     Ok(object.as_slice().to_vec())
+}
+
+fn build_module<'ctx>(
+    context: &'ctx Context,
+    target_machine: &TargetMachine,
+    program: &mir::Program,
+) -> Result<Module<'ctx>, BackendError> {
+    let triple = TargetMachine::get_default_triple();
+    let module = context.create_module("doria_stage_15");
+    module.set_triple(&triple);
+    let target_data = target_machine.get_target_data();
+    module.set_data_layout(&target_data.get_data_layout());
+
+    let functions = declare_functions(context, &module, &target_data, program)?;
+    let class_drop_functions = declare_class_drop_functions(context, &module, program);
+    let collection_drop_functions = declare_collection_drop_functions(context, &module, program);
+    let statics = declare_statics(context, &module, &target_data, program)?;
+    let declarations = DeclaredProgram {
+        functions,
+        class_drop_functions,
+        collection_drop_functions,
+        statics,
+    };
+    for function in &program.functions {
+        define_function(
+            context,
+            &module,
+            &target_data,
+            program,
+            function,
+            &declarations,
+        )?;
+    }
+    define_class_drop_functions(context, &module, &target_data, program, &declarations)?;
+    define_collection_drop_functions(context, &module, &target_data, program, &declarations)?;
+    define_process_main(
+        context,
+        &module,
+        &target_data,
+        program,
+        &declarations.functions,
+    )?;
+
+    module
+        .verify()
+        .map_err(|error| backend_failure(format!("LLVM verification failed: {error}")))?;
+    Ok(module)
 }
 
 fn initialize_native_target() -> Result<(), BackendError> {
@@ -479,6 +508,7 @@ fn define_function<'ctx>(
         module,
         target_data,
         builder,
+        entry_block: prologue,
         program,
         function,
         functions: &declarations.functions,
@@ -540,6 +570,7 @@ fn define_class_drop_functions<'ctx>(
             module,
             target_data,
             builder,
+            entry_block: entry,
             program,
             function,
             functions: &declarations.functions,
@@ -586,6 +617,7 @@ fn define_collection_drop_functions<'ctx>(
             module,
             target_data,
             builder,
+            entry_block: entry,
             program,
             function,
             functions: &declarations.functions,
@@ -778,6 +810,8 @@ struct FunctionLowerer<'ctx, 'program> {
     module: &'program Module<'ctx>,
     target_data: &'program TargetData,
     builder: Builder<'ctx>,
+    /// The block every scratch slot is allocated in. See [`FunctionLowerer::entry_alloca`].
+    entry_block: BasicBlock<'ctx>,
     program: &'program mir::Program,
     function: &'program mir::Function,
     functions: &'program [FunctionValue<'ctx>],
@@ -795,6 +829,12 @@ struct FunctionLowerer<'ctx, 'program> {
 }
 
 #[derive(Clone, Copy)]
+enum CollectionMemoryRegion {
+    Header,
+    Values,
+}
+
+#[derive(Clone, Copy)]
 enum DeferredOwnedTemporary {
     Class(crate::class_layout::ClassId),
     Collection(mir::CollectionTypeId),
@@ -804,6 +844,88 @@ enum DeferredOwnedTemporary {
 }
 
 impl<'ctx> FunctionLowerer<'ctx, '_> {
+    /// Marks accesses using the runtime invariant that a collection header and
+    /// its value buffer are separate allocations. Header fields remain one
+    /// conservative alias class, as do all elements within the value buffer.
+    fn tag_collection_memory_access(
+        &self,
+        instruction: InstructionValue<'ctx>,
+        region: CollectionMemoryRegion,
+    ) -> Result<(), BackendError> {
+        let zero = self.context.i64_type().const_zero();
+        let root = self.context.metadata_node(&[self
+            .context
+            .metadata_string("Doria collection memory")
+            .into()]);
+        let name = match region {
+            CollectionMemoryRegion::Header => "Doria collection header",
+            CollectionMemoryRegion::Values => "Doria collection values",
+        };
+        let scalar = self.context.metadata_node(&[
+            self.context.metadata_string(name).into(),
+            root.into(),
+            zero.into(),
+        ]);
+        let access = self
+            .context
+            .metadata_node(&[scalar.into(), scalar.into(), zero.into()]);
+        instruction
+            .set_metadata(access, self.context.get_kind_id("tbaa"))
+            .map_err(|error| {
+                backend_failure(format!(
+                    "failed to attach collection alias metadata: {error}"
+                ))
+            })
+    }
+
+    fn load_collection_memory<T: BasicType<'ctx>>(
+        &self,
+        ty: T,
+        address: PointerValue<'ctx>,
+        name: &str,
+        region: CollectionMemoryRegion,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let value = build(self.builder.build_load(ty, address, name))?;
+        let instruction = value
+            .as_instruction_value()
+            .ok_or_else(|| backend_failure("collection load did not produce an instruction"))?;
+        self.tag_collection_memory_access(instruction, region)?;
+        Ok(value)
+    }
+
+    fn store_collection_memory(
+        &self,
+        address: PointerValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        region: CollectionMemoryRegion,
+    ) -> Result<(), BackendError> {
+        let instruction = build(self.builder.build_store(address, value))?;
+        self.tag_collection_memory_access(instruction, region)
+    }
+
+    /// Allocates a scratch slot in the function's entry block.
+    ///
+    /// LLVM only treats an `alloca` as part of the fixed frame when it sits in
+    /// the entry block. One emitted at the current insertion point instead
+    /// becomes a dynamic allocation that moves the stack pointer when it
+    /// executes and is not reclaimed until the function returns, so a slot
+    /// allocated inside a loop grows the frame on every iteration until the
+    /// guard page is reached. Only the allocation moves; callers keep their
+    /// stores at the current insertion point, so each pass over the
+    /// surrounding code still initialises the slot before reading it.
+    fn entry_alloca<T: BasicType<'ctx>>(
+        &self,
+        ty: T,
+        name: &str,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let builder = self.context.create_builder();
+        match self.entry_block.get_first_instruction() {
+            Some(instruction) => builder.position_before(&instruction),
+            None => builder.position_at_end(self.entry_block),
+        }
+        build(builder.build_alloca(ty, name))
+    }
+
     fn nullable_type(&self, payload: BasicTypeEnum<'ctx>) -> inkwell::types::StructType<'ctx> {
         nullable_type(self.context, self.target_data, payload)
     }
@@ -1244,12 +1366,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 key,
                 value,
-            }
-            | mir::Statement::AssignCollectionIndex {
+            } => self.lower_collection_set(*collection, key, value, false)?,
+            mir::Statement::AssignCollectionIndex {
+                positional,
                 collection,
                 index: key,
                 value,
-            } => self.lower_collection_set(*collection, key, value)?,
+            } => self.lower_collection_set(*collection, key, value, *positional)?,
             mir::Statement::DropCollection { local, collection } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let slot = local_slot(&self.local_slots, *local)?;
@@ -1729,12 +1852,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             COLLECTION_LENGTH_FIELD,
             "collection.length.address",
         ))?;
-        let length = build(self.builder.build_load(
-            usize_type,
-            length_address,
-            "collection.length",
-        ))?
-        .into_int_value();
+        let length = self
+            .load_collection_memory(
+                usize_type,
+                length_address,
+                "collection.length",
+                CollectionMemoryRegion::Header,
+            )?
+            .into_int_value();
         let (comparable_index, comparable_length) = match index
             .get_type()
             .get_bit_width()
@@ -1795,12 +1920,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             COLLECTION_VALUES_FIELD,
             "collection.values.address",
         ))?;
-        let values = build(self.builder.build_load(
-            self.context.ptr_type(AddressSpace::default()),
-            values_address,
-            "collection.values",
-        ))?
-        .into_pointer_value();
+        let values = self
+            .load_collection_memory(
+                self.context.ptr_type(AddressSpace::default()),
+                values_address,
+                "collection.values",
+                CollectionMemoryRegion::Header,
+            )?
+            .into_pointer_value();
         build(unsafe {
             self.builder.build_in_bounds_gep(
                 collection_storage_type(self.context, self.target_data, value_type)?,
@@ -1942,10 +2069,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             self.lower_nullable_collection_parts(&entry.value, definition.value)?;
                         let value_word = self.value_to_collection_word(value, payload_ty)?;
                         if fixed {
-                            let previous_present = build(self.builder.build_alloca(
+                            let previous_present = self.entry_alloca(
                                 self.context.i8_type(),
                                 "collection.previous.present",
-                            ))?;
+                            )?;
                             let _ = self.call_runtime(
                                 COLLECTION_SET_AT_NULLABLE,
                                 &[
@@ -2108,11 +2235,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 index,
                 index_span,
                 transfer,
+                positional,
                 ..
             } => {
                 self.set_active_panic_site(*index_span)?;
                 Ok(self
-                    .lower_collection_index(*source, index, *transfer)?
+                    .lower_collection_index(*source, index, *transfer, *positional)?
                     .into_pointer_value())
             }
             mir::CollectionExpression::Property {
@@ -2294,6 +2422,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         collection: mir::LocalId,
         index: &mir::Rvalue,
         remove: bool,
+        positional: bool,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
@@ -2327,17 +2456,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 IntegerType::Int64,
             )));
         let index_value = self.lower_rvalue(index)?;
-        let word = if definition.key.is_some() {
+        let word = if definition.key.is_some() && !positional {
             if remove {
                 return Err(malformed_mir(
                     "dictionary indexed removal must use Dictionary::remove",
                 ));
             }
             let index_word = self.value_to_collection_word(index_value, index_type)?;
-            let found = build(
-                self.builder
-                    .build_alloca(self.context.i8_type(), "dictionary.found"),
-            )?;
+            let found = self.entry_alloca(self.context.i8_type(), "dictionary.found")?;
             let word = self
                 .call_runtime(
                     COLLECTION_KEYED_GET,
@@ -2408,9 +2534,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 index_value.into_int_value(),
                 definition.value,
             )?;
-            let value = build(
-                self.builder
-                    .build_load(storage_type, address, "collection.value"),
+            let value = self.load_collection_memory(
+                storage_type,
+                address,
+                "collection.value",
+                CollectionMemoryRegion::Values,
             )?;
             if matches!(definition.value, mir::Type::Scalar(_)) {
                 return Ok(value);
@@ -2490,19 +2618,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let collection = self.collection_pointer(collection)?;
         let key_value = self.lower_rvalue(key)?;
         let key_word = self.value_to_collection_word(key_value, key_type)?;
-        let found = build(
-            self.builder
-                .build_alloca(self.context.i8_type(), "dictionary.get.found"),
-        )?;
-        let removed_key = build(
-            self.builder
-                .build_alloca(self.context.i64_type(), "dictionary.removed.key"),
-        )?;
+        let found = self.entry_alloca(self.context.i8_type(), "dictionary.get.found")?;
+        let removed_key = self.entry_alloca(self.context.i64_type(), "dictionary.removed.key")?;
         if access == mir::NullableCollectionAccess::Index {
-            let present = build(
-                self.builder
-                    .build_alloca(self.context.i8_type(), "dictionary.index.present"),
-            )?;
+            let present = self.entry_alloca(self.context.i8_type(), "dictionary.index.present")?;
             let word = self
                 .call_runtime(
                     COLLECTION_KEYED_GET_NULLABLE,
@@ -2715,10 +2834,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ],
             )?;
         } else if op == mir::CollectionMutationOp::Remove {
-            let removed_slot = build(
-                self.builder
-                    .build_alloca(self.context.i64_type(), "set.removed.value"),
-            )?;
+            let removed_slot = self.entry_alloca(self.context.i64_type(), "set.removed.value")?;
             let removed = self
                 .call_runtime(
                     COLLECTION_REMOVE_VALUE,
@@ -2792,6 +2908,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         collection: mir::LocalId,
         index: &mir::Rvalue,
         value: &mir::Rvalue,
+        positional: bool,
     ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
@@ -2806,7 +2923,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             let (present, value, actual_payload_ty) =
                 self.lower_nullable_collection_parts(value, definition.value)?;
             debug_assert_eq!(payload_ty, actual_payload_ty);
-            if let Some(key_type) = definition.key {
+            if let Some(key_type) = definition.key.filter(|_| !positional) {
                 self.lower_dictionary_set_nullable_value(
                     collection_value,
                     index,
@@ -2816,10 +2933,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     payload_ty,
                 )?;
             } else {
-                let previous_present_slot = build(
-                    self.builder
-                        .build_alloca(self.context.i8_type(), "collection.previous.present"),
-                )?;
+                let previous_present_slot =
+                    self.entry_alloca(self.context.i8_type(), "collection.previous.present")?;
                 let value_word = self.value_to_collection_word(value, payload_ty)?;
                 let old_word = self
                     .call_runtime(
@@ -2875,11 +2990,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
             return Ok(());
         }
-        if let Some(key_type) = definition.key {
+        if let Some(key_type) = definition.key.filter(|_| !positional) {
             self.lower_dictionary_set_value(
                 collection_value,
                 index,
                 key_type,
+                value,
+                definition.value,
+            )?;
+        } else if matches!(definition.value, mir::Type::Scalar(_))
+            && stage26_collection_kind(definition.kind).is_none()
+        {
+            self.lower_positional_scalar_store(
+                collection_value,
+                index.into_int_value(),
                 value,
                 definition.value,
             )?;
@@ -2910,6 +3034,97 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(())
     }
 
+    /// Stores a scalar at a position without calling the runtime.
+    ///
+    /// `dr_v2_collection_set_at` exists to do three things a general element
+    /// write needs: drop the value being replaced, dispatch on the element
+    /// width recorded in the header, and invalidate any membership index. A
+    /// scalar has no drop, and the width is a static property of the element
+    /// type here, so the first two are dead. Only the index has to be dealt
+    /// with, and it is null unless something asked this collection about
+    /// membership — so the write becomes a bounds check and a store, matching
+    /// the read path in `lower_collection_index`.
+    ///
+    /// The indexed case still goes through the runtime rather than open-coding
+    /// the discard, which keeps the one path that has to stay in step with the
+    /// index's internals inside the runtime that owns them. It runs at most
+    /// once per index, because the call leaves the index null.
+    ///
+    /// Stage 26 kinds are excluded: `Deque` addresses elements through `head`,
+    /// which `checked_collection_value_address` does not apply.
+    fn lower_positional_scalar_store(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        index: IntValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
+        value_type: mir::Type,
+    ) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let header = collection_header_type(self.context, self.target_data);
+        let function = current_function(&self.builder)?;
+        let indexed_block = self
+            .context
+            .append_basic_block(function, "collection.store.indexed");
+        let direct_block = self
+            .context
+            .append_basic_block(function, "collection.store.direct");
+        let done_block = self
+            .context
+            .append_basic_block(function, "collection.store.done");
+
+        let index_address = build(self.builder.build_struct_gep(
+            header,
+            collection,
+            COLLECTION_INDEX_FIELD,
+            "collection.index.address",
+        ))?;
+        let membership_index = self
+            .load_collection_memory(
+                pointer,
+                index_address,
+                "collection.membership.index",
+                CollectionMemoryRegion::Header,
+            )?
+            .into_pointer_value();
+        let indexed = build(
+            self.builder
+                .build_is_not_null(membership_index, "collection.indexed"),
+        )?;
+        build(
+            self.builder
+                .build_conditional_branch(indexed, indexed_block, direct_block),
+        )?;
+
+        self.builder.position_at_end(indexed_block);
+        let value_word = self.value_to_collection_word(value, value_type)?;
+        let _ = self.call_runtime(
+            COLLECTION_SET_AT,
+            &[
+                pointer.into(),
+                pointer.into(),
+                usize_type.into(),
+                self.context.i64_type().into(),
+            ],
+            Some(self.context.i64_type().into()),
+            &[
+                self.current_frame.into(),
+                collection.into(),
+                index.into(),
+                value_word.into(),
+            ],
+        )?;
+        build(self.builder.build_unconditional_branch(done_block))?;
+
+        self.builder.position_at_end(direct_block);
+        let address = self.checked_collection_value_address(collection, index, value_type)?;
+        self.store_collection_memory(address, value, CollectionMemoryRegion::Values)?;
+        build(self.builder.build_unconditional_branch(done_block))?;
+
+        self.builder.position_at_end(done_block);
+        Ok(())
+    }
+
     fn lower_dictionary_set_value(
         &mut self,
         collection: PointerValue<'ctx>,
@@ -2921,10 +3136,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let key_word = self.value_to_collection_word(key, key_type)?;
         let value_word = self.value_to_collection_word(value, value_type)?;
-        let replaced_slot = build(
-            self.builder
-                .build_alloca(self.context.i8_type(), "dictionary.replaced"),
-        )?;
+        let replaced_slot = self.entry_alloca(self.context.i8_type(), "dictionary.replaced")?;
         let old_word = self
             .call_runtime(
                 COLLECTION_KEYED_SET,
@@ -2970,14 +3182,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let key_word = self.value_to_collection_word(key, key_type)?;
         let value_word = self.value_to_collection_word(value, payload_type)?;
-        let replaced_slot = build(
-            self.builder
-                .build_alloca(self.context.i8_type(), "dictionary.replaced"),
-        )?;
-        let previous_present_slot = build(
-            self.builder
-                .build_alloca(self.context.i8_type(), "dictionary.previous.present"),
-        )?;
+        let replaced_slot = self.entry_alloca(self.context.i8_type(), "dictionary.replaced")?;
+        let previous_present_slot =
+            self.entry_alloca(self.context.i8_type(), "dictionary.previous.present")?;
         let old_word = self
             .call_runtime(
                 COLLECTION_KEYED_SET_NULLABLE,
@@ -3215,7 +3422,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?
             .ok_or_else(|| backend_failure("collection length produced no result"))?
             .into_int_value();
-        let index_slot = build(self.builder.build_alloca(usize_type, "set.from.index"))?;
+        let index_slot = self.entry_alloca(usize_type, "set.from.index")?;
         build(
             self.builder
                 .build_store(index_slot, usize_type.const_zero()),
@@ -3463,10 +3670,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?
             .ok_or_else(|| backend_failure("collection length produced no result"))?
             .into_int_value();
-        let index_slot = build(
-            self.builder
-                .build_alloca(usize_type, "collection.drop.index"),
-        )?;
+        let index_slot = self.entry_alloca(usize_type, "collection.drop.index")?;
         build(self.builder.build_store(index_slot, length))?;
         let header = self
             .context
@@ -3836,9 +4040,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 transfer,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *transfer)?
+                .lower_collection_index(*collection, index, *transfer, *positional)?
                 .into_pointer_value()),
             mir::ClassExpression::MixedPayload {
                 mixed,
@@ -3987,9 +4192,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4103,9 +4309,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4268,9 +4475,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4460,9 +4668,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4601,9 +4810,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4661,9 +4871,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
         }
     }
@@ -4862,9 +5073,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
             mir::SharedReferenceAccessExpression::Call { function, args, .. } => Ok(self
                 .lower_call(*function, args, true)?
@@ -4920,9 +5132,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 collection,
                 index,
                 remove,
+                positional,
                 ..
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_pointer_value()),
             mir::NullableSharedReferenceAccessExpression::CollectionGet {
                 collection,
@@ -5596,10 +5809,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::NullableScalarExpression::Parse { value, .. } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let text = self.lower_string_expression(value)?;
-                let found_slot = build(
-                    self.builder
-                        .build_alloca(self.context.i8_type(), "parse.found"),
-                )?;
+                let found_slot = self.entry_alloca(self.context.i8_type(), "parse.found")?;
                 let symbol = match ty {
                     mir::ScalarType::Integer(_) => INT_PARSE,
                     mir::ScalarType::Float(_) => FLOAT_PARSE,
@@ -5924,7 +6134,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | Kind::LastIndexOf
             | Kind::IndexOfIgnoreCase
             | Kind::LastIndexOfIgnoreCase => {
-                let found_slot = build(self.builder.build_alloca(i8_type, "string.search.found"))?;
+                let found_slot = self.entry_alloca(i8_type, "string.search.found")?;
                 let (name, with_frame) = match call.kind {
                     Kind::IndexOf => (STRING_INDEX_OF, false),
                     Kind::LastIndexOf => (STRING_LAST_INDEX_OF, false),
@@ -6418,13 +6628,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.lower_mixed_box(mir::MixedTag::Class(class), payload.into(), *payload_owned)
             }
             mir::MixedExpression::CollectionIndex {
+                positional,
                 collection,
                 index,
                 transfer,
                 remove,
             } => {
                 let value = self
-                    .lower_collection_index(*collection, index, *remove)?
+                    .lower_collection_index(*collection, index, *remove, *positional)?
                     .into_pointer_value();
                 if *transfer && !*remove {
                     // Owning index read (`mixed $x = $items[0]`): clone the collection's box
@@ -7512,12 +7723,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into_pointer_value())
             }
             mir::StringExpression::CollectionIndex {
+                positional,
                 collection,
                 index,
                 remove,
             } => {
                 let value = self
-                    .lower_collection_index(*collection, index, *remove)?
+                    .lower_collection_index(*collection, index, *remove, *positional)?
                     .into_pointer_value();
                 if *remove {
                     Ok(value)
@@ -8336,11 +8548,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .into_int_value())
             }
             mir::Operand::CollectionIndex {
+                positional,
                 collection,
                 index,
                 remove,
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_int_value()),
             mir::Operand::CollectionKeyAt { collection, offset } => Ok(self
                 .lower_collection_key_at(
@@ -8414,11 +8627,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?
                 .into_float_value()),
                 mir::Operand::CollectionIndex {
+                    positional,
                     collection,
                     index,
                     remove,
                 } => Ok(self
-                    .lower_collection_index(*collection, index, *remove)?
+                    .lower_collection_index(*collection, index, *remove, *positional)?
                     .into_float_value()),
                 mir::Operand::CollectionKeyAt { collection, offset } => Ok(self
                     .lower_collection_key_at(
@@ -9151,10 +9365,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         inserted
                     }
                     mir::CollectionMembershipOp::Remove => {
-                        let removed_slot = build(
-                            self.builder
-                                .build_alloca(self.context.i64_type(), "set.removed.value"),
-                        )?;
+                        let removed_slot =
+                            self.entry_alloca(self.context.i64_type(), "set.removed.value")?;
                         let removed = self
                             .call_runtime(
                                 COLLECTION_REMOVE_VALUE,
@@ -9330,11 +9542,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             ))?
             .into_int_value()),
             mir::Operand::CollectionIndex {
+                positional,
                 collection,
                 index,
                 remove,
             } => Ok(self
-                .lower_collection_index(*collection, index, *remove)?
+                .lower_collection_index(*collection, index, *remove, *positional)?
                 .into_int_value()),
             mir::Operand::CollectionKeyAt { collection, offset } => Ok(self
                 .lower_collection_key_at(
@@ -9772,15 +9985,27 @@ fn collection_header_type<'ctx>(
 ) -> StructType<'ctx> {
     let word = context.ptr_sized_int_type(target_data, None);
     let pointer = context.ptr_type(AddressSpace::default());
+    let byte = context.i8_type();
+    // Mirrors `#[repr(C)] DrCollectionV1` through the membership index pointer.
+    // Only the fields codegen reads have named constants, but every field up to
+    // the last one read has to be present or the offsets shift. The tail beyond
+    // `index` stays runtime-only. `collection_header_offsets_match_runtime`
+    // pins this against the runtime's own `offset_of!`.
     context.struct_type(
         &[
-            word.into(),
-            word.into(),
-            pointer.into(),
-            pointer.into(),
-            context.i8_type().into(),
-            context.i8_type().into(),
-            context.i8_type().into(),
+            word.into(),    // length
+            word.into(),    // capacity
+            pointer.into(), // keys
+            pointer.into(), // values
+            byte.into(),    // keyed
+            byte.into(),    // fixed
+            byte.into(),    // value_width
+            byte.into(),    // kind
+            byte.into(),    // comparator
+            byte.into(),    // finalized
+            byte.into(),    // value_nullable
+            word.into(),    // head
+            pointer.into(), // index
         ],
         false,
     )
@@ -10186,6 +10411,20 @@ mod tests {
             (
                 crate::native_abi::COLLECTION_VALUE_WIDTH_FIELD,
                 doria_rt::DR_COLLECTION_VALUE_WIDTH_OFFSET,
+            ),
+            (
+                crate::native_abi::COLLECTION_KIND_FIELD,
+                doria_rt::DR_COLLECTION_KIND_OFFSET,
+            ),
+            // `head` follows four bytes of tail flags, so it is the field that
+            // catches a padding disagreement between LLVM and repr(C).
+            (
+                crate::native_abi::COLLECTION_HEAD_FIELD,
+                doria_rt::DR_COLLECTION_HEAD_OFFSET,
+            ),
+            (
+                crate::native_abi::COLLECTION_INDEX_FIELD,
+                doria_rt::DR_COLLECTION_INDEX_OFFSET,
             ),
         ] {
             assert_eq!(

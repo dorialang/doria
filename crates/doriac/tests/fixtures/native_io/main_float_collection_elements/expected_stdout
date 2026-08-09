@@ -1,0 +1,16 @@
+array-bound:2.5
+array-interp:1.5
+array-concat:2.5
+array-arith:3.5
+array-compare:ordered
+narrow-bound:2.5
+narrow-arith:2.5
+list-bound:3.5
+list-interp:4.5
+dictionary-bound:6.5
+dictionary-compare:above
+sorted-interp:8.5
+deque-each:10.5
+deque-each:11.5
+deque-front:10.5
+static:2.5:1.25

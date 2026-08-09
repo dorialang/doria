@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "repository": "dorialang/doria",
+  "pins": [
+    {
+      "id": "benchmarks-engine",
+      "repository": "dorialang/benchmarks",
+      "publishedRefs": ["refs/heads/main"],
+      "source": {
+        "file": "benchmarks-revision.json",
+        "format": "json-pointer",
+        "pointer": "/revision"
+      },
+      "purpose": "Benchmark engine revision used by the coordinated performance guards and by controlled measurement sessions."
+    }
+  ]
+}

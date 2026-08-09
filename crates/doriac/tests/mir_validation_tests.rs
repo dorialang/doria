@@ -64,7 +64,120 @@ fn shared_validator_rejects_noncanonical_bool_operands() {
         .expect_err("integer truthiness must not enter native backends");
     assert!(error
         .message
-        .contains("bool expression has an incompatible operand"));
+        .contains("bool expression contains a non-bool constant"));
+}
+
+/// The bool and float operand surfaces are validated by exhaustive matches, so
+/// every `Operand` variant a scalar element read can produce has to be listed.
+/// A catch-all arm here reported well-formed reads as malformed MIR: first for
+/// `bool` collection elements, then — identically shaped — for `float`
+/// collection elements and `float` statics.
+#[test]
+fn shared_validator_accepts_every_scalar_element_read_operand() {
+    let program = doriac::lower_source_to_mir(
+        "scalar-element-reads.doria",
+        r#"
+class Ratios
+{
+    static float $wide = 2.5;
+    static float32 $narrow = 1.25;
+    static bool $on = true;
+}
+
+function main(): void
+{
+    float[] $array = [2.5, 1.5];
+    float $bound = $array[0];
+    float $sum = $array[0] + 1.0;
+    echo "{$bound}{$sum}{$array[1]}\n";
+    if ($array[0] > 1.0) {
+        echo "ordered\n";
+    }
+
+    float32[] $narrow = [2.5, 1.5];
+    float32 $narrowBound = $narrow[0];
+    echo "{$narrowBound}\n";
+
+    List<float> $list = [3.5];
+    Dictionary<int, float> $dictionary = [1 => 6.5];
+    echo "{$list[0]}{$dictionary[1]}\n";
+
+    bool[] $flags = [true, false];
+    if ($flags[0]) {
+        echo "flag\n";
+    }
+
+    float $staticWide = Ratios::wide;
+    float32 $staticNarrow = Ratios::narrow;
+    if (Ratios::on) {
+        echo "{$staticWide}{$staticNarrow}\n";
+    }
+}
+"#,
+    )
+    .expect("scalar element and static reads must lower");
+
+    doriac::mir_validation::validate_program(&program)
+        .expect("scalar element and static reads must pass shared MIR validation");
+}
+
+#[test]
+fn shared_validator_rejects_a_float_element_read_of_another_type() {
+    let mut program = valid_void_program();
+    let collection = CollectionTypeId(0);
+    program.collection_types.push(CollectionType {
+        id: collection,
+        kind: CollectionKind::TypedArray,
+        key: None,
+        value: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+        comparator: None,
+    });
+    program.functions.push(Function {
+        id: FunctionId(1),
+        name: "first".to_string(),
+        source_span: Default::default(),
+        method: None,
+        receiver_mode: None,
+        params: Vec::new(),
+        return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
+        locals: vec![Local {
+            id: LocalId(0),
+            name: "numbers".to_string(),
+            ty: Type::Collection(collection),
+            writable: false,
+            owned: true,
+            synthetic: false,
+        }],
+        blocks: vec![BasicBlock {
+            id: BlockId(0),
+            statements: Vec::new(),
+            terminator: Terminator::Return(Rvalue::Value(ValueExpression::Float(
+                FloatExpression::Use {
+                    ty: FloatType::Float64,
+                    operand: Operand::CollectionIndex {
+                        positional: true,
+                        collection: LocalId(0),
+                        index: Box::new(Rvalue::Value(ValueExpression::Integer(
+                            IntegerExpression::constant(IntegerValue::from_bits(
+                                IntegerType::Int64,
+                                0,
+                            )),
+                        ))),
+                        remove: false,
+                    },
+                },
+            ))),
+        }],
+        entry_block: BlockId(0),
+    });
+
+    let error = doriac::mir_validation::validate_program(&program)
+        .expect_err("an int element must not be read as a float");
+    assert!(
+        error.message.contains("float index element type mismatch"),
+        "unexpected validation message: {}",
+        error.message
+    );
 }
 
 #[test]

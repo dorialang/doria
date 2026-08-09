@@ -1,0 +1,13 @@
+// List::pop in a loop body. It returns `?T`, so its lowering allocates the
+// same kind of nullable out-parameter slot the dictionary path uses.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    writable List<int> $values = [];
+    let writable $checksum = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        $values->add($index % 97);
+        $checksum = ($checksum + ($values->pop() ?? 0)) % 1000003;
+    }
+    echo "{$checksum}:{$values->count}\n";
+}

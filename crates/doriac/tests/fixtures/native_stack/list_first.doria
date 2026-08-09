@@ -1,0 +1,15 @@
+// The `?T` first/last projections in a loop body. They share the nullable
+// access lowering that Dictionary::get and List::pop use.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    writable List<int> $values = [];
+    for (let writable $index = 0; $index < 64; $index++) {
+        $values->add($index);
+    }
+    let writable $checksum = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        $checksum = ($checksum + ($values->first ?? 0) + ($values->last ?? 0)) % 1000003;
+    }
+    echo "{$checksum}\n";
+}

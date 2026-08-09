@@ -168,6 +168,9 @@ pub const COLLECTION_VALUES_FIELD: u32 = 3;
 pub const COLLECTION_KEYED_FIELD: u32 = 4;
 pub const COLLECTION_FIXED_FIELD: u32 = 5;
 pub const COLLECTION_VALUE_WIDTH_FIELD: u32 = 6;
+pub const COLLECTION_KIND_FIELD: u32 = 7;
+pub const COLLECTION_HEAD_FIELD: u32 = 11;
+pub const COLLECTION_INDEX_FIELD: u32 = 12;
 
 pub const fn stage26_collection_kind(kind: mir::CollectionKind) -> Option<u8> {
     match kind {

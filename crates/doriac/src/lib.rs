@@ -29,6 +29,8 @@ pub mod parser;
 pub mod performance;
 pub mod return_analysis;
 pub mod runtime_artifact;
+#[path = "runtime_digest.rs"]
+mod runtime_digest;
 pub mod semantics;
 pub mod source;
 pub mod string_literal;

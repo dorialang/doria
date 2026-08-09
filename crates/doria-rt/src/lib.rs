@@ -145,7 +145,8 @@ pub struct DrStringV1 {
 pub use bytes::DrBytesV1;
 pub use collection::{
     DrCollectionV1, DR_COLLECTION_CAPACITY_OFFSET, DR_COLLECTION_FIXED_OFFSET,
-    DR_COLLECTION_KEYED_OFFSET, DR_COLLECTION_KEYS_OFFSET, DR_COLLECTION_LENGTH_OFFSET,
+    DR_COLLECTION_HEAD_OFFSET, DR_COLLECTION_INDEX_OFFSET, DR_COLLECTION_KEYED_OFFSET,
+    DR_COLLECTION_KEYS_OFFSET, DR_COLLECTION_KIND_OFFSET, DR_COLLECTION_LENGTH_OFFSET,
     DR_COLLECTION_VALUES_OFFSET, DR_COLLECTION_VALUE_WIDTH_OFFSET,
 };
 pub use mixed::DrMixedV1;
@@ -3137,7 +3138,7 @@ fn unsigned_decimal(mut value: u64, buffer: &mut [u8; 20]) -> (usize, usize) {
     (cursor, buffer.len() - cursor)
 }
 
-unsafe fn string_bytes(string: *const DrStringV1) -> *const u8 {
+pub(crate) unsafe fn string_bytes(string: *const DrStringV1) -> *const u8 {
     string.cast::<u8>().add(STRING_HEADER_SIZE)
 }
 

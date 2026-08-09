@@ -15,7 +15,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 20a/20b const-evaluable defaults are complete for Copy scalars and readonly strings across free functions, instance methods, static methods, and constructors through one caller-side MIR splice. Writable Copy scalars remain supported; `?string`, `writable string`, `take string`, and other move/`take` defaults retain explicit temporary diagnostics.
 - Stage 21 non-lexical borrowing, returned-borrow elision, and constructor definite initialization are complete on the current branch. Returned-borrow provenance now remains tied transitively to `$this` or one borrowed parameter through property paths, collection indexing, and compiler-known `Dictionary::get`/`List::first`/`List::last` reads. Constructor paths use decision 0090's uninitialized/initialized/maybe-initialized lattice, and shared MIR validation independently enforces the normal-exit and readonly exactly-once invariants.
 - Stage 22 general nullable types, `??`, `?->`, exact `is`, flow-sensitive narrowing, and `mixed` static semantics are complete on the current branch. Narrowing reuses the shared CFG/forward-dataflow framework; local and parameter guards preserve dominating nullable-presence proofs in MIR, and nullable scalar, string, and concrete-class values execute through the interpreter, Cranelift, and LLVM.
-- Stage 23 Slice 1 runtime collections and typed arrays are complete on the current branch. `T[]`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are owned move types backed by shared collection MIR and `doria-rt`; contextual literals, fixed-length typed arrays, indexing and indexed read-modify-write, insertion-ordered `foreach`, move-in/removal ownership, and Decision 0100's default member surface run through the interpreter, Cranelift, and LLVM. Dictionary `keys`/`values` are readonly, insertion-ordered, `foreach`-only projections and are not storable values.
+- Stage 23 Slice 1 runtime collections and typed arrays are complete on the current branch. `T[]`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are owned move types backed by shared collection MIR and `doria-rt`; contextual literals, fixed-length typed arrays, indexing and indexed read-modify-write, insertion-ordered `foreach`, move-in/removal ownership, and Decision 0100's default member surface run through the interpreter, Cranelift, and LLVM. Decision 0113 amends that surface. Slice 1 is implemented: `has` is now `containsKey`, and `contains` is widened as decided. Slices 2-4 — diagnostics, the remaining members, and `clear()` — are pending. Dictionary `keys`/`values` are readonly, insertion-ordered, `foreach`-only projections and are not storable values.
 - Stage 23 Slice 2 is complete on the current branch. The owned `Bytes` move type provides explicit copying conversion to and from `uint8[]`, length, byte indexing and indexed read-modify-write, and byte-wise equality. `read_file_bytes`/`write_file_bytes`/`append_file_bytes`, `read_stdin_bytes`/`write_stdout_bytes`/`write_stderr_bytes`, and text `append_file` use shared validated MIR and `doria-rt`, with exact non-UTF-8 bytes and interpreter/Cranelift/LLVM parity.
 - Stage 23 Slice 3 is complete on the current branch. The boxed `dr_mixed` runtime representation stores a tag, class type id when needed, and owned payload; bool, fixed-width integers, floats, string, and concrete classes box into `mixed`, narrow back out through exact `is`, and execute through the interpreter, Cranelift, and LLVM. `?mixed`, `List<mixed>`, `Dictionary<K, mixed>`, and `Set<mixed>` value paths use the same shared MIR/runtime box. Collection/interface/subtype `is` and boxing collections, typed arrays, or `Bytes` into `mixed` remain deferred with stage-named diagnostics.
 - Stage 25a Slices 1 through 4 are implemented and Stage 25a is complete. The readonly `SharedReference<T>` / `WeakReference<T>` family and the permanently disjoint writable family lower through validated MIR to the interpreter, Cranelift, LLVM, and separate `doria-rt` control structures. `WritableSharedReference<T>` executes class, generic-class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through owned readonly/writable access objects. One access state is shared by every writable-family handle to an allocation; access objects move through returns, parameters, properties, and collection slots; nullable strong, weak, and readonly/writable access forms remain in-family and lazy; and destruction releases access before strong ownership. P1501 carries one of the three exact Decision 0106 conflict conditions as a typed runtime fact. The allocation-free `referencedValue` projection resolves wrapper/payload collisions without changing either ownership count, and durable weak-cycle and bounded-stress fixtures agree across all native paths. Scalar/string payload access and all shared handles through `mixed` remain runtime-pending rather than being given an invented value projection or misrepresented as class pointers. The PHP backend still refuses shared ownership.
@@ -43,6 +43,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   continues and broadens it.
 - The parser accepts generalized `parent::member()` and trait-local `self::member` under the two-clocks rule; semantic checking names Stage 34 and Stage 35 respectively and stops those forms before MIR. `Foo::$prop` and `static::` are permanent errors with precise fixes.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
+- Both native profiles keep loop-body stack use constant. Every LLVM scratch slot — the flags and out-parameters the dictionary, set, list, string-search, and parse lowerings use to return `?T` — is allocated in its function's entry block, because LLVM treats an allocation anywhere else as a dynamic stack allocation that moves the stack pointer when it executes and is not reclaimed until the function returns. Cranelift stack slots are function-scoped by construction and were never affected. `llvm_mir_tests` asserts the placement on the module the backend emits before optimization, and `native_mir_parity_tests` runs those loop bodies two million times on every enabled profile and asserts a clean exit with exact output.
 - Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
 - Native classes now cover construction, property initialization/access, class-valued locals/arguments/returns, `take` transfer, lifecycle bodies, recursive destruction, and deterministic normal structured-exit cleanup through the interpreter, Cranelift, and LLVM.
 - Concrete `Displayable` conversion lowers to an ordinary direct `toString()` method call for interpolation, `.`, `echo`, and `%s`; interface-typed values and general interface dispatch remain deferred.
@@ -120,18 +121,41 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   move values are rejected except for explicitly typed nullable literal-null
   initialization. Interpreter, Cranelift, LLVM, and PHP compatibility agree;
   grouping creates no runtime object.
-- Stage 26b — Performance Baseline Foundation — In Progress. Decision 0112 is
-  accepted and Slices 1 and 2 are complete: the manifest/provenance foundation,
+- Stage 26b — Performance Baseline Foundation — Complete. Decision 0112 is
+  accepted and all three slices are complete: the manifest/provenance foundation,
   opt-in compiler phase and structural report, compiler scaling generators,
   compiler/generated/runtime/diagnostic matrix, process resource counters,
   separate Callgrind/DHAT adapters, candidate evidence, and exact structural
-  baseline are in place. Slice 3 adds peer sources and accepts controlled timing
-  thresholds; Slice 2 makes no optimization claim.
-- Stage 26b — In Progress.
+  baseline are in place. Slice 3 adds peer sources, the exact native acceptance
+  policy, and controlled measurement and promotion workflows; timing thresholds
+  still require separate review of eligible evidence, and Slice 2 makes no
+  optimization claim.
+  Slice 3 Part 1 is delivered: C, C++, Rust, and PHP peers for the comparative
+  generated-program and runtime-subsystem cases, peer fairness and
+  semantic-equivalence records enforced when the manifest loads, two controlled
+  candidate sessions, and a timing threshold proposal. It accepts no threshold
+  and promotes no baseline. Both Doria backends are measured. The proposal's
+  finding is that seventy-nine of eighty case and target pairs are dominated by
+  process startup rather than by their workload, so those cases cannot carry a
+  timing threshold until their workloads are scaled. An earlier write-up
+  reported `string_search` on Cranelift at 6.6 times its floor; that result is
+  withdrawn. Deterministic runtime construction and full compiler/runtime
+  identity now close the reproducibility defect. The exact `1.30` native
+  acceptance rule is bound, and hot workloads require both five times their
+  target startup floor and at least 25 ms. No controlled physical-host Linux runner or
+  eligible physical-host session is currently configured, so no native
+  acceptance matrix or Doria timing baseline can be promoted. Docker, WSL,
+  containers, and virtual machines remain valid for engineering and correctness
+  evidence, but not release claims. Controlled timing, verified affinity,
+  Callgrind, DHAT, hardware counters, and cross-platform timing baselines are not
+  stage gates. Missing eligible-runner evidence does not halt compiler stages.
+- Stage 26b — Complete.
 - Stage 26b Slice 1 — Complete.
 - Stage 26b Slice 2 — Complete.
-- Stage 26b Slice 3 — Next.
-- Stage 27 — Blocked Until Stage 26b Completes.
+- Stage 26b Slice 3 — Complete.
+- Measurement Status: Pending Available Runner.
+- Decision 0113 Slices 2-4 — Next.
+- Stage 27 — Sequenced After Decision 0113; No Performance-Evidence Dependency.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36a — Scheduled, Not Implemented.
 
