@@ -19,12 +19,14 @@ function check_performance_foundation(string $root): array
             '## Slice 3 Threshold Contract',
             '## Native Runtime Acceptance Standard',
             '## Development And Release Evidence Gates',
+            '## Portable Stage 26b Closure Contract',
             '## Slicing',
             'call_overhead',
             'checked_arith',
             'element_access',
             'Eligible timing evidence does not gate language or compiler stage progression',
-            'Stage 27 remains blocked',
+            'Measurement Status: Pending Available Runner',
+            'Stage 27 is sequenced after Decision 0113',
             'Doria Median / Fastest Valid Native Peer Median <= 1.30',
             'A ratio greater than `1.30` is',
             'Inconclusive**, never Pass',
@@ -42,9 +44,9 @@ function check_performance_foundation(string $root): array
             'Stage 26b Slice 1 — Complete',
             'Stage 26b Slice 2 — Complete',
             'Stage 26b Slice 3 — Complete',
-            'Controlled Physical-Host Acceptance Evidence — Pending, Non-Blocking Release Validation',
+            'Measurement Status: Pending Available Runner',
             'Decision 0113 Slices 2-4 — Next',
-            'Stage 27 — Enums + payload cases — Blocked Until Decision 0113 Completes.',
+            'Stage 27 — Enums + payload cases — Sequenced After Decision 0113; No Performance-Evidence Dependency.',
         ],
         'docs/performance-and-benchmarking.md' => [
             'Decision 0112',
@@ -55,6 +57,8 @@ function check_performance_foundation(string $root): array
             'five warmups',
             'exact structural baseline without timing thresholds',
             'ratio <= 1.30',
+            'Measurement Status: Pending Available Runner',
+            'are not Stage 26b or Stage 27 closure conditions',
         ],
         'docs/notes/current-pipeline.md' => [
             'Stage 26b — Performance Baseline Foundation — Complete.',
@@ -62,10 +66,10 @@ function check_performance_foundation(string $root): array
             'Stage 26b Slice 1 — Complete.',
             'Stage 26b Slice 2 — Complete.',
             'Stage 26b Slice 3 — Complete.',
-            'Controlled Physical-Host Acceptance Evidence — Pending, Non-Blocking.',
+            'Measurement Status: Pending Available Runner.',
             'Decision 0113 Slices 2-4 — Next.',
             'all three slices are complete',
-            'Stage 27 — Blocked Until Decision 0113 Completes.',
+            'Stage 27 — Sequenced After Decision 0113; No Performance-Evidence Dependency.',
         ],
         'AGENTS.md' => [
             '`dorialang/benchmarks` repository',
@@ -107,7 +111,7 @@ function check_performance_foundation(string $root): array
         ],
         'benchmarks-revision.json' => [
             '"repository": "dorialang/benchmarks"',
-            '"revision": "22186382dd43b9b43017cfb9bca61ba5f092177e"',
+            '"revision": "6234ccd6ac34589734998f3ab0967a5fdb5051e8"',
         ],
         'scripts/check_benchmark_revision.php' => [
             'check_benchmark_revision',
@@ -127,6 +131,28 @@ function check_performance_foundation(string $root): array
         foreach ($needles as $needle) {
             if (!str_contains($contents, $needle)) {
                 $failures[] = "{$path}: missing performance-foundation authority {$needle}";
+            }
+        }
+    }
+
+    $activeStatusFiles = [
+        'docs/decisions/0112-performance-baseline-provenance-and-regression-measurement.md',
+        'docs/doria-end-to-end-plan.md',
+        'docs/notes/current-pipeline.md',
+        'docs/performance-and-benchmarking.md',
+    ];
+    $hardwareGatePatterns = [
+        '/Stage (?:26b|27)[^\n]*(?:blocked|wait)[^\n]*(?:Linux|affinity|Callgrind|DHAT|hardware|timing)/i',
+        '/(?:Linux|affinity|Callgrind|DHAT|hardware|timing)[^\n]*(?:blocks?|wait)[^\n]*Stage (?:26b|27)/i',
+    ];
+    foreach ($activeStatusFiles as $path) {
+        $contents = file_get_contents($root . '/' . $path);
+        if ($contents === false) {
+            continue;
+        }
+        foreach ($hardwareGatePatterns as $pattern) {
+            if (preg_match($pattern, $contents) === 1) {
+                $failures[] = "{$path}: hardware availability must not gate Stage 26b or Stage 27";
             }
         }
     }

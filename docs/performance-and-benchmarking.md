@@ -52,7 +52,16 @@ gate. Docker, WSL, containers, and virtual machines may run the suite for
 correctness, workflow rehearsal, optimization guidance, and local regression
 investigation; their timing remains Inconclusive and cannot promote a baseline
 or support a release/public performance claim. Missing qualifying hardware does
-not halt language or compiler development.
+not halt language or compiler development. The exact state until a runner is
+available is `Measurement Status: Pending Available Runner`.
+
+Portable closure requires benchmark correctness, interpreter/Cranelift/LLVM
+parity, exact compiler/runtime provenance, deterministic runtime selection,
+workload scaling, peer-equivalence metadata, the exact `1.30` rule, structural
+baselines, portable smoke validation, the failure/scheduled-work register, and
+controlled-runner commands/report schemas. Controlled Linux timing, verified
+affinity, Callgrind, DHAT, hardware counters, and cross-platform timing baselines
+are not Stage 26b or Stage 27 closure conditions.
 
 Slice 3 Part 1 is delivered. C, C++, Rust, and PHP peers cover the comparative
 generated-program and runtime-subsystem cases, and every comparative case that

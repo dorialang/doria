@@ -149,7 +149,30 @@ non-virtualized physical Linux host with every controlled-runner requirement
 achieved and independently attested. Until that evidence exists, the project
 must make no accepted cross-language performance claim and must promote no
 timing threshold. This requirement is pending validation work, not a compiler
-roadmap blocker.
+roadmap blocker. Its exact repository status is:
+
+```text
+Measurement Status: Pending Available Runner
+```
+
+Pending evidence is neither Pass nor Fail. When an eligible runner becomes
+available, the project runs and classifies the matrix without reopening Stage
+26b or blocking unrelated language stages.
+
+## Portable Stage 26b Closure Contract
+
+Stage 26b closes when every portable obligation passes: benchmark correctness;
+interpreter, Cranelift, and LLVM parity; exact compiler and runtime provenance;
+deterministic runtime selection; workload scaling; peer-equivalence metadata;
+the binding `1.30` native acceptance rule; structural baselines; portable
+benchmark smoke validation; the failure and scheduled-work register; and the
+controlled-runner commands and report schemas.
+
+Controlled Linux timing, verified CPU affinity, Callgrind, DHAT, hardware
+counters, and cross-platform timing baselines are not Stage 26b or Stage 27
+closure conditions. Their absence preserves `Measurement Status: Pending
+Available Runner`, prevents timing-baseline promotion and comparative release
+claims, and does nothing else to the language roadmap.
 
 ## Slicing
 
@@ -161,7 +184,8 @@ evidence, and an accepted exact structural baseline. Slice 3 adds peer sources
 for the new runtime cases, controlled-runner and baseline-promotion workflows,
 the exact native acceptance policy, and the stage-completion workflow. All three
 Stage 26b slices are complete. Decision 0113 Slices 2-4 are next, and Stage 27
-remains blocked until that accepted collection-surface work completes.
+is sequenced after that accepted collection-surface work with no
+performance-evidence dependency.
 
 Slice 3 is split. Part 1 delivers the peer matrix, peer fairness and
 semantic-equivalence records, controlled candidate measurement, and a timing
@@ -190,8 +214,8 @@ pending release validation under the non-blocking gate above.
 - No eligible controlled physical-host Linux session exists yet, so no timing
   baseline or cross-language acceptance matrix is promoted. That pending
   release validation does not reopen Stage 26b or block compiler development.
-- Decision 0113 Slices 2-4 are next. Stage 27 remains blocked until Decision
-  0113 completes.
+- Decision 0113 Slices 2-4 are next. Stage 27 is sequenced after Decision 0113
+  and has no performance-evidence dependency.
 - The compiler pins the benchmark repository revision used by its coordinated
   checks in `benchmarks-revision.json` without requiring network access. The
   optional sibling checkout is validated when present and absence remains valid
@@ -299,3 +323,6 @@ for controlled physical-host Linux evidence.
   evidence only; it must not expose development-stage status or broad claims.
 - Compiler-stage plans must not convert missing physical benchmark hardware into
   a roadmap blocker. They may require that evidence for release claims.
+- Active planning and guard documents use the exact `Measurement Status: Pending
+  Available Runner` wording and reject hardware-based Stage 26b or Stage 27
+  closure conditions.

@@ -146,15 +146,16 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   eligible physical-host session is currently configured, so no native
   acceptance matrix or Doria timing baseline can be promoted. Docker, WSL,
   containers, and virtual machines remain valid for engineering and correctness
-  evidence, but not release claims. Missing physical-host evidence is pending,
-  non-blocking release validation and does not halt compiler stages.
+  evidence, but not release claims. Controlled timing, verified affinity,
+  Callgrind, DHAT, hardware counters, and cross-platform timing baselines are not
+  stage gates. Missing eligible-runner evidence does not halt compiler stages.
 - Stage 26b — Complete.
 - Stage 26b Slice 1 — Complete.
 - Stage 26b Slice 2 — Complete.
 - Stage 26b Slice 3 — Complete.
-- Controlled Physical-Host Acceptance Evidence — Pending, Non-Blocking.
+- Measurement Status: Pending Available Runner.
 - Decision 0113 Slices 2-4 — Next.
-- Stage 27 — Blocked Until Decision 0113 Completes.
+- Stage 27 — Sequenced After Decision 0113; No Performance-Evidence Dependency.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36a — Scheduled, Not Implemented.
 
