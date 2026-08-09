@@ -30,8 +30,8 @@ declare(strict_types=1);
  *                     cannot be reached. Ordinary local work with unpushed
  *                     siblings is not blocked.
  *   --require-remote  inability to verify reachability is a failure. Use in
- *                     coordinated CI and before publishing anything that
- *                     depends on a pin resolving elsewhere.
+ *                     credentialed coordinated CI and before publishing
+ *                     anything that depends on a pin resolving elsewhere.
  *   --offline         skip remote work entirely and report every pin unverified.
  *
  * Targets:
@@ -219,12 +219,11 @@ function cross_repo_check_reachable(string $repoRoot, string $repository, array 
     foreach ($refs as $index => $ref) {
         $specs[] = escapeshellarg($ref . ':refs/remotes/cross-repo-pin-probe/' . $index);
     }
-    // These repositories are public, so an anonymous fetch is enough. The GitHub
-    // CLI credential helper is used only when it is present, which covers hosts
-    // where SSH is blocked or the repository is not yet public, without making
-    // the check depend on a tool CI may not install.
+    // Anonymous fetches cover public repositories. Private repositories use the
+    // GitHub CLI credential helper only when gh has an authenticated account or
+    // token; merely having the executable installed does not provide access.
     $helper = '';
-    exec('command -v gh 2>/dev/null', $ignoredProbe, $ghStatus);
+    exec('command -v gh >/dev/null 2>&1 && gh auth status --hostname github.com >/dev/null 2>&1', $ignoredProbe, $ghStatus);
     if ($ghStatus === 0) {
         $helper = '-c credential.helper=' . escapeshellarg('!gh auth git-credential') . ' ';
     }

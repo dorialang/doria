@@ -230,14 +230,21 @@ jobs:
           php scripts/check_docs_authority.php
           php scripts/check_stage25a_completion.php
 
-      # Reachability needs the network, so it is a separate step from the
-      # offline documentation guards. --require-remote makes an unverifiable pin
-      # a failure here: a pin that cannot be resolved from a published ref is a
-      # promise this repository cannot keep for anyone else.
+      # Reachability needs the network and, for private repositories, an
+      # explicitly scoped credential. Structural checks always run. A configured
+      # credential makes remote verification mandatory; otherwise the checker
+      # reports UNVERIFIED without pretending that reachability was proved.
       - name: Check cross-repository revision pins
+        env:
+          GH_TOKEN: ${{ secrets.DORIA_CROSS_REPO_TOKEN }}
         run: |
           php scripts/test_cross_repo_pins.php
-          php scripts/check_cross_repo_pins.php --require-remote
+          if [ -n "${GH_TOKEN}" ]; then
+            php scripts/check_cross_repo_pins.php --require-remote
+          else
+            echo "::warning::Cross-repository reachability is unverified because DORIA_CROSS_REPO_TOKEN is not configured"
+            php scripts/check_cross_repo_pins.php
+          fi
 
       - name: Check diagnostic and runtime-outcome architecture
         run: |
