@@ -15,16 +15,16 @@ builds.
 
 | Measure | Count |
 | --- | ---: |
-| Total codes audited | 173 |
-| Codes with representative human-language upgrades in this beat | 7 |
+| Total codes audited | 176 |
+| Codes with representative human-language upgrades | 10 |
 | Codes intentionally retaining their established semantic detail through the compatibility projection | 166 |
 | Codes currently constructed through the development-only path | 15 |
 | Backend codes | 7 |
 | Internal compiler codes | 10 |
 
-The 15 development-only codes are `E0493`, `E0496`, `E0509`, `E0510`,
+The 16 development-only codes are `E0493`, `E0496`, `E0509`, `E0510`,
 `E0513`, `E0521`, `E0523`, `E0524`, `E0525`, `E0528`, `E0533`, `E0534`,
-`E0536`, `M1101`, and `M1102`. Development-only is a property of the emitted
+`E0536`, `E0559`, `M1101`, and `M1102`. Development-only is a property of the emitted
 diagnostic, not permanently of the code: a stable code can cease to use the
 unsupported-development-surface constructor when its implementation lands.
 
@@ -41,6 +41,9 @@ unsupported-development-surface constructor when its implementation lands.
 - Unexpected characters, type mismatches, readonly binding/property writes, use after ownership
   transfer, unknown named arguments, and conflicting access now exercise the
   richer explanatory and secondary-label paths.
+- Decision 0113 collection discovery uses receiver-aware E0521 edits, dedicated
+  E0557 property-call guidance, E0558 literal-construction guidance, and E0559
+  accepted-pending boundaries through the same structured model.
 - Runtime panics now extend the compiler-owned diagnostic model and central
   catalogue infrastructure. Every implemented built-in panic has a stable
   `P` code and Title Case title; interpreter, native runtime, and PHP

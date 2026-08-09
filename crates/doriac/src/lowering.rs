@@ -450,6 +450,7 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
             property,
             null_safe,
             span,
+            ..
         } => hir::Expr::PropertyAccess {
             object: Box::new(lower_expr(object, class_name)),
             property: property.clone(),
@@ -462,6 +463,7 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
             args,
             null_safe,
             span,
+            ..
         } => hir::Expr::MethodCall {
             object: Box::new(lower_expr(object, class_name)),
             method: method.clone(),

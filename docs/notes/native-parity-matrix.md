@@ -15,9 +15,10 @@ Stage 26b Slice 2 extends that separate evidence with compiler scaling and
 runtime-subsystem cases. Exact output remains the bridge between the systems;
 this parity matrix does not acquire timing, RSS, profiler, or baseline policy.
 
-Stage 26b Slice 2 extends that separate evidence with compiler scaling and
-runtime-subsystem cases. Exact output remains the bridge between the systems;
-this parity matrix does not acquire timing, RSS, profiler, or baseline policy.
+Decision 0113 Slice 2 changes failed member resolution and diagnostic
+projection only. It adds no MIR, runtime export, backend lowering, generated
+allocation, or parity fixture. Accepted Slice 3 and Slice 4 members stop before
+this matrix until their executable slices land.
 
 | Feature / example | MIR interpreter | Cranelift fast | LLVM release | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
