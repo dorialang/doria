@@ -311,7 +311,7 @@ function check_stream_io_completeness(string $root): array
         'Stage 46 reuses Stage 36a standard-stream views, readiness, blocking substrate, timeout/deadline integration, cancellation, and platform-device abstraction',
         'Decision 0110: stream, readiness, standard I/O, blocking-mode, and performance model',
         'Stage 26 — Remaining collection family — Complete.',
-        'Stage 26b — Performance Baseline Foundation — In Progress; Slices 1 And 2 Complete, Slice 3 In Progress',
+        'Stage 26b — Performance Baseline Foundation — In Progress; Slices 1 And 2 Complete, Slice 3 Blocked On Controlled Linux Evidence',
         'Stage 27 — Enums + payload cases — Blocked Until Stage 26b Completes',
         'Stage 36a Public Spellings — Deferred',
         'Stage 36a — Not Implemented',

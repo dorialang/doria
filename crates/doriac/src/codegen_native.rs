@@ -17,6 +17,8 @@ pub struct NativePerformance {
     pub runtime_selection: Duration,
     pub runtime_artifact: PathBuf,
     pub runtime: crate::runtime_artifact::RuntimeArtifact,
+    pub linker: String,
+    pub link_command: Vec<String>,
     pub linking: Duration,
 }
 
@@ -54,7 +56,8 @@ pub(crate) fn generate_executable_with_performance(
     let runtime_selection = started.elapsed();
 
     let started = Instant::now();
-    let executable = link_object(&object_bytes, &runtime_path)?;
+    let (executable, linker, link_command) =
+        link_object_with_metadata(&object_bytes, &runtime_path)?;
     let linking = started.elapsed();
     Ok((
         executable,
@@ -64,6 +67,8 @@ pub(crate) fn generate_executable_with_performance(
             runtime_selection,
             runtime_artifact: runtime_path,
             runtime,
+            linker,
+            link_command,
             linking,
         },
     ))
@@ -94,6 +99,13 @@ fn lower_release_object(_program: &mir::Program) -> Result<Vec<u8>, BackendError
 }
 
 fn link_object(object_bytes: &[u8], runtime_path: &Path) -> Result<Vec<u8>, BackendError> {
+    link_object_with_metadata(object_bytes, runtime_path).map(|(bytes, _, _)| bytes)
+}
+
+fn link_object_with_metadata(
+    object_bytes: &[u8],
+    runtime_path: &Path,
+) -> Result<(Vec<u8>, String, Vec<String>), BackendError> {
     let temp_stem = unique_temp_stem();
     let object_path = temp_stem.with_extension(object_extension());
     let executable_path = temp_stem.with_extension(executable_extension());
@@ -101,32 +113,41 @@ fn link_object(object_bytes: &[u8], runtime_path: &Path) -> Result<Vec<u8>, Back
     fs::write(&object_path, object_bytes)
         .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?;
 
-    let link_result = invoke_linker(&object_path, runtime_path, &executable_path);
-    let executable_bytes = match link_result {
-        Ok(()) => fs::read(&executable_path)
-            .map_err(|error| BackendError::new(format!("backend emission failure: {error}")))?,
+    let (linker, arguments) = match invoke_linker(&object_path, runtime_path, &executable_path) {
+        Ok(metadata) => metadata,
         Err(error) => {
             cleanup_temp_artifacts(&object_path, &executable_path);
             return Err(error);
         }
     };
+    let executable_bytes = match fs::read(&executable_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            cleanup_temp_artifacts(&object_path, &executable_path);
+            return Err(BackendError::new(format!(
+                "backend emission failure: {error}"
+            )));
+        }
+    };
 
     cleanup_temp_artifacts(&object_path, &executable_path);
-    Ok(executable_bytes)
+    let mut command = Vec::with_capacity(arguments.len() + 1);
+    command.push(linker.clone());
+    command.extend(arguments);
+    Ok((executable_bytes, linker, command))
 }
 
 fn invoke_linker(
     object_path: &Path,
     runtime_path: &Path,
     executable_path: &Path,
-) -> Result<(), BackendError> {
+) -> Result<(String, Vec<String>), BackendError> {
     // Cranelift emits a host object from MIR, then the host toolchain links it.
     // Doria does not generate C source or use C semantics as an oracle.
     let cc_is_set = env::var_os("CC").is_some();
     let msvc_host = cfg!(all(windows, target_env = "msvc"));
     let linker = env::var("CC").unwrap_or_else(|_| default_linker(msvc_host).to_string());
-    let mut command = Command::new(&linker);
-    command.args(linker_arguments(
+    let arguments = linker_arguments(
         &linker,
         cc_is_set,
         cfg!(windows),
@@ -134,7 +155,9 @@ fn invoke_linker(
         object_path,
         runtime_path,
         executable_path,
-    ));
+    );
+    let mut command = Command::new(&linker);
+    command.args(&arguments);
 
     let output = command.output().map_err(|error| {
         BackendError::new(format!(
@@ -143,7 +166,13 @@ fn invoke_linker(
     })?;
 
     if output.status.success() {
-        return Ok(());
+        return Ok((
+            linker,
+            arguments
+                .into_iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect(),
+        ));
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);

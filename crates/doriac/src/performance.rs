@@ -90,6 +90,10 @@ pub fn compile_native(
         "target": options.target.name(),
         "profile": options.native_profile.name(),
         "backend": backend,
+        "linker": {
+            "executable": native.linker,
+            "command": native.link_command
+        },
         "success": true,
         "totalDurationNs": duration_ns(total),
         "artifacts": {

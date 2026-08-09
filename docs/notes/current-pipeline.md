@@ -15,7 +15,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 20a/20b const-evaluable defaults are complete for Copy scalars and readonly strings across free functions, instance methods, static methods, and constructors through one caller-side MIR splice. Writable Copy scalars remain supported; `?string`, `writable string`, `take string`, and other move/`take` defaults retain explicit temporary diagnostics.
 - Stage 21 non-lexical borrowing, returned-borrow elision, and constructor definite initialization are complete on the current branch. Returned-borrow provenance now remains tied transitively to `$this` or one borrowed parameter through property paths, collection indexing, and compiler-known `Dictionary::get`/`List::first`/`List::last` reads. Constructor paths use decision 0090's uninitialized/initialized/maybe-initialized lattice, and shared MIR validation independently enforces the normal-exit and readonly exactly-once invariants.
 - Stage 22 general nullable types, `??`, `?->`, exact `is`, flow-sensitive narrowing, and `mixed` static semantics are complete on the current branch. Narrowing reuses the shared CFG/forward-dataflow framework; local and parameter guards preserve dominating nullable-presence proofs in MIR, and nullable scalar, string, and concrete-class values execute through the interpreter, Cranelift, and LLVM.
-- Stage 23 Slice 1 runtime collections and typed arrays are complete on the current branch. `T[]`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are owned move types backed by shared collection MIR and `doria-rt`; contextual literals, fixed-length typed arrays, indexing and indexed read-modify-write, insertion-ordered `foreach`, move-in/removal ownership, and Decision 0100's default member surface run through the interpreter, Cranelift, and LLVM. Decision 0113 amends that surface — `has` becomes `containsKey`, and members 0100 left out are added — and is accepted but not yet implemented; the members listed above are the ones that exist today. Dictionary `keys`/`values` are readonly, insertion-ordered, `foreach`-only projections and are not storable values.
+- Stage 23 Slice 1 runtime collections and typed arrays are complete on the current branch. `T[]`, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are owned move types backed by shared collection MIR and `doria-rt`; contextual literals, fixed-length typed arrays, indexing and indexed read-modify-write, insertion-ordered `foreach`, move-in/removal ownership, and Decision 0100's default member surface run through the interpreter, Cranelift, and LLVM. Decision 0113 amends that surface. Slice 1 is implemented: `has` is now `containsKey`, and `contains` is widened as decided. Slices 2-4 — diagnostics, the remaining members, and `clear()` — are pending. Dictionary `keys`/`values` are readonly, insertion-ordered, `foreach`-only projections and are not storable values.
 - Stage 23 Slice 2 is complete on the current branch. The owned `Bytes` move type provides explicit copying conversion to and from `uint8[]`, length, byte indexing and indexed read-modify-write, and byte-wise equality. `read_file_bytes`/`write_file_bytes`/`append_file_bytes`, `read_stdin_bytes`/`write_stdout_bytes`/`write_stderr_bytes`, and text `append_file` use shared validated MIR and `doria-rt`, with exact non-UTF-8 bytes and interpreter/Cranelift/LLVM parity.
 - Stage 23 Slice 3 is complete on the current branch. The boxed `dr_mixed` runtime representation stores a tag, class type id when needed, and owned payload; bool, fixed-width integers, floats, string, and concrete classes box into `mixed`, narrow back out through exact `is`, and execute through the interpreter, Cranelift, and LLVM. `?mixed`, `List<mixed>`, `Dictionary<K, mixed>`, and `Set<mixed>` value paths use the same shared MIR/runtime box. Collection/interface/subtype `is` and boxing collections, typed arrays, or `Bytes` into `mixed` remain deferred with stage-named diagnostics.
 - Stage 25a Slices 1 through 4 are implemented and Stage 25a is complete. The readonly `SharedReference<T>` / `WeakReference<T>` family and the permanently disjoint writable family lower through validated MIR to the interpreter, Cranelift, LLVM, and separate `doria-rt` control structures. `WritableSharedReference<T>` executes class, generic-class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through owned readonly/writable access objects. One access state is shared by every writable-family handle to an allocation; access objects move through returns, parameters, properties, and collection slots; nullable strong, weak, and readonly/writable access forms remain in-family and lazy; and destruction releases access before strong ownership. P1501 carries one of the three exact Decision 0106 conflict conditions as a typed runtime fact. The allocation-free `referencedValue` projection resolves wrapper/payload collisions without changing either ownership count, and durable weak-cycle and bounded-stress fixtures agree across all native paths. Scalar/string payload access and all shared handles through `mixed` remain runtime-pending rather than being given an invented value projection or misrepresented as class pointers. The PHP backend still refuses shared ownership.
@@ -128,7 +128,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   separate Callgrind/DHAT adapters, candidate evidence, and exact structural
   baseline are in place. Slice 3 adds peer sources and proposes controlled timing
   thresholds for a separate review; Slice 2 makes no optimization claim.
-  Slice 3 Part 1 is delivered: C, Rust, and PHP peers for the seventeen
+  Slice 3 Part 1 is delivered: C, C++, Rust, and PHP peers for the comparative
   generated-program and runtime-subsystem cases, peer fairness and
   semantic-equivalence records enforced when the manifest loads, two controlled
   candidate sessions, and a timing threshold proposal. It accepts no threshold
@@ -136,17 +136,18 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   finding is that seventy-nine of eighty case and target pairs are dominated by
   process startup rather than by their workload, so those cases cannot carry a
   timing threshold until their workloads are scaled. An earlier write-up
-  reported `string_search` on Cranelift at 6.6 times its floor; that result did
-  not survive a compiler rebuild and is withdrawn, because two builds of the
-  same compiler revision bundled materially different runtime archives and the
-  report does not record which archive was linked. Timing results are not
-  comparable across compiler rebuilds until runtime-archive identity is part of
-  recorded provenance.
+  reported `string_search` on Cranelift at 6.6 times its floor; that result is
+  withdrawn. Deterministic runtime construction and full compiler/runtime
+  identity now close the reproducibility defect. The exact `1.30` native
+  acceptance rule is bound, and hot workloads require both five times their
+  target startup floor and at least 25 ms. No controlled Linux runner or
+  eligible session is currently configured, so no native acceptance matrix or
+  Doria timing baseline can be promoted.
 - Stage 26b — In Progress.
 - Stage 26b Slice 1 — Complete.
 - Stage 26b Slice 2 — Complete.
-- Stage 26b Slice 3 — In Progress. Part 1 delivered.
-- Stage 26b Timing Threshold Review — Next.
+- Stage 26b Slice 3 — Blocked On Controlled Linux Evidence.
+- Stage 26b Controlled Linux Acceptance Evidence — Next.
 - Stage 27 — Blocked Until Stage 26b Completes.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36a — Scheduled, Not Implemented.

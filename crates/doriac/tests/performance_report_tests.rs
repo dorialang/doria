@@ -75,6 +75,21 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
     );
     assert_eq!(report["phases"]["llvmCodeGeneration"]["available"], false);
     assert_eq!(report["phases"]["link"]["available"], true);
+    let linker = report["linker"]["executable"]
+        .as_str()
+        .expect("linker executable");
+    let link_command = report["linker"]["command"]
+        .as_array()
+        .expect("link command");
+    assert!(!linker.is_empty());
+    assert_eq!(
+        link_command.first().and_then(|value| value.as_str()),
+        Some(linker)
+    );
+    assert!(
+        link_command.len() >= 4,
+        "link command should retain its inputs"
+    );
     assert!(report["metrics"]["outputBytes"]
         .as_u64()
         .is_some_and(|value| value > 0));

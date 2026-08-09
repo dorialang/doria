@@ -38,7 +38,7 @@ invalid shapes, and missing files are rejected. Generated reports use a strict
 versioned JSON schema, retain all raw samples in integer nanoseconds, and derive
 min, max, mean, median, p95, and population standard deviation from those samples.
 
-Five warmups and at least ten measured runs are the default controlled shape.
+Five warmups and at least fifteen measured runs are the default controlled shape.
 Targets run round-robin with a rotating first target. Quick smoke reports are
 always marked ineligible for baselines. Missing platform metrics are recorded as
 unavailable with a reason; they are never invented as zero.
@@ -99,6 +99,34 @@ Later stages that change runtime representation, allocation, ownership, dispatch
 code generation, control flow, I/O, concurrency, or FFI must update relevant
 cases and record their performance impact under the master-plan rule.
 
+## Native Runtime Acceptance Standard
+
+Doria aims to match or beat C, C++, and Rust on comparable native workloads.
+For each acceptance-bearing workload, the native peer is the fastest valid,
+semantically eligible C, C++, or Rust result. PHP is adoption evidence and is
+never used as the native acceptance peer.
+
+The maximum passing runtime ratio is exact:
+
+```text
+Doria Median / Fastest Valid Native Peer Median <= 1.30
+```
+
+A ratio at or below `1.30` is **Pass**. A ratio greater than `1.30` is
+**Fail**. Incorrect, incomparable, startup-dominated, noisy, unstable, or
+incompletely attributed evidence is **Inconclusive**, never Pass. An unfinished
+compiler, a stronger semantic guarantee, or work scheduled to a later stage may
+explain a failure but does not change it into a pass. Semantic differences may
+require separate semantics-matched and idiomatic product-cost comparisons; they
+do not create a qualified pass.
+
+Only Andrew, as Doria's language designer, may change the `1.30` boundary.
+
+This cross-language status is separate from a Doria self-regression threshold.
+A Doria build may pass against its own accepted baseline while the baseline
+remains a cross-language Fail. Compile time, link time, startup, peak memory,
+and artifact size remain separate dimensions and do not offset a runtime Fail.
+
 ## Slicing
 
 Stage 26b Slice 1 establishes this measurement foundation, compiler reports,
@@ -129,7 +157,9 @@ threshold review is a separate step that consumes Part 1's proposal.
 - The pre-existing comparative source layouts and historical evidence remain;
   new evidence gains exact correctness authority and reproducible provenance.
 - Stage 26b is in progress with Slices 1 and 2 complete and Slice 3 in progress.
-  Slice 3 Part 1 is delivered; the timing threshold review is next.
+  Slice 3's non-timing closure work and native acceptance policy are in place.
+  Runtime selection is reproducible, but no eligible controlled Linux session
+  exists yet, so no timing baseline is promoted and Slice 3 remains blocked.
 - Stage 27 remains blocked until Stage 26b completes.
 - The compiler pins the benchmark repository revision used by its coordinated
   checks in `benchmarks-revision.json` without requiring network access. The
@@ -223,6 +253,12 @@ developer's build directory. A profile that prefers a workspace archive over the
 runtime the compiler bundled can link a runtime from a different revision than
 the compiler performing code generation, which silently violates the
 single-selected-revision rule this decision already requires.
+
+The compiler now builds and bundles the runtime deterministically from the
+runtime manifest, lockfile, target, profile, and revision. Reports identify the
+compiler binary and runtime archive by SHA-256 and reject cross-session identity
+drift. This closes the earlier runtime-selection defect; it does not substitute
+for controlled Linux evidence.
 
 ## Invalidated Elsewhere
 
