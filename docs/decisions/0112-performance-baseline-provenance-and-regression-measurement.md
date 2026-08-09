@@ -2,6 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-08-03
+- **Amended:** 2026-08-09 by Andrew Masiye
 - **Owners:** Doria language, compiler, runtime, and benchmark design
 - **Scope:** Repository-owned performance evidence and the rules for comparing it over time
 
@@ -127,6 +128,29 @@ A Doria build may pass against its own accepted baseline while the baseline
 remains a cross-language Fail. Compile time, link time, startup, peak memory,
 and artifact size remain separate dimensions and do not offset a runtime Fail.
 
+## Development And Release Evidence Gates
+
+Eligible timing evidence does not gate language or compiler stage progression.
+The benchmark foundation, correctness matrix, peer-equivalence records,
+reproducible artifact provenance, structural baseline, controlled-runner
+workflow, and exact acceptance policy are sufficient to complete Stage 26b.
+Missing access to a qualifying measurement host must not halt unrelated compiler
+development.
+
+Docker, WSL, containers, and virtual machines are valid engineering
+environments. Their results may support correctness checks, workflow rehearsal,
+optimization guidance, and local regression investigation when provenance is
+recorded. They are not eligible to promote timing baselines or support release
+or public performance claims, and their native acceptance status remains
+**Inconclusive**.
+
+Release-grade timing evidence requires direct execution on a dedicated,
+non-virtualized physical Linux host with every controlled-runner requirement
+achieved and independently attested. Until that evidence exists, the project
+must make no accepted cross-language performance claim and must promote no
+timing threshold. This requirement is pending validation work, not a compiler
+roadmap blocker.
+
 ## Slicing
 
 Stage 26b Slice 1 establishes this measurement foundation, compiler reports,
@@ -134,21 +158,25 @@ initial paired diagnostics, provenance, and deterministic checks. Slice 2 record
 the initial compiler/program/runtime matrix, process-resource adapters, optional
 separate Callgrind and DHAT executions, compiler scaling generators, candidate
 evidence, and an accepted exact structural baseline. Slice 3 adds peer sources
-for the new runtime cases, controlled timing thresholds, and the
-stage-completion workflow.
-Stage 27 remains blocked until all Stage 26b slices complete.
+for the new runtime cases, controlled-runner and baseline-promotion workflows,
+the exact native acceptance policy, and the stage-completion workflow. All three
+Stage 26b slices are complete. Decision 0113 Slices 2-4 are next, and Stage 27
+remains blocked until that accepted collection-surface work completes.
 
 Slice 3 is split. Part 1 delivers the peer matrix, peer fairness and
 semantic-equivalence records, controlled candidate measurement, and a timing
 threshold proposal, together with the controlled-runner and baseline-promotion
 workflows. Part 1 does not accept a threshold or promote a baseline. The timing
-threshold review is a separate step that consumes Part 1's proposal.
+threshold review is a separate step that consumes Part 1's proposal. Part 2
+binds the exact acceptance policy, deterministic compiler/runtime artifact
+identity, scaled workloads, and closure rules. Physical-host timing remains
+pending release validation under the non-blocking gate above.
 
 ## Explicit Non-Goals
 
 - Optimizing compiler output or runtime implementations.
 - Approving timing thresholds from shared CI machines.
-- Beginning Stage 27 or later performance stages.
+- Implementing Decision 0113 or beginning Stage 27.
 - Treating the interpreter as a native performance competitor.
 - Claiming causation from a timing delta without a confirming experiment.
 
@@ -156,11 +184,14 @@ threshold review is a separate step that consumes Part 1's proposal.
 
 - The pre-existing comparative source layouts and historical evidence remain;
   new evidence gains exact correctness authority and reproducible provenance.
-- Stage 26b is in progress with Slices 1 and 2 complete and Slice 3 in progress.
-  Slice 3's non-timing closure work and native acceptance policy are in place.
-  Runtime selection is reproducible, but no eligible controlled Linux session
-  exists yet, so no timing baseline is promoted and Slice 3 remains blocked.
-- Stage 27 remains blocked until Stage 26b completes.
+- Stage 26b is complete. Its measurement foundation, three slices, structural
+  baseline, native acceptance policy, and reproducible runtime selection are in
+  place.
+- No eligible controlled physical-host Linux session exists yet, so no timing
+  baseline or cross-language acceptance matrix is promoted. That pending
+  release validation does not reopen Stage 26b or block compiler development.
+- Decision 0113 Slices 2-4 are next. Stage 27 remains blocked until Decision
+  0113 completes.
 - The compiler pins the benchmark repository revision used by its coordinated
   checks in `benchmarks-revision.json` without requiring network access. The
   optional sibling checkout is validated when present and absence remains valid
@@ -258,7 +289,7 @@ The compiler now builds and bundles the runtime deterministically from the
 runtime manifest, lockfile, target, profile, and revision. Reports identify the
 compiler binary and runtime archive by SHA-256 and reject cross-session identity
 drift. This closes the earlier runtime-selection defect; it does not substitute
-for controlled Linux evidence.
+for controlled physical-host Linux evidence.
 
 ## Invalidated Elsewhere
 
@@ -266,3 +297,5 @@ for controlled Linux evidence.
   must not create a second benchmark engine.
 - Public or website performance material may consume curated target-state
   evidence only; it must not expose development-stage status or broad claims.
+- Compiler-stage plans must not convert missing physical benchmark hardware into
+  a roadmap blocker. They may require that evidence for release claims.

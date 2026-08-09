@@ -32,8 +32,8 @@ eligible for ordinary optimization; no group value survives in generated code.
 
 ## Stage 26b performance baseline foundation
 
-Stage 26b is in progress. Decision 0112 accepts the repository-owned measurement,
-provenance, and regression contract. Slices 1 and 2 are complete: the sibling benchmark
+Stage 26b is complete. Decision 0112 accepts the repository-owned measurement,
+provenance, and regression contract. All three slices are complete: the sibling benchmark
 repository has a strict manifest, versioned JSON schema, committed correctness
 fixtures, round-robin sampling, explicit toolchain selection, complete available
 provenance, and the first three diagnostic pairs. `doriac compile
@@ -42,9 +42,17 @@ evidence without changing the ordinary compile path. Slice 2 records the initial
 compiler/generated/runtime/diagnostic matrix, deterministic source scaling,
 process resource counters, separate optional Callgrind/DHAT evidence, candidate
 evidence, and an exact structural baseline without timing thresholds. Slice 3
-adds peers for the new cases and proposes controlled timing thresholds for a
-separate review. This is not an unlimited optimization campaign and does not
-displace Stage 36a's stream gate.
+adds peers for the new cases, the exact native acceptance policy, and controlled
+measurement and promotion workflows. Timing thresholds still require a separate
+review of eligible evidence. This is not an unlimited optimization campaign and
+does not displace Stage 36a's stream gate.
+
+Eligible physical-host timing is a release-evidence gate, not a compiler-stage
+gate. Docker, WSL, containers, and virtual machines may run the suite for
+correctness, workflow rehearsal, optimization guidance, and local regression
+investigation; their timing remains Inconclusive and cannot promote a baseline
+or support a release/public performance claim. Missing qualifying hardware does
+not halt language or compiler development.
 
 Slice 3 Part 1 is delivered. C, C++, Rust, and PHP peers cover the comparative
 generated-program and runtime-subsystem cases, and every comparative case that

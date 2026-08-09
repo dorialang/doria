@@ -121,13 +121,15 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   move values are rejected except for explicitly typed nullable literal-null
   initialization. Interpreter, Cranelift, LLVM, and PHP compatibility agree;
   grouping creates no runtime object.
-- Stage 26b — Performance Baseline Foundation — In Progress. Decision 0112 is
-  accepted and Slices 1 and 2 are complete: the manifest/provenance foundation,
+- Stage 26b — Performance Baseline Foundation — Complete. Decision 0112 is
+  accepted and all three slices are complete: the manifest/provenance foundation,
   opt-in compiler phase and structural report, compiler scaling generators,
   compiler/generated/runtime/diagnostic matrix, process resource counters,
   separate Callgrind/DHAT adapters, candidate evidence, and exact structural
-  baseline are in place. Slice 3 adds peer sources and proposes controlled timing
-  thresholds for a separate review; Slice 2 makes no optimization claim.
+  baseline are in place. Slice 3 adds peer sources, the exact native acceptance
+  policy, and controlled measurement and promotion workflows; timing thresholds
+  still require separate review of eligible evidence, and Slice 2 makes no
+  optimization claim.
   Slice 3 Part 1 is delivered: C, C++, Rust, and PHP peers for the comparative
   generated-program and runtime-subsystem cases, peer fairness and
   semantic-equivalence records enforced when the manifest loads, two controlled
@@ -140,15 +142,19 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   withdrawn. Deterministic runtime construction and full compiler/runtime
   identity now close the reproducibility defect. The exact `1.30` native
   acceptance rule is bound, and hot workloads require both five times their
-  target startup floor and at least 25 ms. No controlled Linux runner or
-  eligible session is currently configured, so no native acceptance matrix or
-  Doria timing baseline can be promoted.
-- Stage 26b — In Progress.
+  target startup floor and at least 25 ms. No controlled physical-host Linux runner or
+  eligible physical-host session is currently configured, so no native
+  acceptance matrix or Doria timing baseline can be promoted. Docker, WSL,
+  containers, and virtual machines remain valid for engineering and correctness
+  evidence, but not release claims. Missing physical-host evidence is pending,
+  non-blocking release validation and does not halt compiler stages.
+- Stage 26b — Complete.
 - Stage 26b Slice 1 — Complete.
 - Stage 26b Slice 2 — Complete.
-- Stage 26b Slice 3 — Blocked On Controlled Linux Evidence.
-- Stage 26b Controlled Linux Acceptance Evidence — Next.
-- Stage 27 — Blocked Until Stage 26b Completes.
+- Stage 26b Slice 3 — Complete.
+- Controlled Physical-Host Acceptance Evidence — Pending, Non-Blocking.
+- Decision 0113 Slices 2-4 — Next.
+- Stage 27 — Blocked Until Decision 0113 Completes.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36a — Scheduled, Not Implemented.
 

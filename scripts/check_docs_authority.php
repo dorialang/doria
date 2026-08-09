@@ -721,12 +721,12 @@ if ($namingAuthority !== false) {
         || !str_contains($pipeline, 'Stage 43 later')
         || !str_contains($pipeline, 'Stage 26 — Complete')
         || !str_contains($pipeline, 'Stage 26a — Complete')
-        || !str_contains($pipeline, 'Stage 26b — Performance Baseline Foundation — In Progress')
-        || !str_contains($pipeline, 'Stage 27 — Blocked Until Stage 26b Completes')
+        || !str_contains($pipeline, 'Stage 26b — Performance Baseline Foundation — Complete')
+        || !str_contains($pipeline, 'Stage 27 — Blocked Until Decision 0113 Completes')
         || !str_contains($pipeline, 'Stage 36a Public Spellings — Deferred')
         || !str_contains($pipeline, 'Stage 36a — Not Implemented')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 and 26a complete, Stage 26b Slices 1 and 2 complete with Slice 3 next, Stage 27 blocked until 26b, and Stage 36a scheduled but not implemented with public spellings deferred";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 through 26b complete, Decision 0113 Slices 2-4 next, Stage 27 blocked until Decision 0113, and Stage 36a scheduled but not implemented with public spellings deferred";
     }
 
     if (
