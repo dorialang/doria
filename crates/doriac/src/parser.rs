@@ -1172,13 +1172,19 @@ impl Parser {
             if let Some(null_safe) = null_safe {
                 let property =
                     self.expect_identifier("expected property or method name after member access")?;
+                let member_span = self.previous().span;
                 if self.match_kind(&TokenKind::LeftParen) {
+                    let argument_list_start = self.previous().span.start;
                     let args = self.parse_argument_list_after_open()?;
+                    let argument_list_span =
+                        Span::new(argument_list_start, self.previous().span.end);
                     let span = expr.span().merge(self.previous().span);
                     expr = Expr::MethodCall {
                         object: Box::new(expr),
                         method: property,
+                        member_span,
                         args,
+                        argument_list_span,
                         null_safe,
                         span,
                     };
@@ -1187,6 +1193,7 @@ impl Parser {
                     expr = Expr::PropertyAccess {
                         object: Box::new(expr),
                         property,
+                        member_span,
                         null_safe,
                         span,
                     };
@@ -1352,13 +1359,17 @@ impl Parser {
         };
 
         if self.match_kind(&TokenKind::LeftParen) {
+            let argument_list_start = self.previous().span.start;
             let args = self.parse_argument_list_after_open()?;
+            let argument_list_span = Span::new(argument_list_start, self.previous().span.end);
             Some(Expr::StaticCall {
                 qualifier,
                 qualifier_span,
                 method: member,
+                member_span: token.span,
                 member_sigil_span,
                 args,
+                argument_list_span,
                 span: Span::new(start, self.previous().span.end),
             })
         } else {
@@ -1366,6 +1377,7 @@ impl Parser {
                 qualifier,
                 qualifier_span,
                 member,
+                member_span: token.span,
                 member_sigil_span,
                 span: Span::new(start, token.span.end),
             })

@@ -376,6 +376,39 @@ Each slice needs `semantics.rs`, MIR lowering, all four backends
 including durable native parity entries, `docs/stdlib-reference.md`, plan §9.1,
 and the language-server sweep in `dorialang/doria-language-server`.
 
+### Implementation status
+
+- **Slice 1 — Complete.** `has` was removed, `containsKey` is executable on both
+  map families, and element `contains` is executable on every receiver settled
+  by §1.
+- **Slice 2 — Complete.** E0521 now uses one compiler-owned, receiver-aware
+  suggestion table with structured source edits. Property calls have dedicated
+  E0557 diagnostics, equality requirements name the actual receiver operation,
+  withdrawn `List::from` / `Dictionary::from` calls teach bracket literals, and
+  every accepted Slice 3/4 member stops before MIR with E0559.
+- **Slice 3 — Next.** The remaining members in sequencing item 3 are recognized
+  but not executable.
+- **Slice 4 — Pending.** `clear()` is recognized on all seven named collections
+  but is not executable.
+- **Stage 27 — Sequenced after Decision 0113.** Pending controlled performance
+  measurement is not a dependency.
+
+### Slice 2 performance impact
+
+| Dimension | Impact |
+| --- | --- |
+| Generated runtime | No change |
+| Runtime representation or ABI | No change |
+| Generated allocations, copies, or dispatch | No change |
+| Backend lowering | No change |
+| Compiler work | One bounded receiver-aware table lookup after failed collection-member resolution |
+| Successful compilation fast path | No meaningful change expected |
+| Benchmark | Not required |
+
+The suggestion data is compiler-owned so a future `doriac migrate php` can
+reuse it directly. The language server consumes structured compiler fixes and
+does not maintain a second spelling table.
+
 ## Affected components
 
 Semantic analysis (member resolution and the membership gates), MIR and its

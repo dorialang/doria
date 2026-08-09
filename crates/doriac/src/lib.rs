@@ -8,6 +8,7 @@ pub mod codegen_cranelift;
 pub mod codegen_llvm;
 pub mod codegen_native;
 pub mod codegen_php;
+pub mod collection_diagnostics;
 pub mod const_eval;
 mod constructor_init;
 pub mod control_flow;
@@ -61,7 +62,7 @@ pub fn parse_source(path: impl Into<String>, text: impl Into<String>) -> Diagnos
 pub fn check_source(path: impl Into<String>, text: impl Into<String>) -> DiagnosticResult<Program> {
     let source = SourceFile::new(path, text);
     let program = parse_source_file(&source)?;
-    semantics::check_program(&program)?;
+    semantics::analyze_program_with_source(&program, &source.text)?;
     Ok(program)
 }
 
@@ -99,7 +100,7 @@ pub fn lower_source(
 ) -> DiagnosticResult<hir::Program> {
     let source = SourceFile::new(path, text);
     let program = parse_source_file(&source)?;
-    let semantic_info = semantics::analyze_program(&program)?;
+    let semantic_info = semantics::analyze_program_with_source(&program, &source.text)?;
     let mut hir = lowering::lower_program_with_semantics(&program, semantic_info)?;
     hir.source_path = source.path;
     hir.source_text = source.text;

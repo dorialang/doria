@@ -3,7 +3,12 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::*;
 use crate::builtins::{is_reserved_intrinsic_name, php_function_suggestion, Builtin};
 use crate::class_layout::{ClassId, PropertyId};
-use crate::diagnostics::{Diagnostic, DiagnosticResult};
+use crate::collection_diagnostics::{
+    self, ArgumentShape, CollectionMemberKind, CollectionReceiver, ImplementationStatus,
+};
+use crate::diagnostics::{
+    Diagnostic, DiagnosticResult, DiagnosticSource, FixApplicability, FixEdit,
+};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
@@ -144,11 +149,30 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
 }
 
 pub fn analyze_program_for_ide(program: &Program) -> SemanticAnalysis {
+    analyze_program_for_ide_with_source(program, None)
+}
+
+pub fn analyze_program_with_source<'source>(
+    program: &'source Program,
+    source_text: &'source str,
+) -> DiagnosticResult<SemanticInfo> {
+    let analysis = analyze_program_for_ide_with_source(program, Some(source_text));
+    if analysis.diagnostics.is_empty() {
+        Ok(analysis.info)
+    } else {
+        Err(analysis.diagnostics)
+    }
+}
+
+pub fn analyze_program_for_ide_with_source<'source>(
+    program: &'source Program,
+    source_text: Option<&'source str>,
+) -> SemanticAnalysis {
     let (const_evaluation, const_diagnostics) = match crate::const_eval::evaluate_program(program) {
         Ok(evaluation) => (evaluation, Vec::new()),
         Err(diagnostics) => (crate::const_eval::Evaluation::default(), diagnostics),
     };
-    let mut checker = Checker::new(program, const_evaluation);
+    let mut checker = Checker::new(program, const_evaluation, source_text);
     checker.diagnostics.extend(const_diagnostics);
     checker.check();
     if checker.diagnostics.is_empty() {
@@ -773,6 +797,7 @@ pub(crate) fn trait_declaration_diagnostic(trait_decl: &TraitDecl) -> Diagnostic
 
 struct Checker<'program> {
     program: &'program Program,
+    source_text: Option<&'program str>,
     classes: HashMap<String, ClassInfo>,
     functions: HashMap<String, FunctionInfo>,
     function_signatures: HashMap<usize, FunctionInfo>,
@@ -798,6 +823,7 @@ struct Checker<'program> {
     parameter_defaults:
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
     flow_facts: crate::narrowing::FactsByUse,
+    contextual_expression_types: HashMap<(usize, usize), TypeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -824,6 +850,18 @@ struct CallSite<'a> {
     return_borrow: Option<ReturnBorrow>,
     params: &'a [ParamInfo],
     args: &'a [Argument],
+}
+
+#[derive(Clone, Copy)]
+struct CollectionMethodCall<'a> {
+    object: &'a Expr,
+    method: &'a str,
+    args: &'a [Argument],
+    member_span: Span,
+    argument_list_span: Span,
+    span: Span,
+    scopes: &'a ScopeStack,
+    method_context: Option<&'a MethodContext>,
 }
 
 #[derive(Debug, Clone)]
@@ -937,6 +975,7 @@ struct StaticAccess<'a> {
     qualifier_span: Span,
     member_sigil_span: Option<Span>,
     member: &'a str,
+    member_span: Span,
     span: Span,
 }
 
@@ -964,9 +1003,14 @@ enum DisplayConversionKind {
 }
 
 impl<'program> Checker<'program> {
-    fn new(program: &'program Program, const_evaluation: crate::const_eval::Evaluation) -> Self {
+    fn new(
+        program: &'program Program,
+        const_evaluation: crate::const_eval::Evaluation,
+        source_text: Option<&'program str>,
+    ) -> Self {
         Self {
             program,
+            source_text,
             classes: HashMap::new(),
             functions: HashMap::new(),
             function_signatures: HashMap::new(),
@@ -991,6 +1035,7 @@ impl<'program> Checker<'program> {
             const_evaluation,
             parameter_defaults: HashMap::new(),
             flow_facts: crate::narrowing::analyze_program(program),
+            contextual_expression_types: HashMap::new(),
         }
     }
 
@@ -3562,11 +3607,19 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let diagnostics_before = self.diagnostics.len();
+        let explicit_ty = decl
+            .ty
+            .as_ref()
+            .map(|ty| self.resolve_type_ref(ty, decl.span));
+        if let Some(target_ty) = explicit_ty {
+            let span = decl.initializer.span();
+            self.contextual_expression_types
+                .insert((span.start, span.end), target_ty);
+        }
         self.check_expr(&decl.initializer, scopes, method_context);
         let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
-        let ty = match &decl.ty {
-            Some(ty) => {
-                let target_ty = self.resolve_type_ref(ty, decl.span);
+        let ty = match explicit_ty {
+            Some(target_ty) => {
                 self.check_expr_assignable(
                     target_ty,
                     &decl.initializer,
@@ -4168,6 +4221,7 @@ impl<'program> Checker<'program> {
             Expr::PropertyAccess {
                 object,
                 property,
+                member_span,
                 null_safe,
                 span,
             } => {
@@ -4202,6 +4256,7 @@ impl<'program> Checker<'program> {
                     self.check_compiler_known_property(
                         object,
                         property,
+                        *member_span,
                         *span,
                         scopes,
                         method_context,
@@ -4213,8 +4268,10 @@ impl<'program> Checker<'program> {
             Expr::MethodCall {
                 object,
                 method,
+                member_span,
                 span,
                 args,
+                argument_list_span,
                 null_safe,
             } => {
                 self.check_expr(object, scopes, method_context);
@@ -4235,14 +4292,16 @@ impl<'program> Checker<'program> {
                     *span,
                     scopes,
                     method_context,
-                ) && !self.check_collection_method_call(
+                ) && !self.check_collection_method_call(CollectionMethodCall {
                     object,
                     method,
                     args,
-                    *span,
+                    member_span: *member_span,
+                    argument_list_span: *argument_list_span,
+                    span: *span,
                     scopes,
                     method_context,
-                ) {
+                }) {
                     self.check_method_call(
                         object,
                         method,
@@ -4268,9 +4327,11 @@ impl<'program> Checker<'program> {
                 qualifier,
                 qualifier_span,
                 method,
+                member_span,
                 member_sigil_span,
                 args,
                 span,
+                ..
             } => {
                 for arg in args {
                     self.check_expr(&arg.value, scopes, method_context);
@@ -4281,6 +4342,7 @@ impl<'program> Checker<'program> {
                         qualifier_span: *qualifier_span,
                         member_sigil_span: *member_sigil_span,
                         member: method,
+                        member_span: *member_span,
                         span: *span,
                     },
                     args,
@@ -4292,6 +4354,7 @@ impl<'program> Checker<'program> {
                 qualifier,
                 qualifier_span,
                 member,
+                member_span,
                 member_sigil_span,
                 span,
             } => {
@@ -4301,6 +4364,7 @@ impl<'program> Checker<'program> {
                         qualifier_span: *qualifier_span,
                         member_sigil_span: *member_sigil_span,
                         member,
+                        member_span: *member_span,
                         span: *span,
                     },
                     method_context,
@@ -5720,6 +5784,7 @@ impl<'program> Checker<'program> {
                 property,
                 null_safe,
                 span,
+                ..
             } => {
                 if *null_safe {
                     self.diagnostics.push(
@@ -5849,6 +5914,7 @@ impl<'program> Checker<'program> {
                 qualifier,
                 qualifier_span,
                 member,
+                member_span,
                 member_sigil_span,
                 span,
             } => self.check_static_assignment_target(
@@ -5857,6 +5923,7 @@ impl<'program> Checker<'program> {
                     qualifier_span: *qualifier_span,
                     member_sigil_span: *member_sigil_span,
                     member,
+                    member_span: *member_span,
                     span: *span,
                 },
                 method_context,
@@ -6652,6 +6719,12 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        if let StaticQualifier::Class(collection) = access.qualifier {
+            if matches!(collection.as_str(), "List" | "Dictionary") && access.member == "from" {
+                self.report_withdrawn_collection_from(collection, access, args);
+                return;
+            }
+        }
         let Some(class_name) = self.resolve_static_qualifier(access, method_context) else {
             return;
         };
@@ -6953,6 +7026,85 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+    }
+
+    fn report_withdrawn_collection_from(
+        &mut self,
+        collection: &str,
+        access: StaticAccess<'_>,
+        args: &[Argument],
+    ) {
+        let mut diagnostic = Diagnostic::new(
+            "E0558",
+            format!("`{collection}::from` is not a Doria collection constructor"),
+            access.member_span,
+        )
+        .with_title("Use A Collection Literal")
+        .with_primary_label("This Construction Form Was Withdrawn")
+        .with_explanation(
+            "List and Dictionary use bracket literals. `::from` is reserved for collection types that have no literal form.",
+        );
+
+        let expected = self
+            .contextual_expression_types
+            .get(&(access.span.start, access.span.end))
+            .copied();
+        let direct_literal = match args {
+            [Argument {
+                name: None,
+                value: Expr::Array { elements, span },
+                ..
+            }] => Some((elements, *span)),
+            _ => None,
+        };
+        let safe_literal = direct_literal.is_some_and(|(elements, _)| {
+            if elements.is_empty() {
+                expected.is_some_and(|target| {
+                    matches!(
+                        (collection, self.types.kind(target)),
+                        ("List", TypeKind::List(_)) | ("Dictionary", TypeKind::Dictionary(_, _))
+                    )
+                })
+            } else if collection == "List" {
+                elements.iter().all(|element| element.key.is_none())
+            } else {
+                elements.iter().all(|element| element.key.is_some())
+            }
+        });
+
+        if safe_literal {
+            let (_, literal_span) = direct_literal.expect("safe direct literal exists");
+            if let Some(literal) = self.source_slice(literal_span).map(str::to_owned) {
+                diagnostic = diagnostic
+                    .with_help("use the bracket literal directly")
+                    .with_structured_fix(
+                        format!("Replace `{collection}::from` With The Literal"),
+                        FixApplicability::MachineApplicable,
+                        vec![FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: access.span,
+                            replacement: literal,
+                        }],
+                    );
+            } else {
+                diagnostic = diagnostic.with_help("use the bracket literal directly");
+            }
+        } else if direct_literal.is_some_and(|(elements, _)| elements.is_empty()) {
+            diagnostic = diagnostic.with_help(format!(
+                "declare the element types explicitly, for example `{collection}<...> $values = []`"
+            ));
+        } else if direct_literal.is_some() {
+            diagnostic = diagnostic.with_help(if collection == "List" {
+                "use an unkeyed bracket literal for List values"
+            } else {
+                "use a keyed bracket literal for Dictionary values"
+            });
+        } else {
+            diagnostic = diagnostic.with_help(
+                "iterate the source into an explicitly typed literal-constructible collection; general cross-collection materialization remains deferred",
+            );
+        }
+        self.diagnostics.push(diagnostic);
     }
 
     fn check_static_member(
@@ -10924,10 +11076,178 @@ impl<'program> Checker<'program> {
         Some(self.null_safe_result_type(result, null_safe && nullable_access))
     }
 
+    fn collection_receiver(kind: &TypeKind) -> Option<CollectionReceiver> {
+        match kind {
+            TypeKind::TypedArray(_) => Some(CollectionReceiver::TypedArray),
+            TypeKind::List(_) => Some(CollectionReceiver::List),
+            TypeKind::Dictionary(_, _) => Some(CollectionReceiver::Dictionary),
+            TypeKind::Set(_) => Some(CollectionReceiver::Set),
+            TypeKind::SortedDictionary(_, _) => Some(CollectionReceiver::SortedDictionary),
+            TypeKind::SortedSet(_) => Some(CollectionReceiver::SortedSet),
+            TypeKind::PriorityQueue(_) => Some(CollectionReceiver::PriorityQueue),
+            TypeKind::Deque(_) => Some(CollectionReceiver::Deque),
+            _ => None,
+        }
+    }
+
+    fn report_pending_collection_member(
+        &mut self,
+        receiver: CollectionReceiver,
+        member: &str,
+        member_span: Span,
+        slice: u8,
+    ) {
+        self.diagnostics.push(
+            Diagnostic::unsupported_stage(
+                "E0559",
+                format!(
+                    "`{}::{member}` is accepted by Decision 0113 but is not executable yet",
+                    receiver.source_name()
+                ),
+                member_span,
+            )
+            .with_title("Accepted Collection Member Is Not Executable Yet")
+            .with_primary_label("This Accepted Member Is Pending Implementation")
+            .with_explanation(format!(
+                "Decision 0113 Slice {slice} owns the executable implementation of this collection member. Semantic checking stops before MIR or backend lowering."
+            )),
+        );
+    }
+
+    fn report_unknown_collection_member(
+        &mut self,
+        receiver_ty: TypeId,
+        receiver: CollectionReceiver,
+        written: &str,
+        member_span: Span,
+        written_argument_count: Option<usize>,
+        suggestion: &collection_diagnostics::CollectionMemberSuggestion,
+    ) {
+        let mut diagnostic = Diagnostic::new(
+            "E0521",
+            format!(
+                "unknown collection member `{written}` on `{}`; did you mean `{}`?",
+                self.types.display(receiver_ty),
+                suggestion.canonical
+            ),
+            member_span,
+        )
+        .with_title("Unknown Collection Member")
+        .with_primary_label("This Member Name Is Not Available On The Receiver")
+        .with_explanation(format!(
+            "`{}` uses `{}` for this operation under {}'s collection naming rules.",
+            receiver.source_name(),
+            suggestion.canonical,
+            suggestion.decision_owner
+        ))
+        .with_help(format!(
+            "replace `{written}` with `{}`",
+            suggestion.canonical
+        ));
+
+        let argument_shape_matches = match (suggestion.arguments, written_argument_count) {
+            (ArgumentShape::Property, None) => true,
+            (ArgumentShape::Exact(expected), Some(found)) => expected == found,
+            _ => false,
+        };
+        let applicability = if argument_shape_matches {
+            suggestion.applicability
+        } else {
+            FixApplicability::RequiresReview
+        };
+        diagnostic = diagnostic.with_structured_fix(
+            format!("Rename `{written}` To `{}`", suggestion.canonical),
+            applicability,
+            vec![FixEdit {
+                source: DiagnosticSource::Current,
+                span: member_span,
+                replacement: suggestion.canonical.to_string(),
+            }],
+        );
+        self.diagnostics.push(diagnostic);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn report_property_invoked_as_method(
+        &mut self,
+        receiver_ty: TypeId,
+        receiver: CollectionReceiver,
+        written: &str,
+        member_span: Span,
+        argument_list_span: Span,
+        args: &[Argument],
+        suggestion: Option<&collection_diagnostics::CollectionMemberSuggestion>,
+        status: ImplementationStatus,
+    ) {
+        let canonical = suggestion.map_or(written, |entry| entry.canonical);
+        let mut diagnostic = Diagnostic::new(
+            "E0557",
+            format!(
+                "`{canonical}` is a property on `{}`, not a method",
+                self.types.display(receiver_ty)
+            ),
+            member_span,
+        )
+        .with_title("Property Is Not A Method")
+        .with_primary_label("This Collection State Is Read As A Property")
+        .with_explanation(format!(
+            "`{canonical}` represents collection state on `{}` and is read without parentheses.",
+            receiver.source_name()
+        ));
+
+        if args.is_empty() {
+            let mut edits = Vec::with_capacity(2);
+            if canonical != written {
+                edits.push(FixEdit {
+                    source: DiagnosticSource::Current,
+                    span: member_span,
+                    replacement: canonical.to_string(),
+                });
+            }
+            edits.push(FixEdit {
+                source: DiagnosticSource::Current,
+                span: argument_list_span,
+                replacement: String::new(),
+            });
+
+            let projection_requires_context = matches!(canonical, "keys" | "values");
+            let applicability = if status == ImplementationStatus::Executable
+                && !projection_requires_context
+                && suggestion
+                    .is_none_or(|entry| entry.applicability == FixApplicability::MachineApplicable)
+            {
+                FixApplicability::MachineApplicable
+            } else {
+                FixApplicability::RequiresReview
+            };
+            diagnostic = diagnostic
+                .with_help(format!("read the property as `->{canonical}`"))
+                .with_structured_fix(
+                    if canonical == written {
+                        format!("Remove Parentheses From `{canonical}`")
+                    } else {
+                        format!("Use The `{canonical}` Property")
+                    },
+                    applicability,
+                    edits,
+                );
+        } else {
+            diagnostic = diagnostic.with_help(format!(
+                "read `->{canonical}` without arguments; the supplied arguments cannot be removed automatically"
+            ));
+        }
+        self.diagnostics.push(diagnostic);
+    }
+
+    fn source_slice(&self, span: Span) -> Option<&str> {
+        self.source_text?.get(span.start..span.end)
+    }
+
     fn check_compiler_known_property(
         &mut self,
         object: &Expr,
         property: &str,
+        member_span: Span,
         span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
@@ -10961,6 +11281,26 @@ impl<'program> Checker<'program> {
                 ),
             }
             return;
+        }
+        let receiver = Self::collection_receiver(self.types.kind(ty));
+        if let Some(receiver) = receiver {
+            if collection_diagnostics::canonical_property_status(receiver, property)
+                == Some(ImplementationStatus::PendingSlice3)
+            {
+                self.report_pending_collection_member(receiver, property, member_span, 3);
+                return;
+            }
+            if let Some(suggestion) = collection_diagnostics::suggestion_for(receiver, property) {
+                self.report_unknown_collection_member(
+                    ty,
+                    receiver,
+                    property,
+                    member_span,
+                    None,
+                    suggestion,
+                );
+                return;
+            }
         }
         let supported = matches!(
             (self.types.kind(ty), property),
@@ -11012,25 +11352,36 @@ impl<'program> Checker<'program> {
             return;
         }
         if !supported {
-            self.diagnostics.push(Diagnostic::unsupported_stage(
-                "E0521",
-                format!(
-                    "collection property `{property}` is not part of the collection surface settled by Decision 0113"
-                ),
-                span,
-            ));
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0521",
+                    format!(
+                        "unknown collection property `{property}` on `{}`; it is not part of the surface settled by Decision 0113",
+                        self.types.display(ty),
+                    ),
+                    member_span,
+                )
+                .with_title("Unknown Collection Member")
+                .with_primary_label("This Property Is Not Available On The Receiver")
+                .with_explanation(
+                    "Collection members are resolved from the receiver type, so names from another collection family do not apply here.",
+                )
+                .with_help("use a member documented for this collection type"),
+            );
         }
     }
 
-    fn check_collection_method_call(
-        &mut self,
-        object: &Expr,
-        method: &str,
-        args: &[Argument],
-        span: Span,
-        scopes: &ScopeStack,
-        method_context: Option<&MethodContext>,
-    ) -> bool {
+    fn check_collection_method_call(&mut self, call: CollectionMethodCall<'_>) -> bool {
+        let CollectionMethodCall {
+            object,
+            method,
+            args,
+            member_span,
+            argument_list_span,
+            span,
+            scopes,
+            method_context,
+        } = call;
         let ty = self.infer_expr_type(object, scopes, method_context);
         let ty = self.forwarded_access_payload_type(ty);
         let kind = self.types.kind(ty).clone();
@@ -11049,20 +11400,84 @@ impl<'program> Checker<'program> {
         if !is_collection {
             return false;
         }
+        let receiver = Self::collection_receiver(&kind);
+        if let Some(receiver) = receiver {
+            if let Some(status) =
+                collection_diagnostics::canonical_property_status(receiver, method)
+            {
+                self.report_property_invoked_as_method(
+                    ty,
+                    receiver,
+                    method,
+                    member_span,
+                    argument_list_span,
+                    args,
+                    None,
+                    status,
+                );
+                return true;
+            }
+            if let Some(status) = collection_diagnostics::pending_method_status(receiver, method) {
+                self.report_pending_collection_member(
+                    receiver,
+                    method,
+                    member_span,
+                    status.slice().expect("pending member has a slice"),
+                );
+                return true;
+            }
+            if let Some(suggestion) = collection_diagnostics::suggestion_for(receiver, method) {
+                if suggestion.member_kind == CollectionMemberKind::Property {
+                    self.report_property_invoked_as_method(
+                        ty,
+                        receiver,
+                        method,
+                        member_span,
+                        argument_list_span,
+                        args,
+                        Some(suggestion),
+                        suggestion.implementation,
+                    );
+                } else {
+                    self.report_unknown_collection_member(
+                        ty,
+                        receiver,
+                        method,
+                        member_span,
+                        Some(args.len()),
+                        suggestion,
+                    );
+                }
+                return true;
+            }
+        }
         if self.reject_named_arguments(&format!("collection method `{method}`"), args) {
             return true;
         }
 
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
-        if let (
-            TypeKind::List(value)
-            | TypeKind::TypedArray(value)
-            | TypeKind::PriorityQueue(value)
-            | TypeKind::Deque(value),
-            "contains",
-        ) = (&kind, method)
-        {
-            self.check_stage23_equatable_type(*value, span);
+        let compared_type = match (&kind, method) {
+            (
+                TypeKind::List(value)
+                | TypeKind::TypedArray(value)
+                | TypeKind::Set(value)
+                | TypeKind::SortedSet(value)
+                | TypeKind::PriorityQueue(value)
+                | TypeKind::Deque(value),
+                "contains",
+            ) => Some(*value),
+            (TypeKind::Dictionary(key, _) | TypeKind::SortedDictionary(key, _), "containsKey") => {
+                Some(*key)
+            }
+            _ => None,
+        };
+        if let Some(compared_type) = compared_type {
+            let receiver = receiver.expect("collection equality receiver");
+            self.check_stage23_equatable_type(
+                compared_type,
+                span,
+                &format!("{}::{method}", receiver.source_name()),
+            );
         }
         let (expected, mutating): (Vec<TypeId>, bool) = match (kind, method) {
             (TypeKind::List(value), "add") => (vec![value], true),
@@ -11140,13 +11555,22 @@ impl<'program> Checker<'program> {
                 return true;
             }
             _ => {
-                self.diagnostics.push(Diagnostic::unsupported_stage(
-                    "E0521",
-                    format!(
-                        "collection method `{method}` is not part of the collection surface settled by Decision 0113"
-                    ),
-                    span,
-                ));
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0521",
+                        format!(
+                            "unknown collection method `{method}` on `{}`; it is not part of the surface settled by Decision 0113",
+                            self.types.display(ty),
+                        ),
+                        member_span,
+                    )
+                    .with_title("Unknown Collection Member")
+                    .with_primary_label("This Method Is Not Available On The Receiver")
+                    .with_explanation(
+                        "Collection members are resolved from the receiver type, so names from another collection family do not apply here.",
+                    )
+                    .with_help("use a member documented for this collection type"),
+                );
                 return true;
             }
         };
@@ -11181,29 +11605,42 @@ impl<'program> Checker<'program> {
         true
     }
 
-    fn check_stage23_equatable_type(&mut self, ty: TypeId, span: Span) {
+    fn check_stage23_equatable_type(&mut self, ty: TypeId, span: Span, operation: &str) {
         match self.types.kind(ty) {
             TypeKind::Integer(_)
             | TypeKind::Float(_)
             | TypeKind::String
             | TypeKind::Bool
             | TypeKind::Unknown => {}
-            TypeKind::Class(_) => self.diagnostics.push(Diagnostic::unsupported_stage(
-                "E0524",
-                format!(
-                    "List::contains for `{}` requires Stage 35 user-defined `Equatable` conformance",
-                    self.types.display(ty)
+            TypeKind::Class(_) => self.diagnostics.push(
+                Diagnostic::unsupported_stage(
+                    "E0524",
+                    format!(
+                        "{operation} cannot yet compare user-defined values of type `{}`",
+                        self.types.display(ty)
+                    ),
+                    span,
+                )
+                .with_title("Collection Value Cannot Be Compared")
+                .with_explanation(
+                    "The selected collection operation compares values for equality, but user-defined equality is not executable in the current language stage.",
                 ),
-                span,
-            )),
-            _ => self.diagnostics.push(Diagnostic::new(
-                "E0524",
-                format!(
-                    "List::contains cannot compare values of type `{}`",
-                    self.types.display(ty)
-                ),
-                span,
-            )),
+            ),
+            _ => self.diagnostics.push(
+                Diagnostic::new(
+                    "E0524",
+                    format!(
+                        "{operation} cannot compare values of type `{}`",
+                        self.types.display(ty)
+                    ),
+                    span,
+                )
+                .with_title("Collection Value Cannot Be Compared")
+                .with_explanation(
+                    "The selected collection operation compares values for equality, and this value type does not support that comparison in the current language.",
+                )
+                .with_help("use a value type with defined equality for this collection operation"),
+            ),
         }
     }
 
