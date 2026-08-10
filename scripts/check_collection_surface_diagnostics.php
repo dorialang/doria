@@ -41,26 +41,41 @@ function require_suggestion(string $table, string $input, string $canonical, arr
 $decisionPath = 'docs/decisions/0113-collection-surface-completion.md';
 $planPath = 'docs/doria-end-to-end-plan.md';
 $pipelinePath = 'docs/notes/current-pipeline.md';
+$stdlibPath = 'docs/stdlib-reference.md';
+$parityPath = 'docs/notes/native-parity-matrix.md';
+$auditPath = 'docs/notes/collection-surface-audit.md';
 $tablePath = 'crates/doriac/src/collection_diagnostics.rs';
 $semanticsPath = 'crates/doriac/src/semantics.rs';
+$mirPath = 'crates/doriac/src/mir.rs';
 $testsPath = 'crates/doriac/tests/collection_diagnostic_tests.rs';
+$stage26TestsPath = 'crates/doriac/tests/stage26_tests.rs';
+$fixturePath = 'examples/native/main_stage26_collection_slice3.doria';
+$manifestPath = 'crates/doriac/tests/fixtures/native_parity_examples.txt';
 
 $decision = required_contents($root, $decisionPath, $failures);
 $plan = required_contents($root, $planPath, $failures);
 $pipeline = required_contents($root, $pipelinePath, $failures);
+$stdlib = required_contents($root, $stdlibPath, $failures);
+$parity = required_contents($root, $parityPath, $failures);
+$audit = required_contents($root, $auditPath, $failures);
 $table = required_contents($root, $tablePath, $failures);
 $semantics = required_contents($root, $semanticsPath, $failures);
+$mir = required_contents($root, $mirPath, $failures);
 $tests = required_contents($root, $testsPath, $failures);
+$stage26Tests = required_contents($root, $stage26TestsPath, $failures);
+$fixture = required_contents($root, $fixturePath, $failures);
+$manifest = required_contents($root, $manifestPath, $failures);
 
 require_all($decisionPath, $decision, [
     '**Slice 1 — Complete.**',
     '**Slice 2 — Complete.**',
-    '**Slice 3 — Next.**',
-    '**Slice 4 — Pending.**',
+    '**Slice 3 — Complete.**',
+    '**Slice 4 — Next.**',
     '**Stage 27 — Sequenced after Decision 0113.**',
-    'One bounded receiver-aware table lookup after failed collection-member resolution',
-    'Generated runtime | No change',
-    'Runtime representation or ABI | No change',
+    '`List::indexOf` | O(n) | None',
+    '`List::remove` | O(n), including one tail shift | None',
+    '`Dictionary::containsValue` | O(n) | None',
+    '`Set::first` / `last` | O(1) | None',
 ], $failures);
 
 foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
@@ -68,20 +83,44 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 26b — Complete',
         'Measurement Status: Pending Available Runner',
         'Decision 0113 Slice 2 — Complete',
-        'Decision 0113 Slice 3 — Next',
-        'Decision 0113 Slice 4 — Pending',
+        'Decision 0113 Slice 3 — Complete',
+        'Decision 0113 Slice 4 — Next',
         'Stage 27 — Sequenced After Decision 0113',
     ], $failures);
 }
+
+require_all($stdlibPath, $stdlib, [
+    'Decision 0113 Slices 1-3 are implemented',
+    '`indexOf(T): ?int`',
+    'writable `remove(T): bool`',
+    'executable O(n) `containsValue(V): bool`',
+    'executable readonly `first: ?T` / `last: ?T` properties',
+    'Writable `clear(): void` remains accepted pending Slice 4',
+], $failures);
+
+require_all($parityPath, $parity, [
+    'Decision 0113 Slice 3 collection members',
+    'main_stage26_collection_slice3.doria',
+    'Slice 4',
+    '`clear()` still stops before MIR with E0559',
+], $failures);
+
+require_all($auditPath, $audit, [
+    'Decision 0113 Slices 1-3 are complete',
+    'Slice 4 `clear()` is next',
+], $failures);
 
 require_all($tablePath, $table, [
     'COLLECTION_MEMBER_SUGGESTIONS',
     'pub fn suggestion_for(',
     'pending_method_status',
-    '(List, "indexOf" | "remove")',
     '"clear",',
     'decision_owner: "Decision 0113"',
 ], $failures);
+
+if (str_contains($table, 'PendingSlice3')) {
+    $failures[] = "{$tablePath}: completed Slice 3 must not remain in the pending-state model";
+}
 
 foreach ([
     ['has', 'containsKey'],
@@ -106,6 +145,11 @@ require_all($semanticsPath, $semantics, [
     'Accepted Collection Member Is Not Executable Yet',
 ], $failures);
 
+require_all($mirPath, $mir, [
+    'CollectionIndexOf',
+    'ContainsValue',
+], $failures);
+
 foreach (['List::contains for', '"get" | "has"', '"containsKey" | "has"'] as $forbidden) {
     if (str_contains($semantics, $forbidden)) {
         $failures[] = "{$semanticsPath}: forbidden stale or executable `has` contract `{$forbidden}`";
@@ -116,7 +160,7 @@ require_all($testsPath, $tests, [
     'map_membership_spellings_have_receiver_aware_applied_fixes',
     'property_invocation_has_safe_and_combined_fixes',
     'withdrawn_literal_constructors_preserve_source_and_context',
-    'accepted_pending_members_stop_before_lowering_with_their_slice_owner',
+    'slice_three_members_execute_and_only_slice_four_remains_pending',
     'equality_diagnostics_name_the_actual_collection_operation',
     'valid-from-families.doria',
     'Set::from([1])',
@@ -126,9 +170,18 @@ require_all($testsPath, $tests, [
     'Deque::from([1])',
 ], $failures);
 
+require_all($stage26TestsPath, $stage26Tests, [
+    'decision_0113_slice_three_example_executes_in_the_semantic_oracle',
+    'collection_search_receiver_and_probe_evaluate_once_in_source_order',
+], $failures);
+
+require_all($manifestPath, $manifest, [
+    'examples/native/main_stage26_collection_slice3.doria',
+], $failures);
+
 foreach (['Andrew', 'Lucy', 'Masiye'] as $privateName) {
-    if (str_contains($tests, $privateName)) {
-        $failures[] = "{$testsPath}: private or family name `{$privateName}` is not allowed in fixtures";
+    if (str_contains($tests, $privateName) || str_contains($fixture, $privateName)) {
+        $failures[] = "Slice 3 tests or fixtures contain private or family name `{$privateName}`";
     }
 }
 

@@ -48,9 +48,7 @@ function main(): void
             _ => None,
         })
         .expect("indexOf assignment should be present");
-    *expression = Box::new(Rvalue::String(StringExpression::Literal(
-        "wrong".to_string(),
-    )));
+    **expression = Rvalue::String(StringExpression::Literal("wrong".to_string()));
     assert!(doriac::mir_validation::validate_program(&wrong_probe)
         .expect_err("indexOf with a wrong probe type must be malformed")
         .message
@@ -137,7 +135,7 @@ function main(): void
             _ => None,
         })
         .expect("containsValue assignment should be present");
-    *value = Box::new(Rvalue::String(StringExpression::Literal("one".to_string())));
+    **value = Rvalue::String(StringExpression::Literal("one".to_string()));
     assert!(doriac::mir_validation::validate_program(&wrong_axis_type)
         .expect_err("containsValue must validate against the value axis")
         .message

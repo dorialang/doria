@@ -17,6 +17,16 @@ correctly, and the MIR interpreter and Cranelift agree byte for byte — there i
 **no two-clocks violation** in the current surface. LLVM is not enabled in this
 build, so the release profile is unverified rather than confirmed.
 
+## Implementation follow-up
+
+Decision 0113 Slices 1-3 are complete on current `develop`. Slice 3 makes
+`List::indexOf`, writable `List::remove`, both map `containsValue` operations,
+and readonly `Set` / `SortedSet` `first` and `last` properties executable
+through the MIR interpreter, Cranelift, and LLVM. Slice 4 `clear()` is next and
+remains the only accepted Decision 0113 member stopped by E0559. The measured
+matrix below remains the historical input to the decision rather than being
+rewritten as if those operations existed at audit time.
+
 ## 1. Correction to the reported symptom
 
 The audit was prompted by the report that `Dictionary` and `SortedDictionary`

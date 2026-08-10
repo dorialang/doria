@@ -42,7 +42,6 @@ pub enum ArgumentShape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImplementationStatus {
     Executable,
-    PendingSlice3,
     PendingSlice4,
 }
 
@@ -50,7 +49,6 @@ impl ImplementationStatus {
     pub const fn slice(self) -> Option<u8> {
         match self {
             Self::Executable => None,
-            Self::PendingSlice3 => Some(3),
             Self::PendingSlice4 => Some(4),
         }
     }
@@ -101,7 +99,7 @@ const REMOVE_COLLECTIONS: &[CollectionReceiver] = &[
     CollectionReceiver::SortedDictionary,
     CollectionReceiver::SortedSet,
 ];
-const PENDING_ENDPOINT_COLLECTIONS: &[CollectionReceiver] =
+const SET_ENDPOINT_COLLECTIONS: &[CollectionReceiver] =
     &[CollectionReceiver::Set, CollectionReceiver::SortedSet];
 const LIST: &[CollectionReceiver] = &[CollectionReceiver::List];
 const DEQUE: &[CollectionReceiver] = &[CollectionReceiver::Deque];
@@ -309,20 +307,20 @@ pub const COLLECTION_MEMBER_SUGGESTIONS: &[CollectionMemberSuggestion] = &[
     suggestion!(
         "Min",
         "first",
-        PENDING_ENDPOINT_COLLECTIONS,
+        SET_ENDPOINT_COLLECTIONS,
         Property,
         ArgumentShape::Property,
-        RequiresReview,
-        PendingSlice3
+        MachineApplicable,
+        Executable
     ),
     suggestion!(
         "Max",
         "last",
-        PENDING_ENDPOINT_COLLECTIONS,
+        SET_ENDPOINT_COLLECTIONS,
         Property,
         ArgumentShape::Property,
-        RequiresReview,
-        PendingSlice3
+        MachineApplicable,
+        Executable
     ),
     suggestion!(
         "Enqueue",

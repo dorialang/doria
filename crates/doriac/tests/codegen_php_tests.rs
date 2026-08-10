@@ -2301,14 +2301,17 @@ fn php_backend_executes_ordered_slice3_members_with_strict_nullable_semantics() 
         r#"
 function main(): void
 {
-    SortedDictionary<string, ?int> $numbers =
-        SortedDictionary::from(["empty" => null, "zero" => 0, "answer" => 42]);
+    writable SortedDictionary<string, ?int> $numbers = SortedDictionary::from([]);
+    $numbers->set("empty", null);
+    $numbers->set("zero", 0);
+    $numbers->set("answer", 42);
     echo $numbers->containsValue(null);
     echo $numbers->containsValue(0);
     echo $numbers->containsValue(7);
 
-    SortedDictionary<string, ?bool> $flags =
-        SortedDictionary::from(["empty" => null, "false" => false]);
+    writable SortedDictionary<string, ?bool> $flags = SortedDictionary::from([]);
+    $flags->set("empty", null);
+    $flags->set("false", false);
     echo $flags->containsValue(null);
     echo $flags->containsValue(false);
     echo $flags->containsValue(true);
@@ -2355,7 +2358,7 @@ function main(): void
         "{}",
         String::from_utf8_lossy(&run.stderr)
     );
-    assert_eq!(run.stdout, b"110110\n10 30\n-1 -1");
+    assert_eq!(run.stdout, b"truetruefalsetruetruefalse\n10 30\n-1 -1");
     assert!(
         run.stderr.is_empty(),
         "{}",

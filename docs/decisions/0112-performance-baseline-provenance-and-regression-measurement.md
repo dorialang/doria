@@ -183,8 +183,8 @@ separate Callgrind and DHAT executions, compiler scaling generators, candidate
 evidence, and an accepted exact structural baseline. Slice 3 adds peer sources
 for the new runtime cases, controlled-runner and baseline-promotion workflows,
 the exact native acceptance policy, and the stage-completion workflow. All three
-Stage 26b slices are complete. Decision 0113 Slices 1-2 are complete, Slice 3
-is next, Slice 4 is pending, and Stage 27 is sequenced after that accepted collection-surface work with no
+Stage 26b slices are complete. Decision 0113 Slices 1-3 are complete, Slice 4
+is next, and Stage 27 is sequenced after that accepted collection-surface work with no
 performance-evidence dependency.
 
 Slice 3 is split. Part 1 delivers the peer matrix, peer fairness and
@@ -214,7 +214,7 @@ pending release validation under the non-blocking gate above.
 - No eligible controlled physical-host Linux session exists yet, so no timing
   baseline or cross-language acceptance matrix is promoted. That pending
   release validation does not reopen Stage 26b or block compiler development.
-- Decision 0113 Slices 1-2 are complete, Slice 3 is next, and Slice 4 is pending. Stage 27 is sequenced after Decision 0113
+- Decision 0113 Slices 1-3 are complete and Slice 4 is next. Stage 27 is sequenced after Decision 0113
   and has no performance-evidence dependency.
 - The compiler pins the benchmark repository revision used by its coordinated
   checks in `benchmarks-revision.json` without requiring network access. The

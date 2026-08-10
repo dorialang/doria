@@ -114,6 +114,8 @@ fn peer_spellings_cover_size_mutation_search_endpoints_and_queue_vocabulary() {
         ),
         ("List<int> $v = [1];", "Min", "first"),
         ("List<int> $v = [1];", "Max", "last"),
+        ("Set<int> $v = Set::from([1]);", "Min", "first"),
+        ("SortedSet<int> $v = SortedSet::from([1]);", "Max", "last"),
         (
             "writable Deque<int> $v = Deque::from([1]);",
             "Enqueue(2)",
@@ -128,6 +130,10 @@ fn peer_spellings_cover_size_mutation_search_endpoints_and_queue_vocabulary() {
         let source = format!("function main(): void {{ {declaration} $v->{written}; }}");
         let error = diagnostic(&source, "E0521");
         assert_eq!(error.fixes[0].edits[0].replacement, canonical);
+        assert_eq!(
+            error.fixes[0].applicability,
+            FixApplicability::MachineApplicable
+        );
     }
 
     for written in ["array_search(1)", "position(1)", "find(1)"] {

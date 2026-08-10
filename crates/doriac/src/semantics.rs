@@ -11319,12 +11319,6 @@ impl<'program> Checker<'program> {
         }
         let receiver = Self::collection_receiver(self.types.kind(ty));
         if let Some(receiver) = receiver {
-            if collection_diagnostics::canonical_property_status(receiver, property)
-                == Some(ImplementationStatus::PendingSlice3)
-            {
-                self.report_pending_collection_member(receiver, property, member_span, 3);
-                return;
-            }
             if let Some(suggestion) = collection_diagnostics::suggestion_for(receiver, property) {
                 self.report_unknown_collection_member(
                     ty,
