@@ -10625,9 +10625,10 @@ impl<'program> Checker<'program> {
                 | TypeKind::Deque(_),
                 "isEmpty",
             ) => Some(bool_ty),
-            (TypeKind::List(value), "first" | "last") => {
-                Some(self.types.intern(TypeKind::Nullable(*value)))
-            }
+            (
+                TypeKind::List(value) | TypeKind::Set(value) | TypeKind::SortedSet(value),
+                "first" | "last",
+            ) => Some(self.types.intern(TypeKind::Nullable(*value))),
             (TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _), "keys" | "values") => {
                 Some(self.types.unknown())
             }
@@ -11059,6 +11060,11 @@ impl<'program> Checker<'program> {
             | (TypeKind::Deque(_), "pushFront" | "pushBack") => Some(void),
             (TypeKind::List(value), "removeAt") => Some(value),
             (TypeKind::List(value), "pop") => Some(self.types.intern(TypeKind::Nullable(value))),
+            (TypeKind::List(_), "indexOf") => {
+                let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
+                Some(self.types.intern(TypeKind::Nullable(int)))
+            }
+            (TypeKind::List(_), "remove") => Some(bool_ty),
             (TypeKind::List(_), "contains")
             | (TypeKind::TypedArray(_), "contains")
             | (TypeKind::PriorityQueue(_), "contains")
@@ -11070,6 +11076,7 @@ impl<'program> Checker<'program> {
                 Some(self.types.intern(TypeKind::Nullable(value)))
             }
             (TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _), "containsKey")
+            | (TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _), "containsValue")
             | (TypeKind::Set(_) | TypeKind::SortedSet(_), "add" | "remove" | "contains") => {
                 Some(bool_ty)
             }
@@ -11354,7 +11361,10 @@ impl<'program> Checker<'program> {
                         | TypeKind::Deque(_),
                     "isEmpty"
                 )
-                | (TypeKind::List(_), "first" | "last")
+                | (
+                    TypeKind::List(_) | TypeKind::Set(_) | TypeKind::SortedSet(_),
+                    "first" | "last"
+                )
                 | (TypeKind::PriorityQueue(_), "peek")
                 | (TypeKind::Deque(_), "peekFront" | "peekBack")
         );
@@ -11497,6 +11507,11 @@ impl<'program> Checker<'program> {
             (TypeKind::Dictionary(key, _) | TypeKind::SortedDictionary(key, _), "containsKey") => {
                 Some(*key)
             }
+            (TypeKind::List(value), "indexOf" | "remove")
+            | (
+                TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value),
+                "containsValue",
+            ) => Some(*value),
             _ => None,
         };
         if let Some(compared_type) = compared_type {
@@ -11513,14 +11528,18 @@ impl<'program> Checker<'program> {
             (TypeKind::List(_), "removeAt") => (vec![int], true),
             (TypeKind::List(_), "pop") => (vec![], true),
             (TypeKind::List(value), "contains") => (vec![value], false),
+            (TypeKind::List(value), "indexOf") => (vec![value], false),
+            (TypeKind::List(value), "remove") => (vec![value], true),
             (TypeKind::TypedArray(value), "contains") => (vec![value], false),
             (TypeKind::PriorityQueue(value), "contains") => (vec![value], false),
             (TypeKind::Deque(value), "contains") => (vec![value], false),
             (TypeKind::Dictionary(key, value), "set") => (vec![key, value], true),
             (TypeKind::Dictionary(key, _), "get" | "containsKey") => (vec![key], false),
+            (TypeKind::Dictionary(_, value), "containsValue") => (vec![value], false),
             (TypeKind::Dictionary(key, _), "remove") => (vec![key], true),
             (TypeKind::SortedDictionary(key, value), "set") => (vec![key, value], true),
             (TypeKind::SortedDictionary(key, _), "get" | "containsKey") => (vec![key], false),
+            (TypeKind::SortedDictionary(_, value), "containsValue") => (vec![value], false),
             (TypeKind::SortedDictionary(key, _), "remove") => (vec![key], true),
             (TypeKind::Set(value), "add" | "remove") => (vec![value], true),
             (TypeKind::Set(value), "contains") => (vec![value], false),
@@ -11635,6 +11654,7 @@ impl<'program> Checker<'program> {
 
     fn check_stage23_equatable_type(&mut self, ty: TypeId, span: Span, operation: &str) {
         match self.types.kind(ty) {
+            TypeKind::Nullable(inner) => self.check_stage23_equatable_type(*inner, span, operation),
             TypeKind::Integer(_)
             | TypeKind::Float(_)
             | TypeKind::String

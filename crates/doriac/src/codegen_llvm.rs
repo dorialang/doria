@@ -29,23 +29,23 @@ use crate::native_abi::{
     BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
     CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
     COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
-    COLLECTION_FREE, COLLECTION_INDEX_FIELD, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE,
-    COLLECTION_KEYED_GET, COLLECTION_KEYED_GET_NULLABLE, COLLECTION_KEYED_HAS,
-    COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT, COLLECTION_LENGTH,
-    COLLECTION_LENGTH_FIELD, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
-    COLLECTION_PUSH_FRONT, COLLECTION_PUSH_FRONT_NULLABLE, COLLECTION_PUSH_NULLABLE,
-    COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA,
-    COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE,
-    COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW, COLLECTION_VALUES_FIELD,
-    COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
-    FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED,
-    MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS,
-    MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64,
-    MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64,
-    MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE,
-    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE,
-    SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
-    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    COLLECTION_FREE, COLLECTION_INDEX_FIELD, COLLECTION_INDEX_OF, COLLECTION_INSERT_AT,
+    COLLECTION_INSERT_AT_NULLABLE, COLLECTION_KEYED_GET, COLLECTION_KEYED_GET_NULLABLE,
+    COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT,
+    COLLECTION_LENGTH, COLLECTION_LENGTH_FIELD, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS,
+    COLLECTION_PUSH, COLLECTION_PUSH_FRONT, COLLECTION_PUSH_FRONT_NULLABLE,
+    COLLECTION_PUSH_NULLABLE, COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT,
+    COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE,
+    COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW,
+    COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
+    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
+    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
+    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
+    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
+    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
+    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE,
+    SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK,
+    SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
     STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
     STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
     STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
@@ -2068,7 +2068,31 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         let (present, value, payload_ty) =
                             self.lower_nullable_collection_parts(&entry.value, definition.value)?;
                         let value_word = self.value_to_collection_word(value, payload_ty)?;
-                        if fixed {
+                        if matches!(
+                            definition.kind,
+                            mir::CollectionKind::Set | mir::CollectionKind::SortedSet
+                        ) {
+                            let inserted = self
+                                .call_runtime(
+                                    COLLECTION_PUSH_UNIQUE,
+                                    &[
+                                        pointer.into(),
+                                        self.context.i64_type().into(),
+                                        self.context.i8_type().into(),
+                                        self.context.i8_type().into(),
+                                    ],
+                                    Some(self.context.i8_type().into()),
+                                    &[
+                                        result.into(),
+                                        value_word.into(),
+                                        present.into(),
+                                        self.collection_compare_kind(payload_ty)?.into(),
+                                    ],
+                                )?
+                                .ok_or_else(|| backend_failure("set insertion produced no result"))?
+                                .into_int_value();
+                            self.drop_value_unless(inserted, value, definition.value)?;
+                        } else if fixed {
                             let previous_present = self.entry_alloca(
                                 self.context.i8_type(),
                                 "collection.previous.present",
@@ -2138,11 +2162,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                     pointer.into(),
                                     self.context.i64_type().into(),
                                     self.context.i8_type().into(),
+                                    self.context.i8_type().into(),
                                 ],
                                 Some(self.context.i8_type().into()),
                                 &[
                                     result.into(),
                                     value_word.into(),
+                                    self.context.i8_type().const_int(1, false).into(),
                                     self.collection_compare_kind(definition.value)?.into(),
                                 ],
                             )?
@@ -2767,12 +2793,87 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     | mir::CollectionMutationOp::InsertAt
                     | mir::CollectionMutationOp::PushFront
                     | mir::CollectionMutationOp::PushBack
+                    | mir::CollectionMutationOp::Remove
             )
         {
             let (present, value, payload_ty) =
                 self.lower_nullable_collection_parts(value, definition.value)?;
             let word = self.value_to_collection_word(value, payload_ty)?;
-            if op == mir::CollectionMutationOp::InsertAt {
+            if op == mir::CollectionMutationOp::Remove {
+                let removed_slot =
+                    self.entry_alloca(self.context.i64_type(), "collection.removed.value")?;
+                let removed_present_slot =
+                    self.entry_alloca(self.context.i8_type(), "collection.removed.present")?;
+                let removed = self
+                    .call_runtime(
+                        COLLECTION_REMOVE_VALUE,
+                        &[
+                            pointer.into(),
+                            self.context.i64_type().into(),
+                            self.context.i8_type().into(),
+                            self.context.i8_type().into(),
+                            pointer.into(),
+                            pointer.into(),
+                        ],
+                        Some(self.context.i8_type().into()),
+                        &[
+                            collection_value.into(),
+                            word.into(),
+                            present.into(),
+                            self.collection_compare_kind(payload_ty)?.into(),
+                            removed_slot.into(),
+                            removed_present_slot.into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("collection removal produced no result"))?
+                    .into_int_value();
+                let removed_word = build(self.builder.build_load(
+                    self.context.i64_type(),
+                    removed_slot,
+                    "collection.removed.word",
+                ))?
+                .into_int_value();
+                let removed_value = self.collection_word_to_value(removed_word, payload_ty)?;
+                let removed_present = build(self.builder.build_load(
+                    self.context.i8_type(),
+                    removed_present_slot,
+                    "collection.removed.present.value",
+                ))?
+                .into_int_value();
+                let should_drop = build(self.builder.build_and(
+                    removed,
+                    removed_present,
+                    "collection.removed.should-drop",
+                ))?;
+                self.drop_value_if(should_drop, removed_value, definition.value)?;
+                self.drop_stored_value(value, definition.value)?;
+            } else if op == mir::CollectionMutationOp::Add
+                && matches!(
+                    definition.kind,
+                    mir::CollectionKind::Set | mir::CollectionKind::SortedSet
+                )
+            {
+                let inserted = self
+                    .call_runtime(
+                        COLLECTION_PUSH_UNIQUE,
+                        &[
+                            pointer.into(),
+                            self.context.i64_type().into(),
+                            self.context.i8_type().into(),
+                            self.context.i8_type().into(),
+                        ],
+                        Some(self.context.i8_type().into()),
+                        &[
+                            collection_value.into(),
+                            word.into(),
+                            present.into(),
+                            self.collection_compare_kind(payload_ty)?.into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("set insertion produced no result"))?
+                    .into_int_value();
+                self.drop_value_unless(inserted, value, definition.value)?;
+            } else if op == mir::CollectionMutationOp::InsertAt {
                 let _ = self.call_runtime(
                     COLLECTION_INSERT_AT_NULLABLE,
                     &[
@@ -2842,14 +2943,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         pointer.into(),
                         self.context.i64_type().into(),
                         self.context.i8_type().into(),
+                        self.context.i8_type().into(),
+                        pointer.into(),
                         pointer.into(),
                     ],
                     Some(self.context.i8_type().into()),
                     &[
                         collection_value.into(),
                         word.into(),
+                        self.context.i8_type().const_int(1, false).into(),
                         self.collection_compare_kind(definition.value)?.into(),
                         removed_slot.into(),
+                        self.entry_alloca(self.context.i8_type(), "collection.removed.present")?
+                            .into(),
                     ],
                 )?
                 .ok_or_else(|| backend_failure("set removal produced no result"))?
@@ -2874,11 +2980,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         pointer.into(),
                         self.context.i64_type().into(),
                         self.context.i8_type().into(),
+                        self.context.i8_type().into(),
                     ],
                     Some(self.context.i8_type().into()),
                     &[
                         collection_value.into(),
                         word.into(),
+                        self.context.i8_type().const_int(1, false).into(),
                         self.collection_compare_kind(definition.value)?.into(),
                     ],
                 )?
@@ -3467,11 +3575,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     pointer.into(),
                     self.context.i64_type().into(),
                     self.context.i8_type().into(),
+                    self.context.i8_type().into(),
                 ],
                 Some(self.context.i8_type().into()),
                 &[
                     result.into(),
                     word.into(),
+                    self.context.i8_type().const_int(1, false).into(),
                     self.collection_compare_kind(source_definition.value)?
                         .into(),
                 ],
@@ -3507,7 +3617,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         if !matches!(
             ty,
             mir::Type::String
+                | mir::Type::NullableString
                 | mir::Type::Class(_)
+                | mir::Type::NullableClass(_)
                 | mir::Type::SharedReference(_)
                 | mir::Type::WeakReference(_)
                 | mir::Type::NullableSharedReference(_)
@@ -3521,6 +3633,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
                 | mir::Type::Collection(_)
+                | mir::Type::NullableCollection(_)
                 | mir::Type::Mixed
                 | mir::Type::NullableMixed
         ) {
@@ -5805,6 +5918,62 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let (present, payload) =
                     self.lower_dictionary_get(*collection, key, mir::Type::Scalar(ty), *access)?;
                 self.nullable_value(present, payload)
+            }
+            mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let local = local_in(self.function, *collection)?;
+                let mir::Type::Collection(collection_type) = local.ty else {
+                    return Err(malformed_mir("List::indexOf uses a non-collection local"));
+                };
+                let definition = self.collection_definition(collection_type)?.clone();
+                let (needle_present, needle, needle_type) =
+                    if nullable_payload_type(definition.value).is_some() {
+                        self.lower_nullable_collection_parts(value, definition.value)?
+                    } else {
+                        (
+                            self.context.i8_type().const_int(1, false),
+                            self.lower_rvalue(value)?,
+                            definition.value,
+                        )
+                    };
+                let needle_word = self.value_to_collection_word(needle, needle_type)?;
+                let collection = self.collection_pointer(*collection)?;
+                let kind = self.collection_compare_kind(needle_type)?;
+                let found_slot = self.entry_alloca(self.context.i8_type(), "index-of.found")?;
+                let position = self
+                    .call_runtime(
+                        COLLECTION_INDEX_OF,
+                        &[
+                            pointer.into(),
+                            self.context.i64_type().into(),
+                            self.context.i8_type().into(),
+                            self.context.i8_type().into(),
+                            pointer.into(),
+                        ],
+                        Some(self.context.i64_type().into()),
+                        &[
+                            collection.into(),
+                            needle_word.into(),
+                            needle_present.into(),
+                            kind.into(),
+                            found_slot.into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("List::indexOf produced no result"))?
+                    .into_int_value();
+                let found = build(self.builder.build_load(
+                    self.context.i8_type(),
+                    found_slot,
+                    "index-of.found.value",
+                ))?
+                .into_int_value();
+                let present = build(self.builder.build_int_z_extend(
+                    found,
+                    self.context.ptr_sized_int_type(self.target_data, None),
+                    "index-of.present",
+                ))?;
+                self.drop_stored_value(needle, definition.value)?;
+                self.nullable_value(present, position.into())
             }
             mir::NullableScalarExpression::Parse { value, .. } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
@@ -9295,41 +9464,81 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     return Err(malformed_mir("collection has uses non-collection local"));
                 };
                 let definition = self.collection_definition(collection_type)?.clone();
-                let needle_type = definition.key.unwrap_or(definition.value);
+                let stored_needle_type = if *op == mir::CollectionMembershipOp::Contains {
+                    definition.key.unwrap_or(definition.value)
+                } else {
+                    definition.value
+                };
                 let mixed_ownership = value.mixed_ownership();
-                let needle = self.lower_rvalue(value)?;
+                let (needle_present, needle, needle_type) =
+                    if nullable_payload_type(stored_needle_type).is_some() {
+                        self.lower_nullable_collection_parts(value, stored_needle_type)?
+                    } else {
+                        (
+                            self.context.i8_type().const_int(1, false),
+                            self.lower_rvalue(value)?,
+                            stored_needle_type,
+                        )
+                    };
                 let needle_word = self.value_to_collection_word(needle, needle_type)?;
                 let collection_value = self.collection_pointer(*collection)?;
                 let kind = self.collection_compare_kind(needle_type)?;
                 let found = match op {
-                    mir::CollectionMembershipOp::Contains => {
-                        let name = if definition.key.is_some() {
+                    mir::CollectionMembershipOp::Contains
+                    | mir::CollectionMembershipOp::ContainsValue => {
+                        let name = if *op == mir::CollectionMembershipOp::Contains
+                            && definition.key.is_some()
+                        {
                             COLLECTION_KEYED_HAS
                         } else {
                             COLLECTION_CONTAINS
                         };
-                        let found = self
-                            .call_runtime(
-                                name,
-                                &[
+                        let (parameter_types, arguments) = if name == COLLECTION_KEYED_HAS {
+                            (
+                                vec![
                                     pointer.into(),
                                     self.context.i64_type().into(),
                                     self.context.i8_type().into(),
                                 ],
+                                vec![collection_value.into(), needle_word.into(), kind.into()],
+                            )
+                        } else {
+                            (
+                                vec![
+                                    pointer.into(),
+                                    self.context.i64_type().into(),
+                                    self.context.i8_type().into(),
+                                    self.context.i8_type().into(),
+                                ],
+                                vec![
+                                    collection_value.into(),
+                                    needle_word.into(),
+                                    needle_present.into(),
+                                    kind.into(),
+                                ],
+                            )
+                        };
+                        let found = self
+                            .call_runtime(
+                                name,
+                                &parameter_types,
                                 Some(self.context.i8_type().into()),
-                                &[collection_value.into(), needle_word.into(), kind.into()],
+                                &arguments,
                             )?
                             .ok_or_else(|| {
                                 backend_failure("collection membership produced no result")
                             })?
                             .into_int_value();
-                        if matches!(needle_type, mir::Type::Mixed | mir::Type::NullableMixed) {
+                        if matches!(
+                            stored_needle_type,
+                            mir::Type::Mixed | mir::Type::NullableMixed
+                        ) {
                             self.cleanup_mixed_temporary(
                                 needle.into_pointer_value(),
                                 mixed_ownership,
                             )?;
                         } else {
-                            self.drop_stored_value(needle, needle_type)?;
+                            self.drop_stored_value(needle, stored_needle_type)?;
                         }
                         found
                     }
@@ -9341,13 +9550,22 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                     pointer.into(),
                                     self.context.i64_type().into(),
                                     self.context.i8_type().into(),
+                                    self.context.i8_type().into(),
                                 ],
                                 Some(self.context.i8_type().into()),
-                                &[collection_value.into(), needle_word.into(), kind.into()],
+                                &[
+                                    collection_value.into(),
+                                    needle_word.into(),
+                                    needle_present.into(),
+                                    kind.into(),
+                                ],
                             )?
                             .ok_or_else(|| backend_failure("set insertion produced no result"))?
                             .into_int_value();
-                        if matches!(needle_type, mir::Type::Mixed | mir::Type::NullableMixed) {
+                        if matches!(
+                            stored_needle_type,
+                            mir::Type::Mixed | mir::Type::NullableMixed
+                        ) {
                             let rejected = build(self.builder.build_int_compare(
                                 IntPredicate::EQ,
                                 inserted,
@@ -9360,13 +9578,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                 mixed_ownership,
                             )?;
                         } else {
-                            self.drop_value_unless(inserted, needle, needle_type)?;
+                            self.drop_value_unless(inserted, needle, stored_needle_type)?;
                         }
                         inserted
                     }
                     mir::CollectionMembershipOp::Remove => {
                         let removed_slot =
                             self.entry_alloca(self.context.i64_type(), "set.removed.value")?;
+                        let removed_present_slot = self
+                            .entry_alloca(self.context.i8_type(), "collection.removed.present")?;
                         let removed = self
                             .call_runtime(
                                 COLLECTION_REMOVE_VALUE,
@@ -9374,14 +9594,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                     pointer.into(),
                                     self.context.i64_type().into(),
                                     self.context.i8_type().into(),
+                                    self.context.i8_type().into(),
+                                    pointer.into(),
                                     pointer.into(),
                                 ],
                                 Some(self.context.i8_type().into()),
                                 &[
                                     collection_value.into(),
                                     needle_word.into(),
+                                    needle_present.into(),
                                     kind.into(),
                                     removed_slot.into(),
+                                    removed_present_slot.into(),
                                 ],
                             )?
                             .ok_or_else(|| backend_failure("set removal produced no result"))?
@@ -9394,14 +9618,28 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .into_int_value();
                         let removed_value =
                             self.collection_word_to_value(removed_word, needle_type)?;
-                        self.drop_value_if(removed, removed_value, needle_type)?;
-                        if matches!(needle_type, mir::Type::Mixed | mir::Type::NullableMixed) {
+                        let removed_present = build(self.builder.build_load(
+                            self.context.i8_type(),
+                            removed_present_slot,
+                            "collection.removed.present.value",
+                        ))?
+                        .into_int_value();
+                        let should_drop = build(self.builder.build_and(
+                            removed,
+                            removed_present,
+                            "collection.removed.should-drop",
+                        ))?;
+                        self.drop_value_if(should_drop, removed_value, stored_needle_type)?;
+                        if matches!(
+                            stored_needle_type,
+                            mir::Type::Mixed | mir::Type::NullableMixed
+                        ) {
                             self.cleanup_mixed_temporary(
                                 needle.into_pointer_value(),
                                 mixed_ownership,
                             )?;
                         } else {
-                            self.drop_stored_value(needle, needle_type)?;
+                            self.drop_stored_value(needle, stored_needle_type)?;
                         }
                         removed
                     }

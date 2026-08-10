@@ -5139,6 +5139,11 @@ fn lower_nullable_scalar_expression(
     if let Some(value) = lower_null_safe_collection_scalar(expr, expected, context)? {
         return Ok(value);
     }
+    if expected == mir::ScalarType::Integer(IntegerType::Int64) {
+        if let Some(value) = lower_list_index_of(expr, context)? {
+            return Ok(value);
+        }
+    }
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
     {
@@ -7457,12 +7462,19 @@ fn lower_condition(
                     | (mir::CollectionKind::Set | mir::CollectionKind::SortedSet, "contains") => {
                         Some(mir::CollectionMembershipOp::Contains)
                     }
+                    (
+                        mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary,
+                        "containsValue",
+                    ) => Some(mir::CollectionMembershipOp::ContainsValue),
                     (mir::CollectionKind::Set | mir::CollectionKind::SortedSet, "add") => {
                         Some(mir::CollectionMembershipOp::Add)
                     }
-                    (mir::CollectionKind::Set | mir::CollectionKind::SortedSet, "remove") => {
-                        Some(mir::CollectionMembershipOp::Remove)
-                    }
+                    (
+                        mir::CollectionKind::List
+                        | mir::CollectionKind::Set
+                        | mir::CollectionKind::SortedSet,
+                        "remove",
+                    ) => Some(mir::CollectionMembershipOp::Remove),
                     _ => None,
                 };
                 if let Some(op) = op {
@@ -7472,7 +7484,11 @@ fn lower_condition(
                             format!("collection `{method}` expects 1 argument"),
                         )]);
                     };
-                    let value_type = info.key.unwrap_or(info.value);
+                    let value_type = if op == mir::CollectionMembershipOp::Contains {
+                        info.key.unwrap_or(info.value)
+                    } else {
+                        info.value
+                    };
                     let value = if op == mir::CollectionMembershipOp::Add {
                         lower_rvalue_as_expected(value, value_type, context)?
                     } else {
@@ -9676,8 +9692,12 @@ impl NullableCollectionScalarOperation<'_> {
             }
             Self::Property("isEmpty") => expected == mir::ScalarType::Bool,
             Self::Property("first" | "last") => {
-                definition.kind == mir::CollectionKind::List
-                    && definition.value == mir::Type::Scalar(expected)
+                matches!(
+                    definition.kind,
+                    mir::CollectionKind::List
+                        | mir::CollectionKind::Set
+                        | mir::CollectionKind::SortedSet
+                ) && definition.value == mir::Type::Scalar(expected)
             }
             Self::Property("peek") => {
                 definition.kind == mir::CollectionKind::PriorityQueue
@@ -9706,11 +9726,24 @@ impl NullableCollectionScalarOperation<'_> {
                         mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary
                     )
             }
+            Self::Method("containsValue", [_]) => {
+                expected == mir::ScalarType::Bool
+                    && matches!(
+                        definition.kind,
+                        mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary
+                    )
+            }
+            Self::Method("indexOf", [_]) => {
+                expected == mir::ScalarType::Integer(IntegerType::Int64)
+                    && definition.kind == mir::CollectionKind::List
+            }
             Self::Method("add" | "remove", [_]) => {
                 (expected == mir::ScalarType::Bool
                     && matches!(
                         definition.kind,
-                        mir::CollectionKind::Set | mir::CollectionKind::SortedSet
+                        mir::CollectionKind::List
+                            | mir::CollectionKind::Set
+                            | mir::CollectionKind::SortedSet
                     ))
                     || (definition.value == mir::Type::Scalar(expected)
                         && matches!(
@@ -9814,14 +9847,29 @@ impl NullableCollectionScalarOperation<'_> {
                     ),
                 ))
             }
+            Self::Method("indexOf", [value]) => {
+                Ok(mir::NullableScalarExpression::CollectionIndexOf {
+                    collection,
+                    value: Box::new(lower_rvalue_as_borrowed(
+                        &value.value,
+                        definition.value,
+                        context,
+                    )?),
+                })
+            }
             Self::Method(method, [argument]) => {
                 let op = match *method {
                     "contains" | "containsKey" => mir::CollectionMembershipOp::Contains,
+                    "containsValue" => mir::CollectionMembershipOp::ContainsValue,
                     "add" => mir::CollectionMembershipOp::Add,
                     "remove" => mir::CollectionMembershipOp::Remove,
                     _ => unreachable!("operation was checked before lowering"),
                 };
-                let value_type = definition.key.unwrap_or(definition.value);
+                let value_type = if op == mir::CollectionMembershipOp::Contains {
+                    definition.key.unwrap_or(definition.value)
+                } else {
+                    definition.value
+                };
                 let value = if op == mir::CollectionMembershipOp::Add {
                     lower_rvalue_as_expected(&argument.value, value_type, context)?
                 } else {
@@ -9846,6 +9894,40 @@ fn zero_int_rvalue() -> mir::Rvalue {
             IntegerValue::from_i128(IntegerType::Int64, 0).expect("zero is a valid int"),
         ),
     ))
+}
+
+fn lower_list_index_of(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<mir::NullableScalarExpression>> {
+    let hir::Expr::MethodCall {
+        object,
+        method,
+        args,
+        null_safe: false,
+        ..
+    } = unparenthesized_place(expr)
+    else {
+        return Ok(None);
+    };
+    let Ok((collection, collection_type)) = lower_collection_local(object, context) else {
+        return Ok(None);
+    };
+    let definition = context.collection_type(collection_type).clone();
+    if method != "indexOf" || definition.kind != mir::CollectionKind::List {
+        return Ok(None);
+    }
+    let [value] = args.as_slice() else {
+        return Ok(None);
+    };
+    Ok(Some(mir::NullableScalarExpression::CollectionIndexOf {
+        collection,
+        value: Box::new(lower_rvalue_as_borrowed(
+            &value.value,
+            definition.value,
+            context,
+        )?),
+    }))
 }
 
 fn lower_bytes_local(
@@ -10026,6 +10108,16 @@ fn lower_collection_method_statement(
                 op: mir::CollectionMutationOp::Remove,
             };
             context.push_statement(statement);
+        }
+        (mir::CollectionKind::List, "remove", [value]) => {
+            let value = mir::Rvalue::Value(mir::ValueExpression::Bool(
+                mir::BoolExpression::CollectionHas {
+                    collection,
+                    value: Box::new(lower_rvalue_as_borrowed(&value.value, info.value, context)?),
+                    op: mir::CollectionMembershipOp::Remove,
+                },
+            ));
+            lower_discarded_rvalue(value, context);
         }
         (
             mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary,
@@ -10403,6 +10495,10 @@ fn lower_collection_nullable_property(
     if !matches!(
         (definition.kind, property.as_str()),
         (mir::CollectionKind::List, "first" | "last")
+            | (
+                mir::CollectionKind::Set | mir::CollectionKind::SortedSet,
+                "first" | "last"
+            )
             | (mir::CollectionKind::PriorityQueue, "peek")
             | (mir::CollectionKind::Deque, "peekFront" | "peekBack")
     ) {

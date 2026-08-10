@@ -250,7 +250,7 @@ pub const COLLECTION_MEMBER_SUGGESTIONS: &[CollectionMemberSuggestion] = &[
         Method,
         ArgumentShape::Exact(1),
         RequiresReview,
-        PendingSlice3
+        Executable
     ),
     suggestion!(
         "position",
@@ -259,7 +259,7 @@ pub const COLLECTION_MEMBER_SUGGESTIONS: &[CollectionMemberSuggestion] = &[
         Method,
         ArgumentShape::Exact(1),
         RequiresReview,
-        PendingSlice3
+        Executable
     ),
     suggestion!(
         "find",
@@ -268,7 +268,7 @@ pub const COLLECTION_MEMBER_SUGGESTIONS: &[CollectionMemberSuggestion] = &[
         Method,
         ArgumentShape::Exact(1),
         RequiresReview,
-        PendingSlice3
+        Executable
     ),
     suggestion!(
         "unset",
@@ -370,7 +370,7 @@ pub fn canonical_property_status(
         (Dictionary | SortedDictionary, "keys" | "values") => Some(Executable),
         (PriorityQueue, "peek") => Some(Executable),
         (Deque, "peekFront" | "peekBack") => Some(Executable),
-        (Set | SortedSet, "first" | "last") => Some(PendingSlice3),
+        (Set | SortedSet, "first" | "last") => Some(Executable),
         _ => None,
     }
 }
@@ -383,9 +383,6 @@ pub fn pending_method_status(
     use ImplementationStatus::*;
 
     match (receiver, member) {
-        (List, "indexOf" | "remove") | (Dictionary | SortedDictionary, "containsValue") => {
-            Some(PendingSlice3)
-        }
         (
             List | Dictionary | Set | SortedDictionary | SortedSet | PriorityQueue | Deque,
             "clear",

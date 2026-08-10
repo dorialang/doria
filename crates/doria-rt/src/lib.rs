@@ -685,12 +685,34 @@ pub unsafe extern "C" fn dr_v1_collection_nullable_access(
 /// `collection` must point to a live collection and `value` must match
 /// `value_kind`.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_collection_contains(
+pub unsafe extern "C" fn dr_v2_collection_contains(
     collection: *const DrCollectionV1,
     value: u64,
+    present: u8,
     value_kind: u8,
 ) -> u8 {
-    u8::from(collection::contains(collection, value, value_kind))
+    u8::from(collection::contains(
+        collection,
+        value,
+        present != 0,
+        value_kind,
+    ))
+}
+
+/// # Safety
+///
+/// `collection` must point to a live unkeyed collection, `value` and `present`
+/// must describe one value of its element type, and `found` must point to
+/// writable storage.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_index_of(
+    collection: *const DrCollectionV1,
+    value: u64,
+    present: u8,
+    value_kind: u8,
+    found: *mut u8,
+) -> u64 {
+    collection::index_of(collection, value, present != 0, value_kind, found)
 }
 
 /// # Safety
@@ -781,12 +803,18 @@ pub unsafe extern "C" fn dr_v1_mixed_payload(value: *const DrMixedV1) -> u64 {
 /// `collection` must be a uniquely borrowed live Set and `value` must match
 /// `value_kind`.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_collection_push_unique(
+pub unsafe extern "C" fn dr_v2_collection_push_unique(
     collection: *mut DrCollectionV1,
     value: u64,
+    present: u8,
     value_kind: u8,
 ) -> u8 {
-    u8::from(collection::push_unique(collection, value, value_kind))
+    u8::from(collection::push_unique(
+        collection,
+        value,
+        present != 0,
+        value_kind,
+    ))
 }
 
 /// # Safety
@@ -794,14 +822,21 @@ pub unsafe extern "C" fn dr_v1_collection_push_unique(
 /// `collection` must be a uniquely borrowed live Set, `value` must match
 /// `value_kind`, and `removed` must point to writable storage.
 #[no_mangle]
-pub unsafe extern "C" fn dr_v1_collection_remove_value(
+pub unsafe extern "C" fn dr_v2_collection_remove_value(
     collection: *mut DrCollectionV1,
     value: u64,
+    present: u8,
     value_kind: u8,
     removed: *mut u64,
+    removed_present: *mut u8,
 ) -> u8 {
     u8::from(collection::remove_value(
-        collection, value, value_kind, removed,
+        collection,
+        value,
+        present != 0,
+        value_kind,
+        removed,
+        removed_present,
     ))
 }
 
@@ -3823,6 +3858,43 @@ mod tests {
             assert_eq!((*string).references, 1);
             dr_v1_collection_free(strings);
             dr_v1_string_release(string);
+        }
+    }
+
+    #[test]
+    fn collection_removal_returns_exactly_one_owned_string_for_caller_cleanup() {
+        unsafe {
+            let first = dr_v1_string_from_utf8(b"blue".as_ptr(), 4);
+            let second = dr_v1_string_from_utf8(b"green".as_ptr(), 5);
+            let probe = dr_v1_string_from_utf8(b"blue".as_ptr(), 4);
+            let collection = collection::new(0, false, false, 8);
+            collection::push(collection, first as u64);
+            collection::push(collection, second as u64);
+
+            let mut removed = 0u64;
+            let mut removed_present = 0u8;
+            assert!(collection::remove_value(
+                collection,
+                probe as u64,
+                true,
+                collection::COMPARE_STRING,
+                &mut removed,
+                &mut removed_present,
+            ));
+            assert_eq!(removed as *mut DrStringV1, first);
+            assert_eq!(removed_present, 1);
+            assert_eq!((*first).references, 1);
+            assert_eq!((*probe).references, 1, "the search probe is borrowed");
+            assert_eq!(dr_v1_collection_length(collection), 1);
+            assert_eq!(
+                dr_v2_collection_value_at(ptr::null(), collection, 0) as *mut DrStringV1,
+                second,
+            );
+
+            dr_v1_string_release(removed as *mut DrStringV1);
+            dr_v1_string_release(probe);
+            dr_v1_string_release(second);
+            dr_v1_collection_free(collection);
         }
     }
 

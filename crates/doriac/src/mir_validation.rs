@@ -3700,6 +3700,8 @@ fn validate_dictionary_get(
         mir::NullableCollectionAccess::First | mir::NullableCollectionAccess::Last => matches!(
             collection.kind,
             mir::CollectionKind::List
+                | mir::CollectionKind::Set
+                | mir::CollectionKind::SortedSet
                 | mir::CollectionKind::PriorityQueue
                 | mir::CollectionKind::Deque
         ),
@@ -5678,6 +5680,9 @@ fn collect_nullable_scalar_class_local_accesses<'a>(
         mir::NullableScalarExpression::DictionaryGet { key, .. } => {
             collect_rvalue_class_local_accesses(key, accesses)
         }
+        mir::NullableScalarExpression::CollectionIndexOf { value, .. } => {
+            collect_rvalue_class_local_accesses(value, accesses)
+        }
         mir::NullableScalarExpression::StringIntrinsic(call) => {
             collect_rvalue_args_class_local_accesses(&call.args, accesses)
         }
@@ -6395,6 +6400,7 @@ fn nullable_scalar_expression_is_present(
         | mir::NullableScalarExpression::NullSafeProperty { .. }
         | mir::NullableScalarExpression::NullSafeCall { .. }
         | mir::NullableScalarExpression::DictionaryGet { .. }
+        | mir::NullableScalarExpression::CollectionIndexOf { .. }
         | mir::NullableScalarExpression::Parse { .. }
         | mir::NullableScalarExpression::StringIntrinsic(_) => false,
     }
@@ -8103,6 +8109,9 @@ fn nullable_scalar_observes_property(
         mir::NullableScalarExpression::DictionaryGet { key, .. } => {
             rvalue_observes_property(key, receiver, property)
         }
+        mir::NullableScalarExpression::CollectionIndexOf { value, .. } => {
+            rvalue_observes_property(value, receiver, property)
+        }
         mir::NullableScalarExpression::Parse { value, .. } => {
             string_observes_property(value, receiver, property)
         }
@@ -8847,7 +8856,11 @@ fn validate_condition(
                 return Err(malformed_mir("collection has source is not a collection"));
             };
             let collection_type = collection_in(program, collection_type)?;
-            let expected = collection_type.key.unwrap_or(collection_type.value);
+            let expected = if *op == mir::CollectionMembershipOp::Contains {
+                collection_type.key.unwrap_or(collection_type.value)
+            } else {
+                collection_type.value
+            };
             if value.ty() != expected {
                 return Err(malformed_mir("collection has argument type mismatch"));
             }
@@ -8864,15 +8877,36 @@ fn validate_condition(
                     | mir::CollectionKind::SortedSet,
                 ) => {}
                 (
-                    mir::CollectionMembershipOp::Add | mir::CollectionMembershipOp::Remove,
+                    mir::CollectionMembershipOp::ContainsValue,
+                    mir::CollectionKind::Dictionary | mir::CollectionKind::SortedDictionary,
+                ) => {}
+                (
+                    mir::CollectionMembershipOp::Add,
                     mir::CollectionKind::Set | mir::CollectionKind::SortedSet,
                 ) if local.writable => {}
                 (
-                    mir::CollectionMembershipOp::Add | mir::CollectionMembershipOp::Remove,
+                    mir::CollectionMembershipOp::Remove,
+                    mir::CollectionKind::List
+                    | mir::CollectionKind::Set
+                    | mir::CollectionKind::SortedSet,
+                ) if local.writable => {}
+                (
+                    mir::CollectionMembershipOp::Add,
                     mir::CollectionKind::Set | mir::CollectionKind::SortedSet,
                 ) => {
                     return Err(malformed_mir(format!(
                         "set mutation uses readonly local{}",
+                        local.id.0
+                    )));
+                }
+                (
+                    mir::CollectionMembershipOp::Remove,
+                    mir::CollectionKind::List
+                    | mir::CollectionKind::Set
+                    | mir::CollectionKind::SortedSet,
+                ) => {
+                    return Err(malformed_mir(format!(
+                        "collection removal uses readonly local{}",
                         local.id.0
                     )));
                 }
@@ -9452,6 +9486,19 @@ fn validate_nullable_scalar_expression(
             mir::Type::Scalar(ty),
             *access,
         ),
+        mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir("List::indexOf source is not a collection"));
+            };
+            let definition = collection_in(program, collection_type)?;
+            if definition.kind != mir::CollectionKind::List || value.ty() != definition.value {
+                return Err(malformed_mir(
+                    "List::indexOf source or argument type does not match",
+                ));
+            }
+            validate_rvalue(program, function, value)
+        }
         mir::NullableScalarExpression::Parse {
             ty: parse_ty,
             value,

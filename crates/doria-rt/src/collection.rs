@@ -6,7 +6,7 @@ use crate::{
     DrStringV1,
 };
 
-const COMPARE_STRING: u8 = 1;
+pub(crate) const COMPARE_STRING: u8 = 1;
 const COMPARE_FLOAT32: u8 = 2;
 const COMPARE_FLOAT64: u8 = 3;
 const COMPARE_SIGNED_8: u8 = 4;
@@ -1491,21 +1491,66 @@ unsafe fn nullable_pop(collection: *mut DrCollectionV1, found: *mut u8, front: b
     value
 }
 
-pub unsafe fn contains(collection: *const DrCollectionV1, value: u64, value_kind: u8) -> bool {
-    if (*collection).kind == KIND_SORTED_SET && (*collection).finalized != 0 {
+unsafe fn value_matches(
+    collection: *const DrCollectionV1,
+    index: usize,
+    value: u64,
+    present: bool,
+    value_kind: u8,
+) -> bool {
+    read_present(collection, index) == present
+        && (!present || keys_equal(read_value(collection, index), value, value_kind))
+}
+
+pub unsafe fn contains(
+    collection: *const DrCollectionV1,
+    value: u64,
+    present: bool,
+    value_kind: u8,
+) -> bool {
+    if !present {
+        return (0..(*collection).length).any(|index| !read_present(collection, index));
+    }
+    if (*collection).value_nullable == 0
+        && (*collection).kind == KIND_SORTED_SET
+        && (*collection).finalized != 0
+    {
         return ordered_position(collection, value, false).is_ok();
     }
     // See `find` for why building through a shared pointer is sound here.
     let mutable = collection as *mut DrCollectionV1;
-    if index_ready(mutable, value_kind, false) {
+    if (*collection).value_nullable == 0 && index_ready(mutable, value_kind, false) {
         return index_position(collection, value, value_kind, false).is_some();
     }
     (0..(*collection).length)
-        .any(|index| keys_equal(read_value(collection, index), value, value_kind))
+        .any(|index| value_matches(collection, index, value, present, value_kind))
 }
 
-pub unsafe fn push_unique(collection: *mut DrCollectionV1, value: u64, value_kind: u8) -> bool {
-    if contains(collection, value, value_kind) {
+pub unsafe fn index_of(
+    collection: *const DrCollectionV1,
+    value: u64,
+    present: bool,
+    value_kind: u8,
+    found: *mut u8,
+) -> u64 {
+    let position = (0..(*collection).length)
+        .find(|index| value_matches(collection, *index, value, present, value_kind));
+    if let Some(position) = position {
+        *found = 1;
+        position as u64
+    } else {
+        *found = 0;
+        0
+    }
+}
+
+pub unsafe fn push_unique(
+    collection: *mut DrCollectionV1,
+    value: u64,
+    present: bool,
+    value_kind: u8,
+) -> bool {
+    if contains(collection, value, present, value_kind) {
         false
     } else {
         if (*collection).kind == KIND_SORTED_SET && (*collection).finalized != 0 {
@@ -1521,8 +1566,14 @@ pub unsafe fn push_unique(collection: *mut DrCollectionV1, value: u64, value_kin
                     tail * usize::from((*collection).value_width),
                 );
             }
-            write_value(collection, index, value);
+            if (*collection).value_nullable != 0 {
+                write_nullable_value(collection, index, present, value);
+            } else {
+                write_value(collection, index, value);
+            }
             (*collection).length += 1;
+        } else if (*collection).value_nullable != 0 {
+            push_nullable(collection, present, value);
         } else {
             push(collection, value);
         }
@@ -1533,19 +1584,26 @@ pub unsafe fn push_unique(collection: *mut DrCollectionV1, value: u64, value_kin
 pub unsafe fn remove_value(
     collection: *mut DrCollectionV1,
     value: u64,
+    present: bool,
     value_kind: u8,
     removed: *mut u64,
+    removed_present: *mut u8,
 ) -> bool {
-    let found = if index_ready(collection, value_kind, false) {
+    let found = if present
+        && (*collection).value_nullable == 0
+        && index_ready(collection, value_kind, false)
+    {
         index_position(collection, value, value_kind, false)
     } else {
         (0..(*collection).length)
-            .find(|index| keys_equal(read_value(collection, *index), value, value_kind))
+            .find(|index| value_matches(collection, *index, value, present, value_kind))
     };
     let Some(index) = found else {
         *removed = 0;
+        *removed_present = 0;
         return false;
     };
+    *removed_present = u8::from(read_present(collection, index));
     *removed = read_value(collection, index);
     index_note_removal(collection, index);
     let tail = (*collection).length - index - 1;
@@ -1579,21 +1637,23 @@ pub unsafe fn set_algebra(
     };
     for index in 0..(*left).length {
         let value = read_value(left, index);
+        let present = read_present(left, index);
         let include = match operation {
             0 => true,
-            1 => contains(right, value, value_kind),
-            2 => !contains(right, value, value_kind),
+            1 => contains(right, value, present, value_kind),
+            2 => !contains(right, value, present, value_kind),
             _ => collection_panic(b"P1001"),
         };
         if include {
-            push_retained(result, value, value_kind);
+            push_retained(result, value, present, value_kind);
         }
     }
     if operation == 0 {
         for index in 0..(*right).length {
             let value = read_value(right, index);
-            if !contains(result, value, value_kind) {
-                push_retained(result, value, value_kind);
+            let present = read_present(right, index);
+            if !contains(result, value, present, value_kind) {
+                push_retained(result, value, present, value_kind);
             }
         }
     }
@@ -1603,11 +1663,20 @@ pub unsafe fn set_algebra(
     result
 }
 
-unsafe fn push_retained(collection: *mut DrCollectionV1, value: u64, value_kind: u8) {
-    if value_kind == COMPARE_STRING {
+unsafe fn push_retained(
+    collection: *mut DrCollectionV1,
+    value: u64,
+    present: bool,
+    value_kind: u8,
+) {
+    if present && value_kind == COMPARE_STRING {
         crate::dr_v1_string_retain(value as *mut DrStringV1);
     }
-    push(collection, value);
+    if (*collection).value_nullable != 0 || !present {
+        push_nullable(collection, present, value);
+    } else {
+        push(collection, value);
+    }
 }
 
 fn collection_panic(code: &'static [u8]) -> ! {
@@ -1853,7 +1922,7 @@ mod tests {
                 let value = random.next() % 64;
                 match random.next() % 4 {
                     0 | 1 => {
-                        let added = push_unique(collection, value, COMPARE_UNSIGNED_64);
+                        let added = push_unique(collection, value, true, COMPARE_UNSIGNED_64);
                         if expected.contains(&value) {
                             assert!(!added, "step {step}: {value} was already a member");
                         } else {
@@ -1862,14 +1931,21 @@ mod tests {
                         }
                     }
                     2 => assert_eq!(
-                        contains(collection, value, COMPARE_UNSIGNED_64),
+                        contains(collection, value, true, COMPARE_UNSIGNED_64),
                         expected.contains(&value),
                         "step {step}: membership disagreed for {value}"
                     ),
                     _ => {
                         let mut removed = 0u64;
-                        let did =
-                            remove_value(collection, value, COMPARE_UNSIGNED_64, &mut removed);
+                        let mut removed_present = 0u8;
+                        let did = remove_value(
+                            collection,
+                            value,
+                            true,
+                            COMPARE_UNSIGNED_64,
+                            &mut removed,
+                            &mut removed_present,
+                        );
                         match expected.iter().position(|existing| *existing == value) {
                             Some(position) => {
                                 assert!(did, "step {step}");
@@ -1892,6 +1968,53 @@ mod tests {
                     );
                 }
             }
+            free(collection);
+        }
+    }
+
+    #[test]
+    fn nullable_search_and_first_removal_keep_presence_separate_from_zero() {
+        unsafe {
+            let collection = new(0, false, false, 16);
+            push_nullable(collection, false, 0);
+            push_nullable(collection, true, 0);
+            push_nullable(collection, true, 7);
+            push_nullable(collection, false, 0);
+
+            let mut found = 0u8;
+            assert_eq!(
+                index_of(collection, 0, false, COMPARE_SIGNED_64, &mut found),
+                0
+            );
+            assert_eq!(found, 1, "a stored null at position zero must be found");
+            assert_eq!(
+                index_of(collection, 0, true, COMPARE_SIGNED_64, &mut found),
+                1
+            );
+            assert_eq!(found, 1, "zero must remain distinct from stored null");
+            assert_eq!(
+                index_of(collection, 9, true, COMPARE_SIGNED_64, &mut found),
+                0
+            );
+            assert_eq!(found, 0, "absence must not be encoded as position zero");
+
+            let mut removed = u64::MAX;
+            let mut removed_present = u8::MAX;
+            assert!(remove_value(
+                collection,
+                0,
+                false,
+                COMPARE_SIGNED_64,
+                &mut removed,
+                &mut removed_present,
+            ));
+            assert_eq!((removed, removed_present), (0, 0));
+            assert_eq!((*collection).length, 3);
+            assert!(read_present(collection, 0));
+            assert_eq!(read_value(collection, 0), 0);
+            assert!(read_present(collection, 1));
+            assert_eq!(read_value(collection, 1), 7);
+            assert!(!read_present(collection, 2));
             free(collection);
         }
     }
@@ -2032,13 +2155,21 @@ mod tests {
                 let value = random.signed();
                 if random.next() & 1 == 0 {
                     assert_eq!(
-                        push_unique(collection, value as u64, COMPARE_SIGNED_64),
+                        push_unique(collection, value as u64, true, COMPARE_SIGNED_64),
                         expected.insert(value)
                     );
                 } else {
                     let mut removed = 0;
+                    let mut removed_present = 0;
                     assert_eq!(
-                        remove_value(collection, value as u64, COMPARE_SIGNED_64, &mut removed),
+                        remove_value(
+                            collection,
+                            value as u64,
+                            true,
+                            COMPARE_SIGNED_64,
+                            &mut removed,
+                            &mut removed_present,
+                        ),
                         expected.remove(&value)
                     );
                 }

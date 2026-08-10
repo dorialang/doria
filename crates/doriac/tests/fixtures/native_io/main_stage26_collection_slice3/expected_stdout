@@ -1,0 +1,10 @@
+index 0 1 -1
+remove true false red green blue
+nullable 0 1 -1
+dictionary true true false
+sorted true true false
+set 30 20
+set changed 10 20
+empty -1 -1
+sorted set 10 30
+sorted changed 20 20
