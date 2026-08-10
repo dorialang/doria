@@ -466,6 +466,10 @@ enum EvaluationTask {
         op: mir::CollectionMembershipOp,
         ownership: mir::MixedOwnership,
     },
+    CollectionIndexOf {
+        collection: mir::LocalId,
+        ownership: mir::MixedOwnership,
+    },
     CollectionIsEmpty(mir::LocalId),
     CollectionLength(mir::LocalId),
     CollectionIndexScalar(mir::LocalId, bool),
@@ -2639,8 +2643,12 @@ impl Interpreter<'_> {
                 let (found, needle_type) = {
                     let collection = self.collection_local(collection)?;
                     let definition = &self.program.collection_types[collection.ty.0];
-                    let needle_type = definition.key.unwrap_or(definition.value);
-                    if definition.key.is_some() {
+                    let needle_type = if op == mir::CollectionMembershipOp::Contains {
+                        definition.key.unwrap_or(definition.value)
+                    } else {
+                        definition.value
+                    };
+                    if op == mir::CollectionMembershipOp::Contains && definition.key.is_some() {
                         (
                             collection.entries().iter().any(|(key, _)| {
                                 key.as_ref().is_some_and(|key| {
@@ -2677,7 +2685,8 @@ impl Interpreter<'_> {
                     return Ok(StepOutcome::Continue);
                 }
                 let result = match op {
-                    mir::CollectionMembershipOp::Contains => found,
+                    mir::CollectionMembershipOp::Contains
+                    | mir::CollectionMembershipOp::ContainsValue => found,
                     mir::CollectionMembershipOp::Remove => {
                         let position = {
                             let collection = self.collection_local(collection)?;
@@ -2702,6 +2711,35 @@ impl Interpreter<'_> {
                     self.queue_value_drops(needle)?;
                 }
                 self.push_scalar(mir::ScalarValue::Bool(result))?;
+            }
+            EvaluationTask::CollectionIndexOf {
+                collection,
+                ownership,
+            } => {
+                let needle = self.pop_local_value()?;
+                let position = {
+                    let collection = self.collection_local(collection)?;
+                    let definition = &self.program.collection_types[collection.ty.0];
+                    collection.entries().iter().position(|(_, value)| {
+                        collection_values_equal(definition.value, value, &needle)
+                    })
+                };
+                if ownership == mir::MixedOwnership::Owned {
+                    self.queue_value_drops(needle)?;
+                }
+                let value = position.map(|position| {
+                    mir::ScalarValue::Integer(
+                        crate::numeric::IntegerValue::from_i128(
+                            crate::numeric::IntegerType::Int64,
+                            position as i128,
+                        )
+                        .expect("collection position fits Doria int"),
+                    )
+                });
+                self.push_nullable_scalar(
+                    mir::ScalarType::Integer(crate::numeric::IntegerType::Int64),
+                    value,
+                )?;
             }
             EvaluationTask::CollectionIsEmpty(collection) => {
                 let empty = self.collection_local(collection)?.entries().is_empty();
@@ -5345,6 +5383,15 @@ impl Interpreter<'_> {
                     access,
                 });
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
+            }
+            mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
+                let ownership = value.mixed_ownership();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::CollectionIndexOf {
+                    collection,
+                    ownership,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*value));
             }
             mir::NullableScalarExpression::Parse { ty, value } => {
                 let frame = self.current_frame_mut()?;

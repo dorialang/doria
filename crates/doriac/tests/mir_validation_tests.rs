@@ -1,16 +1,196 @@
 use doriac::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
 use doriac::format_string::{FormatConversion, FormatPiece, FormatSpec};
 use doriac::mir::{
-    BasicBlock, BlockId, Class, ClassExpression, CollectionComparator, CollectionExpression,
-    CollectionKind, CollectionType, CollectionTypeId, FloatBinaryOp, FloatExpression,
-    FormatArgument, FormatExpression, Function, FunctionId, IntegerExpression, Local, LocalId,
-    NullableClassExpression, NullableSharedReferenceExpression, NullableStringExpression, Operand,
-    Program, Property, PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType,
-    ScalarValue, SharedReferenceExpression, Statement, StaticId, StaticProperty, StaticValue,
-    StringExpression, StringIntrinsicCall, StringIntrinsicKind, Terminator, Type, ValueExpression,
+    BasicBlock, BlockId, BoolExpression, Class, ClassExpression, CollectionComparator,
+    CollectionExpression, CollectionKind, CollectionMembershipOp, CollectionType, CollectionTypeId,
+    FloatBinaryOp, FloatExpression, FormatArgument, FormatExpression, Function, FunctionId,
+    IntegerExpression, Local, LocalId, NullableClassExpression, NullableScalarExpression,
+    NullableSharedReferenceExpression, NullableStringExpression, Operand, Program, Property,
+    PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType, ScalarValue,
+    SharedReferenceExpression, Statement, StaticId, StaticProperty, StaticValue, StringExpression,
+    StringIntrinsicCall, StringIntrinsicKind, Terminator, Type, ValueExpression,
     WeakReferenceExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
+
+#[test]
+fn shared_validator_rejects_malformed_list_index_of_shapes() {
+    let source = r#"
+function main(): void
+{
+    List<int> $values = [1, 2];
+    ?int $position = $values->indexOf(2);
+}
+"#;
+
+    let mut wrong_receiver =
+        doriac::lower_source_to_mir("index-of.doria", source).expect("valid indexOf should lower");
+    wrong_receiver.collection_types[0].kind = CollectionKind::Set;
+    assert!(doriac::mir_validation::validate_program(&wrong_receiver)
+        .expect_err("indexOf on a non-list must be malformed")
+        .message
+        .contains("List::indexOf"));
+
+    let mut wrong_probe =
+        doriac::lower_source_to_mir("index-of.doria", source).expect("valid indexOf should lower");
+    let entry = wrong_probe.entry.0;
+    let expression = wrong_probe.functions[entry].blocks[0]
+        .statements
+        .iter_mut()
+        .find_map(|statement| match statement {
+            Statement::AssignLocal {
+                value:
+                    Rvalue::NullableScalar(NullableScalarExpression::CollectionIndexOf {
+                        value, ..
+                    }),
+                ..
+            } => Some(value),
+            _ => None,
+        })
+        .expect("indexOf assignment should be present");
+    **expression = Rvalue::String(StringExpression::Literal("wrong".to_string()));
+    assert!(doriac::mir_validation::validate_program(&wrong_probe)
+        .expect_err("indexOf with a wrong probe type must be malformed")
+        .message
+        .contains("argument type"));
+
+    let mut wrong_result =
+        doriac::lower_source_to_mir("index-of.doria", source).expect("valid indexOf should lower");
+    let entry = wrong_result.entry.0;
+    let target = wrong_result.functions[entry].blocks[0]
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::AssignLocal {
+                target,
+                value: Rvalue::NullableScalar(NullableScalarExpression::CollectionIndexOf { .. }),
+            } => Some(*target),
+            _ => None,
+        })
+        .expect("indexOf assignment should be present");
+    wrong_result.functions[entry].locals[target.0].ty =
+        Type::Scalar(ScalarType::Integer(IntegerType::Int64));
+    assert!(doriac::mir_validation::validate_program(&wrong_result)
+        .expect_err("indexOf into non-nullable int must be malformed")
+        .message
+        .contains("nullable"));
+}
+
+#[test]
+fn shared_validator_rejects_malformed_slice_three_membership_shapes() {
+    let source = r#"
+function main(): void
+{
+    Dictionary<string, int> $values = ["one" => 1];
+    bool $found = $values->containsValue(1);
+}
+"#;
+    let mut wrong_receiver = doriac::lower_source_to_mir("contains-value.doria", source)
+        .expect("valid containsValue should lower");
+    let entry = wrong_receiver.entry.0;
+    let collection = wrong_receiver.functions[entry].blocks[0]
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::AssignLocal {
+                value:
+                    Rvalue::Value(ValueExpression::Bool(BoolExpression::CollectionHas {
+                        collection,
+                        op: CollectionMembershipOp::ContainsValue,
+                        ..
+                    })),
+                ..
+            } => Some(*collection),
+            _ => None,
+        })
+        .expect("containsValue assignment should be present");
+    wrong_receiver.functions[entry].blocks[0]
+        .statements
+        .retain(|statement| {
+            !matches!(statement, Statement::AssignLocal { target, .. } if *target == collection)
+        });
+    wrong_receiver.collection_types[0].kind = CollectionKind::List;
+    wrong_receiver.collection_types[0].key = None;
+    assert!(doriac::mir_validation::validate_program(&wrong_receiver)
+        .expect_err("containsValue on a non-map must be malformed")
+        .message
+        .contains("collection kind"));
+
+    let mut wrong_axis_type = doriac::lower_source_to_mir("contains-value.doria", source)
+        .expect("valid containsValue should lower");
+    let entry = wrong_axis_type.entry.0;
+    let value = wrong_axis_type.functions[entry].blocks[0]
+        .statements
+        .iter_mut()
+        .find_map(|statement| match statement {
+            Statement::AssignLocal {
+                value:
+                    Rvalue::Value(ValueExpression::Bool(BoolExpression::CollectionHas {
+                        value,
+                        op: CollectionMembershipOp::ContainsValue,
+                        ..
+                    })),
+                ..
+            } => Some(value),
+            _ => None,
+        })
+        .expect("containsValue assignment should be present");
+    **value = Rvalue::String(StringExpression::Literal("one".to_string()));
+    assert!(doriac::mir_validation::validate_program(&wrong_axis_type)
+        .expect_err("containsValue must validate against the value axis")
+        .message
+        .contains("argument type"));
+
+    let remove_source = r#"
+function main(): void
+{
+    writable List<int> $values = [1, 2];
+    bool $removed = $values->remove(1);
+}
+"#;
+    let mut readonly_remove = doriac::lower_source_to_mir("list-remove.doria", remove_source)
+        .expect("valid writable List::remove should lower");
+    let entry = readonly_remove.entry.0;
+    let collection = readonly_remove.functions[entry].blocks[0]
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::AssignLocal {
+                value:
+                    Rvalue::Value(ValueExpression::Bool(BoolExpression::CollectionHas {
+                        collection,
+                        op: CollectionMembershipOp::Remove,
+                        ..
+                    })),
+                ..
+            } => Some(*collection),
+            _ => None,
+        })
+        .expect("List::remove assignment should be present");
+    readonly_remove.functions[entry].locals[collection.0].writable = false;
+    assert!(doriac::mir_validation::validate_program(&readonly_remove)
+        .expect_err("remove against a readonly MIR place must be malformed")
+        .message
+        .contains("readonly"));
+}
+
+#[test]
+fn shared_validator_rejects_set_endpoint_access_on_an_invalid_receiver() {
+    let source = r#"
+function main(): void
+{
+    Set<int> $values = Set::from([1]);
+    ?int $first = $values->first;
+}
+"#;
+    let mut program = doriac::lower_source_to_mir("set-first.doria", source)
+        .expect("valid Set::first should lower");
+    program.collection_types[0].kind = CollectionKind::TypedArray;
+    assert!(doriac::mir_validation::validate_program(&program)
+        .expect_err("set endpoint MIR on another receiver must be malformed")
+        .message
+        .contains("nullable collection access type mismatch"));
+}
 
 #[test]
 fn shared_validator_rejects_mixed_width_float_binary_operands() {

@@ -27,6 +27,50 @@ fn complete_family_example_executes_in_the_semantic_oracle() {
 }
 
 #[test]
+fn decision_0113_slice_three_example_executes_in_the_semantic_oracle() {
+    let source = include_str!("../../../examples/native/main_stage26_collection_slice3.doria");
+    let output = interpret(source);
+    assert_eq!(
+        output.stdout,
+        b"index 0 1 -1\nremove true false red green blue\nnullable 0 1 -1\ndictionary true true false\nsorted true true false\nset 30 20\nset changed 10 20\nempty -1 -1\nsorted set 10 30\nsorted changed 20 20\n"
+    );
+    assert_eq!(output.exit_status, 0);
+}
+
+#[test]
+fn collection_search_receiver_and_probe_evaluate_once_in_source_order() {
+    let output = interpret(
+        r#"
+class Calls
+{
+    static writable int $step = 0;
+
+    static function list(): List<int>
+    {
+        echo "receiver" . Calls::step;
+        Calls::step++;
+        return [7, 8];
+    }
+
+    static function probe(): int
+    {
+        echo " probe" . Calls::step;
+        Calls::step++;
+        return 8;
+    }
+}
+
+function main(): void
+{
+    echo " index=" . (Calls::list()->indexOf(Calls::probe()) ?? -1) .
+        " calls=" . Calls::step;
+}
+"#,
+    );
+    assert_eq!(output.stdout, b"receiver0 probe1 index=1 calls=2");
+}
+
+#[test]
 fn signed_ordering_mutation_and_set_algebra_are_exact() {
     let output = interpret(
         r#"

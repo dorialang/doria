@@ -114,6 +114,8 @@ fn peer_spellings_cover_size_mutation_search_endpoints_and_queue_vocabulary() {
         ),
         ("List<int> $v = [1];", "Min", "first"),
         ("List<int> $v = [1];", "Max", "last"),
+        ("Set<int> $v = Set::from([1]);", "Min", "first"),
+        ("SortedSet<int> $v = SortedSet::from([1]);", "Max", "last"),
         (
             "writable Deque<int> $v = Deque::from([1]);",
             "Enqueue(2)",
@@ -128,6 +130,10 @@ fn peer_spellings_cover_size_mutation_search_endpoints_and_queue_vocabulary() {
         let source = format!("function main(): void {{ {declaration} $v->{written}; }}");
         let error = diagnostic(&source, "E0521");
         assert_eq!(error.fixes[0].edits[0].replacement, canonical);
+        assert_eq!(
+            error.fixes[0].applicability,
+            FixApplicability::MachineApplicable
+        );
     }
 
     for written in ["array_search(1)", "position(1)", "find(1)"] {
@@ -178,6 +184,8 @@ fn property_invocation_has_safe_and_combined_fixes() {
     for source in [
         "function main(): void { List<int> $v = [1]; echo $v->isEmpty(); }",
         "function main(): void { List<int> $v = [1]; echo $v->first(); echo $v->last(); }",
+        "function main(): void { Set<int> $v = Set::from([1]); echo $v->first(); echo $v->last(); }",
+        "function main(): void { SortedSet<int> $v = SortedSet::from([1]); echo $v->first(); echo $v->last(); }",
         "function main(): void { Dictionary<string, int> $v = []; echo $v->keys(); echo $v->values(); }",
         "function main(): void { PriorityQueue<int> $v = PriorityQueue::from([1]); echo $v->peek(); }",
         "function main(): void { Deque<int> $v = Deque::from([1]); echo $v->peekFront(); echo $v->peekBack(); }",
@@ -235,52 +243,56 @@ fn withdrawn_literal_constructors_preserve_source_and_context() {
 }
 
 #[test]
-fn accepted_pending_members_stop_before_lowering_with_their_slice_owner() {
-    let cases = [
-        ("List<int> $v = [1]; echo $v->indexOf(1);", "indexOf", 3),
-        ("writable List<int> $v = [1]; echo $v->remove(1);", "remove", 3),
-        ("Dictionary<string, int> $v = []; echo $v->containsValue(1);", "containsValue", 3),
-        ("SortedDictionary<string, int> $v = SortedDictionary::from([]); echo $v->containsValue(1);", "containsValue", 3),
-        ("Set<int> $v = Set::from([1]); echo $v->first;", "first", 3),
-        ("SortedSet<int> $v = SortedSet::from([1]); echo $v->last;", "last", 3),
-        ("writable List<int> $v = [1]; $v->clear();", "clear", 4),
-        ("writable Dictionary<string, int> $v = []; $v->clear();", "clear", 4),
-        ("writable Set<int> $v = Set::from([1]); $v->clear();", "clear", 4),
-        ("writable SortedDictionary<string, int> $v = SortedDictionary::from([]); $v->clear();", "clear", 4),
-        ("writable SortedSet<int> $v = SortedSet::from([1]); $v->clear();", "clear", 4),
-        ("writable PriorityQueue<int> $v = PriorityQueue::from([1]); $v->clear();", "clear", 4),
-        ("writable Deque<int> $v = Deque::from([1]); $v->clear();", "clear", 4),
+fn slice_three_members_execute_and_only_slice_four_remains_pending() {
+    let executable = [
+        "List<int> $v = [1]; echo $v->indexOf(1) ?? -1;",
+        "writable List<int> $v = [1]; echo $v->remove(1);",
+        "Dictionary<string, int> $v = []; echo $v->containsValue(1);",
+        "SortedDictionary<string, int> $v = SortedDictionary::from([]); echo $v->containsValue(1);",
+        "Set<int> $v = Set::from([1]); echo $v->first ?? -1; echo $v->last ?? -1;",
+        "SortedSet<int> $v = SortedSet::from([1]); echo $v->first ?? -1; echo $v->last ?? -1;",
     ];
-    for (statement, member, slice) in cases {
+    for statement in executable {
+        let source = format!("function main(): void {{ {statement} }}");
+        doriac::lower_source_to_mir("slice-three-member.doria", source)
+            .expect("Slice 3 collection members should lower");
+    }
+
+    let pending_clear = [
+        "writable List<int> $v = [1]; $v->clear();",
+        "writable Dictionary<string, int> $v = []; $v->clear();",
+        "writable Set<int> $v = Set::from([1]); $v->clear();",
+        "writable SortedDictionary<string, int> $v = SortedDictionary::from([]); $v->clear();",
+        "writable SortedSet<int> $v = SortedSet::from([1]); $v->clear();",
+        "writable PriorityQueue<int> $v = PriorityQueue::from([1]); $v->clear();",
+        "writable Deque<int> $v = Deque::from([1]); $v->clear();",
+    ];
+    for statement in pending_clear {
         let source = format!("function main(): void {{ {statement} }}");
         let errors = rejected(&source);
         let pending = errors
             .iter()
             .find(|error| error.code == "E0559")
-            .unwrap_or_else(|| panic!("{member} must have an accepted-pending diagnostic"));
-        assert!(pending.message.contains(member));
-        assert!(pending
-            .explanation
-            .as_deref()
-            .unwrap()
-            .contains(&format!("Slice {slice}")));
+            .unwrap_or_else(|| panic!("clear must retain an accepted-pending diagnostic"));
+        assert!(pending.message.contains("clear"));
+        assert!(pending.explanation.as_deref().unwrap().contains("Slice 4"));
         assert!(!errors.iter().any(|error| error.code == "E0521"));
         assert!(doriac::lower_source_to_mir("pending-member.doria", source).is_err());
     }
 
     let suggested = diagnostic(
-        "function main(): void { List<int> $v = [1]; echo $v->find(1); }",
+        "function main(): void { List<int> $v = [1]; echo $v->find(1) ?? -1; }",
         "E0521",
     );
     assert_eq!(suggested.fixes[0].edits[0].replacement, "indexOf");
-    let pending = diagnostic(
-        &apply_fix(
-            "function main(): void { List<int> $v = [1]; echo $v->find(1); }",
+    doriac::check_source(
+        "fixed-member.doria",
+        apply_fix(
+            "function main(): void { List<int> $v = [1]; echo $v->find(1) ?? -1; }",
             &suggested,
         ),
-        "E0559",
-    );
-    assert!(pending.message.contains("indexOf"));
+    )
+    .expect("the safe indexOf migration should now execute");
 }
 
 #[test]
@@ -318,6 +330,46 @@ fn equality_diagnostics_name_the_actual_collection_operation() {
             "missing receiver-aware equality diagnostic for {operation}: {errors:#?}"
         );
     }
+
+    for (declaration, member, operation) in [
+        ("List<Token> $v = [];", "indexOf", "List::indexOf"),
+        ("writable List<Token> $v = [];", "remove", "List::remove"),
+        (
+            "Dictionary<string, Token> $v = [];",
+            "containsValue",
+            "Dictionary::containsValue",
+        ),
+        (
+            "SortedDictionary<string, Token> $v = SortedDictionary::from([]);",
+            "containsValue",
+            "SortedDictionary::containsValue",
+        ),
+    ] {
+        let source = format!(
+            "class Token {{}} function main(): void {{ {declaration} echo $v->{member}(new Token()); }}"
+        );
+        let errors = rejected(&source);
+        assert!(
+            errors
+                .iter()
+                .filter(|error| error.code == "E0524")
+                .any(|error| error.message.contains(operation)),
+            "missing receiver-aware equality diagnostic for {operation}: {errors:#?}"
+        );
+    }
+}
+
+#[test]
+fn list_remove_reports_the_readonly_receiver_instead_of_an_unknown_member() {
+    let errors = rejected(
+        "function main(): void { List<int> $values = [1, 2, 3]; echo $values->remove(2); }",
+    );
+    assert!(!errors.iter().any(|error| error.code == "E0521"));
+    assert!(errors.iter().any(|error| {
+        error.code == "E0201"
+            && error.message.contains("remove")
+            && error.message.contains("readonly")
+    }));
 }
 
 #[test]

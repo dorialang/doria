@@ -74,7 +74,15 @@ final class SortedDictionary extends __DoriaOrderedCollection implements ArrayAc
         return $found ? $this->entries[$index][1] : null;
     }
 
-    public function has(mixed $key): bool { return $this->locate($key)[0]; }
+    public function containsKey(mixed $key): bool { return $this->locate($key)[0]; }
+
+    public function containsValue(mixed $value): bool
+    {
+        foreach ($this->entries as $entry) {
+            if ($entry[1] === $value) { return true; }
+        }
+        return false;
+    }
 
     public function remove(mixed $key): mixed
     {
@@ -94,7 +102,7 @@ final class SortedDictionary extends __DoriaOrderedCollection implements ArrayAc
         return null;
     }
 
-    public function offsetExists(mixed $offset): bool { return $this->has($offset); }
+    public function offsetExists(mixed $offset): bool { return $this->containsKey($offset); }
     public function offsetGet(mixed $offset): mixed
     {
         [$found, $index] = $this->locate($offset);
@@ -176,6 +184,10 @@ final class SortedSet extends __DoriaOrderedCollection implements IteratorAggreg
     {
         if ($name === 'count') { return count($this->values); }
         if ($name === 'isEmpty') { return count($this->values) === 0; }
+        if ($name === 'first') { return $this->values[0] ?? null; }
+        if ($name === 'last') {
+            return $this->values ? $this->values[count($this->values) - 1] : null;
+        }
         return null;
     }
     public function getIterator(): Traversable { yield from $this->values; }

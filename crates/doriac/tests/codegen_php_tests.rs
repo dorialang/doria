@@ -2130,6 +2130,47 @@ function main(): void
 "#,
         ),
         (
+            "list indexOf",
+            r#"
+function main(): void
+{
+    List<int> $items = [1];
+    echo $items->indexOf(1) ?? -1;
+}
+"#,
+        ),
+        (
+            "list remove",
+            r#"
+function main(): void
+{
+    writable List<int> $items = [1];
+    $items->remove(1);
+}
+"#,
+        ),
+        (
+            "dictionary containsValue",
+            r#"
+function main(): void
+{
+    Dictionary<string, int> $items = ["answer" => 42];
+    echo $items->containsValue(42);
+}
+"#,
+        ),
+        (
+            "set endpoints",
+            r#"
+function main(): void
+{
+    Set<int> $items = Set::from([1]);
+    echo $items->first ?? -1;
+    echo $items->last ?? -1;
+}
+"#,
+        ),
+        (
             "writable foreach",
             r#"
 function main(): void
@@ -2246,6 +2287,78 @@ function main(): void
         run.stdout,
         b"-1 1 2 3 \n-1 0 1 3 \n-3 -2 1 4 \nfirst middle last "
     );
+    assert!(
+        run.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn php_backend_executes_ordered_slice3_members_with_strict_nullable_semantics() {
+    let php = doriac::compile_source_to_php(
+        "stage26-slice3.php.doria",
+        r#"
+function main(): void
+{
+    writable SortedDictionary<string, ?int> $numbers = SortedDictionary::from([]);
+    $numbers->set("empty", null);
+    $numbers->set("zero", 0);
+    $numbers->set("answer", 42);
+    echo $numbers->containsValue(null);
+    echo $numbers->containsValue(0);
+    echo $numbers->containsValue(7);
+
+    writable SortedDictionary<string, ?bool> $flags = SortedDictionary::from([]);
+    $flags->set("empty", null);
+    $flags->set("false", false);
+    echo $flags->containsValue(null);
+    echo $flags->containsValue(false);
+    echo $flags->containsValue(true);
+    echo "\n";
+
+    SortedSet<int> $values = SortedSet::from([30, 10, 20]);
+    echo $values->first ?? -1;
+    echo " ";
+    echo $values->last ?? -1;
+    echo "\n";
+
+    SortedSet<int> $empty = SortedSet::from([]);
+    echo $empty->first ?? -1;
+    echo " ";
+    echo $empty->last ?? -1;
+}
+"#,
+    )
+    .expect("ordered Slice 3 members should lower to PHP compatibility helpers");
+
+    assert!(php.contains("if ($entry[1] === $value) { return true; }"));
+    assert!(php.contains("if ($name === 'first') { return $this->values[0] ?? null; }"));
+    assert!(php.contains("if ($name === 'last')"));
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated ordered Slice 3 PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"truetruefalsetruetruefalse\n10 30\n-1 -1");
     assert!(
         run.stderr.is_empty(),
         "{}",

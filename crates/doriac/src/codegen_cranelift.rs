@@ -21,10 +21,10 @@ use crate::native_abi::{
     BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
     CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
     COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
-    COLLECTION_FREE, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE, COLLECTION_KEYED_GET,
-    COLLECTION_KEYED_GET_NULLABLE, COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET,
-    COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT, COLLECTION_LENGTH, COLLECTION_NEW,
-    COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_FRONT,
+    COLLECTION_FREE, COLLECTION_INDEX_OF, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE,
+    COLLECTION_KEYED_GET, COLLECTION_KEYED_GET_NULLABLE, COLLECTION_KEYED_HAS,
+    COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT, COLLECTION_LENGTH,
+    COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_FRONT,
     COLLECTION_PUSH_FRONT_NULLABLE, COLLECTION_PUSH_NULLABLE, COLLECTION_PUSH_UNIQUE,
     COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
     COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY,
@@ -2552,7 +2552,30 @@ fn lower_collection_expression(
                         resources,
                     )?;
                     let word = value_to_collection_word(builder, value, payload_ty, pointer)?;
-                    if fixed {
+                    if matches!(
+                        definition.kind,
+                        mir::CollectionKind::Set | mir::CollectionKind::SortedSet
+                    ) {
+                        let kind = builder
+                            .ins()
+                            .iconst(types::I8, collection_compare_kind(payload_ty)?);
+                        let inserted = runtime_call(
+                            builder,
+                            COLLECTION_PUSH_UNIQUE,
+                            &[pointer, types::I64, types::I8, types::I8],
+                            Some(types::I8),
+                            &[result, word, present, kind],
+                            resources,
+                        )?
+                        .ok_or_else(|| backend_failure("set insertion produced no result"))?;
+                        lower_drop_value_unless(
+                            builder,
+                            inserted,
+                            value,
+                            definition.value,
+                            resources,
+                        )?;
+                    } else if fixed {
                         let index = builder.ins().iconst(pointer, index as i64);
                         let previous_present_slot = builder.create_sized_stack_slot(
                             StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0),
@@ -2608,12 +2631,13 @@ fn lower_collection_expression(
                     let value_kind = builder
                         .ins()
                         .iconst(types::I8, collection_compare_kind(definition.value)?);
+                    let present = builder.ins().iconst(types::I8, 1);
                     let inserted = runtime_call(
                         builder,
                         COLLECTION_PUSH_UNIQUE,
-                        &[pointer, types::I64, types::I8],
+                        &[pointer, types::I64, types::I8, types::I8],
                         Some(types::I8),
-                        &[result, value, value_kind],
+                        &[result, value, present, value_kind],
                         resources,
                     )?
                     .ok_or_else(|| backend_failure("set insertion produced no result"))?;
@@ -3181,11 +3205,86 @@ fn lower_collection_add(
                 | mir::CollectionMutationOp::InsertAt
                 | mir::CollectionMutationOp::PushFront
                 | mir::CollectionMutationOp::PushBack
+                | mir::CollectionMutationOp::Remove
         )
     {
         let (present, value, payload_ty) =
             lower_nullable_collection_parts(builder, value, definition.value, resources)?;
         let word = value_to_collection_word(builder, value, payload_ty, pointer)?;
+        if op == mir::CollectionMutationOp::Remove {
+            let removed_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+            let removed_pointer = builder.ins().stack_addr(pointer, removed_slot, 0);
+            let removed_present_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let removed_present_pointer =
+                builder.ins().stack_addr(pointer, removed_present_slot, 0);
+            let kind = builder
+                .ins()
+                .iconst(types::I8, collection_compare_kind(payload_ty)?);
+            let removed = runtime_call(
+                builder,
+                COLLECTION_REMOVE_VALUE,
+                &[pointer, types::I64, types::I8, types::I8, pointer, pointer],
+                Some(types::I8),
+                &[
+                    collection_value,
+                    word,
+                    present,
+                    kind,
+                    removed_pointer,
+                    removed_present_pointer,
+                ],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("collection removal produced no result"))?;
+            let removed_word = builder
+                .ins()
+                .stack_load(pointer, types::I64, removed_slot, 0);
+            let removed_value =
+                collection_word_to_value(builder, removed_word, payload_ty, pointer)?;
+            let removed_present =
+                builder
+                    .ins()
+                    .stack_load(pointer, types::I8, removed_present_slot, 0);
+            let should_drop = builder.ins().band(removed, removed_present);
+            lower_drop_value_if(
+                builder,
+                should_drop,
+                removed_value,
+                definition.value,
+                resources,
+            )?;
+            lower_drop_stored_value(builder, value, definition.value, resources)?;
+            return Ok(());
+        }
+        if op == mir::CollectionMutationOp::Add
+            && matches!(
+                definition.kind,
+                mir::CollectionKind::Set | mir::CollectionKind::SortedSet
+            )
+        {
+            let kind = builder
+                .ins()
+                .iconst(types::I8, collection_compare_kind(payload_ty)?);
+            let inserted = runtime_call(
+                builder,
+                COLLECTION_PUSH_UNIQUE,
+                &[pointer, types::I64, types::I8, types::I8],
+                Some(types::I8),
+                &[collection_value, word, present, kind],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("set insertion produced no result"))?;
+            lower_drop_value_unless(builder, inserted, value, definition.value, resources)?;
+            return Ok(());
+        }
         let (name, parameter_types, arguments) = if op == mir::CollectionMutationOp::InsertAt {
             (
                 COLLECTION_INSERT_AT_NULLABLE,
@@ -3237,12 +3336,23 @@ fn lower_collection_add(
         let kind = builder
             .ins()
             .iconst(types::I8, collection_compare_kind(definition.value)?);
+        let removed_present_slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
+        let removed_present_pointer = builder.ins().stack_addr(pointer, removed_present_slot, 0);
+        let present = builder.ins().iconst(types::I8, 1);
         let removed = runtime_call(
             builder,
             COLLECTION_REMOVE_VALUE,
-            &[pointer, types::I64, types::I8, pointer],
+            &[pointer, types::I64, types::I8, types::I8, pointer, pointer],
             Some(types::I8),
-            &[collection_value, word, kind, removed_pointer],
+            &[
+                collection_value,
+                word,
+                present,
+                kind,
+                removed_pointer,
+                removed_present_pointer,
+            ],
             resources,
         )?
         .ok_or_else(|| backend_failure("set removal produced no result"))?;
@@ -3260,12 +3370,13 @@ fn lower_collection_add(
         let kind = builder
             .ins()
             .iconst(types::I8, collection_compare_kind(definition.value)?);
+        let present = builder.ins().iconst(types::I8, 1);
         let inserted = runtime_call(
             builder,
             COLLECTION_PUSH_UNIQUE,
-            &[pointer, types::I64, types::I8],
+            &[pointer, types::I64, types::I8, types::I8],
             Some(types::I8),
-            &[collection_value, word, kind],
+            &[collection_value, word, present, kind],
             resources,
         )?
         .ok_or_else(|| backend_failure("set insertion produced no result"))?;
@@ -3675,12 +3786,13 @@ fn lower_set_from(
     let kind = builder
         .ins()
         .iconst(types::I8, collection_compare_kind(source_definition.value)?);
+    let present = builder.ins().iconst(types::I8, 1);
     let inserted = runtime_call(
         builder,
         COLLECTION_PUSH_UNIQUE,
-        &[pointer, types::I64, types::I8],
+        &[pointer, types::I64, types::I8, types::I8],
         Some(types::I8),
-        &[target_value, word, kind],
+        &[target_value, word, present, kind],
         resources,
     )?
     .ok_or_else(|| backend_failure("Set::from insertion produced no result"))?;
@@ -3712,7 +3824,9 @@ fn lower_drop_value_if(
     if !matches!(
         ty,
         mir::Type::String
+            | mir::Type::NullableString
             | mir::Type::Class(_)
+            | mir::Type::NullableClass(_)
             | mir::Type::SharedReference(_)
             | mir::Type::WeakReference(_)
             | mir::Type::NullableSharedReference(_)
@@ -7044,6 +7158,47 @@ fn lower_nullable_scalar_expression(
             )?;
             Ok(LoweredValue::Nullable { present, payload })
         }
+        mir::NullableScalarExpression::CollectionIndexOf { collection, value } => {
+            let local = local_definition(resources.program, resources.function_id, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir("List::indexOf uses a non-collection local"));
+            };
+            let definition = collection_definition(resources.program, collection_type)?.clone();
+            let (needle_present, needle, needle_type) =
+                if nullable_payload_type(definition.value).is_some() {
+                    lower_nullable_collection_parts(builder, value, definition.value, resources)?
+                } else {
+                    let needle = lower_rvalue(builder, value, resources)?.single()?;
+                    (builder.ins().iconst(types::I8, 1), needle, definition.value)
+                };
+            let needle_word = value_to_collection_word(builder, needle, needle_type, pointer)?;
+            let collection = lower_collection_pointer(builder, *collection, resources)?;
+            let kind = builder
+                .ins()
+                .iconst(types::I8, collection_compare_kind(needle_type)?);
+            let found_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let found_pointer = builder.ins().stack_addr(pointer, found_slot, 0);
+            let position = runtime_call(
+                builder,
+                COLLECTION_INDEX_OF,
+                &[pointer, types::I64, types::I8, types::I8, pointer],
+                Some(types::I64),
+                &[collection, needle_word, needle_present, kind, found_pointer],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("List::indexOf produced no result"))?;
+            let found = builder.ins().stack_load(pointer, types::I8, found_slot, 0);
+            let present = builder.ins().uextend(pointer, found);
+            lower_drop_stored_value(builder, needle, definition.value, resources)?;
+            Ok(LoweredValue::Nullable {
+                present,
+                payload: position,
+            })
+        }
         mir::NullableScalarExpression::Parse { value, .. } => {
             let text = lower_string_expression(builder, value, resources)?;
             let found_slot = builder.create_sized_stack_slot(StackSlotData::new(
@@ -9149,34 +9304,60 @@ fn lower_condition_to_branch(
                 return Err(malformed_mir("collection has uses non-collection local"));
             };
             let definition = collection_definition(resources.program, collection_type)?.clone();
-            let needle_type = definition.key.unwrap_or(definition.value);
+            let stored_needle_type = if *op == mir::CollectionMembershipOp::Contains {
+                definition.key.unwrap_or(definition.value)
+            } else {
+                definition.value
+            };
             let mixed_ownership = value.mixed_ownership();
-            let needle = lower_rvalue(builder, value, resources)?.single()?;
+            let (needle_present, needle, needle_type) =
+                if nullable_payload_type(stored_needle_type).is_some() {
+                    lower_nullable_collection_parts(builder, value, stored_needle_type, resources)?
+                } else {
+                    (
+                        builder.ins().iconst(types::I8, 1),
+                        lower_rvalue(builder, value, resources)?.single()?,
+                        stored_needle_type,
+                    )
+                };
             let needle_word = value_to_collection_word(builder, needle, needle_type, pointer)?;
             let collection_value = lower_collection_pointer(builder, *collection, resources)?;
             let kind = builder
                 .ins()
                 .iconst(types::I8, collection_compare_kind(needle_type)?);
             let result = match op {
-                mir::CollectionMembershipOp::Contains => {
-                    let name = if definition.key.is_some() {
+                mir::CollectionMembershipOp::Contains
+                | mir::CollectionMembershipOp::ContainsValue => {
+                    let name = if *op == mir::CollectionMembershipOp::Contains
+                        && definition.key.is_some()
+                    {
                         COLLECTION_KEYED_HAS
                     } else {
                         COLLECTION_CONTAINS
                     };
-                    let found = runtime_call(
-                        builder,
-                        name,
-                        &[pointer, types::I64, types::I8],
-                        Some(types::I8),
-                        &[collection_value, needle_word, kind],
-                        resources,
-                    )?
-                    .ok_or_else(|| backend_failure("collection membership produced no result"))?;
-                    if matches!(needle_type, mir::Type::Mixed | mir::Type::NullableMixed) {
+                    let (params, args) = if name == COLLECTION_KEYED_HAS {
+                        (
+                            vec![pointer, types::I64, types::I8],
+                            vec![collection_value, needle_word, kind],
+                        )
+                    } else {
+                        (
+                            vec![pointer, types::I64, types::I8, types::I8],
+                            vec![collection_value, needle_word, needle_present, kind],
+                        )
+                    };
+                    let found =
+                        runtime_call(builder, name, &params, Some(types::I8), &args, resources)?
+                            .ok_or_else(|| {
+                                backend_failure("collection membership produced no result")
+                            })?;
+                    if matches!(
+                        stored_needle_type,
+                        mir::Type::Mixed | mir::Type::NullableMixed
+                    ) {
                         lower_cleanup_mixed_temporary(builder, needle, mixed_ownership, resources)?;
                     } else {
-                        lower_drop_stored_value(builder, needle, needle_type, resources)?;
+                        lower_drop_stored_value(builder, needle, stored_needle_type, resources)?;
                     }
                     found
                 }
@@ -9184,13 +9365,16 @@ fn lower_condition_to_branch(
                     let inserted = runtime_call(
                         builder,
                         COLLECTION_PUSH_UNIQUE,
-                        &[pointer, types::I64, types::I8],
+                        &[pointer, types::I64, types::I8, types::I8],
                         Some(types::I8),
-                        &[collection_value, needle_word, kind],
+                        &[collection_value, needle_word, needle_present, kind],
                         resources,
                     )?
                     .ok_or_else(|| backend_failure("set insertion produced no result"))?;
-                    if matches!(needle_type, mir::Type::Mixed | mir::Type::NullableMixed) {
+                    if matches!(
+                        stored_needle_type,
+                        mir::Type::Mixed | mir::Type::NullableMixed
+                    ) {
                         let zero = builder.ins().iconst(types::I8, 0);
                         let rejected = builder.ins().icmp(IntCC::Equal, inserted, zero);
                         lower_cleanup_mixed_temporary_if(
@@ -9201,7 +9385,13 @@ fn lower_condition_to_branch(
                             resources,
                         )?;
                     } else {
-                        lower_drop_value_unless(builder, inserted, needle, needle_type, resources)?;
+                        lower_drop_value_unless(
+                            builder,
+                            inserted,
+                            needle,
+                            stored_needle_type,
+                            resources,
+                        )?;
                     }
                     inserted
                 }
@@ -9212,12 +9402,26 @@ fn lower_condition_to_branch(
                         3,
                     ));
                     let removed_pointer = builder.ins().stack_addr(pointer, removed_slot, 0);
+                    let removed_present_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        1,
+                        0,
+                    ));
+                    let removed_present_pointer =
+                        builder.ins().stack_addr(pointer, removed_present_slot, 0);
                     let removed = runtime_call(
                         builder,
                         COLLECTION_REMOVE_VALUE,
-                        &[pointer, types::I64, types::I8, pointer],
+                        &[pointer, types::I64, types::I8, types::I8, pointer, pointer],
                         Some(types::I8),
-                        &[collection_value, needle_word, kind, removed_pointer],
+                        &[
+                            collection_value,
+                            needle_word,
+                            needle_present,
+                            kind,
+                            removed_pointer,
+                            removed_present_pointer,
+                        ],
                         resources,
                     )?
                     .ok_or_else(|| backend_failure("set removal produced no result"))?;
@@ -9227,11 +9431,25 @@ fn lower_condition_to_branch(
                             .stack_load(pointer, types::I64, removed_slot, 0);
                     let removed_value =
                         collection_word_to_value(builder, removed_word, needle_type, pointer)?;
-                    lower_drop_value_if(builder, removed, removed_value, needle_type, resources)?;
-                    if matches!(needle_type, mir::Type::Mixed | mir::Type::NullableMixed) {
+                    let removed_present =
+                        builder
+                            .ins()
+                            .stack_load(pointer, types::I8, removed_present_slot, 0);
+                    let should_drop = builder.ins().band(removed, removed_present);
+                    lower_drop_value_if(
+                        builder,
+                        should_drop,
+                        removed_value,
+                        stored_needle_type,
+                        resources,
+                    )?;
+                    if matches!(
+                        stored_needle_type,
+                        mir::Type::Mixed | mir::Type::NullableMixed
+                    ) {
                         lower_cleanup_mixed_temporary(builder, needle, mixed_ownership, resources)?;
                     } else {
-                        lower_drop_stored_value(builder, needle, needle_type, resources)?;
+                        lower_drop_stored_value(builder, needle, stored_needle_type, resources)?;
                     }
                     removed
                 }

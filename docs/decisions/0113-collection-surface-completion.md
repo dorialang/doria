@@ -384,11 +384,16 @@ and the language-server sweep in `dorialang/doria-language-server`.
 - **Slice 2 — Complete.** E0521 now uses one compiler-owned, receiver-aware
   suggestion table with structured source edits. Property calls have dedicated
   E0557 diagnostics, equality requirements name the actual receiver operation,
-  withdrawn `List::from` / `Dictionary::from` calls teach bracket literals, and
-  every accepted Slice 3/4 member stops before MIR with E0559.
-- **Slice 3 — Next.** The remaining members in sequencing item 3 are recognized
-  but not executable.
-- **Slice 4 — Pending.** `clear()` is recognized on all seven named collections
+  and withdrawn `List::from` / `Dictionary::from` calls teach bracket literals.
+  This slice introduced E0559 as the pre-MIR boundary for accepted later work.
+- **Slice 3 — Complete.** `List::indexOf` returns the first equal position as
+  `?int`; writable `List::remove` removes the first equal element;
+  `Dictionary` and `SortedDictionary` execute O(n) value membership; and `Set`
+  and `SortedSet` expose borrowed O(1) `first` / `last` properties. Shared MIR,
+  its validator, the interpreter, Cranelift, LLVM, and the ordered-family PHP
+  helpers implement the same contracts. E0559 no longer applies to these
+  members.
+- **Slice 4 — Next.** `clear()` is recognized on all seven named collections
   but is not executable.
 - **Stage 27 — Sequenced after Decision 0113.** Pending controlled performance
   measurement is not a dependency.
@@ -408,6 +413,25 @@ and the language-server sweep in `dorialang/doria-language-server`.
 The suggestion data is compiler-owned so a future `doriac migrate php` can
 reuse it directly. The language server consumes structured compiler fixes and
 does not maintain a second spelling table.
+
+### Slice 3 performance impact
+
+| Operation | Required complexity | Allocation |
+| --- | ---: | ---: |
+| `List::indexOf` | O(n) | None |
+| `List::remove` | O(n), including one tail shift | None |
+| `Dictionary::containsValue` | O(n) | None |
+| `SortedDictionary::containsValue` | O(n) | None |
+| `Set::first` / `last` | O(1) | None |
+| `SortedSet::first` / `last` | O(1) | None |
+
+Each search performs one scan and evaluates its probe once. `List::remove`
+finds and removes in one runtime operation rather than searching twice. Set
+endpoints use known storage positions and neither scan nor sort. Slice 3 does
+not change the collection representation. Its private runtime ABI adds the
+position-returning `indexOf` operation and advances membership/removal exports
+to carry nullable-value presence explicitly; the compiler and runtime ship that
+private ABI together, and no legacy entry points are retained.
 
 ## Affected components
 

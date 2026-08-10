@@ -2098,6 +2098,10 @@ pub enum NullableScalarExpression {
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
     },
+    CollectionIndexOf {
+        collection: LocalId,
+        value: Box<Rvalue>,
+    },
     /// `Int::parse(string)` / `Float::parse(string)`: parses the string and yields
     /// `?ty`, producing the absent value when the text is not a valid number.
     Parse {
@@ -2120,6 +2124,7 @@ impl NullableScalarExpression {
             | Self::Coalesce { ty, .. }
             | Self::DictionaryGet { ty, .. }
             | Self::Parse { ty, .. } => *ty,
+            Self::CollectionIndexOf { .. } => ScalarType::Integer(IntegerType::Int64),
             Self::StringIntrinsic(call) => match call.result {
                 Type::NullableScalar(ty) => ty,
                 _ => panic!("validated String intrinsic nullable scalar result"),
@@ -2843,6 +2848,7 @@ pub enum BoolExpression {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectionMembershipOp {
     Contains,
+    ContainsValue,
     Add,
     Remove,
 }
@@ -3640,6 +3646,9 @@ fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) ->
                 + nullable_scalar_class_temporary_capacity(right)
         }
         NullableScalarExpression::DictionaryGet { key, .. } => rvalue_class_temporary_capacity(key),
+        NullableScalarExpression::CollectionIndexOf { value, .. } => {
+            rvalue_class_temporary_capacity(value)
+        }
         NullableScalarExpression::StringIntrinsic(call) => {
             call.args.iter().map(rvalue_class_temporary_capacity).sum()
         }
@@ -4735,6 +4744,9 @@ impl fmt::Display for NullableScalarExpression {
                 collection, key, ..
             } => {
                 write!(formatter, "local{}.get({key})", collection.0)
+            }
+            Self::CollectionIndexOf { collection, value } => {
+                write!(formatter, "local{}.indexOf({value})", collection.0)
             }
             Self::Parse { ty, value } => write!(formatter, "parse::<{ty}>({value})"),
             Self::StringIntrinsic(call) => write!(formatter, "{call}"),

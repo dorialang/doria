@@ -42,7 +42,6 @@ pub enum ArgumentShape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImplementationStatus {
     Executable,
-    PendingSlice3,
     PendingSlice4,
 }
 
@@ -50,7 +49,6 @@ impl ImplementationStatus {
     pub const fn slice(self) -> Option<u8> {
         match self {
             Self::Executable => None,
-            Self::PendingSlice3 => Some(3),
             Self::PendingSlice4 => Some(4),
         }
     }
@@ -101,7 +99,7 @@ const REMOVE_COLLECTIONS: &[CollectionReceiver] = &[
     CollectionReceiver::SortedDictionary,
     CollectionReceiver::SortedSet,
 ];
-const PENDING_ENDPOINT_COLLECTIONS: &[CollectionReceiver] =
+const SET_ENDPOINT_COLLECTIONS: &[CollectionReceiver] =
     &[CollectionReceiver::Set, CollectionReceiver::SortedSet];
 const LIST: &[CollectionReceiver] = &[CollectionReceiver::List];
 const DEQUE: &[CollectionReceiver] = &[CollectionReceiver::Deque];
@@ -250,7 +248,7 @@ pub const COLLECTION_MEMBER_SUGGESTIONS: &[CollectionMemberSuggestion] = &[
         Method,
         ArgumentShape::Exact(1),
         RequiresReview,
-        PendingSlice3
+        Executable
     ),
     suggestion!(
         "position",
@@ -259,7 +257,7 @@ pub const COLLECTION_MEMBER_SUGGESTIONS: &[CollectionMemberSuggestion] = &[
         Method,
         ArgumentShape::Exact(1),
         RequiresReview,
-        PendingSlice3
+        Executable
     ),
     suggestion!(
         "find",
@@ -268,7 +266,7 @@ pub const COLLECTION_MEMBER_SUGGESTIONS: &[CollectionMemberSuggestion] = &[
         Method,
         ArgumentShape::Exact(1),
         RequiresReview,
-        PendingSlice3
+        Executable
     ),
     suggestion!(
         "unset",
@@ -309,20 +307,20 @@ pub const COLLECTION_MEMBER_SUGGESTIONS: &[CollectionMemberSuggestion] = &[
     suggestion!(
         "Min",
         "first",
-        PENDING_ENDPOINT_COLLECTIONS,
+        SET_ENDPOINT_COLLECTIONS,
         Property,
         ArgumentShape::Property,
-        RequiresReview,
-        PendingSlice3
+        MachineApplicable,
+        Executable
     ),
     suggestion!(
         "Max",
         "last",
-        PENDING_ENDPOINT_COLLECTIONS,
+        SET_ENDPOINT_COLLECTIONS,
         Property,
         ArgumentShape::Property,
-        RequiresReview,
-        PendingSlice3
+        MachineApplicable,
+        Executable
     ),
     suggestion!(
         "Enqueue",
@@ -370,7 +368,7 @@ pub fn canonical_property_status(
         (Dictionary | SortedDictionary, "keys" | "values") => Some(Executable),
         (PriorityQueue, "peek") => Some(Executable),
         (Deque, "peekFront" | "peekBack") => Some(Executable),
-        (Set | SortedSet, "first" | "last") => Some(PendingSlice3),
+        (Set | SortedSet, "first" | "last") => Some(Executable),
         _ => None,
     }
 }
@@ -383,9 +381,6 @@ pub fn pending_method_status(
     use ImplementationStatus::*;
 
     match (receiver, member) {
-        (List, "indexOf" | "remove") | (Dictionary | SortedDictionary, "containsValue") => {
-            Some(PendingSlice3)
-        }
         (
             List | Dictionary | Set | SortedDictionary | SortedSet | PriorityQueue | Deque,
             "clear",

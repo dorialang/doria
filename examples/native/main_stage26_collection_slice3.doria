@@ -1,0 +1,43 @@
+function main(): void
+{
+    writable List<string> $colors = ["red", "blue", "green", "blue"];
+    echo "index " . ($colors->indexOf("red") ?? -1) . " " .
+        ($colors->indexOf("blue") ?? -1) . " " .
+        ($colors->indexOf("purple") ?? -1) . "\n";
+    echo "remove {$colors->remove("blue")} {$colors->remove("purple")}";
+    foreach ($colors as string $color) {
+        echo " {$color}";
+    }
+    echo "\n";
+
+    List<?int> $nullable = [null, 0, null];
+    echo "nullable " . ($nullable->indexOf(null) ?? -1) . " " .
+        ($nullable->indexOf(0) ?? -1) . " " .
+        ($nullable->indexOf(7) ?? -1) . "\n";
+
+    Dictionary<string, ?int> $values = [
+        "empty" => null,
+        "zero" => 0,
+        "answer" => 42,
+    ];
+    echo "dictionary {$values->containsValue(null)} " .
+        "{$values->containsValue(0)} {$values->containsValue(7)}\n";
+    SortedDictionary<string, ?int> $sorted = SortedDictionary::from($values);
+    echo "sorted {$sorted->containsValue(null)} " .
+        "{$sorted->containsValue(42)} {$sorted->containsValue(7)}\n";
+
+    writable Set<int> $set = Set::from([30, 10, 20]);
+    echo "set " . ($set->first ?? -1) . " " . ($set->last ?? -1) . "\n";
+    $set->remove(30);
+    echo "set changed " . ($set->first ?? -1) . " " . ($set->last ?? -1) . "\n";
+    Set<int> $empty = Set::from([]);
+    echo "empty " . ($empty->first ?? -1) . " " . ($empty->last ?? -1) . "\n";
+
+    writable SortedSet<int> $ordered = SortedSet::from([30, 10, 20, 10]);
+    echo "sorted set " . ($ordered->first ?? -1) . " " .
+        ($ordered->last ?? -1) . "\n";
+    $ordered->remove(10);
+    $ordered->remove(30);
+    echo "sorted changed " . ($ordered->first ?? -1) . " " .
+        ($ordered->last ?? -1) . "\n";
+}
