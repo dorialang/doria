@@ -2120,6 +2120,10 @@ pub enum NullableScalarExpression {
         function: FunctionId,
         args: Vec<Rvalue>,
     },
+    EnumBacking {
+        enum_id: EnumId,
+        value: Box<NullableScalarExpression>,
+    },
     Coalesce {
         ty: ScalarType,
         left: Box<NullableScalarExpression>,
@@ -2157,6 +2161,7 @@ impl NullableScalarExpression {
             | Self::Coalesce { ty, .. }
             | Self::DictionaryGet { ty, .. }
             | Self::Parse { ty, .. } => *ty,
+            Self::EnumBacking { .. } => ScalarType::Integer(IntegerType::Int64),
             Self::CollectionIndexOf { .. } => ScalarType::Integer(IntegerType::Int64),
             Self::StringIntrinsic(call) => match call.result {
                 Type::NullableScalar(ty) => ty,
@@ -2703,6 +2708,10 @@ pub enum NullableStringExpression {
         object: Box<NullableClassExpression>,
         function: FunctionId,
         args: Vec<Rvalue>,
+    },
+    EnumBacking {
+        enum_id: EnumId,
+        value: Box<NullableScalarExpression>,
     },
     Coalesce {
         left: Box<NullableStringExpression>,
@@ -3657,6 +3666,9 @@ fn nullable_string_class_temporary_capacity(value: &NullableStringExpression) ->
         NullableStringExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
+        NullableStringExpression::EnumBacking { value, .. } => {
+            nullable_scalar_class_temporary_capacity(value)
+        }
         NullableStringExpression::Intrinsic(call) => {
             call.args.iter().map(rvalue_class_temporary_capacity).sum()
         }
@@ -3732,6 +3744,9 @@ fn nullable_scalar_class_temporary_capacity(value: &NullableScalarExpression) ->
         NullableScalarExpression::Value(value) => value_class_temporary_capacity(value),
         NullableScalarExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableScalarExpression::EnumBacking { value, .. } => {
+            nullable_scalar_class_temporary_capacity(value)
         }
         NullableScalarExpression::NullSafeProperty { object, .. } => {
             nullable_class_temporary_capacity(object)
@@ -4737,6 +4752,9 @@ impl fmt::Display for NullableStringExpression {
                 write!(formatter, "{object}?->")?;
                 write_call(formatter, *function, args)
             }
+            Self::EnumBacking { enum_id, value } => {
+                write!(formatter, "nullable_enum_backing<{enum_id:?}>({value})")
+            }
             Self::Coalesce { left, right } => write!(formatter, "({left} ?? {right})"),
             Self::DictionaryGet {
                 collection, key, ..
@@ -4867,6 +4885,9 @@ impl fmt::Display for NullableScalarExpression {
             }
             Self::Static { id, .. } => write!(formatter, "static{}", id.0),
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
+            Self::EnumBacking { enum_id, value } => {
+                write!(formatter, "nullable_enum_backing<{enum_id:?}>({value})")
+            }
             Self::NullSafeProperty {
                 object, property, ..
             } => {

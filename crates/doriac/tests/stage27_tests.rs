@@ -89,6 +89,33 @@ function main(): void
 }
 
 #[test]
+fn nullable_backed_enum_value_projection_preserves_presence() {
+    let output = interpret(
+        r#"
+enum Priority: int { case Low = 1; case High = 10; }
+enum Transport: string { case Road = "road"; case Rail = "rail"; }
+
+function main(): void
+{
+    ?Priority $priority = Priority::High;
+    ?Priority $missingPriority = null;
+    ?Transport $transport = Transport::Rail;
+    ?Transport $missingTransport = null;
+    ?int $priorityValue = $priority?->value;
+    ?int $missingPriorityValue = $missingPriority?->value;
+    ?string $transportValue = $transport?->value;
+    ?string $missingTransportValue = $missingTransport?->value;
+    echo "{$priorityValue ?? -1} {$missingPriorityValue ?? -1} ";
+    echo $transportValue ?? "missing";
+    echo " ";
+    echo $missingTransportValue ?? "missing";
+}
+"#,
+    );
+    assert_eq!(output.stdout, b"10 -1 rail missing");
+}
+
+#[test]
 fn enum_identity_survives_mixed_boxing_and_exact_narrowing() {
     let output = interpret(
         r#"
@@ -384,4 +411,40 @@ fn enum_type_namespace_and_case_namespaces_are_checked_globally() {
         "enum Left { case Ready; } enum Right { case Ready; }",
     )
     .expect("case names are scoped to their declaring enum");
+}
+
+#[test]
+fn enum_payload_types_resolve_against_all_declared_classes() {
+    for source in [
+        "class User {} enum Result { case Ok(User $user); }",
+        "enum Result { case Ok(User $user); } class User {}",
+    ] {
+        doriac::check_source("stage27.doria", source)
+            .expect("enum payload types should resolve regardless of declaration order");
+    }
+}
+
+#[test]
+fn enums_cannot_shadow_compiler_known_type_names() {
+    for name in [
+        "String",
+        "Int",
+        "Float",
+        "Bool",
+        "List",
+        "Dictionary",
+        "Set",
+        "Bytes",
+        "Displayable",
+        "SharedReference",
+        "WritableSharedReference",
+        "WeakReference",
+    ] {
+        let source = format!("enum {name} {{ case Value; }}");
+        let found = diagnostics(&source);
+        assert!(
+            found.iter().any(|diagnostic| diagnostic.code == "E0561"),
+            "{name} should be rejected as a reserved type name: {found:#?}"
+        );
+    }
 }

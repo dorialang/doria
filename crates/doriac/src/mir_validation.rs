@@ -5698,6 +5698,9 @@ fn collect_nullable_string_class_local_accesses<'a>(
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
         }
+        mir::NullableStringExpression::EnumBacking { value, .. } => {
+            collect_nullable_scalar_class_local_accesses(value, accesses)
+        }
         mir::NullableStringExpression::ReadLine { prompt, .. } => {
             collect_string_class_local_accesses(prompt, accesses);
         }
@@ -5931,6 +5934,9 @@ fn collect_nullable_scalar_class_local_accesses<'a>(
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
+        }
+        mir::NullableScalarExpression::EnumBacking { value, .. } => {
+            collect_nullable_scalar_class_local_accesses(value, accesses)
         }
         mir::NullableScalarExpression::NullSafeProperty { object, .. } => {
             collect_nullable_class_local_accesses(object, accesses)
@@ -6669,6 +6675,9 @@ fn nullable_scalar_expression_is_present(
             nullable_scalar_expression_is_present(left, present)
                 || nullable_scalar_expression_is_present(right, present)
         }
+        mir::NullableScalarExpression::EnumBacking { value, .. } => {
+            nullable_scalar_expression_is_present(value, present)
+        }
         mir::NullableScalarExpression::Null(_)
         | mir::NullableScalarExpression::Property { .. }
         | mir::NullableScalarExpression::Static { .. }
@@ -6692,6 +6701,9 @@ fn nullable_string_expression_is_present(
         mir::NullableStringExpression::Coalesce { left, right } => {
             nullable_string_expression_is_present(left, present)
                 || nullable_string_expression_is_present(right, present)
+        }
+        mir::NullableStringExpression::EnumBacking { value, .. } => {
+            nullable_scalar_expression_is_present(value, present)
         }
         mir::NullableStringExpression::Null
         | mir::NullableStringExpression::Property { .. }
@@ -8236,6 +8248,9 @@ fn nullable_string_observes_property(
         mir::NullableStringExpression::Call { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::NullableStringExpression::EnumBacking { value, .. } => {
+            nullable_scalar_observes_property(value, receiver, property)
+        }
         mir::NullableStringExpression::NullSafeProperty { object, .. } => {
             nullable_class_observes_property(object, receiver, property)
         }
@@ -8397,6 +8412,9 @@ fn nullable_scalar_observes_property(
         mir::NullableScalarExpression::Call { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::NullableScalarExpression::EnumBacking { value, .. } => {
+            nullable_scalar_observes_property(value, receiver, property)
+        }
         mir::NullableScalarExpression::NullSafeProperty { object, .. } => {
             nullable_class_observes_property(object, receiver, property)
         }
@@ -9685,6 +9703,20 @@ fn validate_nullable_string_expression(
             }
             validate_call_args(program, function, callee, args)
         }
+        mir::NullableStringExpression::EnumBacking { enum_id, value } => {
+            let definition = enum_in(program, *enum_id)?;
+            if definition.backing_type != Some(crate::enums::EnumBackingType::String) {
+                return Err(malformed_mir(
+                    "nullable string backing projection targets a non-string-backed enum",
+                ));
+            }
+            if value.ty() != mir::ScalarType::Enum(*enum_id) {
+                return Err(malformed_mir(
+                    "nullable string backing projection uses a different enum type",
+                ));
+            }
+            validate_nullable_scalar_expression(program, function, value)
+        }
         mir::NullableStringExpression::NullSafeProperty { object, property } => {
             let class = object.class();
             validate_nullable_class_expression(program, function, object)?;
@@ -9761,6 +9793,20 @@ fn validate_nullable_scalar_expression(
                 ));
             }
             validate_call_args(program, function, callee, args)
+        }
+        mir::NullableScalarExpression::EnumBacking { enum_id, value } => {
+            let definition = enum_in(program, *enum_id)?;
+            if definition.backing_type != Some(crate::enums::EnumBackingType::Int) {
+                return Err(malformed_mir(
+                    "nullable integer backing projection targets a non-int-backed enum",
+                ));
+            }
+            if value.ty() != mir::ScalarType::Enum(*enum_id) {
+                return Err(malformed_mir(
+                    "nullable integer backing projection uses a different enum type",
+                ));
+            }
+            validate_nullable_scalar_expression(program, function, value)
         }
         mir::NullableScalarExpression::NullSafeProperty {
             object, property, ..

@@ -562,6 +562,8 @@ enum EvaluationTask {
     AfterStringCoalesce(mir::StringExpression),
     EnumBackingInt(crate::enums::EnumId),
     EnumBackingString(crate::enums::EnumId),
+    NullableEnumBackingInt(crate::enums::EnumId),
+    NullableEnumBackingString(crate::enums::EnumId),
     AfterNullableScalarCoalesce(mir::NullableScalarExpression),
     AfterNullableStringCoalesce(mir::NullableStringExpression),
     AfterClassCoalesce {
@@ -3689,13 +3691,9 @@ impl Interpreter<'_> {
                         "MIR enum backing projection produced another scalar type",
                     ));
                 };
-                if value.enum_id != enum_id {
-                    return Err(InterpreterError::new(
-                        "MIR enum backing projection changed enum identity",
-                    ));
-                }
-                let case = enum_case_in(self.program, value)?;
-                let Some(crate::enums::EnumBackingValue::Int(backing)) = case.backing_value else {
+                let crate::enums::EnumBackingValue::Int(backing) =
+                    enum_backing_in(self.program, enum_id, value)?
+                else {
                     return Err(InterpreterError::new(
                         "MIR integer backing projection targets another backing type",
                     ));
@@ -3708,20 +3706,58 @@ impl Interpreter<'_> {
                         "MIR enum backing projection produced another scalar type",
                     ));
                 };
-                if value.enum_id != enum_id {
-                    return Err(InterpreterError::new(
-                        "MIR enum backing projection changed enum identity",
-                    ));
-                }
-                let case = enum_case_in(self.program, value)?;
-                let Some(crate::enums::EnumBackingValue::String(backing)) = &case.backing_value
+                let crate::enums::EnumBackingValue::String(backing) =
+                    enum_backing_in(self.program, enum_id, value)?
                 else {
                     return Err(InterpreterError::new(
                         "MIR string backing projection targets another backing type",
                     ));
                 };
-                let backing = backing.clone();
                 self.push_string(backing)?;
+            }
+            EvaluationTask::NullableEnumBackingInt(enum_id) => {
+                let (_, value) = self.pop_nullable_scalar()?;
+                let value = match value {
+                    None => None,
+                    Some(mir::ScalarValue::Enum(value)) => {
+                        let crate::enums::EnumBackingValue::Int(backing) =
+                            enum_backing_in(self.program, enum_id, value)?
+                        else {
+                            return Err(InterpreterError::new(
+                                "MIR nullable integer backing projection targets another backing type",
+                            ));
+                        };
+                        Some(mir::ScalarValue::Integer(backing))
+                    }
+                    Some(_) => {
+                        return Err(InterpreterError::new(
+                            "MIR nullable enum backing projection produced another scalar type",
+                        ));
+                    }
+                };
+                self.push_nullable_scalar(mir::ScalarType::Integer(IntegerType::Int64), value)?;
+            }
+            EvaluationTask::NullableEnumBackingString(enum_id) => {
+                let (_, value) = self.pop_nullable_scalar()?;
+                let value = match value {
+                    None => None,
+                    Some(mir::ScalarValue::Enum(value)) => {
+                        let crate::enums::EnumBackingValue::String(backing) =
+                            enum_backing_in(self.program, enum_id, value)?
+                        else {
+                            return Err(InterpreterError::new(
+                                "MIR nullable string backing projection targets another backing type",
+                            ));
+                        };
+                        Some(backing.into())
+                    }
+                    Some(_) => {
+                        return Err(InterpreterError::new(
+                            "MIR nullable enum backing projection produced another scalar type",
+                        ));
+                    }
+                };
+                self.push_nullable_string(value)?;
             }
             EvaluationTask::AfterStringCoalesce(right) => {
                 if let Some(value) = self.pop_nullable_string()? {
@@ -5455,6 +5491,13 @@ impl Interpreter<'_> {
                     ReturnExpectation::Value(mir::Type::NullableScalar(ty)),
                 )?;
             }
+            mir::NullableScalarExpression::EnumBacking { enum_id, value } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableEnumBackingInt(enum_id));
+                frame.tasks.push(EvaluationTask::NullableScalar(*value));
+            }
             mir::NullableScalarExpression::StringIntrinsic(call) => {
                 self.queue_string_intrinsic(*call)?;
             }
@@ -5738,6 +5781,13 @@ impl Interpreter<'_> {
                     args,
                     ReturnExpectation::Value(mir::Type::NullableString),
                 )?;
+            }
+            mir::NullableStringExpression::EnumBacking { enum_id, value } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::NullableEnumBackingString(enum_id));
+                frame.tasks.push(EvaluationTask::NullableScalar(*value));
             }
             mir::NullableStringExpression::Intrinsic(call) => {
                 self.queue_string_intrinsic(*call)?;
@@ -11356,6 +11406,22 @@ fn enum_case_in(
         .and_then(|definition| definition.cases.get(value.case_id.index))
         .filter(|case| case.id == value.case_id)
         .ok_or_else(|| InterpreterError::new("MIR enum case does not exist"))
+}
+
+fn enum_backing_in(
+    program: &mir::Program,
+    enum_id: crate::enums::EnumId,
+    value: crate::enums::EnumValue,
+) -> Result<crate::enums::EnumBackingValue, InterpreterError> {
+    if value.enum_id != enum_id {
+        return Err(InterpreterError::new(
+            "MIR enum backing projection changed enum identity",
+        ));
+    }
+    enum_case_in(program, value)?
+        .backing_value
+        .clone()
+        .ok_or_else(|| InterpreterError::new("MIR enum backing projection has no backing value"))
 }
 
 fn function_in(

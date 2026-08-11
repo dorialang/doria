@@ -5859,6 +5859,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("nullable-string call produced no result"))?
                 .into_struct_value()),
+            mir::NullableStringExpression::EnumBacking { enum_id, value } => {
+                let value = self.lower_nullable_scalar_expression(value)?;
+                self.lower_nullable_value_map(pointer.into(), value, |lowerer, tag| {
+                    Ok(lowerer
+                        .lower_string_enum_backing_from_tag(*enum_id, tag.into_int_value())?
+                        .into())
+                })
+            }
             mir::NullableStringExpression::NullSafeProperty { object, property } => {
                 let owned_receiver = object.owned_temporary_class();
                 let object = self.lower_nullable_class_expression(object)?;
@@ -5985,6 +5993,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("nullable-scalar call produced no result"))?
                 .into_struct_value()),
+            mir::NullableScalarExpression::EnumBacking { enum_id, value } => {
+                let value = self.lower_nullable_scalar_expression(value)?;
+                self.lower_nullable_value_map(
+                    self.context.i64_type().into(),
+                    value,
+                    |lowerer, tag| {
+                        Ok(lowerer
+                            .lower_integer_enum_backing_from_tag(*enum_id, tag.into_int_value())?
+                            .into())
+                    },
+                )
+            }
             mir::NullableScalarExpression::NullSafeProperty {
                 object, property, ..
             } => {
@@ -6171,6 +6191,60 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         phi.add_incoming(&[(&value, some_end), (&absent, none_end)]);
         let result = phi.as_basic_value().into_struct_value();
         Ok(result)
+    }
+
+    fn lower_nullable_value_map(
+        &mut self,
+        payload_type: BasicTypeEnum<'ctx>,
+        value: StructValue<'ctx>,
+        present_value: impl FnOnce(
+            &mut Self,
+            BasicValueEnum<'ctx>,
+        ) -> Result<BasicValueEnum<'ctx>, BackendError>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let (present, source_payload) = self.nullable_parts(value)?;
+        let function = current_function(&self.builder)?;
+        let some = self
+            .context
+            .append_basic_block(function, "nullable.map.some");
+        let none = self
+            .context
+            .append_basic_block(function, "nullable.map.none");
+        let done = self
+            .context
+            .append_basic_block(function, "nullable.map.done");
+        let is_present = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            present,
+            present.get_type().const_zero(),
+            "nullable.map.present",
+        ))?;
+        build(
+            self.builder
+                .build_conditional_branch(is_present, some, none),
+        )?;
+        self.builder.position_at_end(some);
+        let payload = present_value(self, source_payload)?;
+        let value = self.nullable_value(self.present_word(true), payload)?;
+        build(self.builder.build_unconditional_branch(done))?;
+        let some_end = self
+            .builder
+            .get_insert_block()
+            .expect("nullable map some block");
+        self.builder.position_at_end(none);
+        let absent = self.nullable_value(self.present_word(false), payload_type.const_zero())?;
+        build(self.builder.build_unconditional_branch(done))?;
+        let none_end = self
+            .builder
+            .get_insert_block()
+            .expect("nullable map none block");
+        self.builder.position_at_end(done);
+        let phi = build(
+            self.builder
+                .build_phi(self.nullable_type(payload_type), "nullable.map.value"),
+        )?;
+        phi.add_incoming(&[(&value, some_end), (&absent, none_end)]);
+        Ok(phi.as_basic_value().into_struct_value())
     }
 
     fn lower_null_safe_statement_call(
@@ -8043,6 +8117,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         value: &mir::EnumExpression,
     ) -> Result<PointerValue<'ctx>, BackendError> {
         let tag = self.lower_enum_expression(value)?;
+        self.lower_string_enum_backing_from_tag(enum_id, tag)
+    }
+
+    fn lower_string_enum_backing_from_tag(
+        &mut self,
+        enum_id: crate::enums::EnumId,
+        tag: IntValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
         let cases = enum_definition(self.program, enum_id)?
             .cases
             .iter()
@@ -8412,41 +8494,49 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             }
             mir::IntegerExpression::EnumBacking { enum_id, value } => {
                 let tag = self.lower_enum_expression(value)?;
-                let values = enum_definition(self.program, *enum_id)?
-                    .cases
-                    .iter()
-                    .map(|case| match case.backing_value.as_ref() {
-                        Some(crate::enums::EnumBackingValue::Int(value)) => Ok((case.tag, *value)),
-                        _ => Err(malformed_mir("int-backed enum case has no integer value")),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut values = values.into_iter();
-                let (_, first) = values
-                    .next()
-                    .ok_or_else(|| malformed_mir("enum has no cases"))?;
-                let mut result = integer_constant(self.context, first);
-                for (case_tag, backing) in values {
-                    let selected = build(
-                        self.builder.build_int_compare(
-                            IntPredicate::EQ,
-                            tag,
-                            self.context
-                                .i32_type()
-                                .const_int(u64::from(case_tag), false),
-                            "enum.backing.case",
-                        ),
-                    )?;
-                    result = build(self.builder.build_select(
-                        selected,
-                        integer_constant(self.context, backing),
-                        result,
-                        "enum.backing.value",
-                    ))?
-                    .into_int_value();
-                }
-                Ok(result)
+                self.lower_integer_enum_backing_from_tag(*enum_id, tag)
             }
         }
+    }
+
+    fn lower_integer_enum_backing_from_tag(
+        &mut self,
+        enum_id: crate::enums::EnumId,
+        tag: IntValue<'ctx>,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let values = enum_definition(self.program, enum_id)?
+            .cases
+            .iter()
+            .map(|case| match case.backing_value.as_ref() {
+                Some(crate::enums::EnumBackingValue::Int(value)) => Ok((case.tag, *value)),
+                _ => Err(malformed_mir("int-backed enum case has no integer value")),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut values = values.into_iter();
+        let (_, first) = values
+            .next()
+            .ok_or_else(|| malformed_mir("enum has no cases"))?;
+        let mut result = integer_constant(self.context, first);
+        for (case_tag, backing) in values {
+            let selected = build(
+                self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    tag,
+                    self.context
+                        .i32_type()
+                        .const_int(u64::from(case_tag), false),
+                    "enum.backing.case",
+                ),
+            )?;
+            result = build(self.builder.build_select(
+                selected,
+                integer_constant(self.context, backing),
+                result,
+                "enum.backing.value",
+            ))?
+            .into_int_value();
+        }
+        Ok(result)
     }
 
     fn lower_integer_unary(

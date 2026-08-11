@@ -1144,6 +1144,7 @@ impl<'program> Checker<'program> {
                 namespace.span,
             ));
         }
+        self.predeclare_classes();
         self.collect_enums();
         self.collect_classes();
         self.collect_functions();
@@ -1176,15 +1177,13 @@ impl<'program> Checker<'program> {
         self.check_pending_integer_literal_ranges();
     }
 
-    fn collect_classes(&mut self) {
-        let mut declared_classes = Vec::new();
-
+    fn predeclare_classes(&mut self) {
         for item in &self.program.items {
             let Item::Class(class_decl) = item else {
                 continue;
             };
 
-            if let Some(message) = Self::reserved_class_name_message(&class_decl.name) {
+            if let Some(message) = Self::reserved_type_name_message(&class_decl.name) {
                 self.diagnostics
                     .push(Diagnostic::new("E0309", message, class_decl.span));
                 continue;
@@ -1218,10 +1217,27 @@ impl<'program> Checker<'program> {
                     members: HashMap::new(),
                 },
             );
-            declared_classes.push(class_decl);
         }
+    }
 
-        for class_decl in declared_classes {
+    fn collect_classes(&mut self) {
+        let mut processed = HashSet::new();
+        let declarations = self
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(declaration) => Some(declaration),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for class_decl in declarations {
+            if !processed.insert(class_decl.name.clone())
+                || !self.classes.contains_key(&class_decl.name)
+            {
+                continue;
+            }
             self.check_class_type_parameter_declarations(class_decl);
             self.type_parameter_scopes
                 .push(type_parameter_scope(&class_decl.type_params));
@@ -1373,6 +1389,13 @@ impl<'program> Checker<'program> {
             .collect::<Vec<_>>();
 
         for declaration in &declarations {
+            if let Some(message) = Self::reserved_type_name_message(&declaration.name) {
+                self.diagnostics.push(
+                    Diagnostic::new("E0561", message, declaration.span)
+                        .with_title("Type Name Collision"),
+                );
+                continue;
+            }
             if non_enum_types.contains(declaration.name.as_str()) {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -1795,7 +1818,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn reserved_class_name_message(name: &str) -> Option<String> {
+    fn reserved_type_name_message(name: &str) -> Option<String> {
         if SharedHandleKind::from_source_name(name).is_some() {
             return Some(format!(
                 "`{name}` is a compiler-known shared-ownership type and cannot be redeclared"
@@ -1819,7 +1842,7 @@ impl<'program> Checker<'program> {
         }
         match name {
             "self" => Some(
-                "`self` is reserved for the declaring or composing class context and cannot be used as a class name"
+                "`self` is reserved for the declaring or composing class context and cannot be redeclared as a type"
                     .to_string(),
             ),
             "Displayable" => Some(
@@ -1844,18 +1867,18 @@ impl<'program> Checker<'program> {
                 "`{name}` is a compiler-known collection alias and cannot be redeclared"
             )),
             "array" => Some(
-                "`array` is not a Doria class name; use typed arrays like `T[]` or collection aliases"
+                "`array` is not a Doria type name; use typed arrays like `T[]` or collection aliases"
                     .to_string(),
             ),
             "mixed" => Some(
-                "`mixed` is a Doria dynamic-boundary type and cannot be used as a class name"
+                "`mixed` is a Doria dynamic-boundary type and cannot be redeclared"
                     .to_string(),
             ),
             "object" => Some(
-                "`object` is not a Doria type and cannot be used as a class name".to_string(),
+                "`object` is not a Doria type and cannot be redeclared".to_string(),
             ),
             "resource" => Some(
-                "`resource` is reserved for future PHP interop and cannot be used as a class name"
+                "`resource` is reserved for future PHP interop and cannot be redeclared"
                     .to_string(),
             ),
             _ => None,
@@ -12960,10 +12983,12 @@ impl<'program> Checker<'program> {
         let ty = self.infer_expr_type(object, scopes, method_context);
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => {
-                if !matches!(
+                let member_receiver = matches!(
                     self.types.kind(*inner),
                     TypeKind::Class(_) | TypeKind::SharedHandle(_, _)
-                ) {
+                ) || (operation == "property access"
+                    && matches!(self.types.kind(*inner), TypeKind::Enum(_)));
+                if !member_receiver {
                     self.diagnostics.push(Diagnostic::new(
                         "E0507",
                         format!("{operation} requires a class value"),

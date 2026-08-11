@@ -5048,6 +5048,14 @@ fn lower_nullable_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
+    if let Some((enum_id, value)) =
+        lower_nullable_enum_backing_receiver(expr, crate::enums::EnumBackingType::String, context)?
+    {
+        return Ok(mir::NullableStringExpression::EnumBacking {
+            enum_id,
+            value: Box::new(value),
+        });
+    }
     if let Some(call) = lower_string_intrinsic_call(expr, context) {
         let call = call?;
         if call.result != mir::Type::NullableString {
@@ -5338,6 +5346,16 @@ fn lower_nullable_scalar_expression(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if expected == mir::ScalarType::Integer(IntegerType::Int64) {
+        if let Some((enum_id, value)) =
+            lower_nullable_enum_backing_receiver(expr, crate::enums::EnumBackingType::Int, context)?
+        {
+            return Ok(mir::NullableScalarExpression::EnumBacking {
+                enum_id,
+                value: Box::new(value),
+            });
+        }
+    }
     if let Some(call) = lower_string_intrinsic_call(expr, context) {
         let call = call?;
         if call.result != mir::Type::NullableScalar(expected) {
@@ -5669,6 +5687,41 @@ fn lower_nullable_scalar_expression(
             Ok(mir::NullableScalarExpression::Value(value))
         }
     }
+}
+
+fn lower_nullable_enum_backing_receiver(
+    expr: &hir::Expr,
+    expected_backing: crate::enums::EnumBackingType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(crate::enums::EnumId, mir::NullableScalarExpression)>> {
+    let hir::Expr::PropertyAccess {
+        object,
+        property,
+        null_safe: true,
+        ..
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if property != "value" {
+        return Ok(None);
+    }
+    let mir::Type::NullableScalar(mir::ScalarType::Enum(enum_id)) =
+        context.expression_type(object)?
+    else {
+        return Ok(None);
+    };
+    if context
+        .semantic_info
+        .enums
+        .get(enum_id.0)
+        .and_then(|definition| definition.backing_type)
+        != Some(expected_backing)
+    {
+        return Ok(None);
+    }
+    let value = lower_nullable_scalar_expression(object, mir::ScalarType::Enum(enum_id), context)?;
+    Ok(Some((enum_id, value)))
 }
 
 fn lower_nullable_class_expression(

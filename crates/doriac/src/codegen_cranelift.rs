@@ -7042,6 +7042,15 @@ fn lower_string_enum_backing(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Value, BackendError> {
     let tag = lower_enum_expression(builder, value, resources)?;
+    lower_string_enum_backing_from_tag(builder, enum_id, tag, resources)
+}
+
+fn lower_string_enum_backing_from_tag(
+    builder: &mut FunctionBuilder,
+    enum_id: crate::enums::EnumId,
+    tag: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
     let cases = enum_definition(resources.program, enum_id)?
         .cases
         .iter()
@@ -7155,6 +7164,18 @@ fn lower_nullable_string_expression(
         mir::NullableStringExpression::Call { function, args } => {
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("nullable-string call produced no result"))
+        }
+        mir::NullableStringExpression::EnumBacking { enum_id, value } => {
+            let value = lower_nullable_scalar_expression(builder, value, resources)?;
+            lower_nullable_value_map(
+                builder,
+                value,
+                pointer,
+                resources,
+                |builder, tag, resources| {
+                    lower_string_enum_backing_from_tag(builder, *enum_id, tag, resources)
+                },
+            )
         }
         mir::NullableStringExpression::NullSafeProperty { object, property } => {
             let owned_receiver = object.owned_temporary_class();
@@ -7286,6 +7307,18 @@ fn lower_nullable_scalar_expression(
         mir::NullableScalarExpression::Call { function, args, .. } => {
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("nullable-scalar call produced no result"))
+        }
+        mir::NullableScalarExpression::EnumBacking { enum_id, value } => {
+            let value = lower_nullable_scalar_expression(builder, value, resources)?;
+            lower_nullable_value_map(
+                builder,
+                value,
+                types::I64,
+                resources,
+                |builder, tag, resources| {
+                    lower_integer_enum_backing_from_tag(builder, *enum_id, tag, resources)
+                },
+            )
         }
         mir::NullableScalarExpression::NullSafeProperty {
             object, property, ..
@@ -7441,6 +7474,57 @@ fn scalar_zero(builder: &mut FunctionBuilder, ty: mir::ScalarType) -> Value {
     }
 }
 
+fn lower_nullable_value_map(
+    builder: &mut FunctionBuilder,
+    value: LoweredValue,
+    payload_type: ClifType,
+    resources: &mut LoweringResources<'_, '_>,
+    present_value: impl FnOnce(
+        &mut FunctionBuilder,
+        Value,
+        &mut LoweringResources<'_, '_>,
+    ) -> Result<Value, BackendError>,
+) -> Result<LoweredValue, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let (present, source_payload) = value.nullable()?;
+    let zero = builder.ins().iconst(pointer, 0);
+    let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+    let some = builder.create_block();
+    let none = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, pointer);
+    builder.append_block_param(done, payload_type);
+    builder.ins().brif(is_present, some, &[], none, &[]);
+    builder.switch_to_block(some);
+    let payload = present_value(builder, source_payload, resources)?;
+    let present = builder.ins().iconst(pointer, 1);
+    builder
+        .ins()
+        .jump(done, &[BlockArg::Value(present), BlockArg::Value(payload)]);
+    builder.switch_to_block(none);
+    let absent = builder.ins().iconst(pointer, 0);
+    let payload = clif_zero(builder, payload_type);
+    builder
+        .ins()
+        .jump(done, &[BlockArg::Value(absent), BlockArg::Value(payload)]);
+    builder.switch_to_block(done);
+    let params = builder.block_params(done);
+    Ok(LoweredValue::Nullable {
+        present: params[0],
+        payload: params[1],
+    })
+}
+
+fn clif_zero(builder: &mut FunctionBuilder, ty: ClifType) -> Value {
+    if ty == types::F32 {
+        builder.ins().f32const(Ieee32::with_bits(0))
+    } else if ty == types::F64 {
+        builder.ins().f64const(Ieee64::with_bits(0))
+    } else {
+        builder.ins().iconst(ty, 0)
+    }
+}
+
 fn lower_null_safe_nullable(
     builder: &mut FunctionBuilder,
     object: Value,
@@ -7476,15 +7560,7 @@ fn lower_null_safe_nullable(
         .jump(done, &[BlockArg::Value(present), BlockArg::Value(payload)]);
     builder.switch_to_block(none);
     let absent = builder.ins().iconst(pointer, 0);
-    let payload = if payload_type.is_float() {
-        if payload_type == types::F32 {
-            builder.ins().f32const(Ieee32::with_bits(0))
-        } else {
-            builder.ins().f64const(Ieee64::with_bits(0))
-        }
-    } else {
-        builder.ins().iconst(payload_type, 0)
-    };
+    let payload = clif_zero(builder, payload_type);
     builder
         .ins()
         .jump(done, &[BlockArg::Value(absent), BlockArg::Value(payload)]);
@@ -7802,28 +7878,37 @@ fn lower_integer_expression(
         }
         mir::IntegerExpression::EnumBacking { enum_id, value } => {
             let tag = lower_enum_expression(builder, value, resources)?;
-            let values = enum_definition(resources.program, *enum_id)?
-                .cases
-                .iter()
-                .map(|case| match case.backing_value.as_ref() {
-                    Some(crate::enums::EnumBackingValue::Int(value)) => Ok((case.tag, *value)),
-                    _ => Err(malformed_mir("int-backed enum case has no integer value")),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut values = values.into_iter();
-            let (_first_tag, first) = values
-                .next()
-                .ok_or_else(|| malformed_mir("enum has no cases"))?;
-            let mut result = integer_constant(builder, first);
-            for (case_tag, backing) in values {
-                let expected = builder.ins().iconst(types::I32, i64::from(case_tag));
-                let selected = builder.ins().icmp(IntCC::Equal, tag, expected);
-                let backing = integer_constant(builder, backing);
-                result = builder.ins().select(selected, backing, result);
-            }
-            Ok(result)
+            lower_integer_enum_backing_from_tag(builder, *enum_id, tag, resources)
         }
     }
+}
+
+fn lower_integer_enum_backing_from_tag(
+    builder: &mut FunctionBuilder,
+    enum_id: crate::enums::EnumId,
+    tag: Value,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let values = enum_definition(resources.program, enum_id)?
+        .cases
+        .iter()
+        .map(|case| match case.backing_value.as_ref() {
+            Some(crate::enums::EnumBackingValue::Int(value)) => Ok((case.tag, *value)),
+            _ => Err(malformed_mir("int-backed enum case has no integer value")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut values = values.into_iter();
+    let (_first_tag, first) = values
+        .next()
+        .ok_or_else(|| malformed_mir("enum has no cases"))?;
+    let mut result = integer_constant(builder, first);
+    for (case_tag, backing) in values {
+        let expected = builder.ins().iconst(types::I32, i64::from(case_tag));
+        let selected = builder.ins().icmp(IntCC::Equal, tag, expected);
+        let backing = integer_constant(builder, backing);
+        result = builder.ins().select(selected, backing, result);
+    }
+    Ok(result)
 }
 
 fn lower_integer_unary(

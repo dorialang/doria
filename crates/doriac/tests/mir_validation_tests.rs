@@ -31,6 +31,10 @@ function main(): void
     mixed $boxed = Status::Draft;
     int $priority = Priority::High->value;
     string $label = Label::Long->value;
+    ?Priority $nullablePriority = Priority::High;
+    ?int $nullablePriorityValue = $nullablePriority?->value;
+    ?Label $nullableLabel = Label::Long;
+    ?string $nullableLabelValue = $nullableLabel?->value;
 }
 "#;
     let valid = doriac::lower_source_to_mir("enum-validation.doria", source)
@@ -95,6 +99,24 @@ function main(): void
         case.backing_value = Some(EnumBackingValue::String(format!("value{index}")));
     }
     malformed(&wrong_backing_result, "non-int-backed enum");
+
+    let mut wrong_nullable_integer_backing = valid.clone();
+    let Rvalue::NullableScalar(NullableScalarExpression::EnumBacking { enum_id, .. }) =
+        assignment_rvalue(&mut wrong_nullable_integer_backing, "nullablePriorityValue")
+    else {
+        panic!("expected nullable integer enum backing projection");
+    };
+    *enum_id = EnumId(3);
+    malformed(&wrong_nullable_integer_backing, "non-int-backed enum");
+
+    let mut wrong_nullable_string_backing = valid.clone();
+    let Rvalue::NullableString(NullableStringExpression::EnumBacking { enum_id, .. }) =
+        assignment_rvalue(&mut wrong_nullable_string_backing, "nullableLabelValue")
+    else {
+        panic!("expected nullable string enum backing projection");
+    };
+    *enum_id = EnumId(2);
+    malformed(&wrong_nullable_string_backing, "non-string-backed enum");
 
     let mut different_equality = valid.clone();
     let Rvalue::Value(ValueExpression::Bool(BoolExpression::Compare { right, .. })) =
