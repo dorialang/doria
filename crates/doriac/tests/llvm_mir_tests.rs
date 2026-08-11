@@ -396,6 +396,21 @@ function main(): void
         ir.contains("collection.drop.body"),
         "owned clear needs release iteration"
     );
+    let detach = ir
+        .find("call ptr @dr_v3_collection_detach_for_cleanup")
+        .expect("owned clear must detach storage before release iteration");
+    let release = ir[detach..]
+        .find("call void @dr_v1_string_release")
+        .map(|offset| detach + offset)
+        .expect("owned clear must release its detached string values");
+    let finish = ir[release..]
+        .find("call void @dr_v3_collection_finish_detached_cleanup")
+        .map(|offset| release + offset)
+        .expect("owned clear must finish detached storage after release iteration");
+    assert!(
+        detach < release && release < finish,
+        "owned clear must become empty before drop glue and preserve destructor refills"
+    );
     let placement = scan_alloca_placement(&ir);
     assert!(placement.escaped.is_empty(), "{:#?}", placement.escaped);
 

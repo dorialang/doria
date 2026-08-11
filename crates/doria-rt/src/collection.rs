@@ -431,6 +431,75 @@ pub unsafe fn reset_after_cleanup(collection: *mut DrCollectionV1) {
     index_discard(collection);
 }
 
+/// Detaches every live entry from `collection` before generated drop glue runs.
+///
+/// User destructors may reach the collection again. Moving its backing storage
+/// into a private snapshot makes that re-entrant view empty and prevents a
+/// refill from overwriting entries whose drop glue has not run yet.
+pub unsafe fn detach_for_cleanup(
+    frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+) -> *mut DrCollectionV1 {
+    if collection.is_null() || (*collection).fixed != 0 {
+        collection_panic_with_frame(frame, b"P1001");
+    }
+    let detached = allocate(mem::size_of::<DrCollectionV1>()).cast::<DrCollectionV1>();
+    if detached.is_null() {
+        collection_panic_with_frame(frame, b"P1313");
+    }
+    ptr::write(detached, ptr::read(collection));
+    ptr::write(
+        collection,
+        DrCollectionV1 {
+            length: 0,
+            capacity: 0,
+            keys: ptr::null_mut(),
+            values: ptr::null_mut(),
+            keyed: (*detached).keyed,
+            fixed: (*detached).fixed,
+            value_width: (*detached).value_width,
+            kind: (*detached).kind,
+            comparator: (*detached).comparator,
+            finalized: (*detached).finalized,
+            value_nullable: (*detached).value_nullable,
+            head: 0,
+            index: ptr::null_mut(),
+            index_slots: 0,
+            index_kind: 0,
+            index_keyed: 0,
+        },
+    );
+    detached
+}
+
+/// Releases a detached cleanup snapshot after generated drop glue has consumed
+/// all of its logical entries. A collection that was not refilled while its
+/// destructors ran recovers the original backing allocation; otherwise the
+/// refill remains untouched and the old allocation is released.
+pub unsafe fn finish_detached_cleanup(
+    collection: *mut DrCollectionV1,
+    detached: *mut DrCollectionV1,
+) {
+    if collection.is_null() || detached.is_null() || collection == detached {
+        collection_panic(b"P1001");
+    }
+    let untouched = (*collection).length == 0
+        && (*collection).capacity == 0
+        && (*collection).keys.is_null()
+        && (*collection).values.is_null()
+        && (*collection).index.is_null();
+    if untouched {
+        index_discard(detached);
+        (*collection).capacity = (*detached).capacity;
+        (*collection).keys = (*detached).keys;
+        (*collection).values = (*detached).values;
+        (*detached).capacity = 0;
+        (*detached).keys = ptr::null_mut();
+        (*detached).values = ptr::null_mut();
+    }
+    free(detached);
+}
+
 pub unsafe fn length(collection: *const DrCollectionV1) -> usize {
     (*collection).length
 }
@@ -1760,6 +1829,58 @@ mod tests {
     use super::*;
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+
+    #[test]
+    fn detached_cleanup_isolates_destructor_refills() {
+        unsafe {
+            let collection = new(0, false, false, 8);
+            push(collection, 10);
+            push(collection, 20);
+            let old_values = (*collection).values;
+
+            let detached = detach_for_cleanup(ptr::null(), collection);
+            assert_eq!((*collection).length, 0);
+            assert_eq!((*collection).capacity, 0);
+            assert!((*collection).values.is_null());
+            assert_eq!((*detached).length, 2);
+            assert_eq!(read_value(detached, 0), 10);
+            assert_eq!(read_value(detached, 1), 20);
+
+            push(collection, 30);
+            assert_ne!((*collection).values, old_values);
+            assert_eq!(read_value(collection, 0), 30);
+            assert_eq!(read_value(detached, 0), 10);
+
+            finish_detached_cleanup(collection, detached);
+            assert_eq!((*collection).length, 1);
+            assert_eq!(read_value(collection, 0), 30);
+            free(collection);
+        }
+    }
+
+    #[test]
+    fn detached_cleanup_restores_unmodified_backing_storage() {
+        unsafe {
+            let collection = new(0, true, false, 8);
+            let mut replaced = 0;
+            keyed_set(collection, 10, 100, COMPARE_UNSIGNED_64, &mut replaced);
+            assert!(keyed_has(collection, 10, COMPARE_UNSIGNED_64));
+            let keys = (*collection).keys;
+            let values = (*collection).values;
+            let capacity = (*collection).capacity;
+
+            let detached = detach_for_cleanup(ptr::null(), collection);
+            finish_detached_cleanup(collection, detached);
+
+            assert_eq!((*collection).length, 0);
+            assert_eq!((*collection).keys, keys);
+            assert_eq!((*collection).values, values);
+            assert_eq!((*collection).capacity, capacity);
+            assert!((*collection).index.is_null());
+            assert!(!keyed_has(collection, 10, COMPARE_UNSIGNED_64));
+            free(collection);
+        }
+    }
 
     #[test]
     fn reset_retains_storage_and_discards_membership_state() {

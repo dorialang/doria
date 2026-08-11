@@ -28,7 +28,8 @@ use crate::native_abi::{
     stage26_collection_kind, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
     BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
     CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
-    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
+    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_DETACH_FOR_CLEANUP,
+    COLLECTION_FILL_STRING, COLLECTION_FILL_WORD, COLLECTION_FINISH_DETACHED_CLEANUP,
     COLLECTION_FREE, COLLECTION_INDEX_FIELD, COLLECTION_INDEX_OF, COLLECTION_INSERT_AT,
     COLLECTION_INSERT_AT_NULLABLE, COLLECTION_KEYED_GET, COLLECTION_KEYED_GET_NULLABLE,
     COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT,
@@ -3812,12 +3813,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             self.builder.position_at_end(done);
             return Ok(());
         }
+        let cleanup_collection = if action == CollectionStorageAction::Reset {
+            self.call_runtime(
+                COLLECTION_DETACH_FOR_CLEANUP,
+                &[pointer.into(), pointer.into()],
+                Some(pointer.into()),
+                &[self.current_frame.into(), collection.into()],
+            )?
+            .ok_or_else(|| backend_failure("collection cleanup detach produced no result"))?
+            .into_pointer_value()
+        } else {
+            collection
+        };
         let length = self
             .call_runtime(
                 COLLECTION_LENGTH,
                 &[pointer.into()],
                 Some(usize_type.into()),
-                &[collection.into()],
+                &[cleanup_collection.into()],
             )?
             .ok_or_else(|| backend_failure("collection length produced no result"))?
             .into_int_value();
@@ -3858,7 +3871,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 COLLECTION_VALUE_AT,
                 &[pointer.into(), pointer.into(), usize_type.into()],
                 Some(self.context.i64_type().into()),
-                &[self.current_frame.into(), collection.into(), current.into()],
+                &[
+                    self.current_frame.into(),
+                    cleanup_collection.into(),
+                    current.into(),
+                ],
             )?
             .ok_or_else(|| backend_failure("collection value read produced no result"))?
             .into_int_value();
@@ -3871,7 +3888,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     COLLECTION_KEY_AT,
                     &[pointer.into(), pointer.into(), usize_type.into()],
                     Some(self.context.i64_type().into()),
-                    &[self.current_frame.into(), collection.into(), current.into()],
+                    &[
+                        self.current_frame.into(),
+                        cleanup_collection.into(),
+                        current.into(),
+                    ],
                 )?
                 .ok_or_else(|| backend_failure("collection key read produced no result"))?
                 .into_int_value();
@@ -3881,11 +3902,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         build(self.builder.build_store(index_slot, current))?;
         build(self.builder.build_unconditional_branch(header))?;
         self.builder.position_at_end(free);
-        let symbol = match action {
-            CollectionStorageAction::Free => COLLECTION_FREE,
-            CollectionStorageAction::Reset => COLLECTION_RESET_AFTER_CLEANUP,
-        };
-        let _ = self.call_runtime(symbol, &[pointer.into()], None, &[collection.into()])?;
+        match action {
+            CollectionStorageAction::Free => {
+                let _ = self.call_runtime(
+                    COLLECTION_FREE,
+                    &[pointer.into()],
+                    None,
+                    &[cleanup_collection.into()],
+                )?;
+            }
+            CollectionStorageAction::Reset => {
+                let _ = self.call_runtime(
+                    COLLECTION_FINISH_DETACHED_CLEANUP,
+                    &[pointer.into(), pointer.into()],
+                    None,
+                    &[collection.into(), cleanup_collection.into()],
+                )?;
+            }
+        }
         build(self.builder.build_unconditional_branch(done))?;
         self.builder.position_at_end(done);
         Ok(())

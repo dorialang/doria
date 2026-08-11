@@ -20,7 +20,8 @@ use crate::native_abi::{
     stage26_collection_kind, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
     BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
     CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
-    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
+    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_DETACH_FOR_CLEANUP,
+    COLLECTION_FILL_STRING, COLLECTION_FILL_WORD, COLLECTION_FINISH_DETACHED_CLEANUP,
     COLLECTION_FREE, COLLECTION_INDEX_OF, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE,
     COLLECTION_KEYED_GET, COLLECTION_KEYED_GET_NULLABLE, COLLECTION_KEYED_HAS,
     COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT, COLLECTION_LENGTH,
@@ -4003,12 +4004,25 @@ fn lower_finish_collection_value(
         builder.switch_to_block(done);
         return Ok(());
     }
+    let cleanup_collection = if action == CollectionStorageAction::Reset {
+        runtime_call(
+            builder,
+            COLLECTION_DETACH_FOR_CLEANUP,
+            &[pointer, pointer],
+            Some(pointer),
+            &[resources.current_frame, collection],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("collection cleanup detach produced no result"))?
+    } else {
+        collection
+    };
     let length = runtime_call(
         builder,
         COLLECTION_LENGTH,
         &[pointer],
         Some(pointer),
-        &[collection],
+        &[cleanup_collection],
         resources,
     )?
     .ok_or_else(|| backend_failure("collection length produced no result"))?;
@@ -4029,7 +4043,7 @@ fn lower_finish_collection_value(
         COLLECTION_VALUE_AT,
         &[pointer, pointer, pointer],
         Some(types::I64),
-        &[resources.current_frame, collection, index],
+        &[resources.current_frame, cleanup_collection, index],
         resources,
     )?
     .ok_or_else(|| backend_failure("collection value read produced no result"))?;
@@ -4042,7 +4056,7 @@ fn lower_finish_collection_value(
             COLLECTION_KEY_AT,
             &[pointer, pointer, pointer],
             Some(types::I64),
-            &[resources.current_frame, collection, index],
+            &[resources.current_frame, cleanup_collection, index],
             resources,
         )?
         .ok_or_else(|| backend_failure("collection key read produced no result"))?;
@@ -4051,11 +4065,28 @@ fn lower_finish_collection_value(
     }
     builder.ins().jump(header, &[BlockArg::Value(index)]);
     builder.switch_to_block(free);
-    let symbol = match action {
-        CollectionStorageAction::Free => COLLECTION_FREE,
-        CollectionStorageAction::Reset => COLLECTION_RESET_AFTER_CLEANUP,
-    };
-    let _ = runtime_call(builder, symbol, &[pointer], None, &[collection], resources)?;
+    match action {
+        CollectionStorageAction::Free => {
+            let _ = runtime_call(
+                builder,
+                COLLECTION_FREE,
+                &[pointer],
+                None,
+                &[cleanup_collection],
+                resources,
+            )?;
+        }
+        CollectionStorageAction::Reset => {
+            let _ = runtime_call(
+                builder,
+                COLLECTION_FINISH_DETACHED_CLEANUP,
+                &[pointer, pointer],
+                None,
+                &[collection, cleanup_collection],
+                resources,
+            )?;
+        }
+    }
     builder.ins().jump(done, &[]);
     builder.switch_to_block(done);
     Ok(())

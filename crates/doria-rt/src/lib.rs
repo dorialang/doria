@@ -394,6 +394,39 @@ pub unsafe extern "C" fn dr_v2_collection_reset_after_cleanup(collection: *mut D
     collection::reset_after_cleanup(collection)
 }
 
+/// Detaches the current storage from a growable collection before generated
+/// type-aware drop glue invokes any user destructors.
+///
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain and
+/// `collection` must be a uniquely borrowed live growable collection. The
+/// returned snapshot must be consumed exactly once by
+/// `dr_v3_collection_finish_detached_cleanup`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_collection_detach_for_cleanup(
+    current_frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+) -> *mut DrCollectionV1 {
+    collection::detach_for_cleanup(current_frame, collection)
+}
+
+/// Finishes type-aware cleanup without disturbing entries inserted by a
+/// destructor after the collection was detached.
+///
+/// # Safety
+///
+/// `collection` must be the live collection passed to
+/// `dr_v3_collection_detach_for_cleanup`; `detached` must be that call's
+/// unconsumed result after generated drop glue released every logical entry.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_collection_finish_detached_cleanup(
+    collection: *mut DrCollectionV1,
+    detached: *mut DrCollectionV1,
+) {
+    collection::finish_detached_cleanup(collection, detached)
+}
+
 /// # Safety
 ///
 /// `collection` must point to a live collection allocation.
