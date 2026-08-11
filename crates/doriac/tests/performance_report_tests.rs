@@ -456,6 +456,54 @@ fn generic_class_fixture_reports_structural_and_class_specialization_counts() {
     let _ = fs::remove_dir_all(directory);
 }
 
+#[test]
+fn enum_fixture_reports_additive_structural_counts_without_a_schema_bump() {
+    if !host_linker_is_available() {
+        return;
+    }
+    let directory = fixture_directory("enum-structure");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    fs::write(
+        directory.join("main.doria"),
+        concat!(
+            "enum Status { case Draft; case Published; }\n",
+            "enum Priority: int { case Low = 1; case High = 10; }\n",
+            "enum Transport: string { case Rail = \"rail\"; }\n",
+            "enum Shape { case Circle(float $radius); case Rect(float $width, float $height); }\n",
+            "function main(): void {}\n",
+        ),
+    )
+    .expect("source");
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "performance.json",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(
+        output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
+            .expect("JSON");
+    assert_eq!(report["schemaVersion"], 1);
+    assert_eq!(report["metrics"]["enumCount"], 4);
+    assert_eq!(report["metrics"]["unitEnumCount"], 1);
+    assert_eq!(report["metrics"]["backedEnumCount"], 2);
+    assert_eq!(report["metrics"]["payloadEnumCount"], 1);
+    assert_eq!(report["metrics"]["enumCaseCount"], 7);
+    assert_eq!(report["metrics"]["enumPayloadFieldCount"], 3);
+    let _ = fs::remove_dir_all(directory);
+}
+
 #[cfg(feature = "llvm-backend")]
 #[test]
 fn release_report_identifies_llvm_without_cranelift_phase_data() {

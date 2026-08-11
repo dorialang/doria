@@ -63,6 +63,8 @@ impl Parser {
     fn parse_item(&mut self) -> Option<Item> {
         if self.match_kind(&TokenKind::Class) {
             self.parse_class().map(Item::Class)
+        } else if self.match_kind(&TokenKind::Enum) {
+            self.parse_enum().map(Item::Enum)
         } else if self.match_kind(&TokenKind::Interface) {
             self.parse_interface().map(Item::Interface)
         } else if self.match_kind(&TokenKind::Trait) {
@@ -77,6 +79,83 @@ impl Parser {
         } else {
             self.parse_statement().map(Item::Statement)
         }
+    }
+
+    fn parse_enum(&mut self) -> Option<EnumDecl> {
+        let start = self.previous().span.start;
+        let name = self.expect_type_declaration_name("expected enum name")?;
+        let name_span = self.previous().span;
+        let type_params = self.parse_type_params()?;
+        let backing_type = if self.match_kind(&TokenKind::Colon) {
+            Some(self.parse_type_ref()?)
+        } else {
+            None
+        };
+        self.expect(TokenKind::LeftBrace, "expected `{` after enum declaration")?;
+
+        let mut cases = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            let case_start = self.peek().span.start;
+            self.expect(TokenKind::Case, "expected `case` in enum body")?;
+            let name = self.expect_identifier("expected enum case name")?;
+            let name_span = self.previous().span;
+            let payload = if self.match_kind(&TokenKind::LeftParen) {
+                self.parse_enum_payload_fields()?
+            } else {
+                Vec::new()
+            };
+            let backing_value = if self.match_kind(&TokenKind::Equals) {
+                Some(self.parse_expression()?)
+            } else {
+                None
+            };
+            let end = self
+                .expect(TokenKind::Semicolon, "expected `;` after enum case")?
+                .span
+                .end;
+            cases.push(EnumCaseDecl {
+                name,
+                name_span,
+                payload,
+                backing_value,
+                span: Span::new(case_start, end),
+            });
+        }
+
+        let end = self
+            .expect(TokenKind::RightBrace, "expected `}` after enum body")?
+            .span
+            .end;
+        Some(EnumDecl {
+            name,
+            name_span,
+            type_params,
+            backing_type,
+            cases,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_enum_payload_fields(&mut self) -> Option<Vec<EnumPayloadField>> {
+        let mut fields = Vec::new();
+        if self.match_kind(&TokenKind::RightParen) {
+            return Some(fields);
+        }
+        loop {
+            let start = self.peek().span.start;
+            let ty = self.parse_type_ref()?;
+            let (name, name_span) = self.expect_variable("expected enum payload variable")?;
+            fields.push(EnumPayloadField {
+                ty,
+                name,
+                span: Span::new(start, name_span.end),
+            });
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RightParen, "expected `)` after enum payload")?;
+        Some(fields)
     }
 
     fn parse_class(&mut self) -> Option<ClassDecl> {
@@ -1317,6 +1396,7 @@ impl Parser {
             TokenKind::Null => Some(Expr::Null { span: token.span }),
             TokenKind::When => self.parse_unsupported_when(token.span.start, false),
             TokenKind::Given => self.parse_unsupported_when(token.span.start, true),
+            TokenKind::Match => self.parse_match_expression(token.span.start),
             TokenKind::New => self.parse_new(token.span.start, false),
             TokenKind::Shared => self.parse_shared_new(token.span.start),
             TokenKind::LeftBracket => self.parse_array(token.span.start),
@@ -1337,6 +1417,87 @@ impl Parser {
                 None
             }
         }
+    }
+
+    fn parse_match_expression(&mut self, start: usize) -> Option<Expr> {
+        self.expect(TokenKind::LeftParen, "expected `(` after `match`")?;
+        let scrutinee = self.parse_expression()?;
+        self.expect(TokenKind::RightParen, "expected `)` after match value")?;
+        self.expect(TokenKind::LeftBrace, "expected `{` before match arms")?;
+
+        let mut arms = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            let arm_start = self.peek().span.start;
+            let pattern = self.parse_match_pattern()?;
+            self.expect(TokenKind::FatArrow, "expected `=>` after match pattern")?;
+            let value = self.parse_expression()?;
+            let arm_end = value.span().end;
+            arms.push(MatchArm {
+                pattern,
+                value,
+                span: Span::new(arm_start, arm_end),
+            });
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self
+            .expect(TokenKind::RightBrace, "expected `}` after match arms")?
+            .span
+            .end;
+        Some(Expr::Match {
+            scrutinee: Box::new(scrutinee),
+            arms,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_match_pattern(&mut self) -> Option<MatchPattern> {
+        if self.match_kind(&TokenKind::Default) {
+            return Some(MatchPattern::Default {
+                span: self.previous().span,
+            });
+        }
+
+        if let TokenKind::Identifier(name) = self.peek().kind.clone() {
+            let qualifier_token = self.advance().clone();
+            if self.match_kind(&TokenKind::DoubleColon) {
+                let case_token = self.advance().clone();
+                let TokenKind::Identifier(case) = case_token.kind else {
+                    self.error("expected enum case after `::`", case_token.span);
+                    return None;
+                };
+                let mut bindings = Vec::new();
+                let mut end = case_token.span.end;
+                if self.match_kind(&TokenKind::LeftParen) {
+                    if !self.check(&TokenKind::RightParen) {
+                        loop {
+                            let (name, span) =
+                                self.expect_variable("expected payload binding variable")?;
+                            bindings.push(MatchBinding { name, span });
+                            if !self.match_kind(&TokenKind::Comma) {
+                                break;
+                            }
+                        }
+                    }
+                    end = self
+                        .expect(TokenKind::RightParen, "expected `)` after payload bindings")?
+                        .span
+                        .end;
+                }
+                return Some(MatchPattern::EnumCase {
+                    qualifier: name,
+                    qualifier_span: qualifier_token.span,
+                    case,
+                    case_span: case_token.span,
+                    bindings,
+                    span: Span::new(qualifier_token.span.start, end),
+                });
+            }
+            self.current -= 1;
+        }
+
+        self.parse_expression().map(MatchPattern::Expression)
     }
 
     fn parse_scoped_access(
@@ -1580,6 +1741,7 @@ impl Parser {
             Expr::Range { start, end, .. } => {
                 Self::contains_bare_identifier(start) || Self::contains_bare_identifier(end)
             }
+            Expr::Match { .. } => false,
             Expr::Variable { .. }
             | Expr::This { .. }
             | Expr::StaticMember { .. }
@@ -2175,6 +2337,8 @@ impl Parser {
 fn token_name(kind: &TokenKind) -> &'static str {
     match kind {
         TokenKind::Class => "class",
+        TokenKind::Enum => "enum",
+        TokenKind::Case => "case",
         TokenKind::Interface => "interface",
         TokenKind::Trait => "trait",
         TokenKind::Implements => "implements",
@@ -2198,6 +2362,8 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::As => "as",
         TokenKind::If => "if",
         TokenKind::Else => "else",
+        TokenKind::Match => "match",
+        TokenKind::Default => "default",
         TokenKind::When => "when",
         TokenKind::Given => "given",
         TokenKind::Finally => "finally",

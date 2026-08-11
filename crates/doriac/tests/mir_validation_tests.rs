@@ -1,17 +1,199 @@
 use doriac::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
+use doriac::enums::{EnumBackingType, EnumBackingValue, EnumCaseId, EnumId, EnumValue};
 use doriac::format_string::{FormatConversion, FormatPiece, FormatSpec};
 use doriac::mir::{
     BasicBlock, BlockId, BoolExpression, Class, ClassExpression, CollectionComparator,
     CollectionExpression, CollectionKind, CollectionMembershipOp, CollectionType, CollectionTypeId,
-    FloatBinaryOp, FloatExpression, FormatArgument, FormatExpression, Function, FunctionId,
-    IntegerExpression, Local, LocalId, NullableClassExpression, NullableScalarExpression,
-    NullableSharedReferenceExpression, NullableStringExpression, Operand, Program, Property,
-    PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType, ScalarValue,
-    SharedReferenceExpression, Statement, StaticId, StaticProperty, StaticValue, StringExpression,
-    StringIntrinsicCall, StringIntrinsicKind, Terminator, Type, ValueExpression,
+    EnumExpression, FloatBinaryOp, FloatExpression, FormatArgument, FormatExpression, Function,
+    FunctionId, IntegerExpression, Local, LocalId, MixedExpression, NullableClassExpression,
+    NullableScalarExpression, NullableSharedReferenceExpression, NullableStringExpression, Operand,
+    Program, Property, PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType,
+    ScalarValue, SharedReferenceExpression, Statement, StaticId, StaticProperty, StaticValue,
+    StringExpression, StringIntrinsicCall, StringIntrinsicKind, Terminator, Type, ValueExpression,
     WeakReferenceExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
+
+#[test]
+fn shared_validator_rejects_malformed_enum_identity_and_projection_shapes() {
+    let source = r#"
+enum Status { case Draft; case Published; }
+enum Other { case Draft; }
+enum Priority: int { case Low = 1; case High = 10; }
+enum Label: string { case Short = "short"; case Long = "long"; }
+enum Payload { case Value(int $value); }
+function main(): void
+{
+    Status $status = Status::Draft;
+    Other $other = Other::Draft;
+    bool $same = $status == Status::Draft;
+    ?Status $nullable = Status::Draft;
+    mixed $boxed = Status::Draft;
+    int $priority = Priority::High->value;
+    string $label = Label::Long->value;
+    ?Priority $nullablePriority = Priority::High;
+    ?int $nullablePriorityValue = $nullablePriority?->value;
+    ?Label $nullableLabel = Label::Long;
+    ?string $nullableLabelValue = $nullableLabel?->value;
+}
+"#;
+    let valid = doriac::lower_source_to_mir("enum-validation.doria", source)
+        .expect("valid enum source should lower");
+    doriac::mir_validation::validate_program(&valid).expect("valid enum MIR should validate");
+
+    let malformed = |program: &Program, expected: &str| {
+        let error = doriac::mir_validation::validate_program(program)
+            .expect_err("malformed enum MIR must stop before backend emission");
+        assert!(
+            error.message.contains(expected),
+            "expected {expected:?}, got {:?}",
+            error.message
+        );
+    };
+
+    let mut unknown_enum = valid.clone();
+    let value = enum_case_assignment(&mut unknown_enum, "status");
+    value.enum_id = EnumId(99);
+    value.case_id.enum_id = EnumId(99);
+    malformed(&unknown_enum, "enum#99");
+
+    let mut unknown_case = valid.clone();
+    enum_case_assignment(&mut unknown_case, "status")
+        .case_id
+        .index = 99;
+    malformed(&unknown_case, "enum case does not exist");
+
+    let mut wrong_enum = valid.clone();
+    enum_case_assignment(&mut wrong_enum, "status").case_id = EnumCaseId {
+        enum_id: EnumId(1),
+        index: 0,
+    };
+    malformed(&wrong_enum, "enum case identity names another enum");
+
+    let mut payload_case = valid.clone();
+    payload_case.enums[0].cases[0]
+        .payload
+        .push(doriac::mir::EnumPayloadDefinition {
+            name: "value".to_string(),
+            ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+        });
+    malformed(&payload_case, "constructs a payload case");
+
+    let mut backing_on_unit = valid.clone();
+    *assignment_rvalue(&mut backing_on_unit, "priority") =
+        Rvalue::Value(ValueExpression::Integer(IntegerExpression::EnumBacking {
+            enum_id: EnumId(0),
+            value: Box::new(EnumExpression::Case(EnumValue {
+                enum_id: EnumId(0),
+                case_id: EnumCaseId {
+                    enum_id: EnumId(0),
+                    index: 0,
+                },
+            })),
+        }));
+    malformed(&backing_on_unit, "non-int-backed enum");
+
+    let mut wrong_backing_result = valid.clone();
+    wrong_backing_result.enums[2].backing_type = Some(EnumBackingType::String);
+    for (index, case) in wrong_backing_result.enums[2].cases.iter_mut().enumerate() {
+        case.backing_value = Some(EnumBackingValue::String(format!("value{index}")));
+    }
+    malformed(&wrong_backing_result, "non-int-backed enum");
+
+    let mut wrong_nullable_integer_backing = valid.clone();
+    let Rvalue::NullableScalar(NullableScalarExpression::EnumBacking { enum_id, .. }) =
+        assignment_rvalue(&mut wrong_nullable_integer_backing, "nullablePriorityValue")
+    else {
+        panic!("expected nullable integer enum backing projection");
+    };
+    *enum_id = EnumId(3);
+    malformed(&wrong_nullable_integer_backing, "non-int-backed enum");
+
+    let mut wrong_nullable_string_backing = valid.clone();
+    let Rvalue::NullableString(NullableStringExpression::EnumBacking { enum_id, .. }) =
+        assignment_rvalue(&mut wrong_nullable_string_backing, "nullableLabelValue")
+    else {
+        panic!("expected nullable string enum backing projection");
+    };
+    *enum_id = EnumId(2);
+    malformed(&wrong_nullable_string_backing, "non-string-backed enum");
+
+    let mut different_equality = valid.clone();
+    let Rvalue::Value(ValueExpression::Bool(BoolExpression::Compare { right, .. })) =
+        assignment_rvalue(&mut different_equality, "same")
+    else {
+        panic!("expected enum equality assignment");
+    };
+    **right = ValueExpression::Enum(EnumExpression::Case(EnumValue {
+        enum_id: EnumId(1),
+        case_id: EnumCaseId {
+            enum_id: EnumId(1),
+            index: 0,
+        },
+    }));
+    malformed(
+        &different_equality,
+        "comparison has enum#0 and enum#1 operands",
+    );
+
+    let mut nullable_payload = valid.clone();
+    let Rvalue::NullableScalar(NullableScalarExpression::Value(ValueExpression::Enum(
+        EnumExpression::Case(value),
+    ))) = assignment_rvalue(&mut nullable_payload, "nullable")
+    else {
+        panic!("expected nullable enum assignment");
+    };
+    *value = EnumValue {
+        enum_id: EnumId(1),
+        case_id: EnumCaseId {
+            enum_id: EnumId(1),
+            index: 0,
+        },
+    };
+    malformed(
+        &nullable_payload,
+        "nullable local local3 receives a mismatched rvalue",
+    );
+
+    let mut mixed_identity = valid;
+    let Rvalue::Mixed(MixedExpression::BoxValue(ValueExpression::Enum(EnumExpression::Case(
+        value,
+    )))) = assignment_rvalue(&mut mixed_identity, "boxed")
+    else {
+        panic!("expected mixed enum box");
+    };
+    value.enum_id = EnumId(99);
+    value.case_id.enum_id = EnumId(99);
+    malformed(&mixed_identity, "enum#99");
+}
+
+fn assignment_rvalue<'a>(program: &'a mut Program, local_name: &str) -> &'a mut Rvalue {
+    let function = &mut program.functions[program.entry.0];
+    let local = function
+        .locals
+        .iter()
+        .find(|local| local.name == local_name)
+        .map(|local| local.id)
+        .unwrap_or_else(|| panic!("missing local {local_name}"));
+    function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::AssignLocal { target, value } if *target == local => Some(value),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing assignment for local {local_name}"))
+}
+
+fn enum_case_assignment<'a>(program: &'a mut Program, local_name: &str) -> &'a mut EnumValue {
+    let Rvalue::Value(ValueExpression::Enum(EnumExpression::Case(value))) =
+        assignment_rvalue(program, local_name)
+    else {
+        panic!("expected enum case assignment for {local_name}");
+    };
+    value
+}
 
 #[test]
 fn shared_validator_rejects_malformed_collection_clear_shapes() {
@@ -3875,6 +4057,7 @@ fn display_spec() -> FormatSpec {
 
 fn valid_void_program() -> Program {
     Program {
+        enums: Vec::new(),
         source: doriac::source::SourceFile::new("<test>", ""),
         classes: vec![],
         collection_types: vec![],

@@ -22,6 +22,12 @@ nullable endpoint paths, and registers
 adds backend-neutral in-place collection clearing and registers
 `main_collection_clear.doria`; no Decision 0113 member remains behind E0559.
 
+Stage 27 Slice 1 adds nominal unit and backed enum MIR and registers
+`main_unit_enums.doria`, `main_backed_enums.doria`, `main_nullable_enums.doria`,
+`main_enum_mixed.doria`, and `main_enum_constants_and_defaults.doria`. The
+three execution paths compare exact output and preserve enum identity through
+nullable values, `mixed`, constants, defaults, properties, and collection values.
+
 | Feature / example | MIR interpreter | Cranelift fast | LLVM release | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
 | `main(): int` literal return | Covered | Covered | Covered | Covered | All three produce the same explicit status. |
@@ -55,6 +61,10 @@ adds backend-neutral in-place collection clearing and registers
 | Standalone lexical blocks | Covered | Covered | Covered | Covered | Nested scopes and shared-access boundaries clean up on fallthrough and every structured exit; panic remains abort-only. |
 | Traditional `for` | Covered | Covered | Covered | Covered | `continue` reaches the increment block. |
 | Grouped local declarations | Covered | Covered | Covered | Covered | One canonical MIR initializer evaluates once; ordered independent Copy bindings, string retains, and typed nullable-move `null` agree exactly. |
+| Stage 27 unit enums | Covered | Covered | Covered | Covered | Nominal inline case tags construct, copy, compare, return, pass, and occupy supported value positions without an enum allocation API. |
+| Stage 27 backed enums | Covered | Covered | Covered | Covered | `int` and static-string backing projections agree exactly while runtime equality remains case identity. |
+| Stage 27 nullable enums | Covered | Covered | Covered | Covered | Presence is separate from tag zero across locals, parameters, returns, coalescing, and narrowing. |
+| Stage 27 enum `mixed` identity | Covered | Covered | Covered | Covered | Boxes retain both the enum mixed tag and exact enum type ID; a different enum never narrows merely because its case tag matches. |
 | Integer range `foreach` | Covered | Covered | Covered | Covered | Inclusive/exclusive ranges and terminal overflow guards are covered. |
 | Top-level integer helpers | Covered | Covered | Covered | Covered | Parameters and returns preserve every declared width and signedness. |
 | Void helper calls | Covered | Covered | Covered | Covered | Shared stdout preserves source call order. |
@@ -167,6 +177,6 @@ front-to-back iteration across the interpreter, Cranelift, and LLVM. The Stage
 independent writable bindings, shared immutable strings, and nullable empty
 move bindings across the same three execution paths.
 
-Status: Passed through Stage 22 after this branch's full validation gates pass.
+Status: Passed through Stage 27 Slice 1 after this branch's full validation gates pass.
 
 All accepted native scalar, string, interpolation, checked-format, text-I/O, ownership, native-class, method, static, constant, concrete-display, nullable, collection, `Bytes`, boxed-`mixed`, monomorphized generic, and Stage 25a shared-ownership lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; Linux CI memory-checks the ownership-bearing native fixtures, including readonly collision projection, writable shared class, all writable payload domains, weak-cycle breaking, bounded stress, access lifetime, and stored-access paths; and the Stage 7-10 native smoke module remains retired and deleted. Stage 21 ordinary borrowing and constructor definite initialization and Stage 22 narrowing use the same backend-independent control-flow/dataflow foundation. Stage 24 specializes reachable free functions and instance/static methods once per concrete generic-argument set before any backend consumes the program. Stage 25 specializes generic classes. Stage 25a Slices 1 through 4 provide the two distinct non-atomic control models, per-allocation writable access state, owned access objects, collision projection, exact conflict reasons, and complete parity/tooling closure.

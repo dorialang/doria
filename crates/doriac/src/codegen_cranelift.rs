@@ -33,19 +33,19 @@ use crate::native_abi::{
     COLLECTION_STAGE26_NEW, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
     FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
     MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
-    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
-    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
-    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
-    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE,
-    SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK,
-    SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
-    STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
-    STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
-    STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
-    STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY,
-    STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER,
-    STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT,
-    STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
+    MIXED_TAG_CLASS, MIXED_TAG_ENUM, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16,
+    MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16,
+    MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL,
+    PROCESS_EXIT, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED,
+    SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE,
+    SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT,
+    STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA,
+    STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL,
+    STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
+    STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE,
+    STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE,
+    STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE,
+    STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
     STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
     STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
     WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
@@ -253,6 +253,7 @@ fn clif_scalar_type(ty: mir::ScalarType) -> ClifType {
         mir::ScalarType::Float(FloatType::Float32) => types::F32,
         mir::ScalarType::Float(FloatType::Float64) => types::F64,
         mir::ScalarType::Bool => types::I8,
+        mir::ScalarType::Enum(_) => types::I32,
     }
 }
 
@@ -404,6 +405,7 @@ fn scalar_storage_bytes(ty: mir::ScalarType) -> u32 {
         mir::ScalarType::Integer(ty) => ty.storage_bytes(),
         mir::ScalarType::Float(ty) => ty.storage_bytes(),
         mir::ScalarType::Bool => 1,
+        mir::ScalarType::Enum(_) => 4,
     }
 }
 
@@ -510,6 +512,7 @@ fn scalar_data_bytes(value: mir::ScalarValue) -> Vec<u8> {
             FloatType::Float64 => value.bits.to_ne_bytes().to_vec(),
         },
         mir::ScalarValue::Bool(value) => vec![u8::from(value)],
+        mir::ScalarValue::Enum(value) => (value.case_id.index as u32).to_ne_bytes().to_vec(),
     }
 }
 
@@ -872,6 +875,7 @@ fn initialize_locals(
                 builder.ins().f64const(Ieee64::with_bits(0))
             }
             mir::Type::Scalar(mir::ScalarType::Bool) => builder.ins().iconst(types::I8, 0),
+            mir::Type::Scalar(mir::ScalarType::Enum(_)) => builder.ins().iconst(types::I32, 0),
             mir::Type::String
             | mir::Type::Mixed
             | mir::Type::Class(_)
@@ -2185,6 +2189,39 @@ fn lower_value_expression(
         mir::ValueExpression::Integer(value) => lower_integer_expression(builder, value, resources),
         mir::ValueExpression::Float(value) => lower_float_expression(builder, value, resources),
         mir::ValueExpression::Bool(value) => lower_condition_value(builder, value, resources),
+        mir::ValueExpression::Enum(value) => lower_enum_expression(builder, value, resources),
+    }
+}
+
+fn lower_enum_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::EnumExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    match expression {
+        mir::EnumExpression::Case(value) => {
+            Ok(builder.ins().iconst(types::I32, value.case_id.index as i64))
+        }
+        mir::EnumExpression::Use { enum_id, operand } => {
+            lower_enum_operand(builder, *enum_id, operand, resources)
+        }
+        mir::EnumExpression::Call { function, args, .. } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("enum call produced no result"))?
+                .single()
+        }
+        mir::EnumExpression::Coalesce { left, right, .. } => {
+            let left = lower_nullable_scalar_expression(builder, left, resources)?;
+            let (present, payload) = left.nullable()?;
+            lower_coalesce_value(
+                builder,
+                present,
+                payload,
+                types::I32,
+                resources,
+                |builder, resources| lower_enum_expression(builder, right, resources),
+            )
+        }
     }
 }
 
@@ -2412,6 +2449,7 @@ fn collection_word_to_value(
             }
         }
         mir::Type::Scalar(mir::ScalarType::Bool) => builder.ins().ireduce(types::I8, word),
+        mir::Type::Scalar(mir::ScalarType::Enum(_)) => builder.ins().ireduce(types::I32, word),
         mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)) => {
             let bits = builder.ins().ireduce(types::I32, word);
             builder.ins().bitcast(types::F32, MemFlagsData::new(), bits)
@@ -6467,6 +6505,7 @@ fn mixed_tag_value(tag: mir::MixedTag) -> (u8, u32) {
         mir::MixedTag::Float(FloatType::Float64) => (MIXED_TAG_FLOAT64, 0),
         mir::MixedTag::String => (MIXED_TAG_STRING, 0),
         mir::MixedTag::Class(class) => (MIXED_TAG_CLASS, class.0 as u32),
+        mir::MixedTag::Enum(enum_id) => (MIXED_TAG_ENUM, enum_id.0 as u32),
     }
 }
 
@@ -6531,6 +6570,7 @@ fn lower_mixed_expression(
                 mir::ScalarType::Bool => mir::MixedTag::Bool,
                 mir::ScalarType::Integer(ty) => mir::MixedTag::Integer(ty),
                 mir::ScalarType::Float(ty) => mir::MixedTag::Float(ty),
+                mir::ScalarType::Enum(enum_id) => mir::MixedTag::Enum(enum_id),
             };
             let payload = lower_value_expression(builder, value, resources)?;
             lower_mixed_box(builder, tag, payload, false, resources)
@@ -6768,7 +6808,7 @@ fn lower_mixed_is(
     let (expected_tag, expected_type_id) = mixed_tag_value(tag);
     let expected_tag = builder.ins().iconst(types::I8, i64::from(expected_tag));
     let tag_matches = builder.ins().icmp(IntCC::Equal, actual_tag, expected_tag);
-    let result = if matches!(tag, mir::MixedTag::Class(_)) {
+    let result = if matches!(tag, mir::MixedTag::Class(_) | mir::MixedTag::Enum(_)) {
         let actual_type_id = runtime_call(
             builder,
             MIXED_TYPE_ID,
@@ -6907,6 +6947,11 @@ fn lower_string_expression(
                 mir::ScalarType::Float(FloatType::Float32) => (STRING_FROM_F32, types::F32, scalar),
                 mir::ScalarType::Float(FloatType::Float64) => (STRING_FROM_F64, types::F64, scalar),
                 mir::ScalarType::Bool => (STRING_FROM_BOOL, types::I8, scalar),
+                mir::ScalarType::Enum(_) => {
+                    return Err(malformed_mir(
+                        "enum display requires an explicit projection",
+                    ));
+                }
             };
             runtime_call(
                 builder,
@@ -6984,7 +7029,66 @@ fn lower_string_expression(
             )?;
             retain_string(builder, value, resources)
         }
+        mir::StringExpression::EnumBacking { enum_id, value } => {
+            lower_string_enum_backing(builder, *enum_id, value, resources)
+        }
     }
+}
+
+fn lower_string_enum_backing(
+    builder: &mut FunctionBuilder,
+    enum_id: crate::enums::EnumId,
+    value: &mir::EnumExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let tag = lower_enum_expression(builder, value, resources)?;
+    lower_string_enum_backing_from_tag(builder, enum_id, tag, resources)
+}
+
+fn lower_string_enum_backing_from_tag(
+    builder: &mut FunctionBuilder,
+    enum_id: crate::enums::EnumId,
+    tag: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let cases = enum_definition(resources.program, enum_id)?
+        .cases
+        .iter()
+        .map(|case| match case.backing_value.as_ref() {
+            Some(crate::enums::EnumBackingValue::String(value)) => Ok((case.tag, value.clone())),
+            _ => Err(malformed_mir("string-backed enum case has no string value")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let pointer = resources.module.target_config().pointer_type();
+    let done = builder.create_block();
+    builder.append_block_param(done, pointer);
+    let mut cases = cases.into_iter().peekable();
+    while let Some((case_tag, backing)) = cases.next() {
+        if cases.peek().is_some() {
+            let selected = builder.create_block();
+            let next = builder.create_block();
+            let expected = builder.ins().iconst(types::I32, i64::from(case_tag));
+            let matches = builder.ins().icmp(IntCC::Equal, tag, expected);
+            builder.ins().brif(matches, selected, &[], next, &[]);
+            builder.switch_to_block(selected);
+            let result = lower_string_expression(
+                builder,
+                &mir::StringExpression::Literal(backing),
+                resources,
+            )?;
+            builder.ins().jump(done, &[result.into()]);
+            builder.switch_to_block(next);
+        } else {
+            let result = lower_string_expression(
+                builder,
+                &mir::StringExpression::Literal(backing),
+                resources,
+            )?;
+            builder.ins().jump(done, &[result.into()]);
+        }
+    }
+    builder.switch_to_block(done);
+    Ok(builder.block_params(done)[0])
 }
 
 fn lower_nullable_string_expression(
@@ -7060,6 +7164,18 @@ fn lower_nullable_string_expression(
         mir::NullableStringExpression::Call { function, args } => {
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("nullable-string call produced no result"))
+        }
+        mir::NullableStringExpression::EnumBacking { enum_id, value } => {
+            let value = lower_nullable_scalar_expression(builder, value, resources)?;
+            lower_nullable_value_map(
+                builder,
+                value,
+                pointer,
+                resources,
+                |builder, tag, resources| {
+                    lower_string_enum_backing_from_tag(builder, *enum_id, tag, resources)
+                },
+            )
         }
         mir::NullableStringExpression::NullSafeProperty { object, property } => {
             let owned_receiver = object.owned_temporary_class();
@@ -7192,6 +7308,18 @@ fn lower_nullable_scalar_expression(
             lower_function_call(builder, *function, args, resources)?
                 .ok_or_else(|| malformed_mir("nullable-scalar call produced no result"))
         }
+        mir::NullableScalarExpression::EnumBacking { enum_id, value } => {
+            let value = lower_nullable_scalar_expression(builder, value, resources)?;
+            lower_nullable_value_map(
+                builder,
+                value,
+                types::I64,
+                resources,
+                |builder, tag, resources| {
+                    lower_integer_enum_backing_from_tag(builder, *enum_id, tag, resources)
+                },
+            )
+        }
         mir::NullableScalarExpression::NullSafeProperty {
             object, property, ..
         } => {
@@ -7314,7 +7442,7 @@ fn lower_nullable_scalar_expression(
             let symbol = match ty {
                 mir::ScalarType::Integer(_) => INT_PARSE,
                 mir::ScalarType::Float(_) => FLOAT_PARSE,
-                mir::ScalarType::Bool => {
+                mir::ScalarType::Bool | mir::ScalarType::Enum(_) => {
                     return Err(malformed_mir("parse does not produce a bool value"));
                 }
             };
@@ -7342,6 +7470,58 @@ fn scalar_zero(builder: &mut FunctionBuilder, ty: mir::ScalarType) -> Value {
         mir::ScalarType::Float(FloatType::Float32) => builder.ins().f32const(Ieee32::with_bits(0)),
         mir::ScalarType::Float(FloatType::Float64) => builder.ins().f64const(Ieee64::with_bits(0)),
         mir::ScalarType::Bool => builder.ins().iconst(types::I8, 0),
+        mir::ScalarType::Enum(_) => builder.ins().iconst(types::I32, 0),
+    }
+}
+
+fn lower_nullable_value_map(
+    builder: &mut FunctionBuilder,
+    value: LoweredValue,
+    payload_type: ClifType,
+    resources: &mut LoweringResources<'_, '_>,
+    present_value: impl FnOnce(
+        &mut FunctionBuilder,
+        Value,
+        &mut LoweringResources<'_, '_>,
+    ) -> Result<Value, BackendError>,
+) -> Result<LoweredValue, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let (present, source_payload) = value.nullable()?;
+    let zero = builder.ins().iconst(pointer, 0);
+    let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+    let some = builder.create_block();
+    let none = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, pointer);
+    builder.append_block_param(done, payload_type);
+    builder.ins().brif(is_present, some, &[], none, &[]);
+    builder.switch_to_block(some);
+    let payload = present_value(builder, source_payload, resources)?;
+    let present = builder.ins().iconst(pointer, 1);
+    builder
+        .ins()
+        .jump(done, &[BlockArg::Value(present), BlockArg::Value(payload)]);
+    builder.switch_to_block(none);
+    let absent = builder.ins().iconst(pointer, 0);
+    let payload = clif_zero(builder, payload_type);
+    builder
+        .ins()
+        .jump(done, &[BlockArg::Value(absent), BlockArg::Value(payload)]);
+    builder.switch_to_block(done);
+    let params = builder.block_params(done);
+    Ok(LoweredValue::Nullable {
+        present: params[0],
+        payload: params[1],
+    })
+}
+
+fn clif_zero(builder: &mut FunctionBuilder, ty: ClifType) -> Value {
+    if ty == types::F32 {
+        builder.ins().f32const(Ieee32::with_bits(0))
+    } else if ty == types::F64 {
+        builder.ins().f64const(Ieee64::with_bits(0))
+    } else {
+        builder.ins().iconst(ty, 0)
     }
 }
 
@@ -7380,15 +7560,7 @@ fn lower_null_safe_nullable(
         .jump(done, &[BlockArg::Value(present), BlockArg::Value(payload)]);
     builder.switch_to_block(none);
     let absent = builder.ins().iconst(pointer, 0);
-    let payload = if payload_type.is_float() {
-        if payload_type == types::F32 {
-            builder.ins().f32const(Ieee32::with_bits(0))
-        } else {
-            builder.ins().f64const(Ieee64::with_bits(0))
-        }
-    } else {
-        builder.ins().iconst(payload_type, 0)
-    };
+    let payload = clif_zero(builder, payload_type);
     builder
         .ins()
         .jump(done, &[BlockArg::Value(absent), BlockArg::Value(payload)]);
@@ -7704,7 +7876,39 @@ fn lower_integer_expression(
                 |builder, resources| lower_integer_expression(builder, right, resources),
             )
         }
+        mir::IntegerExpression::EnumBacking { enum_id, value } => {
+            let tag = lower_enum_expression(builder, value, resources)?;
+            lower_integer_enum_backing_from_tag(builder, *enum_id, tag, resources)
+        }
     }
+}
+
+fn lower_integer_enum_backing_from_tag(
+    builder: &mut FunctionBuilder,
+    enum_id: crate::enums::EnumId,
+    tag: Value,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let values = enum_definition(resources.program, enum_id)?
+        .cases
+        .iter()
+        .map(|case| match case.backing_value.as_ref() {
+            Some(crate::enums::EnumBackingValue::Int(value)) => Ok((case.tag, *value)),
+            _ => Err(malformed_mir("int-backed enum case has no integer value")),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut values = values.into_iter();
+    let (_first_tag, first) = values
+        .next()
+        .ok_or_else(|| malformed_mir("enum has no cases"))?;
+    let mut result = integer_constant(builder, first);
+    for (case_tag, backing) in values {
+        let expected = builder.ins().iconst(types::I32, i64::from(case_tag));
+        let selected = builder.ins().icmp(IntCC::Equal, tag, expected);
+        let backing = integer_constant(builder, backing);
+        result = builder.ins().select(selected, backing, result);
+    }
+    Ok(result)
 }
 
 fn lower_integer_unary(
@@ -9153,6 +9357,7 @@ fn lower_condition_to_branch(
                     builder.ins().fcmp(float_compare_code(*op), left, right)
                 }
                 mir::ScalarType::Bool => builder.ins().icmp(bool_compare_code(*op), left, right),
+                mir::ScalarType::Enum(_) => builder.ins().icmp(bool_compare_code(*op), left, right),
             };
             builder.ins().brif(value, then_block, &[], else_block, &[]);
         }
@@ -9742,6 +9947,83 @@ fn lower_bool_operand(
     }
 }
 
+fn lower_enum_operand(
+    builder: &mut FunctionBuilder,
+    enum_id: crate::enums::EnumId,
+    operand: &mir::Operand,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let expected = mir::Type::Scalar(mir::ScalarType::Enum(enum_id));
+    match operand {
+        mir::Operand::Scalar(mir::ScalarValue::Enum(value)) if value.enum_id == enum_id => {
+            Ok(builder.ins().iconst(types::I32, value.case_id.index as i64))
+        }
+        mir::Operand::Local(id) => {
+            let definition = local_definition(resources.program, resources.function_id, *id)?;
+            if definition.ty != expected {
+                return Err(malformed_mir(
+                    "enum expression reads a local of another type",
+                ));
+            }
+            let pointer = resources.module.target_config().pointer_type();
+            Ok(builder.ins().stack_load(
+                pointer,
+                types::I32,
+                local_slot(resources.local_slots, *id)?,
+                0,
+            ))
+        }
+        mir::Operand::NullablePayload(id) => {
+            let definition = local_definition(resources.program, resources.function_id, *id)?;
+            if definition.ty != mir::Type::NullableScalar(mir::ScalarType::Enum(enum_id)) {
+                return Err(malformed_mir(
+                    "enum expression reads a nullable local of another type",
+                ));
+            }
+            let pointer = resources.module.target_config().pointer_type();
+            Ok(builder.ins().stack_load(
+                pointer,
+                types::I32,
+                local_slot(resources.local_slots, *id)?,
+                pointer.bytes() as i32,
+            ))
+        }
+        mir::Operand::Static(id) => {
+            let address = lower_static_address(builder, *id, resources)?;
+            Ok(builder.ins().load(
+                types::I32,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            ))
+        }
+        mir::Operand::Property { object, property } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(builder.ins().load(
+                types::I32,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            ))
+        }
+        mir::Operand::CollectionIndex {
+            positional,
+            collection,
+            index,
+            remove,
+        } => lower_collection_index(builder, *collection, index, *remove, *positional, resources),
+        mir::Operand::CollectionKeyAt { collection, offset } => {
+            lower_collection_key_at(builder, *collection, offset, expected, resources)
+        }
+        mir::Operand::MixedPayload { mixed, tag } => {
+            lower_mixed_payload(builder, *mixed, *tag, resources)
+        }
+        _ => Err(malformed_mir(
+            "enum expression contains another scalar type",
+        )),
+    }
+}
+
 #[allow(dead_code)]
 fn resolve_string_locals(
     function: &mir::Function,
@@ -9850,6 +10132,7 @@ fn resolve_string_expression_from_definitions(
             Ok(value)
         }
         mir::StringExpression::Intrinsic(_)
+        | mir::StringExpression::EnumBacking { .. }
         | mir::StringExpression::Display(_)
         | mir::StringExpression::Call { .. }
         | mir::StringExpression::ReadFile { .. }
@@ -9895,6 +10178,7 @@ fn resolve_string_expression(
             Ok(value)
         }
         mir::StringExpression::Intrinsic(_)
+        | mir::StringExpression::EnumBacking { .. }
         | mir::StringExpression::Display(_)
         | mir::StringExpression::Call { .. }
         | mir::StringExpression::ReadFile { .. }
@@ -10049,6 +10333,17 @@ fn class_definition(
         .get(class.0)
         .filter(|definition| definition.id == class)
         .ok_or_else(|| malformed_mir(format!("class#{} does not exist", class.0)))
+}
+
+fn enum_definition(
+    program: &mir::Program,
+    enum_id: crate::enums::EnumId,
+) -> Result<&mir::EnumDefinition, BackendError> {
+    program
+        .enums
+        .get(enum_id.0)
+        .filter(|definition| definition.id == enum_id)
+        .ok_or_else(|| malformed_mir(format!("enum#{} does not exist", enum_id.0)))
 }
 
 fn property_definition(

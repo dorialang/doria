@@ -57,6 +57,7 @@ pub fn lower_program_with_semantics(
 fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
     match item {
         ast::Item::Class(class_decl) => Ok(hir::Item::Class(lower_class(class_decl))),
+        ast::Item::Enum(enum_decl) => Ok(hir::Item::Enum(lower_enum(enum_decl))),
         ast::Item::Interface(interface_decl) => Err(
             crate::semantics::interface_declaration_diagnostic(interface_decl),
         ),
@@ -66,6 +67,43 @@ fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
         ast::Item::Function(function) => Ok(hir::Item::Function(lower_function(function, None))),
         ast::Item::Constant(constant) => Ok(hir::Item::Constant(lower_constant(constant, None))),
         ast::Item::Statement(statement) => Ok(hir::Item::Statement(lower_stmt(statement, None))),
+    }
+}
+
+fn lower_enum(enum_decl: &ast::EnumDecl) -> hir::EnumDecl {
+    hir::EnumDecl {
+        name: enum_decl.name.clone(),
+        type_params: enum_decl
+            .type_params
+            .iter()
+            .map(|param| lower_type_param(param, None))
+            .collect(),
+        backing_type: enum_decl
+            .backing_type
+            .as_ref()
+            .map(|ty| lower_type_ref(ty, None)),
+        cases: enum_decl
+            .cases
+            .iter()
+            .map(|case| hir::EnumCaseDecl {
+                name: case.name.clone(),
+                payload: case
+                    .payload
+                    .iter()
+                    .map(|field| hir::EnumPayloadField {
+                        ty: lower_type_ref(&field.ty, None),
+                        name: field.name.clone(),
+                        span: field.span,
+                    })
+                    .collect(),
+                backing_value: case
+                    .backing_value
+                    .as_ref()
+                    .map(|value| lower_expr(value, None)),
+                span: case.span,
+            })
+            .collect(),
+        span: enum_decl.span,
     }
 }
 
@@ -555,6 +593,22 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
             start: Box::new(lower_expr(start, class_name)),
             end: Box::new(lower_expr(end, class_name)),
             inclusive: *inclusive,
+            span: *span,
+        },
+        ast::Expr::Match {
+            scrutinee,
+            arms,
+            span,
+        } => hir::Expr::Match {
+            scrutinee: Box::new(lower_expr(scrutinee, class_name)),
+            arms: arms
+                .iter()
+                .map(|arm| hir::MatchArm {
+                    pattern: arm.pattern.clone(),
+                    value: lower_expr(&arm.value, class_name),
+                    span: arm.span,
+                })
+                .collect(),
             span: *span,
         },
     }

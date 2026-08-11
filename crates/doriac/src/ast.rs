@@ -16,11 +16,38 @@ pub struct NamespaceDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Class(ClassDecl),
+    Enum(EnumDecl),
     Interface(InterfaceDecl),
     Trait(TraitDecl),
     Function(FunctionDecl),
     Constant(ConstDecl),
     Statement(Stmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub type_params: Vec<TypeParamDecl>,
+    pub backing_type: Option<TypeRef>,
+    pub cases: Vec<EnumCaseDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumCaseDecl {
+    pub name: String,
+    pub name_span: Span,
+    pub payload: Vec<EnumPayloadField>,
+    pub backing_value: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumPayloadField {
+    pub ty: TypeRef,
+    pub name: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -412,6 +439,40 @@ pub enum Expr {
         inclusive: bool,
         span: Span,
     },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: MatchPattern,
+    pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MatchPattern {
+    Default {
+        span: Span,
+    },
+    EnumCase {
+        qualifier: String,
+        qualifier_span: Span,
+        case: String,
+        case_span: Span,
+        bindings: Vec<MatchBinding>,
+        span: Span,
+    },
+    Expression(Expr),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchBinding {
+    pub name: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,7 +552,8 @@ impl Expr {
             | Expr::Grouped { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
-            | Expr::Range { span, .. } => *span,
+            | Expr::Range { span, .. }
+            | Expr::Match { span, .. } => *span,
         }
     }
 }

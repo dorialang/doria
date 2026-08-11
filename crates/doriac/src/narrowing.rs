@@ -230,7 +230,11 @@ impl NullabilityCatalog {
                         }
                     }
                 }
-                Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+                Item::Enum(_)
+                | Item::Interface(_)
+                | Item::Trait(_)
+                | Item::Constant(_)
+                | Item::Statement(_) => {}
             }
         }
         catalog
@@ -394,7 +398,11 @@ impl MutationCatalog {
                         }
                     }
                 }
-                Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+                Item::Enum(_)
+                | Item::Interface(_)
+                | Item::Trait(_)
+                | Item::Constant(_)
+                | Item::Statement(_) => {}
             }
         }
         catalog
@@ -531,7 +539,11 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
                     }
                 }
             }
-            Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+            Item::Enum(_)
+            | Item::Interface(_)
+            | Item::Trait(_)
+            | Item::Constant(_)
+            | Item::Statement(_) => {}
         }
     }
     facts
@@ -1035,6 +1047,7 @@ fn kill_mutated_call_arguments(
         | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Null { .. }
+        | Expr::Match { .. }
         | Expr::StaticMember { .. } => {}
     }
 }
@@ -1153,6 +1166,7 @@ fn expression_fact(
         | Expr::This { .. }
         | Expr::Unary { .. }
         | Expr::IsType { .. } => Some(Fact::NonNull),
+        Expr::Match { .. } => None,
         Expr::Variable { .. } => variable_binding(value, resolution).and_then(|binding| {
             state.facts.get(&binding).cloned().or_else(|| {
                 resolution
@@ -1528,6 +1542,7 @@ fn collect_expr(
         | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Null { .. }
+        | Expr::Match { .. }
         | Expr::StaticMember { .. }
         | Expr::Variable { .. } => state.clone(),
     }
@@ -1900,6 +1915,7 @@ impl Resolver {
             | Expr::Float { .. }
             | Expr::Bool { .. }
             | Expr::Null { .. }
+            | Expr::Match { .. }
             | Expr::StaticMember { .. }
             | Expr::Variable { .. } => {}
         }

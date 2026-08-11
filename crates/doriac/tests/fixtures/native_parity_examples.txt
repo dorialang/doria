@@ -182,3 +182,8 @@ examples/native/main_collection_membership_after_write.doria
 examples/native/main_collection_alias_contract.doria
 examples/native/main_collection_fill_widths.doria
 examples/native/main_float_collection_elements.doria
+examples/native/main_unit_enums.doria
+examples/native/main_backed_enums.doria
+examples/native/main_nullable_enums.doria
+examples/native/main_enum_mixed.doria
+examples/native/main_enum_constants_and_defaults.doria

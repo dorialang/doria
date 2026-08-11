@@ -1,0 +1,38 @@
+enum Status
+{
+    case Draft;
+    case Published;
+}
+
+enum Priority: int
+{
+    case Low = 1;
+    case High = 10;
+}
+
+enum Transport: string
+{
+    case Road = "road";
+    case Rail = "rail";
+}
+
+function main(): void
+{
+    mixed $unit = Status::Draft;
+    mixed $number = Priority::High;
+    mixed $text = Transport::Rail;
+
+    if ($unit is Status) {
+        echo $unit == Status::Draft;
+    }
+    if ($number is Priority) {
+        echo $number == Priority::High;
+    }
+    if ($text is Transport) {
+        echo $text == Transport::Rail;
+    }
+    if ($unit is Priority) {
+        echo "wrong";
+    }
+    echo "\n";
+}

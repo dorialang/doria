@@ -9,6 +9,7 @@ use crate::collection_diagnostics::{
 use crate::diagnostics::{
     Diagnostic, DiagnosticResult, DiagnosticSource, FixApplicability, FixEdit,
 };
+use crate::enums::{EnumBackingType, EnumBackingValue, EnumCaseId, EnumId, EnumType, EnumValue};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
@@ -40,6 +41,8 @@ pub struct SemanticInfo {
     pub float_expression_types: HashMap<(usize, usize), FloatType>,
     /// Resolved semantic type for checked expressions, independent of backend layout.
     pub expression_types: HashMap<(usize, usize), ResolvedType>,
+    /// Resolved enum case for each unit/backed case expression.
+    pub enum_case_values: HashMap<(usize, usize), EnumValue>,
     /// Resolved concrete target for each checked `is` expression.
     pub type_test_types: HashMap<(usize, usize), ResolvedType>,
     /// Compiler-resolved callable target for each user-defined call expression.
@@ -55,6 +58,8 @@ pub struct SemanticInfo {
     pub(crate) constrained_display_calls: HashSet<(usize, usize)>,
     /// Stable nominal class identities and the total Stage 19 property order.
     pub classes: Vec<ClassSemanticInfo>,
+    /// Stable nominal enum identities and declaration-order case metadata.
+    pub enums: Vec<EnumSemanticInfo>,
     /// Values produced by the bounded Stage 20 constant evaluator.
     pub const_evaluation: crate::const_eval::Evaluation,
     /// Const-folded Copy-scalar defaults keyed by callable and parameter identity.
@@ -111,6 +116,30 @@ pub struct PropertySemanticInfo {
     pub ty: ResolvedType,
     pub writable: bool,
     pub promoted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumSemanticInfo {
+    pub id: EnumId,
+    pub name: String,
+    pub backing_type: Option<EnumBackingType>,
+    pub cases: Vec<EnumCaseSemanticInfo>,
+    pub copy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumCaseSemanticInfo {
+    pub id: EnumCaseId,
+    pub name: String,
+    pub tag: u32,
+    pub backing_value: Option<EnumBackingValue>,
+    pub payload: Vec<EnumPayloadSemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumPayloadSemanticInfo {
+    pub name: String,
+    pub ty: ResolvedType,
 }
 
 impl SemanticInfo {
@@ -210,16 +239,19 @@ pub fn analyze_program_for_ide_with_source<'source>(
         .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
         .collect();
     let classes = collect_ordered_class_semantics(program, &mut checker);
+    let enums = collect_ordered_enum_semantics(&checker);
     SemanticAnalysis {
         info: SemanticInfo {
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
             expression_types: checker.expression_types,
+            enum_case_values: checker.enum_case_values,
             type_test_types: checker.type_test_types,
             call_targets: checker.call_targets,
             generic_call_specializations: checker.generic_call_specializations,
             constrained_display_calls: checker.constrained_display_calls,
             classes,
+            enums,
             const_evaluation: checker.const_evaluation,
             parameter_defaults: checker.parameter_defaults,
             return_borrows,
@@ -227,6 +259,38 @@ pub fn analyze_program_for_ide_with_source<'source>(
         },
         diagnostics: checker.diagnostics,
     }
+}
+
+fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo> {
+    let mut enums = checker.enums.values().cloned().collect::<Vec<_>>();
+    enums.sort_by_key(|definition| definition.id);
+    enums
+        .into_iter()
+        .map(|definition| EnumSemanticInfo {
+            id: definition.id,
+            name: definition.name,
+            backing_type: definition.backing_type,
+            cases: definition
+                .cases
+                .into_iter()
+                .map(|case| EnumCaseSemanticInfo {
+                    id: case.id,
+                    name: case.name,
+                    tag: case.tag,
+                    backing_value: case.backing_value,
+                    payload: case
+                        .payload
+                        .into_iter()
+                        .map(|field| EnumPayloadSemanticInfo {
+                            name: field.name,
+                            ty: checker.types.resolved(field.ty),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            copy: definition.copy,
+        })
+        .collect()
 }
 
 fn collect_ordered_class_semantics(
@@ -408,7 +472,11 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
                     }
                 }
             }
-            Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+            Item::Enum(_)
+            | Item::Interface(_)
+            | Item::Trait(_)
+            | Item::Constant(_)
+            | Item::Statement(_) => {}
         }
     }
 
@@ -799,6 +867,7 @@ struct Checker<'program> {
     program: &'program Program,
     source_text: Option<&'program str>,
     classes: HashMap<String, ClassInfo>,
+    enums: HashMap<String, EnumDefinition>,
     functions: HashMap<String, FunctionInfo>,
     function_signatures: HashMap<usize, FunctionInfo>,
     types: TypeRegistry,
@@ -806,6 +875,7 @@ struct Checker<'program> {
     integer_expression_types: HashMap<(usize, usize), IntegerType>,
     float_expression_types: HashMap<(usize, usize), FloatType>,
     expression_types: HashMap<(usize, usize), ResolvedType>,
+    enum_case_values: HashMap<(usize, usize), EnumValue>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
     call_targets: HashMap<(usize, usize), CallableTarget>,
     generic_call_specializations: HashMap<(usize, usize), GenericSpecialization>,
@@ -824,6 +894,31 @@ struct Checker<'program> {
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
     flow_facts: crate::narrowing::FactsByUse,
     contextual_expression_types: HashMap<(usize, usize), TypeId>,
+}
+
+#[derive(Debug, Clone)]
+struct EnumDefinition {
+    id: EnumId,
+    name: String,
+    backing_type: Option<EnumBackingType>,
+    cases: Vec<EnumCaseDefinition>,
+    case_by_name: HashMap<String, usize>,
+    copy: bool,
+}
+
+#[derive(Debug, Clone)]
+struct EnumCaseDefinition {
+    id: EnumCaseId,
+    name: String,
+    tag: u32,
+    backing_value: Option<EnumBackingValue>,
+    payload: Vec<EnumPayloadDefinition>,
+}
+
+#[derive(Debug, Clone)]
+struct EnumPayloadDefinition {
+    name: String,
+    ty: TypeId,
 }
 
 #[derive(Debug, Clone)]
@@ -1012,6 +1107,7 @@ impl<'program> Checker<'program> {
             program,
             source_text,
             classes: HashMap::new(),
+            enums: HashMap::new(),
             functions: HashMap::new(),
             function_signatures: HashMap::new(),
             types: TypeRegistry::new(),
@@ -1019,6 +1115,7 @@ impl<'program> Checker<'program> {
             integer_expression_types: HashMap::new(),
             float_expression_types: HashMap::new(),
             expression_types: HashMap::new(),
+            enum_case_values: HashMap::new(),
             type_test_types: HashMap::new(),
             call_targets: HashMap::new(),
             generic_call_specializations: HashMap::new(),
@@ -1047,6 +1144,8 @@ impl<'program> Checker<'program> {
                 namespace.span,
             ));
         }
+        self.predeclare_classes();
+        self.collect_enums();
         self.collect_classes();
         self.collect_functions();
         self.infer_return_borrow_signatures();
@@ -1063,6 +1162,7 @@ impl<'program> Checker<'program> {
                     self.check_constant_initializer(&constant.initializer, None)
                 }
                 Item::Class(class_decl) => self.check_class(class_decl),
+                Item::Enum(enum_decl) => self.check_enum(enum_decl),
                 Item::Interface(interface_decl) => {
                     self.diagnostics
                         .push(interface_declaration_diagnostic(interface_decl));
@@ -1077,15 +1177,13 @@ impl<'program> Checker<'program> {
         self.check_pending_integer_literal_ranges();
     }
 
-    fn collect_classes(&mut self) {
-        let mut declared_classes = Vec::new();
-
+    fn predeclare_classes(&mut self) {
         for item in &self.program.items {
             let Item::Class(class_decl) = item else {
                 continue;
             };
 
-            if let Some(message) = Self::reserved_class_name_message(&class_decl.name) {
+            if let Some(message) = Self::reserved_type_name_message(&class_decl.name) {
                 self.diagnostics
                     .push(Diagnostic::new("E0309", message, class_decl.span));
                 continue;
@@ -1119,10 +1217,27 @@ impl<'program> Checker<'program> {
                     members: HashMap::new(),
                 },
             );
-            declared_classes.push(class_decl);
         }
+    }
 
-        for class_decl in declared_classes {
+    fn collect_classes(&mut self) {
+        let mut processed = HashSet::new();
+        let declarations = self
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(declaration) => Some(declaration),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for class_decl in declarations {
+            if !processed.insert(class_decl.name.clone())
+                || !self.classes.contains_key(&class_decl.name)
+            {
+                continue;
+            }
             self.check_class_type_parameter_declarations(class_decl);
             self.type_parameter_scopes
                 .push(type_parameter_scope(&class_decl.type_params));
@@ -1250,6 +1365,339 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn collect_enums(&mut self) {
+        let non_enum_types = self
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(declaration) => Some(declaration.name.as_str()),
+                Item::Interface(declaration) => Some(declaration.name.as_str()),
+                Item::Trait(declaration) => Some(declaration.name.as_str()),
+                Item::Enum(_) | Item::Function(_) | Item::Constant(_) | Item::Statement(_) => None,
+            })
+            .collect::<HashSet<_>>();
+
+        let declarations = self
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Enum(declaration) => Some(declaration),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for declaration in &declarations {
+            if let Some(message) = Self::reserved_type_name_message(&declaration.name) {
+                self.diagnostics.push(
+                    Diagnostic::new("E0561", message, declaration.span)
+                        .with_title("Type Name Collision"),
+                );
+                continue;
+            }
+            if non_enum_types.contains(declaration.name.as_str()) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0561",
+                        format!(
+                            "type name `{}` is already used by another declaration",
+                            declaration.name
+                        ),
+                        declaration.span,
+                    )
+                    .with_title("Type Name Collision"),
+                );
+                continue;
+            }
+            if self.enums.contains_key(&declaration.name) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0560",
+                        format!("enum `{}` is already declared", declaration.name),
+                        declaration.span,
+                    )
+                    .with_title("Duplicate Enum"),
+                );
+                continue;
+            }
+            let id = EnumId(self.enums.len());
+            self.enums.insert(
+                declaration.name.clone(),
+                EnumDefinition {
+                    id,
+                    name: declaration.name.clone(),
+                    backing_type: None,
+                    cases: Vec::new(),
+                    case_by_name: HashMap::new(),
+                    copy: true,
+                },
+            );
+        }
+
+        let mut processed = HashSet::new();
+        for declaration in declarations {
+            if !processed.insert(declaration.name.clone()) {
+                continue;
+            }
+            let Some(mut definition) = self.enums.remove(&declaration.name) else {
+                continue;
+            };
+            if !Self::uses_pascal_case(&declaration.name) {
+                let mut diagnostic = Diagnostic::new(
+                    "E0563",
+                    format!("enum name `{}` must use PascalCase", declaration.name),
+                    declaration.name_span,
+                )
+                .with_title("Enum Name Must Use PascalCase");
+                if let Some(replacement) = Self::safe_pascal_case_fix(&declaration.name) {
+                    let collides = non_enum_types.contains(replacement.as_str())
+                        || self.enums.contains_key(&replacement);
+                    if !collides {
+                        diagnostic = diagnostic.with_fix(declaration.name_span, replacement);
+                    }
+                }
+                self.diagnostics.push(diagnostic);
+            }
+            if !declaration.type_params.is_empty() {
+                self.diagnostics.push(
+                    Diagnostic::unsupported_stage(
+                        "E0572",
+                        "generic enum syntax is accepted, but generic enums are not implemented",
+                        declaration.span,
+                    )
+                    .with_title("Generic Enums Are Not Implemented"),
+                );
+            }
+            if declaration.cases.is_empty() {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0562",
+                        format!("enum `{}` must declare at least one case", declaration.name),
+                        declaration.span,
+                    )
+                    .with_title("Enum Must Have A Case"),
+                );
+            }
+
+            definition.backing_type = declaration.backing_type.as_ref().and_then(|ty| {
+                if ty.nullable || !ty.arguments.is_empty() {
+                    self.report_invalid_enum_backing(ty, declaration.span);
+                    return None;
+                }
+                match ty.name.as_str() {
+                    "int" => Some(EnumBackingType::Int),
+                    "string" => Some(EnumBackingType::String),
+                    _ => {
+                        self.report_invalid_enum_backing(ty, declaration.span);
+                        None
+                    }
+                }
+            });
+
+            let mut backing_values = HashSet::new();
+            let declared_case_names = declaration
+                .cases
+                .iter()
+                .map(|case| case.name.as_str())
+                .collect::<HashSet<_>>();
+            for case in &declaration.cases {
+                if definition.case_by_name.contains_key(&case.name) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0565",
+                            format!(
+                                "enum `{}` already declares case `{}`",
+                                declaration.name, case.name
+                            ),
+                            case.span,
+                        )
+                        .with_title("Duplicate Enum Case"),
+                    );
+                    continue;
+                }
+                if !Self::uses_pascal_case(&case.name) {
+                    let mut diagnostic = Diagnostic::new(
+                        "E0564",
+                        format!("enum case `{}` must use PascalCase", case.name),
+                        case.name_span,
+                    )
+                    .with_title("Case Name Must Use PascalCase");
+                    if let Some(replacement) = Self::safe_pascal_case_fix(&case.name) {
+                        if !declared_case_names.contains(replacement.as_str()) {
+                            diagnostic = diagnostic.with_fix(case.name_span, replacement);
+                        }
+                    }
+                    self.diagnostics.push(diagnostic);
+                }
+                let mut field_names = HashSet::new();
+                let payload = case
+                    .payload
+                    .iter()
+                    .filter_map(|field| {
+                        if !field_names.insert(field.name.clone()) {
+                            self.diagnostics.push(Diagnostic::new(
+                                "E0565",
+                                format!("payload field `${}` is already declared", field.name),
+                                field.span,
+                            ));
+                            return None;
+                        }
+                        Some(EnumPayloadDefinition {
+                            name: field.name.clone(),
+                            ty: self.resolve_type_ref(&field.ty, field.span),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if definition.backing_type.is_some() && !payload.is_empty() {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0571",
+                            "a backed enum cannot declare payload cases",
+                            case.span,
+                        )
+                        .with_title("Backed Enum Cannot Have Payload Cases"),
+                    );
+                }
+
+                let backing_value = match (definition.backing_type, &case.backing_value) {
+                    (Some(backing_type), Some(value)) if payload.is_empty() => {
+                        self.evaluate_enum_backing(backing_type, value, case.span)
+                    }
+                    (Some(_), None) if payload.is_empty() => {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0567",
+                                "every backed enum case must declare a backing value",
+                                case.span,
+                            )
+                            .with_title("Backed Case Requires A Value"),
+                        );
+                        None
+                    }
+                    (None, Some(_)) => {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0568",
+                                "a plain enum case cannot declare a backing value",
+                                case.span,
+                            )
+                            .with_title("Plain Case Cannot Have A Backing Value"),
+                        );
+                        None
+                    }
+                    _ => None,
+                };
+                if let Some(value) = &backing_value {
+                    if !backing_values.insert(value.clone()) {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0569",
+                                "backed enum case values must be unique",
+                                case.span,
+                            )
+                            .with_title("Duplicate Backing Value"),
+                        );
+                    }
+                }
+
+                let id = EnumCaseId {
+                    enum_id: definition.id,
+                    index: definition.cases.len(),
+                };
+                let tag = definition.cases.len() as u32;
+                definition
+                    .case_by_name
+                    .insert(case.name.clone(), definition.cases.len());
+                definition.cases.push(EnumCaseDefinition {
+                    id,
+                    name: case.name.clone(),
+                    tag,
+                    backing_value,
+                    payload,
+                });
+            }
+            definition.copy = definition
+                .cases
+                .iter()
+                .flat_map(|case| &case.payload)
+                .all(|field| !self.type_is_move_type(field.ty));
+            self.enums.insert(declaration.name.clone(), definition);
+        }
+    }
+
+    fn check_enum(&mut self, _declaration: &EnumDecl) {}
+
+    fn uses_pascal_case(name: &str) -> bool {
+        name.chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_uppercase())
+    }
+
+    fn safe_pascal_case_fix(name: &str) -> Option<String> {
+        let mut characters = name.chars();
+        let first = characters.next()?;
+        if !first.is_ascii_lowercase()
+            || !characters
+                .clone()
+                .all(|character| character.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+        let mut replacement = first.to_ascii_uppercase().to_string();
+        replacement.extend(characters);
+        Some(replacement)
+    }
+
+    fn report_invalid_enum_backing(&mut self, ty: &TypeRef, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0566",
+                format!("enum backing type must be `int` or `string`, found `{ty}`"),
+                span,
+            )
+            .with_title("Invalid Backing Type"),
+        );
+    }
+
+    fn evaluate_enum_backing(
+        &mut self,
+        backing_type: EnumBackingType,
+        value: &Expr,
+        span: Span,
+    ) -> Option<EnumBackingValue> {
+        let expected = TypeRef::named(match backing_type {
+            EnumBackingType::Int => "int",
+            EnumBackingType::String => "string",
+        });
+        let evaluated = crate::const_eval::evaluate_parameter_default(
+            &self.const_evaluation,
+            value,
+            &expected,
+            None,
+        );
+        let result = match (backing_type, evaluated) {
+            (EnumBackingType::Int, Some(crate::const_eval::ConstValue::Integer(value))) => {
+                Some(EnumBackingValue::Int(value))
+            }
+            (EnumBackingType::String, Some(crate::const_eval::ConstValue::String(value))) => {
+                Some(EnumBackingValue::String(value))
+            }
+            _ => None,
+        };
+        if result.is_none() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0570",
+                    "enum backing value must be a constant expression of the declared backing type",
+                    span,
+                )
+                .with_title("Wrong Backing Value Type"),
+            );
+        }
+        result
+    }
+
     fn check_class_type_parameter_declarations(&mut self, class: &ClassDecl) {
         self.check_type_parameter_declarations(
             &class.type_params,
@@ -1370,7 +1818,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn reserved_class_name_message(name: &str) -> Option<String> {
+    fn reserved_type_name_message(name: &str) -> Option<String> {
         if SharedHandleKind::from_source_name(name).is_some() {
             return Some(format!(
                 "`{name}` is a compiler-known shared-ownership type and cannot be redeclared"
@@ -1394,7 +1842,7 @@ impl<'program> Checker<'program> {
         }
         match name {
             "self" => Some(
-                "`self` is reserved for the declaring or composing class context and cannot be used as a class name"
+                "`self` is reserved for the declaring or composing class context and cannot be redeclared as a type"
                     .to_string(),
             ),
             "Displayable" => Some(
@@ -1419,18 +1867,18 @@ impl<'program> Checker<'program> {
                 "`{name}` is a compiler-known collection alias and cannot be redeclared"
             )),
             "array" => Some(
-                "`array` is not a Doria class name; use typed arrays like `T[]` or collection aliases"
+                "`array` is not a Doria type name; use typed arrays like `T[]` or collection aliases"
                     .to_string(),
             ),
             "mixed" => Some(
-                "`mixed` is a Doria dynamic-boundary type and cannot be used as a class name"
+                "`mixed` is a Doria dynamic-boundary type and cannot be redeclared"
                     .to_string(),
             ),
             "object" => Some(
-                "`object` is not a Doria type and cannot be used as a class name".to_string(),
+                "`object` is not a Doria type and cannot be redeclared".to_string(),
             ),
             "resource" => Some(
-                "`resource` is reserved for future PHP interop and cannot be used as a class name"
+                "`resource` is reserved for future PHP interop and cannot be redeclared"
                     .to_string(),
             ),
             _ => None,
@@ -1748,9 +2196,11 @@ impl<'program> Checker<'program> {
                         ClassMember::Property(_) | ClassMember::Constant(_) => None,
                     })
                     .collect(),
-                Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {
-                    Vec::new()
-                }
+                Item::Enum(_)
+                | Item::Interface(_)
+                | Item::Trait(_)
+                | Item::Constant(_)
+                | Item::Statement(_) => Vec::new(),
             })
             .collect::<Vec<_>>();
 
@@ -2003,7 +2453,8 @@ impl<'program> Checker<'program> {
                                 self.update_method_move_return_signature(&class_decl.name, method);
                         }
                     }
-                    Item::Interface(_)
+                    Item::Enum(_)
+                    | Item::Interface(_)
                     | Item::Trait(_)
                     | Item::Constant(_)
                     | Item::Statement(_) => {}
@@ -3083,7 +3534,11 @@ impl<'program> Checker<'program> {
 
         if !matches!(
             kind,
-            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool | TypeKind::String
+            TypeKind::Integer(_)
+                | TypeKind::Float(_)
+                | TypeKind::Bool
+                | TypeKind::String
+                | TypeKind::Enum(_)
         ) {
             self.diagnostics.push(Diagnostic::new(
                 "E0498",
@@ -4259,26 +4714,37 @@ impl<'program> Checker<'program> {
                     } else {
                         self.lookup_property(object, property, *span, scopes, method_context);
                     }
-                } else if self
-                    .compiler_known_property_type(
-                        object,
-                        property,
-                        *null_safe,
-                        scopes,
-                        method_context,
-                    )
-                    .is_some()
-                {
-                    self.check_compiler_known_property(
-                        object,
-                        property,
-                        *member_span,
-                        *span,
-                        scopes,
-                        method_context,
-                    );
                 } else {
-                    self.lookup_property(object, property, *span, scopes, method_context);
+                    let receiver_ty = self.forwarded_access_payload_type(object_ty);
+                    let enum_receiver = match self.types.kind(receiver_ty) {
+                        TypeKind::Enum(_) => true,
+                        TypeKind::Nullable(inner) => {
+                            matches!(self.types.kind(*inner), TypeKind::Enum(_))
+                        }
+                        _ => false,
+                    };
+                    if enum_receiver
+                        || self
+                            .compiler_known_property_type(
+                                object,
+                                property,
+                                *null_safe,
+                                scopes,
+                                method_context,
+                            )
+                            .is_some()
+                    {
+                        self.check_compiler_known_property(
+                            object,
+                            property,
+                            *member_span,
+                            *span,
+                            scopes,
+                            method_context,
+                        );
+                    } else {
+                        self.lookup_property(object, property, *span, scopes, method_context);
+                    }
                 }
             }
             Expr::MethodCall {
@@ -4302,6 +4768,17 @@ impl<'program> Checker<'program> {
                     scopes,
                     method_context,
                 );
+                if self.check_enum_property_method_call(
+                    object,
+                    method,
+                    *member_span,
+                    *argument_list_span,
+                    args,
+                    scopes,
+                    method_context,
+                ) {
+                    return;
+                }
                 if !self.check_string_instance_method_call(
                     object,
                     method,
@@ -4491,6 +4968,13 @@ impl<'program> Checker<'program> {
                         *span,
                     ));
                 }
+            }
+            Expr::Match { span, .. } => {
+                self.diagnostics.push(Diagnostic::unsupported_stage(
+                    "E0576",
+                    "match expressions are accepted syntax; match semantics land in Stage 28",
+                    *span,
+                ));
             }
             Expr::Float { .. } => self.check_float_literal_range(expr, FloatType::Float64),
             Expr::Identifier { name, span } => {
@@ -5090,6 +5574,43 @@ impl<'program> Checker<'program> {
             ));
             return;
         }
+        match (&left_kind, &right_kind) {
+            (TypeKind::Enum(left), TypeKind::Enum(right)) if left.id != right.id => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0579",
+                        format!(
+                            "different enum types `{}` and `{}` cannot be compared",
+                            left.name, right.name
+                        ),
+                        span,
+                    )
+                    .with_title("Different Enum Types Cannot Be Compared"),
+                );
+                return;
+            }
+            (TypeKind::Enum(enum_type), _) | (_, TypeKind::Enum(enum_type))
+                if !matches!(
+                    (&left_kind, &right_kind),
+                    (TypeKind::Enum(_), TypeKind::Enum(_))
+                ) =>
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0580",
+                        format!(
+                            "enum `{}` cannot be compared with a non-enum value",
+                            enum_type.name
+                        ),
+                        span,
+                    )
+                    .with_title("Enum Cannot Be Compared With Its Backing Type")
+                    .with_help("compare the backed enum's `value` property explicitly when the backing value is intended"),
+                );
+                return;
+            }
+            _ => {}
+        }
         if self.is_supported_nullable_equality(left, left_ty, right, right_ty)
             || self.is_equality_compatible(left_ty, right_ty)
         {
@@ -5415,6 +5936,11 @@ impl<'program> Checker<'program> {
     fn type_is_move_type(&self, ty: TypeId) -> bool {
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.type_is_move_type(*inner),
+            TypeKind::Enum(enum_type) => self
+                .enums
+                .values()
+                .find(|definition| definition.id == enum_type.id)
+                .is_some_and(|definition| !definition.copy),
             TypeKind::Class(_)
             | TypeKind::SharedHandle(_, _)
             | TypeKind::TypeParameter(_)
@@ -5817,6 +6343,14 @@ impl<'program> Checker<'program> {
                 }
                 self.check_expr(object, scopes, method_context);
                 self.check_mixed_operation(object, "property write", scopes, method_context);
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if matches!(self.types.kind(object_ty), TypeKind::Enum(_)) {
+                    self.diagnostics.push(
+                        Diagnostic::new("E0578", "enum properties are readonly", *span)
+                            .with_title("Enum Value Is Readonly"),
+                    );
+                    return None;
+                }
                 if !Self::is_property_write_object_path(object) {
                     self.diagnostics.push(
                         Diagnostic::new(
@@ -6755,6 +7289,10 @@ impl<'program> Checker<'program> {
             self.report_deferred_qualified_name(class_name, access.span);
             return;
         }
+        if let Some(definition) = self.enums.get(class_name).cloned() {
+            self.check_enum_case_call(&definition, access, args);
+            return;
+        }
         if class_name == "String" {
             self.check_string_companion_call(
                 access.member,
@@ -7164,6 +7702,10 @@ impl<'program> Checker<'program> {
             self.report_deferred_qualified_name(class_name, access.span);
             return;
         }
+        if let Some(definition) = self.enums.get(class_name).cloned() {
+            self.check_enum_case_member(&definition, access);
+            return;
+        }
         let Some(class_info) = self.classes.get(class_name) else {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
@@ -7202,6 +7744,112 @@ impl<'program> Checker<'program> {
                 access.span,
             ));
         }
+    }
+
+    fn check_enum_case_member(&mut self, definition: &EnumDefinition, access: StaticAccess<'_>) {
+        let Some(index) = definition.case_by_name.get(access.member).copied() else {
+            let candidates = definition
+                .cases
+                .iter()
+                .map(|case| case.name.as_str())
+                .collect::<Vec<_>>();
+            let mut diagnostic = Diagnostic::new(
+                "E0574",
+                format!("unknown case `{}::{}`", definition.name, access.member),
+                access.member_span,
+            )
+            .with_title("Unknown Enum Case");
+            if let Some(suggestion) =
+                crate::arg_binding::unambiguous_name_suggestion(access.member, &candidates)
+            {
+                diagnostic = diagnostic
+                    .with_help(format!("did you mean `{}::{suggestion}`?", definition.name))
+                    .with_fix(access.member_span, suggestion);
+            }
+            self.diagnostics.push(diagnostic);
+            return;
+        };
+        let case = &definition.cases[index];
+        if !case.payload.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::unsupported_stage(
+                    "E0573",
+                    format!(
+                        "payload case `{}::{}` requires arguments; payload enum execution lands in Stage 27 Slice 2",
+                        definition.name, case.name
+                    ),
+                    access.span,
+                )
+                .with_title("Payload Enum Execution Lands In Stage 27 Slice 2"),
+            );
+            return;
+        }
+        self.enum_case_values.insert(
+            (access.span.start, access.span.end),
+            EnumValue {
+                enum_id: definition.id,
+                case_id: case.id,
+            },
+        );
+    }
+
+    fn check_enum_case_call(
+        &mut self,
+        definition: &EnumDefinition,
+        access: StaticAccess<'_>,
+        _args: &[Argument],
+    ) {
+        let Some(index) = definition.case_by_name.get(access.member).copied() else {
+            let candidates = definition
+                .cases
+                .iter()
+                .map(|case| case.name.as_str())
+                .collect::<Vec<_>>();
+            let mut diagnostic = Diagnostic::new(
+                "E0574",
+                format!("unknown case `{}::{}`", definition.name, access.member),
+                access.member_span,
+            )
+            .with_title("Unknown Enum Case");
+            if let Some(suggestion) =
+                crate::arg_binding::unambiguous_name_suggestion(access.member, &candidates)
+            {
+                diagnostic = diagnostic
+                    .with_help(format!("did you mean `{}::{suggestion}`?", definition.name))
+                    .with_fix(access.member_span, suggestion);
+            }
+            self.diagnostics.push(diagnostic);
+            return;
+        };
+        let case = &definition.cases[index];
+        if !case.payload.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::unsupported_stage(
+                    "E0573",
+                    format!(
+                        "payload enum case `{}::{}` is accepted; payload enum execution lands in Stage 27 Slice 2",
+                        definition.name, case.name
+                    ),
+                    access.span,
+                )
+                .with_title("Payload Enum Execution Lands In Stage 27 Slice 2"),
+            );
+            return;
+        }
+        let parentheses = Span::new(access.member_span.end, access.span.end);
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0575",
+                format!(
+                    "unit enum case `{}::{}` has no payload and is not called",
+                    definition.name, case.name
+                ),
+                access.span,
+            )
+            .with_title("Unit Case Has No Payload")
+            .with_help("remove the empty parentheses")
+            .with_fix(parentheses, ""),
+        );
     }
 
     fn check_static_assignment_target(
@@ -8667,6 +9315,23 @@ impl<'program> Checker<'program> {
                 let inner = self.types.intern(TypeKind::Bool);
                 TypeKind::Nullable(inner)
             }
+            crate::const_eval::ConstType::Enum(enum_id) => TypeKind::Enum(
+                self.enums
+                    .values()
+                    .find(|definition| definition.id == enum_id)
+                    .map(|definition| crate::enums::EnumType {
+                        id: definition.id,
+                        name: definition.name.clone(),
+                    })
+                    .unwrap_or_else(|| crate::enums::EnumType {
+                        id: enum_id,
+                        name: format!("enum#{}", enum_id.0),
+                    }),
+            ),
+            crate::const_eval::ConstType::NullableEnum(enum_id) => {
+                let enum_type = self.const_type_id(crate::const_eval::ConstType::Enum(enum_id));
+                TypeKind::Nullable(enum_type)
+            }
             crate::const_eval::ConstType::Null => TypeKind::Null,
             crate::const_eval::ConstType::NullableString => {
                 let string = self.types.intern(TypeKind::String);
@@ -8732,6 +9397,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::String
                 | TypeKind::Bool
                 | TypeKind::Mixed
+                | TypeKind::Enum(_)
                 | TypeKind::TypeParameter(_)
                 | TypeKind::Class(_)
                 | TypeKind::SharedHandle(_, _)
@@ -8839,6 +9505,24 @@ impl<'program> Checker<'program> {
                 "E0432",
                 "`resource` is reserved for PHP interop through the future Phase I bridge and is not a Doria value type",
             ),
+            name if self.enums.contains_key(name) => {
+                if !self.expect_type_arg_count(ty, 0, span) {
+                    for arg in ty.type_arguments() {
+                        self.resolve_type_ref_in_position(
+                            arg,
+                            span,
+                            TypePosition::Value,
+                            declaring_class,
+                        );
+                    }
+                    return self.types.unknown();
+                }
+                let definition = self.enums.get(name).expect("enum existence checked");
+                self.types.intern(TypeKind::Enum(EnumType::new(
+                    definition.id,
+                    definition.name.clone(),
+                )))
+            }
             "uint" => self.reject_type_ref_with_help(
                 ty,
                 span,
@@ -10361,6 +11045,9 @@ impl<'program> Checker<'program> {
                 else {
                     return self.types.unknown();
                 };
+                if self.enums.contains_key(&class_name) {
+                    return self.types.unknown();
+                }
                 if class_name == "Int" && method == "toFloat" {
                     return self.types.intern(TypeKind::Float(FloatType::Float64));
                 }
@@ -10465,6 +11152,15 @@ impl<'program> Checker<'program> {
                 else {
                     return self.types.unknown();
                 };
+                if let Some(definition) = self.enums.get(&class_name) {
+                    if definition.case_by_name.contains_key(member) {
+                        return self.types.intern(TypeKind::Enum(EnumType::new(
+                            definition.id,
+                            definition.name.clone(),
+                        )));
+                    }
+                    return self.types.unknown();
+                }
                 let ty = self.classes.get(&class_name).and_then(|class_info| {
                     class_info
                         .constants
@@ -10494,7 +11190,7 @@ impl<'program> Checker<'program> {
             Expr::Binary {
                 left, op, right, ..
             } => self.infer_binary_type(left, op, right, scopes, method_context),
-            Expr::Range { .. } => self.types.unknown(),
+            Expr::Range { .. } | Expr::Match { .. } => self.types.unknown(),
         }
     }
 
@@ -10608,13 +11304,34 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         let ty = self.infer_expr_type(object, scopes, method_context);
-        let nullable_access = self
+        let forwarded_nullable_access = self
             .forwarded_access_payload(ty)
             .is_some_and(|(_, nullable)| nullable);
-        let ty = self.forwarded_access_payload_type(ty);
+        let mut ty = self.forwarded_access_payload_type(ty);
+        let nullable_access = if null_safe {
+            match self.types.kind(ty) {
+                TypeKind::Nullable(inner) => {
+                    ty = *inner;
+                    true
+                }
+                _ => forwarded_nullable_access,
+            }
+        } else {
+            forwarded_nullable_access
+        };
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
         let bool_ty = self.types.intern(TypeKind::Bool);
         let result = match (self.types.kind(ty), property) {
+            (TypeKind::Enum(enum_type), "value") => {
+                let definition = self
+                    .enums
+                    .values()
+                    .find(|definition| definition.id == enum_type.id)?;
+                definition.backing_type.map(|backing| match backing {
+                    EnumBackingType::Int => int,
+                    EnumBackingType::String => self.types.intern(TypeKind::String),
+                })
+            }
             (TypeKind::String, "length" | "byteLength") => Some(int),
             (TypeKind::String, "isEmpty") => Some(bool_ty),
             (TypeKind::String, "bytes") => Some(self.types.intern(TypeKind::Bytes)),
@@ -10665,6 +11382,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::Deque(_),
                 _,
             ) => Some(self.types.unknown()),
+            (TypeKind::Enum(_), _) => Some(self.types.unknown()),
             _ => None,
         }?;
         Some(self.null_safe_result_type(result, null_safe && nullable_access))
@@ -11137,6 +11855,66 @@ impl<'program> Checker<'program> {
         Some(self.null_safe_result_type(result, null_safe && nullable_access))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn check_enum_property_method_call(
+        &mut self,
+        object: &Expr,
+        method: &str,
+        member_span: Span,
+        argument_list_span: Span,
+        args: &[Argument],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let ty = self.infer_expr_type(object, scopes, method_context);
+        let ty = match self.types.kind(ty) {
+            TypeKind::Nullable(inner) => *inner,
+            _ => ty,
+        };
+        let TypeKind::Enum(enum_type) = self.types.kind(ty).clone() else {
+            return false;
+        };
+        let backed = self
+            .enums
+            .values()
+            .find(|definition| definition.id == enum_type.id)
+            .is_some_and(|definition| definition.backing_type.is_some());
+        if method != "value" {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0577",
+                    format!("enum `{}` has no method `{method}`", enum_type.name),
+                    member_span,
+                )
+                .with_title("Unknown Enum Member"),
+            );
+            return true;
+        }
+        if !backed {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0577",
+                    format!("unit enum `{}` has no `value` property", enum_type.name),
+                    member_span,
+                )
+                .with_title("Unit Enum Has No Value Property"),
+            );
+            return true;
+        }
+        let mut diagnostic = Diagnostic::new(
+            "E0575",
+            "`value` is a readonly enum property, not a method",
+            member_span,
+        )
+        .with_title("Property Invoked As Method")
+        .with_help("read `->value` without parentheses");
+        if args.is_empty() {
+            diagnostic = diagnostic.with_fix(argument_list_span, "");
+        }
+        self.diagnostics.push(diagnostic);
+        true
+    }
+
     fn collection_receiver(kind: &TypeKind) -> Option<CollectionReceiver> {
         match kind {
             TypeKind::TypedArray(_) => Some(CollectionReceiver::TypedArray),
@@ -11291,6 +12069,29 @@ impl<'program> Checker<'program> {
     ) {
         let ty = self.infer_expr_type(object, scopes, method_context);
         let ty = self.forwarded_access_payload_type(ty);
+        let ty = match self.types.kind(ty) {
+            TypeKind::Nullable(inner) => *inner,
+            _ => ty,
+        };
+        if let TypeKind::Enum(enum_type) = self.types.kind(ty).clone() {
+            let definition = self
+                .enums
+                .values()
+                .find(|definition| definition.id == enum_type.id);
+            if property == "value" && definition.is_some_and(|value| value.backing_type.is_some()) {
+                return;
+            }
+            let message = if property == "value" {
+                format!("unit enum `{}` has no `value` property", enum_type.name)
+            } else {
+                format!("enum `{}` has no property `{property}`", enum_type.name)
+            };
+            self.diagnostics.push(
+                Diagnostic::new("E0577", message, member_span)
+                    .with_title("Unit Enum Has No Value Property"),
+            );
+            return;
+        }
         if matches!(self.types.kind(ty), TypeKind::String) {
             match property {
                 "length" | "byteLength" | "isEmpty" | "bytes" => {}
@@ -11656,6 +12457,7 @@ impl<'program> Checker<'program> {
             | TypeKind::Float(_)
             | TypeKind::String
             | TypeKind::Bool
+            | TypeKind::Enum(_)
             | TypeKind::Unknown => {}
             TypeKind::Class(_) => self.diagnostics.push(
                 Diagnostic::unsupported_stage(
@@ -12181,10 +12983,12 @@ impl<'program> Checker<'program> {
         let ty = self.infer_expr_type(object, scopes, method_context);
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => {
-                if !matches!(
+                let member_receiver = matches!(
                     self.types.kind(*inner),
                     TypeKind::Class(_) | TypeKind::SharedHandle(_, _)
-                ) {
+                ) || (operation == "property access"
+                    && matches!(self.types.kind(*inner), TypeKind::Enum(_)));
+                if !member_receiver {
                     self.diagnostics.push(Diagnostic::new(
                         "E0507",
                         format!("{operation} requires a class value"),
@@ -12267,6 +13071,7 @@ impl<'program> Checker<'program> {
                     | TypeKind::Float(_)
                     | TypeKind::String
                     | TypeKind::Bool
+                    | TypeKind::Enum(_)
                     | TypeKind::Class(_)
                     | TypeKind::Unknown
             )

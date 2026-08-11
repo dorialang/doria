@@ -1,0 +1,18 @@
+enum Status
+{
+    case Draft;
+    case Published;
+    case Archived;
+}
+
+function isDraft(Status $status = Status::Draft): bool
+{
+    return $status == Status::Draft;
+}
+
+function main(): void
+{
+    Status $first, $second = Status::Draft;
+    Status $copy = $first;
+    echo "unit {isDraft()} {$copy != Status::Archived} {$second == Status::Draft}\n";
+}

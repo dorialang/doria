@@ -225,6 +225,7 @@ pub const MIXED_TAG_FLOAT32: u8 = 10;
 pub const MIXED_TAG_FLOAT64: u8 = 11;
 pub const MIXED_TAG_STRING: u8 = 12;
 pub const MIXED_TAG_CLASS: u8 = 13;
+pub const MIXED_TAG_ENUM: u8 = 14;
 
 pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<u8> {
     match ty {
@@ -232,6 +233,7 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(ty.storage_bytes() as u8),
         mir::Type::Scalar(mir::ScalarType::Float(crate::numeric::FloatType::Float32)) => Some(4),
         mir::Type::Scalar(mir::ScalarType::Float(crate::numeric::FloatType::Float64)) => Some(8),
+        mir::Type::Scalar(mir::ScalarType::Enum(_)) => Some(4),
         mir::Type::String
         | mir::Type::Mixed
         | mir::Type::Class(_)

@@ -4,6 +4,7 @@ use std::fmt;
 
 use crate::ast::{self, Argument, BinaryOp, Expr, Item, MemberAccess, StaticQualifier, UnaryOp};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
+use crate::enums::{EnumCaseId, EnumId, EnumValue};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
 use crate::types::TypeRef;
@@ -15,6 +16,7 @@ pub enum ConstValue {
     String(String),
     Bool(bool),
     Null,
+    Enum(EnumValue),
 }
 
 impl ConstValue {
@@ -25,6 +27,7 @@ impl ConstValue {
             Self::String(value) => Some(value.clone()),
             Self::Bool(value) => Some(value.to_string()),
             Self::Null => None,
+            Self::Enum(_) => None,
         }
     }
 }
@@ -72,6 +75,8 @@ impl TypedValue {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Evaluation {
     pub values: HashMap<ConstKey, EvaluatedDecl>,
+    pub enum_cases: HashMap<(String, String), EnumValue>,
+    pub enum_names: HashMap<String, EnumId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -86,7 +91,7 @@ pub fn evaluate_parameter_default(
     expected: &TypeRef,
     declaring_class: Option<&str>,
 ) -> Option<ConstValue> {
-    let expected = const_type(expected)?;
+    let expected = const_type_with_enums(expected, &evaluation.enum_names)?;
     let requester = EvaluationRequester::parameter_default(declaring_class);
     let mut evaluator = Evaluator {
         nodes: HashMap::new(),
@@ -97,6 +102,8 @@ pub fn evaluate_parameter_default(
             .collect(),
         stack: Vec::new(),
         diagnostics: Vec::new(),
+        enum_cases: evaluation.enum_cases.clone(),
+        enum_names: evaluation.enum_names.clone(),
     };
     let value = evaluator.evaluate_expr(expr, Some(expected), &requester)?;
     evaluator.diagnostics.is_empty().then_some(value.value)
@@ -159,6 +166,8 @@ pub fn evaluate_program(program: &ast::Program) -> DiagnosticResult<Evaluation> 
                     State::Visiting(_) | State::Failed => None,
                 })
                 .collect(),
+            enum_cases: evaluator.enum_cases,
+            enum_names: evaluator.enum_names,
         })
     } else {
         Err(evaluator.diagnostics)
@@ -170,6 +179,8 @@ struct Evaluator {
     states: HashMap<ConstKey, State>,
     stack: Vec<ConstKey>,
     diagnostics: Vec<Diagnostic>,
+    enum_cases: HashMap<(String, String), EnumValue>,
+    enum_names: HashMap<String, EnumId>,
 }
 
 impl Evaluator {
@@ -179,7 +190,29 @@ impl Evaluator {
             states: HashMap::new(),
             stack: Vec::new(),
             diagnostics: Vec::new(),
+            enum_cases: HashMap::new(),
+            enum_names: HashMap::new(),
         };
+        for item in &program.items {
+            if let Item::Enum(declaration) = item {
+                let next = evaluator.enum_names.len();
+                let enum_id = *evaluator
+                    .enum_names
+                    .entry(declaration.name.clone())
+                    .or_insert(EnumId(next));
+                for (index, case) in declaration.cases.iter().enumerate() {
+                    if case.payload.is_empty() {
+                        evaluator.enum_cases.insert(
+                            (declaration.name.clone(), case.name.clone()),
+                            EnumValue {
+                                enum_id,
+                                case_id: EnumCaseId { enum_id, index },
+                            },
+                        );
+                    }
+                }
+            }
+        }
         for item in &program.items {
             match item {
                 Item::Constant(decl) => evaluator.insert(Node {
@@ -232,7 +265,11 @@ impl Evaluator {
                         }
                     }
                 }
-                Item::Interface(_) | Item::Trait(_) | Item::Function(_) | Item::Statement(_) => {}
+                Item::Enum(_)
+                | Item::Interface(_)
+                | Item::Trait(_)
+                | Item::Function(_)
+                | Item::Statement(_) => {}
             }
         }
         evaluator
@@ -312,7 +349,10 @@ impl Evaluator {
         let index = self.stack.len();
         self.states.insert(key.clone(), State::Visiting(index));
         self.stack.push(key.clone());
-        let expected = node.annotation.as_ref().and_then(const_type);
+        let expected = node
+            .annotation
+            .as_ref()
+            .and_then(|ty| const_type_with_enums(ty, &self.enum_names));
         if let Some(annotation) = &node.annotation {
             if expected.is_none() && !matches!(node.key, ConstKey::Static { .. }) {
                 self.diagnostics.push(Diagnostic::new(
@@ -395,6 +435,13 @@ impl Evaluator {
                 ..
             } => {
                 let class_name = self.qualifier_class_name(qualifier, requester)?;
+                if let Some(value) = self
+                    .enum_cases
+                    .get(&(class_name.clone(), member.clone()))
+                    .copied()
+                {
+                    return Some(TypedValue::new(ConstValue::Enum(value)));
+                }
                 let constant = ConstKey::Class {
                     class_name: class_name.clone(),
                     name: member.clone(),
@@ -697,6 +744,13 @@ impl Evaluator {
                 BinaryOp::GreaterEqual => Ok(ConstValue::Bool(left >= right)),
                 _ => Err("invalid string operation in constant expression"),
             },
+            (ConstValue::Enum(left), ConstValue::Enum(right)) if left.enum_id == right.enum_id => {
+                match op {
+                    BinaryOp::Equal => Ok(ConstValue::Bool(left.case_id == right.case_id)),
+                    BinaryOp::NotEqual => Ok(ConstValue::Bool(left.case_id != right.case_id)),
+                    _ => Err("only equality is defined for enum constants"),
+                }
+            }
             (ConstValue::Null, ConstValue::Null) => match op {
                 BinaryOp::Equal => Ok(ConstValue::Bool(true)),
                 BinaryOp::NotEqual => Ok(ConstValue::Bool(false)),
@@ -880,6 +934,8 @@ pub enum ConstType {
     NullableBool,
     Null,
     NullableString,
+    Enum(EnumId),
+    NullableEnum(EnumId),
 }
 
 impl ConstType {
@@ -890,6 +946,7 @@ impl ConstType {
             ConstValue::String(_) => Self::String,
             ConstValue::Bool(_) => Self::Bool,
             ConstValue::Null => Self::Null,
+            ConstValue::Enum(value) => Self::Enum(value.enum_id),
         }
     }
 
@@ -900,6 +957,8 @@ impl ConstType {
                 | (Self::NullableInteger(_), Self::Null)
                 | (Self::NullableFloat(_), Self::Null)
                 | (Self::NullableBool, Self::Bool | Self::Null) => true,
+                (Self::NullableEnum(expected), Self::Enum(actual)) => expected == actual,
+                (Self::NullableEnum(_), Self::Null) => true,
                 (Self::NullableInteger(expected), Self::Integer(actual)) => expected == actual,
                 (Self::NullableFloat(expected), Self::Float(actual)) => expected == actual,
                 _ => false,
@@ -913,6 +972,7 @@ impl ConstType {
                 | Self::NullableFloat(_)
                 | Self::NullableBool
                 | Self::NullableString
+                | Self::NullableEnum(_)
         )
     }
 
@@ -922,6 +982,7 @@ impl ConstType {
             Self::NullableFloat(ty) => Some(Self::Float(ty)),
             Self::NullableBool => Some(Self::Bool),
             Self::NullableString => Some(Self::String),
+            Self::NullableEnum(enum_id) => Some(Self::Enum(enum_id)),
             _ => None,
         }
     }
@@ -953,6 +1014,8 @@ impl fmt::Display for ConstType {
             Self::NullableBool => formatter.write_str("?bool"),
             Self::Null => formatter.write_str("null"),
             Self::NullableString => formatter.write_str("?string"),
+            Self::Enum(enum_id) => write!(formatter, "enum#{}", enum_id.0),
+            Self::NullableEnum(enum_id) => write!(formatter, "?enum#{}", enum_id.0),
         }
     }
 }
@@ -981,6 +1044,21 @@ fn const_type(ty: &TypeRef) -> Option<ConstType> {
         (true, "bool", true) => Some(ConstType::NullableBool),
         _ => None,
     }
+}
+
+fn const_type_with_enums(ty: &TypeRef, enum_names: &HashMap<String, EnumId>) -> Option<ConstType> {
+    const_type(ty).or_else(|| {
+        (ty.arguments.is_empty())
+            .then(|| enum_names.get(&ty.name).copied())
+            .flatten()
+            .map(|enum_id| {
+                if ty.nullable {
+                    ConstType::NullableEnum(enum_id)
+                } else {
+                    ConstType::Enum(enum_id)
+                }
+            })
+    })
 }
 
 fn is_screaming_snake_case(name: &str) -> bool {

@@ -9,7 +9,21 @@ use crate::source::Span;
 use crate::types::{resolved_type_complexity, ClassType, ResolvedType};
 use crate::{hir, mir};
 
-type ClassIds = HashMap<ClassType<ResolvedType>, ClassId>;
+#[derive(Default)]
+struct ClassIds {
+    classes: HashMap<ClassType<ResolvedType>, ClassId>,
+    enums: HashMap<String, crate::enums::EnumType>,
+}
+
+impl ClassIds {
+    fn get(&self, class_type: &ClassType<ResolvedType>) -> Option<&ClassId> {
+        self.classes.get(class_type)
+    }
+
+    fn resolve_enum_nominals(&self, ty: ResolvedType) -> ResolvedType {
+        resolve_enum_nominals(ty, &self.enums)
+    }
+}
 
 #[derive(Clone, Default)]
 struct CollectionRegistry {
@@ -478,6 +492,12 @@ fn substitute_resolved_type(
 /// Opt-in counters accumulated while MIR nodes are already being materialized.
 /// Ordinary lowering passes no collector and allocates no report state.
 pub(crate) struct StructuralMetrics {
+    pub(crate) enum_count: usize,
+    pub(crate) unit_enum_count: usize,
+    pub(crate) backed_enum_count: usize,
+    pub(crate) payload_enum_count: usize,
+    pub(crate) enum_case_count: usize,
+    pub(crate) enum_payload_field_count: usize,
     pub(crate) callable_specialization_count: usize,
     pub(crate) class_specialization_count: usize,
     pub(crate) basic_block_count: usize,
@@ -501,17 +521,49 @@ fn lower_program_impl(
     program: &hir::Program,
     mut metrics: Option<&mut StructuralMetrics>,
 ) -> DiagnosticResult<mir::Program> {
-    let class_ids = program
-        .semantic_info
-        .classes
-        .iter()
-        .map(|class| {
-            (
-                ClassType::new(class.declaration_name.clone(), class.arguments.clone()),
-                class.id,
-            )
-        })
-        .collect::<HashMap<_, _>>();
+    if let Some(metrics) = metrics.as_deref_mut() {
+        metrics.enum_count = program.semantic_info.enums.len();
+        for definition in &program.semantic_info.enums {
+            metrics.enum_case_count += definition.cases.len();
+            let payload_fields = definition
+                .cases
+                .iter()
+                .map(|case| case.payload.len())
+                .sum::<usize>();
+            metrics.enum_payload_field_count += payload_fields;
+            if payload_fields != 0 {
+                metrics.payload_enum_count += 1;
+            } else if definition.backing_type.is_some() {
+                metrics.backed_enum_count += 1;
+            } else {
+                metrics.unit_enum_count += 1;
+            }
+        }
+    }
+    let class_ids = ClassIds {
+        classes: program
+            .semantic_info
+            .classes
+            .iter()
+            .map(|class| {
+                (
+                    ClassType::new(class.declaration_name.clone(), class.arguments.clone()),
+                    class.id,
+                )
+            })
+            .collect(),
+        enums: program
+            .semantic_info
+            .enums
+            .iter()
+            .map(|definition| {
+                (
+                    definition.name.clone(),
+                    crate::enums::EnumType::new(definition.id, definition.name.clone()),
+                )
+            })
+            .collect(),
+    };
     let mut collection_registry = CollectionRegistry::default();
     let mut static_ids = HashMap::new();
     let mut statics = Vec::new();
@@ -686,7 +738,7 @@ fn lower_program_impl(
                     "top-level executable statements are not supported by native compilation",
                 )]);
             }
-            hir::Item::Constant(_) => {}
+            hir::Item::Enum(_) | hir::Item::Constant(_) => {}
         }
     }
 
@@ -884,12 +936,62 @@ fn lower_program_impl(
         })
         .collect::<DiagnosticResult<Vec<_>>>()?;
 
+    let enums = program
+        .semantic_info
+        .enums
+        .iter()
+        .map(|enum_info| {
+            Ok(mir::EnumDefinition {
+                id: enum_info.id,
+                name: enum_info.name.clone(),
+                backing_type: enum_info.backing_type,
+                cases: enum_info
+                    .cases
+                    .iter()
+                    .map(|case| {
+                        Ok(mir::EnumCaseDefinition {
+                            id: case.id,
+                            name: case.name.clone(),
+                            tag: case.tag,
+                            backing_value: case.backing_value.clone(),
+                            payload: case
+                                .payload
+                                .iter()
+                                .map(|field| {
+                                    Ok(mir::EnumPayloadDefinition {
+                                        name: field.name.clone(),
+                                        ty: intern_resolved_collection_types(
+                                            &field.ty,
+                                            &class_ids,
+                                            &mut collection_registry,
+                                        )
+                                        .ok_or_else(|| {
+                                            vec![unsupported(
+                                                Span::default(),
+                                                format!(
+                                                    "enum payload `${}` has no native type representation",
+                                                    field.name
+                                                ),
+                                            )]
+                                        })?,
+                                    })
+                                })
+                                .collect::<DiagnosticResult<Vec<_>>>()?,
+                        })
+                    })
+                    .collect::<DiagnosticResult<Vec<_>>>()?,
+                copy: enum_info.copy,
+            })
+        })
+        .collect::<DiagnosticResult<Vec<_>>>()?;
+
     Ok(mir::Program {
         source: crate::source::SourceFile::new(
             program.source_path.clone(),
             program.source_text.clone(),
         ),
         classes,
+        enums,
         collection_types: collection_registry.types,
         statics,
         functions,
@@ -910,6 +1012,7 @@ fn intern_resolved_collection_types(
         ResolvedType::String => mir::Type::String,
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::Mixed => mir::Type::Mixed,
+        ResolvedType::Enum(enum_type) => mir::Type::Scalar(mir::ScalarType::Enum(enum_type.id)),
         ResolvedType::Class(class) => mir::Type::Class(*class_ids.get(class)?),
         ResolvedType::SharedHandle(kind, payload) => match kind {
             crate::types::SharedHandleKind::SharedReference => {
@@ -1161,6 +1264,13 @@ fn lower_static_value(
             | mir::Type::NullableScalar(mir::ScalarType::Bool),
         ) => Ok(mir::StaticValue::Scalar(mir::ScalarValue::Bool(*value))),
         (
+            crate::const_eval::ConstValue::Enum(value),
+            mir::Type::Scalar(mir::ScalarType::Enum(expected))
+            | mir::Type::NullableScalar(mir::ScalarType::Enum(expected)),
+        ) if value.enum_id == expected => {
+            Ok(mir::StaticValue::Scalar(mir::ScalarValue::Enum(*value)))
+        }
+        (
             crate::const_eval::ConstValue::String(value),
             mir::Type::String | mir::Type::NullableString,
         ) => Ok(mir::StaticValue::String(value.clone())),
@@ -1379,7 +1489,8 @@ fn mir_type_ref_with_substitutions(
     collection_registry: &mut CollectionRegistry,
     substitutions: &HashMap<String, crate::types::ResolvedType>,
 ) -> Option<mir::Type> {
-    let resolved = resolved_type_ref_with_substitutions(ty, substitutions)?;
+    let resolved =
+        class_ids.resolve_enum_nominals(resolved_type_ref_with_substitutions(ty, substitutions)?);
     intern_resolved_collection_types(&resolved, class_ids, collection_registry)
 }
 
@@ -1449,6 +1560,51 @@ fn resolved_type_ref_with_substitutions(
     }
 }
 
+fn resolve_enum_nominals(
+    ty: ResolvedType,
+    enums: &HashMap<String, crate::enums::EnumType>,
+) -> ResolvedType {
+    match ty {
+        ResolvedType::Class(class) if class.arguments.is_empty() => enums
+            .get(&class.name)
+            .cloned()
+            .map_or(ResolvedType::Class(class), ResolvedType::Enum),
+        ResolvedType::Nullable(inner) => {
+            ResolvedType::Nullable(Box::new(resolve_enum_nominals(*inner, enums)))
+        }
+        ResolvedType::TypedArray(inner) => {
+            ResolvedType::TypedArray(Box::new(resolve_enum_nominals(*inner, enums)))
+        }
+        ResolvedType::List(inner) => {
+            ResolvedType::List(Box::new(resolve_enum_nominals(*inner, enums)))
+        }
+        ResolvedType::Set(inner) => {
+            ResolvedType::Set(Box::new(resolve_enum_nominals(*inner, enums)))
+        }
+        ResolvedType::SortedSet(inner) => {
+            ResolvedType::SortedSet(Box::new(resolve_enum_nominals(*inner, enums)))
+        }
+        ResolvedType::PriorityQueue(inner) => {
+            ResolvedType::PriorityQueue(Box::new(resolve_enum_nominals(*inner, enums)))
+        }
+        ResolvedType::Deque(inner) => {
+            ResolvedType::Deque(Box::new(resolve_enum_nominals(*inner, enums)))
+        }
+        ResolvedType::Dictionary(key, value) => ResolvedType::Dictionary(
+            Box::new(resolve_enum_nominals(*key, enums)),
+            Box::new(resolve_enum_nominals(*value, enums)),
+        ),
+        ResolvedType::SortedDictionary(key, value) => ResolvedType::SortedDictionary(
+            Box::new(resolve_enum_nominals(*key, enums)),
+            Box::new(resolve_enum_nominals(*value, enums)),
+        ),
+        ResolvedType::SharedHandle(kind, payload) => {
+            ResolvedType::SharedHandle(kind, Box::new(resolve_enum_nominals(*payload, enums)))
+        }
+        ty => ty,
+    }
+}
+
 fn intern_bytes_type(collections: &mut CollectionRegistry) -> mir::CollectionTypeId {
     let byte = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8));
     collections.intern(mir::CollectionKind::TypedArray, None, byte);
@@ -1460,6 +1616,9 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(FieldType::Integer(ty)),
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Some(FieldType::Float(ty)),
         mir::Type::Scalar(mir::ScalarType::Bool) => Some(FieldType::Bool),
+        mir::Type::Scalar(mir::ScalarType::Enum(_)) => {
+            Some(FieldType::Integer(IntegerType::UInt32))
+        }
         mir::Type::String => Some(FieldType::String),
         mir::Type::Mixed => Some(FieldType::Mixed),
         mir::Type::NullableScalar(mir::ScalarType::Integer(ty)) => {
@@ -1467,6 +1626,9 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
         }
         mir::Type::NullableScalar(mir::ScalarType::Float(ty)) => Some(FieldType::NullableFloat(ty)),
         mir::Type::NullableScalar(mir::ScalarType::Bool) => Some(FieldType::NullableBool),
+        mir::Type::NullableScalar(mir::ScalarType::Enum(_)) => {
+            Some(FieldType::NullableInteger(IntegerType::UInt32))
+        }
         mir::Type::NullableString => Some(FieldType::NullableString),
         mir::Type::NullableMixed => Some(FieldType::NullableMixed),
         mir::Type::Class(class) => Some(FieldType::Class(class)),
@@ -3317,6 +3479,22 @@ impl<'semantic> LoweringContext<'semantic> {
         self.constant_decl(expr).map(|decl| &decl.value)
     }
 
+    fn enum_case_value(&self, enum_name: &str, case_name: &str) -> Option<crate::enums::EnumValue> {
+        let definition = self
+            .semantic_info
+            .enums
+            .iter()
+            .find(|definition| definition.name == enum_name)?;
+        let case = definition
+            .cases
+            .iter()
+            .find(|case| case.name == case_name)?;
+        Some(crate::enums::EnumValue {
+            enum_id: definition.id,
+            case_id: case.id,
+        })
+    }
+
     fn static_property(
         &self,
         class_name: &str,
@@ -3341,6 +3519,18 @@ impl<'semantic> LoweringContext<'semantic> {
 
     fn native_type_ref(&self, ty: &crate::types::TypeRef) -> Option<mir::Type> {
         let resolved = resolved_type_ref_with_substitutions(ty, &self.type_substitutions)?;
+        let enum_types = self
+            .semantic_info
+            .enums
+            .iter()
+            .map(|definition| {
+                (
+                    definition.name.clone(),
+                    crate::enums::EnumType::new(definition.id, definition.name.clone()),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let resolved = resolve_enum_nominals(resolved, &enum_types);
         self.mir_resolved_type(&resolved)
     }
 
@@ -3481,6 +3671,9 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
             ResolvedType::String => Some(mir::Type::String),
             ResolvedType::Mixed => Some(mir::Type::Mixed),
+            ResolvedType::Enum(enum_type) => {
+                Some(mir::Type::Scalar(mir::ScalarType::Enum(enum_type.id)))
+            }
             ResolvedType::TypeParameter(name) => self
                 .type_substitutions
                 .get(name)
@@ -4593,6 +4786,7 @@ fn lower_increment_value(
             }))
         }
         mir::ScalarType::Bool => Err(vec![unsupported(span, "bool increment is invalid")]),
+        mir::ScalarType::Enum(_) => Err(vec![unsupported(span, "enum increment is invalid")]),
     }
 }
 
@@ -4700,7 +4894,28 @@ fn lower_string_expression(
             }
         }
         hir::Expr::Grouped { expr, .. } => lower_string_expression(expr, context),
-        hir::Expr::PropertyAccess { .. } => {
+        hir::Expr::PropertyAccess {
+            object, property, ..
+        } => {
+            if property == "value" {
+                if let mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) =
+                    context.expression_type(object)?
+                {
+                    if context
+                        .semantic_info
+                        .enums
+                        .get(enum_id.0)
+                        .is_some_and(|definition| {
+                            definition.backing_type == Some(crate::enums::EnumBackingType::String)
+                        })
+                    {
+                        return Ok(mir::StringExpression::EnumBacking {
+                            enum_id,
+                            value: Box::new(lower_enum_expression(object, enum_id, context)?),
+                        });
+                    }
+                }
+            }
             let (object, property) = lower_property_operand(expr, mir::Type::String, context)?;
             Ok(mir::StringExpression::Property { object, property })
         }
@@ -4833,6 +5048,14 @@ fn lower_nullable_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
+    if let Some((enum_id, value)) =
+        lower_nullable_enum_backing_receiver(expr, crate::enums::EnumBackingType::String, context)?
+    {
+        return Ok(mir::NullableStringExpression::EnumBacking {
+            enum_id,
+            value: Box::new(value),
+        });
+    }
     if let Some(call) = lower_string_intrinsic_call(expr, context) {
         let call = call?;
         if call.result != mir::Type::NullableString {
@@ -5123,6 +5346,16 @@ fn lower_nullable_scalar_expression(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if expected == mir::ScalarType::Integer(IntegerType::Int64) {
+        if let Some((enum_id, value)) =
+            lower_nullable_enum_backing_receiver(expr, crate::enums::EnumBackingType::Int, context)?
+        {
+            return Ok(mir::NullableScalarExpression::EnumBacking {
+                enum_id,
+                value: Box::new(value),
+            });
+        }
+    }
     if let Some(call) = lower_string_intrinsic_call(expr, context) {
         let call = call?;
         if call.result != mir::Type::NullableScalar(expected) {
@@ -5295,6 +5528,20 @@ fn lower_nullable_scalar_expression(
             member,
             span,
         } => {
+            if let mir::ScalarType::Enum(enum_id) = expected {
+                if let Some(value) = context.enum_case_value(class_name, member) {
+                    if value.enum_id != enum_id {
+                        return Err(vec![Diagnostic::new(
+                            "I2701",
+                            "enum case has a different nominal enum type",
+                            *span,
+                        )]);
+                    }
+                    return Ok(mir::NullableScalarExpression::Value(
+                        mir::ValueExpression::Enum(mir::EnumExpression::Case(value)),
+                    ));
+                }
+            }
             let (id, ty) = context.static_property(class_name, member, *span)?;
             match ty {
                 mir::Type::NullableScalar(actual) if actual == expected => {
@@ -5440,6 +5687,41 @@ fn lower_nullable_scalar_expression(
             Ok(mir::NullableScalarExpression::Value(value))
         }
     }
+}
+
+fn lower_nullable_enum_backing_receiver(
+    expr: &hir::Expr,
+    expected_backing: crate::enums::EnumBackingType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(crate::enums::EnumId, mir::NullableScalarExpression)>> {
+    let hir::Expr::PropertyAccess {
+        object,
+        property,
+        null_safe: true,
+        ..
+    } = expr
+    else {
+        return Ok(None);
+    };
+    if property != "value" {
+        return Ok(None);
+    }
+    let mir::Type::NullableScalar(mir::ScalarType::Enum(enum_id)) =
+        context.expression_type(object)?
+    else {
+        return Ok(None);
+    };
+    if context
+        .semantic_info
+        .enums
+        .get(enum_id.0)
+        .and_then(|definition| definition.backing_type)
+        != Some(expected_backing)
+    {
+        return Ok(None);
+    }
+    let value = lower_nullable_scalar_expression(object, mir::ScalarType::Enum(enum_id), context)?;
+    Ok(Some((enum_id, value)))
 }
 
 fn lower_nullable_class_expression(
@@ -6521,6 +6803,12 @@ fn lower_const_parameter_default(
                 operand: mir::Operand::Scalar(mir::ScalarValue::Bool(*value)),
             })
         }
+        (
+            crate::const_eval::ConstValue::Enum(value),
+            mir::Type::Scalar(mir::ScalarType::Enum(enum_id)),
+        ) if value.enum_id == enum_id => {
+            mir::ValueExpression::Enum(mir::EnumExpression::Case(*value))
+        }
         _ => {
             return Err(vec![Diagnostic::new(
                 "I2003",
@@ -6980,6 +7268,12 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
         ),
         mir::Type::Scalar(mir::ScalarType::Bool) => {
             mir::Rvalue::Value(mir::ValueExpression::Bool(mir::BoolExpression::Use {
+                operand: mir::Operand::Local(local),
+            }))
+        }
+        mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) => {
+            mir::Rvalue::Value(mir::ValueExpression::Enum(mir::EnumExpression::Use {
+                enum_id,
                 operand: mir::Operand::Local(local),
             }))
         }
@@ -8077,9 +8371,219 @@ fn lower_value_expression(
         | mir::Type::NullableScalar(mir::ScalarType::Bool) => {
             lower_condition(expr, context).map(mir::ValueExpression::Bool)
         }
+        mir::Type::Scalar(mir::ScalarType::Enum(enum_id))
+        | mir::Type::NullableScalar(mir::ScalarType::Enum(enum_id)) => {
+            lower_enum_expression(expr, enum_id, context).map(mir::ValueExpression::Enum)
+        }
         _ => Err(vec![unsupported(
             expr.span(),
             "this expression is not a scalar value",
+        )]),
+    }
+}
+
+fn lower_enum_expression(
+    expr: &hir::Expr,
+    enum_id: crate::enums::EnumId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::EnumExpression> {
+    if let Some(crate::const_eval::ConstValue::Enum(value)) = context.constant_value(expr) {
+        if value.enum_id == enum_id {
+            return Ok(mir::EnumExpression::Case(*value));
+        }
+    }
+    if let Some(value) = context
+        .semantic_info
+        .enum_case_values
+        .get(&(expr.span().start, expr.span().end))
+        .copied()
+    {
+        if value.enum_id != enum_id {
+            return Err(vec![Diagnostic::new(
+                "I2701",
+                "resolved enum case does not match its expression type",
+                expr.span(),
+            )]);
+        }
+        return Ok(mir::EnumExpression::Case(value));
+    }
+
+    match expr {
+        hir::Expr::Grouped { expr, .. } => lower_enum_expression(expr, enum_id, context),
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_enum_expression(left, enum_id, context),
+            CoalesceSelection::Right => lower_enum_expression(right, enum_id, context),
+            CoalesceSelection::Dynamic => Ok(mir::EnumExpression::Coalesce {
+                enum_id,
+                left: Box::new(lower_nullable_scalar_expression(
+                    left,
+                    mir::ScalarType::Enum(enum_id),
+                    context,
+                )?),
+                right: Box::new(lower_enum_expression(right, enum_id, context)?),
+            }),
+        },
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            let operand = match context.local_type(local) {
+                mir::Type::Scalar(mir::ScalarType::Enum(actual)) if actual == enum_id => {
+                    mir::Operand::Local(local)
+                }
+                mir::Type::NullableScalar(mir::ScalarType::Enum(actual)) if actual == enum_id => {
+                    mir::Operand::NullablePayload(local)
+                }
+                mir::Type::Mixed | mir::Type::NullableMixed
+                    if context
+                        .exact_mixed_local(expr)
+                        .is_some_and(|(_, narrowed)| {
+                            narrowed == mir::Type::Scalar(mir::ScalarType::Enum(enum_id))
+                        }) =>
+                {
+                    mir::Operand::MixedPayload {
+                        mixed: local,
+                        tag: mir::MixedTag::Enum(enum_id),
+                    }
+                }
+                _ => {
+                    return Err(vec![Diagnostic::new(
+                        "I2701",
+                        "enum local has inconsistent MIR type metadata",
+                        *span,
+                    )]);
+                }
+            };
+            Ok(mir::EnumExpression::Use { enum_id, operand })
+        }
+        hir::Expr::PropertyAccess { .. } => {
+            let (object, property) = lower_property_operand(
+                expr,
+                mir::Type::Scalar(mir::ScalarType::Enum(enum_id)),
+                context,
+            )?;
+            Ok(mir::EnumExpression::Use {
+                enum_id,
+                operand: mir::Operand::Property { object, property },
+            })
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::Scalar(mir::ScalarType::Enum(enum_id)),
+                context,
+            )?;
+            Ok(mir::EnumExpression::Use {
+                enum_id,
+                operand: mir::Operand::CollectionIndex {
+                    collection,
+                    index: Box::new(index),
+                    positional: false,
+                    remove: false,
+                },
+            })
+        }
+        hir::Expr::StaticMember {
+            class_name,
+            member,
+            span,
+        } => {
+            if let Some(value) = context.enum_case_value(class_name, member) {
+                if value.enum_id != enum_id {
+                    return Err(vec![Diagnostic::new(
+                        "I2701",
+                        "enum case has a different nominal enum type",
+                        *span,
+                    )]);
+                }
+                return Ok(mir::EnumExpression::Case(value));
+            }
+            let (id, ty) = context.static_property(class_name, member, *span)?;
+            if ty != mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) {
+                return Err(vec![Diagnostic::new(
+                    "I2701",
+                    "static property has a different enum type",
+                    *span,
+                )]);
+            }
+            Ok(mir::EnumExpression::Use {
+                enum_id,
+                operand: mir::Operand::Static(id),
+            })
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type
+                != mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Enum(enum_id)))
+            {
+                return Err(vec![Diagnostic::new(
+                    "I2701",
+                    format!("function `{name}` returns a different enum type"),
+                    *span,
+                )]);
+            }
+            Ok(mir::EnumExpression::Call {
+                enum_id,
+                function: signature.id,
+                args: lower_call_args(name, args, signature, *span, context)?,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        } => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            if signature.return_type
+                != mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Enum(enum_id)))
+            {
+                return Err(vec![Diagnostic::new(
+                    "I2701",
+                    "method returns a different enum type",
+                    *span,
+                )]);
+            }
+            Ok(mir::EnumExpression::Call {
+                enum_id,
+                function: signature.id,
+                args,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            if signature.return_type
+                != mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Enum(enum_id)))
+            {
+                return Err(vec![Diagnostic::new(
+                    "I2701",
+                    "static method returns a different enum type",
+                    *span,
+                )]);
+            }
+            Ok(mir::EnumExpression::Call {
+                enum_id,
+                function: signature.id,
+                args,
+            })
+        }
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this enum expression is not supported by native compilation",
         )]),
     }
 }
@@ -8099,6 +8603,11 @@ fn call_value_expression(
         mir::ScalarType::Bool => {
             mir::ValueExpression::Bool(mir::BoolExpression::Call { function, args })
         }
+        mir::ScalarType::Enum(enum_id) => mir::ValueExpression::Enum(mir::EnumExpression::Call {
+            enum_id,
+            function,
+            args,
+        }),
     }
 }
 
@@ -8114,6 +8623,9 @@ fn value_expression_from_operand(
             mir::ValueExpression::Float(mir::FloatExpression::Use { ty, operand })
         }
         mir::ScalarType::Bool => mir::ValueExpression::Bool(mir::BoolExpression::Use { operand }),
+        mir::ScalarType::Enum(enum_id) => {
+            mir::ValueExpression::Enum(mir::EnumExpression::Use { enum_id, operand })
+        }
     }
 }
 
@@ -8466,6 +8978,7 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         mir::Type::Scalar(mir::ScalarType::Bool) => Ok(mir::MixedTag::Bool),
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Ok(mir::MixedTag::Integer(ty)),
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Ok(mir::MixedTag::Float(ty)),
+        mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) => Ok(mir::MixedTag::Enum(enum_id)),
         mir::Type::String => Ok(mir::MixedTag::String),
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
@@ -9446,7 +9959,8 @@ fn materialize_nested_collection_places(
         | hir::Expr::Float { .. }
         | hir::Expr::Bool { .. }
         | hir::Expr::Null { .. }
-        | hir::Expr::StaticMember { .. } => {}
+        | hir::Expr::StaticMember { .. }
+        | hir::Expr::Match { .. } => {}
     }
     Ok(())
 }
@@ -13651,6 +14165,25 @@ fn lower_integer_expression(
         hir::Expr::PropertyAccess {
             object, property, ..
         } => {
+            if property == "value" {
+                if let mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) =
+                    context.expression_type(object)?
+                {
+                    if context
+                        .semantic_info
+                        .enums
+                        .get(enum_id.0)
+                        .is_some_and(|definition| {
+                            definition.backing_type == Some(crate::enums::EnumBackingType::Int)
+                        })
+                    {
+                        return Ok(mir::IntegerExpression::EnumBacking {
+                            enum_id,
+                            value: Box::new(lower_enum_expression(object, enum_id, context)?),
+                        });
+                    }
+                }
+            }
             if matches!(property.as_str(), "length" | "count") {
                 if let Ok((collection, _)) = lower_collection_local(object, context) {
                     return Ok(mir::IntegerExpression::Use {
@@ -13928,6 +14461,10 @@ fn lower_compound_value(
             Span::default(),
             "bool compound assignment is invalid",
         )]),
+        mir::ScalarType::Enum(_) => Err(vec![unsupported(
+            Span::default(),
+            "enum compound assignment is invalid",
+        )]),
     }
 }
 
@@ -14031,6 +14568,7 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
         hir::Expr::Identifier { .. } => "this identifier cannot be used as an integer expression",
         hir::Expr::Unary { .. } => "this unary expression cannot be used as an integer expression",
         hir::Expr::Range { .. } => "a range cannot be used as an integer expression",
+        hir::Expr::Match { .. } => "a match expression cannot be used before Stage 28",
         hir::Expr::Binary {
             op:
                 hir::BinaryOp::Equal

@@ -370,7 +370,11 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     }
                 }
             }
-            Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
+            Item::Enum(_)
+            | Item::Interface(_)
+            | Item::Trait(_)
+            | Item::Constant(_)
+            | Item::Statement(_) => {}
         }
     }
 
@@ -435,7 +439,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     }
                 }
             }
-            Item::Interface(_) | Item::Trait(_) | Item::Constant(_) => {}
+            Item::Enum(_) | Item::Interface(_) | Item::Trait(_) | Item::Constant(_) => {}
             Item::Statement(statement) => {
                 if top_level_falls_through {
                     top_level_falls_through = checker
@@ -2142,6 +2146,7 @@ impl Checker<'_> {
             | Expr::Int { .. }
             | Expr::Float { .. }
             | Expr::Bool { .. }
+            | Expr::Match { .. }
             | Expr::Null { .. } => {}
         }
     }
@@ -3440,6 +3445,7 @@ fn expr_uses_variable(expr: &Expr, name: &str) -> bool {
         | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Null { .. }
+        | Expr::Match { .. }
         | Expr::StaticMember { .. } => false,
     }
 }

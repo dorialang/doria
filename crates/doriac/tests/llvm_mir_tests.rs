@@ -47,9 +47,65 @@ fn lowers_complete_stage_14_mir_shapes_to_verified_objects() {
 }
 
 #[test]
+fn enum_ir_preserves_inline_tags_backings_nullability_and_mixed_identity() {
+    let source = r#"
+enum Status { case Draft; case Published; }
+enum Priority: int { case Low = 1; case High = 10; }
+enum Transport: string { case Road = "road"; case Rail = "rail"; }
+function main(): void
+{
+    Status $status = Status::Draft;
+    Priority $priority = Priority::High;
+    Transport $transport = Transport::Rail;
+    ?Status $nullable = Status::Draft;
+    mixed $boxed = Status::Draft;
+    echo $status == Status::Draft;
+    echo $priority->value;
+    echo $transport->value;
+    echo $nullable != null;
+    echo $boxed is Status;
+}
+"#;
+    let program = doriac::lower_source_to_mir("llvm-enum.doria", source)
+        .expect("enum source should lower to validated MIR");
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
+        .expect("enum MIR should lower to LLVM IR");
+
+    assert!(
+        ir.contains("icmp eq i32"),
+        "enum equality is not a tag comparison:\n{ir}"
+    );
+    assert!(
+        ir.contains("enum.backing.value"),
+        "int backing is not selected in O(1):\n{ir}"
+    );
+    assert!(
+        ir.contains("enum.backing.string"),
+        "string backing has no static-data selection:\n{ir}"
+    );
+    assert!(
+        ir.contains("__doria_string_"),
+        "string backing bytes are not module data:\n{ir}"
+    );
+    assert!(
+        ir.contains("mixed.type.matches"),
+        "mixed enum narrowing ignores nominal identity:\n{ir}"
+    );
+    assert!(
+        ir.contains("{ i64, i32 }") || ir.contains("{ i8, i32 }") || ir.contains("{ i1, i32 }"),
+        "nullable enum lacks a separate presence field:\n{ir}"
+    );
+    assert!(
+        !ir.contains("dr_v1_enum_"),
+        "unit/backed enums gained a runtime allocation API:\n{ir}"
+    );
+}
+
+#[test]
 fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
     let program = Program {
         source: doriac::source::SourceFile::new("llvm-test.doria", ""),
+        enums: vec![],
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
