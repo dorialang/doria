@@ -93,6 +93,8 @@ final class SortedDictionary extends __DoriaOrderedCollection implements ArrayAc
         return $value;
     }
 
+    public function clear(): void { $this->entries = []; }
+
     public function __get(string $name): mixed
     {
         if ($name === 'count') { return count($this->entries); }
@@ -162,6 +164,8 @@ final class SortedSet extends __DoriaOrderedCollection implements IteratorAggreg
     }
 
     public function contains(mixed $value): bool { return $this->locate($value)[0]; }
+
+    public function clear(): void { $this->values = []; }
 
     private function algebra(self $other, string $operation): self
     {
@@ -236,6 +240,7 @@ final class PriorityQueue extends __DoriaOrderedCollection
         if ($this->heap) { $this->heap[0] = $last; $this->siftDown(0); }
         return $value;
     }
+    public function clear(): void { $this->heap = []; }
     public function __get(string $name): mixed
     {
         if ($name === 'count') { return count($this->heap); }
@@ -297,6 +302,12 @@ final class Deque implements IteratorAggregate
         unset($this->values[$index]);
         --$this->count;
         return $value;
+    }
+    public function clear(): void
+    {
+        $this->values = [];
+        $this->head = 0;
+        $this->count = 0;
     }
     public function __get(string $name): mixed
     {

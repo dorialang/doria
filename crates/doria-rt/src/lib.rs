@@ -382,6 +382,18 @@ pub unsafe extern "C" fn dr_v1_collection_free(collection: *mut DrCollectionV1) 
     collection::free(collection)
 }
 
+/// Resets a growable collection after generated type-aware drop glue has
+/// released all live keys and values. The collection allocation is retained.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live named collection. Every live
+/// owned key and value must already have been released exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_reset_after_cleanup(collection: *mut DrCollectionV1) {
+    collection::reset_after_cleanup(collection)
+}
+
 /// # Safety
 ///
 /// `collection` must point to a live collection allocation.

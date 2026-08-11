@@ -1314,6 +1314,36 @@ fn validate_statement(
             validate_rvalue(program, function, index)?;
             validate_rvalue(program, function, value)
         }
+        mir::Statement::CollectionClear {
+            collection,
+            collection_type,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(found) = local.ty else {
+                return Err(malformed_mir(
+                    "collection clear targets a non-collection or nullable local",
+                ));
+            };
+            if found != *collection_type {
+                return Err(malformed_mir("collection clear type mismatch"));
+            }
+            if !local.writable {
+                return Err(malformed_mir(format!(
+                    "collection clear uses readonly local{}",
+                    local.id.0
+                )));
+            }
+            let definition = collection_in(program, *collection_type)?;
+            if matches!(
+                definition.kind,
+                mir::CollectionKind::Bytes | mir::CollectionKind::TypedArray
+            ) {
+                return Err(malformed_mir(
+                    "collection clear requires a named growable collection",
+                ));
+            }
+            Ok(())
+        }
         mir::Statement::DropCollection { local, collection } => {
             let definition = local_in(function, *local)?;
             if !matches!(
@@ -5826,6 +5856,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
             collect_rvalue_class_local_accesses(index, &mut accesses);
             collect_rvalue_class_local_accesses(value, &mut accesses);
         }
+        mir::Statement::CollectionClear { .. } => {}
         mir::Statement::EchoStringLiteral(_)
         | mir::Statement::DropClass { .. }
         | mir::Statement::DropString { .. }
@@ -7220,6 +7251,7 @@ fn statement_observes_property(
         | mir::Statement::DropClass { .. }
         | mir::Statement::DropString { .. }
         | mir::Statement::DropMixed { .. }
+        | mir::Statement::CollectionClear { .. }
         | mir::Statement::DropCollection { .. }
         | mir::Statement::DropSharedReference { .. }
         | mir::Statement::DropWeakReference { .. }

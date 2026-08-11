@@ -35,17 +35,18 @@ use crate::native_abi::{
     COLLECTION_LENGTH, COLLECTION_LENGTH_FIELD, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS,
     COLLECTION_PUSH, COLLECTION_PUSH_FRONT, COLLECTION_PUSH_FRONT_NULLABLE,
     COLLECTION_PUSH_NULLABLE, COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT,
-    COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE,
-    COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW,
-    COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
-    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
-    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
-    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
-    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
-    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
-    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE,
-    SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK,
-    SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    COLLECTION_REMOVE_VALUE, COLLECTION_RESET_AFTER_CLEANUP, COLLECTION_SET_ALGEBRA,
+    COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE,
+    COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW, COLLECTION_VALUES_FIELD,
+    COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
+    FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED,
+    MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS,
+    MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64,
+    MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64,
+    MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE,
+    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE,
+    SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
+    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
     STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
     STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
     STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
@@ -834,6 +835,12 @@ enum CollectionMemoryRegion {
     Values,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollectionStorageAction {
+    Free,
+    Reset,
+}
+
 #[derive(Clone, Copy)]
 enum DeferredOwnedTemporary {
     Class(crate::class_layout::ClassId),
@@ -1373,6 +1380,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 index: key,
                 value,
             } => self.lower_collection_set(*collection, key, value, *positional)?,
+            mir::Statement::CollectionClear {
+                collection,
+                collection_type,
+            } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let slot = local_slot(&self.local_slots, *collection)?;
+                let value = build(self.builder.build_load(pointer, slot, "collection.clear"))?
+                    .into_pointer_value();
+                self.clear_collection_value(value, *collection_type)?;
+            }
             mir::Statement::DropCollection { local, collection } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let slot = local_slot(&self.local_slots, *local)?;
@@ -3733,6 +3750,23 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         collection: PointerValue<'ctx>,
         collection_type: mir::CollectionTypeId,
     ) -> Result<(), BackendError> {
+        self.finish_collection_value(collection, collection_type, CollectionStorageAction::Free)
+    }
+
+    fn clear_collection_value(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        collection_type: mir::CollectionTypeId,
+    ) -> Result<(), BackendError> {
+        self.finish_collection_value(collection, collection_type, CollectionStorageAction::Reset)
+    }
+
+    fn finish_collection_value(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        collection_type: mir::CollectionTypeId,
+        action: CollectionStorageAction,
+    ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         let definition = self.collection_definition(collection_type)?.clone();
@@ -3751,6 +3785,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         )?;
         self.builder.position_at_end(drop_block);
         if definition.kind == mir::CollectionKind::Bytes {
+            if action != CollectionStorageAction::Free {
+                return Err(malformed_mir(
+                    "Bytes cannot be cleared as a named collection",
+                ));
+            }
             let _ = self.call_runtime(BYTES_FREE, &[pointer.into()], None, &[collection.into()])?;
             build(self.builder.build_unconditional_branch(done))?;
             self.builder.position_at_end(done);
@@ -3764,12 +3803,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .key
             .is_none_or(|key| matches!(key, mir::Type::Scalar(_)));
         if scalar_values && scalar_keys {
-            let _ = self.call_runtime(
-                COLLECTION_FREE,
-                &[pointer.into()],
-                None,
-                &[collection.into()],
-            )?;
+            let symbol = match action {
+                CollectionStorageAction::Free => COLLECTION_FREE,
+                CollectionStorageAction::Reset => COLLECTION_RESET_AFTER_CLEANUP,
+            };
+            let _ = self.call_runtime(symbol, &[pointer.into()], None, &[collection.into()])?;
             build(self.builder.build_unconditional_branch(done))?;
             self.builder.position_at_end(done);
             return Ok(());
@@ -3843,12 +3881,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         build(self.builder.build_store(index_slot, current))?;
         build(self.builder.build_unconditional_branch(header))?;
         self.builder.position_at_end(free);
-        let _ = self.call_runtime(
-            COLLECTION_FREE,
-            &[pointer.into()],
-            None,
-            &[collection.into()],
-        )?;
+        let symbol = match action {
+            CollectionStorageAction::Free => COLLECTION_FREE,
+            CollectionStorageAction::Reset => COLLECTION_RESET_AFTER_CLEANUP,
+        };
+        let _ = self.call_runtime(symbol, &[pointer.into()], None, &[collection.into()])?;
         build(self.builder.build_unconditional_branch(done))?;
         self.builder.position_at_end(done);
         Ok(())

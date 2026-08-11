@@ -42,14 +42,12 @@ pub enum ArgumentShape {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImplementationStatus {
     Executable,
-    PendingSlice4,
 }
 
 impl ImplementationStatus {
     pub const fn slice(self) -> Option<u8> {
         match self {
             Self::Executable => None,
-            Self::PendingSlice4 => Some(4),
         }
     }
 }
@@ -369,22 +367,6 @@ pub fn canonical_property_status(
         (PriorityQueue, "peek") => Some(Executable),
         (Deque, "peekFront" | "peekBack") => Some(Executable),
         (Set | SortedSet, "first" | "last") => Some(Executable),
-        _ => None,
-    }
-}
-
-pub fn pending_method_status(
-    receiver: CollectionReceiver,
-    member: &str,
-) -> Option<ImplementationStatus> {
-    use CollectionReceiver::*;
-    use ImplementationStatus::*;
-
-    match (receiver, member) {
-        (
-            List | Dictionary | Set | SortedDictionary | SortedSet | PriorityQueue | Deque,
-            "clear",
-        ) => Some(PendingSlice4),
         _ => None,
     }
 }

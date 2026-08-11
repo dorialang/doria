@@ -19,7 +19,8 @@ Decision 0113 Slice 3 adds explicit shared MIR for value-axis membership and
 nullable first-position search, reuses the existing first-match removal and
 nullable endpoint paths, and registers
 `main_stage26_collection_slice3.doria` for exact triple-backend parity. Slice 4
-`clear()` still stops before MIR with E0559.
+adds backend-neutral in-place collection clearing and registers
+`main_collection_clear.doria`; no Decision 0113 member remains behind E0559.
 
 | Feature / example | MIR interpreter | Cranelift fast | LLVM release | Status | Notes |
 | --- | --- | --- | --- | --- | --- |
@@ -79,6 +80,7 @@ nullable endpoint paths, and registers
 | Readonly shared ownership | Covered | Covered | Covered | Covered | `SharedReference<T>`, `WeakReference<T>`, nullable acquisition, forwarding, generic/property/collection storage, exact `referencedValue` collision projection, weak expiry, and final-strong destruction use a separate non-atomic control block without changing class payload layout. |
 | Writable shared ownership and access | Covered | Covered | Covered | Covered | Concrete/generic class, `T[]`, `List`, `Dictionary`, `Set`, and `Bytes` payloads; disjoint strong/weak families; weak-cycle breaking; owned access objects; three exact P1501 conflict reasons; forwarding; bounded stress; and deterministic access-before-strong release share one validated MIR/runtime contract. |
 | Decision 0113 Slice 3 collection members | Covered | Covered | Covered | Covered | First-match nullable `List::indexOf`, first-match writable `List::remove`, nullable map value membership, insertion-ordered `Set` endpoints, and ascending `SortedSet` endpoints preserve exact stdout, stderr, and status through one validated MIR contract. |
+| Decision 0113 Slice 4 collection clear | Covered | Covered | Covered | Covered | All seven named collections clear in place, invalidate old membership state, survive double clear, and preserve reuse order through one validated MIR statement and runtime reset contract. |
 | Runtime panic diagnostic outcome | Covered | Covered | Covered | Covered | Catalogued `P` code, Title Case title, precise Doria source label, `Why`, `Call Path`, stderr bytes, and status 101 remain exact across the durable manifest. |
 | `take` ownership transfer | Covered | Covered | Covered | Covered | Transfer invalidates the caller slot and cleanup becomes the callee's obligation. |
 | Property loads and Stage 19 assignments | Covered | Covered | Covered | Covered | Shared class metadata supplies checked types and compiler-known offsets. |

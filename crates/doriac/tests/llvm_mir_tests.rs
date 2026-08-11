@@ -215,7 +215,7 @@ fn scan_alloca_placement(ir: &str) -> AllocaPlacement {
 /// how many times the surrounding code runs.
 #[test]
 fn allocates_every_scratch_slot_in_the_entry_block() {
-    let sources: [&str; 6] = [
+    let sources: [&str; 7] = [
         // Dictionary get, set, index, and remove: the shape that first failed.
         r#"
 function main(): void
@@ -302,6 +302,19 @@ function main(): void
     echo "{$total}\n";
 }
 "#,
+        // Collection clear uses the same release loop repeatedly; its index
+        // scratch must remain in the fixed entry frame.
+        r#"
+function main(): void
+{
+    writable List<string> $values = [];
+    for (let writable $index = 0; $index < 8; $index++) {
+        $values->add("value{$index}");
+        $values->clear();
+    }
+    echo "{$values->count}\n";
+}
+"#,
         // Class temporaries allocated in a loop body.
         r#"
 class Point
@@ -346,6 +359,59 @@ function main(): void
             placement.escaped.join("\n")
         );
     }
+}
+
+#[test]
+fn collection_clear_uses_reset_and_type_aware_release_paths() {
+    let program = doriac::lower_source_to_mir(
+        "llvm-clear.doria",
+        r#"
+function main(): void
+{
+    writable List<int> $scalars = [1, 2];
+    $scalars->clear();
+    writable List<string> $strings = ["one", "two"];
+    $strings->clear();
+}
+"#,
+    )
+    .expect("collection clear should lower to MIR");
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
+        .expect("collection clear should lower to LLVM IR");
+    let first_clear = ir
+        .find("%collection.clear = load")
+        .expect("fixture must emit the scalar clear receiver load");
+    let after_first_clear = &ir[first_clear..];
+    let reset = after_first_clear
+        .find("dr_v2_collection_reset_after_cleanup")
+        .expect("clear must reset the retained collection allocation");
+    let free = after_first_clear
+        .find("dr_v1_collection_free")
+        .expect("later cleanup must free a collection allocation");
+    assert!(
+        reset < free,
+        "clear must reset before the later scope-exit drop frees the allocation"
+    );
+    assert!(
+        ir.contains("collection.drop.body"),
+        "owned clear needs release iteration"
+    );
+    let placement = scan_alloca_placement(&ir);
+    assert!(placement.escaped.is_empty(), "{:#?}", placement.escaped);
+
+    let bytes = doriac::lower_source_to_mir(
+        "llvm-bytes-drop.doria",
+        r#"
+function main(): void
+{
+    Bytes $contents = read_stdin_bytes();
+    write_stdout_bytes($contents);
+}
+"#,
+    )
+    .expect("Bytes drop fixture should lower to MIR");
+    doriac::codegen_llvm::lower_mir_to_llvm_ir(&bytes)
+        .expect("ordinary Bytes drops must keep the free path");
 }
 
 /// Guards the scanner itself. The fixture carries the `; preds = ...` comments

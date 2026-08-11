@@ -14,6 +14,81 @@ use doriac::mir::{
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
 #[test]
+fn shared_validator_rejects_malformed_collection_clear_shapes() {
+    let source = r#"
+function main(): void
+{
+    writable List<int> $values = [1, 2];
+    $values->clear();
+}
+"#;
+    let valid = doriac::lower_source_to_mir("clear.doria", source)
+        .expect("valid collection clear should lower");
+    doriac::mir_validation::validate_program(&valid)
+        .expect("valid collection clear MIR should validate");
+
+    for kind in [CollectionKind::TypedArray, CollectionKind::Bytes] {
+        let mut malformed = valid.clone();
+        malformed.collection_types[0].kind = kind;
+        let error = doriac::mir_validation::validate_program(&malformed)
+            .expect_err("fixed and byte collections cannot be cleared");
+        assert!(
+            error.message.contains("collection"),
+            "unexpected malformed clear diagnostic: {}",
+            error.message
+        );
+    }
+
+    let mut mismatched = valid.clone();
+    mismatched.collection_types.push(CollectionType {
+        id: CollectionTypeId(1),
+        kind: CollectionKind::Set,
+        key: None,
+        value: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
+        comparator: None,
+    });
+    let clear = mismatched.functions[0].blocks[0]
+        .statements
+        .iter_mut()
+        .find_map(|statement| match statement {
+            Statement::CollectionClear {
+                collection_type, ..
+            } => Some(collection_type),
+            _ => None,
+        })
+        .expect("clear statement should exist");
+    *clear = CollectionTypeId(1);
+    assert!(doriac::mir_validation::validate_program(&mismatched)
+        .expect_err("clear type identity must match the receiver")
+        .message
+        .contains("type mismatch"));
+
+    let local = valid.functions[0].blocks[0]
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            Statement::CollectionClear { collection, .. } => Some(*collection),
+            _ => None,
+        })
+        .expect("clear statement should exist");
+
+    let mut nullable = valid.clone();
+    nullable.functions[0].locals[local.0].ty = Type::NullableCollection(CollectionTypeId(0));
+    doriac::mir_validation::validate_program(&nullable)
+        .expect_err("clear requires a proven-present receiver");
+
+    let mut scalar = valid.clone();
+    scalar.functions[0].locals[local.0].ty = Type::Scalar(ScalarType::Integer(IntegerType::Int64));
+    doriac::mir_validation::validate_program(&scalar)
+        .expect_err("clear requires a collection receiver");
+
+    let mut readonly = valid;
+    readonly.functions[0].locals[local.0].writable = false;
+    doriac::mir_validation::validate_program(&readonly)
+        .expect_err("clear requires a writable local");
+}
+
+#[test]
 fn shared_validator_rejects_malformed_list_index_of_shapes() {
     let source = r#"
 function main(): void

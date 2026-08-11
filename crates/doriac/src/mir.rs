@@ -2977,6 +2977,10 @@ pub enum Statement {
         positional: bool,
         value: Rvalue,
     },
+    CollectionClear {
+        collection: LocalId,
+        collection_type: CollectionTypeId,
+    },
     DropCollection {
         local: LocalId,
         collection: CollectionTypeId,
@@ -3047,6 +3051,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropSharedReferenceAccess { .. }
         | Statement::DropString { .. }
         | Statement::DropMixed { .. }
+        | Statement::CollectionClear { .. }
         | Statement::DropCollection { .. }
         | Statement::WriteStreamBytes { .. } => 0,
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
@@ -4991,6 +4996,14 @@ impl fmt::Display for Statement {
                 index,
                 value,
             } => write!(formatter, "local{}[{index}] = {value}", collection.0),
+            Statement::CollectionClear {
+                collection,
+                collection_type,
+            } => write!(
+                formatter,
+                "clear collection#{} local{}",
+                collection_type.0, collection.0
+            ),
             Statement::DropCollection { local, collection } => {
                 write!(
                     formatter,

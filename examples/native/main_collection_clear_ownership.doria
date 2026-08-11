@@ -1,0 +1,70 @@
+class Token
+{
+    function __construct(string $label)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->label}\n";
+    }
+}
+
+function clearList(): void
+{
+    writable List<Token> $values = [new Token("list-a"), new Token("list-b")];
+    $values->clear();
+    $values->clear();
+    $values->add(new Token("list-new"));
+}
+
+function clearDictionary(): void
+{
+    writable Dictionary<string, Token> $values = [
+        "one" => new Token("dictionary-a"),
+        "two" => new Token("dictionary-b"),
+    ];
+    $values->clear();
+    $values->set("new", new Token("dictionary-new"));
+}
+
+function clearWrappedDeque(): void
+{
+    writable Deque<Token> $values = Deque::from([]);
+    $values->pushBack(new Token("deque-removed"));
+    $values->pushBack(new Token("deque-a"));
+    $values->pushBack(new Token("deque-b"));
+    let $removed = $values->popFront();
+    $values->pushBack(new Token("deque-c"));
+    $values->pushBack(new Token("deque-d"));
+    $values->clear();
+}
+
+function clearNestedAndNullable(): void
+{
+    writable List<List<Token>> $nested = [[new Token("nested")]];
+    $nested->clear();
+
+    writable List<?Token> $nullable = [null, new Token("nullable")];
+    $nullable->clear();
+}
+
+function clearMixedAndShared(): void
+{
+    writable List<mixed> $mixedValues = [new Token("mixed")];
+    $mixedValues->clear();
+
+    writable List<SharedReference<Token>> $sharedValues = [
+        shared new Token("shared"),
+    ];
+    $sharedValues->clear();
+}
+
+function main(): void
+{
+    clearList();
+    clearDictionary();
+    clearWrappedDeque();
+    clearNestedAndNullable();
+    clearMixedAndShared();
+}

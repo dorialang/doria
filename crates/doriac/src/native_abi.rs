@@ -117,6 +117,7 @@ pub const COLLECTION_STAGE26_FROM_COPY: &str = "dr_v2_collection_from_copy";
 pub const COLLECTION_FILL_WORD: &str = "dr_v2_collection_fill_word";
 pub const COLLECTION_FILL_STRING: &str = "dr_v2_collection_fill_string";
 pub const COLLECTION_FREE: &str = "dr_v1_collection_free";
+pub const COLLECTION_RESET_AFTER_CLEANUP: &str = "dr_v2_collection_reset_after_cleanup";
 pub const COLLECTION_LENGTH: &str = "dr_v1_collection_length";
 pub const COLLECTION_PUSH: &str = "dr_v1_collection_push";
 pub const COLLECTION_PUSH_NULLABLE: &str = "dr_v2_collection_push_nullable";

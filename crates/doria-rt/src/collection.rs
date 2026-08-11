@@ -419,6 +419,18 @@ pub unsafe fn free(collection: *mut DrCollectionV1) {
     deallocate(collection.cast::<u8>());
 }
 
+/// Resets a live growable collection after generated drop glue has released
+/// every logical key and value. Primary storage and collection identity remain
+/// intact; this function never interprets or releases Doria values.
+pub unsafe fn reset_after_cleanup(collection: *mut DrCollectionV1) {
+    if collection.is_null() || (*collection).fixed != 0 {
+        collection_panic(b"P1001");
+    }
+    (*collection).length = 0;
+    (*collection).head = 0;
+    index_discard(collection);
+}
+
 pub unsafe fn length(collection: *const DrCollectionV1) -> usize {
     (*collection).length
 }
@@ -1748,6 +1760,103 @@ mod tests {
     use super::*;
     use std::cmp::Reverse;
     use std::collections::{BTreeMap, BTreeSet, BinaryHeap, VecDeque};
+
+    #[test]
+    fn reset_retains_storage_and_discards_membership_state() {
+        unsafe {
+            let collection = new(0, true, false, 8);
+            let mut replaced = 0;
+            keyed_set(collection, 10, 100, COMPARE_UNSIGNED_64, &mut replaced);
+            keyed_set(collection, 20, 200, COMPARE_UNSIGNED_64, &mut replaced);
+            assert!(keyed_has(collection, 10, COMPARE_UNSIGNED_64));
+            assert!(
+                !(*collection).index.is_null(),
+                "membership index should exist"
+            );
+            let keys = (*collection).keys;
+            let values = (*collection).values;
+            let capacity = (*collection).capacity;
+
+            reset_after_cleanup(collection);
+            assert_eq!((*collection).length, 0);
+            assert_eq!((*collection).head, 0);
+            assert!((*collection).index.is_null());
+            assert_eq!((*collection).index_slots, 0);
+            assert_eq!((*collection).keys, keys);
+            assert_eq!((*collection).values, values);
+            assert_eq!((*collection).capacity, capacity);
+            assert!(!keyed_has(collection, 10, COMPARE_UNSIGNED_64));
+
+            keyed_set(collection, 10, 300, COMPARE_UNSIGNED_64, &mut replaced);
+            assert_eq!(replaced, 0);
+            assert!(keyed_has(collection, 10, COMPARE_UNSIGNED_64));
+            reset_after_cleanup(collection);
+            reset_after_cleanup(collection);
+            assert_eq!((*collection).length, 0);
+            free(collection);
+        }
+    }
+
+    #[test]
+    fn reset_canonicalizes_wrapped_deque_and_preserves_ordered_state() {
+        unsafe {
+            let deque = new_stage26(0, false, 8, KIND_DEQUE, COMPARE_SIGNED_64);
+            finalize_stage26(deque);
+            for value in [10, 20, 30, 40] {
+                push(deque, value);
+            }
+            let mut found = 0;
+            assert_eq!(pop_front(deque, &mut found), 10);
+            assert_eq!(pop_front(deque, &mut found), 20);
+            push(deque, 50);
+            push(deque, 60);
+            assert_ne!((*deque).head, 0, "deque should be physically wrapped");
+            reset_after_cleanup(deque);
+            assert_eq!(((*deque).length, (*deque).head), (0, 0));
+            push_front(deque, 2);
+            push(deque, 3);
+            assert_eq!(pop_front(deque, &mut found), 2);
+            assert_eq!(pop(deque, &mut found), 3);
+            free(deque);
+
+            for (kind, keyed) in [
+                (KIND_SORTED_DICTIONARY, true),
+                (KIND_SORTED_SET, false),
+                (KIND_PRIORITY_QUEUE, false),
+            ] {
+                let collection = new_stage26(0, keyed, 8, kind, COMPARE_SIGNED_64);
+                finalize_stage26(collection);
+                if keyed {
+                    let mut replaced = 0;
+                    keyed_set(collection, 30, 300, COMPARE_SIGNED_64, &mut replaced);
+                    keyed_set(collection, 10, 100, COMPARE_SIGNED_64, &mut replaced);
+                } else if kind == KIND_SORTED_SET {
+                    push_unique(collection, 30, true, COMPARE_SIGNED_64);
+                    push_unique(collection, 10, true, COMPARE_SIGNED_64);
+                } else {
+                    push(collection, 30);
+                    push(collection, 10);
+                }
+                reset_after_cleanup(collection);
+                assert_eq!((*collection).finalized, 1);
+                if keyed {
+                    let mut replaced = 0;
+                    keyed_set(collection, 20, 200, COMPARE_SIGNED_64, &mut replaced);
+                    keyed_set(collection, 5, 50, COMPARE_SIGNED_64, &mut replaced);
+                    assert_eq!(*(*collection).keys, 5);
+                } else if kind == KIND_SORTED_SET {
+                    push_unique(collection, 20, true, COMPARE_SIGNED_64);
+                    push_unique(collection, 5, true, COMPARE_SIGNED_64);
+                    assert_eq!(read_value(collection, 0), 5);
+                } else {
+                    push(collection, 20);
+                    push(collection, 5);
+                    assert_eq!(read_value(collection, 0), 5);
+                }
+                free(collection);
+            }
+        }
+    }
 
     /// `fill_values` replaced a `write_value` loop, so it has to agree with one
     /// element for element at every width.

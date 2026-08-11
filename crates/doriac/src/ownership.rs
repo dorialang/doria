@@ -117,6 +117,8 @@ enum CollectionFamily {
     List,
     Dictionary,
     Set,
+    PriorityQueue,
+    Deque,
     Bytes,
 }
 
@@ -2781,6 +2783,8 @@ impl Checker<'_> {
                         (collection.family, method.as_str()),
                         (CollectionFamily::List, "removeAt" | "pop")
                             | (CollectionFamily::Dictionary, "remove")
+                            | (CollectionFamily::PriorityQueue, "pop")
+                            | (CollectionFamily::Deque, "popFront" | "popBack")
                     ) && collection.value_move
                         || matches!(
                             (collection.family, method.as_str()),
@@ -2817,8 +2821,10 @@ impl Checker<'_> {
                 object, property, ..
             } => {
                 if let Some(collection) = self.expr_collection_info(object, scopes) {
-                    return collection.family == CollectionFamily::List
-                        && matches!(property.as_str(), "first" | "last")
+                    return matches!(
+                        collection.family,
+                        CollectionFamily::List | CollectionFamily::Set
+                    ) && matches!(property.as_str(), "first" | "last")
                         && collection.value_move;
                 }
                 let Some(class) = self.expr_class(object, scopes) else {
@@ -2858,8 +2864,10 @@ impl Checker<'_> {
             return true;
         }
         if let Some(collection) = self.expr_collection_info(object, scopes) {
-            return collection.family == CollectionFamily::List
-                && matches!(property.as_str(), "first" | "last")
+            return matches!(
+                collection.family,
+                CollectionFamily::List | CollectionFamily::Set
+            ) && matches!(property.as_str(), "first" | "last")
                 && collection.value_move;
         }
         let Some(class) = self.expr_class(object, scopes) else {
@@ -2912,8 +2920,10 @@ impl Checker<'_> {
             } => self
                 .expr_collection_info(object, scopes)
                 .is_some_and(|collection| {
-                    collection.family == CollectionFamily::List
-                        && collection.value_move
+                    matches!(
+                        collection.family,
+                        CollectionFamily::List | CollectionFamily::Set
+                    ) && collection.value_move
                         && matches!(property.as_str(), "first" | "last")
                 }),
             _ => false,
@@ -3145,9 +3155,14 @@ impl Checker<'_> {
             (collection, method),
             (
                 CollectionFamily::List,
-                "add" | "insertAt" | "removeAt" | "pop"
-            ) | (CollectionFamily::Dictionary, "set" | "remove")
-                | (CollectionFamily::Set, "add" | "remove")
+                "add" | "insertAt" | "removeAt" | "pop" | "clear"
+            ) | (CollectionFamily::Dictionary, "set" | "remove" | "clear")
+                | (CollectionFamily::Set, "add" | "remove" | "clear")
+                | (CollectionFamily::PriorityQueue, "push" | "pop" | "clear")
+                | (
+                    CollectionFamily::Deque,
+                    "pushFront" | "pushBack" | "popFront" | "popBack" | "clear"
+                )
         );
         self.use_expr(
             object,
@@ -3166,6 +3181,8 @@ impl Checker<'_> {
                     | (CollectionFamily::List, "insertAt", 1)
                     | (CollectionFamily::Dictionary, "set", 0 | 1)
                     | (CollectionFamily::Set, "add", 0)
+                    | (CollectionFamily::PriorityQueue, "push", 0)
+                    | (CollectionFamily::Deque, "pushFront" | "pushBack", 0)
             );
             if moves_in {
                 self.use_owned_expression(&argument.value, scopes);
@@ -3448,7 +3465,11 @@ fn resolved_type_is_move_type(ty: &crate::types::ResolvedType) -> bool {
         | crate::types::ResolvedType::TypedArray(_)
         | crate::types::ResolvedType::List(_)
         | crate::types::ResolvedType::Dictionary(_, _)
-        | crate::types::ResolvedType::Set(_) => true,
+        | crate::types::ResolvedType::SortedDictionary(_, _)
+        | crate::types::ResolvedType::Set(_)
+        | crate::types::ResolvedType::SortedSet(_)
+        | crate::types::ResolvedType::PriorityQueue(_)
+        | crate::types::ResolvedType::Deque(_) => true,
         crate::types::ResolvedType::Nullable(inner) => resolved_type_is_move_type(inner),
         _ => false,
     }
@@ -3472,8 +3493,14 @@ fn resolved_type_requires_conservative_move(ty: &crate::types::ResolvedType) -> 
         crate::types::ResolvedType::Nullable(inner)
         | crate::types::ResolvedType::TypedArray(inner)
         | crate::types::ResolvedType::List(inner)
-        | crate::types::ResolvedType::Set(inner) => resolved_type_requires_conservative_move(inner),
-        crate::types::ResolvedType::Dictionary(key, value) => {
+        | crate::types::ResolvedType::Set(inner)
+        | crate::types::ResolvedType::SortedSet(inner)
+        | crate::types::ResolvedType::PriorityQueue(inner)
+        | crate::types::ResolvedType::Deque(inner) => {
+            resolved_type_requires_conservative_move(inner)
+        }
+        crate::types::ResolvedType::Dictionary(key, value)
+        | crate::types::ResolvedType::SortedDictionary(key, value) => {
             resolved_type_requires_conservative_move(key)
                 || resolved_type_requires_conservative_move(value)
         }
@@ -3502,8 +3529,14 @@ fn resolved_collection_info(ty: &crate::types::ResolvedType) -> Option<Collectio
         }
         ResolvedType::TypedArray(value) => (CollectionFamily::TypedArray, value.as_ref()),
         ResolvedType::List(value) => (CollectionFamily::List, value.as_ref()),
-        ResolvedType::Dictionary(_, value) => (CollectionFamily::Dictionary, value.as_ref()),
-        ResolvedType::Set(value) => (CollectionFamily::Set, value.as_ref()),
+        ResolvedType::Dictionary(_, value) | ResolvedType::SortedDictionary(_, value) => {
+            (CollectionFamily::Dictionary, value.as_ref())
+        }
+        ResolvedType::Set(value) | ResolvedType::SortedSet(value) => {
+            (CollectionFamily::Set, value.as_ref())
+        }
+        ResolvedType::PriorityQueue(value) => (CollectionFamily::PriorityQueue, value.as_ref()),
+        ResolvedType::Deque(value) => (CollectionFamily::Deque, value.as_ref()),
         ResolvedType::Nullable(inner) => return resolved_collection_info(inner),
         _ => return None,
     };
@@ -3543,7 +3576,17 @@ fn type_ref_collection_info(
         "Dictionary" if ty.type_argument_count() == 2 => {
             (CollectionFamily::Dictionary, ty.type_argument(1)?)
         }
+        "SortedDictionary" if ty.type_argument_count() == 2 => {
+            (CollectionFamily::Dictionary, ty.type_argument(1)?)
+        }
         "Set" if ty.type_argument_count() == 1 => (CollectionFamily::Set, ty.type_argument(0)?),
+        "SortedSet" if ty.type_argument_count() == 1 => {
+            (CollectionFamily::Set, ty.type_argument(0)?)
+        }
+        "PriorityQueue" if ty.type_argument_count() == 1 => {
+            (CollectionFamily::PriorityQueue, ty.type_argument(0)?)
+        }
+        "Deque" if ty.type_argument_count() == 1 => (CollectionFamily::Deque, ty.type_argument(0)?),
         _ => return None,
     };
     Some(CollectionInfo {
@@ -3598,7 +3641,16 @@ pub(crate) fn type_ref_is_move_type(
         || type_ref_class_name(ty, classes, receiver_class).is_some()
         || matches!(
             ty.name.as_str(),
-            "mixed" | "Bytes" | "[]" | "List" | "Dictionary" | "Set"
+            "mixed"
+                | "Bytes"
+                | "[]"
+                | "List"
+                | "Dictionary"
+                | "SortedDictionary"
+                | "Set"
+                | "SortedSet"
+                | "PriorityQueue"
+                | "Deque"
         )
 }
 

@@ -50,7 +50,12 @@ $mirPath = 'crates/doriac/src/mir.rs';
 $testsPath = 'crates/doriac/tests/collection_diagnostic_tests.rs';
 $stage26TestsPath = 'crates/doriac/tests/stage26_tests.rs';
 $fixturePath = 'examples/native/main_stage26_collection_slice3.doria';
+$clearFixturePath = 'examples/native/main_collection_clear.doria';
+$clearOwnershipFixturePath = 'examples/native/main_collection_clear_ownership.doria';
 $manifestPath = 'crates/doriac/tests/fixtures/native_parity_examples.txt';
+$loweringPath = 'crates/doriac/src/mir_lowering.rs';
+$runtimePath = 'crates/doria-rt/src/lib.rs';
+$phpPath = 'crates/doriac/src/codegen_php.rs';
 
 $decision = required_contents($root, $decisionPath, $failures);
 $plan = required_contents($root, $planPath, $failures);
@@ -64,14 +69,20 @@ $mir = required_contents($root, $mirPath, $failures);
 $tests = required_contents($root, $testsPath, $failures);
 $stage26Tests = required_contents($root, $stage26TestsPath, $failures);
 $fixture = required_contents($root, $fixturePath, $failures);
+$clearFixture = required_contents($root, $clearFixturePath, $failures);
+$clearOwnershipFixture = required_contents($root, $clearOwnershipFixturePath, $failures);
 $manifest = required_contents($root, $manifestPath, $failures);
+$lowering = required_contents($root, $loweringPath, $failures);
+$runtime = required_contents($root, $runtimePath, $failures);
+$php = required_contents($root, $phpPath, $failures);
 
 require_all($decisionPath, $decision, [
     '**Slice 1 — Complete.**',
     '**Slice 2 — Complete.**',
     '**Slice 3 — Complete.**',
-    '**Slice 4 — Next.**',
-    '**Stage 27 — Sequenced after Decision 0113.**',
+    '**Slice 4 — Complete.**',
+    '**Decision 0113 — Complete.**',
+    '**Stage 27 — Next.**',
     '`List::indexOf` | O(n) | None',
     '`List::remove` | O(n), including one tail shift | None',
     '`Dictionary::containsValue` | O(n) | None',
@@ -84,42 +95,42 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Measurement Status: Pending Available Runner',
         'Decision 0113 Slice 2 — Complete',
         'Decision 0113 Slice 3 — Complete',
-        'Decision 0113 Slice 4 — Next',
-        'Stage 27 — Sequenced After Decision 0113',
+        'Decision 0113 Slice 4 — Complete',
+        'Decision 0113 — Complete',
+        'Stage 27 — Next',
     ], $failures);
 }
 
 require_all($stdlibPath, $stdlib, [
-    'Decision 0113 Slices 1-3 are implemented',
+    'All four Decision 0113 slices are implemented',
     '`indexOf(T): ?int`',
     'writable `remove(T): bool`',
     'executable O(n) `containsValue(V): bool`',
     'executable readonly `first: ?T` / `last: ?T` properties',
-    'Writable `clear(): void` remains accepted pending Slice 4',
+    'writable `clear(): void`',
 ], $failures);
 
 require_all($parityPath, $parity, [
     'Decision 0113 Slice 3 collection members',
     'main_stage26_collection_slice3.doria',
-    'Slice 4',
-    '`clear()` still stops before MIR with E0559',
+    'Decision 0113 Slice 4 collection clear',
+    'main_collection_clear.doria',
 ], $failures);
 
 require_all($auditPath, $audit, [
-    'Decision 0113 Slices 1-3 are complete',
-    'Slice 4 `clear()` is next',
+    'Decision 0113 and all four slices are complete',
+    '`clear(): void` executable in place',
 ], $failures);
 
 require_all($tablePath, $table, [
     'COLLECTION_MEMBER_SUGGESTIONS',
     'pub fn suggestion_for(',
-    'pending_method_status',
-    '"clear",',
-    'decision_owner: "Decision 0113"',
 ], $failures);
 
-if (str_contains($table, 'PendingSlice3')) {
-    $failures[] = "{$tablePath}: completed Slice 3 must not remain in the pending-state model";
+foreach (['PendingSlice3', 'PendingSlice4', 'pending_method_status'] as $stalePending) {
+    if (str_contains($table, $stalePending)) {
+        $failures[] = "{$tablePath}: completed Decision 0113 must not retain `{$stalePending}`";
+    }
 }
 
 foreach ([
@@ -141,14 +152,30 @@ require_all($semanticsPath, $semantics, [
     '"E0558"',
     '"Use A Collection Literal"',
     'List and Dictionary use bracket literals',
-    '"E0559"',
-    'Accepted Collection Member Is Not Executable Yet',
 ], $failures);
+
+if (str_contains($semantics, '"E0559"')) {
+    $failures[] = "{$semanticsPath}: completed Decision 0113 must not route a member to E0559";
+}
 
 require_all($mirPath, $mir, [
     'CollectionIndexOf',
     'ContainsValue',
+    'CollectionClear',
 ], $failures);
+
+require_all($loweringPath, $lowering, [
+    'mir::Statement::CollectionClear',
+    '"clear"',
+], $failures);
+
+require_all($runtimePath, $runtime, [
+    'dr_v2_collection_reset_after_cleanup',
+], $failures);
+
+if (substr_count($php, 'public function clear(): void') !== 4) {
+    $failures[] = "{$phpPath}: all four ordered PHP helpers must expose clear(): void";
+}
 
 foreach (['List::contains for', '"get" | "has"', '"containsKey" | "has"'] as $forbidden) {
     if (str_contains($semantics, $forbidden)) {
@@ -160,7 +187,8 @@ require_all($testsPath, $tests, [
     'map_membership_spellings_have_receiver_aware_applied_fixes',
     'property_invocation_has_safe_and_combined_fixes',
     'withdrawn_literal_constructors_preserve_source_and_context',
-    'slice_three_members_execute_and_only_slice_four_remains_pending',
+    'decision_0113_members_all_execute',
+    'clear_uses_existing_collection_diagnostics',
     'equality_diagnostics_name_the_actual_collection_operation',
     'valid-from-families.doria',
     'Set::from([1])',
@@ -177,11 +205,16 @@ require_all($stage26TestsPath, $stage26Tests, [
 
 require_all($manifestPath, $manifest, [
     'examples/native/main_stage26_collection_slice3.doria',
+    'examples/native/main_collection_clear.doria',
+    'examples/native/main_collection_clear_ownership.doria',
 ], $failures);
 
 foreach (['Andrew', 'Lucy', 'Masiye'] as $privateName) {
-    if (str_contains($tests, $privateName) || str_contains($fixture, $privateName)) {
-        $failures[] = "Slice 3 tests or fixtures contain private or family name `{$privateName}`";
+    if (str_contains($tests, $privateName)
+        || str_contains($fixture, $privateName)
+        || str_contains($clearFixture, $privateName)
+        || str_contains($clearOwnershipFixture, $privateName)) {
+        $failures[] = "Decision 0113 tests or fixtures contain private or family name `{$privateName}`";
     }
 }
 

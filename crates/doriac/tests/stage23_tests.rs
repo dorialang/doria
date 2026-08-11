@@ -76,6 +76,7 @@ class Holder
 {
     writable List<int> $items = [1];
     writable function append(int $value): void { $this->items->add($value); }
+    writable function reset(): void { $this->items->clear(); }
 }
 function main(): void
 {
@@ -84,14 +85,16 @@ function main(): void
 
     let writable $holder = new Holder();
     $holder->append(2);
-    echo "{$counters[0]->current()}:{$holder->items->count}:{$holder->items[1]}";
+    $holder->reset();
+    $holder->append(3);
+    echo "{$counters[0]->current()}:{$holder->items->count}:{$holder->items[0]}";
 }
 "#,
     )
     .expect("indexed class and collection property places should lower as writable borrows");
     let output = doriac::mir_interpreter::interpret(&mir)
         .expect("borrowed collection places should execute through shared MIR");
-    assert_eq!(output.stdout, b"2:2:2");
+    assert_eq!(output.stdout, b"2:1:3");
 }
 
 #[test]
@@ -392,6 +395,42 @@ function main(): void
 }
 
 #[test]
+fn clear_releases_old_owned_values_once_and_scope_drop_releases_only_refill() {
+    let program = doriac::lower_source_to_mir(
+        "collection-clear-ownership.doria",
+        r#"
+class Token
+{
+    function __construct(int $id) {}
+    function __destruct() { echo "drop {$this->id}\n"; }
+}
+function main(): void
+{
+    writable List<Token> $tokens = [new Token(1), new Token(2)];
+    $tokens->clear();
+    $tokens->clear();
+    $tokens->add(new Token(3));
+
+    writable Dictionary<string, Token> $named = ["old" => new Token(4)];
+    $named->clear();
+    $named->set("new", new Token(5));
+
+    writable List<List<string>> $nested = [["old-a", "old-b"]];
+    $nested->clear();
+    $nested->add(["new"]);
+}
+"#,
+    )
+    .expect("owned collection clear should lower");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("owned collection clear should execute");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "drop 2\ndrop 1\ndrop 4\ndrop 5\ndrop 3\n"
+    );
+}
+
+#[test]
 fn bytes_uses_move_ownership_and_readonly_borrow_parameters() {
     doriac::lower_source_to_mir(
         "stage23-bytes-borrow.doria",
@@ -495,6 +534,56 @@ function main(): void
         "E0425",
     );
     assert!(range.message.contains("readonly"));
+}
+
+#[test]
+fn clear_conflicts_with_live_collection_borrows_but_accepts_last_use() {
+    let live_list = diagnostics(
+        r#"
+class Token { function __construct(int $id) {} }
+function main(): void
+{
+    writable List<Token> $values = [new Token(1)];
+    let $first = $values->first;
+    $values->clear();
+    if ($first != null) { echo "{$first->id}"; }
+}
+"#,
+    );
+    assert!(live_list.iter().any(|diagnostic| {
+        diagnostic.code == "E0477" && diagnostic.message.contains("writable")
+    }));
+
+    let live_dictionary = diagnostics(
+        r#"
+class Token { function __construct(int $id) {} }
+function main(): void
+{
+    writable Dictionary<string, Token> $values = ["one" => new Token(1)];
+    let $found = $values->get("one");
+    $values->clear();
+    if ($found != null) { echo "{$found->id}"; }
+}
+"#,
+    );
+    assert!(live_dictionary
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0477"));
+
+    doriac::lower_source_to_mir(
+        "clear-after-last-use.doria",
+        r#"
+class Token { function __construct(int $id) {} }
+function main(): void
+{
+    writable List<Token> $values = [new Token(1)];
+    let $first = $values->first;
+    if ($first != null) { echo "{$first->id}"; }
+    $values->clear();
+}
+"#,
+    )
+    .expect("a collection borrow that has reached its last use must not block clear");
 }
 
 #[test]

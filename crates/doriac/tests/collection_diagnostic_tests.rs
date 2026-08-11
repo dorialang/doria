@@ -243,7 +243,7 @@ fn withdrawn_literal_constructors_preserve_source_and_context() {
 }
 
 #[test]
-fn slice_three_members_execute_and_only_slice_four_remains_pending() {
+fn decision_0113_members_all_execute() {
     let executable = [
         "List<int> $v = [1]; echo $v->indexOf(1) ?? -1;",
         "writable List<int> $v = [1]; echo $v->remove(1);",
@@ -258,7 +258,7 @@ fn slice_three_members_execute_and_only_slice_four_remains_pending() {
             .expect("Slice 3 collection members should lower");
     }
 
-    let pending_clear = [
+    let clear_members = [
         "writable List<int> $v = [1]; $v->clear();",
         "writable Dictionary<string, int> $v = []; $v->clear();",
         "writable Set<int> $v = Set::from([1]); $v->clear();",
@@ -267,17 +267,10 @@ fn slice_three_members_execute_and_only_slice_four_remains_pending() {
         "writable PriorityQueue<int> $v = PriorityQueue::from([1]); $v->clear();",
         "writable Deque<int> $v = Deque::from([1]); $v->clear();",
     ];
-    for statement in pending_clear {
+    for statement in clear_members {
         let source = format!("function main(): void {{ {statement} }}");
-        let errors = rejected(&source);
-        let pending = errors
-            .iter()
-            .find(|error| error.code == "E0559")
-            .unwrap_or_else(|| panic!("clear must retain an accepted-pending diagnostic"));
-        assert!(pending.message.contains("clear"));
-        assert!(pending.explanation.as_deref().unwrap().contains("Slice 4"));
-        assert!(!errors.iter().any(|error| error.code == "E0521"));
-        assert!(doriac::lower_source_to_mir("pending-member.doria", source).is_err());
+        doriac::lower_source_to_mir("clear-member.doria", source)
+            .expect("Slice 4 clear members should lower without E0559");
     }
 
     let suggested = diagnostic(
@@ -293,6 +286,48 @@ fn slice_three_members_execute_and_only_slice_four_remains_pending() {
         ),
     )
     .expect("the safe indexOf migration should now execute");
+}
+
+#[test]
+fn clear_uses_existing_collection_diagnostics() {
+    let readonly = rejected("function main(): void { List<int> $values = [1]; $values->clear(); }");
+    assert!(readonly.iter().any(|error| {
+        error.code == "E0201"
+            && error.message.contains("clear")
+            && error.message.contains("readonly")
+    }));
+    assert!(!readonly.iter().any(|error| error.code == "E0559"));
+
+    for (source, expected_code) in [
+        (
+            "function main(): void { writable List<int> $v = [1]; $v->clear(1); }",
+            "E0409",
+        ),
+        (
+            "function main(): void { int[] $v = [1]; $v->clear(); }",
+            "E0521",
+        ),
+        (
+            "function main(): void { Bytes $v = Bytes::fromArray([1]); $v->clear(); }",
+            "E0524",
+        ),
+    ] {
+        let errors = rejected(source);
+        assert!(!errors.iter().any(|error| error.code == "E0559"));
+        assert!(
+            errors.iter().any(|error| error.code == expected_code),
+            "expected {expected_code} for {source}, got {:?}",
+            errors.iter().map(|error| error.code).collect::<Vec<_>>()
+        );
+    }
+
+    for source in [
+        "function main(): void { writable List<int> $v = [1]; let $result = $v->clear(); }",
+        "function maybe(): ?List<int> { return null; } function main(): void { let writable $v = maybe(); $v->clear(); }",
+    ] {
+        let errors = rejected(source);
+        assert!(!errors.iter().any(|error| error.code == "E0559"));
+    }
 }
 
 #[test]

@@ -1,0 +1,74 @@
+function main(): void
+{
+    writable List<string> $list = ["old-a", "old-b"];
+    $list->clear();
+    $list->clear();
+    $list->add("new-list");
+    echo "list {$list->count} {$list[0]}\n";
+
+    writable Dictionary<string, ?string> $dictionary = [
+        "old-a" => "value-a",
+        "old-b" => null,
+    ];
+    let $hadOldKey = $dictionary->containsKey("old-a");
+    $dictionary->clear();
+    $dictionary->set("new-b", "value-b");
+    $dictionary->set("new-a", null);
+    echo "dictionary {$hadOldKey} {$dictionary->count} {$dictionary->containsKey("old-a")} " .
+        "{$dictionary->containsKey("new-b")} {$dictionary->containsValue("value-b")}\n";
+    foreach ($dictionary->keys as string $key) {
+        echo "key {$key}\n";
+    }
+
+    writable Set<string> $set = Set::from(["old-a", "old-b"]);
+    let $hadOldSetValue = $set->contains("old-a");
+    $set->clear();
+    $set->add("new-b");
+    $set->add("new-a");
+    echo "set {$hadOldSetValue} {$set->count} {$set->contains("old-a")} " .
+        "{$set->contains("new-a")} " . ($set->first ?? "none") . " " .
+        ($set->last ?? "none") . "\n";
+
+    Dictionary<int, string> $sortedDictionarySource = [30 => "old", 10 => "older"];
+    writable SortedDictionary<int, string> $sortedDictionary =
+        SortedDictionary::from($sortedDictionarySource);
+    $sortedDictionary->clear();
+    $sortedDictionary->set(20, "twenty");
+    $sortedDictionary->set(10, "ten");
+    echo "sorted dictionary {$sortedDictionary->count}";
+    foreach ($sortedDictionary->keys as int $key) {
+        echo " {$key}";
+    }
+    echo "\n";
+
+    writable SortedSet<int> $sortedSet = SortedSet::from([30, 10]);
+    $sortedSet->clear();
+    $sortedSet->add(20);
+    $sortedSet->add(10);
+    echo "sorted set {$sortedSet->count} " . ($sortedSet->first ?? -1) . " " .
+        ($sortedSet->last ?? -1) . "\n";
+
+    writable PriorityQueue<int> $queue = PriorityQueue::from([30, 10]);
+    $queue->clear();
+    $queue->push(20);
+    $queue->push(5);
+    let $peeked = $queue->peek ?? -1;
+    let $popped = $queue->pop() ?? -1;
+    echo "queue {$queue->count} {$peeked} {$popped}\n";
+
+    writable Deque<string> $deque = Deque::from(["zero", "one", "two", "three"]);
+    $deque->popFront();
+    $deque->popFront();
+    $deque->pushBack("four");
+    $deque->pushBack("five");
+    $deque->clear();
+    $deque->pushBack("middle");
+    $deque->pushFront("front");
+    $deque->pushBack("back");
+    echo "deque {$deque->count} " . ($deque->peekFront ?? "none") . " " .
+        ($deque->peekBack ?? "none");
+    foreach ($deque as string $value) {
+        echo " {$value}";
+    }
+    echo "\n";
+}

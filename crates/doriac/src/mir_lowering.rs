@@ -9995,6 +9995,7 @@ fn collection_method_mutates(method: &str) -> bool {
             | "pushBack"
             | "popFront"
             | "popBack"
+            | "clear"
     )
 }
 
@@ -10066,6 +10067,20 @@ fn lower_collection_method_statement(
     };
     let info = context.collection_type(collection_type).clone();
     match (info.kind, method, args) {
+        (
+            mir::CollectionKind::List
+            | mir::CollectionKind::Dictionary
+            | mir::CollectionKind::Set
+            | mir::CollectionKind::SortedDictionary
+            | mir::CollectionKind::SortedSet
+            | mir::CollectionKind::PriorityQueue
+            | mir::CollectionKind::Deque,
+            "clear",
+            [],
+        ) => context.push_statement(mir::Statement::CollectionClear {
+            collection,
+            collection_type,
+        }),
         (
             mir::CollectionKind::List | mir::CollectionKind::Set | mir::CollectionKind::SortedSet,
             "add",

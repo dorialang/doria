@@ -2171,6 +2171,16 @@ function main(): void
 "#,
         ),
         (
+            "default collection clear",
+            r#"
+function main(): void
+{
+    writable List<int> $items = [1];
+    $items->clear();
+}
+"#,
+        ),
+        (
             "writable foreach",
             r#"
 function main(): void
@@ -2251,6 +2261,20 @@ function main(): void
     $deque->pushFront("first");
     $deque->pushBack("last");
     foreach ($deque as string $value) { echo "{$value} "; }
+    echo "\n";
+
+    $map->clear();
+    $map->set(9, "nine");
+    foreach ($map->keys as int $key) { echo "map {$key} "; }
+    $set->clear();
+    $set->add(2);
+    foreach ($set as int $value) { echo "set {$value} "; }
+    $queue->clear();
+    $queue->push(6);
+    echo "queue " . ($queue->pop() ?? 99) . " ";
+    $deque->clear();
+    $deque->pushBack("new");
+    echo "deque " . ($deque->peekFront ?? "none");
 }
 "#,
     )
@@ -2285,7 +2309,7 @@ function main(): void
     );
     assert_eq!(
         run.stdout,
-        b"-1 1 2 3 \n-1 0 1 3 \n-3 -2 1 4 \nfirst middle last "
+        b"-1 1 2 3 \n-1 0 1 3 \n-3 -2 1 4 \nfirst middle last \nmap 9 set 2 queue 6 deque new"
     );
     assert!(
         run.stderr.is_empty(),

@@ -461,6 +461,7 @@ enum EvaluationTask {
     },
     CollectionSet(mir::LocalId),
     AssignCollectionIndex(mir::LocalId, bool),
+    CollectionClear(mir::LocalId),
     CollectionHas {
         collection: mir::LocalId,
         op: mir::CollectionMembershipOp,
@@ -1511,6 +1512,11 @@ impl Interpreter<'_> {
                 ));
                 frame.tasks.push(EvaluationTask::Rvalue(value));
                 frame.tasks.push(EvaluationTask::Rvalue(index));
+            }
+            mir::Statement::CollectionClear { collection, .. } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::CollectionClear(collection));
             }
             mir::Statement::DropCollection { local, .. } => {
                 self.current_frame_mut()?
@@ -4685,6 +4691,9 @@ impl Interpreter<'_> {
             }
             EvaluationTask::DropCollection(local) => {
                 self.drop_collection_local(local)?;
+            }
+            EvaluationTask::CollectionClear(local) => {
+                self.clear_collection_local(local)?;
             }
             EvaluationTask::DropObject { object, class } => {
                 self.queue_object_drop(object, class)?;
@@ -10101,6 +10110,19 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn clear_collection_local(&mut self, local: mir::LocalId) -> Result<(), InterpreterError> {
+        let entries = {
+            let collection = self.collection_local(local)?;
+            std::mem::take(&mut *collection.entries_mut())
+        };
+        let mut drops = Vec::new();
+        collect_owned_objects_from_entries(entries, &mut drops);
+        for drop in drops {
+            self.push_owned_drop_task(drop)?;
+        }
+        Ok(())
+    }
+
     fn drop_mixed_local(&mut self, local: mir::LocalId) -> Result<(), InterpreterError> {
         let value = self
             .current_frame_mut()?
@@ -10735,7 +10757,14 @@ fn retain_mixed_claim(value: &mut MixedValue, ownership: mir::MixedOwnership) {
 }
 
 fn collect_owned_objects_from_collection(collection: CollectionValue, drops: &mut Vec<OwnedDrop>) {
-    for (key, value) in collection.entries().iter().cloned() {
+    collect_owned_objects_from_entries(collection.entries().iter().cloned(), drops);
+}
+
+fn collect_owned_objects_from_entries(
+    entries: impl IntoIterator<Item = (Option<LocalValue>, LocalValue)>,
+    drops: &mut Vec<OwnedDrop>,
+) {
+    for (key, value) in entries {
         if let Some(key) = key {
             collect_owned_objects_from_value(key, drops);
         }
