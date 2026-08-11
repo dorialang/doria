@@ -3814,14 +3814,21 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             return Ok(());
         }
         let cleanup_collection = if action == CollectionStorageAction::Reset {
-            self.call_runtime(
+            let cleanup_collection = self.entry_alloca(
+                collection_header_type(self.context, self.target_data),
+                "collection.cleanup",
+            )?;
+            let _ = self.call_runtime(
                 COLLECTION_DETACH_FOR_CLEANUP,
-                &[pointer.into(), pointer.into()],
-                Some(pointer.into()),
-                &[self.current_frame.into(), collection.into()],
-            )?
-            .ok_or_else(|| backend_failure("collection cleanup detach produced no result"))?
-            .into_pointer_value()
+                &[pointer.into(), pointer.into(), pointer.into()],
+                None,
+                &[
+                    self.current_frame.into(),
+                    collection.into(),
+                    cleanup_collection.into(),
+                ],
+            )?;
+            cleanup_collection
         } else {
             collection
         };
@@ -10295,11 +10302,10 @@ fn collection_header_type<'ctx>(
     let word = context.ptr_sized_int_type(target_data, None);
     let pointer = context.ptr_type(AddressSpace::default());
     let byte = context.i8_type();
-    // Mirrors `#[repr(C)] DrCollectionV1` through the membership index pointer.
-    // Only the fields codegen reads have named constants, but every field up to
-    // the last one read has to be present or the offsets shift. The tail beyond
-    // `index` stays runtime-only. `collection_header_offsets_match_runtime`
-    // pins this against the runtime's own `offset_of!`.
+    // Mirrors the complete `#[repr(C)] DrCollectionV1`. Most fields stay
+    // runtime-only, but clear uses this type as fixed entry-block scratch while
+    // generated drop glue runs, so its size and alignment are part of the
+    // private compiler/runtime ABI as well as the offsets codegen reads.
     context.struct_type(
         &[
             word.into(),    // length
@@ -10315,6 +10321,9 @@ fn collection_header_type<'ctx>(
             byte.into(),    // value_nullable
             word.into(),    // head
             pointer.into(), // index
+            word.into(),    // index_slots
+            byte.into(),    // index_kind
+            byte.into(),    // index_keyed
         ],
         false,
     )
@@ -10741,5 +10750,13 @@ mod tests {
                 Some(expected as u64)
             );
         }
+        assert_eq!(
+            target_data.get_store_size(&header),
+            doria_rt::DR_COLLECTION_SIZE as u64
+        );
+        assert_eq!(
+            target_data.get_abi_alignment(&header),
+            doria_rt::DR_COLLECTION_ALIGN as u32
+        );
     }
 }

@@ -397,7 +397,7 @@ function main(): void
         "owned clear needs release iteration"
     );
     let detach = ir
-        .find("call ptr @dr_v3_collection_detach_for_cleanup")
+        .find("call void @dr_v3_collection_detach_for_cleanup")
         .expect("owned clear must detach storage before release iteration");
     let release = ir[detach..]
         .find("call void @dr_v1_string_release")

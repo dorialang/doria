@@ -72,6 +72,8 @@ pub const DR_COLLECTION_VALUE_WIDTH_OFFSET: usize = mem::offset_of!(DrCollection
 pub const DR_COLLECTION_KIND_OFFSET: usize = mem::offset_of!(DrCollectionV1, kind);
 pub const DR_COLLECTION_HEAD_OFFSET: usize = mem::offset_of!(DrCollectionV1, head);
 pub const DR_COLLECTION_INDEX_OFFSET: usize = mem::offset_of!(DrCollectionV1, index);
+pub const DR_COLLECTION_SIZE: usize = mem::size_of::<DrCollectionV1>();
+pub const DR_COLLECTION_ALIGN: usize = mem::align_of::<DrCollectionV1>();
 
 fn valid_value_width(width: u8) -> bool {
     matches!(width, 1 | 2 | 4 | 8 | 16)
@@ -407,16 +409,25 @@ pub unsafe fn free(collection: *mut DrCollectionV1) {
     if collection.is_null() {
         return;
     }
+    free_storage(collection);
+    deallocate(collection.cast::<u8>());
+}
+
+unsafe fn free_storage(collection: *mut DrCollectionV1) {
     if !(*collection).keys.is_null() {
         deallocate((*collection).keys.cast::<u8>());
+        (*collection).keys = ptr::null_mut();
     }
     if !(*collection).values.is_null() {
         deallocate((*collection).values.cast::<u8>());
+        (*collection).values = ptr::null_mut();
     }
     if !(*collection).index.is_null() {
         deallocate((*collection).index.cast::<u8>());
+        (*collection).index = ptr::null_mut();
     }
-    deallocate(collection.cast::<u8>());
+    (*collection).capacity = 0;
+    (*collection).index_slots = 0;
 }
 
 /// Resets a live growable collection after generated drop glue has released
@@ -439,13 +450,14 @@ pub unsafe fn reset_after_cleanup(collection: *mut DrCollectionV1) {
 pub unsafe fn detach_for_cleanup(
     frame: *const DrStackFrameV2,
     collection: *mut DrCollectionV1,
-) -> *mut DrCollectionV1 {
-    if collection.is_null() || (*collection).fixed != 0 {
+    detached: *mut DrCollectionV1,
+) {
+    if collection.is_null()
+        || detached.is_null()
+        || collection == detached
+        || (*collection).fixed != 0
+    {
         collection_panic_with_frame(frame, b"P1001");
-    }
-    let detached = allocate(mem::size_of::<DrCollectionV1>()).cast::<DrCollectionV1>();
-    if detached.is_null() {
-        collection_panic_with_frame(frame, b"P1313");
     }
     ptr::write(detached, ptr::read(collection));
     ptr::write(
@@ -469,7 +481,6 @@ pub unsafe fn detach_for_cleanup(
             index_keyed: 0,
         },
     );
-    detached
 }
 
 /// Releases a detached cleanup snapshot after generated drop glue has consumed
@@ -497,7 +508,7 @@ pub unsafe fn finish_detached_cleanup(
         (*detached).keys = ptr::null_mut();
         (*detached).values = ptr::null_mut();
     }
-    free(detached);
+    free_storage(detached);
 }
 
 pub unsafe fn length(collection: *const DrCollectionV1) -> usize {
@@ -1838,7 +1849,9 @@ mod tests {
             push(collection, 20);
             let old_values = (*collection).values;
 
-            let detached = detach_for_cleanup(ptr::null(), collection);
+            let mut detached = mem::MaybeUninit::<DrCollectionV1>::uninit();
+            let detached = detached.as_mut_ptr();
+            detach_for_cleanup(ptr::null(), collection, detached);
             assert_eq!((*collection).length, 0);
             assert_eq!((*collection).capacity, 0);
             assert!((*collection).values.is_null());
@@ -1869,7 +1882,9 @@ mod tests {
             let values = (*collection).values;
             let capacity = (*collection).capacity;
 
-            let detached = detach_for_cleanup(ptr::null(), collection);
+            let mut detached = mem::MaybeUninit::<DrCollectionV1>::uninit();
+            let detached = detached.as_mut_ptr();
+            detach_for_cleanup(ptr::null(), collection, detached);
             finish_detached_cleanup(collection, detached);
 
             assert_eq!((*collection).length, 0);

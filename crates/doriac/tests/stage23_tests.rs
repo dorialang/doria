@@ -538,6 +538,25 @@ function main(): void
 
 #[test]
 fn clear_conflicts_with_live_collection_borrows_but_accepts_last_use() {
+    for mutation in ["$values->clear();", "$values->add(new Token(2));"] {
+        let source = format!(
+            r#"
+class Token {{ function __construct(int $id) {{}} }}
+function main(): void
+{{
+    writable List<Token> $values = [new Token(1)];
+    foreach ($values as Token $value) {{
+        {mutation}
+        echo "{{$value->id}}";
+    }}
+}}
+"#
+        );
+        assert!(diagnostics(&source).iter().any(|diagnostic| {
+            diagnostic.code == "E0477" && diagnostic.message.contains("earlier live access")
+        }));
+    }
+
     let live_list = diagnostics(
         r#"
 class Token { function __construct(int $id) {} }

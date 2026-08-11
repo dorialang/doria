@@ -176,6 +176,15 @@ pub const COLLECTION_KIND_FIELD: u32 = 7;
 pub const COLLECTION_HEAD_FIELD: u32 = 11;
 pub const COLLECTION_INDEX_FIELD: u32 = 12;
 
+pub const fn collection_header_size(pointer_bytes: u32) -> u32 {
+    let prefix = align_to(4 * pointer_bytes + 7, pointer_bytes);
+    align_to(prefix + 3 * pointer_bytes + 2, pointer_bytes)
+}
+
+const fn align_to(value: u32, alignment: u32) -> u32 {
+    value.div_ceil(alignment) * alignment
+}
+
 pub const fn stage26_collection_kind(kind: mir::CollectionKind) -> Option<u8> {
     match kind {
         mir::CollectionKind::SortedDictionary => Some(COLLECTION_KIND_SORTED_DICTIONARY),
@@ -285,4 +294,18 @@ pub fn function_symbol(function: &mir::Function) -> String {
         })
         .collect::<String>();
     format!("__doria_fn_{}_{}", function.id.0, sanitized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collection_header_size;
+
+    #[test]
+    fn collection_cleanup_scratch_matches_the_runtime_header() {
+        assert_eq!(
+            collection_header_size(size_of::<usize>() as u32) as usize,
+            doria_rt::DR_COLLECTION_SIZE
+        );
+        assert_eq!(align_of::<usize>(), doria_rt::DR_COLLECTION_ALIGN);
+    }
 }

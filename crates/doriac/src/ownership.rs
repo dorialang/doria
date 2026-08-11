@@ -1599,6 +1599,8 @@ impl Checker<'_> {
         scopes: &mut Scopes,
         return_move_type: bool,
     ) -> Flow {
+        let borrow_depth = self.active_borrows.len();
+        self.activate_place_borrow(&statement.iterable, UseMode::Read, scopes);
         scopes.push();
         if let Some(key) = &statement.key {
             self.declare_foreach_binding(key, scopes);
@@ -1612,6 +1614,7 @@ impl Checker<'_> {
         for break_exit in &mut flow.breaks {
             break_exit.pop();
         }
+        self.active_borrows.truncate(borrow_depth);
         flow
     }
 
@@ -1878,6 +1881,11 @@ impl Checker<'_> {
             }
             Expr::Grouped { expr, .. } => self.use_expr(expr, scopes, mode),
             Expr::PropertyAccess { object, span, .. } => {
+                if mode == UseMode::Write {
+                    if let Some(place) = self.assignment_place_key(expr, scopes) {
+                        self.check_active_borrow_conflict(&place, mode, *span);
+                    }
+                }
                 if mode == UseMode::Give && self.expr_is_non_transferable_property(expr, scopes) {
                     self.diagnostics.push(
                         Diagnostic::new(
@@ -1988,13 +1996,13 @@ impl Checker<'_> {
                         let mode = self.use_owned_expression(key, scopes);
                         self.activate_place_input_borrows(key, scopes);
                         if mode == UseMode::Read {
-                            self.activate_call_borrow(key, mode, scopes);
+                            self.activate_borrow(key, mode, scopes);
                         }
                     }
                     let mode = self.use_owned_expression(&element.value, scopes);
                     self.activate_place_input_borrows(&element.value, scopes);
                     if mode == UseMode::Read {
-                        self.activate_call_borrow(&element.value, mode, scopes);
+                        self.activate_borrow(&element.value, mode, scopes);
                     }
                 }
                 self.active_borrows.truncate(borrow_depth);
@@ -2004,7 +2012,7 @@ impl Checker<'_> {
                 let mode = self.use_owned_expression(value, scopes);
                 self.activate_place_input_borrows(value, scopes);
                 if mode == UseMode::Read {
-                    self.activate_call_borrow(value, mode, scopes);
+                    self.activate_borrow(value, mode, scopes);
                 }
                 self.use_read_with_place_borrow(count, scopes);
                 self.active_borrows.truncate(borrow_depth);
@@ -2155,7 +2163,7 @@ impl Checker<'_> {
                 return;
             }
             if let Some(mode) = signature.receiver {
-                self.activate_call_borrow(receiver, mode, scopes);
+                self.activate_borrow(receiver, mode, scopes);
             }
         }
         // Arguments are visited in source (written) order so ownership and
@@ -2217,7 +2225,7 @@ impl Checker<'_> {
             self.use_expr(arg, scopes, mode);
             self.activate_place_input_borrows(arg, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
-                self.activate_call_borrow(arg, mode, scopes);
+                self.activate_borrow(arg, mode, scopes);
             }
         }
         if let Some(without_call) = without_call {
@@ -2243,10 +2251,24 @@ impl Checker<'_> {
         self.flow_facts.get(&(expr.span().start, expr.span().end))
     }
 
-    fn activate_call_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
+    fn activate_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
         let Some(root) = self.borrow_root_key(expr, scopes) else {
             return;
         };
+        self.activate_borrow_root(root, mode, expr.span(), scopes);
+    }
+
+    fn activate_place_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
+        let Some(root) = self
+            .assignment_place_key(expr, scopes)
+            .or_else(|| self.borrow_root_key(expr, scopes))
+        else {
+            return;
+        };
+        self.activate_borrow_root(root, mode, expr.span(), scopes);
+    }
+
+    fn activate_borrow_root(&mut self, root: String, mode: UseMode, span: Span, scopes: &Scopes) {
         if mode == UseMode::Write {
             if let Some(alias) = scopes.borrowed_from(&root) {
                 self.diagnostics.push(
@@ -2256,7 +2278,7 @@ impl Checker<'_> {
                             "`{}` cannot be used as writable while `${alias}` borrows from it",
                             display_borrow_root(&root)
                         ),
-                        expr.span(),
+                        span,
                     )
                     .with_help(
                         "finish using the borrowed binding or place it in a shorter lexical block before mutating its owner",
@@ -2264,12 +2286,8 @@ impl Checker<'_> {
                 );
             }
         }
-        self.check_active_borrow_conflict(&root, mode, expr.span());
-        self.active_borrows.push(ActiveBorrow {
-            root,
-            mode,
-            span: expr.span(),
-        });
+        self.check_active_borrow_conflict(&root, mode, span);
+        self.active_borrows.push(ActiveBorrow { root, mode, span });
     }
 
     fn activate_place_input_borrows(&mut self, expr: &Expr, scopes: &Scopes) {
@@ -2288,7 +2306,7 @@ impl Checker<'_> {
                     .borrow_root_key(expr, scopes)
                     .is_some_and(|root| !self.active_assignment_writes.contains(&root))
                 {
-                    self.activate_call_borrow(expr, UseMode::Read, scopes);
+                    self.activate_borrow(expr, UseMode::Read, scopes);
                 }
                 self.activate_nested_property_borrows(object, scopes);
             }
@@ -2402,7 +2420,7 @@ impl Checker<'_> {
                 .is_some_and(|borrow| borrow.source == BorrowSource::Receiver);
             if !result_continues_receiver_borrow {
                 if let Some(mode @ (UseMode::Read | UseMode::Write)) = signature.receiver {
-                    self.activate_call_borrow(receiver, mode, scopes);
+                    self.activate_borrow(receiver, mode, scopes);
                 }
             }
         }
@@ -2429,7 +2447,7 @@ impl Checker<'_> {
                         .is_some_and(|borrow| borrow.source == BorrowSource::Parameter(param))
                 });
             if matches!(mode, UseMode::Read | UseMode::Write) && !result_continues_argument_borrow {
-                self.activate_call_borrow(arg, mode, scopes);
+                self.activate_borrow(arg, mode, scopes);
             }
         }
     }
@@ -2437,7 +2455,7 @@ impl Checker<'_> {
     fn use_read_with_place_borrow(&mut self, expr: &Expr, scopes: &mut Scopes) {
         self.use_expr(expr, scopes, UseMode::Read);
         self.activate_place_input_borrows(expr, scopes);
-        self.activate_call_borrow(expr, UseMode::Read, scopes);
+        self.activate_borrow(expr, UseMode::Read, scopes);
     }
 
     fn check_writable_move_argument(&mut self, expr: &Expr, scopes: &Scopes) {
@@ -2685,7 +2703,7 @@ impl Checker<'_> {
             Diagnostic::new(
                 "E0477",
                 format!(
-                    "`{root_display}` cannot be used as {requested} here because it is already used as {existing} in this call"
+                    "`{root_display}` cannot be used as {requested} here because an earlier live access uses it as {existing}"
                 ),
                 span,
             )
