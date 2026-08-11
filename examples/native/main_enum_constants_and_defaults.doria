@@ -1,0 +1,39 @@
+enum Status
+{
+    case Draft;
+    case Published;
+}
+
+const Status DEFAULT_STATUS = Status::Draft;
+
+class Settings
+{
+    const Status PUBLISHED = Status::Published;
+    static Status $current = Status::Draft;
+    Status $initial = Status::Draft;
+
+    function readInitial(): Status
+    {
+        return $this->initial;
+    }
+}
+
+function show(Status $status = Status::Draft): bool
+{
+    return $status == DEFAULT_STATUS;
+}
+
+function main(): void
+{
+    let $settings = new Settings();
+    Status[] $array = [Status::Draft, Status::Published];
+    List<Status> $list = [Status::Draft, Status::Published];
+    Dictionary<string, Status> $dictionary = ["current" => Status::Published];
+    echo "constants {show()} {Settings::PUBLISHED == Status::Published} ";
+    echo Settings::current == Status::Draft;
+    echo " {$settings->readInitial() == Status::Draft} ";
+    echo $array[0] == Status::Draft;
+    echo " {$list->contains(Status::Published)} ";
+    echo $dictionary["current"] == Status::Published;
+    echo "\n";
+}

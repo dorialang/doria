@@ -111,6 +111,7 @@ fn debug_contents(source: &str) -> String {
 fn conditional_program(condition: Condition, then_status: i64, else_status: i64) -> Program {
     Program {
         source: doriac::source::SourceFile::new("<test>", ""),
+        enums: vec![],
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
@@ -789,6 +790,7 @@ fn interprets_multiple_echoes_without_newline() {
 fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
     let program = Program {
         source: doriac::source::SourceFile::new("<test>", ""),
+        enums: vec![],
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
@@ -1447,6 +1449,7 @@ fn interpreter_preserves_void_fallthrough_after_final_else_if() {
 fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
     let program = Program {
         source: doriac::source::SourceFile::new("<test>", ""),
+        enums: vec![],
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
@@ -2924,6 +2927,7 @@ fn stage_11f_debug_target_handles_all_examples() {
 fn explicitly_limited_interpreter_can_bound_call_frames() {
     let program = Program {
         source: doriac::source::SourceFile::new("<test>", ""),
+        enums: vec![],
         classes: vec![],
         collection_types: vec![],
         statics: vec![],

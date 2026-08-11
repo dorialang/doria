@@ -312,7 +312,7 @@ function check_stream_io_completeness(string $root): array
         'Decision 0110: stream, readiness, standard I/O, blocking-mode, and performance model',
         'Stage 26 — Remaining collection family — Complete.',
         'Stage 26b — Performance Baseline Foundation — Complete; All Three Slices Complete',
-        'Stage 27 — Enums + payload cases — Next; No Performance-Evidence Dependency',
+        'Stage 27 — Enums + payload cases — In Progress; No Performance-Evidence Dependency',
         'Stage 36a Public Spellings — Deferred',
         'Stage 36a — Not Implemented',
     ] as $required) {
@@ -326,7 +326,7 @@ function check_stream_io_completeness(string $root): array
         'Stream, Readiness, Standard I/O, Blocking Mode, And Performance Model — Accepted (decision 0110)',
         'Stage 26 — Complete',
         'Stage 26b — Performance Baseline Foundation — Complete',
-        'Stage 27 — Next; No Performance-Evidence Dependency',
+        'Stage 27 — In Progress; No Performance-Evidence Dependency',
         'Stage 36a — Scheduled',
         'Stage 36a Public Spellings — Deferred',
         'Stage 36a — Not Implemented',

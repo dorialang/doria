@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use crate::enums::EnumType;
+
 pub use crate::numeric::{FloatType, IntegerType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -279,6 +281,7 @@ pub enum TypeKind {
     Heterogeneous,
     EmptyCollection,
     TypeParameter(String),
+    Enum(EnumType),
     Class(ClassType<TypeId>),
     List(TypeId),
     Dictionary(TypeId, TypeId),
@@ -301,6 +304,7 @@ pub enum ResolvedType {
     Null,
     Mixed,
     TypeParameter(String),
+    Enum(EnumType),
     Nullable(Box<ResolvedType>),
     Class(ClassType<ResolvedType>),
     TypedArray(Box<ResolvedType>),
@@ -344,6 +348,7 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
         | ResolvedType::Void
         | ResolvedType::Null
         | ResolvedType::TypeParameter(_)
+        | ResolvedType::Enum(_)
         | ResolvedType::Unsupported => 1,
     }
 }
@@ -401,6 +406,7 @@ impl TypeRegistry {
             TypeKind::Heterogeneous => "heterogeneous".to_string(),
             TypeKind::EmptyCollection => "[]".to_string(),
             TypeKind::TypeParameter(name) => name.clone(),
+            TypeKind::Enum(enum_type) => enum_type.name.clone(),
             TypeKind::Class(class) => {
                 if class.arguments.is_empty() {
                     class.name.clone()
@@ -455,6 +461,7 @@ impl TypeRegistry {
             TypeKind::Null => ResolvedType::Null,
             TypeKind::Mixed => ResolvedType::Mixed,
             TypeKind::TypeParameter(name) => ResolvedType::TypeParameter(name.clone()),
+            TypeKind::Enum(enum_type) => ResolvedType::Enum(enum_type.clone()),
             TypeKind::Nullable(inner) => ResolvedType::Nullable(Box::new(self.resolved(*inner))),
             TypeKind::Class(class) => ResolvedType::Class(ClassType::new(
                 class.name.clone(),

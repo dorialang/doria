@@ -17,6 +17,8 @@ pub enum StringQuoteKind {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Class,
+    Enum,
+    Case,
     Interface,
     Trait,
     Implements,
@@ -40,6 +42,8 @@ pub enum TokenKind {
     As,
     If,
     Else,
+    Match,
+    Default,
     When,
     Given,
     Finally,
@@ -433,6 +437,8 @@ impl<'source> Lexer<'source> {
         let text = &self.source.text[start..self.index];
         let kind = match text {
             "class" => TokenKind::Class,
+            "enum" => TokenKind::Enum,
+            "case" => TokenKind::Case,
             "interface" => TokenKind::Interface,
             "trait" => TokenKind::Trait,
             "implements" => TokenKind::Implements,
@@ -456,6 +462,8 @@ impl<'source> Lexer<'source> {
             "as" => TokenKind::As,
             "if" => TokenKind::If,
             "else" => TokenKind::Else,
+            "match" => TokenKind::Match,
+            "default" => TokenKind::Default,
             "when" => TokenKind::When,
             "given" => TokenKind::Given,
             "finally" => TokenKind::Finally,
@@ -490,7 +498,7 @@ impl<'source> Lexer<'source> {
             "and" => TokenKind::And,
             "or" => TokenKind::Or,
             "xor" => TokenKind::Xor,
-            "async" | "await" | "spawn" | "scope" | "enum" | "match" | "try" | "catch" => {
+            "async" | "await" | "spawn" | "scope" | "try" | "catch" => {
                 TokenKind::Reserved(text.to_string())
             }
             _ => TokenKind::Identifier(text.to_string()),

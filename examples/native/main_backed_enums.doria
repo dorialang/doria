@@ -1,0 +1,18 @@
+enum Priority: int
+{
+    case Low = 1;
+    case High = 10;
+}
+
+enum Transport: string
+{
+    case Road = "road";
+    case Rail = "rail";
+}
+
+function main(): void
+{
+    Priority $priority = Priority::High;
+    Transport $transport = Transport::Rail;
+    echo "backed {$priority->value} {$transport->value}\n";
+}

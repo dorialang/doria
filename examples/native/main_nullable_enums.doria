@@ -1,0 +1,36 @@
+enum Status
+{
+    case Draft;
+    case Published;
+}
+
+class Holder
+{
+    ?Status $status = null;
+
+    function read(): ?Status
+    {
+        return $this->status;
+    }
+}
+
+function choose(?Status $status): Status
+{
+    if ($status != null) {
+        return $status;
+    }
+    return Status::Published;
+}
+
+function main(): void
+{
+    ?Status $missing = null;
+    ?Status $first = Status::Draft;
+    Status $fallback = $first ?? Status::Published;
+    let $holder = new Holder();
+    echo "nullable {$missing == null} {$first != null} ";
+    echo choose($missing) == Status::Published;
+    echo " {$fallback == Status::Draft} ";
+    echo choose($holder->read()) == Status::Published;
+    echo "\n";
+}

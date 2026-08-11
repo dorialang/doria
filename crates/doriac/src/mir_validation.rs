@@ -8,6 +8,60 @@ use crate::mir;
 use crate::numeric::{FloatType, IntegerType};
 
 pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
+    for (index, definition) in program.enums.iter().enumerate() {
+        if definition.id != crate::enums::EnumId(index) {
+            return Err(malformed_mir(format!(
+                "enum table slot {index} contains enum#{}",
+                definition.id.0
+            )));
+        }
+        if definition.cases.is_empty() {
+            return Err(malformed_mir(format!(
+                "enum#{} has no cases",
+                definition.id.0
+            )));
+        }
+        for (case_index, case) in definition.cases.iter().enumerate() {
+            if case.id.enum_id != definition.id || case.id.index != case_index {
+                return Err(malformed_mir(format!(
+                    "enum#{} case table slot {case_index} has invalid identity",
+                    definition.id.0
+                )));
+            }
+            if case.tag != case_index as u32 {
+                return Err(malformed_mir(format!(
+                    "enum#{} case {case_index} has invalid declaration-order tag",
+                    definition.id.0
+                )));
+            }
+            match (definition.backing_type, &case.backing_value) {
+                (None, None)
+                | (
+                    Some(crate::enums::EnumBackingType::Int),
+                    Some(crate::enums::EnumBackingValue::Int(_)),
+                )
+                | (
+                    Some(crate::enums::EnumBackingType::String),
+                    Some(crate::enums::EnumBackingValue::String(_)),
+                ) => {}
+                _ => {
+                    return Err(malformed_mir(format!(
+                        "enum#{} case {case_index} has invalid backing metadata",
+                        definition.id.0
+                    )));
+                }
+            }
+            if definition.backing_type.is_some() && !case.payload.is_empty() {
+                return Err(malformed_mir(format!(
+                    "backed enum#{} case {case_index} has a payload",
+                    definition.id.0
+                )));
+            }
+            for field in &case.payload {
+                validate_type(program, field.ty)?;
+            }
+        }
+    }
     for (index, collection) in program.collection_types.iter().enumerate() {
         if collection.id != mir::CollectionTypeId(index) {
             return Err(malformed_mir(format!(
@@ -338,6 +392,7 @@ fn field_type(ty: mir::Type) -> FieldType {
         mir::Type::Scalar(mir::ScalarType::Integer(integer)) => FieldType::Integer(integer),
         mir::Type::Scalar(mir::ScalarType::Float(float)) => FieldType::Float(float),
         mir::Type::Scalar(mir::ScalarType::Bool) => FieldType::Bool,
+        mir::Type::Scalar(mir::ScalarType::Enum(_)) => FieldType::Integer(IntegerType::UInt32),
         mir::Type::String => FieldType::String,
         mir::Type::Mixed => FieldType::Mixed,
         mir::Type::NullableScalar(mir::ScalarType::Integer(integer)) => {
@@ -345,6 +400,9 @@ fn field_type(ty: mir::Type) -> FieldType {
         }
         mir::Type::NullableScalar(mir::ScalarType::Float(float)) => FieldType::NullableFloat(float),
         mir::Type::NullableScalar(mir::ScalarType::Bool) => FieldType::NullableBool,
+        mir::Type::NullableScalar(mir::ScalarType::Enum(_)) => {
+            FieldType::NullableInteger(IntegerType::UInt32)
+        }
         mir::Type::NullableString => FieldType::NullableString,
         mir::Type::NullableMixed => FieldType::NullableMixed,
         mir::Type::Class(class) => FieldType::Class(class),
@@ -438,6 +496,12 @@ fn validate_borrowed_user_locals(
 }
 
 fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendError> {
+    if let mir::Type::Scalar(mir::ScalarType::Enum(enum_id))
+    | mir::Type::NullableScalar(mir::ScalarType::Enum(enum_id)) = ty
+    {
+        enum_in(program, enum_id)?;
+        return Ok(());
+    }
     if let mir::Type::Class(class)
     | mir::Type::NullableClass(class)
     | mir::Type::SharedReference(class)
@@ -463,6 +527,17 @@ fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendErr
         }
     }
     Ok(())
+}
+
+fn enum_in(
+    program: &mir::Program,
+    id: crate::enums::EnumId,
+) -> Result<&mir::EnumDefinition, BackendError> {
+    program
+        .enums
+        .get(id.0)
+        .filter(|definition| definition.id == id)
+        .ok_or_else(|| malformed_mir(format!("enum#{} does not exist", id.0)))
 }
 
 fn validate_writable_shared_payload(
@@ -1599,6 +1674,20 @@ fn validate_integer_expression(
             validate_nullable_scalar_expression(program, function, left)?;
             validate_integer_expression(program, function, right)
         }
+        mir::IntegerExpression::EnumBacking { enum_id, value } => {
+            let definition = enum_in(program, *enum_id)?;
+            if definition.backing_type != Some(crate::enums::EnumBackingType::Int) {
+                return Err(malformed_mir(
+                    "integer backing projection targets a non-int-backed enum",
+                ));
+            }
+            if value.enum_id() != *enum_id {
+                return Err(malformed_mir(
+                    "integer backing projection uses a different enum type",
+                ));
+            }
+            validate_enum_expression(program, function, value)
+        }
     }
 }
 
@@ -1613,6 +1702,134 @@ fn validate_value_expression(
         }
         mir::ValueExpression::Float(value) => validate_float_expression(program, function, value),
         mir::ValueExpression::Bool(value) => validate_condition(program, function, value),
+        mir::ValueExpression::Enum(value) => validate_enum_expression(program, function, value),
+    }
+}
+
+fn validate_enum_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::EnumExpression,
+) -> Result<(), BackendError> {
+    let definition = enum_in(program, expression.enum_id())?;
+    match expression {
+        mir::EnumExpression::Case(value) => {
+            if value.case_id.enum_id != value.enum_id {
+                return Err(malformed_mir("enum case identity names another enum"));
+            }
+            let case = definition
+                .cases
+                .get(value.case_id.index)
+                .filter(|case| case.id == value.case_id)
+                .ok_or_else(|| malformed_mir("enum case does not exist"))?;
+            if !case.payload.is_empty() {
+                return Err(malformed_mir(
+                    "unit enum expression constructs a payload case",
+                ));
+            }
+            Ok(())
+        }
+        mir::EnumExpression::Use { enum_id, operand } => {
+            validate_enum_operand(program, function, *enum_id, operand)
+        }
+        mir::EnumExpression::Call {
+            enum_id,
+            function: callee,
+            args,
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type
+                != mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Enum(*enum_id)))
+            {
+                return Err(malformed_mir(
+                    "enum call targets a function returning another type",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::EnumExpression::Coalesce {
+            enum_id,
+            left,
+            right,
+        } => {
+            if left.ty() != mir::ScalarType::Enum(*enum_id) || right.enum_id() != *enum_id {
+                return Err(malformed_mir("enum coalesce has incompatible operands"));
+            }
+            validate_nullable_scalar_expression(program, function, left)?;
+            validate_enum_expression(program, function, right)
+        }
+    }
+}
+
+fn validate_enum_operand(
+    program: &mir::Program,
+    function: &mir::Function,
+    enum_id: crate::enums::EnumId,
+    operand: &mir::Operand,
+) -> Result<(), BackendError> {
+    let expected = mir::Type::Scalar(mir::ScalarType::Enum(enum_id));
+    match operand {
+        mir::Operand::Scalar(mir::ScalarValue::Enum(value)) => {
+            if value.enum_id != enum_id {
+                return Err(malformed_mir("enum expression contains another enum value"));
+            }
+            validate_enum_expression(program, function, &mir::EnumExpression::Case(*value))
+        }
+        mir::Operand::Scalar(_) => Err(malformed_mir(
+            "enum expression contains a non-enum scalar constant",
+        )),
+        mir::Operand::Local(local) => {
+            if local_in(function, *local)?.ty != expected {
+                return Err(malformed_mir("enum expression uses another local type"));
+            }
+            Ok(())
+        }
+        mir::Operand::NullablePayload(local) => {
+            if local_in(function, *local)?.ty
+                != mir::Type::NullableScalar(mir::ScalarType::Enum(enum_id))
+            {
+                return Err(malformed_mir(
+                    "enum expression uses another nullable payload type",
+                ));
+            }
+            Ok(())
+        }
+        mir::Operand::Static(id) => validate_static_operand(program, *id, expected),
+        mir::Operand::Property { object, property } => {
+            validate_property_operand(program, function, *object, *property, expected)
+        }
+        mir::Operand::CollectionIndex {
+            positional,
+            collection,
+            index,
+            remove,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir("enum index source is not a collection"));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            if collection_type.value != expected {
+                return Err(malformed_mir("enum collection element type mismatch"));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection_type,
+                index,
+                *remove,
+                *positional,
+            )
+        }
+        mir::Operand::MixedPayload { mixed, tag } => {
+            validate_mixed_payload_operand(function, *mixed, *tag, expected)
+        }
+        mir::Operand::CollectionLength(_)
+        | mir::Operand::CollectionKeyAt { .. }
+        | mir::Operand::StringIntrinsic(_) => Err(malformed_mir(
+            "enum expression uses an incompatible operand",
+        )),
     }
 }
 
@@ -5298,6 +5515,28 @@ fn collect_value_class_local_accesses<'a>(
         }
         mir::ValueExpression::Float(value) => collect_float_class_local_accesses(value, accesses),
         mir::ValueExpression::Bool(value) => collect_bool_class_local_accesses(value, accesses),
+        mir::ValueExpression::Enum(value) => collect_enum_class_local_accesses(value, accesses),
+    }
+}
+
+fn collect_enum_class_local_accesses<'a>(
+    value: &'a mir::EnumExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::EnumExpression::Use { operand, .. } => {
+            collect_operand_class_local_accesses(operand, accesses)
+        }
+        mir::EnumExpression::Case(_) => {}
+        mir::EnumExpression::Call { function, args, .. } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::EnumExpression::Coalesce { left, right, .. } => {
+            collect_nullable_scalar_class_local_accesses(left, accesses);
+            collect_enum_class_local_accesses(right, accesses);
+        }
     }
 }
 
@@ -5354,6 +5593,9 @@ fn collect_integer_class_local_accesses<'a>(
         mir::IntegerExpression::Coalesce { left, right, .. } => {
             collect_nullable_scalar_class_local_accesses(left, accesses);
             collect_integer_class_local_accesses(right, accesses);
+        }
+        mir::IntegerExpression::EnumBacking { value, .. } => {
+            collect_enum_class_local_accesses(value, accesses)
         }
     }
 }
@@ -5430,6 +5672,9 @@ fn collect_string_class_local_accesses<'a>(
         }
         mir::StringExpression::MixedPayload(local) => {
             accesses.assume_mixed_tag(*local, mir::MixedTag::String);
+        }
+        mir::StringExpression::EnumBacking { value, .. } => {
+            collect_enum_class_local_accesses(value, accesses)
         }
         mir::StringExpression::Literal(_)
         | mir::StringExpression::Local(_)
@@ -7712,6 +7957,27 @@ fn value_observes_property(
         }
         mir::ValueExpression::Float(value) => float_observes_property(value, receiver, property),
         mir::ValueExpression::Bool(value) => bool_observes_property(value, receiver, property),
+        mir::ValueExpression::Enum(value) => enum_observes_property(value, receiver, property),
+    }
+}
+
+fn enum_observes_property(
+    value: &mir::EnumExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::EnumExpression::Use { operand, .. } => {
+            operand_observes_property(operand, receiver, property)
+        }
+        mir::EnumExpression::Case(_) => false,
+        mir::EnumExpression::Call { args, .. } => args
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::EnumExpression::Coalesce { left, right, .. } => {
+            nullable_scalar_observes_property(left, receiver, property)
+                || enum_observes_property(right, receiver, property)
+        }
     }
 }
 
@@ -7871,6 +8137,9 @@ fn integer_observes_property(
             nullable_scalar_observes_property(left, receiver, property)
                 || integer_observes_property(right, receiver, property)
         }
+        mir::IntegerExpression::EnumBacking { value, .. } => {
+            enum_observes_property(value, receiver, property)
+        }
     }
 }
 
@@ -7940,6 +8209,9 @@ fn string_observes_property(
             .args
             .iter()
             .any(|argument| rvalue_observes_property(argument, receiver, property)),
+        mir::StringExpression::EnumBacking { value, .. } => {
+            enum_observes_property(value, receiver, property)
+        }
         mir::StringExpression::Literal(_)
         | mir::StringExpression::Local(_)
         | mir::StringExpression::Static(_)
@@ -8796,13 +9068,18 @@ fn validate_condition(
 ) -> Result<(), BackendError> {
     match condition {
         mir::BoolExpression::Use { operand } => validate_bool_operand(program, function, operand),
-        mir::BoolExpression::Compare { left, right, .. } => {
+        mir::BoolExpression::Compare { op, left, right } => {
             if left.ty() != right.ty() {
                 return Err(malformed_mir(format!(
                     "comparison has {} and {} operands",
                     left.ty(),
                     right.ty()
                 )));
+            }
+            if matches!(left.ty(), mir::ScalarType::Enum(_))
+                && !matches!(op, mir::CompareOp::Equal | mir::CompareOp::NotEqual)
+            {
+                return Err(malformed_mir("ordered enum comparison is invalid"));
             }
             validate_value_expression(program, function, left)?;
             validate_value_expression(program, function, right)
@@ -8851,6 +9128,9 @@ fn validate_condition(
             validate_mixed_expression(program, function, mixed)?;
             if let mir::MixedTag::Class(class) = tag {
                 class_in(program, *class)?;
+            }
+            if let mir::MixedTag::Enum(enum_id) = tag {
+                enum_in(program, *enum_id)?;
             }
             Ok(())
         }
@@ -9344,6 +9624,20 @@ fn validate_string_expression(
         }
         mir::StringExpression::Intrinsic(call) => {
             validate_string_intrinsic(program, function, call, mir::Type::String)
+        }
+        mir::StringExpression::EnumBacking { enum_id, value } => {
+            let definition = enum_in(program, *enum_id)?;
+            if definition.backing_type != Some(crate::enums::EnumBackingType::String) {
+                return Err(malformed_mir(
+                    "string backing projection targets a non-string-backed enum",
+                ));
+            }
+            if value.enum_id() != *enum_id {
+                return Err(malformed_mir(
+                    "string backing projection uses a different enum type",
+                ));
+            }
+            validate_enum_expression(program, function, value)
         }
     }
 }

@@ -303,6 +303,7 @@ impl MixedValue {
             Self::Scalar(mir::ScalarValue::Bool(_)) => mir::MixedTag::Bool,
             Self::Scalar(mir::ScalarValue::Integer(value)) => mir::MixedTag::Integer(value.ty),
             Self::Scalar(mir::ScalarValue::Float(value)) => mir::MixedTag::Float(value.ty),
+            Self::Scalar(mir::ScalarValue::Enum(value)) => mir::MixedTag::Enum(value.enum_id),
             Self::String(_) => mir::MixedTag::String,
             Self::Class { class, .. } => mir::MixedTag::Class(*class),
         }
@@ -382,6 +383,7 @@ enum ReturnExpectation {
 enum EvaluationTask {
     Rvalue(mir::Rvalue),
     Value(mir::ValueExpression),
+    Enum(mir::EnumExpression),
     String(mir::StringExpression),
     ParseNullableScalar(mir::ScalarType),
     Mixed(mir::MixedExpression),
@@ -556,7 +558,10 @@ enum EvaluationTask {
     AfterIntegerCoalesce(mir::IntegerExpression),
     AfterFloatCoalesce(mir::FloatExpression),
     AfterBoolCoalesce(mir::BoolExpression),
+    AfterEnumCoalesce(mir::EnumExpression),
     AfterStringCoalesce(mir::StringExpression),
+    EnumBackingInt(crate::enums::EnumId),
+    EnumBackingString(crate::enums::EnumId),
     AfterNullableScalarCoalesce(mir::NullableScalarExpression),
     AfterNullableStringCoalesce(mir::NullableStringExpression),
     AfterClassCoalesce {
@@ -1697,7 +1702,13 @@ impl Interpreter<'_> {
                         .tasks
                         .push(EvaluationTask::Bool(value));
                 }
+                mir::ValueExpression::Enum(value) => {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::Enum(value));
+                }
             },
+            EvaluationTask::Enum(expression) => self.expand_enum_expression(expression)?,
             EvaluationTask::String(expression) => self.expand_string_expression(expression)?,
             EvaluationTask::Mixed(expression) => self.expand_mixed_expression(expression)?,
             EvaluationTask::NullableScalar(expression) => {
@@ -3662,6 +3673,56 @@ impl Interpreter<'_> {
                         .push(EvaluationTask::Bool(right));
                 }
             }
+            EvaluationTask::AfterEnumCoalesce(right) => {
+                let (_, value) = self.pop_nullable_scalar()?;
+                if let Some(mir::ScalarValue::Enum(value)) = value {
+                    self.push_scalar(mir::ScalarValue::Enum(value))?;
+                } else {
+                    self.current_frame_mut()?
+                        .tasks
+                        .push(EvaluationTask::Enum(right));
+                }
+            }
+            EvaluationTask::EnumBackingInt(enum_id) => {
+                let mir::ScalarValue::Enum(value) = self.pop_scalar()? else {
+                    return Err(InterpreterError::new(
+                        "MIR enum backing projection produced another scalar type",
+                    ));
+                };
+                if value.enum_id != enum_id {
+                    return Err(InterpreterError::new(
+                        "MIR enum backing projection changed enum identity",
+                    ));
+                }
+                let case = enum_case_in(self.program, value)?;
+                let Some(crate::enums::EnumBackingValue::Int(backing)) = case.backing_value else {
+                    return Err(InterpreterError::new(
+                        "MIR integer backing projection targets another backing type",
+                    ));
+                };
+                self.push_scalar(mir::ScalarValue::Integer(backing))?;
+            }
+            EvaluationTask::EnumBackingString(enum_id) => {
+                let mir::ScalarValue::Enum(value) = self.pop_scalar()? else {
+                    return Err(InterpreterError::new(
+                        "MIR enum backing projection produced another scalar type",
+                    ));
+                };
+                if value.enum_id != enum_id {
+                    return Err(InterpreterError::new(
+                        "MIR enum backing projection changed enum identity",
+                    ));
+                }
+                let case = enum_case_in(self.program, value)?;
+                let Some(crate::enums::EnumBackingValue::String(backing)) = &case.backing_value
+                else {
+                    return Err(InterpreterError::new(
+                        "MIR string backing projection targets another backing type",
+                    ));
+                };
+                let backing = backing.clone();
+                self.push_string(backing)?;
+            }
             EvaluationTask::AfterStringCoalesce(right) => {
                 if let Some(value) = self.pop_nullable_string()? {
                     self.push_string(value)?;
@@ -4846,6 +4907,54 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::AfterIntegerCoalesce(*right));
                 frame.tasks.push(EvaluationTask::NullableScalar(*left));
             }
+            mir::IntegerExpression::EnumBacking { enum_id, value } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::EnumBackingInt(enum_id));
+                frame.tasks.push(EvaluationTask::Enum(*value));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_enum_expression(
+        &mut self,
+        expression: mir::EnumExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::EnumExpression::Case(value) => {
+                self.push_scalar(mir::ScalarValue::Enum(value))?;
+            }
+            mir::EnumExpression::Use { enum_id, operand } => {
+                if self.queue_collection_scalar_operand(&operand)? {
+                    return Ok(());
+                }
+                let value = self.eval_operand(&operand)?;
+                let mir::ScalarValue::Enum(value) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR enum operand produced another scalar type",
+                    ));
+                };
+                if value.enum_id != enum_id {
+                    return Err(InterpreterError::new(
+                        "MIR enum operand changed enum identity",
+                    ));
+                }
+                self.push_scalar(mir::ScalarValue::Enum(value))?;
+            }
+            mir::EnumExpression::Call {
+                enum_id,
+                function,
+                args,
+            } => self.queue_call(
+                function,
+                args,
+                ReturnExpectation::Value(mir::Type::Scalar(mir::ScalarType::Enum(enum_id))),
+            )?,
+            mir::EnumExpression::Coalesce { left, right, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::AfterEnumCoalesce(*right));
+                frame.tasks.push(EvaluationTask::NullableScalar(*left));
+            }
         }
         Ok(())
     }
@@ -5283,6 +5392,11 @@ impl Interpreter<'_> {
             }
             mir::StringExpression::Intrinsic(call) => {
                 self.queue_string_intrinsic(*call)?;
+            }
+            mir::StringExpression::EnumBacking { enum_id, value } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::EnumBackingString(enum_id));
+                frame.tasks.push(EvaluationTask::Enum(*value));
             }
         }
         Ok(())
@@ -10507,6 +10621,22 @@ fn eval_compare(
             mir::CompareOp::Greater => left && !right,
             mir::CompareOp::GreaterEqual => left || !right,
         },
+        (mir::ScalarValue::Enum(left), mir::ScalarValue::Enum(right))
+            if left.enum_id == right.enum_id =>
+        {
+            match op {
+                mir::CompareOp::Equal => left.case_id == right.case_id,
+                mir::CompareOp::NotEqual => left.case_id != right.case_id,
+                mir::CompareOp::Less
+                | mir::CompareOp::LessEqual
+                | mir::CompareOp::Greater
+                | mir::CompareOp::GreaterEqual => {
+                    return Err(InterpreterError::new(
+                        "MIR enum values only support equality comparison",
+                    ));
+                }
+            }
+        }
         _ => {
             return Err(InterpreterError::new(
                 "MIR comparison operands have different scalar types",
@@ -10912,6 +11042,7 @@ fn display_scalar(value: mir::ScalarValue) -> String {
         mir::ScalarValue::Integer(value) => value.display(),
         mir::ScalarValue::Bool(value) => value.to_string(),
         mir::ScalarValue::Float(value) => value.display(),
+        mir::ScalarValue::Enum(_) => "<enum>".to_string(),
     }
 }
 
@@ -11163,6 +11294,7 @@ fn assign_local(
                 mir::ScalarType::Integer(value) => value.source_name(),
                 mir::ScalarType::Float(value) => value.source_name(),
                 mir::ScalarType::Bool => "bool",
+                mir::ScalarType::Enum(_) => "enum",
             },
             LocalValue::String(_) => "string",
             LocalValue::Mixed(_) => "mixed",
@@ -11211,6 +11343,19 @@ fn mixed_value_from_local(value: &LocalValue) -> Option<&MixedValue> {
         LocalValue::NullableMixed(None) => None,
         _ => None,
     }
+}
+
+fn enum_case_in(
+    program: &mir::Program,
+    value: crate::enums::EnumValue,
+) -> Result<&mir::EnumCaseDefinition, InterpreterError> {
+    program
+        .enums
+        .get(value.enum_id.0)
+        .filter(|definition| definition.id == value.enum_id)
+        .and_then(|definition| definition.cases.get(value.case_id.index))
+        .filter(|case| case.id == value.case_id)
+        .ok_or_else(|| InterpreterError::new("MIR enum case does not exist"))
 }
 
 fn function_in(

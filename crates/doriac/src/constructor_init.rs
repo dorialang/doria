@@ -553,6 +553,7 @@ fn inspect_expr(
         | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Null { .. }
+        | Expr::Match { .. }
         | Expr::StaticMember { .. } => {}
     }
 }

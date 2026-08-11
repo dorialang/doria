@@ -26,7 +26,7 @@ function check_performance_foundation(string $root): array
             'element_access',
             'Eligible timing evidence does not gate language or compiler stage progression',
             'Measurement Status: Pending Available Runner',
-            'Stage 27 is next',
+            'Stage 27 is now in progress',
             'Doria Median / Fastest Valid Native Peer Median <= 1.30',
             'A ratio greater than `1.30` is',
             'Inconclusive**, never Pass',
@@ -49,7 +49,7 @@ function check_performance_foundation(string $root): array
             'Decision 0113 Slice 3 — Complete',
             'Decision 0113 Slice 4 — Complete',
             'Decision 0113 — Complete',
-            'Stage 27 — Enums + payload cases — Next; No Performance-Evidence Dependency.',
+            'Stage 27 — Enums + payload cases — In Progress; No Performance-Evidence Dependency.',
         ],
         'docs/performance-and-benchmarking.md' => [
             'Decision 0112',
@@ -75,7 +75,7 @@ function check_performance_foundation(string $root): array
             'Decision 0113 Slice 4 — Complete.',
             'Decision 0113 — Complete.',
             'all three slices are complete',
-            'Stage 27 — Next; No Performance-Evidence Dependency.',
+            'Stage 27 — In Progress; No Performance-Evidence Dependency.',
         ],
         'AGENTS.md' => [
             '`dorialang/benchmarks` repository',

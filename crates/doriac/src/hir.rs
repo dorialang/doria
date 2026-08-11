@@ -2,7 +2,8 @@ use crate::source::Span;
 use crate::types::TypeRef;
 
 pub use crate::ast::{
-    ArgumentName, AssignOp, BinaryOp, IncrementOp, IncrementPosition, MemberAccess, UnaryOp,
+    ArgumentName, AssignOp, BinaryOp, IncrementOp, IncrementPosition, MatchBinding, MatchPattern,
+    MemberAccess, UnaryOp,
 };
 
 /// Current Doria IR implementation.
@@ -28,9 +29,34 @@ pub struct NamespaceDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Item {
     Class(ClassDecl),
+    Enum(EnumDecl),
     Function(FunctionDecl),
     Constant(ConstDecl),
     Statement(Stmt),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumDecl {
+    pub name: String,
+    pub type_params: Vec<TypeParamDecl>,
+    pub backing_type: Option<TypeRef>,
+    pub cases: Vec<EnumCaseDecl>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumCaseDecl {
+    pub name: String,
+    pub payload: Vec<EnumPayloadField>,
+    pub backing_value: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnumPayloadField {
+    pub ty: TypeRef,
+    pub name: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -338,6 +364,18 @@ pub enum Expr {
         inclusive: bool,
         span: Span,
     },
+    Match {
+        scrutinee: Box<Expr>,
+        arms: Vec<MatchArm>,
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchArm {
+    pub pattern: MatchPattern,
+    pub value: Expr,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -377,7 +415,8 @@ impl Expr {
             | Expr::Grouped { span, .. }
             | Expr::Unary { span, .. }
             | Expr::Binary { span, .. }
-            | Expr::Range { span, .. } => *span,
+            | Expr::Range { span, .. }
+            | Expr::Match { span, .. } => *span,
         }
     }
 }

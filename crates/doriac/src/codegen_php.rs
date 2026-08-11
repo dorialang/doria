@@ -435,7 +435,7 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
                     }
                 }
             }
-            Item::Constant(_) | Item::Statement(_) => {}
+            Item::Enum(_) | Item::Constant(_) | Item::Statement(_) => {}
         }
     }
     output.push_str("];\n\n");
@@ -694,6 +694,23 @@ fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), Backen
                             constant.span,
                         )?;
                     }
+                }
+            }
+            Ok(())
+        }
+        Item::Enum(enum_decl) => {
+            if !enum_decl.type_params.is_empty()
+                || enum_decl.cases.iter().any(|case| !case.payload.is_empty())
+            {
+                return Err(BackendError::from_diagnostics(vec![Diagnostic::new(
+                    "B0003",
+                    "PHP compatibility output for generic or payload enums lands in Stage 27 Slice 2",
+                    enum_decl.span,
+                )]));
+            }
+            for case in &enum_decl.cases {
+                if let Some(value) = &case.backing_value {
+                    validate_expr(value, semantic_info)?;
                 }
             }
             Ok(())
@@ -1293,6 +1310,10 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             validate_expr(start, semantic_info)?;
             validate_expr(end, semantic_info)
         }
+        Expr::Match { span, .. } => Err(BackendError::new(format!(
+            "match expressions must be rejected by Stage 28 semantic checking before PHP emission at {}..{}",
+            span.start, span.end
+        ))),
     }
 }
 
@@ -1446,6 +1467,9 @@ fn unsupported_php_property_default(
             .or_else(|| unsupported_php_property_default(right, semantic_info)),
         Expr::Range { span, .. } => {
             Some((*span, "range expressions in instance property initializers"))
+        }
+        Expr::Match { span, .. } => {
+            Some((*span, "match expressions in instance property initializers"))
         }
         Expr::IsType { span, .. } => Some((*span, "type tests in instance property initializers")),
         Expr::Identifier { .. }
@@ -1639,6 +1663,7 @@ fn emit_item(
 ) {
     match item {
         Item::Class(class_decl) => emit_class(class_decl, semantic_info, output, indent, scopes),
+        Item::Enum(enum_decl) => emit_enum(enum_decl, output, indent, scopes),
         Item::Function(function) => {
             emit_function(function, semantic_info, output, indent, false, scopes)
         }
@@ -1651,6 +1676,29 @@ fn emit_item(
         ),
         Item::Statement(statement) => emit_statement(statement, output, indent, scopes),
     }
+}
+
+fn emit_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize, scopes: &PhpNameScopes) {
+    write_indent(output, indent);
+    output.push_str("enum ");
+    output.push_str(&enum_decl.name);
+    if let Some(backing) = &enum_decl.backing_type {
+        output.push_str(": ");
+        output.push_str(&backing.name);
+    }
+    output.push('\n');
+    writeln(output, indent, "{");
+    for case in &enum_decl.cases {
+        write_indent(output, indent + 1);
+        output.push_str("case ");
+        output.push_str(&case.name);
+        if let Some(value) = &case.backing_value {
+            output.push_str(" = ");
+            output.push_str(&emit_expr(value, scopes));
+        }
+        output.push_str(";\n");
+    }
+    writeln(output, indent, "}");
 }
 
 fn emit_class(
@@ -1723,13 +1771,16 @@ fn emit_property(
     if let Some(initializer) = &property.initializer {
         output.push_str(" = ");
         if property.is_static {
-            output.push_str(&emit_const_value(evaluated_value(
+            output.push_str(&emit_const_value(
+                evaluated_value(
+                    evaluation,
+                    &ConstKey::Static {
+                        class_name: class_name.to_string(),
+                        name: property.name.clone(),
+                    },
+                ),
                 evaluation,
-                &ConstKey::Static {
-                    class_name: class_name.to_string(),
-                    name: property.name.clone(),
-                },
-            )));
+            ));
         } else {
             output.push_str(&emit_expr(initializer, &shared_scopes.expression_scope()));
         }
@@ -1762,7 +1813,10 @@ fn emit_constant(
             name: constant.name.clone(),
         },
     );
-    output.push_str(&emit_const_value(evaluated_value(evaluation, &key)));
+    output.push_str(&emit_const_value(
+        evaluated_value(evaluation, &key),
+        evaluation,
+    ));
     output.push_str(";\n");
 }
 
@@ -1779,7 +1833,7 @@ fn evaluated_value<'a>(evaluation: &'a Evaluation, key: &ConstKey) -> &'a ConstV
         .value
 }
 
-fn emit_const_value(value: &ConstValue) -> String {
+fn emit_const_value(value: &ConstValue, evaluation: &Evaluation) -> String {
     match value {
         ConstValue::Integer(value)
             if value.ty.is_default_int() && value.mathematical_value() == i64::MIN as i128 =>
@@ -1802,6 +1856,13 @@ fn emit_const_value(value: &ConstValue) -> String {
         ConstValue::String(value) => emit_php_string_literal(value),
         ConstValue::Bool(value) => value.to_string(),
         ConstValue::Null => "null".to_string(),
+        ConstValue::Enum(value) => evaluation
+            .enum_cases
+            .iter()
+            .find_map(|((enum_name, case_name), candidate)| {
+                (*candidate == *value).then(|| format!("{enum_name}::{case_name}"))
+            })
+            .expect("checked enum constant must name a declared case"),
     }
 }
 
@@ -1841,6 +1902,7 @@ fn emit_function(
                         function_start: function.span.start,
                         parameter_index,
                     }),
+                    &semantic_info.const_evaluation,
                     &scopes,
                 )
             })
@@ -1865,6 +1927,7 @@ fn emit_function(
 fn emit_param(
     param: &Param,
     evaluated_default: Option<&ConstValue>,
+    evaluation: &Evaluation,
     scopes: &PhpNameScopes,
 ) -> String {
     let mut output = String::new();
@@ -1877,9 +1940,11 @@ fn emit_param(
     output.push_str(&scopes.php_name(&param.name));
     if param.default.is_some() {
         output.push_str(" = ");
-        output.push_str(&emit_const_value(evaluated_default.expect(
-            "checked Copy-scalar parameter default must have an evaluated value",
-        )));
+        output.push_str(&emit_const_value(
+            evaluated_default
+                .expect("checked Copy-scalar parameter default must have an evaluated value"),
+            evaluation,
+        ));
     }
     output
 }
@@ -2537,6 +2602,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
             emit_expr(start, scopes),
             emit_expr(end, scopes)
         ),
+        Expr::Match { .. } => unreachable!("semantic analysis rejects match before PHP lowering"),
     }
 }
 

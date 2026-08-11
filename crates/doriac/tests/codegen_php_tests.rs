@@ -22,6 +22,58 @@ echo $count;
 }
 
 #[test]
+fn php_backend_emits_native_unit_and_backed_enums() {
+    let php = doriac::compile_source_to_php(
+        "stage27.doria",
+        r#"
+enum Status { case Draft; case Published; }
+enum Priority: int { case Low = 1; case High = 10; }
+enum Transport: string { case Road = "road"; case Rail = "rail"; }
+function main(): void
+{
+    Status $status = Status::Draft;
+    Priority $priority = Priority::High;
+    Transport $transport = Transport::Rail;
+    echo $status == Status::Draft;
+    echo " {$priority->value} {$transport->value}\n";
+}
+"#,
+    )
+    .expect("unit and backed enums should lower to PHP native enums");
+
+    assert!(php.contains("enum Status"));
+    assert!(php.contains("case Draft;"));
+    assert!(php.contains("enum Priority: int"));
+    assert!(php.contains("case High = 10;"));
+    assert!(php.contains("enum Transport: string"));
+    assert!(php.contains("case Rail = 'rail';") || php.contains("case Rail = \"rail\";"));
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated enum PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"true 10 rail\n");
+}
+
+#[test]
 fn php_grouped_declarations_use_one_collision_safe_temporary_in_order() {
     let php = doriac::compile_source_to_php(
         "stage26a.doria",

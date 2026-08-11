@@ -7,6 +7,7 @@
 use std::fmt;
 
 use crate::class_layout::{ClassId, ClassLayout, PropertyId};
+use crate::enums::{EnumBackingType, EnumBackingValue, EnumCaseId, EnumId, EnumValue};
 use crate::format_string::FormatPiece;
 use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::{SourceFile, Span};
@@ -30,6 +31,7 @@ pub struct CollectionTypeId(pub usize);
 pub struct Program {
     pub source: SourceFile,
     pub classes: Vec<Class>,
+    pub enums: Vec<EnumDefinition>,
     pub collection_types: Vec<CollectionType>,
     pub statics: Vec<StaticProperty>,
     pub functions: Vec<Function>,
@@ -39,11 +41,36 @@ pub struct Program {
 impl PartialEq for Program {
     fn eq(&self, other: &Self) -> bool {
         self.classes == other.classes
+            && self.enums == other.enums
             && self.collection_types == other.collection_types
             && self.statics == other.statics
             && self.functions == other.functions
             && self.entry == other.entry
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumDefinition {
+    pub id: EnumId,
+    pub name: String,
+    pub backing_type: Option<EnumBackingType>,
+    pub cases: Vec<EnumCaseDefinition>,
+    pub copy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumCaseDefinition {
+    pub id: EnumCaseId,
+    pub name: String,
+    pub tag: u32,
+    pub backing_value: Option<EnumBackingValue>,
+    pub payload: Vec<EnumPayloadDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnumPayloadDefinition {
+    pub name: String,
+    pub ty: Type,
 }
 
 impl Eq for Program {}
@@ -212,6 +239,8 @@ pub enum ScalarType {
     Integer(IntegerType),
     Float(FloatType),
     Bool,
+    /// A nominal unit/backed enum whose physical tag width is backend-private.
+    Enum(EnumId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -219,6 +248,7 @@ pub enum ScalarValue {
     Integer(IntegerValue),
     Float(FloatValue),
     Bool(bool),
+    Enum(EnumValue),
 }
 
 impl ScalarValue {
@@ -227,6 +257,7 @@ impl ScalarValue {
             Self::Integer(value) => ScalarType::Integer(value.ty),
             Self::Float(value) => ScalarType::Float(value.ty),
             Self::Bool(_) => ScalarType::Bool,
+            Self::Enum(value) => ScalarType::Enum(value.enum_id),
         }
     }
 }
@@ -1914,6 +1945,7 @@ pub enum MixedTag {
     Float(FloatType),
     String,
     Class(ClassId),
+    Enum(EnumId),
 }
 
 impl MixedTag {
@@ -1924,6 +1956,7 @@ impl MixedTag {
             Self::Float(ty) => Type::Scalar(ScalarType::Float(ty)),
             Self::String => Type::String,
             Self::Class(class) => Type::Class(class),
+            Self::Enum(enum_id) => Type::Scalar(ScalarType::Enum(enum_id)),
         }
     }
 }
@@ -2280,6 +2313,7 @@ pub enum ValueExpression {
     Integer(IntegerExpression),
     Float(FloatExpression),
     Bool(BoolExpression),
+    Enum(EnumExpression),
 }
 
 impl ValueExpression {
@@ -2288,6 +2322,37 @@ impl ValueExpression {
             Self::Integer(value) => ScalarType::Integer(value.ty()),
             Self::Float(value) => ScalarType::Float(value.ty()),
             Self::Bool(_) => ScalarType::Bool,
+            Self::Enum(value) => ScalarType::Enum(value.enum_id()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnumExpression {
+    Use {
+        enum_id: EnumId,
+        operand: Operand,
+    },
+    Case(EnumValue),
+    Call {
+        enum_id: EnumId,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
+    Coalesce {
+        enum_id: EnumId,
+        left: Box<NullableScalarExpression>,
+        right: Box<EnumExpression>,
+    },
+}
+
+impl EnumExpression {
+    pub const fn enum_id(&self) -> EnumId {
+        match self {
+            Self::Use { enum_id, .. }
+            | Self::Call { enum_id, .. }
+            | Self::Coalesce { enum_id, .. } => *enum_id,
+            Self::Case(value) => value.enum_id,
         }
     }
 }
@@ -2352,6 +2417,10 @@ pub enum IntegerExpression {
         ty: IntegerType,
         left: Box<NullableScalarExpression>,
         right: Box<IntegerExpression>,
+    },
+    EnumBacking {
+        enum_id: EnumId,
+        value: Box<EnumExpression>,
     },
 }
 
@@ -2442,6 +2511,16 @@ impl PartialEq for IntegerExpression {
                     right: right_right,
                 },
             ) => left_ty == right_ty && left_left == right_left && left_right == right_right,
+            (
+                Self::EnumBacking {
+                    enum_id: left_enum,
+                    value: left,
+                },
+                Self::EnumBacking {
+                    enum_id: right_enum,
+                    value: right,
+                },
+            ) => left_enum == right_enum && left == right,
             _ => false,
         }
     }
@@ -2459,6 +2538,7 @@ impl IntegerExpression {
             | Self::Call { ty, .. }
             | Self::Coalesce { ty, .. } => *ty,
             Self::FloatToInt { .. } => IntegerType::Int64,
+            Self::EnumBacking { .. } => IntegerType::Int64,
         }
     }
 
@@ -2571,6 +2651,10 @@ pub enum StringExpression {
     },
     MixedPayload(LocalId),
     Intrinsic(Box<StringIntrinsicCall>),
+    EnumBacking {
+        enum_id: EnumId,
+        value: Box<EnumExpression>,
+    },
 }
 
 impl StringExpression {
@@ -3488,6 +3572,17 @@ fn value_class_temporary_capacity(value: &ValueExpression) -> usize {
         ValueExpression::Integer(value) => integer_class_temporary_capacity(value),
         ValueExpression::Float(value) => float_class_temporary_capacity(value),
         ValueExpression::Bool(value) => bool_class_temporary_capacity(value),
+        ValueExpression::Enum(value) => enum_class_temporary_capacity(value),
+    }
+}
+
+fn enum_class_temporary_capacity(value: &EnumExpression) -> usize {
+    match value {
+        EnumExpression::Use { .. } | EnumExpression::Case(_) => 0,
+        EnumExpression::Call { args, .. } => args.iter().map(rvalue_class_temporary_capacity).sum(),
+        EnumExpression::Coalesce { left, right, .. } => {
+            nullable_scalar_class_temporary_capacity(left) + enum_class_temporary_capacity(right)
+        }
     }
 }
 
@@ -3508,6 +3603,7 @@ fn integer_class_temporary_capacity(value: &IntegerExpression) -> usize {
         IntegerExpression::Coalesce { left, right, .. } => {
             nullable_scalar_class_temporary_capacity(left) + integer_class_temporary_capacity(right)
         }
+        IntegerExpression::EnumBacking { value, .. } => enum_class_temporary_capacity(value),
     }
 }
 
@@ -3545,6 +3641,7 @@ fn string_class_temporary_capacity(value: &StringExpression) -> usize {
         StringExpression::Intrinsic(call) => {
             call.args.iter().map(rvalue_class_temporary_capacity).sum()
         }
+        StringExpression::EnumBacking { value, .. } => enum_class_temporary_capacity(value),
         StringExpression::Literal(_)
         | StringExpression::Local(_)
         | StringExpression::NullableLocalAssumeNonNull(_)
@@ -4274,6 +4371,7 @@ impl fmt::Display for MixedTag {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Bool => formatter.write_str("bool"),
+            Self::Enum(enum_id) => write!(formatter, "enum#{}", enum_id.0),
             Self::Integer(ty) => write!(formatter, "{ty}"),
             Self::Float(ty) => write!(formatter, "{ty}"),
             Self::String => formatter.write_str("string"),
@@ -4354,6 +4452,7 @@ impl fmt::Display for ScalarType {
             Self::Integer(ty) => write!(formatter, "{ty}"),
             Self::Float(ty) => write!(formatter, "{ty}"),
             Self::Bool => formatter.write_str("bool"),
+            Self::Enum(enum_id) => write!(formatter, "enum#{}", enum_id.0),
         }
     }
 }
@@ -4367,6 +4466,11 @@ impl fmt::Display for ScalarValue {
                 FloatType::Float64 => write!(formatter, "0x{:016x}: float", value.bits),
             },
             Self::Bool(value) => write!(formatter, "{value}: bool"),
+            Self::Enum(value) => write!(
+                formatter,
+                "enum#{}::case{}",
+                value.enum_id.0, value.case_id.index
+            ),
         }
     }
 }
@@ -4377,6 +4481,33 @@ impl fmt::Display for ValueExpression {
             Self::Integer(value) => write!(formatter, "{value}"),
             Self::Float(value) => write!(formatter, "{value}"),
             Self::Bool(value) => write!(formatter, "{value}"),
+            Self::Enum(value) => write!(formatter, "{value}"),
+        }
+    }
+}
+
+impl fmt::Display for EnumExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Use { enum_id, operand } => write!(formatter, "{operand:?}: enum#{}", enum_id.0),
+            Self::Case(value) => write!(
+                formatter,
+                "enum#{}::case{}",
+                value.enum_id.0, value.case_id.index
+            ),
+            Self::Call {
+                enum_id,
+                function,
+                args,
+            } => {
+                write_call(formatter, *function, args)?;
+                write!(formatter, ": enum#{}", enum_id.0)
+            }
+            Self::Coalesce {
+                enum_id,
+                left,
+                right,
+            } => write!(formatter, "({left} ?? {right}): enum#{}", enum_id.0),
         }
     }
 }
@@ -4463,6 +4594,9 @@ impl fmt::Display for IntegerExpression {
             }
             IntegerExpression::Coalesce { ty, left, right } => {
                 write!(formatter, "({left} ?? {right}): {ty}")
+            }
+            IntegerExpression::EnumBacking { enum_id, value } => {
+                write!(formatter, "enum_backing<{:?}>({value})", enum_id)
             }
         }
     }
@@ -4573,6 +4707,9 @@ impl fmt::Display for StringExpression {
                 write!(formatter, "key_at(local{}, {offset})", collection.0)
             }
             StringExpression::Intrinsic(call) => write!(formatter, "{call}"),
+            StringExpression::EnumBacking { enum_id, value } => {
+                write!(formatter, "enum_backing<{:?}>({value})", enum_id)
+            }
         }
     }
 }

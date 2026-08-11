@@ -380,6 +380,7 @@ fn rejects_malformed_block_id() {
 fn void_program() -> Program {
     Program {
         source: doriac::source::SourceFile::new("<test>", ""),
+        enums: vec![],
         classes: vec![],
         collection_types: vec![],
         statics: vec![],

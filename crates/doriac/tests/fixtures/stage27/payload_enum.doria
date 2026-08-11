@@ -1,0 +1,10 @@
+enum Shape
+{
+    case Circle(float $radius);
+    case Rect(float $width, float $height);
+}
+
+function main(): void
+{
+    Shape $shape = Shape::Circle(2.5);
+}

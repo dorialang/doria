@@ -14,6 +14,7 @@ mod constructor_init;
 pub mod control_flow;
 pub mod dataflow;
 pub mod diagnostics;
+pub mod enums;
 pub mod format_string;
 pub mod hir;
 pub mod lexer;

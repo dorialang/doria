@@ -767,6 +767,47 @@ use an explicit presence word and payload. `?T` keeps `T`'s ownership class:
 nullable Copy payloads remain Copy, while `?Class` remains a move value and drops
 the class only when present. Decision 0093 defines the complete Stage 22 model.
 
+### Enums
+
+Enums are nominal top-level types. Enum and case names use PascalCase, every
+case ends with `;`, and cases are selected with static-member syntax:
+
+```doria
+enum Status
+{
+    case Draft;
+    case Published;
+}
+
+Status $status = Status::Draft;
+```
+
+A backed enum uses exactly `int` or `string`. Every case has one unique,
+exactly typed constant backing value. The public backing value is available
+through the readonly `value` property; it is not the enum's identity and there
+is no implicit enum/backing conversion.
+
+```doria
+enum Priority: int
+{
+    case Low = 1;
+    case High = 10;
+}
+
+echo Priority::High->value;
+```
+
+Unit and backed enums are inline Copy values. Equality requires the same enum
+type and compares case identity. Enums are not implicitly displayable and do
+not gain automatic hashing or ordering. Nullable enums keep presence separate
+from the private case tag, and enum values boxed into `mixed` retain exact enum
+type identity.
+
+Payload case syntax is accepted and records readonly owned fields, but payload
+construction and execution remain the next Stage 27 slice. `match` syntax is
+accepted for the syntax clock while pattern semantics remain Stage 28.
+Decision 0114 defines the complete enum model and implementation boundary.
+
 Typed arrays use C-style suffix spelling:
 
 ```text

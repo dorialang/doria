@@ -1,0 +1,18 @@
+enum Shape
+{
+    case Circle(float $radius);
+    case Rect(float $width, float $height);
+}
+
+function area(Shape $shape): float
+{
+    return match ($shape) {
+        Shape::Circle($radius) => 3.14159265 * $radius * $radius,
+        Shape::Rect($width, $height) => $width * $height,
+        default => 0.0,
+    };
+}
+
+function main(): void
+{
+}
