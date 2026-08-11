@@ -28,24 +28,26 @@ use crate::native_abi::{
     stage26_collection_kind, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
     BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
     CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
-    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
+    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_DETACH_FOR_CLEANUP,
+    COLLECTION_FILL_STRING, COLLECTION_FILL_WORD, COLLECTION_FINISH_DETACHED_CLEANUP,
     COLLECTION_FREE, COLLECTION_INDEX_FIELD, COLLECTION_INDEX_OF, COLLECTION_INSERT_AT,
     COLLECTION_INSERT_AT_NULLABLE, COLLECTION_KEYED_GET, COLLECTION_KEYED_GET_NULLABLE,
     COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT,
     COLLECTION_LENGTH, COLLECTION_LENGTH_FIELD, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS,
     COLLECTION_PUSH, COLLECTION_PUSH_FRONT, COLLECTION_PUSH_FRONT_NULLABLE,
     COLLECTION_PUSH_NULLABLE, COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT,
-    COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE,
-    COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW,
-    COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
-    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
-    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
-    MIXED_TAG_CLASS, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32,
-    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32,
-    MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT,
-    READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE,
-    SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK,
-    SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    COLLECTION_REMOVE_VALUE, COLLECTION_RESET_AFTER_CLEANUP, COLLECTION_SET_ALGEBRA,
+    COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE,
+    COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW, COLLECTION_VALUES_FIELD,
+    COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING,
+    FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW, MIXED_NEW_BORROWED,
+    MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS,
+    MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64,
+    MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64,
+    MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE,
+    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE,
+    SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
+    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
     STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
     STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
     STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
@@ -834,6 +836,12 @@ enum CollectionMemoryRegion {
     Values,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollectionStorageAction {
+    Free,
+    Reset,
+}
+
 #[derive(Clone, Copy)]
 enum DeferredOwnedTemporary {
     Class(crate::class_layout::ClassId),
@@ -1373,6 +1381,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 index: key,
                 value,
             } => self.lower_collection_set(*collection, key, value, *positional)?,
+            mir::Statement::CollectionClear {
+                collection,
+                collection_type,
+            } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let slot = local_slot(&self.local_slots, *collection)?;
+                let value = build(self.builder.build_load(pointer, slot, "collection.clear"))?
+                    .into_pointer_value();
+                self.clear_collection_value(value, *collection_type)?;
+            }
             mir::Statement::DropCollection { local, collection } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let slot = local_slot(&self.local_slots, *local)?;
@@ -3733,6 +3751,23 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         collection: PointerValue<'ctx>,
         collection_type: mir::CollectionTypeId,
     ) -> Result<(), BackendError> {
+        self.finish_collection_value(collection, collection_type, CollectionStorageAction::Free)
+    }
+
+    fn clear_collection_value(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        collection_type: mir::CollectionTypeId,
+    ) -> Result<(), BackendError> {
+        self.finish_collection_value(collection, collection_type, CollectionStorageAction::Reset)
+    }
+
+    fn finish_collection_value(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        collection_type: mir::CollectionTypeId,
+        action: CollectionStorageAction,
+    ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         let definition = self.collection_definition(collection_type)?.clone();
@@ -3751,6 +3786,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         )?;
         self.builder.position_at_end(drop_block);
         if definition.kind == mir::CollectionKind::Bytes {
+            if action != CollectionStorageAction::Free {
+                return Err(malformed_mir(
+                    "Bytes cannot be cleared as a named collection",
+                ));
+            }
             let _ = self.call_runtime(BYTES_FREE, &[pointer.into()], None, &[collection.into()])?;
             build(self.builder.build_unconditional_branch(done))?;
             self.builder.position_at_end(done);
@@ -3764,22 +3804,40 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .key
             .is_none_or(|key| matches!(key, mir::Type::Scalar(_)));
         if scalar_values && scalar_keys {
-            let _ = self.call_runtime(
-                COLLECTION_FREE,
-                &[pointer.into()],
-                None,
-                &[collection.into()],
-            )?;
+            let symbol = match action {
+                CollectionStorageAction::Free => COLLECTION_FREE,
+                CollectionStorageAction::Reset => COLLECTION_RESET_AFTER_CLEANUP,
+            };
+            let _ = self.call_runtime(symbol, &[pointer.into()], None, &[collection.into()])?;
             build(self.builder.build_unconditional_branch(done))?;
             self.builder.position_at_end(done);
             return Ok(());
         }
+        let cleanup_collection = if action == CollectionStorageAction::Reset {
+            let cleanup_collection = self.entry_alloca(
+                collection_header_type(self.context, self.target_data),
+                "collection.cleanup",
+            )?;
+            let _ = self.call_runtime(
+                COLLECTION_DETACH_FOR_CLEANUP,
+                &[pointer.into(), pointer.into(), pointer.into()],
+                None,
+                &[
+                    self.current_frame.into(),
+                    collection.into(),
+                    cleanup_collection.into(),
+                ],
+            )?;
+            cleanup_collection
+        } else {
+            collection
+        };
         let length = self
             .call_runtime(
                 COLLECTION_LENGTH,
                 &[pointer.into()],
                 Some(usize_type.into()),
-                &[collection.into()],
+                &[cleanup_collection.into()],
             )?
             .ok_or_else(|| backend_failure("collection length produced no result"))?
             .into_int_value();
@@ -3820,7 +3878,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 COLLECTION_VALUE_AT,
                 &[pointer.into(), pointer.into(), usize_type.into()],
                 Some(self.context.i64_type().into()),
-                &[self.current_frame.into(), collection.into(), current.into()],
+                &[
+                    self.current_frame.into(),
+                    cleanup_collection.into(),
+                    current.into(),
+                ],
             )?
             .ok_or_else(|| backend_failure("collection value read produced no result"))?
             .into_int_value();
@@ -3833,7 +3895,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     COLLECTION_KEY_AT,
                     &[pointer.into(), pointer.into(), usize_type.into()],
                     Some(self.context.i64_type().into()),
-                    &[self.current_frame.into(), collection.into(), current.into()],
+                    &[
+                        self.current_frame.into(),
+                        cleanup_collection.into(),
+                        current.into(),
+                    ],
                 )?
                 .ok_or_else(|| backend_failure("collection key read produced no result"))?
                 .into_int_value();
@@ -3843,12 +3909,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         build(self.builder.build_store(index_slot, current))?;
         build(self.builder.build_unconditional_branch(header))?;
         self.builder.position_at_end(free);
-        let _ = self.call_runtime(
-            COLLECTION_FREE,
-            &[pointer.into()],
-            None,
-            &[collection.into()],
-        )?;
+        match action {
+            CollectionStorageAction::Free => {
+                let _ = self.call_runtime(
+                    COLLECTION_FREE,
+                    &[pointer.into()],
+                    None,
+                    &[cleanup_collection.into()],
+                )?;
+            }
+            CollectionStorageAction::Reset => {
+                let _ = self.call_runtime(
+                    COLLECTION_FINISH_DETACHED_CLEANUP,
+                    &[pointer.into(), pointer.into()],
+                    None,
+                    &[collection.into(), cleanup_collection.into()],
+                )?;
+            }
+        }
         build(self.builder.build_unconditional_branch(done))?;
         self.builder.position_at_end(done);
         Ok(())
@@ -10224,11 +10302,10 @@ fn collection_header_type<'ctx>(
     let word = context.ptr_sized_int_type(target_data, None);
     let pointer = context.ptr_type(AddressSpace::default());
     let byte = context.i8_type();
-    // Mirrors `#[repr(C)] DrCollectionV1` through the membership index pointer.
-    // Only the fields codegen reads have named constants, but every field up to
-    // the last one read has to be present or the offsets shift. The tail beyond
-    // `index` stays runtime-only. `collection_header_offsets_match_runtime`
-    // pins this against the runtime's own `offset_of!`.
+    // Mirrors the complete `#[repr(C)] DrCollectionV1`. Most fields stay
+    // runtime-only, but clear uses this type as fixed entry-block scratch while
+    // generated drop glue runs, so its size and alignment are part of the
+    // private compiler/runtime ABI as well as the offsets codegen reads.
     context.struct_type(
         &[
             word.into(),    // length
@@ -10244,6 +10321,9 @@ fn collection_header_type<'ctx>(
             byte.into(),    // value_nullable
             word.into(),    // head
             pointer.into(), // index
+            word.into(),    // index_slots
+            byte.into(),    // index_kind
+            byte.into(),    // index_keyed
         ],
         false,
     )
@@ -10670,5 +10750,13 @@ mod tests {
                 Some(expected as u64)
             );
         }
+        assert_eq!(
+            target_data.get_store_size(&header),
+            doria_rt::DR_COLLECTION_SIZE as u64
+        );
+        assert_eq!(
+            target_data.get_abi_alignment(&header),
+            doria_rt::DR_COLLECTION_ALIGN as u32
+        );
     }
 }

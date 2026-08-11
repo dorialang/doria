@@ -1029,6 +1029,11 @@ fn native_profiles_keep_loop_body_stack_use_constant() {
             include_str!("fixtures/native_stack/list_first.doria"),
             expected_list_first(iterations),
         ),
+        (
+            "collection_clear",
+            include_str!("fixtures/native_stack/collection_clear.doria"),
+            expected_collection_clear(iterations),
+        ),
     ];
 
     #[cfg(feature = "llvm-backend")]
@@ -1132,6 +1137,10 @@ fn expected_dictionary_get(iterations: u64) -> String {
         checksum = (checksum + index % 64) % STACK_GROWTH_MODULUS;
     }
     format!("{checksum}\n")
+}
+
+fn expected_collection_clear(iterations: u64) -> String {
+    format!("{}:0:0:0:0\n", (iterations * 4) % STACK_GROWTH_MODULUS)
 }
 
 fn expected_dictionary_set_remove(iterations: u64) -> String {

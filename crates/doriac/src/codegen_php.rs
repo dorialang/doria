@@ -27,6 +27,25 @@ abstract class __DoriaOrderedCollection
         if (is_bool($left)) { return ((int) $left) <=> ((int) $right); }
         return $left <=> $right;
     }
+
+    protected static function releaseValuesInReverse(array &$values): void
+    {
+        $keys = array_keys($values);
+        for ($index = count($keys) - 1; $index >= 0; --$index) {
+            unset($values[$keys[$index]]);
+        }
+    }
+
+    protected static function releasePairsInReverse(array &$pairs): void
+    {
+        $keys = array_keys($pairs);
+        for ($index = count($keys) - 1; $index >= 0; --$index) {
+            $key = $keys[$index];
+            unset($pairs[$key][1]);
+            unset($pairs[$key][0]);
+            unset($pairs[$key]);
+        }
+    }
 }
 
 final class SortedDictionary extends __DoriaOrderedCollection implements ArrayAccess, IteratorAggregate
@@ -91,6 +110,13 @@ final class SortedDictionary extends __DoriaOrderedCollection implements ArrayAc
         $value = $this->entries[$index][1];
         array_splice($this->entries, $index, 1);
         return $value;
+    }
+
+    public function clear(): void
+    {
+        $entries = $this->entries;
+        $this->entries = [];
+        self::releasePairsInReverse($entries);
     }
 
     public function __get(string $name): mixed
@@ -162,6 +188,13 @@ final class SortedSet extends __DoriaOrderedCollection implements IteratorAggreg
     }
 
     public function contains(mixed $value): bool { return $this->locate($value)[0]; }
+
+    public function clear(): void
+    {
+        $values = $this->values;
+        $this->values = [];
+        self::releaseValuesInReverse($values);
+    }
 
     private function algebra(self $other, string $operation): self
     {
@@ -236,6 +269,12 @@ final class PriorityQueue extends __DoriaOrderedCollection
         if ($this->heap) { $this->heap[0] = $last; $this->siftDown(0); }
         return $value;
     }
+    public function clear(): void
+    {
+        $heap = $this->heap;
+        $this->heap = [];
+        self::releaseValuesInReverse($heap);
+    }
     public function __get(string $name): mixed
     {
         if ($name === 'count') { return count($this->heap); }
@@ -245,7 +284,7 @@ final class PriorityQueue extends __DoriaOrderedCollection
     }
 }
 
-final class Deque implements IteratorAggregate
+final class Deque extends __DoriaOrderedCollection implements IteratorAggregate
 {
     private array $values = [];
     private int $head = 0;
@@ -297,6 +336,19 @@ final class Deque implements IteratorAggregate
         unset($this->values[$index]);
         --$this->count;
         return $value;
+    }
+    public function clear(): void
+    {
+        $values = $this->values;
+        $head = $this->head;
+        $count = $this->count;
+        $capacity = $this->capacity;
+        $this->values = [];
+        $this->head = 0;
+        $this->count = 0;
+        for ($offset = $count - 1; $offset >= 0; --$offset) {
+            unset($values[($head + $offset) % $capacity]);
+        }
     }
     public function __get(string $name): mixed
     {

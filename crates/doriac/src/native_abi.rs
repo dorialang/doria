@@ -117,6 +117,9 @@ pub const COLLECTION_STAGE26_FROM_COPY: &str = "dr_v2_collection_from_copy";
 pub const COLLECTION_FILL_WORD: &str = "dr_v2_collection_fill_word";
 pub const COLLECTION_FILL_STRING: &str = "dr_v2_collection_fill_string";
 pub const COLLECTION_FREE: &str = "dr_v1_collection_free";
+pub const COLLECTION_RESET_AFTER_CLEANUP: &str = "dr_v2_collection_reset_after_cleanup";
+pub const COLLECTION_DETACH_FOR_CLEANUP: &str = "dr_v3_collection_detach_for_cleanup";
+pub const COLLECTION_FINISH_DETACHED_CLEANUP: &str = "dr_v3_collection_finish_detached_cleanup";
 pub const COLLECTION_LENGTH: &str = "dr_v1_collection_length";
 pub const COLLECTION_PUSH: &str = "dr_v1_collection_push";
 pub const COLLECTION_PUSH_NULLABLE: &str = "dr_v2_collection_push_nullable";
@@ -172,6 +175,15 @@ pub const COLLECTION_VALUE_WIDTH_FIELD: u32 = 6;
 pub const COLLECTION_KIND_FIELD: u32 = 7;
 pub const COLLECTION_HEAD_FIELD: u32 = 11;
 pub const COLLECTION_INDEX_FIELD: u32 = 12;
+
+pub const fn collection_header_size(pointer_bytes: u32) -> u32 {
+    let prefix = align_to(4 * pointer_bytes + 7, pointer_bytes);
+    align_to(prefix + 3 * pointer_bytes + 2, pointer_bytes)
+}
+
+const fn align_to(value: u32, alignment: u32) -> u32 {
+    value.div_ceil(alignment) * alignment
+}
 
 pub const fn stage26_collection_kind(kind: mir::CollectionKind) -> Option<u8> {
     match kind {
@@ -282,4 +294,18 @@ pub fn function_symbol(function: &mir::Function) -> String {
         })
         .collect::<String>();
     format!("__doria_fn_{}_{}", function.id.0, sanitized)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::collection_header_size;
+
+    #[test]
+    fn collection_cleanup_scratch_matches_the_runtime_header() {
+        assert_eq!(
+            collection_header_size(size_of::<usize>() as u32) as usize,
+            doria_rt::DR_COLLECTION_SIZE
+        );
+        assert_eq!(align_of::<usize>(), doria_rt::DR_COLLECTION_ALIGN);
+    }
 }

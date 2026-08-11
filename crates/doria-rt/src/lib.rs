@@ -144,10 +144,10 @@ pub struct DrStringV1 {
 
 pub use bytes::DrBytesV1;
 pub use collection::{
-    DrCollectionV1, DR_COLLECTION_CAPACITY_OFFSET, DR_COLLECTION_FIXED_OFFSET,
+    DrCollectionV1, DR_COLLECTION_ALIGN, DR_COLLECTION_CAPACITY_OFFSET, DR_COLLECTION_FIXED_OFFSET,
     DR_COLLECTION_HEAD_OFFSET, DR_COLLECTION_INDEX_OFFSET, DR_COLLECTION_KEYED_OFFSET,
     DR_COLLECTION_KEYS_OFFSET, DR_COLLECTION_KIND_OFFSET, DR_COLLECTION_LENGTH_OFFSET,
-    DR_COLLECTION_VALUES_OFFSET, DR_COLLECTION_VALUE_WIDTH_OFFSET,
+    DR_COLLECTION_SIZE, DR_COLLECTION_VALUES_OFFSET, DR_COLLECTION_VALUE_WIDTH_OFFSET,
 };
 pub use mixed::DrMixedV1;
 
@@ -380,6 +380,55 @@ pub unsafe extern "C" fn dr_v2_collection_fill_string(
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_collection_free(collection: *mut DrCollectionV1) {
     collection::free(collection)
+}
+
+/// Resets a growable collection after generated type-aware drop glue has
+/// released all live keys and values. The collection allocation is retained.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live named collection. Every live
+/// owned key and value must already have been released exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_collection_reset_after_cleanup(collection: *mut DrCollectionV1) {
+    collection::reset_after_cleanup(collection)
+}
+
+/// Detaches the current storage from a growable collection before generated
+/// type-aware drop glue invokes any user destructors.
+///
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain and
+/// `collection` must be a uniquely borrowed live growable collection. The
+/// `detached` must point to writable, properly aligned stack scratch large
+/// enough for `DrCollectionV1`, and that snapshot must be consumed exactly once by
+/// `dr_v3_collection_finish_detached_cleanup`.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_collection_detach_for_cleanup(
+    current_frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    detached: *mut DrCollectionV1,
+) {
+    collection::detach_for_cleanup(current_frame, collection, detached)
+}
+
+/// Finishes type-aware cleanup without disturbing entries inserted by a
+/// destructor after the collection was detached.
+///
+/// # Safety
+///
+/// `collection` must be the live collection passed to
+/// `dr_v3_collection_detach_for_cleanup`; `detached` must be that call's
+/// unconsumed stack snapshot after generated drop glue released every logical
+/// entry. This function releases only detached backing storage, never the
+/// caller-owned snapshot itself.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_collection_finish_detached_cleanup(
+    collection: *mut DrCollectionV1,
+    detached: *mut DrCollectionV1,
+) {
+    collection::finish_detached_cleanup(collection, detached)
 }
 
 /// # Safety

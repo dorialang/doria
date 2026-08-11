@@ -117,6 +117,8 @@ enum CollectionFamily {
     List,
     Dictionary,
     Set,
+    PriorityQueue,
+    Deque,
     Bytes,
 }
 
@@ -1597,6 +1599,8 @@ impl Checker<'_> {
         scopes: &mut Scopes,
         return_move_type: bool,
     ) -> Flow {
+        let borrow_depth = self.active_borrows.len();
+        self.activate_place_borrow(&statement.iterable, UseMode::Read, scopes);
         scopes.push();
         if let Some(key) = &statement.key {
             self.declare_foreach_binding(key, scopes);
@@ -1610,6 +1614,7 @@ impl Checker<'_> {
         for break_exit in &mut flow.breaks {
             break_exit.pop();
         }
+        self.active_borrows.truncate(borrow_depth);
         flow
     }
 
@@ -1876,6 +1881,11 @@ impl Checker<'_> {
             }
             Expr::Grouped { expr, .. } => self.use_expr(expr, scopes, mode),
             Expr::PropertyAccess { object, span, .. } => {
+                if mode == UseMode::Write {
+                    if let Some(place) = self.assignment_place_key(expr, scopes) {
+                        self.check_active_borrow_conflict(&place, mode, *span);
+                    }
+                }
                 if mode == UseMode::Give && self.expr_is_non_transferable_property(expr, scopes) {
                     self.diagnostics.push(
                         Diagnostic::new(
@@ -1986,13 +1996,13 @@ impl Checker<'_> {
                         let mode = self.use_owned_expression(key, scopes);
                         self.activate_place_input_borrows(key, scopes);
                         if mode == UseMode::Read {
-                            self.activate_call_borrow(key, mode, scopes);
+                            self.activate_borrow(key, mode, scopes);
                         }
                     }
                     let mode = self.use_owned_expression(&element.value, scopes);
                     self.activate_place_input_borrows(&element.value, scopes);
                     if mode == UseMode::Read {
-                        self.activate_call_borrow(&element.value, mode, scopes);
+                        self.activate_borrow(&element.value, mode, scopes);
                     }
                 }
                 self.active_borrows.truncate(borrow_depth);
@@ -2002,7 +2012,7 @@ impl Checker<'_> {
                 let mode = self.use_owned_expression(value, scopes);
                 self.activate_place_input_borrows(value, scopes);
                 if mode == UseMode::Read {
-                    self.activate_call_borrow(value, mode, scopes);
+                    self.activate_borrow(value, mode, scopes);
                 }
                 self.use_read_with_place_borrow(count, scopes);
                 self.active_borrows.truncate(borrow_depth);
@@ -2153,7 +2163,7 @@ impl Checker<'_> {
                 return;
             }
             if let Some(mode) = signature.receiver {
-                self.activate_call_borrow(receiver, mode, scopes);
+                self.activate_borrow(receiver, mode, scopes);
             }
         }
         // Arguments are visited in source (written) order so ownership and
@@ -2215,7 +2225,7 @@ impl Checker<'_> {
             self.use_expr(arg, scopes, mode);
             self.activate_place_input_borrows(arg, scopes);
             if matches!(mode, UseMode::Read | UseMode::Write) {
-                self.activate_call_borrow(arg, mode, scopes);
+                self.activate_borrow(arg, mode, scopes);
             }
         }
         if let Some(without_call) = without_call {
@@ -2241,10 +2251,24 @@ impl Checker<'_> {
         self.flow_facts.get(&(expr.span().start, expr.span().end))
     }
 
-    fn activate_call_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
+    fn activate_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
         let Some(root) = self.borrow_root_key(expr, scopes) else {
             return;
         };
+        self.activate_borrow_root(root, mode, expr.span(), scopes);
+    }
+
+    fn activate_place_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
+        let Some(root) = self
+            .assignment_place_key(expr, scopes)
+            .or_else(|| self.borrow_root_key(expr, scopes))
+        else {
+            return;
+        };
+        self.activate_borrow_root(root, mode, expr.span(), scopes);
+    }
+
+    fn activate_borrow_root(&mut self, root: String, mode: UseMode, span: Span, scopes: &Scopes) {
         if mode == UseMode::Write {
             if let Some(alias) = scopes.borrowed_from(&root) {
                 self.diagnostics.push(
@@ -2254,7 +2278,7 @@ impl Checker<'_> {
                             "`{}` cannot be used as writable while `${alias}` borrows from it",
                             display_borrow_root(&root)
                         ),
-                        expr.span(),
+                        span,
                     )
                     .with_help(
                         "finish using the borrowed binding or place it in a shorter lexical block before mutating its owner",
@@ -2262,12 +2286,8 @@ impl Checker<'_> {
                 );
             }
         }
-        self.check_active_borrow_conflict(&root, mode, expr.span());
-        self.active_borrows.push(ActiveBorrow {
-            root,
-            mode,
-            span: expr.span(),
-        });
+        self.check_active_borrow_conflict(&root, mode, span);
+        self.active_borrows.push(ActiveBorrow { root, mode, span });
     }
 
     fn activate_place_input_borrows(&mut self, expr: &Expr, scopes: &Scopes) {
@@ -2286,7 +2306,7 @@ impl Checker<'_> {
                     .borrow_root_key(expr, scopes)
                     .is_some_and(|root| !self.active_assignment_writes.contains(&root))
                 {
-                    self.activate_call_borrow(expr, UseMode::Read, scopes);
+                    self.activate_borrow(expr, UseMode::Read, scopes);
                 }
                 self.activate_nested_property_borrows(object, scopes);
             }
@@ -2400,7 +2420,7 @@ impl Checker<'_> {
                 .is_some_and(|borrow| borrow.source == BorrowSource::Receiver);
             if !result_continues_receiver_borrow {
                 if let Some(mode @ (UseMode::Read | UseMode::Write)) = signature.receiver {
-                    self.activate_call_borrow(receiver, mode, scopes);
+                    self.activate_borrow(receiver, mode, scopes);
                 }
             }
         }
@@ -2427,7 +2447,7 @@ impl Checker<'_> {
                         .is_some_and(|borrow| borrow.source == BorrowSource::Parameter(param))
                 });
             if matches!(mode, UseMode::Read | UseMode::Write) && !result_continues_argument_borrow {
-                self.activate_call_borrow(arg, mode, scopes);
+                self.activate_borrow(arg, mode, scopes);
             }
         }
     }
@@ -2435,7 +2455,7 @@ impl Checker<'_> {
     fn use_read_with_place_borrow(&mut self, expr: &Expr, scopes: &mut Scopes) {
         self.use_expr(expr, scopes, UseMode::Read);
         self.activate_place_input_borrows(expr, scopes);
-        self.activate_call_borrow(expr, UseMode::Read, scopes);
+        self.activate_borrow(expr, UseMode::Read, scopes);
     }
 
     fn check_writable_move_argument(&mut self, expr: &Expr, scopes: &Scopes) {
@@ -2683,7 +2703,7 @@ impl Checker<'_> {
             Diagnostic::new(
                 "E0477",
                 format!(
-                    "`{root_display}` cannot be used as {requested} here because it is already used as {existing} in this call"
+                    "`{root_display}` cannot be used as {requested} here because an earlier live access uses it as {existing}"
                 ),
                 span,
             )
@@ -2781,6 +2801,8 @@ impl Checker<'_> {
                         (collection.family, method.as_str()),
                         (CollectionFamily::List, "removeAt" | "pop")
                             | (CollectionFamily::Dictionary, "remove")
+                            | (CollectionFamily::PriorityQueue, "pop")
+                            | (CollectionFamily::Deque, "popFront" | "popBack")
                     ) && collection.value_move
                         || matches!(
                             (collection.family, method.as_str()),
@@ -2817,8 +2839,10 @@ impl Checker<'_> {
                 object, property, ..
             } => {
                 if let Some(collection) = self.expr_collection_info(object, scopes) {
-                    return collection.family == CollectionFamily::List
-                        && matches!(property.as_str(), "first" | "last")
+                    return matches!(
+                        collection.family,
+                        CollectionFamily::List | CollectionFamily::Set
+                    ) && matches!(property.as_str(), "first" | "last")
                         && collection.value_move;
                 }
                 let Some(class) = self.expr_class(object, scopes) else {
@@ -2858,8 +2882,10 @@ impl Checker<'_> {
             return true;
         }
         if let Some(collection) = self.expr_collection_info(object, scopes) {
-            return collection.family == CollectionFamily::List
-                && matches!(property.as_str(), "first" | "last")
+            return matches!(
+                collection.family,
+                CollectionFamily::List | CollectionFamily::Set
+            ) && matches!(property.as_str(), "first" | "last")
                 && collection.value_move;
         }
         let Some(class) = self.expr_class(object, scopes) else {
@@ -2912,8 +2938,10 @@ impl Checker<'_> {
             } => self
                 .expr_collection_info(object, scopes)
                 .is_some_and(|collection| {
-                    collection.family == CollectionFamily::List
-                        && collection.value_move
+                    matches!(
+                        collection.family,
+                        CollectionFamily::List | CollectionFamily::Set
+                    ) && collection.value_move
                         && matches!(property.as_str(), "first" | "last")
                 }),
             _ => false,
@@ -3145,9 +3173,14 @@ impl Checker<'_> {
             (collection, method),
             (
                 CollectionFamily::List,
-                "add" | "insertAt" | "removeAt" | "pop"
-            ) | (CollectionFamily::Dictionary, "set" | "remove")
-                | (CollectionFamily::Set, "add" | "remove")
+                "add" | "insertAt" | "removeAt" | "pop" | "clear"
+            ) | (CollectionFamily::Dictionary, "set" | "remove" | "clear")
+                | (CollectionFamily::Set, "add" | "remove" | "clear")
+                | (CollectionFamily::PriorityQueue, "push" | "pop" | "clear")
+                | (
+                    CollectionFamily::Deque,
+                    "pushFront" | "pushBack" | "popFront" | "popBack" | "clear"
+                )
         );
         self.use_expr(
             object,
@@ -3166,6 +3199,8 @@ impl Checker<'_> {
                     | (CollectionFamily::List, "insertAt", 1)
                     | (CollectionFamily::Dictionary, "set", 0 | 1)
                     | (CollectionFamily::Set, "add", 0)
+                    | (CollectionFamily::PriorityQueue, "push", 0)
+                    | (CollectionFamily::Deque, "pushFront" | "pushBack", 0)
             );
             if moves_in {
                 self.use_owned_expression(&argument.value, scopes);
@@ -3448,7 +3483,11 @@ fn resolved_type_is_move_type(ty: &crate::types::ResolvedType) -> bool {
         | crate::types::ResolvedType::TypedArray(_)
         | crate::types::ResolvedType::List(_)
         | crate::types::ResolvedType::Dictionary(_, _)
-        | crate::types::ResolvedType::Set(_) => true,
+        | crate::types::ResolvedType::SortedDictionary(_, _)
+        | crate::types::ResolvedType::Set(_)
+        | crate::types::ResolvedType::SortedSet(_)
+        | crate::types::ResolvedType::PriorityQueue(_)
+        | crate::types::ResolvedType::Deque(_) => true,
         crate::types::ResolvedType::Nullable(inner) => resolved_type_is_move_type(inner),
         _ => false,
     }
@@ -3472,8 +3511,14 @@ fn resolved_type_requires_conservative_move(ty: &crate::types::ResolvedType) -> 
         crate::types::ResolvedType::Nullable(inner)
         | crate::types::ResolvedType::TypedArray(inner)
         | crate::types::ResolvedType::List(inner)
-        | crate::types::ResolvedType::Set(inner) => resolved_type_requires_conservative_move(inner),
-        crate::types::ResolvedType::Dictionary(key, value) => {
+        | crate::types::ResolvedType::Set(inner)
+        | crate::types::ResolvedType::SortedSet(inner)
+        | crate::types::ResolvedType::PriorityQueue(inner)
+        | crate::types::ResolvedType::Deque(inner) => {
+            resolved_type_requires_conservative_move(inner)
+        }
+        crate::types::ResolvedType::Dictionary(key, value)
+        | crate::types::ResolvedType::SortedDictionary(key, value) => {
             resolved_type_requires_conservative_move(key)
                 || resolved_type_requires_conservative_move(value)
         }
@@ -3502,8 +3547,14 @@ fn resolved_collection_info(ty: &crate::types::ResolvedType) -> Option<Collectio
         }
         ResolvedType::TypedArray(value) => (CollectionFamily::TypedArray, value.as_ref()),
         ResolvedType::List(value) => (CollectionFamily::List, value.as_ref()),
-        ResolvedType::Dictionary(_, value) => (CollectionFamily::Dictionary, value.as_ref()),
-        ResolvedType::Set(value) => (CollectionFamily::Set, value.as_ref()),
+        ResolvedType::Dictionary(_, value) | ResolvedType::SortedDictionary(_, value) => {
+            (CollectionFamily::Dictionary, value.as_ref())
+        }
+        ResolvedType::Set(value) | ResolvedType::SortedSet(value) => {
+            (CollectionFamily::Set, value.as_ref())
+        }
+        ResolvedType::PriorityQueue(value) => (CollectionFamily::PriorityQueue, value.as_ref()),
+        ResolvedType::Deque(value) => (CollectionFamily::Deque, value.as_ref()),
         ResolvedType::Nullable(inner) => return resolved_collection_info(inner),
         _ => return None,
     };
@@ -3543,7 +3594,17 @@ fn type_ref_collection_info(
         "Dictionary" if ty.type_argument_count() == 2 => {
             (CollectionFamily::Dictionary, ty.type_argument(1)?)
         }
+        "SortedDictionary" if ty.type_argument_count() == 2 => {
+            (CollectionFamily::Dictionary, ty.type_argument(1)?)
+        }
         "Set" if ty.type_argument_count() == 1 => (CollectionFamily::Set, ty.type_argument(0)?),
+        "SortedSet" if ty.type_argument_count() == 1 => {
+            (CollectionFamily::Set, ty.type_argument(0)?)
+        }
+        "PriorityQueue" if ty.type_argument_count() == 1 => {
+            (CollectionFamily::PriorityQueue, ty.type_argument(0)?)
+        }
+        "Deque" if ty.type_argument_count() == 1 => (CollectionFamily::Deque, ty.type_argument(0)?),
         _ => return None,
     };
     Some(CollectionInfo {
@@ -3598,7 +3659,16 @@ pub(crate) fn type_ref_is_move_type(
         || type_ref_class_name(ty, classes, receiver_class).is_some()
         || matches!(
             ty.name.as_str(),
-            "mixed" | "Bytes" | "[]" | "List" | "Dictionary" | "Set"
+            "mixed"
+                | "Bytes"
+                | "[]"
+                | "List"
+                | "Dictionary"
+                | "SortedDictionary"
+                | "Set"
+                | "SortedSet"
+                | "PriorityQueue"
+                | "Deque"
         )
 }
 

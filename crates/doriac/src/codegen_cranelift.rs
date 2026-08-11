@@ -16,17 +16,19 @@ use crate::format_string::{FormatConversion, FormatPiece};
 use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
-    collection_comparator_code, collection_value_width, function_symbol, nullable_payload_type,
-    stage26_collection_kind, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE,
-    BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE,
-    CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64, COLLECTION_COMPARE_STRING,
-    COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
-    COLLECTION_FREE, COLLECTION_INDEX_OF, COLLECTION_INSERT_AT, COLLECTION_INSERT_AT_NULLABLE,
-    COLLECTION_KEYED_GET, COLLECTION_KEYED_GET_NULLABLE, COLLECTION_KEYED_HAS,
-    COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT, COLLECTION_LENGTH,
-    COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH, COLLECTION_PUSH_FRONT,
-    COLLECTION_PUSH_FRONT_NULLABLE, COLLECTION_PUSH_NULLABLE, COLLECTION_PUSH_UNIQUE,
-    COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
+    collection_comparator_code, collection_header_size, collection_value_width, function_symbol,
+    nullable_payload_type, stage26_collection_kind, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL,
+    BYTES_FREE, BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION,
+    CLASS_ALLOCATE, CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64,
+    COLLECTION_COMPARE_STRING, COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS,
+    COLLECTION_DETACH_FOR_CLEANUP, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
+    COLLECTION_FINISH_DETACHED_CLEANUP, COLLECTION_FREE, COLLECTION_INDEX_OF, COLLECTION_INSERT_AT,
+    COLLECTION_INSERT_AT_NULLABLE, COLLECTION_KEYED_GET, COLLECTION_KEYED_GET_NULLABLE,
+    COLLECTION_KEYED_HAS, COLLECTION_KEYED_SET, COLLECTION_KEYED_SET_NULLABLE, COLLECTION_KEY_AT,
+    COLLECTION_LENGTH, COLLECTION_NEW, COLLECTION_NULLABLE_ACCESS, COLLECTION_PUSH,
+    COLLECTION_PUSH_FRONT, COLLECTION_PUSH_FRONT_NULLABLE, COLLECTION_PUSH_NULLABLE,
+    COLLECTION_PUSH_UNIQUE, COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE,
+    COLLECTION_RESET_AFTER_CLEANUP, COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT,
     COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY,
     COLLECTION_STAGE26_NEW, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
     FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
@@ -1846,6 +1848,15 @@ fn lower_statement(
             value,
         } => {
             lower_collection_set(builder, *collection, key, value, *positional, resources)?;
+        }
+        mir::Statement::CollectionClear {
+            collection,
+            collection_type,
+        } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let slot = local_slot(resources.local_slots, *collection)?;
+            let value = builder.ins().stack_load(pointer, pointer, slot, 0);
+            lower_clear_collection_value(builder, value, *collection_type, resources)?;
         }
         mir::Statement::DropCollection { local, collection } => {
             let pointer = resources.module.target_config().pointer_type();
@@ -3913,6 +3924,43 @@ fn lower_drop_collection_value(
     collection_type: mir::CollectionTypeId,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
+    lower_finish_collection_value(
+        builder,
+        collection,
+        collection_type,
+        CollectionStorageAction::Free,
+        resources,
+    )
+}
+
+fn lower_clear_collection_value(
+    builder: &mut FunctionBuilder,
+    collection: Value,
+    collection_type: mir::CollectionTypeId,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    lower_finish_collection_value(
+        builder,
+        collection,
+        collection_type,
+        CollectionStorageAction::Reset,
+        resources,
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollectionStorageAction {
+    Free,
+    Reset,
+}
+
+fn lower_finish_collection_value(
+    builder: &mut FunctionBuilder,
+    collection: Value,
+    collection_type: mir::CollectionTypeId,
+    action: CollectionStorageAction,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     let definition = collection_definition(resources.program, collection_type)?.clone();
     let zero = builder.ins().iconst(pointer, 0);
@@ -3922,6 +3970,11 @@ fn lower_drop_collection_value(
     builder.ins().brif(present, drop_block, &[], done, &[]);
     builder.switch_to_block(drop_block);
     if definition.kind == mir::CollectionKind::Bytes {
+        if action != CollectionStorageAction::Free {
+            return Err(malformed_mir(
+                "Bytes cannot be cleared as a named collection",
+            ));
+        }
         let _ = runtime_call(
             builder,
             BYTES_FREE,
@@ -3934,12 +3987,49 @@ fn lower_drop_collection_value(
         builder.switch_to_block(done);
         return Ok(());
     }
+    let scalar_values = matches!(
+        definition.value,
+        mir::Type::Scalar(_) | mir::Type::NullableScalar(_)
+    );
+    let scalar_keys = definition
+        .key
+        .is_none_or(|key| matches!(key, mir::Type::Scalar(_)));
+    if scalar_values && scalar_keys {
+        let symbol = match action {
+            CollectionStorageAction::Free => COLLECTION_FREE,
+            CollectionStorageAction::Reset => COLLECTION_RESET_AFTER_CLEANUP,
+        };
+        let _ = runtime_call(builder, symbol, &[pointer], None, &[collection], resources)?;
+        builder.ins().jump(done, &[]);
+        builder.switch_to_block(done);
+        return Ok(());
+    }
+    let cleanup_collection = if action == CollectionStorageAction::Reset {
+        let pointer_bytes = pointer.bytes();
+        let cleanup_slot = builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            collection_header_size(pointer_bytes),
+            pointer_bytes.trailing_zeros() as u8,
+        ));
+        let cleanup_collection = builder.ins().stack_addr(pointer, cleanup_slot, 0);
+        let _ = runtime_call(
+            builder,
+            COLLECTION_DETACH_FOR_CLEANUP,
+            &[pointer, pointer, pointer],
+            None,
+            &[resources.current_frame, collection, cleanup_collection],
+            resources,
+        )?;
+        cleanup_collection
+    } else {
+        collection
+    };
     let length = runtime_call(
         builder,
         COLLECTION_LENGTH,
         &[pointer],
         Some(pointer),
-        &[collection],
+        &[cleanup_collection],
         resources,
     )?
     .ok_or_else(|| backend_failure("collection length produced no result"))?;
@@ -3960,7 +4050,7 @@ fn lower_drop_collection_value(
         COLLECTION_VALUE_AT,
         &[pointer, pointer, pointer],
         Some(types::I64),
-        &[resources.current_frame, collection, index],
+        &[resources.current_frame, cleanup_collection, index],
         resources,
     )?
     .ok_or_else(|| backend_failure("collection value read produced no result"))?;
@@ -3973,7 +4063,7 @@ fn lower_drop_collection_value(
             COLLECTION_KEY_AT,
             &[pointer, pointer, pointer],
             Some(types::I64),
-            &[resources.current_frame, collection, index],
+            &[resources.current_frame, cleanup_collection, index],
             resources,
         )?
         .ok_or_else(|| backend_failure("collection key read produced no result"))?;
@@ -3982,14 +4072,28 @@ fn lower_drop_collection_value(
     }
     builder.ins().jump(header, &[BlockArg::Value(index)]);
     builder.switch_to_block(free);
-    let _ = runtime_call(
-        builder,
-        COLLECTION_FREE,
-        &[pointer],
-        None,
-        &[collection],
-        resources,
-    )?;
+    match action {
+        CollectionStorageAction::Free => {
+            let _ = runtime_call(
+                builder,
+                COLLECTION_FREE,
+                &[pointer],
+                None,
+                &[cleanup_collection],
+                resources,
+            )?;
+        }
+        CollectionStorageAction::Reset => {
+            let _ = runtime_call(
+                builder,
+                COLLECTION_FINISH_DETACHED_CLEANUP,
+                &[pointer, pointer],
+                None,
+                &[collection, cleanup_collection],
+                resources,
+            )?;
+        }
+    }
     builder.ins().jump(done, &[]);
     builder.switch_to_block(done);
     Ok(())

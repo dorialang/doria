@@ -285,6 +285,10 @@ function main(): void
     let $setAccess = $set->acquireWritableAccess();
     let $queueAccess = $queue->acquireWritableAccess();
     let $dequeAccess = $deque->acquireWritableAccess();
+    $mapAccess->clear();
+    $setAccess->clear();
+    $queueAccess->clear();
+    $dequeAccess->clear();
     $mapAccess->set("b", 2);
     $setAccess->add(2);
     $queueAccess->push(2);
@@ -293,6 +297,22 @@ function main(): void
 "#,
     )
     .expect("all Stage 26 collection kinds should be valid writable shared payloads");
+
+    let diagnostics = doriac::check_source(
+        "readonly-shared-clear.doria",
+        r#"
+function main(): void
+{
+    let $shared = new WritableSharedReference<List<int>>([1]);
+    let $access = $shared->acquireReadonlyAccess();
+    $access->clear();
+}
+"#,
+    )
+    .expect_err("readonly shared access must not expose mutating clear");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0201"));
 }
 
 #[test]

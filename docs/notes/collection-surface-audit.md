@@ -19,11 +19,12 @@ build, so the release profile is unverified rather than confirmed.
 
 ## Implementation follow-up
 
-Decision 0113 Slices 1-3 are complete on current `develop`. Slice 3 makes
+Decision 0113 and all four slices are complete on current `develop`. Slice 3 makes
 `List::indexOf`, writable `List::remove`, both map `containsValue` operations,
 and readonly `Set` / `SortedSet` `first` and `last` properties executable
-through the MIR interpreter, Cranelift, and LLVM. Slice 4 `clear()` is next and
-remains the only accepted Decision 0113 member stopped by E0559. The measured
+through the MIR interpreter, Cranelift, and LLVM. Slice 4 makes writable
+`clear(): void` executable in place on every named collection with exact-once
+cleanup, state reset, and reuse; no Decision 0113 member remains behind E0559. The measured
 matrix below remains the historical input to the decision rather than being
 rewritten as if those operations existed at audit time.
 

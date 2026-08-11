@@ -1,0 +1,24 @@
+// Repeated clear/refill across the original collection families. Scalar clear
+// takes the direct runtime-reset path and must not grow the native stack.
+function main(List<string> $args): void
+{
+    let $n = Int::parse($args[0]) ?? 0;
+    writable List<int> $list = [];
+    writable Dictionary<int, int> $dictionary = [];
+    writable Set<int> $set = Set::from([]);
+    writable Deque<int> $deque = Deque::from([]);
+    let writable $checksum = 0;
+    for (let writable $index = 0; $index < $n; $index++) {
+        $list->add($index);
+        $dictionary->set($index, $index);
+        $set->add($index);
+        $deque->pushBack($index);
+        $checksum = ($checksum + $list->count + $dictionary->count +
+            $set->count + $deque->count) % 1000003;
+        $list->clear();
+        $dictionary->clear();
+        $set->clear();
+        $deque->clear();
+    }
+    echo "{$checksum}:{$list->count}:{$dictionary->count}:{$set->count}:{$deque->count}\n";
+}

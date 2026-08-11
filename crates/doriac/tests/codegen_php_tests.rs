@@ -2171,6 +2171,16 @@ function main(): void
 "#,
         ),
         (
+            "default collection clear",
+            r#"
+function main(): void
+{
+    writable List<int> $items = [1];
+    $items->clear();
+}
+"#,
+        ),
+        (
             "writable foreach",
             r#"
 function main(): void
@@ -2251,6 +2261,20 @@ function main(): void
     $deque->pushFront("first");
     $deque->pushBack("last");
     foreach ($deque as string $value) { echo "{$value} "; }
+    echo "\n";
+
+    $map->clear();
+    $map->set(9, "nine");
+    foreach ($map->keys as int $key) { echo "map {$key} "; }
+    $set->clear();
+    $set->add(2);
+    foreach ($set as int $value) { echo "set {$value} "; }
+    $queue->clear();
+    $queue->push(6);
+    echo "queue " . ($queue->pop() ?? 99) . " ";
+    $deque->clear();
+    $deque->pushBack("new");
+    echo "deque " . ($deque->peekFront ?? "none");
 }
 "#,
     )
@@ -2285,12 +2309,62 @@ function main(): void
     );
     assert_eq!(
         run.stdout,
-        b"-1 1 2 3 \n-1 0 1 3 \n-3 -2 1 4 \nfirst middle last "
+        b"-1 1 2 3 \n-1 0 1 3 \n-3 -2 1 4 \nfirst middle last \nmap 9 set 2 queue 6 deque new"
     );
     assert!(
         run.stderr.is_empty(),
         "{}",
         String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn php_collection_clear_releases_owned_deque_values_in_doria_order() {
+    let php = doriac::compile_source_to_php(
+        "stage26-clear-order.doria",
+        r#"
+function main(): void
+{
+    writable Deque<int> $values = Deque::from([1]);
+    $values->clear();
+}
+"#,
+    )
+    .expect("a Stage 26 Deque should emit the PHP compatibility helper");
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        r#"{}
+final class ClearOrderToken
+{{
+    public function __construct(private int $id) {{}}
+    public function __destruct() {{ echo "drop {{$this->id}}\n"; }}
+}}
+$values = Deque::from([new ClearOrderToken(1), new ClearOrderToken(2)]);
+$values->pushFront(new ClearOrderToken(3));
+$values->clear();"#,
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated PHP collection clear should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stdout),
+        "drop 2\ndrop 1\ndrop 3\n"
     );
 }
 

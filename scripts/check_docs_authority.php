@@ -725,12 +725,13 @@ if ($namingAuthority !== false) {
         || !str_contains($pipeline, 'Measurement Status: Pending Available Runner')
         || !str_contains($pipeline, 'Decision 0113 Slice 2 — Complete')
         || !str_contains($pipeline, 'Decision 0113 Slice 3 — Complete')
-        || !str_contains($pipeline, 'Decision 0113 Slice 4 — Next')
-        || !str_contains($pipeline, 'Stage 27 — Sequenced After Decision 0113; No Performance-Evidence Dependency')
+        || !str_contains($pipeline, 'Decision 0113 Slice 4 — Complete')
+        || !str_contains($pipeline, 'Decision 0113 — Complete')
+        || !str_contains($pipeline, 'Stage 27 — Next; No Performance-Evidence Dependency')
         || !str_contains($pipeline, 'Stage 36a Public Spellings — Deferred')
         || !str_contains($pipeline, 'Stage 36a — Not Implemented')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 through 26b complete, performance measurement pending an available runner without blocking development, Decision 0113 Slices 1-3 complete with Slice 4 next, Stage 27 sequenced after Decision 0113 without a performance dependency, and Stage 36a scheduled but not implemented with public spellings deferred";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 through 26b complete, performance measurement pending an available runner without blocking development, Decision 0113 complete, Stage 27 next without a performance dependency, and Stage 36a scheduled but not implemented with public spellings deferred";
     }
 
     if (

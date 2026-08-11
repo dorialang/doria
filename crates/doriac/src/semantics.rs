@@ -3618,6 +3618,22 @@ impl<'program> Checker<'program> {
         }
         self.check_expr(&decl.initializer, scopes, method_context);
         let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
+        if self.is_void_type(value_ty) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0403",
+                    "a `void` expression cannot initialize a local binding",
+                    decl.initializer.span(),
+                )
+                .with_title("Void Expression Has No Value")
+                .with_primary_label("This Call Returns `void`")
+                .with_explanation(
+                    "A `void` call performs an action but does not produce a value that can be stored.",
+                )
+                .with_help("call the operation as an expression statement instead"),
+            );
+            return;
+        }
         let ty = match explicit_ty {
             Some(target_ty) => {
                 self.check_expr_assignable(
@@ -11057,7 +11073,17 @@ impl<'program> Checker<'program> {
             (TypeKind::List(_), "add" | "insertAt")
             | (TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _), "set")
             | (TypeKind::PriorityQueue(_), "push")
-            | (TypeKind::Deque(_), "pushFront" | "pushBack") => Some(void),
+            | (TypeKind::Deque(_), "pushFront" | "pushBack")
+            | (
+                TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::SortedDictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_),
+                "clear",
+            ) => Some(void),
             (TypeKind::List(value), "removeAt") => Some(value),
             (TypeKind::List(value), "pop") => Some(self.types.intern(TypeKind::Nullable(value))),
             (TypeKind::List(_), "indexOf") => {
@@ -11123,30 +11149,6 @@ impl<'program> Checker<'program> {
             TypeKind::Deque(_) => Some(CollectionReceiver::Deque),
             _ => None,
         }
-    }
-
-    fn report_pending_collection_member(
-        &mut self,
-        receiver: CollectionReceiver,
-        member: &str,
-        member_span: Span,
-        slice: u8,
-    ) {
-        self.diagnostics.push(
-            Diagnostic::unsupported_stage(
-                "E0559",
-                format!(
-                    "`{}::{member}` is accepted by Decision 0113 but is not executable yet",
-                    receiver.source_name()
-                ),
-                member_span,
-            )
-            .with_title("Accepted Collection Member Is Not Executable Yet")
-            .with_primary_label("This Accepted Member Is Pending Implementation")
-            .with_explanation(format!(
-                "Decision 0113 Slice {slice} owns the executable implementation of this collection member. Semantic checking stops before MIR or backend lowering."
-            )),
-        );
     }
 
     fn report_unknown_collection_member(
@@ -11449,15 +11451,6 @@ impl<'program> Checker<'program> {
                 );
                 return true;
             }
-            if let Some(status) = collection_diagnostics::pending_method_status(receiver, method) {
-                self.report_pending_collection_member(
-                    receiver,
-                    method,
-                    member_span,
-                    status.slice().expect("pending member has a slice"),
-                );
-                return true;
-            }
             if let Some(suggestion) = collection_diagnostics::suggestion_for(receiver, method) {
                 if suggestion.member_kind == CollectionMemberKind::Property {
                     self.report_property_invoked_as_method(
@@ -11565,6 +11558,16 @@ impl<'program> Checker<'program> {
             (TypeKind::PriorityQueue(_), "pop") => (vec![], true),
             (TypeKind::Deque(value), "pushFront" | "pushBack") => (vec![value], true),
             (TypeKind::Deque(_), "popFront" | "popBack") => (vec![], true),
+            (
+                TypeKind::List(_)
+                | TypeKind::Dictionary(_, _)
+                | TypeKind::SortedDictionary(_, _)
+                | TypeKind::Set(_)
+                | TypeKind::SortedSet(_)
+                | TypeKind::PriorityQueue(_)
+                | TypeKind::Deque(_),
+                "clear",
+            ) => (vec![], true),
             (TypeKind::Bytes, "toArray") => (vec![], false),
             (
                 TypeKind::Bytes

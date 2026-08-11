@@ -1,6 +1,6 @@
 # Decision 0113: Collection Surface Completion
 
-- **Status:** Accepted
+- **Status:** Complete
 - **Accepted:** 2026-08-06 by Andrew Masiye
 - **Date:** 2026-08-05
 - **Owners:** Doria language and compiler design
@@ -393,10 +393,15 @@ and the language-server sweep in `dorialang/doria-language-server`.
   its validator, the interpreter, Cranelift, LLVM, and the ordered-family PHP
   helpers implement the same contracts. E0559 no longer applies to these
   members.
-- **Slice 4 — Next.** `clear()` is recognized on all seven named collections
-  but is not executable.
-- **Stage 27 — Sequenced after Decision 0113.** Pending controlled performance
-  measurement is not a dependency.
+- **Slice 4 — Complete.** Writable `clear(): void` executes on all seven named
+  collections through shared validated MIR. It releases owned keys and values
+  through the same type-aware, backend-independent order as final collection
+  destruction, resets the existing allocation in place, invalidates membership
+  indexes, and leaves the collection reusable. No Decision 0113 member remains
+  routed to E0559.
+- **Decision 0113 — Complete.** All four implementation slices are complete.
+- **Stage 27 — Next.** Pending controlled performance measurement is not a
+  dependency.
 
 ### Slice 2 performance impact
 
@@ -432,6 +437,21 @@ not change the collection representation. Its private runtime ABI adds the
 position-returning `indexOf` operation and advances membership/removal exports
 to carry nullable-value presence explicitly; the compiler and runtime ship that
 private ABI together, and no legacy entry points are retained.
+
+### Slice 4 performance impact
+
+| Case | Required complexity | Allocation |
+| --- | ---: | ---: |
+| Scalar-only collection | O(1) where the drop loop is elided | None |
+| Owned-element collection | O(n), one release pass | None |
+| Dictionary with owned keys or values | O(n), one release pass | None |
+| Membership-index invalidation | O(1) reset/deallocation | No replacement collection |
+| Refill within retained primary capacity | Existing insertion cost | No primary-storage growth |
+
+Capacity remains unspecified publicly. The current implementation retains the
+primary buffers, resets length and deque head, and discards the auxiliary
+membership index. Compiler-emitted drop glue owns value cleanup; the narrow
+runtime reset operation never interprets type IDs or releases Doria values.
 
 ## Affected components
 
