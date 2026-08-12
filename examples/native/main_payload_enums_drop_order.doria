@@ -28,8 +28,25 @@ function dropSingle(): void
     echo "leave single\n";
 }
 
+enum Entry
+{
+    case Value(Token $token);
+}
+
+function replaceDictionaryEntries(): void
+{
+    writable Dictionary<string, Entry> $items = [
+        "same" => Entry::Value(new Token("literal first")),
+        "same" => Entry::Value(new Token("literal second")),
+    ];
+    $items["same"] = Entry::Value(new Token("indexed"));
+    $items->set("same", Entry::Value(new Token("method")));
+    echo "leave dictionary\n";
+}
+
 function main(): void
 {
     dropPair();
     dropSingle();
+    replaceDictionaryEntries();
 }

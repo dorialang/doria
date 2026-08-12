@@ -3905,13 +3905,25 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        if matches!(kind, TypeKind::Nullable(_)) {
-            self.diagnostics.push(Diagnostic::new(
-                "E0498",
-                "default values for nullable string parameters are not yet supported",
-                default.span(),
-            ));
-            return;
+        let nullable_copy_enum = match &kind {
+            TypeKind::Nullable(inner) => {
+                matches!(self.types.kind(*inner), TypeKind::Enum(_))
+                    && !self.type_is_move_type(*inner)
+            }
+            _ => false,
+        };
+
+        if let TypeKind::Nullable(inner) = &kind {
+            if !nullable_copy_enum {
+                let message = if matches!(self.types.kind(*inner), TypeKind::String) {
+                    "default values for nullable string parameters are not yet supported"
+                } else {
+                    "default values for this nullable parameter type are not yet supported"
+                };
+                self.diagnostics
+                    .push(Diagnostic::new("E0498", message, default.span()));
+                return;
+            }
         }
 
         if param.take || self.type_is_move_type(ty) {
@@ -3923,14 +3935,16 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        if !matches!(
-            kind,
-            TypeKind::Integer(_)
-                | TypeKind::Float(_)
-                | TypeKind::Bool
-                | TypeKind::String
-                | TypeKind::Enum(_)
-        ) {
+        if !nullable_copy_enum
+            && !matches!(
+                &kind,
+                TypeKind::Integer(_)
+                    | TypeKind::Float(_)
+                    | TypeKind::Bool
+                    | TypeKind::String
+                    | TypeKind::Enum(_)
+            )
+        {
             self.diagnostics.push(Diagnostic::new(
                 "E0498",
                 "default values for this parameter type are not yet supported",

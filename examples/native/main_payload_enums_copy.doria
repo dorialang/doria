@@ -22,6 +22,13 @@ function usesDefault(Label $label = Label::Text("default")): bool
     return $label == DEFAULT_LABEL;
 }
 
+function describe(?Coordinate $value = Coordinate::Origin): string
+{
+    if ($value == null) { return "null"; }
+    if ($value == Coordinate::Origin) { return "origin"; }
+    return "point";
+}
+
 function main(): void
 {
     Coordinate $point = Coordinate::Point(
@@ -35,5 +42,5 @@ function main(): void
     echo " {$point == Coordinate::Point(20, 22)}";
     echo " {$copy == $point}";
     echo " {$labelCopy == Label::Text("copy")}";
-    echo " {usesDefault()}\n";
+    echo " {usesDefault()} {describe(null)} {describe()}\n";
 }

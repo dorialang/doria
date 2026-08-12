@@ -136,6 +136,102 @@ function main(): void
 }
 
 #[test]
+fn php_backend_distinguishes_omitted_payload_defaults_from_explicit_null() {
+    let php = doriac::compile_source_to_php(
+        "nullable-payload-default.doria",
+        r#"
+enum Coordinate
+{
+    case Origin;
+    case Point(int $x, int $y);
+}
+
+function describe(?Coordinate $value = Coordinate::Origin): string
+{
+    if ($value == null) { return "null"; }
+    if ($value == Coordinate::Origin) { return "origin"; }
+    return "point";
+}
+
+function main(): void
+{
+    echo describe(null);
+    echo " ";
+    echo describe();
+}
+
+main();
+"#,
+    )
+    .expect("nullable Copy payload defaults should lower to PHP");
+
+    assert!(php.contains("Coordinate|array|null $value = []"));
+    assert!(php.contains("if ($value === [])"));
+    assert!(!php.contains("$value ??="));
+
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(php.strip_prefix("<?php").expect("generated PHP header"))
+        .output()
+        .expect("PHP should execute nullable payload defaults");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"null origin");
+}
+
+#[test]
+fn php_backend_initializes_internal_static_payloads_in_declaring_class_scope() {
+    let php = doriac::compile_source_to_php(
+        "internal-static-payload.doria",
+        r#"
+enum Label
+{
+    case Empty;
+    case Text(string $value);
+}
+
+class Vault
+{
+    internal static Label $label = Label::Text("secret");
+
+    static function reveal(): Label
+    {
+        return self::label;
+    }
+}
+
+function main(): void
+{
+    echo Vault::reveal() == Label::Text("secret");
+}
+
+main();
+"#,
+    )
+    .expect("internal static payload initializers should lower to PHP");
+
+    assert!(php.contains("private static Label $label;"));
+    assert!(php.contains("(\\Closure::bind(static function (): void {"));
+    assert!(php.contains("self::$label = Label::Text(\"secret\");"));
+    assert!(!php.contains("Vault::$label ="));
+
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(php.strip_prefix("<?php").expect("generated PHP header"))
+        .output()
+        .expect("PHP should execute internal static payload initialization");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"true");
+}
+
+#[test]
 fn php_grouped_declarations_use_one_collision_safe_temporary_in_order() {
     let php = doriac::compile_source_to_php(
         "stage26a.doria",

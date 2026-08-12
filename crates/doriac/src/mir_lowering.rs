@@ -7028,9 +7028,18 @@ fn lower_const_rvalue(
         };
     }
 
-    if let (crate::const_eval::ConstValue::PayloadEnum(value), mir::Type::PayloadEnum(expected)) =
-        (value, expected)
-    {
+    if let crate::const_eval::ConstValue::PayloadEnum(value) = value {
+        let (expected, nullable) = match expected {
+            mir::Type::PayloadEnum(expected) => (expected, false),
+            mir::Type::NullablePayloadEnum(expected) => (expected, true),
+            _ => {
+                return Err(vec![Diagnostic::new(
+                    "I2003",
+                    "checked payload enum default does not match its MIR parameter type",
+                    span,
+                )]);
+            }
+        };
         if value.enum_id != expected.id {
             return Err(vec![Diagnostic::new(
                 "I2003",
@@ -7054,14 +7063,17 @@ fn lower_const_rvalue(
                 lower_const_rvalue(field, expected, span, enum_types, semantic_info)
             })
             .collect::<DiagnosticResult<Vec<_>>>()?;
-        return Ok(mir::Rvalue::PayloadEnum(
-            mir::PayloadEnumExpression::Construct {
-                ty: expected,
-                case: value.case_id,
-                fields,
-                span,
-            },
-        ));
+        let value = mir::PayloadEnumExpression::Construct {
+            ty: expected,
+            case: value.case_id,
+            fields,
+            span,
+        };
+        return Ok(if nullable {
+            mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Value(value))
+        } else {
+            mir::Rvalue::PayloadEnum(value)
+        });
     }
 
     let value = match (value, expected) {

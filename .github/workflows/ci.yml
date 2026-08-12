@@ -180,6 +180,13 @@ jobs:
           cargo run -p doriac -- compile examples/native/main_stage26a_grouped_locals.doria --out build/native/main_stage26a_grouped_locals
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage26a_grouped_locals
 
+      - name: Leak-check Stage 27 payload enum ownership with Cranelift
+        run: |
+          for name in main_payload_enums_copy main_payload_enums_drop_order; do
+            cargo run -p doriac -- compile "examples/native/${name}.doria" --out "build/native/${name}"
+            valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
+          done
+
       - name: Smoke signed and unsigned narrow-width native fixtures
         run: |
           cargo run -p doriac -- compile examples/native/main_integer_div_mod_42.doria --target native --out build/native/main_integer_div_mod_42

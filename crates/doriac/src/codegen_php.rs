@@ -1865,11 +1865,7 @@ fn emit_payload_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize) {
 
     for (tag, case) in enum_decl.cases.iter().enumerate() {
         output.push('\n');
-        let method = if case.payload.is_empty() {
-            format!("__doriaCase{}", case.name)
-        } else {
-            case.name.clone()
-        };
+        let method = php_payload_case_method(&case.name, !case.payload.is_empty());
         write_indent(output, indent + 1);
         output.push_str("public static function ");
         output.push_str(&method);
@@ -2033,7 +2029,7 @@ fn emit_class(
         output.push('\n');
     }
     writeln(output, indent, "}");
-    for property in class_decl.members.iter().filter_map(|member| match member {
+    let static_payload_initializers = class_decl.members.iter().filter_map(|member| match member {
         ClassMember::Property(property)
             if property.is_static
                 && matches!(
@@ -2051,25 +2047,38 @@ fn emit_class(
             Some(property)
         }
         _ => None,
-    }) {
+    });
+    let static_payload_initializers = static_payload_initializers.collect::<Vec<_>>();
+    if !static_payload_initializers.is_empty() {
         writeln(
             output,
             indent,
-            &format!(
-                "{}::${} = {};",
-                class_decl.name,
-                property.name,
-                emit_const_value(
-                    evaluated_value(
+            "(\\Closure::bind(static function (): void {",
+        );
+        for property in static_payload_initializers {
+            writeln(
+                output,
+                indent + 1,
+                &format!(
+                    "self::${} = {};",
+                    property.name,
+                    emit_const_value(
+                        evaluated_value(
+                            &semantic_info.const_evaluation,
+                            &ConstKey::Static {
+                                class_name: class_decl.name.clone(),
+                                name: property.name.clone(),
+                            },
+                        ),
                         &semantic_info.const_evaluation,
-                        &ConstKey::Static {
-                            class_name: class_decl.name.clone(),
-                            name: property.name.clone(),
-                        },
-                    ),
-                    &semantic_info.const_evaluation,
-                )
-            ),
+                    )
+                ),
+            );
+        }
+        writeln(
+            output,
+            indent,
+            &format!("}}, null, {}::class))();", class_decl.name),
         );
     }
 }
@@ -2238,8 +2247,9 @@ fn emit_const_value(value: &ConstValue, evaluation: &Evaluation) -> String {
             let (enum_name, case_name) = evaluation
                 .payload_case_name(value.enum_id, value.case_id)
                 .expect("checked payload enum constant must name a declared case");
+            let method = php_payload_case_method(case_name, !value.fields.is_empty());
             format!(
-                "{enum_name}::{case_name}({})",
+                "{enum_name}::{method}({})",
                 value
                     .fields
                     .iter()
@@ -2325,15 +2335,20 @@ fn emit_function(
         else {
             continue;
         };
+        let name = scopes.php_name(&param.name);
+        writeln(output, indent + 1, &format!("if (${name} === []) {{"));
         writeln(
             output,
-            indent + 1,
+            indent + 2,
             &format!(
-                "${} ??= {};",
-                scopes.php_name(&param.name),
+                "${name} = {};",
                 emit_const_value(default, &semantic_info.const_evaluation)
             ),
         );
+        if param.promoted_access.is_some() {
+            writeln(output, indent + 2, &format!("$this->{name} = ${name};"));
+        }
+        writeln(output, indent + 1, "}");
     }
     for statement in &function.body.statements {
         emit_statement(statement, output, indent + 1, &mut scopes);
@@ -2354,10 +2369,16 @@ fn emit_param(
         output.push(' ');
     }
     let payload_default = matches!(evaluated_default, Some(ConstValue::PayloadEnum(_)));
-    if payload_default && !param.ty.nullable {
-        output.push('?');
+    if payload_default {
+        let payload_type = php_type(&param.ty);
+        output.push_str(payload_type.trim_start_matches('?'));
+        output.push_str("|array");
+        if param.ty.nullable {
+            output.push_str("|null");
+        }
+    } else {
+        output.push_str(&php_type(&param.ty));
     }
-    output.push_str(&php_type(&param.ty));
     output.push_str(" $");
     output.push_str(&scopes.php_name(&param.name));
     if param.default.is_some() {
@@ -2365,7 +2386,7 @@ fn emit_param(
         let default =
             evaluated_default.expect("checked Copy parameter default must have an evaluated value");
         if payload_default {
-            output.push_str("null");
+            output.push_str("[]");
         } else {
             output.push_str(&emit_const_value(default, evaluation));
         }
@@ -2375,6 +2396,14 @@ fn emit_param(
 
 fn php_top_level_constant_name(name: &str) -> String {
     format!("__DORIA_CONST_{name}")
+}
+
+fn php_payload_case_method(case_name: &str, has_payload: bool) -> String {
+    if has_payload {
+        case_name.to_string()
+    } else {
+        format!("__doriaCase{case_name}")
+    }
 }
 
 fn emit_block(block: &Block, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {
@@ -2941,7 +2970,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
         Expr::StaticMember {
             class_name, member, ..
         } if scopes.is_payload_unit_case(class_name, member) => {
-            format!("{class_name}::__doriaCase{member}()")
+            format!("{class_name}::{}()", php_payload_case_method(member, false))
         }
         Expr::StaticMember {
             class_name, member, ..

@@ -232,14 +232,13 @@ impl Evaluator {
                     .enum_names
                     .entry(declaration.name.clone())
                     .or_insert(EnumId(next));
+                let payload_enum = declaration
+                    .cases
+                    .iter()
+                    .any(|case| !case.payload.is_empty());
                 for (index, case) in declaration.cases.iter().enumerate() {
                     let case_id = EnumCaseId { enum_id, index };
-                    if case.payload.is_empty() {
-                        evaluator.enum_cases.insert(
-                            (declaration.name.clone(), case.name.clone()),
-                            EnumValue { enum_id, case_id },
-                        );
-                    } else {
+                    if payload_enum {
                         evaluator.payload_cases.insert(
                             (declaration.name.clone(), case.name.clone()),
                             PayloadCaseSchema {
@@ -251,6 +250,11 @@ impl Evaluator {
                                     .map(|field| (field.name.clone(), field.ty.clone()))
                                     .collect(),
                             },
+                        );
+                    } else {
+                        evaluator.enum_cases.insert(
+                            (declaration.name.clone(), case.name.clone()),
+                            EnumValue { enum_id, case_id },
                         );
                     }
                 }
@@ -478,6 +482,20 @@ impl Evaluator {
                 ..
             } => {
                 let class_name = self.qualifier_class_name(qualifier, requester)?;
+                if let Some(schema) = self
+                    .payload_cases
+                    .get(&(class_name.clone(), member.clone()))
+                    .filter(|schema| schema.fields.is_empty())
+                {
+                    return Some(TypedValue::new(ConstValue::PayloadEnum(
+                        ConstPayloadEnumValue {
+                            enum_id: schema.enum_id,
+                            case_id: schema.case_id,
+                            fields: Vec::new(),
+                            field_types: Vec::new(),
+                        },
+                    )));
+                }
                 if let Some(value) = self
                     .enum_cases
                     .get(&(class_name.clone(), member.clone()))

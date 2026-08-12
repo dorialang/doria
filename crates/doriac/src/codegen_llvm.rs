@@ -2055,12 +2055,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .zip(&case_definition.payload)
                     .zip(&case_layout.fields)
                 {
-                    let mut value = self.lower_rvalue(field)?;
-                    if field_definition.ty == mir::Type::String {
-                        value = self
-                            .retain_string(value.into_pointer_value())?
-                            .as_basic_value_enum();
-                    }
+                    let value = self.lower_rvalue(field)?;
                     let field_address =
                         self.byte_offset(address, field_layout.offset, "payload.enum.field")?;
                     self.store_value_at_address(field_address, value, field_definition.ty)?;
@@ -3785,26 +3780,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             let source = self.lower_rvalue(&entry.value)?.into_pointer_value();
             let destination = if let (Some(key_type), Some(key)) = (definition.key, &entry.key) {
                 let key = self.lower_rvalue(key)?;
-                let key_word = self.value_to_collection_word(key, key_type)?;
-                let replaced = self.entry_alloca(byte, "aggregate.dictionary.replaced")?;
-                self.call_runtime(
-                    COLLECTION_AGGREGATE_KEYED_SET_SLOT,
-                    &[
-                        pointer.into(),
-                        self.context.i64_type().into(),
-                        byte.into(),
-                        pointer.into(),
-                    ],
-                    Some(pointer.into()),
-                    &[
-                        result.into(),
-                        key_word.into(),
-                        self.collection_compare_kind(key_type)?.into(),
-                        replaced.into(),
-                    ],
-                )?
-                .ok_or_else(|| backend_failure("aggregate dictionary insertion produced no slot"))?
-                .into_pointer_value()
+                self.lower_aggregate_dictionary_write_slot(result, key, key_type, ty, nullable)?
             } else if fixed {
                 self.call_runtime(
                     COLLECTION_AGGREGATE_VALUE_AT,
@@ -3851,6 +3827,65 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
         }
         Ok(result)
+    }
+
+    fn lower_aggregate_dictionary_write_slot(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        key: BasicValueEnum<'ctx>,
+        key_type: mir::Type,
+        value_type: mir::PayloadEnumType,
+        nullable_value: bool,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let byte = self.context.i8_type();
+        let key_word = self.value_to_collection_word(key, key_type)?;
+        let replaced = self.entry_alloca(byte, "aggregate.dictionary.replaced")?;
+        let destination = self
+            .call_runtime(
+                COLLECTION_AGGREGATE_KEYED_SET_SLOT,
+                &[
+                    pointer.into(),
+                    self.context.i64_type().into(),
+                    byte.into(),
+                    pointer.into(),
+                ],
+                Some(pointer.into()),
+                &[
+                    collection.into(),
+                    key_word.into(),
+                    self.collection_compare_kind(key_type)?.into(),
+                    replaced.into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("aggregate dictionary write produced no slot"))?
+            .into_pointer_value();
+        let replaced = build(self.builder.build_load(
+            byte,
+            replaced,
+            "aggregate.dictionary.replaced.value",
+        ))?
+        .into_int_value();
+        let function = current_function(&self.builder)?;
+        let drop = self
+            .context
+            .append_basic_block(function, "aggregate.dictionary.replace.drop");
+        let done = self
+            .context
+            .append_basic_block(function, "aggregate.dictionary.replace.done");
+        let has_old = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            replaced,
+            byte.const_zero(),
+            "aggregate.dictionary.replaced",
+        ))?;
+        build(self.builder.build_conditional_branch(has_old, drop, done))?;
+        self.builder.position_at_end(drop);
+        self.drop_payload_enum_at(destination, value_type, nullable_value)?;
+        self.drop_stored_value(key, key_type)?;
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        Ok(destination)
     }
 
     fn checked_collection_value_address(
@@ -5089,38 +5124,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let index = self.lower_rvalue(index)?;
         if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
             let replacement = self.lower_rvalue(value)?.into_pointer_value();
-            let (destination, replaced) = if let Some(key_type) =
-                definition.key.filter(|_| !positional)
-            {
-                let key_word = self.value_to_collection_word(index, key_type)?;
-                let replaced =
-                    self.entry_alloca(self.context.i8_type(), "aggregate.dictionary.replaced")?;
-                let destination = self
-                    .call_runtime(
-                        COLLECTION_AGGREGATE_KEYED_SET_SLOT,
-                        &[
-                            pointer.into(),
-                            self.context.i64_type().into(),
-                            self.context.i8_type().into(),
-                            pointer.into(),
-                        ],
-                        Some(pointer.into()),
-                        &[
-                            collection_value.into(),
-                            key_word.into(),
-                            self.collection_compare_kind(key_type)?.into(),
-                            replaced.into(),
-                        ],
-                    )?
-                    .ok_or_else(|| backend_failure("aggregate dictionary write produced no slot"))?
-                    .into_pointer_value();
-                let replaced = build(self.builder.build_load(
-                    self.context.i8_type(),
-                    replaced,
-                    "aggregate.dictionary.replaced.value",
-                ))?
-                .into_int_value();
-                (destination, Some(replaced))
+            let destination = if let Some(key_type) = definition.key.filter(|_| !positional) {
+                self.lower_aggregate_dictionary_write_slot(
+                    collection_value,
+                    index,
+                    key_type,
+                    ty,
+                    nullable,
+                )?
             } else {
                 let index = self.value_to_collection_word(
                     index,
@@ -5150,30 +5161,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     )?
                     .ok_or_else(|| backend_failure("aggregate collection write produced no slot"))?
                     .into_pointer_value();
-                (destination, None)
+                self.drop_payload_enum_at(destination, ty, nullable)?;
+                destination
             };
-            if let Some(replaced) = replaced {
-                let function = current_function(&self.builder)?;
-                let drop = self
-                    .context
-                    .append_basic_block(function, "aggregate.collection.replace.drop");
-                let done = self
-                    .context
-                    .append_basic_block(function, "aggregate.collection.replace.done");
-                let has_old = build(self.builder.build_int_compare(
-                    IntPredicate::NE,
-                    replaced,
-                    self.context.i8_type().const_zero(),
-                    "aggregate.collection.replaced",
-                ))?;
-                build(self.builder.build_conditional_branch(has_old, drop, done))?;
-                self.builder.position_at_end(drop);
-                self.drop_payload_enum_at(destination, ty, nullable)?;
-                build(self.builder.build_unconditional_branch(done))?;
-                self.builder.position_at_end(done);
-            } else {
-                self.drop_payload_enum_at(destination, ty, nullable)?;
-            }
             self.copy_payload_bytes(destination, replacement, ty, nullable)?;
             return Ok(());
         }
@@ -5890,7 +5880,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .ok_or_else(|| backend_failure("aggregate collection read produced no slot"))?
             .into_pointer_value();
         let destination = if let Some(key_ty) = target.key {
-            let key = self
+            let key_word = self
                 .call_runtime(
                     COLLECTION_KEY_AT,
                     &[pointer.into(), pointer.into(), usize_type.into()],
@@ -5899,33 +5889,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?
                 .ok_or_else(|| backend_failure("aggregate collection key read produced no result"))?
                 .into_int_value();
-            if key_ty == mir::Type::String {
+            let key = if key_ty == mir::Type::String {
                 let key_pointer = build(self.builder.build_int_to_ptr(
-                    key,
+                    key_word,
                     pointer,
                     "aggregate.from.string-key",
                 ))?;
                 self.retain_string(key_pointer)?;
-            }
-            let replaced = self.entry_alloca(byte, "aggregate.from.replaced")?;
-            self.call_runtime(
-                COLLECTION_AGGREGATE_KEYED_SET_SLOT,
-                &[
-                    pointer.into(),
-                    self.context.i64_type().into(),
-                    byte.into(),
-                    pointer.into(),
-                ],
-                Some(pointer.into()),
-                &[
-                    result.into(),
-                    key.into(),
-                    self.collection_compare_kind(key_ty)?.into(),
-                    replaced.into(),
-                ],
-            )?
-            .ok_or_else(|| backend_failure("aggregate dictionary insertion produced no slot"))?
-            .into_pointer_value()
+                key_pointer.into()
+            } else {
+                key_word.into()
+            };
+            self.lower_aggregate_dictionary_write_slot(result, key, key_ty, ty, nullable)?
         } else {
             self.call_runtime(
                 COLLECTION_AGGREGATE_PUSH_SLOT,

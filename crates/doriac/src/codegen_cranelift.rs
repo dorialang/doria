@@ -2740,11 +2740,7 @@ fn lower_payload_enum_expression(
                 .zip(&case_definition.payload)
                 .zip(&case_layout.fields)
             {
-                let mut value = lower_rvalue(builder, field, resources)?;
-                if field_definition.ty == mir::Type::String {
-                    value =
-                        LoweredValue::Single(retain_string(builder, value.single()?, resources)?);
-                }
+                let value = lower_rvalue(builder, field, resources)?;
                 let field_address = builder
                     .ins()
                     .iadd_imm_u(address, i64::from(field_layout.offset));
@@ -4177,25 +4173,9 @@ fn lower_payload_enum_collection_literal(
         let source = lower_rvalue(builder, &entry.value, resources)?.single()?;
         let destination = if let (Some(key_ty), Some(key)) = (definition.key, &entry.key) {
             let key = lower_rvalue(builder, key, resources)?.single()?;
-            let key = value_to_collection_word(builder, key, key_ty, pointer)?;
-            let key_kind = builder
-                .ins()
-                .iconst(types::I8, collection_compare_kind(key_ty)?);
-            let replaced_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                1,
-                0,
-            ));
-            let replaced = builder.ins().stack_addr(pointer, replaced_slot, 0);
-            runtime_call(
-                builder,
-                COLLECTION_AGGREGATE_KEYED_SET_SLOT,
-                &[pointer, types::I64, types::I8, pointer],
-                Some(pointer),
-                &[result, key, key_kind, replaced],
-                resources,
+            lower_aggregate_dictionary_write_slot(
+                builder, result, key, key_ty, ty, nullable, resources,
             )?
-            .ok_or_else(|| backend_failure("aggregate dictionary insertion produced no slot"))?
         } else if fixed {
             let index = builder.ins().iconst(types::I64, index as i64);
             let positional = builder.ins().iconst(types::I8, 1);
@@ -4241,6 +4221,48 @@ fn lower_payload_enum_collection_literal(
         )?;
     }
     Ok(result)
+}
+
+fn lower_aggregate_dictionary_write_slot(
+    builder: &mut FunctionBuilder,
+    collection: Value,
+    key: Value,
+    key_type: mir::Type,
+    value_type: mir::PayloadEnumType,
+    nullable_value: bool,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let key_word = value_to_collection_word(builder, key, key_type, pointer)?;
+    let key_kind = builder
+        .ins()
+        .iconst(types::I8, collection_compare_kind(key_type)?);
+    let replaced_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
+    let replaced_pointer = builder.ins().stack_addr(pointer, replaced_slot, 0);
+    let destination = runtime_call(
+        builder,
+        COLLECTION_AGGREGATE_KEYED_SET_SLOT,
+        &[pointer, types::I64, types::I8, pointer],
+        Some(pointer),
+        &[collection, key_word, key_kind, replaced_pointer],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("aggregate dictionary write produced no slot"))?;
+    let replaced = builder
+        .ins()
+        .stack_load(pointer, types::I8, replaced_slot, 0);
+    let zero = builder.ins().iconst(types::I8, 0);
+    let has_old = builder.ins().icmp(IntCC::NotEqual, replaced, zero);
+    let drop_block = builder.create_block();
+    let done = builder.create_block();
+    builder.ins().brif(has_old, drop_block, &[], done, &[]);
+    builder.switch_to_block(drop_block);
+    lower_drop_payload_enum_at(builder, destination, value_type, nullable_value, resources)?;
+    lower_drop_stored_value(builder, key, key_type, resources)?;
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+    Ok(destination)
 }
 
 fn lower_collection_expression(
@@ -5276,31 +5298,16 @@ fn lower_collection_set(
     let index = lower_rvalue(builder, index, resources)?.single()?;
     if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
         let replacement = lower_rvalue(builder, value, resources)?.single()?;
-        let (destination, replaced) = if let Some(key_type) = definition.key.filter(|_| !positional)
-        {
-            let key_word = value_to_collection_word(builder, index, key_type, pointer)?;
-            let key_kind = builder
-                .ins()
-                .iconst(types::I8, collection_compare_kind(key_type)?);
-            let replaced_slot = builder.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                1,
-                0,
-            ));
-            let replaced_pointer = builder.ins().stack_addr(pointer, replaced_slot, 0);
-            let destination = runtime_call(
+        let destination = if let Some(key_type) = definition.key.filter(|_| !positional) {
+            lower_aggregate_dictionary_write_slot(
                 builder,
-                COLLECTION_AGGREGATE_KEYED_SET_SLOT,
-                &[pointer, types::I64, types::I8, pointer],
-                Some(pointer),
-                &[collection_value, key_word, key_kind, replaced_pointer],
+                collection_value,
+                index,
+                key_type,
+                ty,
+                nullable,
                 resources,
             )?
-            .ok_or_else(|| backend_failure("aggregate dictionary write produced no slot"))?;
-            let replaced = builder
-                .ins()
-                .stack_load(pointer, types::I8, replaced_slot, 0);
-            (destination, Some(replaced))
         } else {
             let positional = builder.ins().iconst(types::I8, 1);
             let key_kind = builder
@@ -5326,21 +5333,9 @@ fn lower_collection_set(
                 resources,
             )?
             .ok_or_else(|| backend_failure("aggregate collection write produced no slot"))?;
-            (destination, None)
+            lower_drop_payload_enum_at(builder, destination, ty, nullable, resources)?;
+            destination
         };
-        if let Some(replaced) = replaced {
-            let zero = builder.ins().iconst(types::I8, 0);
-            let has_old = builder.ins().icmp(IntCC::NotEqual, replaced, zero);
-            let drop_block = builder.create_block();
-            let done = builder.create_block();
-            builder.ins().brif(has_old, drop_block, &[], done, &[]);
-            builder.switch_to_block(drop_block);
-            lower_drop_payload_enum_at(builder, destination, ty, nullable, resources)?;
-            builder.ins().jump(done, &[]);
-            builder.switch_to_block(done);
-        } else {
-            lower_drop_payload_enum_at(builder, destination, ty, nullable, resources)?;
-        }
         copy_inline_bytes(
             builder,
             destination,
@@ -5869,21 +5864,9 @@ fn lower_payload_enum_collection_from(
         if key_ty == mir::Type::String {
             key = retain_string(builder, key, resources)?;
         }
-        let key_kind = builder
-            .ins()
-            .iconst(types::I8, collection_compare_kind(key_ty)?);
-        let replaced_slot =
-            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
-        let replaced = builder.ins().stack_addr(pointer, replaced_slot, 0);
-        runtime_call(
-            builder,
-            COLLECTION_AGGREGATE_KEYED_SET_SLOT,
-            &[pointer, types::I64, types::I8, pointer],
-            Some(pointer),
-            &[result, key, key_kind, replaced],
-            resources,
+        lower_aggregate_dictionary_write_slot(
+            builder, result, key, key_ty, ty, nullable, resources,
         )?
-        .ok_or_else(|| backend_failure("aggregate dictionary insertion produced no slot"))?
     } else {
         runtime_call(
             builder,
