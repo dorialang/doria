@@ -442,8 +442,15 @@ pub enum Expr {
     Match {
         scrutinee: Box<Expr>,
         arms: Vec<MatchArm>,
+        origin: MatchOrigin,
         span: Span,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchOrigin {
+    Match,
+    Ternary,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -463,7 +470,14 @@ pub enum MatchPattern {
         qualifier_span: Span,
         case: String,
         case_span: Span,
-        bindings: Vec<MatchBinding>,
+        /// `None` ignores a payload. `Some` preserves an authored binding list,
+        /// including an empty one, so semantic analysis can enforce exact arity.
+        bindings: Option<Vec<MatchBinding>>,
+        span: Span,
+    },
+    TypeBinding {
+        ty: TypeRef,
+        binding: MatchBinding,
         span: Span,
     },
     Expression(Expr),

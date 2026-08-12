@@ -1,0 +1,20 @@
+enum Status
+{
+    case Draft;
+    case Published;
+    case Archived;
+}
+
+function label(Status $status): string
+{
+    return match ($status) {
+        Status::Draft => "draft",
+        Status::Published => "published",
+        Status::Archived => "archived",
+    };
+}
+
+function main(): void
+{
+    echo "{label(Status::Draft)} {label(Status::Published)} {label(Status::Archived)}\n";
+}

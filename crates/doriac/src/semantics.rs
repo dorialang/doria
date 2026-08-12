@@ -50,6 +50,8 @@ pub struct SemanticInfo {
     pub enum_case_constructions: HashMap<(usize, usize), EnumCaseId>,
     /// Resolved concrete target for each checked `is` expression.
     pub type_test_types: HashMap<(usize, usize), ResolvedType>,
+    /// Fully checked match plans consumed by backend-independent MIR lowering.
+    pub matches: HashMap<(usize, usize), MatchSemanticInfo>,
     /// Compiler-resolved callable target for each user-defined call expression.
     pub call_targets: HashMap<(usize, usize), CallableTarget>,
     /// Concrete generic arguments selected for each checked user-defined call.
@@ -146,6 +148,41 @@ pub struct EnumCaseSemanticInfo {
 pub struct EnumPayloadSemanticInfo {
     pub name: String,
     pub ty: ResolvedType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchSemanticInfo {
+    pub scrutinee_type: ResolvedType,
+    pub result_type: ResolvedType,
+    pub origin: MatchOrigin,
+    pub condition_mode: bool,
+    pub arms: Vec<MatchArmSemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchArmSemanticInfo {
+    pub pattern: ResolvedMatchPattern,
+    pub bindings: Vec<MatchBindingSemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatchBindingSemanticInfo {
+    pub name: String,
+    pub ty: ResolvedType,
+    pub borrowed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedMatchPattern {
+    Default,
+    Constant(crate::const_eval::ConstValue),
+    Null,
+    EnumCase {
+        enum_id: EnumId,
+        case_id: EnumCaseId,
+    },
+    ExactType(ResolvedType),
+    Condition,
 }
 
 impl SemanticInfo {
@@ -261,6 +298,7 @@ pub fn analyze_program_for_ide_with_source<'source>(
             enum_case_values: checker.enum_case_values,
             enum_case_constructions: checker.enum_case_constructions,
             type_test_types: checker.type_test_types,
+            matches: checker.matches,
             call_targets: checker.call_targets,
             generic_call_specializations: checker.generic_call_specializations,
             constrained_display_calls: checker.constrained_display_calls,
@@ -900,6 +938,7 @@ struct Checker<'program> {
     enum_case_values: HashMap<(usize, usize), EnumValue>,
     enum_case_constructions: HashMap<(usize, usize), EnumCaseId>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
+    matches: HashMap<(usize, usize), MatchSemanticInfo>,
     call_targets: HashMap<(usize, usize), CallableTarget>,
     generic_call_specializations: HashMap<(usize, usize), GenericSpecialization>,
     constrained_display_calls: HashSet<(usize, usize)>,
@@ -1376,6 +1415,7 @@ impl<'program> Checker<'program> {
             enum_case_values: HashMap::new(),
             enum_case_constructions: HashMap::new(),
             type_test_types: HashMap::new(),
+            matches: HashMap::new(),
             call_targets: HashMap::new(),
             generic_call_specializations: HashMap::new(),
             constrained_display_calls: HashSet::new(),
@@ -5374,12 +5414,13 @@ impl<'program> Checker<'program> {
                     ));
                 }
             }
-            Expr::Match { span, .. } => {
-                self.diagnostics.push(Diagnostic::unsupported_stage(
-                    "E0576",
-                    "match expressions are accepted syntax; match semantics land in Stage 28",
-                    *span,
-                ));
+            Expr::Match {
+                scrutinee,
+                arms,
+                origin,
+                span,
+            } => {
+                self.check_match_expression(scrutinee, arms, *origin, *span, scopes, method_context)
             }
             Expr::Float { .. } => self.check_float_literal_range(expr, FloatType::Float64),
             Expr::Identifier { name, span } => {
@@ -5407,6 +5448,826 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+    }
+
+    fn check_match_expression(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[MatchArm],
+        origin: MatchOrigin,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        self.check_expr(scrutinee, scopes, method_context);
+        let scrutinee_ty = self.infer_expr_type(scrutinee, scopes, method_context);
+        let condition_mode = origin == MatchOrigin::Match
+            && matches!(
+                Self::ungroup_expr(scrutinee),
+                Expr::Bool { value: true, .. }
+            );
+
+        if origin == MatchOrigin::Ternary
+            && !matches!(
+                self.types.kind(scrutinee_ty),
+                TypeKind::Bool | TypeKind::Unknown
+            )
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0595",
+                    "ternary condition must have type `bool`",
+                    scrutinee.span(),
+                )
+                .with_title("Ternary Condition Must Be Bool")
+                .with_help("use an explicit comparison that produces `bool`"),
+            );
+        }
+
+        let expected = self
+            .contextual_expression_types
+            .get(&(span.start, span.end))
+            .copied();
+        let mut resolved_arms = Vec::with_capacity(arms.len());
+        let mut result_ty = expected;
+        let mut seen_default = false;
+        let mut default_span = None;
+        let mut seen_enum_cases = HashSet::new();
+        let mut seen_constants = Vec::new();
+        let mut seen_types = HashSet::new();
+        let mut seen_null = false;
+        let mut shape_valid = true;
+
+        for (index, arm) in arms.iter().enumerate() {
+            let pattern_span = Self::match_pattern_span(&arm.pattern);
+            if seen_default {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0589",
+                        "match arm is unreachable after `default`",
+                        pattern_span,
+                    )
+                    .with_title("Unreachable Match Arm")
+                    .with_help("remove the arm or move `default` to the end"),
+                );
+                shape_valid = false;
+            }
+
+            let mut arm_scopes = scopes.clone();
+            arm_scopes.push();
+            let mut bindings = Vec::new();
+            let resolved_pattern = if condition_mode {
+                match &arm.pattern {
+                    MatchPattern::Default { .. } => {
+                        seen_default = true;
+                        default_span = Some(pattern_span);
+                        ResolvedMatchPattern::Default
+                    }
+                    MatchPattern::Expression(condition) => {
+                        self.check_expr(condition, &arm_scopes, method_context);
+                        let condition_ty =
+                            self.infer_expr_type(condition, &arm_scopes, method_context);
+                        if !matches!(
+                            self.types.kind(condition_ty),
+                            TypeKind::Bool | TypeKind::Unknown
+                        ) {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "E0594",
+                                    "`match (true)` arm condition must have type `bool`",
+                                    condition.span(),
+                                )
+                                .with_title("Match Condition Must Be Bool")
+                                .with_help("use an explicit comparison that produces `bool`"),
+                            );
+                            shape_valid = false;
+                        }
+                        ResolvedMatchPattern::Condition
+                    }
+                    _ => {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0588",
+                                "`match (true)` accepts bool conditions and `default`",
+                                pattern_span,
+                            )
+                            .with_title("Invalid Match Pattern"),
+                        );
+                        shape_valid = false;
+                        ResolvedMatchPattern::Condition
+                    }
+                }
+            } else {
+                self.resolve_match_pattern(
+                    &arm.pattern,
+                    scrutinee_ty,
+                    &mut arm_scopes,
+                    method_context,
+                    &mut bindings,
+                    &mut seen_default,
+                    &mut seen_enum_cases,
+                    &mut seen_constants,
+                    &mut seen_types,
+                    &mut seen_null,
+                    &mut shape_valid,
+                )
+            };
+
+            if matches!(resolved_pattern, ResolvedMatchPattern::Default) {
+                default_span = Some(pattern_span);
+            }
+
+            if matches!(resolved_pattern, ResolvedMatchPattern::Default) && index + 1 != arms.len()
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0589",
+                        "`default` must be the final match arm",
+                        pattern_span,
+                    )
+                    .with_title("Unreachable Match Arm")
+                    .with_help("move `default` to the end of the match"),
+                );
+                shape_valid = false;
+            }
+
+            self.check_expr(&arm.value, &arm_scopes, method_context);
+            let arm_ty = self.infer_expr_type(&arm.value, &arm_scopes, method_context);
+            if self.is_void_type(arm_ty) {
+                self.diagnostics.push(
+                    Diagnostic::new("E0593", "match arms must produce a value", arm.value.span())
+                        .with_title("Match Arm Has No Value")
+                        .with_help("use `if` or future `when` for side-effect-only branching"),
+                );
+                shape_valid = false;
+            } else if let Some(target) = expected {
+                self.check_expr_assignable(
+                    target,
+                    &arm.value,
+                    &arm_scopes,
+                    method_context,
+                    AssignmentDestination::Type,
+                );
+            } else {
+                result_ty = self.unify_match_result_type(result_ty, arm_ty, arm.value.span());
+            }
+
+            resolved_arms.push(MatchArmSemanticInfo {
+                pattern: resolved_pattern,
+                bindings,
+            });
+        }
+
+        if arms.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::new("E0585", "match expression has no arms", span)
+                    .with_title("Non-Exhaustive Match"),
+            );
+            shape_valid = false;
+        }
+
+        if condition_mode && !seen_default {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0585",
+                    "`match (true)` requires a final `default` arm",
+                    span,
+                )
+                .with_title("Non-Exhaustive Match")
+                .with_help("add `default => value` as the final arm"),
+            );
+            shape_valid = false;
+        } else if !condition_mode {
+            let missing = self.missing_match_coverage(
+                scrutinee_ty,
+                seen_null,
+                &seen_enum_cases,
+                &seen_constants,
+                &seen_types,
+            );
+            if seen_default {
+                if missing.is_empty() {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0589",
+                            "`default` is unreachable because earlier arms cover the match domain",
+                            default_span.unwrap_or(span),
+                        )
+                        .with_title("Unreachable Match Arm")
+                        .with_help("remove the redundant `default` arm"),
+                    );
+                    shape_valid = false;
+                }
+            } else if !missing.is_empty() {
+                self.report_missing_match_coverage(&missing, span);
+                shape_valid = false;
+            }
+        }
+
+        let result_ty = result_ty.unwrap_or_else(|| self.types.unknown());
+        if expected.is_none() && matches!(self.types.kind(result_ty), TypeKind::Null) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0592",
+                    "a match whose arms are all `null` needs an expected nullable type",
+                    span,
+                )
+                .with_title("Match Result Type Cannot Be Inferred")
+                .with_help("add an explicit nullable destination type"),
+            );
+            shape_valid = false;
+        }
+        self.expression_types
+            .insert((span.start, span.end), self.types.resolved(result_ty));
+        if shape_valid || !resolved_arms.is_empty() {
+            self.matches.insert(
+                (span.start, span.end),
+                MatchSemanticInfo {
+                    scrutinee_type: self.types.resolved(scrutinee_ty),
+                    result_type: self.types.resolved(result_ty),
+                    origin,
+                    condition_mode,
+                    arms: resolved_arms,
+                },
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_match_pattern(
+        &mut self,
+        pattern: &MatchPattern,
+        scrutinee_ty: TypeId,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+        bindings: &mut Vec<MatchBindingSemanticInfo>,
+        seen_default: &mut bool,
+        seen_enum_cases: &mut HashSet<EnumCaseId>,
+        seen_constants: &mut Vec<crate::const_eval::ConstValue>,
+        seen_types: &mut HashSet<ResolvedType>,
+        seen_null: &mut bool,
+        shape_valid: &mut bool,
+    ) -> ResolvedMatchPattern {
+        let pattern_span = Self::match_pattern_span(pattern);
+        match pattern {
+            MatchPattern::Default { .. } => {
+                if *seen_default {
+                    self.duplicate_match_pattern("duplicate `default` arm", pattern_span);
+                    *shape_valid = false;
+                }
+                *seen_default = true;
+                ResolvedMatchPattern::Default
+            }
+            MatchPattern::EnumCase {
+                qualifier,
+                case,
+                bindings: authored_bindings,
+                ..
+            } => {
+                if authored_bindings.is_none() {
+                    if let Some(value) = self
+                        .const_evaluation
+                        .values
+                        .get(&crate::const_eval::ConstKey::Class {
+                            class_name: qualifier.clone(),
+                            name: case.clone(),
+                        })
+                        .map(|value| value.value.clone())
+                    {
+                        let value_ty = self.const_value_type(&value);
+                        let (base, _) = self.match_base_type(scrutinee_ty);
+                        if value_ty != base {
+                            self.incompatible_match_pattern(
+                                &format!("constant of type `{}`", self.types.display(value_ty)),
+                                scrutinee_ty,
+                                pattern_span,
+                            );
+                            *shape_valid = false;
+                        }
+                        if seen_constants.contains(&value) {
+                            self.duplicate_match_pattern(
+                                "duplicate literal or constant pattern",
+                                pattern_span,
+                            );
+                            *shape_valid = false;
+                        } else {
+                            seen_constants.push(value.clone());
+                        }
+                        return ResolvedMatchPattern::Constant(value);
+                    }
+                }
+                let (base_ty, _) = self.match_base_type(scrutinee_ty);
+                let TypeKind::Enum(scrutinee_enum) = self.types.kind(base_ty).clone() else {
+                    self.incompatible_match_pattern("enum case", scrutinee_ty, pattern_span);
+                    *shape_valid = false;
+                    return ResolvedMatchPattern::EnumCase {
+                        enum_id: EnumId(usize::MAX),
+                        case_id: EnumCaseId {
+                            enum_id: EnumId(usize::MAX),
+                            index: usize::MAX,
+                        },
+                    };
+                };
+                if qualifier != &scrutinee_enum.name {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0588",
+                            format!(
+                                "case `{qualifier}::{case}` does not belong to matched enum `{}`",
+                                scrutinee_enum.name
+                            ),
+                            pattern_span,
+                        )
+                        .with_title("Match Pattern Has Wrong Type"),
+                    );
+                    *shape_valid = false;
+                }
+                let Some(definition) = self.enums.get(&scrutinee_enum.name).cloned() else {
+                    *shape_valid = false;
+                    return ResolvedMatchPattern::EnumCase {
+                        enum_id: scrutinee_enum.id,
+                        case_id: EnumCaseId {
+                            enum_id: scrutinee_enum.id,
+                            index: usize::MAX,
+                        },
+                    };
+                };
+                let Some(case_index) = definition.case_by_name.get(case).copied() else {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0575",
+                        format!("enum `{}` has no case `{case}`", definition.name),
+                        pattern_span,
+                    ));
+                    *shape_valid = false;
+                    return ResolvedMatchPattern::EnumCase {
+                        enum_id: definition.id,
+                        case_id: EnumCaseId {
+                            enum_id: definition.id,
+                            index: usize::MAX,
+                        },
+                    };
+                };
+                let case_definition = &definition.cases[case_index];
+                if !seen_enum_cases.insert(case_definition.id) {
+                    self.duplicate_match_pattern(
+                        &format!("duplicate match arm for `{}::{case}`", definition.name),
+                        pattern_span,
+                    );
+                    *shape_valid = false;
+                }
+                if let Some(authored_bindings) = authored_bindings {
+                    if authored_bindings.len() != case_definition.payload.len() {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0590",
+                                format!(
+                                    "case `{}::{case}` has {} payload field(s), but this pattern binds {}",
+                                    definition.name,
+                                    case_definition.payload.len(),
+                                    authored_bindings.len()
+                                ),
+                                pattern_span,
+                            )
+                            .with_title("Match Payload Arity Mismatch"),
+                        );
+                        *shape_valid = false;
+                    }
+                    let mut names = HashSet::new();
+                    for (binding, field) in
+                        authored_bindings.iter().zip(case_definition.payload.iter())
+                    {
+                        if !names.insert(binding.name.clone()) {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "E0103",
+                                    format!(
+                                        "variable `${}` is already declared in this match pattern",
+                                        binding.name
+                                    ),
+                                    binding.span,
+                                )
+                                .with_title("Duplicate Pattern Binding"),
+                            );
+                            *shape_valid = false;
+                            continue;
+                        }
+                        let borrowed = self.type_is_move_type(field.ty);
+                        self.declare_binding(
+                            scopes,
+                            binding.name.clone(),
+                            Binding {
+                                writable: false,
+                                ty: field.ty,
+                                declared_ty: field.ty,
+                                int_constant: None,
+                                string_constant: None,
+                            },
+                            binding.span,
+                        );
+                        self.expression_types.insert(
+                            (binding.span.start, binding.span.end),
+                            self.types.resolved(field.ty),
+                        );
+                        bindings.push(MatchBindingSemanticInfo {
+                            name: binding.name.clone(),
+                            ty: self.types.resolved(field.ty),
+                            borrowed,
+                        });
+                    }
+                }
+                ResolvedMatchPattern::EnumCase {
+                    enum_id: definition.id,
+                    case_id: case_definition.id,
+                }
+            }
+            MatchPattern::TypeBinding { ty, binding, .. } => {
+                let pattern_ty = self.resolve_type_ref(ty, pattern_span);
+                if ty.nullable || !self.is_exact_match_pattern_type(pattern_ty) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0588",
+                            "type-binding patterns require a concrete non-null exact type",
+                            pattern_span,
+                        )
+                        .with_title("Invalid Match Type Pattern")
+                        .with_help("use `null` for absence and `default` for the open remainder"),
+                    );
+                    *shape_valid = false;
+                }
+                let (base, nullable) = self.match_base_type(scrutinee_ty);
+                let compatible = matches!(self.types.kind(scrutinee_ty), TypeKind::Mixed)
+                    || (nullable && self.is_assignable(base, pattern_ty));
+                if !compatible {
+                    if base == pattern_ty && !nullable {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0589",
+                                format!(
+                                    "type pattern `{}` is always true for this scrutinee",
+                                    self.types.display(pattern_ty)
+                                ),
+                                pattern_span,
+                            )
+                            .with_title("Unreachable Match Arm")
+                            .with_help(
+                                "use the value directly instead of matching its existing type",
+                            ),
+                        );
+                    } else {
+                        self.incompatible_match_pattern(
+                            &format!("type `{}`", self.types.display(pattern_ty)),
+                            scrutinee_ty,
+                            pattern_span,
+                        );
+                    }
+                    *shape_valid = false;
+                }
+                let resolved = self.types.resolved(pattern_ty);
+                if !seen_types.insert(resolved.clone()) {
+                    self.duplicate_match_pattern("duplicate exact type pattern", pattern_span);
+                    *shape_valid = false;
+                }
+                self.declare_binding(
+                    scopes,
+                    binding.name.clone(),
+                    Binding {
+                        writable: false,
+                        ty: pattern_ty,
+                        declared_ty: pattern_ty,
+                        int_constant: None,
+                        string_constant: None,
+                    },
+                    binding.span,
+                );
+                self.expression_types
+                    .insert((binding.span.start, binding.span.end), resolved.clone());
+                bindings.push(MatchBindingSemanticInfo {
+                    name: binding.name.clone(),
+                    ty: resolved.clone(),
+                    borrowed: self.type_is_move_type(pattern_ty),
+                });
+                ResolvedMatchPattern::ExactType(resolved)
+            }
+            MatchPattern::Expression(expr)
+                if matches!(Self::ungroup_expr(expr), Expr::Null { .. }) =>
+            {
+                let (_, nullable) = self.match_base_type(scrutinee_ty);
+                if !nullable && !matches!(self.types.kind(scrutinee_ty), TypeKind::Mixed) {
+                    self.incompatible_match_pattern("`null`", scrutinee_ty, pattern_span);
+                    *shape_valid = false;
+                }
+                if *seen_null {
+                    self.duplicate_match_pattern("duplicate `null` pattern", pattern_span);
+                    *shape_valid = false;
+                }
+                *seen_null = true;
+                ResolvedMatchPattern::Null
+            }
+            MatchPattern::Expression(expr) => {
+                self.check_expr(expr, scopes, method_context);
+                let (base, _) = self.match_base_type(scrutinee_ty);
+                if let TypeKind::Integer(integer) = *self.types.kind(base) {
+                    if self.check_contextual_integer_literal(expr, integer) == Some(false) {
+                        *shape_valid = false;
+                        return ResolvedMatchPattern::Constant(crate::const_eval::ConstValue::Null);
+                    }
+                }
+                let Some(value) = self.match_constant_value(expr, scrutinee_ty, scopes) else {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0587",
+                            "ordinary match patterns must be known during compilation",
+                            pattern_span,
+                        )
+                        .with_title("Match Pattern Is Not Constant")
+                        .with_help(
+                            "use a literal, an accessible constant, an enum case, or `default`",
+                        ),
+                    );
+                    *shape_valid = false;
+                    return ResolvedMatchPattern::Constant(crate::const_eval::ConstValue::Null);
+                };
+                let value_ty = self.infer_expr_type(expr, scopes, method_context);
+                if value_ty != base {
+                    self.incompatible_match_pattern(
+                        &format!("value of type `{}`", self.types.display(value_ty)),
+                        scrutinee_ty,
+                        pattern_span,
+                    );
+                    *shape_valid = false;
+                }
+                if seen_constants.contains(&value) {
+                    self.duplicate_match_pattern(
+                        "duplicate literal or constant pattern",
+                        pattern_span,
+                    );
+                    *shape_valid = false;
+                } else {
+                    seen_constants.push(value.clone());
+                }
+                ResolvedMatchPattern::Constant(value)
+            }
+        }
+    }
+
+    fn missing_match_coverage(
+        &self,
+        scrutinee_ty: TypeId,
+        has_null: bool,
+        enum_cases: &HashSet<EnumCaseId>,
+        constants: &[crate::const_eval::ConstValue],
+        exact_types: &HashSet<ResolvedType>,
+    ) -> Vec<String> {
+        let (base, nullable) = self.match_base_type(scrutinee_ty);
+        let null_covered = !nullable || has_null;
+        let missing = match self.types.kind(base).clone() {
+            TypeKind::Enum(enum_type) => self
+                .enums
+                .get(&enum_type.name)
+                .map(|definition| {
+                    definition
+                        .cases
+                        .iter()
+                        .filter(|case| !enum_cases.contains(&case.id))
+                        .map(|case| format!("{}::{}", definition.name, case.name))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+            TypeKind::Bool => [true, false]
+                .into_iter()
+                .filter(|value| !constants.contains(&crate::const_eval::ConstValue::Bool(*value)))
+                .map(|value| value.to_string())
+                .collect(),
+            _ if nullable && exact_types.contains(&self.types.resolved(base)) => Vec::new(),
+            _ => vec!["default".to_string()],
+        };
+        let mut missing = missing;
+        if !null_covered {
+            missing.insert(0, "null".to_string());
+        }
+        missing
+    }
+
+    fn report_missing_match_coverage(&mut self, missing: &[String], span: Span) {
+        let detail = missing
+            .iter()
+            .map(|item| format!("- {item}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.diagnostics.push(
+            Diagnostic::new("E0585", "match does not cover every possible value", span)
+                .with_title("Non-Exhaustive Match")
+                .with_explanation(format!("Missing match cases:\n{detail}"))
+                .with_help("add the missing cases or a final `default` arm"),
+        );
+    }
+
+    fn is_exact_match_pattern_type(&self, ty: TypeId) -> bool {
+        matches!(
+            self.types.kind(ty),
+            TypeKind::Integer(_)
+                | TypeKind::Float(_)
+                | TypeKind::String
+                | TypeKind::Bool
+                | TypeKind::Enum(_)
+                | TypeKind::Class(_)
+        )
+    }
+
+    fn unify_match_result_type(
+        &mut self,
+        current: Option<TypeId>,
+        next: TypeId,
+        span: Span,
+    ) -> Option<TypeId> {
+        let Some(current) = current else {
+            return Some(next);
+        };
+        if current == next || self.is_assignable(current, next) {
+            return Some(current);
+        }
+        if self.is_assignable(next, current) {
+            return Some(next);
+        }
+        let nullable = match (
+            self.types.kind(current).clone(),
+            self.types.kind(next).clone(),
+        ) {
+            (TypeKind::Null, _)
+                if !matches!(self.types.kind(next), TypeKind::Null | TypeKind::Void) =>
+            {
+                Some(next)
+            }
+            (_, TypeKind::Null)
+                if !matches!(self.types.kind(current), TypeKind::Null | TypeKind::Void) =>
+            {
+                Some(current)
+            }
+            _ => None,
+        };
+        if let Some(inner) = nullable {
+            return Some(self.types.intern(TypeKind::Nullable(inner)));
+        }
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0592",
+                format!(
+                    "match arm type `{}` does not match result type `{}`",
+                    self.types.display(next),
+                    self.types.display(current)
+                ),
+                span,
+            )
+            .with_title("Match Arm Type Mismatch")
+            .with_help("make every arm produce one compatible type"),
+        );
+        Some(current)
+    }
+
+    fn match_constant_value(
+        &mut self,
+        expr: &Expr,
+        scrutinee_ty: TypeId,
+        scopes: &ScopeStack,
+    ) -> Option<crate::const_eval::ConstValue> {
+        let (base, _) = self.match_base_type(scrutinee_ty);
+        match Self::ungroup_expr(expr) {
+            Expr::Bool { value, .. } => Some(crate::const_eval::ConstValue::Bool(*value)),
+            Expr::String { .. }
+            | Expr::Binary {
+                op: BinaryOp::Concat,
+                ..
+            } => {
+                Self::eval_string_constant(expr, scopes).map(crate::const_eval::ConstValue::String)
+            }
+            Expr::Int { .. }
+            | Expr::Unary {
+                op: UnaryOp::Negate,
+                ..
+            } if matches!(self.types.kind(base), TypeKind::Integer(_)) => {
+                let TypeKind::Integer(integer) = *self.types.kind(base) else {
+                    unreachable!()
+                };
+                match Self::eval_int_constant(expr, scopes, integer) {
+                    IntConstantEval::Known(value) => {
+                        Some(crate::const_eval::ConstValue::Integer(value))
+                    }
+                    IntConstantEval::Unknown | IntConstantEval::Invalid => None,
+                }
+            }
+            Expr::Float { value, .. } if matches!(self.types.kind(base), TypeKind::Float(_)) => {
+                let TypeKind::Float(float) = *self.types.kind(base) else {
+                    unreachable!()
+                };
+                FloatValue::parse_decimal(float, value).map(crate::const_eval::ConstValue::Float)
+            }
+            Expr::Identifier { name, .. } => self
+                .const_evaluation
+                .values
+                .get(&crate::const_eval::ConstKey::TopLevel(name.clone()))
+                .map(|value| value.value.clone()),
+            Expr::StaticMember {
+                qualifier: StaticQualifier::Class(class_name),
+                member,
+                ..
+            } => self
+                .const_evaluation
+                .enum_cases
+                .get(&(class_name.clone(), member.clone()))
+                .copied()
+                .map(crate::const_eval::ConstValue::Enum)
+                .or_else(|| {
+                    self.const_evaluation
+                        .values
+                        .get(&crate::const_eval::ConstKey::Class {
+                            class_name: class_name.clone(),
+                            name: member.clone(),
+                        })
+                        .map(|value| value.value.clone())
+                }),
+            _ => None,
+        }
+    }
+
+    fn const_value_type(&mut self, value: &crate::const_eval::ConstValue) -> TypeId {
+        match value {
+            crate::const_eval::ConstValue::Integer(value) => {
+                self.types.intern(TypeKind::Integer(value.ty))
+            }
+            crate::const_eval::ConstValue::Float(value) => {
+                self.types.intern(TypeKind::Float(value.ty))
+            }
+            crate::const_eval::ConstValue::String(_) => self.types.intern(TypeKind::String),
+            crate::const_eval::ConstValue::Bool(_) => self.types.intern(TypeKind::Bool),
+            crate::const_eval::ConstValue::Null => self.types.intern(TypeKind::Null),
+            crate::const_eval::ConstValue::Enum(value) => {
+                let enum_id = value.enum_id;
+                let name = self
+                    .enums
+                    .values()
+                    .find(|definition| definition.id == enum_id)
+                    .map(|definition| definition.name.clone())
+                    .unwrap_or_default();
+                self.types
+                    .intern(TypeKind::Enum(crate::enums::EnumType { id: enum_id, name }))
+            }
+            crate::const_eval::ConstValue::PayloadEnum(value) => {
+                let enum_id = value.enum_id;
+                let name = self
+                    .enums
+                    .values()
+                    .find(|definition| definition.id == enum_id)
+                    .map(|definition| definition.name.clone())
+                    .unwrap_or_default();
+                self.types
+                    .intern(TypeKind::Enum(crate::enums::EnumType { id: enum_id, name }))
+            }
+        }
+    }
+
+    fn match_base_type(&self, ty: TypeId) -> (TypeId, bool) {
+        match self.types.kind(ty) {
+            TypeKind::Nullable(inner) => (*inner, true),
+            _ => (ty, false),
+        }
+    }
+
+    fn duplicate_match_pattern(&mut self, message: &str, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::new("E0586", message, span)
+                .with_title("Duplicate Match Pattern")
+                .with_help("remove the repeated arm"),
+        );
+    }
+
+    fn incompatible_match_pattern(&mut self, pattern: &str, scrutinee_ty: TypeId, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0588",
+                format!(
+                    "{pattern} cannot match scrutinee type `{}`",
+                    self.types.display(scrutinee_ty)
+                ),
+                span,
+            )
+            .with_title("Match Pattern Has Wrong Type"),
+        );
+    }
+
+    fn match_pattern_span(pattern: &MatchPattern) -> Span {
+        match pattern {
+            MatchPattern::Default { span }
+            | MatchPattern::EnumCase { span, .. }
+            | MatchPattern::TypeBinding { span, .. } => *span,
+            MatchPattern::Expression(expr) => expr.span(),
+        }
+    }
+
+    fn ungroup_expr(mut expr: &Expr) -> &Expr {
+        while let Expr::Grouped { expr: inner, .. } = expr {
+            expr = inner;
+        }
+        expr
     }
 
     fn is_grouped_range_expr(expr: &Expr) -> bool {
@@ -11661,7 +12522,13 @@ impl<'program> Checker<'program> {
             Expr::Binary {
                 left, op, right, ..
             } => self.infer_binary_type(left, op, right, scopes, method_context),
-            Expr::Range { .. } | Expr::Match { .. } => self.types.unknown(),
+            Expr::Range { .. } => self.types.unknown(),
+            Expr::Match { span, .. } => self
+                .expression_types
+                .get(&(span.start, span.end))
+                .cloned()
+                .map(|ty| self.types.intern_resolved(&ty))
+                .unwrap_or_else(|| self.types.unknown()),
         }
     }
 

@@ -688,7 +688,7 @@ The exact operator, panic, and conversion rules are authoritative in decisions 0
 
 `mixed` is Doria's only dynamic type. It has three laws:
 
-1. `mixed` is unknown-flavored, never any-flavored. A `mixed` value permits no property access, method calls, arithmetic, concatenation, interpolation, comparison, or other typed operation until it is narrowed. Exact `is` narrowing is implemented; `match` supplies another narrowing form when it lands at Stage 28.
+1. `mixed` is unknown-flavored, never any-flavored. A `mixed` value permits no property access, method calls, arithmetic, concatenation, interpolation, comparison, or other typed operation until it is narrowed. Exact `is` and exact type-binding `match` patterns provide narrowing.
 2. Any value may flow into `mixed` implicitly. This is the deliberate dynamic-boundary exemption from the no-implicit-conversion rule. Values do not flow out of `mixed` implicitly; source must narrow first. There is no cast spelling.
 3. `mixed` is a boxed, runtime-tagged move type, always, even when the payload is a Copy value.
 
@@ -711,7 +711,7 @@ other values outside the exact Stage 22 `is` set remains deferred with a
 stage-named unsupported-feature diagnostic; those values are never represented by
 a placeholder.
 
-`object` does not exist in Doria. Use `mixed` for dynamic object-shaped boundaries and narrow with `is` now or `match` after Stage 28.
+`object` does not exist in Doria. Use `mixed` for dynamic object-shaped boundaries and narrow with exact `is` or `match` type patterns.
 
 `null` is a literal, not a type-position name. The internal null type exists for nullable machinery, but source spells nullable values as `?T`.
 
@@ -759,8 +759,8 @@ access on a possibly-null class value is an error until the value is narrowed.
 
 Stage 22 exact class tests do not perform subtype or interface conformance.
 Hierarchy `is` is deferred to Stage 34 and interface `is` to Stage 35; those
-forms parse and receive stage-named diagnostics. `match` narrowing remains Stage
-28.
+forms parse and receive stage-named diagnostics. Core exact type-binding match
+patterns use the same Stage 22 exact-type narrowing facts.
 
 Nullable concrete classes use a null pointer for absence. Other nullable values
 use an explicit presence word and payload. `?T` keeps `T`'s ownership class:
@@ -816,9 +816,54 @@ Payload enums work in nullable values, `mixed`, class and generic-class
 properties, function calls and returns, Copy constants/defaults, and collection
 value positions whose existing equality/order constraints permit them. They do
 not gain automatic hashing, ordering, display, reflection, or heap identity.
-`match` syntax is accepted for the syntax clock while pattern semantics remain
-Stage 28. Generic enums remain deferred. Decision 0114 defines the complete enum
-model and boundary.
+Core `match` observes payloads through readonly positional bindings or case-only
+patterns. Generic enums remain deferred. Decision 0114 defines the enum model;
+decision 0115 defines match semantics and ownership.
+
+### Match expressions
+
+`match` is an exhaustive expression. Its scrutinee evaluates once, arms are
+tested in source order, exactly one arm expression executes, and there is no
+fallthrough:
+
+```doria
+string $label = match ($status) {
+    Status::Draft => "draft",
+    Status::Published => "published",
+};
+```
+
+Core patterns are qualified enum cases, exact compile-time-known literals and
+constants, `null`, exact `Type $binding` patterns, and one final `default`.
+Payload cases bind every field positionally when parentheses are present; a
+case-only pattern ignores all payloads. Bindings are readonly and local to one
+arm.
+
+Enum and bool matches must cover their finite domain. Nullable finite matches
+also cover `null`. Integer, float, string, class, and `mixed` open domains use a
+final `default`, except the exact nullable pair `null` plus `Type $binding`.
+Duplicate and unreachable arms are errors. Every arm produces one non-void
+value, and arm types unify without numeric widening or an implicit `mixed`
+fallback.
+
+```doria
+string $description = match ($value) {
+    int $number => "integer {$number}",
+    string $text => "text {$text}",
+    default => "other",
+};
+```
+
+`match (true)` is the ordered-condition form. Its reached conditions are strict
+`bool`, evaluate once in source order, and stop at the first true arm; it
+requires `default`. Full right-associative ternary is the same two-arm bool
+match semantically. Short ternary/Elvis `?:` is not Doria.
+
+Named move scrutinees are borrowed rather than consumed. Temporary move
+scrutinees live through the selected arm. Copy payload bindings copy, including
+the normal immutable string retain; move payload bindings are readonly borrows
+and may not escape their provenance. Pattern guards and writable or consuming
+payload patterns remain Stage 28 Slice 2. Decision 0115 is authoritative.
 
 Typed arrays use C-style suffix spelling:
 

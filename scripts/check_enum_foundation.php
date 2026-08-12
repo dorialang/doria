@@ -85,7 +85,9 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 27 — Complete',
         'Stage 27 Slice 1 — Complete',
         'Stage 27 Slice 2 — Complete',
-        'Stage 28 — Next',
+        'Stage 28 — In Progress',
+        'Stage 28 Slice 1 — Complete',
+        'Stage 28 Slice 2 — Next',
     ]);
 }
 
@@ -109,7 +111,7 @@ $require($semanticsPath, $semantics, [
     'Recursive Inline Enum Layout',
     'Payload Enum Equality Is Unavailable',
     'Enum Payload Requires Pattern Matching',
-    'match semantics land in Stage 28',
+    'fn check_match_expression(',
     'Generic Enums Are Not Implemented',
 ]);
 $require($mirPath, $mir, [
@@ -141,7 +143,7 @@ $require($testsPath, $tests, [
     'unit_and_backed_enums_execute_with_nominal_equality_and_value_projection',
     'nullable_enum_keeps_first_case_distinct_from_null_and_supports_narrowing',
     'enum_identity_survives_mixed_boxing_and_exact_narrowing',
-    'payload_execution_and_match_boundary_are_independent',
+    'payload_execution_and_core_match_are_both_available_after_stage_27',
     'payload_construction_copy_constants_defaults_and_generic_storage_execute',
     'payload_ownership_layout_equality_and_observation_boundaries_are_checked',
     'payload_case_calls_reuse_the_normal_argument_binding_rules',

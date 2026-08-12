@@ -3151,6 +3151,12 @@ pub enum BoolExpression {
         left: Box<PayloadEnumExpression>,
         right: Box<PayloadEnumExpression>,
     },
+    PayloadEnumIsCase {
+        local: LocalId,
+        ty: PayloadEnumType,
+        case: EnumCaseId,
+        nullable: bool,
+    },
     NullablePayloadEnumCompare {
         op: CompareOp,
         left: Box<NullablePayloadEnumExpression>,
@@ -3224,6 +3230,20 @@ pub enum Statement {
     AssignLocalGroup {
         targets: Vec<LocalId>,
         value: Rvalue,
+    },
+    BindPayloadEnumFields {
+        source: LocalId,
+        ty: PayloadEnumType,
+        case: EnumCaseId,
+        nullable: bool,
+        targets: Vec<LocalId>,
+    },
+    /// Validation-only identity for a lowered match result. Backends execute the
+    /// explicit CFG and ignore this statement after shared validation.
+    MatchResultPlan {
+        result: LocalId,
+        arms: Vec<BlockId>,
+        merge: BlockId,
     },
     EchoStringLiteral(String),
     EchoString(StringExpression),
@@ -3391,6 +3411,8 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
             rvalue_class_temporary_capacity(index) + rvalue_class_temporary_capacity(value)
         }
         Statement::EchoStringLiteral(_)
+        | Statement::BindPayloadEnumFields { .. }
+        | Statement::MatchResultPlan { .. }
         | Statement::DropClass { .. }
         | Statement::DropSharedReference { .. }
         | Statement::DropWeakReference { .. }
@@ -4167,6 +4189,7 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
             nullable_payload_enum_class_temporary_capacity(left)
                 + nullable_payload_enum_class_temporary_capacity(right)
         }
+        BoolExpression::PayloadEnumIsCase { .. } => 0,
         BoolExpression::Not(value) => bool_class_temporary_capacity(value),
         BoolExpression::Binary { left, right, .. } => {
             bool_class_temporary_capacity(left) + bool_class_temporary_capacity(right)
@@ -5191,6 +5214,19 @@ impl fmt::Display for BoolExpression {
             Self::PayloadEnumCompare { op, left, right } => {
                 write!(formatter, "{left:?} {op} {right:?}")
             }
+            Self::PayloadEnumIsCase {
+                local,
+                ty,
+                case,
+                nullable,
+            } => write!(
+                formatter,
+                "{}payload-enum#{} local{} is case{}",
+                if *nullable { "nullable " } else { "" },
+                ty.id.0,
+                local.0,
+                case.index
+            ),
             Self::NullablePayloadEnumCompare { op, left, right } => {
                 write!(formatter, "{left:?} {op} {right:?}")
             }
@@ -5390,6 +5426,35 @@ impl fmt::Display for Statement {
                 }
                 write!(formatter, "] = {value}")
             }
+            Statement::BindPayloadEnumFields {
+                source,
+                case,
+                targets,
+                ..
+            } => {
+                write!(formatter, "bind case{} local{} -> [", case.index, source.0)?;
+                for (index, target) in targets.iter().enumerate() {
+                    if index > 0 {
+                        write!(formatter, ", ")?;
+                    }
+                    write!(formatter, "local{}", target.0)?;
+                }
+                write!(formatter, "]")
+            }
+            Statement::MatchResultPlan {
+                result,
+                arms,
+                merge,
+            } => write!(
+                formatter,
+                "match local{} arms [{}] -> block{}",
+                result.0,
+                arms.iter()
+                    .map(|block| format!("block{}", block.0))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                merge.0
+            ),
             Statement::EchoStringLiteral(value) => {
                 write!(formatter, "echo \"{}\"", escape_debug_string(value))
             }

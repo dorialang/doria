@@ -518,6 +518,57 @@ fn enum_fixture_reports_additive_structural_counts_without_a_schema_bump() {
     let _ = fs::remove_dir_all(directory);
 }
 
+#[test]
+fn match_fixture_reports_additive_structural_counts_without_a_schema_bump() {
+    if !host_linker_is_available() {
+        return;
+    }
+    let directory = fixture_directory("match-structure");
+    fs::create_dir_all(&directory).expect("fixture directory");
+    fs::write(
+        directory.join("main.doria"),
+        concat!(
+            "enum State { case Draft; case Ready; }\n",
+            "function classify(mixed $value, int $score, bool $ready): string {\n",
+            "  string $state = match (State::Ready) { State::Draft => \"draft\", State::Ready => \"ready\", };\n",
+            "  string $grade = match (true) { $score >= 80 => \"pass\", default => \"retry\", };\n",
+            "  string $kind = match ($value) { string $text => $text, default => \"other\", };\n",
+            "  return $ready ? $state . $grade . $kind : \"missing\";\n",
+            "}\n",
+            "function main(): void { echo classify(\"value\", 90, true); }\n",
+        ),
+    )
+    .expect("source");
+    let output = Command::new(doriac_bin())
+        .current_dir(&directory)
+        .args([
+            "compile",
+            "main.doria",
+            "--out",
+            executable_name(),
+            "--performance-report",
+            "performance.json",
+        ])
+        .output()
+        .expect("doriac");
+    assert!(
+        output.status.success(),
+        "compile failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
+            .expect("JSON");
+    assert_eq!(report["schemaVersion"], 1);
+    assert_eq!(report["metrics"]["matchExpressionCount"], 4);
+    assert_eq!(report["metrics"]["matchArmCount"], 8);
+    assert_eq!(report["metrics"]["enumMatchCount"], 1);
+    assert_eq!(report["metrics"]["conditionMatchCount"], 1);
+    assert_eq!(report["metrics"]["typePatternCount"], 1);
+    assert_eq!(report["metrics"]["ternaryCount"], 1);
+    let _ = fs::remove_dir_all(directory);
+}
+
 #[cfg(feature = "llvm-backend")]
 #[test]
 fn release_report_identifies_llvm_without_cranelift_phase_data() {

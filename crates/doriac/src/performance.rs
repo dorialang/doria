@@ -104,6 +104,12 @@ pub fn compile_native(
         "callableSpecializationCount": structure.callable_specialization_count,
         "classSpecializationCount": structure.class_specialization_count,
         "totalGenericSpecializationCount": structure.callable_specialization_count + structure.class_specialization_count,
+        "matchExpressionCount": structure.match_expression_count,
+        "matchArmCount": structure.match_arm_count,
+        "enumMatchCount": structure.enum_match_count,
+        "conditionMatchCount": structure.condition_match_count,
+        "typePatternCount": structure.type_pattern_count,
+        "ternaryCount": structure.ternary_count,
         "runtimeArtifactBytes": runtime_artifact_bytes,
         "peakRssBytes": {"available": false, "reason": "portable in-process peak RSS collection is unavailable"}
     });

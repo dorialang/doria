@@ -507,6 +507,8 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     validate_borrowed_user_locals(function, &reachable)?;
     validate_nullable_presence(program, function)?;
     validate_mixed_tag_proofs(program, function)?;
+    validate_payload_case_proofs(program, function)?;
+    validate_match_result_plans(function)?;
     validate_class_local_lifetimes(function)
 }
 
@@ -657,6 +659,80 @@ fn validate_statement(
     statement: &mir::Statement,
 ) -> Result<(), BackendError> {
     match statement {
+        mir::Statement::BindPayloadEnumFields {
+            source,
+            ty,
+            case,
+            nullable,
+            targets,
+        } => {
+            let expected = if *nullable {
+                mir::Type::NullablePayloadEnum(*ty)
+            } else {
+                mir::Type::PayloadEnum(*ty)
+            };
+            if local_in(function, *source)?.ty != expected {
+                return Err(malformed_mir(
+                    "payload binding source has an incompatible enum type",
+                ));
+            }
+            let definition = validate_payload_enum_type(program, *ty)?;
+            let case_definition = definition
+                .cases
+                .get(case.index)
+                .filter(|definition| definition.id == *case)
+                .ok_or_else(|| malformed_mir("payload binding case does not exist"))?;
+            if targets.len() != case_definition.payload.len() {
+                return Err(malformed_mir(
+                    "payload binding arity does not match its case",
+                ));
+            }
+            let mut unique_targets = HashSet::new();
+            for (target, field) in targets.iter().zip(&case_definition.payload) {
+                let target = local_in(function, *target)?;
+                let expected_owned = matches!(
+                    field.ty,
+                    mir::Type::PayloadEnum(payload)
+                        | mir::Type::NullablePayloadEnum(payload)
+                        if payload.capabilities.copy && payload.capabilities.needs_drop
+                );
+                if target.ty != field.ty || target.writable || target.owned != expected_owned {
+                    return Err(malformed_mir(
+                        "payload binding target has incompatible readonly copy/borrow ownership",
+                    ));
+                }
+                if target.id == *source || !unique_targets.insert(target.id) {
+                    return Err(malformed_mir("payload binding targets overlap"));
+                }
+            }
+            Ok(())
+        }
+        mir::Statement::MatchResultPlan {
+            result,
+            arms,
+            merge,
+        } => {
+            let result = local_in(function, *result)?;
+            if !result.synthetic || result.writable {
+                return Err(malformed_mir(
+                    "match result plan must target a readonly synthetic local",
+                ));
+            }
+            block_in(function, *merge)?;
+            if arms.is_empty() {
+                return Err(malformed_mir("match result plan has no arm blocks"));
+            }
+            let mut unique = HashSet::new();
+            for arm in arms {
+                block_in(function, *arm)?;
+                if *arm == *merge || !unique.insert(*arm) {
+                    return Err(malformed_mir(
+                        "match result plan has an invalid or repeated arm block",
+                    ));
+                }
+            }
+            Ok(())
+        }
         mir::Statement::AssignLocal { target, value } => {
             let local = local_in(function, *target)?;
             match (local.ty, value) {
@@ -1382,7 +1458,9 @@ fn validate_statement(
         }
         mir::Statement::DropString { local } => {
             let local = local_in(function, *local)?;
-            if local.ty != mir::Type::String || !local.synthetic {
+            if !matches!(local.ty, mir::Type::String | mir::Type::NullableString)
+                || !local.synthetic
+            {
                 return Err(malformed_mir(
                     "string drop must reference a synthetic string local",
                 ));
@@ -2073,15 +2151,16 @@ fn validate_payload_enum_assignment_ownership(
             ))
         }
     };
-    if local.owned != ty.capabilities.needs_drop {
+    if ty.capabilities.needs_drop && matches!(mode, Some(mir::PayloadEnumUseMode::Borrow)) {
+        if local.owned || !local.synthetic {
+            return Err(malformed_mir(format!(
+                "borrowed payload enum requires a non-owning synthetic local, got local{}",
+                local.id.0
+            )));
+        }
+    } else if local.owned != ty.capabilities.needs_drop {
         return Err(malformed_mir(format!(
             "payload enum local local{} has inconsistent drop ownership",
-            local.id.0
-        )));
-    }
-    if ty.capabilities.needs_drop && matches!(mode, Some(mir::PayloadEnumUseMode::Borrow)) {
-        return Err(malformed_mir(format!(
-            "owned payload enum local local{} receives a borrowed value",
             local.id.0
         )));
     }
@@ -6467,6 +6546,7 @@ fn collect_bool_class_local_accesses<'a>(
             collect_payload_enum_class_local_accesses(left, accesses);
             collect_payload_enum_class_local_accesses(right, accesses);
         }
+        mir::BoolExpression::PayloadEnumIsCase { .. } => {}
         mir::BoolExpression::NullablePayloadEnumCompare { left, right, .. } => {
             collect_nullable_payload_enum_class_local_accesses(left, accesses);
             collect_nullable_payload_enum_class_local_accesses(right, accesses);
@@ -6638,6 +6718,7 @@ fn collect_format_class_local_accesses<'a>(
 fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLocalAccesses<'_> {
     let mut accesses = ClassLocalAccesses::default();
     match statement {
+        mir::Statement::BindPayloadEnumFields { .. } | mir::Statement::MatchResultPlan { .. } => {}
         mir::Statement::AssignLocal { value, .. }
         | mir::Statement::AssignLocalGroup { value, .. }
         | mir::Statement::AssignStatic { value, .. } => {
@@ -6985,6 +7066,156 @@ fn validate_mixed_tag_proofs(
     Ok(())
 }
 
+fn validate_payload_case_proofs(
+    _program: &mir::Program,
+    function: &mir::Function,
+) -> Result<(), BackendError> {
+    let mut entries = vec![None; function.blocks.len()];
+    entries[function.entry_block.0] = Some(HashMap::new());
+    let mut pending = VecDeque::from([function.entry_block]);
+
+    while let Some(block_id) = pending.pop_front() {
+        let block = block_in(function, block_id)?;
+        let Some(mut cases) = entries[block_id.0].clone() else {
+            continue;
+        };
+        for statement in &block.statements {
+            apply_payload_case_statement(function, statement, &mut cases)?;
+        }
+
+        match &block.terminator {
+            mir::Terminator::Jump(target) => {
+                if merge_definite_payload_cases(&mut entries[target.0], &cases) {
+                    pending.push_back(*target);
+                }
+            }
+            mir::Terminator::Branch {
+                condition,
+                then_block,
+                else_block,
+            } => {
+                for (target, condition_value) in [(*then_block, true), (*else_block, false)] {
+                    if constant_bool_expression(condition)
+                        .is_some_and(|value| value != condition_value)
+                    {
+                        continue;
+                    }
+                    let mut outgoing = cases.clone();
+                    apply_payload_case_condition(condition, condition_value, &mut outgoing);
+                    if merge_definite_payload_cases(&mut entries[target.0], &outgoing) {
+                        pending.push_back(target);
+                    }
+                }
+            }
+            mir::Terminator::Return(_)
+            | mir::Terminator::ReturnVoid
+            | mir::Terminator::Panic { .. }
+            | mir::Terminator::Unreachable => {}
+        }
+    }
+
+    for block in &function.blocks {
+        let Some(mut cases) = entries[block.id.0].clone() else {
+            continue;
+        };
+        for statement in &block.statements {
+            if let mir::Statement::BindPayloadEnumFields { source, case, .. } = statement {
+                if cases.get(source) != Some(case) {
+                    return Err(malformed_mir(format!(
+                        "payload enum local local{} is destructured without a dominating exact case proof",
+                        source.0
+                    )));
+                }
+            }
+            apply_payload_case_statement(function, statement, &mut cases)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_match_result_plans(function: &mir::Function) -> Result<(), BackendError> {
+    for block in &function.blocks {
+        for statement in &block.statements {
+            let mir::Statement::MatchResultPlan {
+                result,
+                arms,
+                merge,
+            } = statement
+            else {
+                continue;
+            };
+            for arm in arms {
+                validate_match_arm_result_path(function, *result, *arm, *merge)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_match_arm_result_path(
+    function: &mir::Function,
+    result: mir::LocalId,
+    arm: mir::BlockId,
+    merge: mir::BlockId,
+) -> Result<(), BackendError> {
+    let mut pending = VecDeque::from([(arm, 0_u8)]);
+    let mut visited = HashSet::new();
+    let mut reached_merge = false;
+    while let Some((block_id, assignments)) = pending.pop_front() {
+        if block_id == merge {
+            reached_merge = true;
+            if assignments != 1 {
+                return Err(malformed_mir(format!(
+                    "match arm reaches its merge with {assignments} result assignments"
+                )));
+            }
+            continue;
+        }
+        if !visited.insert((block_id, assignments)) {
+            continue;
+        }
+        let block = block_in(function, block_id)?;
+        let assignments = block
+            .statements
+            .iter()
+            .fold(assignments, |count, statement| {
+                count.saturating_add(u8::from(matches!(
+                    statement,
+                    mir::Statement::AssignLocal { target, .. } if *target == result
+                )))
+            });
+        if assignments > 1 {
+            return Err(malformed_mir(
+                "match arm assigns its result more than once on one path",
+            ));
+        }
+        match &block.terminator {
+            mir::Terminator::Jump(target) => pending.push_back((*target, assignments)),
+            mir::Terminator::Branch {
+                then_block,
+                else_block,
+                ..
+            } => {
+                pending.push_back((*then_block, assignments));
+                pending.push_back((*else_block, assignments));
+            }
+            mir::Terminator::Return(_)
+            | mir::Terminator::ReturnVoid
+            | mir::Terminator::Panic { .. } => {
+                return Err(malformed_mir(
+                    "match arm terminates before assigning and merging its result",
+                ));
+            }
+            mir::Terminator::Unreachable => {}
+        }
+    }
+    if !reached_merge {
+        return Err(malformed_mir("match arm cannot reach its result merge"));
+    }
+    Ok(())
+}
+
 fn merge_definitely_present(
     destination: &mut Option<HashSet<mir::LocalId>>,
     incoming: &HashSet<mir::LocalId>,
@@ -7032,6 +7263,94 @@ fn merge_definite_mixed_tags(
             *destination = Some(incoming.clone());
             true
         }
+    }
+}
+
+fn merge_definite_payload_cases(
+    destination: &mut Option<HashMap<mir::LocalId, crate::enums::EnumCaseId>>,
+    incoming: &HashMap<mir::LocalId, crate::enums::EnumCaseId>,
+) -> bool {
+    match destination {
+        Some(current) => {
+            let merged = current
+                .iter()
+                .filter_map(|(local, case)| {
+                    (incoming.get(local) == Some(case)).then_some((*local, *case))
+                })
+                .collect::<HashMap<_, _>>();
+            if *current == merged {
+                false
+            } else {
+                *current = merged;
+                true
+            }
+        }
+        None => {
+            *destination = Some(incoming.clone());
+            true
+        }
+    }
+}
+
+fn apply_payload_case_statement(
+    function: &mir::Function,
+    statement: &mir::Statement,
+    cases: &mut HashMap<mir::LocalId, crate::enums::EnumCaseId>,
+) -> Result<(), BackendError> {
+    match statement {
+        mir::Statement::AssignLocal { target, .. } => {
+            if matches!(
+                local_in(function, *target)?.ty,
+                mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+            ) {
+                cases.remove(target);
+            }
+        }
+        mir::Statement::AssignLocalGroup { targets, .. } => {
+            for target in targets {
+                if matches!(
+                    local_in(function, *target)?.ty,
+                    mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+                ) {
+                    cases.remove(target);
+                }
+            }
+        }
+        mir::Statement::BindPayloadEnumFields { targets, .. } => {
+            for target in targets {
+                cases.remove(target);
+            }
+        }
+        mir::Statement::DropPayloadEnum { local, .. } => {
+            cases.remove(local);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_payload_case_condition(
+    condition: &mir::BoolExpression,
+    when_true: bool,
+    cases: &mut HashMap<mir::LocalId, crate::enums::EnumCaseId>,
+) {
+    match condition {
+        mir::BoolExpression::PayloadEnumIsCase { local, case, .. } => {
+            if when_true {
+                cases.insert(*local, *case);
+            } else {
+                cases.remove(local);
+            }
+        }
+        mir::BoolExpression::Not(value) => apply_payload_case_condition(value, !when_true, cases),
+        mir::BoolExpression::Binary { op, left, right } => match (op, when_true) {
+            (mir::BoolBinaryOp::And, true) | (mir::BoolBinaryOp::Or, false) => {
+                apply_payload_case_condition(left, when_true, cases);
+                apply_payload_case_condition(right, when_true, cases);
+            }
+            _ => {}
+        },
+        _ => {}
     }
 }
 
@@ -7359,6 +7678,11 @@ fn apply_nullable_presence_condition(
             if let Some(local) = nullable_payload_enum_presence_local(value) {
                 set_nullable_presence(local, when_true, present);
             }
+        }
+        mir::BoolExpression::PayloadEnumIsCase {
+            local, nullable, ..
+        } if *nullable => {
+            set_nullable_presence(*local, when_true, present);
         }
         mir::BoolExpression::Not(value) => {
             apply_nullable_presence_condition(value, !when_true, present)
@@ -8107,6 +8431,8 @@ fn statement_observes_property(
             rvalue_observes_property(value, receiver, property)
         }
         mir::Statement::EchoStringLiteral(_)
+        | mir::Statement::BindPayloadEnumFields { .. }
+        | mir::Statement::MatchResultPlan { .. }
         | mir::Statement::DropClass { .. }
         | mir::Statement::DropString { .. }
         | mir::Statement::DropMixed { .. }
@@ -9060,6 +9386,7 @@ fn bool_observes_property(
             payload_enum_observes_property(left, receiver, property)
                 || payload_enum_observes_property(right, receiver, property)
         }
+        mir::BoolExpression::PayloadEnumIsCase { .. } => false,
         mir::BoolExpression::NullablePayloadEnumCompare { left, right, .. } => {
             nullable_payload_enum_observes_property(left, receiver, property)
                 || nullable_payload_enum_observes_property(right, receiver, property)
@@ -9839,6 +10166,30 @@ fn validate_condition(
         }
         mir::BoolExpression::PayloadEnumCompare { op, left, right } => {
             validate_payload_enum_comparison(program, function, *op, left, right)
+        }
+        mir::BoolExpression::PayloadEnumIsCase {
+            local,
+            ty,
+            case,
+            nullable,
+        } => {
+            let expected = if *nullable {
+                mir::Type::NullablePayloadEnum(*ty)
+            } else {
+                mir::Type::PayloadEnum(*ty)
+            };
+            if local_in(function, *local)?.ty != expected {
+                return Err(malformed_mir(
+                    "payload-enum case test uses an incompatible local",
+                ));
+            }
+            let definition = validate_payload_enum_type(program, *ty)?;
+            definition
+                .cases
+                .get(case.index)
+                .filter(|definition| definition.id == *case)
+                .map(|_| ())
+                .ok_or_else(|| malformed_mir("payload-enum case test references no case"))
         }
         mir::BoolExpression::NullablePayloadEnumCompare { op, left, right } => {
             if !matches!(op, mir::CompareOp::Equal | mir::CompareOp::NotEqual) {

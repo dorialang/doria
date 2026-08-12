@@ -1,0 +1,8 @@
+function main(): void
+{
+    bool $ready = true;
+    string $label = $ready ? "ready" : "missing";
+    int $value = false ? 1 : true ? 42 : 0;
+    ?string $optional = $ready ? "present" : null;
+    echo "{$label} {$value} {$optional ?? "missing"}\n";
+}

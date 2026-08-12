@@ -30,7 +30,7 @@
 
 ## Already settled / correctly scheduled (not open — do not re-decide)
 
-Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: `match` (28), checked errors (29), closures (30), namespaces (31), inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Enums are no longer in that list: decision 0114 now owns their complete semantics. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
+Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: checked errors (29), closures (30), namespaces (31), inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Enums and guard-free core match are no longer in that list: decisions 0114 and 0115 own their semantics. Match guards remain the bounded Stage 28 Slice 2 authoring task rather than an open-ended compiler guess. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
 
 ## Open questions (answerable now)
 
@@ -53,6 +53,17 @@ above; their accepted decisions and scheduled work are the authority.
 - **F3**: a new named-arguments record + stage; 0086 and 0095 cross-refs; DDO prerequisites.
 - **F4**: lexer + 0016 + SPEC literals; the `fixed-width-integers` example.
 - Nothing in this note edits the plan/SPEC/records — it is findings only. On approval, each item becomes a plan/SPEC amendment and/or a decision record (next free number, subject-cited until authored, `scripts/check_docs_authority.php` green).
+
+## Stage 31 Authority Prerequisite
+
+Decision 0115 closes the unauthored core-match subject. It does not begin Stage
+31. Before namespace or multi-file implementation starts, authority must still
+settle the public `autoload` vocabulary, namespace-prefix-to-path mappings,
+main/test/generated autoload scopes, dependency source discovery, deterministic
+package graphs, incremental source indexing, and top-level execution rules
+across autoloaded files. Internal compiler/build-plan types may use
+`SourceRoot`, `SourceMapping`, or `PackageSourceGraph`; the public manifest term
+is `autoload`.
 
 ## Proposed deliverable path
 `docs/notes/plan-open-questions-audit.md` (this file), under "supporting context" per `docs/information-architecture.md`. Not a decision record — every item is a stop-and-ask for Andrew.

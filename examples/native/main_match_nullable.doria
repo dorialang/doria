@@ -1,0 +1,39 @@
+class Box
+{
+    function id(): int
+    {
+        return 9;
+    }
+}
+
+function numberLabel(?int $number): string
+{
+    return match ($number) {
+        null => "missing",
+        2 => "two",
+        default => "other",
+    };
+}
+
+function textLength(?string $text): int
+{
+    return match ($text) {
+        null => 0,
+        string $value => $value->length,
+    };
+}
+
+function boxId(?Box $box): int
+{
+    return match ($box) {
+        null => 0,
+        Box $value => $value->id(),
+    };
+}
+
+function main(): void
+{
+    echo "{numberLabel(null)} {numberLabel(2)} {numberLabel(7)}\n";
+    echo "{textLength(null)} {textLength("hello")}\n";
+    echo "{boxId(null)} {boxId(new Box())}\n";
+}

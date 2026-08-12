@@ -194,3 +194,10 @@ examples/native/main_payload_enums_mixed.doria
 examples/native/main_payload_enums_collections.doria
 examples/native/main_payload_enums_abi.doria
 examples/native/main_payload_enums_drop_order.doria
+examples/native/main_match_unit_enums.doria
+examples/native/main_match_payload_enums.doria
+examples/native/main_match_nullable.doria
+examples/native/main_match_mixed.doria
+examples/native/main_match_true.doria
+examples/native/main_match_ternary.doria
+examples/native/main_match_ownership.doria

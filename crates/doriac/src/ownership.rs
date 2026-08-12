@@ -2215,14 +2215,96 @@ impl Checker<'_> {
                     self.active_assignment_writes.insert(root);
                 }
             }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => self.use_match_expression(scrutinee, arms, scopes, mode),
             Expr::Identifier { .. }
             | Expr::String { .. }
             | Expr::Int { .. }
             | Expr::Float { .. }
             | Expr::Bool { .. }
-            | Expr::Match { .. }
             | Expr::Null { .. } => {}
         }
+    }
+
+    fn use_match_expression(
+        &mut self,
+        scrutinee: &Expr,
+        arms: &[ast::MatchArm],
+        scopes: &mut Scopes,
+        mode: UseMode,
+    ) {
+        let borrow_depth = self.active_borrows.len();
+        self.use_expr(scrutinee, scopes, UseMode::Read);
+        let borrow_root = self.borrow_root_key(scrutinee, scopes);
+        self.activate_place_borrow(scrutinee, UseMode::Read, scopes);
+
+        let mut remaining = scopes.clone();
+        let mut outcomes = Vec::with_capacity(arms.len());
+        let mut has_default = false;
+        for arm in arms {
+            if let ast::MatchPattern::Expression(pattern) = &arm.pattern {
+                self.use_expr(pattern, &mut remaining, UseMode::Read);
+            }
+
+            let mut selected = remaining.clone();
+            selected.push();
+            for binding in match_pattern_bindings(&arm.pattern) {
+                self.declare_match_binding(binding, borrow_root.clone(), &mut selected);
+            }
+            self.use_expr(&arm.value, &mut selected, mode);
+            selected.pop();
+            outcomes.push(selected);
+
+            if matches!(arm.pattern, ast::MatchPattern::Default { .. }) {
+                has_default = true;
+                break;
+            }
+        }
+
+        if !has_default {
+            outcomes.push(remaining);
+        }
+        if let Some(mut joined) = outcomes.pop() {
+            for outcome in outcomes {
+                let previous = joined.clone();
+                joined.merge_from(&previous, &outcome);
+            }
+            *scopes = joined;
+        }
+        self.active_borrows.truncate(borrow_depth);
+    }
+
+    fn declare_match_binding(
+        &mut self,
+        binding: &ast::MatchBinding,
+        borrow_root: Option<String>,
+        scopes: &mut Scopes,
+    ) {
+        let Some(ty) = self
+            .resolved_types
+            .get(&(binding.span.start, binding.span.end))
+        else {
+            return;
+        };
+        if !resolved_type_is_move_type(ty, &self.move_enum_names)
+            && !resolved_type_requires_conservative_move(ty)
+        {
+            return;
+        }
+        scopes.declare(
+            binding.name.clone(),
+            Binding {
+                id: self.next_binding_id(),
+                class: resolved_type_class(ty).map(str::to_string),
+                collection: resolved_collection_info(ty, &self.move_enum_names),
+                mixed: resolved_type_is_mixed(ty),
+                borrowed_place: true,
+                borrow_root,
+                writable: false,
+                state: State::Borrowed,
+            },
+        );
     }
 
     fn use_call_args(
@@ -3526,6 +3608,22 @@ fn expr_uses_variable(expr: &Expr, name: &str) -> bool {
             end: right,
             ..
         } => expr_uses_variable(left, name) || expr_uses_variable(right, name),
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            expr_uses_variable(scrutinee, name)
+                || arms.iter().any(|arm| {
+                    let pattern_uses = match &arm.pattern {
+                        ast::MatchPattern::Expression(pattern) => expr_uses_variable(pattern, name),
+                        ast::MatchPattern::Default { .. }
+                        | ast::MatchPattern::EnumCase { .. }
+                        | ast::MatchPattern::TypeBinding { .. } => false,
+                    };
+                    pattern_uses
+                        || (!match_pattern_binds(&arm.pattern, name)
+                            && expr_uses_variable(&arm.value, name))
+                })
+        }
         Expr::This { .. }
         | Expr::Identifier { .. }
         | Expr::String { .. }
@@ -3533,9 +3631,27 @@ fn expr_uses_variable(expr: &Expr, name: &str) -> bool {
         | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Null { .. }
-        | Expr::Match { .. }
         | Expr::StaticMember { .. } => false,
     }
+}
+
+fn match_pattern_bindings(pattern: &ast::MatchPattern) -> Vec<&ast::MatchBinding> {
+    match pattern {
+        ast::MatchPattern::EnumCase {
+            bindings: Some(bindings),
+            ..
+        } => bindings.iter().collect(),
+        ast::MatchPattern::TypeBinding { binding, .. } => vec![binding],
+        ast::MatchPattern::Default { .. }
+        | ast::MatchPattern::Expression(_)
+        | ast::MatchPattern::EnumCase { bindings: None, .. } => Vec::new(),
+    }
+}
+
+fn match_pattern_binds(pattern: &ast::MatchPattern, name: &str) -> bool {
+    match_pattern_bindings(pattern)
+        .into_iter()
+        .any(|binding| binding.name == name)
 }
 
 fn arguments_use_variable(arguments: &[Argument], name: &str) -> bool {

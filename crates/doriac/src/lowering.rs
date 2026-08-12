@@ -598,19 +598,64 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
         ast::Expr::Match {
             scrutinee,
             arms,
+            origin,
             span,
         } => hir::Expr::Match {
             scrutinee: Box::new(lower_expr(scrutinee, class_name)),
             arms: arms
                 .iter()
                 .map(|arm| hir::MatchArm {
-                    pattern: arm.pattern.clone(),
+                    pattern: lower_match_pattern(&arm.pattern, class_name),
                     value: lower_expr(&arm.value, class_name),
                     span: arm.span,
                 })
                 .collect(),
+            origin: *origin,
             span: *span,
         },
+    }
+}
+
+fn lower_match_pattern(
+    pattern: &ast::MatchPattern,
+    class_name: Option<ClassContext<'_>>,
+) -> hir::MatchPattern {
+    match pattern {
+        ast::MatchPattern::Default { span } => hir::MatchPattern::Default { span: *span },
+        ast::MatchPattern::EnumCase {
+            qualifier,
+            qualifier_span,
+            case,
+            case_span,
+            bindings,
+            span,
+        } => hir::MatchPattern::EnumCase {
+            qualifier: qualifier.clone(),
+            qualifier_span: *qualifier_span,
+            case: case.clone(),
+            case_span: *case_span,
+            bindings: bindings.as_ref().map(|bindings| {
+                bindings
+                    .iter()
+                    .map(|binding| hir::MatchBinding {
+                        name: binding.name.clone(),
+                        span: binding.span,
+                    })
+                    .collect()
+            }),
+            span: *span,
+        },
+        ast::MatchPattern::TypeBinding { ty, binding, span } => hir::MatchPattern::TypeBinding {
+            ty: ty.clone(),
+            binding: hir::MatchBinding {
+                name: binding.name.clone(),
+                span: binding.span,
+            },
+            span: *span,
+        },
+        ast::MatchPattern::Expression(expr) => {
+            hir::MatchPattern::Expression(lower_expr(expr, class_name))
+        }
     }
 }
 

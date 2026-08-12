@@ -1,0 +1,35 @@
+class Document
+{
+    function __construct(string $name)
+    {
+    }
+
+    function label(): string
+    {
+        return $this->name;
+    }
+}
+
+enum LoadResult
+{
+    case Loaded(Document $document);
+    case Missing;
+}
+
+function describe(LoadResult $result): string
+{
+    string $label = match ($result) {
+        LoadResult::Loaded($document) => $document->label(),
+        LoadResult::Missing => "missing",
+    };
+
+    bool $stillUsable = $result == LoadResult::Missing;
+    return "{$label}:{$stillUsable}";
+}
+
+function main(): void
+{
+    LoadResult $loaded = LoadResult::Loaded(new Document("guide"));
+    echo describe($loaded) . "\n";
+    echo describe(LoadResult::Missing) . "\n";
+}

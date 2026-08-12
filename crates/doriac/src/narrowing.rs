@@ -1039,6 +1039,28 @@ fn kill_mutated_call_arguments(
             kill_mutated_call_arguments(left, state, resolution, mutations);
             kill_mutated_call_arguments(right, state, resolution, mutations);
         }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            kill_mutated_call_arguments(scrutinee, state, resolution, mutations);
+            let incoming = state.clone();
+            let mut outcomes = Vec::new();
+            for arm in arms {
+                let mut arm_state = incoming.clone();
+                if let crate::ast::MatchPattern::Expression(pattern) = &arm.pattern {
+                    kill_mutated_call_arguments(pattern, &mut arm_state, resolution, mutations);
+                }
+                apply_match_pattern_fact(&arm.pattern, scrutinee, &mut arm_state, resolution);
+                kill_mutated_call_arguments(&arm.value, &mut arm_state, resolution, mutations);
+                outcomes.push(arm_state);
+            }
+            if let Some(joined) = outcomes
+                .into_iter()
+                .reduce(|left, right| joined_state(&left, &right))
+            {
+                *state = joined;
+            }
+        }
         Expr::Variable { .. }
         | Expr::This { .. }
         | Expr::Identifier { .. }
@@ -1047,7 +1069,6 @@ fn kill_mutated_call_arguments(
         | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Null { .. }
-        | Expr::Match { .. }
         | Expr::StaticMember { .. } => {}
     }
 }
@@ -1535,6 +1556,26 @@ fn collect_expr(
             let state = collect_expr(left, state, resolution, mutations, facts);
             collect_expr(right, &state, resolution, mutations, facts)
         }
+        Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            let incoming = collect_expr(scrutinee, state, resolution, mutations, facts);
+            let mut outcomes = Vec::new();
+            for arm in arms {
+                let mut arm_state = incoming.clone();
+                if let crate::ast::MatchPattern::Expression(pattern) = &arm.pattern {
+                    arm_state = collect_expr(pattern, &arm_state, resolution, mutations, facts);
+                }
+                apply_match_pattern_fact(&arm.pattern, scrutinee, &mut arm_state, resolution);
+                outcomes.push(collect_expr(
+                    &arm.value, &arm_state, resolution, mutations, facts,
+                ));
+            }
+            outcomes
+                .into_iter()
+                .reduce(|left, right| joined_state(&left, &right))
+                .unwrap_or(incoming)
+        }
         Expr::This { .. }
         | Expr::Identifier { .. }
         | Expr::String { .. }
@@ -1542,7 +1583,6 @@ fn collect_expr(
         | Expr::Float { .. }
         | Expr::Bool { .. }
         | Expr::Null { .. }
-        | Expr::Match { .. }
         | Expr::StaticMember { .. }
         | Expr::Variable { .. } => state.clone(),
     }
@@ -1591,6 +1631,31 @@ fn variable_binding(expr: &Expr, resolution: &Resolution) -> Option<BindingId> {
         return None;
     };
     resolution.uses.get(&(span.start, span.end)).copied()
+}
+
+fn apply_match_pattern_fact(
+    pattern: &crate::ast::MatchPattern,
+    scrutinee: &Expr,
+    state: &mut State,
+    resolution: &Resolution,
+) {
+    let Some(binding) = variable_binding(scrutinee, resolution) else {
+        return;
+    };
+    match pattern {
+        crate::ast::MatchPattern::Expression(expr)
+            if matches!(ungroup(expr), Expr::Null { .. }) =>
+        {
+            state.facts.insert(binding, Fact::Null);
+        }
+        crate::ast::MatchPattern::TypeBinding { ty, .. } => {
+            state.facts.insert(binding, Fact::Exact(ty.clone()));
+        }
+        crate::ast::MatchPattern::EnumCase { .. } => {
+            state.facts.insert(binding, Fact::NonNull);
+        }
+        crate::ast::MatchPattern::Default { .. } | crate::ast::MatchPattern::Expression(_) => {}
+    }
 }
 
 fn expression_class_name(
@@ -1908,6 +1973,35 @@ impl Resolver {
                 self.resolve_expr(left);
                 self.resolve_expr(right);
             }
+            Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                self.resolve_expr(scrutinee);
+                for arm in arms {
+                    if let crate::ast::MatchPattern::Expression(pattern) = &arm.pattern {
+                        self.resolve_expr(pattern);
+                    }
+                    self.scopes.push(HashMap::new());
+                    match &arm.pattern {
+                        crate::ast::MatchPattern::EnumCase {
+                            bindings: Some(bindings),
+                            ..
+                        } => {
+                            for binding in bindings {
+                                self.declare(&binding.name, binding.span.start, None);
+                            }
+                        }
+                        crate::ast::MatchPattern::TypeBinding { ty, binding, .. } => {
+                            self.declare(&binding.name, binding.span.start, Some(ty.clone()));
+                        }
+                        crate::ast::MatchPattern::Default { .. }
+                        | crate::ast::MatchPattern::EnumCase { bindings: None, .. }
+                        | crate::ast::MatchPattern::Expression(_) => {}
+                    }
+                    self.resolve_expr(&arm.value);
+                    self.scopes.pop();
+                }
+            }
             Expr::This { .. }
             | Expr::Identifier { .. }
             | Expr::String { .. }
@@ -1915,7 +2009,6 @@ impl Resolver {
             | Expr::Float { .. }
             | Expr::Bool { .. }
             | Expr::Null { .. }
-            | Expr::Match { .. }
             | Expr::StaticMember { .. }
             | Expr::Variable { .. } => {}
         }

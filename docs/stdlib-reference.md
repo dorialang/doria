@@ -133,5 +133,6 @@ Hosted modules under the reserved `Doria\Std` namespace. Most are direction-only
 - Stage 23c implements the core-language sequence constructor described above;
   the `Doria\Std\*` module inventory remains a catalogue of planned APIs.
 - Decision 0114 replaces the unauthored enum subject. Unit, backed, and payload
-  enums are executable core-language values; generic enums remain deferred and
-  `match` semantics remain Stage 28.
+  enums are executable core-language values, and Decision 0115 makes guard-free
+  core `match` executable. Generic enums remain deferred; pattern guards and
+  their guard-aware analysis remain Stage 28 Slice 2.

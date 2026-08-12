@@ -1691,6 +1691,79 @@ fn lower_statement(
     debug_assert!(resources.deferred_class_temporary_drops.is_empty());
     resources.defer_class_temporary_drops = true;
     match statement {
+        mir::Statement::BindPayloadEnumFields {
+            source,
+            ty,
+            case,
+            nullable,
+            targets,
+        } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let source_slot = local_slot(resources.local_slots, *source)?;
+            let mut source_address = builder.ins().stack_addr(pointer, source_slot, 0);
+            if *nullable {
+                source_address = builder
+                    .ins()
+                    .iadd_imm_u(source_address, i64::from(ty.nullable_payload_offset));
+            }
+            let definition = enum_definition(resources.program, ty.id)?;
+            let case_definition = definition
+                .cases
+                .get(case.index)
+                .filter(|definition| definition.id == *case)
+                .ok_or_else(|| malformed_mir("payload binding case does not exist"))?;
+            let case_layout = definition
+                .layout
+                .cases
+                .get(case.index)
+                .filter(|layout| layout.case_id == *case)
+                .ok_or_else(|| malformed_mir("payload binding case layout does not exist"))?;
+            for ((field, layout), target) in case_definition
+                .payload
+                .iter()
+                .zip(&case_layout.fields)
+                .zip(targets)
+            {
+                let field_address = builder
+                    .ins()
+                    .iadd_imm_u(source_address, i64::from(layout.offset));
+                let value = load_lowered_from_address(builder, field.ty, field_address, pointer);
+                let target_slot = local_slot(resources.local_slots, *target)?;
+                store_lowered_to_stack(builder, field.ty, target_slot, value, pointer)?;
+                match field.ty {
+                    mir::Type::String => {
+                        let value = builder.ins().stack_load(pointer, pointer, target_slot, 0);
+                        let retained = retain_string(builder, value, resources)?;
+                        builder.ins().stack_store(pointer, retained, target_slot, 0);
+                    }
+                    mir::Type::NullableString => {
+                        let value = builder.ins().stack_load(
+                            pointer,
+                            pointer,
+                            target_slot,
+                            pointer.bytes() as i32,
+                        );
+                        let retained = retain_string(builder, value, resources)?;
+                        builder.ins().stack_store(
+                            pointer,
+                            retained,
+                            target_slot,
+                            pointer.bytes() as i32,
+                        );
+                    }
+                    mir::Type::PayloadEnum(payload) if payload.capabilities.copy => {
+                        let target = builder.ins().stack_addr(pointer, target_slot, 0);
+                        retain_payload_enum_at(builder, target, payload, false, resources)?;
+                    }
+                    mir::Type::NullablePayloadEnum(payload) if payload.capabilities.copy => {
+                        let target = builder.ins().stack_addr(pointer, target_slot, 0);
+                        retain_payload_enum_at(builder, target, payload, true, resources)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        mir::Statement::MatchResultPlan { .. } => {}
         mir::Statement::AssignLocalGroup { targets, value } => {
             let definition = local_definition(
                 resources.program,
@@ -2094,9 +2167,15 @@ fn lower_statement(
         mir::Statement::DropString { local } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder.ins().stack_load(pointer, pointer, slot, 0);
+            let ty = local_definition(resources.program, resources.function_id, *local)?.ty;
+            let offset = if matches!(ty, mir::Type::NullableString) {
+                pointer.bytes() as i32
+            } else {
+                0
+            };
+            let value = builder.ins().stack_load(pointer, pointer, slot, offset);
             let zero = builder.ins().iconst(pointer, 0);
-            builder.ins().stack_store(pointer, zero, slot, 0);
+            builder.ins().stack_store(pointer, zero, slot, offset);
             release_string(builder, value, resources)?;
         }
         mir::Statement::DropMixed { local } => {
@@ -11599,6 +11678,49 @@ fn lower_condition_to_branch(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     match condition {
+        mir::BoolExpression::PayloadEnumIsCase {
+            local,
+            ty,
+            case,
+            nullable,
+        } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let source_slot = local_slot(resources.local_slots, *local)?;
+            let mut source_address = builder.ins().stack_addr(pointer, source_slot, 0);
+            if *nullable {
+                let present = builder.ins().stack_load(pointer, types::I8, source_slot, 0);
+                let zero = builder.ins().iconst(types::I8, 0);
+                let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+                let present_block = builder.create_block();
+                builder
+                    .ins()
+                    .brif(is_present, present_block, &[], else_block, &[]);
+                builder.switch_to_block(present_block);
+                source_address = builder
+                    .ins()
+                    .iadd_imm_u(source_address, i64::from(ty.nullable_payload_offset));
+            }
+            let definition = enum_definition(resources.program, ty.id)?;
+            let case_definition = definition
+                .cases
+                .get(case.index)
+                .filter(|definition| definition.id == *case)
+                .ok_or_else(|| malformed_mir("payload-enum case test references no case"))?;
+            let tag_type = clif_tag_type(definition.layout.tag_width)?;
+            let tag = builder.ins().load(
+                tag_type,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                source_address,
+                definition.layout.tag_offset as i32,
+            );
+            let expected = builder
+                .ins()
+                .iconst(tag_type, i64::from(case_definition.tag));
+            let matches = builder.ins().icmp(IntCC::Equal, tag, expected);
+            builder
+                .ins()
+                .brif(matches, then_block, &[], else_block, &[]);
+        }
         mir::BoolExpression::Use { operand } => {
             let value = lower_bool_operand(builder, operand, resources)?;
             builder.ins().brif(value, then_block, &[], else_block, &[]);

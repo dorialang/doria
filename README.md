@@ -95,6 +95,21 @@ runtime access-check cost.
 
 Doria was created by a PHP developer who wanted compile-time safety and native performance without giving up readable syntax, and it doesn't hide that. If you know PHP, you'll feel at home in minutes; the `$variables`, the class shapes, the pragmatism all carry over. But familiarity is a doorway, not the destination: Doria is its own language, with its own type system, its own memory model, and its own opinions about what a language owes the people who read code as often as they write it.
 
+`match` is an exhaustive value expression. It handles enum cases, payload
+destructuring, exact constants, nullable values, and exact type narrowing while
+evaluating its input once and executing one arm:
+
+```doria
+string $message = match ($result) {
+    Delivery::Queued => "queued",
+    Delivery::Sent($reference) => "sent {$reference}",
+    Delivery::Failed($code, $reason) => "failed {$code}: {$reason}",
+};
+```
+
+Open domains use a final `default`. `match (true)` provides ordered strict-bool
+conditions, and full ternary uses the same typing and ownership rules.
+
 ## Tooling
 
 Official language-server and editor integrations are developed separately in [`dorialang/doria-language-server`](https://github.com/dorialang/doria-language-server), which consumes reusable `doriac` frontend services without duplicating compiler semantics.

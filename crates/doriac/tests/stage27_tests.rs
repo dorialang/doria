@@ -160,7 +160,7 @@ function main(): void
 }
 
 #[test]
-fn payload_execution_and_match_boundary_are_independent() {
+fn payload_execution_and_core_match_are_both_available_after_stage_27() {
     doriac::check_source(
         "stage27.doria",
         r#"
@@ -174,7 +174,8 @@ Shape $shape = Shape::Circle(2.5);
     )
     .expect("payload construction should execute in Stage 27 Slice 2");
 
-    let match_diagnostics = diagnostics(
+    doriac::check_source(
+        "stage28.doria",
         r#"
 enum Shape { case Circle(float $radius); }
 let $area = match (true) {
@@ -182,9 +183,8 @@ let $area = match (true) {
     default => 0.0,
 };
 "#,
-    );
-    assert_eq!(match_diagnostics.len(), 1, "{match_diagnostics:#?}");
-    assert_eq!(match_diagnostics[0].code, "E0576");
+    )
+    .expect("core match should execute in Stage 28 Slice 1");
 }
 
 #[test]
@@ -374,14 +374,17 @@ function main(): void {
     assert_eq!(arms.len(), 3);
     assert!(matches!(
         &arms[0].pattern,
-        ast::MatchPattern::EnumCase { bindings, .. } if bindings.len() == 1
+        ast::MatchPattern::EnumCase {
+            bindings: Some(bindings),
+            ..
+        } if bindings.len() == 1
     ));
     assert!(matches!(arms[1].pattern, ast::MatchPattern::Expression(_)));
     assert!(matches!(arms[2].pattern, ast::MatchPattern::Default { .. }));
 }
 
 #[test]
-fn payload_fixture_executes_while_match_stops_once_in_semantics() {
+fn payload_and_core_match_fixtures_both_pass_semantics() {
     let payload = include_str!("fixtures/stage27/payload_enum.doria");
     doriac::parse_source("stage27.doria", payload)
         .expect("payload syntax should have no lexer or parser diagnostics");
@@ -391,9 +394,8 @@ fn payload_fixture_executes_while_match_stops_once_in_semantics() {
     let matching = include_str!("fixtures/stage27/match_expression.doria");
     doriac::parse_source("stage27.doria", matching)
         .expect("accepted match syntax should have no lexer or parser diagnostics");
-    let found = diagnostics(matching);
-    assert_eq!(found.len(), 1, "{found:#?}");
-    assert_eq!(found[0].code, "E0576");
+    doriac::check_source("stage28.doria", matching)
+        .expect("accepted core match fixture should pass Stage 28 checking");
 }
 
 #[test]
