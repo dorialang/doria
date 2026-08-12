@@ -1481,7 +1481,13 @@ impl Parser {
                     "match pattern guards are not available; guard syntax must be settled before implementation",
                     self.peek().span,
                 );
-                return None;
+                let end = self.recover_match_expression();
+                return Some(Expr::Match {
+                    scrutinee: Box::new(scrutinee),
+                    arms,
+                    origin: MatchOrigin::Match,
+                    span: Span::new(start, end),
+                });
             }
             self.expect(TokenKind::FatArrow, "expected `=>` after match pattern")?;
             let value = self.parse_expression()?;
@@ -1505,6 +1511,24 @@ impl Parser {
             origin: MatchOrigin::Match,
             span: Span::new(start, end),
         })
+    }
+
+    fn recover_match_expression(&mut self) -> usize {
+        let mut brace_depth = 1_usize;
+        while !self.is_at_end() {
+            let token = self.advance().clone();
+            match token.kind {
+                TokenKind::LeftBrace => brace_depth += 1,
+                TokenKind::RightBrace => {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        return token.span.end;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.previous().span.end
     }
 
     fn parse_match_pattern(&mut self) -> Option<MatchPattern> {

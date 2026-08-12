@@ -418,11 +418,12 @@ fn candidate_pattern_guard_spellings_stop_at_one_targeted_boundary() {
         );
         let diagnostics = doriac::parse_source("stage28.doria", &source)
             .expect_err("pattern guards must remain unavailable");
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic
-                .message
-                .contains("pattern guards are not available")
-                && diagnostic.message.contains("settled before implementation")
-        }));
+        assert_eq!(diagnostics.len(), 1, "{guard}: {diagnostics:#?}");
+        assert!(diagnostics[0]
+            .message
+            .contains("pattern guards are not available"));
+        assert!(diagnostics[0]
+            .message
+            .contains("settled before implementation"));
     }
 }
