@@ -752,7 +752,7 @@ member result is not wrapped in another nullable layer.
 
 `== null` and `!= null` establish path-sensitive null facts. `$value is T`
 tests and narrows `mixed` or `?T` against an exact fixed-width numeric, `bool`,
-`string`, or declared concrete class type. Facts follow lexical bindings,
+`string`, declared enum, or declared concrete class type. Facts follow lexical bindings,
 short-circuit control flow, assignments, loops, and branch joins; a fact is
 available after a join only when every incoming path proves it. Ordinary member
 access on a possibly-null class value is an error until the value is narrowed.
@@ -803,10 +803,22 @@ not gain automatic hashing or ordering. Nullable enums keep presence separate
 from the private case tag, and enum values boxed into `mixed` retain exact enum
 type identity.
 
-Payload case syntax is accepted and records readonly owned fields, but payload
-construction and execution remain the next Stage 27 slice. `match` syntax is
-accepted for the syntax clock while pattern semantics remain Stage 28.
-Decision 0114 defines the complete enum model and implementation boundary.
+Payload cases store explicitly typed readonly owned fields inline with their
+case tag. Construction accepts positional or named arguments; expressions run
+once in source order and fields initialize in declaration order. An enum is
+Copy only when every payload in every case is Copy, and only its active case is
+dropped, with fields destroyed in reverse declaration order. Equality first
+compares nominal type and case, then compares active fields left to right.
+Payload fields are observed through Stage 28 pattern matching, not as ordinary
+properties.
+
+Payload enums work in nullable values, `mixed`, class and generic-class
+properties, function calls and returns, Copy constants/defaults, and collection
+value positions whose existing equality/order constraints permit them. They do
+not gain automatic hashing, ordering, display, reflection, or heap identity.
+`match` syntax is accepted for the syntax clock while pattern semantics remain
+Stage 28. Generic enums remain deferred. Decision 0114 defines the complete enum
+model and boundary.
 
 Typed arrays use C-style suffix spelling:
 

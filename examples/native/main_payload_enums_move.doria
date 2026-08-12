@@ -1,0 +1,34 @@
+class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->name}\n";
+    }
+}
+
+enum LoadResult
+{
+    case Loaded(Token $token);
+    case Empty;
+}
+
+function load(): LoadResult
+{
+    return LoadResult::Loaded(new Token("moved"));
+}
+
+function consume(take LoadResult $result): void
+{
+    echo "consume\n";
+}
+
+function main(): void
+{
+    LoadResult $result = load();
+    consume($result);
+    echo "done\n";
+}

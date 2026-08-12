@@ -17,6 +17,15 @@ pub enum ConstValue {
     Bool(bool),
     Null,
     Enum(EnumValue),
+    PayloadEnum(ConstPayloadEnumValue),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstPayloadEnumValue {
+    pub enum_id: EnumId,
+    pub case_id: EnumCaseId,
+    pub fields: Vec<ConstValue>,
+    pub field_types: Vec<TypeRef>,
 }
 
 impl ConstValue {
@@ -27,8 +36,19 @@ impl ConstValue {
             Self::String(value) => Some(value.clone()),
             Self::Bool(value) => Some(value.to_string()),
             Self::Null => None,
-            Self::Enum(_) => None,
+            Self::Enum(_) | Self::PayloadEnum(_) => None,
         }
+    }
+}
+
+impl Evaluation {
+    pub fn payload_case_name(&self, enum_id: EnumId, case_id: EnumCaseId) -> Option<(&str, &str)> {
+        self.payload_cases
+            .iter()
+            .find_map(|((enum_name, case_name), schema)| {
+                (schema.enum_id == enum_id && schema.case_id == case_id)
+                    .then_some((enum_name.as_str(), case_name.as_str()))
+            })
     }
 }
 
@@ -77,6 +97,14 @@ pub struct Evaluation {
     pub values: HashMap<ConstKey, EvaluatedDecl>,
     pub enum_cases: HashMap<(String, String), EnumValue>,
     pub enum_names: HashMap<String, EnumId>,
+    payload_cases: HashMap<(String, String), PayloadCaseSchema>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PayloadCaseSchema {
+    enum_id: EnumId,
+    case_id: EnumCaseId,
+    fields: Vec<(String, TypeRef)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -104,6 +132,7 @@ pub fn evaluate_parameter_default(
         diagnostics: Vec::new(),
         enum_cases: evaluation.enum_cases.clone(),
         enum_names: evaluation.enum_names.clone(),
+        payload_cases: evaluation.payload_cases.clone(),
     };
     let value = evaluator.evaluate_expr(expr, Some(expected), &requester)?;
     evaluator.diagnostics.is_empty().then_some(value.value)
@@ -168,6 +197,7 @@ pub fn evaluate_program(program: &ast::Program) -> DiagnosticResult<Evaluation> 
                 .collect(),
             enum_cases: evaluator.enum_cases,
             enum_names: evaluator.enum_names,
+            payload_cases: evaluator.payload_cases,
         })
     } else {
         Err(evaluator.diagnostics)
@@ -181,6 +211,7 @@ struct Evaluator {
     diagnostics: Vec<Diagnostic>,
     enum_cases: HashMap<(String, String), EnumValue>,
     enum_names: HashMap<String, EnumId>,
+    payload_cases: HashMap<(String, String), PayloadCaseSchema>,
 }
 
 impl Evaluator {
@@ -192,6 +223,7 @@ impl Evaluator {
             diagnostics: Vec::new(),
             enum_cases: HashMap::new(),
             enum_names: HashMap::new(),
+            payload_cases: HashMap::new(),
         };
         for item in &program.items {
             if let Item::Enum(declaration) = item {
@@ -200,14 +232,29 @@ impl Evaluator {
                     .enum_names
                     .entry(declaration.name.clone())
                     .or_insert(EnumId(next));
+                let payload_enum = declaration
+                    .cases
+                    .iter()
+                    .any(|case| !case.payload.is_empty());
                 for (index, case) in declaration.cases.iter().enumerate() {
-                    if case.payload.is_empty() {
+                    let case_id = EnumCaseId { enum_id, index };
+                    if payload_enum {
+                        evaluator.payload_cases.insert(
+                            (declaration.name.clone(), case.name.clone()),
+                            PayloadCaseSchema {
+                                enum_id,
+                                case_id,
+                                fields: case
+                                    .payload
+                                    .iter()
+                                    .map(|field| (field.name.clone(), field.ty.clone()))
+                                    .collect(),
+                            },
+                        );
+                    } else {
                         evaluator.enum_cases.insert(
                             (declaration.name.clone(), case.name.clone()),
-                            EnumValue {
-                                enum_id,
-                                case_id: EnumCaseId { enum_id, index },
-                            },
+                            EnumValue { enum_id, case_id },
                         );
                     }
                 }
@@ -435,6 +482,20 @@ impl Evaluator {
                 ..
             } => {
                 let class_name = self.qualifier_class_name(qualifier, requester)?;
+                if let Some(schema) = self
+                    .payload_cases
+                    .get(&(class_name.clone(), member.clone()))
+                    .filter(|schema| schema.fields.is_empty())
+                {
+                    return Some(TypedValue::new(ConstValue::PayloadEnum(
+                        ConstPayloadEnumValue {
+                            enum_id: schema.enum_id,
+                            case_id: schema.case_id,
+                            fields: Vec::new(),
+                            field_types: Vec::new(),
+                        },
+                    )));
+                }
                 if let Some(value) = self
                     .enum_cases
                     .get(&(class_name.clone(), member.clone()))
@@ -519,6 +580,13 @@ impl Evaluator {
                 ..
             } => {
                 let class_name = self.qualifier_class_name(qualifier, requester)?;
+                if let Some(schema) = self
+                    .payload_cases
+                    .get(&(class_name.clone(), method.clone()))
+                    .cloned()
+                {
+                    return self.payload_enum(&class_name, method, args, schema, *span, requester);
+                }
                 self.convert(&class_name, method, args, *span, requester)
             }
             _ => {
@@ -650,6 +718,75 @@ impl Evaluator {
         })
     }
 
+    fn payload_enum(
+        &mut self,
+        enum_name: &str,
+        case_name: &str,
+        args: &[Argument],
+        schema: PayloadCaseSchema,
+        span: Span,
+        requester: &EvaluationRequester,
+    ) -> Option<TypedValue> {
+        let parameter_names = schema
+            .fields
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        let argument_names = args
+            .iter()
+            .map(|argument| argument.name.as_ref().map(|name| name.text.as_str()))
+            .collect::<Vec<_>>();
+        let bound = crate::arg_binding::bind_arguments(
+            &parameter_names,
+            &vec![false; parameter_names.len()],
+            &argument_names,
+        );
+        if !bound.unknown.is_empty()
+            || !bound.duplicate.is_empty()
+            || !bound.missing.is_empty()
+            || bound.overflow != 0
+        {
+            self.invalid(
+                span,
+                format!("payload enum constant `{enum_name}::{case_name}` has invalid arguments"),
+            );
+            return None;
+        }
+
+        let mut fields = vec![None; schema.fields.len()];
+        for (argument_index, argument) in args.iter().enumerate() {
+            let parameter_index = bound.arg_to_param[argument_index]
+                .expect("validated payload enum argument has a parameter");
+            let expected =
+                const_type_with_enums(&schema.fields[parameter_index].1, &self.enum_names)
+                    .or_else(|| {
+                        self.invalid(
+                            argument.span,
+                            format!(
+                                "payload field `${}` is not available in the Copy constant tier",
+                                schema.fields[parameter_index].0
+                            ),
+                        );
+                        None
+                    })?;
+            fields[parameter_index] = Some(
+                self.evaluate_expr(&argument.value, Some(expected), requester)?
+                    .value,
+            );
+        }
+        Some(TypedValue::new(ConstValue::PayloadEnum(
+            ConstPayloadEnumValue {
+                enum_id: schema.enum_id,
+                case_id: schema.case_id,
+                fields: fields
+                    .into_iter()
+                    .map(|field| field.expect("validated payload field is bound"))
+                    .collect(),
+                field_types: schema.fields.iter().map(|(_, ty)| ty.clone()).collect(),
+            },
+        )))
+    }
+
     fn unary(&mut self, op: &UnaryOp, value: ConstValue, span: Span) -> Option<ConstValue> {
         let result = match (op, value) {
             (UnaryOp::Negate, ConstValue::Integer(value)) if value.ty.is_signed() => value
@@ -748,6 +885,19 @@ impl Evaluator {
                 match op {
                     BinaryOp::Equal => Ok(ConstValue::Bool(left.case_id == right.case_id)),
                     BinaryOp::NotEqual => Ok(ConstValue::Bool(left.case_id != right.case_id)),
+                    _ => Err("only equality is defined for enum constants"),
+                }
+            }
+            (ConstValue::PayloadEnum(left), ConstValue::PayloadEnum(right))
+                if left.enum_id == right.enum_id =>
+            {
+                match op {
+                    BinaryOp::Equal => Ok(ConstValue::Bool(
+                        left.case_id == right.case_id && left.fields == right.fields,
+                    )),
+                    BinaryOp::NotEqual => Ok(ConstValue::Bool(
+                        left.case_id != right.case_id || left.fields != right.fields,
+                    )),
                     _ => Err("only equality is defined for enum constants"),
                 }
             }
@@ -947,6 +1097,7 @@ impl ConstType {
             ConstValue::Bool(_) => Self::Bool,
             ConstValue::Null => Self::Null,
             ConstValue::Enum(value) => Self::Enum(value.enum_id),
+            ConstValue::PayloadEnum(value) => Self::Enum(value.enum_id),
         }
     }
 

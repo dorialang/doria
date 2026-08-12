@@ -400,8 +400,8 @@ and the language-server sweep in `dorialang/doria-language-server`.
   indexes, and leaves the collection reusable. No Decision 0113 member remains
   routed to E0559.
 - **Decision 0113 — Complete.** All four implementation slices are complete.
-- **Stage 27 — In Progress.** Slice 1 is complete, Slice 2 is next, and pending
-  controlled performance measurement is not a dependency.
+- **Stage 27 — Complete.** Both slices are complete, Stage 28 is next, and
+  pending controlled performance measurement remains non-blocking.
 
 ### Slice 2 performance impact
 

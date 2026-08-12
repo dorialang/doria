@@ -1,5 +1,5 @@
 # Durable executable source of truth for accepted native behavior.
-# Highest covered stage: Stage 25a Slice 4 closure
+# Highest covered stage: Stage 27 Slice 2 closure
 examples/native/main_add_overflow_panic.doria
 examples/native/main_arithmetic_42.doria
 examples/native/main_bitwise_42.doria
@@ -187,3 +187,10 @@ examples/native/main_backed_enums.doria
 examples/native/main_nullable_enums.doria
 examples/native/main_enum_mixed.doria
 examples/native/main_enum_constants_and_defaults.doria
+examples/native/main_payload_enums_copy.doria
+examples/native/main_payload_enums_move.doria
+examples/native/main_payload_enums_nullable.doria
+examples/native/main_payload_enums_mixed.doria
+examples/native/main_payload_enums_collections.doria
+examples/native/main_payload_enums_abi.doria
+examples/native/main_payload_enums_drop_order.doria

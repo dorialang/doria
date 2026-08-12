@@ -16,8 +16,8 @@ fn diagnostic(source: &str, code: &str) -> Diagnostic {
 
 fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
     let mir = doriac::lower_source_to_mir("stage27.doria", source)
-        .expect("Stage 27 Slice 1 source should lower through shared MIR");
-    doriac::mir_interpreter::interpret(&mir).expect("Stage 27 Slice 1 MIR should execute")
+        .expect("Stage 27 source should lower through shared MIR");
+    doriac::mir_interpreter::interpret(&mir).expect("Stage 27 MIR should execute")
 }
 
 #[test]
@@ -160,8 +160,9 @@ function main(): void
 }
 
 #[test]
-fn payload_and_match_syntax_stop_once_at_their_owned_semantic_boundaries() {
-    let payload = diagnostics(
+fn payload_execution_and_match_boundary_are_independent() {
+    doriac::check_source(
+        "stage27.doria",
         r#"
 enum Shape
 {
@@ -170,9 +171,8 @@ enum Shape
 }
 Shape $shape = Shape::Circle(2.5);
 "#,
-    );
-    assert_eq!(payload.len(), 1, "{payload:#?}");
-    assert_eq!(payload[0].code, "E0573");
+    )
+    .expect("payload construction should execute in Stage 27 Slice 2");
 
     let match_diagnostics = diagnostics(
         r#"
@@ -381,20 +381,19 @@ function main(): void {
 }
 
 #[test]
-fn accepted_pending_fixtures_parse_then_stop_once_in_semantics() {
-    for (source, code) in [
-        (include_str!("fixtures/stage27/payload_enum.doria"), "E0573"),
-        (
-            include_str!("fixtures/stage27/match_expression.doria"),
-            "E0576",
-        ),
-    ] {
-        doriac::parse_source("stage27.doria", source)
-            .expect("accepted pending syntax should have no lexer or parser diagnostics");
-        let found = diagnostics(source);
-        assert_eq!(found.len(), 1, "{found:#?}");
-        assert_eq!(found[0].code, code);
-    }
+fn payload_fixture_executes_while_match_stops_once_in_semantics() {
+    let payload = include_str!("fixtures/stage27/payload_enum.doria");
+    doriac::parse_source("stage27.doria", payload)
+        .expect("payload syntax should have no lexer or parser diagnostics");
+    doriac::check_source("stage27.doria", payload)
+        .expect("payload construction should pass Stage 27 checking");
+
+    let matching = include_str!("fixtures/stage27/match_expression.doria");
+    doriac::parse_source("stage27.doria", matching)
+        .expect("accepted match syntax should have no lexer or parser diagnostics");
+    let found = diagnostics(matching);
+    assert_eq!(found.len(), 1, "{found:#?}");
+    assert_eq!(found[0].code, "E0576");
 }
 
 #[test]
@@ -421,6 +420,135 @@ fn enum_payload_types_resolve_against_all_declared_classes() {
     ] {
         doriac::check_source("stage27.doria", source)
             .expect("enum payload types should resolve regardless of declaration order");
+    }
+}
+
+#[test]
+fn payload_construction_copy_constants_defaults_and_generic_storage_execute() {
+    let output = interpret(
+        r#"
+enum Coordinate
+{
+    case Origin;
+    case Point(int $x, int $y);
+}
+
+enum Label
+{
+    case Text(string $value);
+}
+
+const Label DEFAULT_LABEL = Label::Text("default");
+
+class Box<T>
+{
+    function __construct(take T $value)
+    {
+    }
+}
+
+function mark(string $name, int $value): int
+{
+    echo $name;
+    return $value;
+}
+
+function defaulted(Label $label = Label::Text("default")): bool
+{
+    return $label == DEFAULT_LABEL;
+}
+
+function main(): void
+{
+    Coordinate $point = Coordinate::Point(
+        y: mark("y", 22),
+        x: mark("x", 20),
+    );
+    Coordinate $copy = $point;
+    let $box = new Box<Coordinate>($copy);
+    echo " {$point == Coordinate::Point(20, 22)}";
+    echo " {$box->value == $point}";
+    echo " {defaulted()}\n";
+}
+"#,
+    );
+    assert_eq!(output.stdout, b"yx true true true\n");
+}
+
+#[test]
+fn payload_ownership_layout_equality_and_observation_boundaries_are_checked() {
+    let moved = diagnostics(
+        r#"
+class Document {}
+enum LoadResult { case Loaded(Document $document); }
+function main(): void
+{
+    Document $document = new Document();
+    LoadResult $result = LoadResult::Loaded($document);
+    let $again = $document;
+}
+"#,
+    );
+    assert!(moved.iter().any(|diagnostic| diagnostic.code == "E0470"));
+
+    diagnostic("enum Node { case Next(Node $next); }", "E0581");
+    diagnostic("enum Node { case Next(?Node $next); }", "E0581");
+    diagnostic(
+        "enum Left { case Next(Right $right); } enum Right { case Next(Left $left); }",
+        "E0581",
+    );
+    doriac::check_source(
+        "stage27.doria",
+        "class Link { ?Node $next = null; } enum Node { case Next(Link $link); }",
+    )
+    .expect("recursion through a pointer-shaped class remains finite");
+
+    diagnostic(
+        r#"
+enum Bucket { case Values(List<int> $values); }
+function main(): void
+{
+    Bucket $left = Bucket::Values([1]);
+    Bucket $right = Bucket::Values([1]);
+    bool $same = $left == $right;
+}
+"#,
+        "E0584",
+    );
+    diagnostic(
+        r#"
+enum Coordinate { case Point(int $x, int $y); }
+function main(): void
+{
+    Coordinate $point = Coordinate::Point(1, 2);
+    echo $point->x;
+}
+"#,
+        "E0577",
+    );
+}
+
+#[test]
+fn payload_case_calls_reuse_the_normal_argument_binding_rules() {
+    diagnostic(
+        "enum Coordinate { case Point(int $x, int $y); } let $p = Coordinate::Point;",
+        "E0583",
+    );
+    diagnostic(
+        "enum Status { case Ready; } let $s = Status::Ready();",
+        "E0575",
+    );
+
+    for source in [
+        "enum Coordinate { case Point(int $x, int $y); } let $p = Coordinate::Point(x: 1);",
+        "enum Coordinate { case Point(int $x, int $y); } let $p = Coordinate::Point(z: 1, y: 2);",
+        "enum Coordinate { case Point(int $x, int $y); } let $p = Coordinate::Point(x: 1, x: 2);",
+        "enum Coordinate { case Point(int $x, int $y); } let $p = Coordinate::Point(x: 1, 2);",
+    ] {
+        assert!(
+            doriac::check_source("stage27.doria", source).is_err(),
+            "invalid payload arguments must be rejected: {source}"
+        );
     }
 }
 

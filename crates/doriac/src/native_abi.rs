@@ -104,6 +104,7 @@ pub const WRITABLE_SHARED_READONLY_PAYLOAD: &str = "dr_v1_writable_shared_readon
 pub const WRITABLE_SHARED_WRITABLE_PAYLOAD: &str = "dr_v1_writable_shared_writable_payload";
 pub const MIXED_NEW: &str = "dr_v1_mixed_new";
 pub const MIXED_NEW_BORROWED: &str = "dr_v1_mixed_new_borrowed";
+pub const MIXED_NEW_AGGREGATE: &str = "dr_v2_mixed_new_aggregate";
 pub const MIXED_CLONE_OWNED: &str = "dr_v1_mixed_clone_owned";
 pub const MIXED_RELEASE_OWNED: &str = "dr_v1_mixed_release_owned";
 pub const MIXED_FREE: &str = "dr_v1_mixed_free";
@@ -112,6 +113,34 @@ pub const MIXED_TYPE_ID: &str = "dr_v1_mixed_type_id";
 pub const MIXED_PAYLOAD: &str = "dr_v1_mixed_payload";
 pub const COLLECTION_NEW: &str = "dr_v1_collection_new";
 pub const COLLECTION_STAGE26_NEW: &str = "dr_v2_collection_new";
+pub const COLLECTION_AGGREGATE_NEW: &str = "dr_v4_collection_new_aggregate";
+pub const COLLECTION_AGGREGATE_VALUE_AT: &str = "dr_v4_collection_aggregate_value_at";
+pub const COLLECTION_AGGREGATE_PUSH_SLOT: &str = "dr_v4_collection_aggregate_push_slot";
+pub const COLLECTION_AGGREGATE_PUSH_FRONT_SLOT: &str = "dr_v4_collection_aggregate_push_front_slot";
+pub const COLLECTION_AGGREGATE_INSERT_SLOT: &str = "dr_v4_collection_aggregate_insert_slot";
+pub const COLLECTION_AGGREGATE_REMOVE_AT_INTO: &str = "dr_v4_collection_aggregate_remove_at_into";
+pub const COLLECTION_AGGREGATE_POP_INTO: &str = "dr_v4_collection_aggregate_pop_into";
+pub const COLLECTION_AGGREGATE_KEYED_SET_SLOT: &str = "dr_v4_collection_aggregate_keyed_set_slot";
+pub const COLLECTION_AGGREGATE_KEYED_REMOVE_INTO: &str =
+    "dr_v4_collection_aggregate_keyed_remove_into";
+pub const COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO: &str =
+    "dr_v4_collection_aggregate_nullable_access_into";
+
+pub const fn nullable_collection_access_code(
+    access: crate::mir::NullableCollectionAccess,
+) -> Option<u8> {
+    match access {
+        crate::mir::NullableCollectionAccess::Get => Some(0),
+        crate::mir::NullableCollectionAccess::Index => None,
+        crate::mir::NullableCollectionAccess::Remove => Some(1),
+        crate::mir::NullableCollectionAccess::First => Some(2),
+        crate::mir::NullableCollectionAccess::Last => Some(3),
+        crate::mir::NullableCollectionAccess::Pop => Some(4),
+        crate::mir::NullableCollectionAccess::PopFront => Some(5),
+        crate::mir::NullableCollectionAccess::PopBack => Some(6),
+        crate::mir::NullableCollectionAccess::At => Some(7),
+    }
+}
 pub const COLLECTION_STAGE26_FINALIZE: &str = "dr_v2_collection_finalize";
 pub const COLLECTION_STAGE26_FROM_COPY: &str = "dr_v2_collection_from_copy";
 pub const COLLECTION_FILL_WORD: &str = "dr_v2_collection_fill_word";
@@ -175,10 +204,15 @@ pub const COLLECTION_VALUE_WIDTH_FIELD: u32 = 6;
 pub const COLLECTION_KIND_FIELD: u32 = 7;
 pub const COLLECTION_HEAD_FIELD: u32 = 11;
 pub const COLLECTION_INDEX_FIELD: u32 = 12;
+pub const COLLECTION_VALUE_SIZE_FIELD: u32 = 16;
+pub const COLLECTION_VALUE_STRIDE_FIELD: u32 = 17;
+pub const COLLECTION_VALUE_ALIGNMENT_FIELD: u32 = 18;
+pub const COLLECTION_AGGREGATE_FIELD: u32 = 19;
 
 pub const fn collection_header_size(pointer_bytes: u32) -> u32 {
     let prefix = align_to(4 * pointer_bytes + 7, pointer_bytes);
-    align_to(prefix + 3 * pointer_bytes + 2, pointer_bytes)
+    let legacy = align_to(prefix + 3 * pointer_bytes + 2, pointer_bytes);
+    align_to(legacy + 3 * pointer_bytes + 1, pointer_bytes)
 }
 
 const fn align_to(value: u32, alignment: u32) -> u32 {
@@ -226,6 +260,7 @@ pub const MIXED_TAG_FLOAT64: u8 = 11;
 pub const MIXED_TAG_STRING: u8 = 12;
 pub const MIXED_TAG_CLASS: u8 = 13;
 pub const MIXED_TAG_ENUM: u8 = 14;
+pub const MIXED_TAG_PAYLOAD_ENUM: u8 = 15;
 
 pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<u8> {
     match ty {
@@ -255,6 +290,7 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_) => Some(pointer_width),
         mir::Type::NullableScalar(_) => Some(16),
+        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => None,
     }
 }
 

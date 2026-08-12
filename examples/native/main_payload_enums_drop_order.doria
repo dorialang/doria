@@ -1,0 +1,52 @@
+class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->name}\n";
+    }
+}
+
+enum Pair
+{
+    case Values(Token $first, Token $second);
+    case Single(Token $only);
+}
+
+function dropPair(): void
+{
+    Pair $pair = Pair::Values(new Token("first"), new Token("second"));
+    echo "leave pair\n";
+}
+
+function dropSingle(): void
+{
+    Pair $single = Pair::Single(new Token("only"));
+    echo "leave single\n";
+}
+
+enum Entry
+{
+    case Value(Token $token);
+}
+
+function replaceDictionaryEntries(): void
+{
+    writable Dictionary<string, Entry> $items = [
+        "same" => Entry::Value(new Token("literal first")),
+        "same" => Entry::Value(new Token("literal second")),
+    ];
+    $items["same"] = Entry::Value(new Token("indexed"));
+    $items->set("same", Entry::Value(new Token("method")));
+    echo "leave dictionary\n";
+}
+
+function main(): void
+{
+    dropPair();
+    dropSingle();
+    replaceDictionaryEntries();
+}

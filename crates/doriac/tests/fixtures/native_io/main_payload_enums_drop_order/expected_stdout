@@ -1,0 +1,10 @@
+leave pair
+drop second
+drop first
+leave single
+drop only
+drop literal first
+drop literal second
+drop indexed
+leave dictionary
+drop method

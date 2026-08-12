@@ -381,7 +381,7 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
     validate_program(program)?;
 
     let mut output = String::from(
-        "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
+        "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\ninterface __DoriaValueEquatable\n{\n    public function __doriaEquals(mixed $other): bool;\n}\n\nfunction __doria_equal(mixed $left, mixed $right): bool\n{\n    if ($left instanceof __DoriaValueEquatable) { return $left->__doriaEquals($right); }\n    if ($right instanceof __DoriaValueEquatable) { return $right->__doriaEquals($left); }\n    return $left === $right;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
     );
     output.push_str(PHP_STAGE26_COLLECTION_HELPERS);
     output.push_str(&format!(
@@ -629,7 +629,88 @@ function __doria_printf(int $start, int $end, string $format, mixed ...$values):
             })
         })
         .collect();
-    let mut scopes = PhpNameScopes::new(static_properties);
+    let payload_enums = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Enum(declaration)
+                if declaration
+                    .cases
+                    .iter()
+                    .any(|case| !case.payload.is_empty()) =>
+            {
+                Some(declaration)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let payload_unit_cases = payload_enums
+        .iter()
+        .flat_map(|declaration| {
+            declaration.cases.iter().filter_map(move |case| {
+                case.payload
+                    .is_empty()
+                    .then_some((declaration.name.clone(), case.name.clone()))
+            })
+        })
+        .collect();
+    let payload_top_constants = program
+        .semantic_info
+        .const_evaluation
+        .values
+        .iter()
+        .filter_map(|(key, value)| {
+            matches!(value.value, ConstValue::PayloadEnum(_))
+                .then(|| match key {
+                    ConstKey::TopLevel(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .flatten()
+        })
+        .collect();
+    let payload_class_constants = program
+        .semantic_info
+        .const_evaluation
+        .values
+        .iter()
+        .filter_map(|(key, value)| {
+            matches!(value.value, ConstValue::PayloadEnum(_))
+                .then(|| match key {
+                    ConstKey::Class { class_name, name } => {
+                        Some((class_name.clone(), name.clone()))
+                    }
+                    _ => None,
+                })
+                .flatten()
+        })
+        .collect();
+    let payload_enum_ids = program
+        .semantic_info
+        .enums
+        .iter()
+        .filter(|definition| definition.cases.iter().any(|case| !case.payload.is_empty()))
+        .map(|definition| definition.id)
+        .collect::<HashSet<_>>();
+    let payload_enum_expressions = program
+        .semantic_info
+        .expression_types
+        .iter()
+        .filter_map(|(span, ty)| {
+            let ty = match ty {
+                ResolvedType::Nullable(inner) => inner.as_ref(),
+                ty => ty,
+            };
+            matches!(ty, ResolvedType::Enum(enum_ty) if payload_enum_ids.contains(&enum_ty.id))
+                .then_some(*span)
+        })
+        .collect();
+    let mut scopes = PhpNameScopes::new(
+        static_properties,
+        payload_unit_cases,
+        payload_top_constants,
+        payload_class_constants,
+        payload_enum_expressions,
+    );
     for item in &program.items {
         emit_item(item, &program.semantic_info, &mut output, 0, &mut scopes);
         if !output.ends_with("\n\n") {
@@ -699,16 +780,17 @@ fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), Backen
             Ok(())
         }
         Item::Enum(enum_decl) => {
-            if !enum_decl.type_params.is_empty()
-                || enum_decl.cases.iter().any(|case| !case.payload.is_empty())
-            {
+            if !enum_decl.type_params.is_empty() {
                 return Err(BackendError::from_diagnostics(vec![Diagnostic::new(
                     "B0003",
-                    "PHP compatibility output for generic or payload enums lands in Stage 27 Slice 2",
+                    "PHP compatibility output for generic enums requires a future generic-enum stage",
                     enum_decl.span,
                 )]));
             }
             for case in &enum_decl.cases {
+                for field in &case.payload {
+                    validate_type(&field.ty, field.span)?;
+                }
                 if let Some(value) = &case.backing_value {
                     validate_expr(value, semantic_info)?;
                 }
@@ -1392,6 +1474,9 @@ fn unsupported_php_property_default(
     expr: &Expr,
     semantic_info: &SemanticInfo,
 ) -> Option<(Span, &'static str)> {
+    if is_payload_enum_expression(expr, semantic_info) {
+        return None;
+    }
     match expr {
         Expr::StaticMember {
             class_name,
@@ -1482,6 +1567,17 @@ fn unsupported_php_property_default(
     }
 }
 
+fn is_payload_enum_expression(expr: &Expr, semantic_info: &SemanticInfo) -> bool {
+    let Some(ResolvedType::Enum(enum_type)) = semantic_info.expression_type(expr.span()) else {
+        return false;
+    };
+    semantic_info
+        .enums
+        .iter()
+        .find(|definition| definition.id == enum_type.id)
+        .is_some_and(|definition| definition.cases.iter().any(|case| !case.payload.is_empty()))
+}
+
 fn integer_literal_magnitude(expr: &Expr) -> Option<u128> {
     match expr {
         Expr::Int { value, .. } => parse_decimal_magnitude(value),
@@ -1567,25 +1663,64 @@ struct PhpNameScopes {
     used_php_names: HashSet<String>,
     next_mangled_id: usize,
     static_properties: HashSet<(String, String)>,
+    payload_unit_cases: HashSet<(String, String)>,
+    payload_top_constants: HashSet<String>,
+    payload_class_constants: HashSet<(String, String)>,
+    payload_enum_expressions: HashSet<(usize, usize)>,
 }
 
 impl PhpNameScopes {
-    fn new(static_properties: HashSet<(String, String)>) -> Self {
+    fn new(
+        static_properties: HashSet<(String, String)>,
+        payload_unit_cases: HashSet<(String, String)>,
+        payload_top_constants: HashSet<String>,
+        payload_class_constants: HashSet<(String, String)>,
+        payload_enum_expressions: HashSet<(usize, usize)>,
+    ) -> Self {
         Self {
             scopes: vec![HashMap::new()],
             used_php_names: HashSet::new(),
             next_mangled_id: 0,
             static_properties,
+            payload_unit_cases,
+            payload_top_constants,
+            payload_class_constants,
+            payload_enum_expressions,
         }
     }
 
     fn expression_scope(&self) -> Self {
-        Self::new(self.static_properties.clone())
+        Self::new(
+            self.static_properties.clone(),
+            self.payload_unit_cases.clone(),
+            self.payload_top_constants.clone(),
+            self.payload_class_constants.clone(),
+            self.payload_enum_expressions.clone(),
+        )
     }
 
     fn is_static_property(&self, class_name: &str, member: &str) -> bool {
         self.static_properties
             .contains(&(class_name.to_string(), member.to_string()))
+    }
+
+    fn is_payload_unit_case(&self, enum_name: &str, case_name: &str) -> bool {
+        self.payload_unit_cases
+            .contains(&(enum_name.to_string(), case_name.to_string()))
+    }
+
+    fn is_payload_top_constant(&self, name: &str) -> bool {
+        self.payload_top_constants.contains(name)
+    }
+
+    fn is_payload_class_constant(&self, class_name: &str, name: &str) -> bool {
+        self.payload_class_constants
+            .contains(&(class_name.to_string(), name.to_string()))
+    }
+
+    fn is_payload_enum_expression(&self, expr: &Expr) -> bool {
+        self.payload_enum_expressions
+            .contains(&(expr.span().start, expr.span().end))
     }
 
     fn push(&mut self) {
@@ -1665,7 +1800,7 @@ fn emit_item(
         Item::Class(class_decl) => emit_class(class_decl, semantic_info, output, indent, scopes),
         Item::Enum(enum_decl) => emit_enum(enum_decl, output, indent, scopes),
         Item::Function(function) => {
-            emit_function(function, semantic_info, output, indent, false, scopes)
+            emit_function(function, semantic_info, output, indent, false, scopes, &[])
         }
         Item::Constant(constant) => emit_constant(
             constant,
@@ -1679,6 +1814,10 @@ fn emit_item(
 }
 
 fn emit_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize, scopes: &PhpNameScopes) {
+    if enum_decl.cases.iter().any(|case| !case.payload.is_empty()) {
+        emit_payload_enum(enum_decl, output, indent);
+        return;
+    }
     write_indent(output, indent);
     output.push_str("enum ");
     output.push_str(&enum_decl.name);
@@ -1701,6 +1840,98 @@ fn emit_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize, scopes: &
     writeln(output, indent, "}");
 }
 
+fn emit_payload_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize) {
+    writeln(
+        output,
+        indent,
+        &format!(
+            "final class {} implements __DoriaValueEquatable",
+            enum_decl.name
+        ),
+    );
+    writeln(output, indent, "{");
+    writeln(output, indent + 1, "private int $__doriaTag;");
+    writeln(output, indent + 1, "private array $__doriaPayload;");
+    output.push('\n');
+    writeln(
+        output,
+        indent + 1,
+        "private function __construct(int $tag, array $payload)",
+    );
+    writeln(output, indent + 1, "{");
+    writeln(output, indent + 2, "$this->__doriaTag = $tag;");
+    writeln(output, indent + 2, "$this->__doriaPayload = $payload;");
+    writeln(output, indent + 1, "}");
+
+    for (tag, case) in enum_decl.cases.iter().enumerate() {
+        output.push('\n');
+        let method = php_payload_case_method(&case.name, !case.payload.is_empty());
+        write_indent(output, indent + 1);
+        output.push_str("public static function ");
+        output.push_str(&method);
+        output.push('(');
+        output.push_str(
+            &case
+                .payload
+                .iter()
+                .map(|field| format!("{} ${}", php_type(&field.ty), field.name))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        output.push_str("): self\n");
+        writeln(output, indent + 1, "{");
+        writeln(
+            output,
+            indent + 2,
+            &format!(
+                "return new self({tag}, [{}]);",
+                case.payload
+                    .iter()
+                    .map(|field| format!("${}", field.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        );
+        writeln(output, indent + 1, "}");
+    }
+
+    output.push('\n');
+    writeln(
+        output,
+        indent + 1,
+        "public function __doriaEquals(mixed $other): bool",
+    );
+    writeln(output, indent + 1, "{");
+    writeln(
+        output,
+        indent + 2,
+        "if (!$other instanceof self || $this->__doriaTag !== $other->__doriaTag) { return false; }",
+    );
+    writeln(
+        output,
+        indent + 2,
+        "foreach ($this->__doriaPayload as $index => $value) {",
+    );
+    writeln(
+        output,
+        indent + 3,
+        "if (!__doria_equal($value, $other->__doriaPayload[$index])) { return false; }",
+    );
+    writeln(output, indent + 2, "}");
+    writeln(output, indent + 2, "return true;");
+    writeln(output, indent + 1, "}");
+    output.push('\n');
+    writeln(output, indent + 1, "public function __destruct()");
+    writeln(output, indent + 1, "{");
+    writeln(
+        output,
+        indent + 2,
+        "for ($index = count($this->__doriaPayload) - 1; $index >= 0; --$index) { unset($this->__doriaPayload[$index]); }",
+    );
+    writeln(output, indent + 1, "}");
+    writeln(output, indent, "}");
+}
+
 fn emit_class(
     class_decl: &ClassDecl,
     semantic_info: &SemanticInfo,
@@ -1708,6 +1939,26 @@ fn emit_class(
     indent: usize,
     scopes: &PhpNameScopes,
 ) {
+    let instance_initializers = class_decl
+        .members
+        .iter()
+        .filter_map(|member| match member {
+            ClassMember::Property(property)
+                if !property.is_static
+                    && property
+                        .initializer
+                        .as_ref()
+                        .is_some_and(|value| is_payload_enum_expression(value, semantic_info)) =>
+            {
+                Some((
+                    property.name.as_str(),
+                    property.initializer.as_ref().unwrap(),
+                ))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut has_constructor = false;
     let implements = if class_decl
         .implements
         .iter()
@@ -1729,12 +1980,27 @@ fn emit_class(
                 property,
                 &class_decl.name,
                 &semantic_info.const_evaluation,
+                semantic_info,
                 output,
                 indent + 1,
                 scopes,
             ),
             ClassMember::Method(method) => {
-                emit_function(method, semantic_info, output, indent + 1, true, scopes)
+                has_constructor |= method.name == "__construct";
+                let initializers = if method.name == "__construct" {
+                    instance_initializers.as_slice()
+                } else {
+                    &[]
+                };
+                emit_function(
+                    method,
+                    semantic_info,
+                    output,
+                    indent + 1,
+                    true,
+                    scopes,
+                    initializers,
+                )
             }
             ClassMember::Constant(constant) => emit_constant(
                 constant,
@@ -1746,13 +2012,82 @@ fn emit_class(
         }
         output.push('\n');
     }
+    if !has_constructor && !instance_initializers.is_empty() {
+        writeln(output, indent + 1, "public function __construct()");
+        writeln(output, indent + 1, "{");
+        for (name, initializer) in &instance_initializers {
+            writeln(
+                output,
+                indent + 2,
+                &format!(
+                    "$this->{name} = {};",
+                    emit_expr(initializer, &scopes.expression_scope())
+                ),
+            );
+        }
+        writeln(output, indent + 1, "}");
+        output.push('\n');
+    }
     writeln(output, indent, "}");
+    let static_payload_initializers = class_decl.members.iter().filter_map(|member| match member {
+        ClassMember::Property(property)
+            if property.is_static
+                && matches!(
+                    semantic_info
+                        .const_evaluation
+                        .values
+                        .get(&ConstKey::Static {
+                            class_name: class_decl.name.clone(),
+                            name: property.name.clone(),
+                        })
+                        .map(|value| &value.value),
+                    Some(ConstValue::PayloadEnum(_))
+                ) =>
+        {
+            Some(property)
+        }
+        _ => None,
+    });
+    let static_payload_initializers = static_payload_initializers.collect::<Vec<_>>();
+    if !static_payload_initializers.is_empty() {
+        writeln(
+            output,
+            indent,
+            "(\\Closure::bind(static function (): void {",
+        );
+        for property in static_payload_initializers {
+            writeln(
+                output,
+                indent + 1,
+                &format!(
+                    "self::${} = {};",
+                    property.name,
+                    emit_const_value(
+                        evaluated_value(
+                            &semantic_info.const_evaluation,
+                            &ConstKey::Static {
+                                class_name: class_decl.name.clone(),
+                                name: property.name.clone(),
+                            },
+                        ),
+                        &semantic_info.const_evaluation,
+                    )
+                ),
+            );
+        }
+        writeln(
+            output,
+            indent,
+            &format!("}}, null, {}::class))();", class_decl.name),
+        );
+    }
 }
 
 fn emit_property(
     property: &PropertyDecl,
     class_name: &str,
     evaluation: &Evaluation,
+    semantic_info: &SemanticInfo,
     output: &mut String,
     indent: usize,
     shared_scopes: &PhpNameScopes,
@@ -1769,8 +2104,24 @@ fn emit_property(
     output.push_str(" $");
     output.push_str(&property.name);
     if let Some(initializer) = &property.initializer {
-        output.push_str(" = ");
-        if property.is_static {
+        let payload_initializer = if property.is_static {
+            matches!(
+                evaluation
+                    .values
+                    .get(&ConstKey::Static {
+                        class_name: class_name.to_string(),
+                        name: property.name.clone(),
+                    })
+                    .map(|value| &value.value),
+                Some(ConstValue::PayloadEnum(_))
+            )
+        } else {
+            is_payload_enum_expression(initializer, semantic_info)
+        };
+        if !payload_initializer {
+            output.push_str(" = ");
+        }
+        if property.is_static && !payload_initializer {
             output.push_str(&emit_const_value(
                 evaluated_value(
                     evaluation,
@@ -1781,7 +2132,7 @@ fn emit_property(
                 ),
                 evaluation,
             ));
-        } else {
+        } else if !payload_initializer {
             output.push_str(&emit_expr(initializer, &shared_scopes.expression_scope()));
         }
     }
@@ -1795,6 +2146,45 @@ fn emit_constant(
     output: &mut String,
     indent: usize,
 ) {
+    let key = class_name.map_or_else(
+        || ConstKey::TopLevel(constant.name.clone()),
+        |class_name| ConstKey::Class {
+            class_name: class_name.to_string(),
+            name: constant.name.clone(),
+        },
+    );
+    let value = evaluated_value(evaluation, &key);
+    if let ConstValue::PayloadEnum(payload) = value {
+        let (enum_name, _) = evaluation
+            .payload_case_name(payload.enum_id, payload.case_id)
+            .expect("checked payload constant must name a payload enum");
+        write_indent(output, indent);
+        if class_name.is_some() {
+            output.push_str(emit_member_access(&constant.access));
+            output.push(' ');
+        }
+        output.push_str(if class_name.is_some() {
+            "static function "
+        } else {
+            "function "
+        });
+        output.push_str(&class_name.map_or_else(
+            || format!("__doria_const_{}", constant.name),
+            |_| format!("__doriaConst{}", constant.name),
+        ));
+        output.push_str("(): ");
+        output.push_str(enum_name);
+        output.push('\n');
+        writeln(output, indent, "{");
+        writeln(output, indent + 1, "static $value = null;");
+        writeln(
+            output,
+            indent + 1,
+            &format!("return $value ??= {};", emit_const_value(value, evaluation)),
+        );
+        writeln(output, indent, "}");
+        return;
+    }
     write_indent(output, indent);
     if class_name.is_some() {
         output.push_str(emit_member_access(&constant.access));
@@ -1806,17 +2196,7 @@ fn emit_constant(
         |_| constant.name.clone(),
     ));
     output.push_str(" = ");
-    let key = class_name.map_or_else(
-        || ConstKey::TopLevel(constant.name.clone()),
-        |class_name| ConstKey::Class {
-            class_name: class_name.to_string(),
-            name: constant.name.clone(),
-        },
-    );
-    output.push_str(&emit_const_value(
-        evaluated_value(evaluation, &key),
-        evaluation,
-    ));
+    output.push_str(&emit_const_value(value, evaluation));
     output.push_str(";\n");
 }
 
@@ -1863,6 +2243,21 @@ fn emit_const_value(value: &ConstValue, evaluation: &Evaluation) -> String {
                 (*candidate == *value).then(|| format!("{enum_name}::{case_name}"))
             })
             .expect("checked enum constant must name a declared case"),
+        ConstValue::PayloadEnum(value) => {
+            let (enum_name, case_name) = evaluation
+                .payload_case_name(value.enum_id, value.case_id)
+                .expect("checked payload enum constant must name a declared case");
+            let method = php_payload_case_method(case_name, !value.fields.is_empty());
+            format!(
+                "{enum_name}::{method}({})",
+                value
+                    .fields
+                    .iter()
+                    .map(|field| emit_const_value(field, evaluation))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
     }
 }
 
@@ -1873,6 +2268,7 @@ fn emit_function(
     indent: usize,
     is_method: bool,
     shared_scopes: &PhpNameScopes,
+    property_initializers: &[(&str, &Expr)],
 ) {
     let mut scopes = shared_scopes.expression_scope();
     for param in &function.params {
@@ -1921,7 +2317,44 @@ fn emit_function(
         output.push_str(&php_type(return_type));
     }
     output.push('\n');
-    emit_block(&function.body, output, indent, &mut scopes);
+    writeln(output, indent, "{");
+    scopes.push();
+    for (name, initializer) in property_initializers {
+        writeln(
+            output,
+            indent + 1,
+            &format!("$this->{name} = {};", emit_expr(initializer, &scopes)),
+        );
+    }
+    for (parameter_index, param) in function.params.iter().enumerate() {
+        let Some(default @ ConstValue::PayloadEnum(_)) =
+            semantic_info.parameter_defaults.get(&ParameterDefaultKey {
+                function_start: function.span.start,
+                parameter_index,
+            })
+        else {
+            continue;
+        };
+        let name = scopes.php_name(&param.name);
+        writeln(output, indent + 1, &format!("if (${name} === []) {{"));
+        writeln(
+            output,
+            indent + 2,
+            &format!(
+                "${name} = {};",
+                emit_const_value(default, &semantic_info.const_evaluation)
+            ),
+        );
+        if param.promoted_access.is_some() {
+            writeln(output, indent + 2, &format!("$this->{name} = ${name};"));
+        }
+        writeln(output, indent + 1, "}");
+    }
+    for statement in &function.body.statements {
+        emit_statement(statement, output, indent + 1, &mut scopes);
+    }
+    scopes.pop();
+    writeln(output, indent, "}");
 }
 
 fn emit_param(
@@ -1935,22 +2368,42 @@ fn emit_param(
         output.push_str(emit_member_access(access));
         output.push(' ');
     }
-    output.push_str(&php_type(&param.ty));
+    let payload_default = matches!(evaluated_default, Some(ConstValue::PayloadEnum(_)));
+    if payload_default {
+        let payload_type = php_type(&param.ty);
+        output.push_str(payload_type.trim_start_matches('?'));
+        output.push_str("|array");
+        if param.ty.nullable {
+            output.push_str("|null");
+        }
+    } else {
+        output.push_str(&php_type(&param.ty));
+    }
     output.push_str(" $");
     output.push_str(&scopes.php_name(&param.name));
     if param.default.is_some() {
         output.push_str(" = ");
-        output.push_str(&emit_const_value(
-            evaluated_default
-                .expect("checked Copy-scalar parameter default must have an evaluated value"),
-            evaluation,
-        ));
+        let default =
+            evaluated_default.expect("checked Copy parameter default must have an evaluated value");
+        if payload_default {
+            output.push_str("[]");
+        } else {
+            output.push_str(&emit_const_value(default, evaluation));
+        }
     }
     output
 }
 
 fn php_top_level_constant_name(name: &str) -> String {
     format!("__DORIA_CONST_{name}")
+}
+
+fn php_payload_case_method(case_name: &str, has_payload: bool) -> String {
+    if has_payload {
+        case_name.to_string()
+    } else {
+        format!("__doriaCase{case_name}")
+    }
 }
 
 fn emit_block(block: &Block, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {
@@ -2414,6 +2867,9 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
     match expr {
         Expr::Variable { name, .. } => format!("${}", scopes.php_name(name)),
         Expr::This { .. } => "$this".to_string(),
+        Expr::Identifier { name, .. } if scopes.is_payload_top_constant(name) => {
+            format!("__doria_const_{name}()")
+        }
         Expr::Identifier { name, .. } => php_top_level_constant_name(name),
         Expr::String { value, .. } => emit_php_string_literal(value),
         Expr::InterpolatedString { parts, .. } => emit_interpolated_string(parts, scopes),
@@ -2513,6 +2969,16 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
         }
         Expr::StaticMember {
             class_name, member, ..
+        } if scopes.is_payload_unit_case(class_name, member) => {
+            format!("{class_name}::{}()", php_payload_case_method(member, false))
+        }
+        Expr::StaticMember {
+            class_name, member, ..
+        } if scopes.is_payload_class_constant(class_name, member) => {
+            format!("{class_name}::__doriaConst{member}()")
+        }
+        Expr::StaticMember {
+            class_name, member, ..
         } => format!("{class_name}::{member}"),
         Expr::New {
             class_type, args, ..
@@ -2565,6 +3031,26 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 emit_expr(left, scopes),
                 emit_expr(right, scopes)
             ),
+            BinaryOp::Equal
+                if scopes.is_payload_enum_expression(left)
+                    || scopes.is_payload_enum_expression(right) =>
+            {
+                format!(
+                    "__doria_equal({}, {})",
+                    emit_expr(left, scopes),
+                    emit_expr(right, scopes)
+                )
+            }
+            BinaryOp::NotEqual
+                if scopes.is_payload_enum_expression(left)
+                    || scopes.is_payload_enum_expression(right) =>
+            {
+                format!(
+                    "!__doria_equal({}, {})",
+                    emit_expr(left, scopes),
+                    emit_expr(right, scopes)
+                )
+            }
             BinaryOp::Concat => format!(
                 "__doria_display({}) . __doria_display({})",
                 emit_expr(left, scopes),

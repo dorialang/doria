@@ -1,0 +1,29 @@
+enum Label
+{
+    case Text(string $value);
+}
+
+enum Other
+{
+    case Text(string $value);
+}
+
+function main(): void
+{
+    mixed $value = Label::Text("hello");
+    echo "{($value is Label)} {($value is Other)}\n";
+
+    if ($value is Label) {
+        Label $copy = $value;
+        echo "{$copy == Label::Text("hello")}\n";
+    }
+
+    ?Label $maybe = Label::Text("nullable");
+    ?mixed $boxed = $maybe;
+    if ($boxed is Label) {
+        Label $copy = $boxed;
+        echo "{$copy == Label::Text("nullable")}\n";
+    }
+
+    mixed $droppedWithoutNarrowing = Label::Text("goodbye");
+}

@@ -7,7 +7,9 @@
 use std::fmt;
 
 use crate::class_layout::{ClassId, ClassLayout, PropertyId};
-use crate::enums::{EnumBackingType, EnumBackingValue, EnumCaseId, EnumId, EnumValue};
+use crate::enums::{
+    EnumBackingType, EnumBackingValue, EnumCapabilities, EnumCaseId, EnumId, EnumLayout, EnumValue,
+};
 use crate::format_string::FormatPiece;
 use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::{SourceFile, Span};
@@ -55,7 +57,28 @@ pub struct EnumDefinition {
     pub name: String,
     pub backing_type: Option<EnumBackingType>,
     pub cases: Vec<EnumCaseDefinition>,
-    pub copy: bool,
+    pub capabilities: EnumCapabilities,
+    pub layout: EnumLayout,
+}
+
+impl EnumDefinition {
+    pub fn payload_type(&self) -> Option<PayloadEnumType> {
+        self.cases
+            .iter()
+            .any(|case| !case.payload.is_empty())
+            .then(|| {
+                let nullable = crate::enums::nullable_enum_layout(&self.layout)
+                    .expect("validated payload enum has finite nullable layout");
+                PayloadEnumType {
+                    id: self.id,
+                    capabilities: self.capabilities,
+                    size: self.layout.size,
+                    align: self.layout.align,
+                    nullable_size: nullable.size,
+                    nullable_payload_offset: nullable.payload_offset,
+                }
+            })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,6 +174,14 @@ pub enum StaticValue {
     Scalar(ScalarValue),
     String(String),
     Null,
+    PayloadEnum(PayloadEnumConstant),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PayloadEnumConstant {
+    pub ty: PayloadEnumType,
+    pub case: EnumCaseId,
+    pub fields: Vec<StaticValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,6 +327,28 @@ pub enum Type {
     NullableWritableSharedReferenceAccess(WritableSharedPayload),
     Collection(CollectionTypeId),
     NullableCollection(CollectionTypeId),
+    PayloadEnum(PayloadEnumType),
+    NullablePayloadEnum(PayloadEnumType),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PayloadEnumType {
+    pub id: EnumId,
+    pub capabilities: EnumCapabilities,
+    pub size: u32,
+    pub align: u32,
+    pub nullable_size: u32,
+    pub nullable_payload_offset: u32,
+}
+
+impl PayloadEnumType {
+    pub const fn storage_size(self, nullable: bool) -> u32 {
+        if nullable {
+            self.nullable_size
+        } else {
+            self.size
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -344,6 +397,14 @@ impl Type {
                 | Self::NullableWritableSharedReferenceAccess(_)
                 | Self::Collection(_)
                 | Self::NullableCollection(_)
+                | Self::PayloadEnum(PayloadEnumType {
+                    capabilities: EnumCapabilities { copy: false, .. },
+                    ..
+                })
+                | Self::NullablePayloadEnum(PayloadEnumType {
+                    capabilities: EnumCapabilities { copy: false, .. },
+                    ..
+                })
         )
     }
 
@@ -482,6 +543,8 @@ pub enum Rvalue {
     NullableSharedReferenceAccess(NullableSharedReferenceAccessExpression),
     Collection(CollectionExpression),
     NullableCollection(NullableCollectionExpression),
+    PayloadEnum(PayloadEnumExpression),
+    NullablePayloadEnum(NullablePayloadEnumExpression),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,6 +584,8 @@ impl Rvalue {
             Self::NullableSharedReferenceAccess(value) => value.ty(),
             Self::Collection(value) => Type::Collection(value.collection()),
             Self::NullableCollection(value) => Type::NullableCollection(value.collection()),
+            Self::PayloadEnum(value) => Type::PayloadEnum(value.ty()),
+            Self::NullablePayloadEnum(value) => Type::NullablePayloadEnum(value.ty()),
         }
     }
 
@@ -544,7 +609,9 @@ impl Rvalue {
             | Self::NullableWritableSharedReference(_)
             | Self::NullableWritableWeakReference(_)
             | Self::SharedReferenceAccess(_)
-            | Self::NullableSharedReferenceAccess(_) => None,
+            | Self::NullableSharedReferenceAccess(_)
+            | Self::PayloadEnum(_)
+            | Self::NullablePayloadEnum(_) => None,
         }
     }
 
@@ -569,7 +636,9 @@ impl Rvalue {
             | Self::NullableWritableSharedReference(_)
             | Self::NullableWritableWeakReference(_)
             | Self::SharedReferenceAccess(_)
-            | Self::NullableSharedReferenceAccess(_) => None,
+            | Self::NullableSharedReferenceAccess(_)
+            | Self::PayloadEnum(_)
+            | Self::NullablePayloadEnum(_) => None,
         }
     }
 
@@ -622,7 +691,17 @@ impl Rvalue {
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::Collection(_)
-            | Self::NullableCollection(_) => None,
+            | Self::NullableCollection(_)
+            | Self::PayloadEnum(_)
+            | Self::NullablePayloadEnum(_) => None,
+        }
+    }
+
+    pub const fn owned_temporary_payload_enum(&self) -> Option<(PayloadEnumType, bool)> {
+        match self {
+            Self::PayloadEnum(value) if value.owned_temporary() => Some((value.ty(), false)),
+            Self::NullablePayloadEnum(value) if value.owned_temporary() => Some((value.ty(), true)),
+            _ => None,
         }
     }
 
@@ -647,7 +726,9 @@ impl Rvalue {
             | Self::NullableWritableSharedReference(_)
             | Self::NullableWritableWeakReference(_)
             | Self::SharedReferenceAccess(_)
-            | Self::NullableSharedReferenceAccess(_) => false,
+            | Self::NullableSharedReferenceAccess(_)
+            | Self::PayloadEnum(_)
+            | Self::NullablePayloadEnum(_) => false,
         }
     }
 
@@ -749,6 +830,18 @@ impl Rvalue {
                     ..
                 },
             ) => Some(*local),
+            Self::PayloadEnum(PayloadEnumExpression::Use {
+                place:
+                    PayloadEnumPlace::Local(local) | PayloadEnumPlace::NullableLocalAssumeNonNull(local),
+                mode: PayloadEnumUseMode::Move,
+                ..
+            })
+            | Self::NullablePayloadEnum(NullablePayloadEnumExpression::Use {
+                place:
+                    PayloadEnumPlace::Local(local) | PayloadEnumPlace::NullableLocalAssumeNonNull(local),
+                mode: PayloadEnumUseMode::Move,
+                ..
+            }) => Some(*local),
             Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -768,7 +861,9 @@ impl Rvalue {
             | Self::NullableWritableSharedReference(_)
             | Self::NullableWritableWeakReference(_)
             | Self::SharedReferenceAccess(_)
-            | Self::NullableSharedReferenceAccess(_) => None,
+            | Self::NullableSharedReferenceAccess(_)
+            | Self::PayloadEnum(_)
+            | Self::NullablePayloadEnum(_) => None,
         }
     }
 
@@ -793,7 +888,143 @@ impl Rvalue {
             | Self::NullableWritableSharedReference(_)
             | Self::NullableWritableWeakReference(_)
             | Self::SharedReferenceAccess(_)
-            | Self::NullableSharedReferenceAccess(_) => MixedOwnership::None,
+            | Self::NullableSharedReferenceAccess(_)
+            | Self::PayloadEnum(_)
+            | Self::NullablePayloadEnum(_) => MixedOwnership::None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadEnumUseMode {
+    Borrow,
+    Copy,
+    Move,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadEnumPlace {
+    Local(LocalId),
+    NullableLocalAssumeNonNull(LocalId),
+    Static(StaticId),
+    Property {
+        object: LocalId,
+        property: PropertyId,
+    },
+    CollectionIndex {
+        collection: LocalId,
+        index: Box<Rvalue>,
+        positional: bool,
+        remove: bool,
+    },
+    MixedPayload {
+        mixed: LocalId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadEnumExpression {
+    Construct {
+        ty: PayloadEnumType,
+        case: EnumCaseId,
+        fields: Vec<Rvalue>,
+        span: Span,
+    },
+    Use {
+        ty: PayloadEnumType,
+        place: PayloadEnumPlace,
+        mode: PayloadEnumUseMode,
+    },
+    Call {
+        ty: PayloadEnumType,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
+    Coalesce {
+        ty: PayloadEnumType,
+        left: Box<NullablePayloadEnumExpression>,
+        right: Box<PayloadEnumExpression>,
+        mode: PayloadEnumUseMode,
+    },
+}
+
+impl PayloadEnumExpression {
+    pub const fn ty(&self) -> PayloadEnumType {
+        match self {
+            Self::Construct { ty, .. }
+            | Self::Use { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::Coalesce { ty, .. } => *ty,
+        }
+    }
+
+    pub const fn use_mode(&self) -> Option<PayloadEnumUseMode> {
+        match self {
+            Self::Use { mode, .. } | Self::Coalesce { mode, .. } => Some(*mode),
+            Self::Construct { .. } | Self::Call { .. } => None,
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> bool {
+        match self {
+            Self::Construct { .. } | Self::Call { .. } => true,
+            Self::Use { mode, .. } | Self::Coalesce { mode, .. } => {
+                !matches!(mode, PayloadEnumUseMode::Borrow)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullablePayloadEnumExpression {
+    Null(PayloadEnumType),
+    Value(PayloadEnumExpression),
+    Use {
+        ty: PayloadEnumType,
+        place: PayloadEnumPlace,
+        mode: PayloadEnumUseMode,
+    },
+    Call {
+        ty: PayloadEnumType,
+        function: FunctionId,
+        args: Vec<Rvalue>,
+    },
+    CollectionGet {
+        ty: PayloadEnumType,
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+        stored_nullable: bool,
+        mode: PayloadEnumUseMode,
+    },
+    Coalesce {
+        ty: PayloadEnumType,
+        left: Box<NullablePayloadEnumExpression>,
+        right: Box<NullablePayloadEnumExpression>,
+        mode: PayloadEnumUseMode,
+    },
+}
+
+impl NullablePayloadEnumExpression {
+    pub const fn ty(&self) -> PayloadEnumType {
+        match self {
+            Self::Null(ty)
+            | Self::Use { ty, .. }
+            | Self::Call { ty, .. }
+            | Self::CollectionGet { ty, .. }
+            | Self::Coalesce { ty, .. } => *ty,
+            Self::Value(value) => value.ty(),
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> bool {
+        match self {
+            Self::Null(_) => false,
+            Self::Value(value) => value.owned_temporary(),
+            Self::Call { .. } => true,
+            Self::Use { mode, .. }
+            | Self::CollectionGet { mode, .. }
+            | Self::Coalesce { mode, .. } => !matches!(mode, PayloadEnumUseMode::Borrow),
         }
     }
 }
@@ -1946,6 +2177,7 @@ pub enum MixedTag {
     String,
     Class(ClassId),
     Enum(EnumId),
+    PayloadEnum(PayloadEnumType),
 }
 
 impl MixedTag {
@@ -1957,6 +2189,7 @@ impl MixedTag {
             Self::String => Type::String,
             Self::Class(class) => Type::Class(class),
             Self::Enum(enum_id) => Type::Scalar(ScalarType::Enum(enum_id)),
+            Self::PayloadEnum(ty) => Type::PayloadEnum(ty),
         }
     }
 }
@@ -1998,6 +2231,9 @@ pub enum MixedExpression {
         value: ClassExpression,
         payload_owned: bool,
     },
+    BoxPayloadEnum {
+        value: Box<PayloadEnumExpression>,
+    },
     CollectionIndex {
         collection: LocalId,
         index: Box<Rvalue>,
@@ -2019,6 +2255,7 @@ impl MixedExpression {
                 ..
             } => MixedOwnership::Owned,
             Self::BoxValue(_) => MixedOwnership::ShellOnly,
+            Self::BoxPayloadEnum { .. } => MixedOwnership::Owned,
             Self::BoxString { payload_owned, .. } | Self::BoxClass { payload_owned, .. } => {
                 if *payload_owned {
                     MixedOwnership::Owned
@@ -2045,6 +2282,7 @@ impl MixedExpression {
 pub enum NullableMixedExpression {
     Null,
     Mixed(MixedExpression),
+    BoxNullablePayloadEnum(Box<NullablePayloadEnumExpression>),
     Local {
         local: LocalId,
         transfer: bool,
@@ -2069,6 +2307,7 @@ impl NullableMixedExpression {
     pub const fn ownership(&self) -> MixedOwnership {
         match self {
             Self::Mixed(value) => value.ownership(),
+            Self::BoxNullablePayloadEnum(_) => MixedOwnership::Owned,
             Self::Local { transfer: true, .. } | Self::Coalesce { .. } => MixedOwnership::Owned,
             Self::Call {
                 return_borrow: None,
@@ -2906,6 +3145,17 @@ pub enum BoolExpression {
     NullableWritableWeakReferenceIsPresent(Box<NullableWritableWeakReferenceExpression>),
     NullableSharedReferenceAccessIsPresent(Box<NullableSharedReferenceAccessExpression>),
     NullableMixedIsPresent(Box<NullableMixedExpression>),
+    NullablePayloadEnumIsPresent(Box<NullablePayloadEnumExpression>),
+    PayloadEnumCompare {
+        op: CompareOp,
+        left: Box<PayloadEnumExpression>,
+        right: Box<PayloadEnumExpression>,
+    },
+    NullablePayloadEnumCompare {
+        op: CompareOp,
+        left: Box<NullablePayloadEnumExpression>,
+        right: Box<NullablePayloadEnumExpression>,
+    },
     Not(Box<BoolExpression>),
     Binary {
         op: BoolBinaryOp,
@@ -3078,6 +3328,11 @@ pub enum Statement {
         local: LocalId,
         collection: CollectionTypeId,
     },
+    DropPayloadEnum {
+        local: LocalId,
+        ty: PayloadEnumType,
+        nullable: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3144,6 +3399,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropSharedReferenceAccess { .. }
         | Statement::DropString { .. }
         | Statement::DropMixed { .. }
+        | Statement::DropPayloadEnum { .. }
         | Statement::CollectionClear { .. }
         | Statement::DropCollection { .. }
         | Statement::WriteStreamBytes { .. } => 0,
@@ -3260,7 +3516,56 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
             Rvalue::NullableCollection(value) => {
                 nullable_collection_class_temporary_capacity(value)
             }
+            Rvalue::PayloadEnum(value) => payload_enum_class_temporary_capacity(value),
+            Rvalue::NullablePayloadEnum(value) => {
+                nullable_payload_enum_class_temporary_capacity(value)
+            }
         }
+}
+
+fn payload_enum_class_temporary_capacity(value: &PayloadEnumExpression) -> usize {
+    match value {
+        PayloadEnumExpression::Construct { fields, .. }
+        | PayloadEnumExpression::Call { args: fields, .. } => {
+            fields.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        PayloadEnumExpression::Use { place, .. } => payload_enum_place_class_capacity(place),
+        PayloadEnumExpression::Coalesce { left, right, .. } => {
+            nullable_payload_enum_class_temporary_capacity(left)
+                + payload_enum_class_temporary_capacity(right)
+        }
+    }
+}
+
+fn nullable_payload_enum_class_temporary_capacity(value: &NullablePayloadEnumExpression) -> usize {
+    match value {
+        NullablePayloadEnumExpression::Null(_) => 0,
+        NullablePayloadEnumExpression::Value(value) => payload_enum_class_temporary_capacity(value),
+        NullablePayloadEnumExpression::Use { place, .. } => {
+            payload_enum_place_class_capacity(place)
+        }
+        NullablePayloadEnumExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullablePayloadEnumExpression::CollectionGet { key, .. } => {
+            rvalue_class_temporary_capacity(key)
+        }
+        NullablePayloadEnumExpression::Coalesce { left, right, .. } => {
+            nullable_payload_enum_class_temporary_capacity(left)
+                + nullable_payload_enum_class_temporary_capacity(right)
+        }
+    }
+}
+
+fn payload_enum_place_class_capacity(place: &PayloadEnumPlace) -> usize {
+    match place {
+        PayloadEnumPlace::CollectionIndex { index, .. } => rvalue_class_temporary_capacity(index),
+        PayloadEnumPlace::Local(_)
+        | PayloadEnumPlace::NullableLocalAssumeNonNull(_)
+        | PayloadEnumPlace::Static(_)
+        | PayloadEnumPlace::Property { .. }
+        | PayloadEnumPlace::MixedPayload { .. } => 0,
+    }
 }
 
 fn nullable_collection_class_temporary_capacity(value: &NullableCollectionExpression) -> usize {
@@ -3516,6 +3821,7 @@ fn mixed_class_temporary_capacity(value: &MixedExpression) -> usize {
         MixedExpression::BoxValue(value) => value_class_temporary_capacity(value),
         MixedExpression::BoxString { value, .. } => string_class_temporary_capacity(value),
         MixedExpression::BoxClass { value, .. } => class_expression_temporary_capacity(value),
+        MixedExpression::BoxPayloadEnum { value } => payload_enum_class_temporary_capacity(value),
         MixedExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
@@ -3528,6 +3834,9 @@ fn mixed_class_temporary_capacity(value: &MixedExpression) -> usize {
 fn nullable_mixed_class_temporary_capacity(value: &NullableMixedExpression) -> usize {
     match value {
         NullableMixedExpression::Mixed(value) => mixed_class_temporary_capacity(value),
+        NullableMixedExpression::BoxNullablePayloadEnum(value) => {
+            nullable_payload_enum_class_temporary_capacity(value)
+        }
         NullableMixedExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
@@ -3847,6 +4156,17 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
         BoolExpression::NullableMixedIsPresent(value) => {
             nullable_mixed_class_temporary_capacity(value)
         }
+        BoolExpression::NullablePayloadEnumIsPresent(value) => {
+            nullable_payload_enum_class_temporary_capacity(value)
+        }
+        BoolExpression::PayloadEnumCompare { left, right, .. } => {
+            payload_enum_class_temporary_capacity(left)
+                + payload_enum_class_temporary_capacity(right)
+        }
+        BoolExpression::NullablePayloadEnumCompare { left, right, .. } => {
+            nullable_payload_enum_class_temporary_capacity(left)
+                + nullable_payload_enum_class_temporary_capacity(right)
+        }
         BoolExpression::Not(value) => bool_class_temporary_capacity(value),
         BoolExpression::Binary { left, right, .. } => {
             bool_class_temporary_capacity(left) + bool_class_temporary_capacity(right)
@@ -3996,6 +4316,10 @@ impl fmt::Display for Type {
             Type::NullableCollection(collection) => {
                 write!(formatter, "?collection#{}", collection.0)
             }
+            Type::PayloadEnum(ty) => write!(formatter, "payload-enum#{}", ty.id.0),
+            Type::NullablePayloadEnum(ty) => {
+                write!(formatter, "?payload-enum#{}", ty.id.0)
+            }
         }
     }
 }
@@ -4088,6 +4412,10 @@ impl fmt::Display for Rvalue {
             Rvalue::Collection(value) => write!(formatter, "{value}"),
             Rvalue::NullableCollection(value) => {
                 write!(formatter, "?collection#{}", value.collection().0)
+            }
+            Rvalue::PayloadEnum(value) => write!(formatter, "payload-enum#{}", value.ty().id.0),
+            Rvalue::NullablePayloadEnum(value) => {
+                write!(formatter, "?payload-enum#{}", value.ty().id.0)
             }
         }
     }
@@ -4391,6 +4719,7 @@ impl fmt::Display for MixedTag {
             Self::Float(ty) => write!(formatter, "{ty}"),
             Self::String => formatter.write_str("string"),
             Self::Class(class) => write!(formatter, "class#{}", class.0),
+            Self::PayloadEnum(ty) => write!(formatter, "payload-enum#{}", ty.id.0),
         }
     }
 }
@@ -4415,6 +4744,9 @@ impl fmt::Display for MixedExpression {
             Self::BoxValue(value) => write!(formatter, "mixed({value})"),
             Self::BoxString { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxClass { value, .. } => write!(formatter, "mixed({value})"),
+            Self::BoxPayloadEnum { value } => {
+                write!(formatter, "mixed(payload-enum#{})", value.ty().id.0)
+            }
             Self::CollectionIndex {
                 positional: _,
                 collection,
@@ -4442,6 +4774,9 @@ impl fmt::Display for NullableMixedExpression {
         match self {
             Self::Null => formatter.write_str("null"),
             Self::Mixed(value) => write!(formatter, "some({value})"),
+            Self::BoxNullablePayloadEnum(value) => {
+                write!(formatter, "mixed(?payload-enum#{})", value.ty().id.0)
+            }
             Self::Local {
                 local,
                 transfer: true,
@@ -4850,6 +5185,15 @@ impl fmt::Display for BoolExpression {
                 write!(formatter, "present(?shared-access<{}>)", value.payload())
             }
             Self::NullableMixedIsPresent(value) => write!(formatter, "present({value})"),
+            Self::NullablePayloadEnumIsPresent(value) => {
+                write!(formatter, "present(?payload-enum#{})", value.ty().id.0)
+            }
+            Self::PayloadEnumCompare { op, left, right } => {
+                write!(formatter, "{left:?} {op} {right:?}")
+            }
+            Self::NullablePayloadEnumCompare { op, left, right } => {
+                write!(formatter, "{left:?} {op} {right:?}")
+            }
             Self::MixedIs { mixed, tag } => write!(formatter, "{mixed} is {tag}"),
             Self::Not(condition) => write!(formatter, "!({condition})"),
             Self::Binary { op, left, right } => {
@@ -5169,6 +5513,17 @@ impl fmt::Display for Statement {
                     collection.0, local.0
                 )
             }
+            Statement::DropPayloadEnum {
+                local,
+                ty,
+                nullable,
+            } => write!(
+                formatter,
+                "drop {}payload-enum#{} local{}",
+                if *nullable { "nullable " } else { "" },
+                ty.id.0,
+                local.0
+            ),
         }
     }
 }
