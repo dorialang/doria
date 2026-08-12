@@ -3572,13 +3572,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     }
 
     fn payload_enum_rvalue_is_owned(value: &mir::Rvalue) -> bool {
-        match value {
-            mir::Rvalue::PayloadEnum(value) => payload_enum_expression_is_owned(value),
-            mir::Rvalue::NullablePayloadEnum(value) => {
-                nullable_payload_enum_expression_is_owned(value)
-            }
-            _ => false,
-        }
+        value.owned_temporary_payload_enum().is_some()
     }
 
     fn lower_payload_enum_collection_search(
@@ -6497,6 +6491,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                 self.defer_or_drop_collection_temporary(value, collection)?;
                             } else if let Some(shared) = argument.owned_temporary_shared() {
                                 self.defer_or_drop_owned_shared_temporary(value, shared)?;
+                            } else if let Some((payload, nullable)) =
+                                argument.owned_temporary_payload_enum()
+                            {
+                                self.drop_payload_enum_at(value, payload, nullable)?;
                             } else if argument.mixed_ownership().has_shell() {
                                 self.defer_or_cleanup_mixed_temporary(
                                     value,
@@ -11884,6 +11882,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.defer_or_drop_collection_temporary(value, collection)?;
                 } else if let Some(shared) = argument.owned_temporary_shared() {
                     self.defer_or_drop_owned_shared_temporary(value, shared)?;
+                } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
+                    self.drop_payload_enum_at(value, payload, nullable)?;
                 } else if argument.mixed_ownership().has_shell() {
                     self.defer_or_cleanup_mixed_temporary(value, argument.mixed_ownership())?;
                 }
@@ -11901,6 +11901,7 @@ fn ordered_owned_argument_indices(args: &[mir::Rvalue]) -> Vec<usize> {
             (argument.owned_temporary_class().is_some()
                 || argument.owned_temporary_collection().is_some()
                 || argument.owned_temporary_shared().is_some()
+                || argument.owned_temporary_payload_enum().is_some()
                 || (argument.mixed_ownership().has_shell()
                     && argument.transferred_owned_local().is_some()))
             .then_some(index)
@@ -11918,31 +11919,6 @@ fn ordered_owned_argument_indices(args: &[mir::Rvalue]) -> Vec<usize> {
         });
     }
     indices
-}
-
-fn payload_enum_expression_is_owned(value: &mir::PayloadEnumExpression) -> bool {
-    match value {
-        mir::PayloadEnumExpression::Construct { .. } | mir::PayloadEnumExpression::Call { .. } => {
-            true
-        }
-        mir::PayloadEnumExpression::Use { mode, .. }
-        | mir::PayloadEnumExpression::Coalesce { mode, .. } => {
-            !matches!(mode, mir::PayloadEnumUseMode::Borrow)
-        }
-    }
-}
-
-fn nullable_payload_enum_expression_is_owned(value: &mir::NullablePayloadEnumExpression) -> bool {
-    match value {
-        mir::NullablePayloadEnumExpression::Null(_) => false,
-        mir::NullablePayloadEnumExpression::Value(value) => payload_enum_expression_is_owned(value),
-        mir::NullablePayloadEnumExpression::Call { .. } => true,
-        mir::NullablePayloadEnumExpression::Use { mode, .. }
-        | mir::NullablePayloadEnumExpression::CollectionGet { mode, .. }
-        | mir::NullablePayloadEnumExpression::Coalesce { mode, .. } => {
-            !matches!(mode, mir::PayloadEnumUseMode::Borrow)
-        }
-    }
 }
 
 fn apply_call_abi_attributes(
@@ -12117,7 +12093,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
             }
             mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
-                let owned = nullable_payload_enum_expression_is_owned(value);
+                let owned = value.owned_temporary();
                 let ty = value.ty();
                 let address = self.lower_nullable_payload_enum_expression(value)?;
                 let present = build(self.builder.build_load(
@@ -12142,8 +12118,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             }
             mir::BoolExpression::PayloadEnumCompare { op, left, right } => {
                 let ty = left.ty();
-                let left_owned = payload_enum_expression_is_owned(left);
-                let right_owned = payload_enum_expression_is_owned(right);
+                let left_owned = left.owned_temporary();
+                let right_owned = right.owned_temporary();
                 let left_address = self.lower_payload_enum_expression(left)?;
                 let right_address = self.lower_payload_enum_expression(right)?;
                 let equal = self.payload_enum_equal_value(left_address, right_address, ty)?;
@@ -12170,8 +12146,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             }
             mir::BoolExpression::NullablePayloadEnumCompare { op, left, right } => {
                 let ty = left.ty();
-                let left_owned = nullable_payload_enum_expression_is_owned(left);
-                let right_owned = nullable_payload_enum_expression_is_owned(right);
+                let left_owned = left.owned_temporary();
+                let right_owned = right.owned_temporary();
                 let left_address = self.lower_nullable_payload_enum_expression(left)?;
                 let right_address = self.lower_nullable_payload_enum_expression(right)?;
                 let equal =

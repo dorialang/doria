@@ -697,6 +697,14 @@ impl Rvalue {
         }
     }
 
+    pub const fn owned_temporary_payload_enum(&self) -> Option<(PayloadEnumType, bool)> {
+        match self {
+            Self::PayloadEnum(value) if value.owned_temporary() => Some((value.ty(), false)),
+            Self::NullablePayloadEnum(value) if value.owned_temporary() => Some((value.ty(), true)),
+            _ => None,
+        }
+    }
+
     pub const fn borrows_class_value(&self) -> bool {
         match self {
             Self::Class(value) => value.borrows_class_value(),
@@ -956,6 +964,15 @@ impl PayloadEnumExpression {
             Self::Construct { .. } | Self::Call { .. } => None,
         }
     }
+
+    pub const fn owned_temporary(&self) -> bool {
+        match self {
+            Self::Construct { .. } | Self::Call { .. } => true,
+            Self::Use { mode, .. } | Self::Coalesce { mode, .. } => {
+                !matches!(mode, PayloadEnumUseMode::Borrow)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -997,6 +1014,17 @@ impl NullablePayloadEnumExpression {
             | Self::CollectionGet { ty, .. }
             | Self::Coalesce { ty, .. } => *ty,
             Self::Value(value) => value.ty(),
+        }
+    }
+
+    pub const fn owned_temporary(&self) -> bool {
+        match self {
+            Self::Null(_) => false,
+            Self::Value(value) => value.owned_temporary(),
+            Self::Call { .. } => true,
+            Self::Use { mode, .. }
+            | Self::CollectionGet { mode, .. }
+            | Self::Coalesce { mode, .. } => !matches!(mode, PayloadEnumUseMode::Borrow),
         }
     }
 }

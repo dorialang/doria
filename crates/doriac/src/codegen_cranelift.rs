@@ -3713,31 +3713,6 @@ fn lower_nullable_bytes_equal_value(
     Ok(builder.block_params(done)[0])
 }
 
-fn payload_enum_expression_is_owned(value: &mir::PayloadEnumExpression) -> bool {
-    match value {
-        mir::PayloadEnumExpression::Construct { .. } | mir::PayloadEnumExpression::Call { .. } => {
-            true
-        }
-        mir::PayloadEnumExpression::Use { mode, .. }
-        | mir::PayloadEnumExpression::Coalesce { mode, .. } => {
-            !matches!(mode, mir::PayloadEnumUseMode::Borrow)
-        }
-    }
-}
-
-fn nullable_payload_enum_expression_is_owned(value: &mir::NullablePayloadEnumExpression) -> bool {
-    match value {
-        mir::NullablePayloadEnumExpression::Null(_) => false,
-        mir::NullablePayloadEnumExpression::Value(value) => payload_enum_expression_is_owned(value),
-        mir::NullablePayloadEnumExpression::Call { .. } => true,
-        mir::NullablePayloadEnumExpression::Use { mode, .. }
-        | mir::NullablePayloadEnumExpression::CollectionGet { mode, .. }
-        | mir::NullablePayloadEnumExpression::Coalesce { mode, .. } => {
-            !matches!(mode, mir::PayloadEnumUseMode::Borrow)
-        }
-    }
-}
-
 fn lower_drop_value_at_address(
     builder: &mut FunctionBuilder,
     ty: mir::Type,
@@ -4014,11 +3989,7 @@ const fn payload_enum_storage(ty: mir::Type) -> Option<(mir::PayloadEnumType, bo
 }
 
 fn payload_enum_rvalue_is_owned(value: &mir::Rvalue) -> bool {
-    match value {
-        mir::Rvalue::PayloadEnum(value) => payload_enum_expression_is_owned(value),
-        mir::Rvalue::NullablePayloadEnum(value) => nullable_payload_enum_expression_is_owned(value),
-        _ => false,
-    }
+    value.owned_temporary_payload_enum().is_some()
 }
 
 fn lower_payload_enum_collection_search(
@@ -6386,6 +6357,12 @@ fn lower_class_expression(
                         } else if let Some(shared) = argument.owned_temporary_shared() {
                             defer_or_drop_owned_shared_temporary(
                                 builder, value, shared, resources,
+                            )?;
+                        } else if let Some((payload, nullable)) =
+                            argument.owned_temporary_payload_enum()
+                        {
+                            lower_drop_payload_enum_at(
+                                builder, value, payload, nullable, resources,
                             )?;
                         } else if argument.mixed_ownership().has_shell() {
                             defer_or_cleanup_mixed_temporary(
@@ -10879,6 +10856,7 @@ fn ordered_owned_argument_indices(args: &[mir::Rvalue]) -> Vec<usize> {
             (argument.owned_temporary_class().is_some()
                 || argument.owned_temporary_collection().is_some()
                 || argument.owned_temporary_shared().is_some()
+                || argument.owned_temporary_payload_enum().is_some()
                 || (argument.mixed_ownership().has_shell()
                     && argument.transferred_owned_local().is_some()))
             .then_some(index)
@@ -11400,6 +11378,8 @@ fn lower_function_call(
                 defer_or_drop_collection_temporary(builder, value, collection, resources)?;
             } else if let Some(shared) = argument.owned_temporary_shared() {
                 defer_or_drop_owned_shared_temporary(builder, value, shared, resources)?;
+            } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
+                lower_drop_payload_enum_at(builder, value, payload, nullable, resources)?;
             } else if argument.mixed_ownership().has_shell() {
                 defer_or_cleanup_mixed_temporary(
                     builder,
@@ -11571,6 +11551,8 @@ fn lower_method_call_with_receiver(
                 defer_or_drop_collection_temporary(builder, value, collection, resources)?;
             } else if let Some(shared) = argument.owned_temporary_shared() {
                 defer_or_drop_owned_shared_temporary(builder, value, shared, resources)?;
+            } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
+                lower_drop_payload_enum_at(builder, value, payload, nullable, resources)?;
             } else if argument.mixed_ownership().has_shell() {
                 defer_or_cleanup_mixed_temporary(
                     builder,
@@ -11692,7 +11674,7 @@ fn lower_condition_to_branch(
             builder.ins().brif(value, then_block, &[], else_block, &[]);
         }
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
-            let owned = nullable_payload_enum_expression_is_owned(value);
+            let owned = value.owned_temporary();
             let ty = value.ty();
             let address = lower_nullable_payload_enum_expression(builder, value, resources)?;
             let present = builder.ins().load(
@@ -11712,8 +11694,8 @@ fn lower_condition_to_branch(
         }
         mir::BoolExpression::PayloadEnumCompare { op, left, right } => {
             let ty = left.ty();
-            let left_owned = payload_enum_expression_is_owned(left);
-            let right_owned = payload_enum_expression_is_owned(right);
+            let left_owned = left.owned_temporary();
+            let right_owned = right.owned_temporary();
             let left_address = lower_payload_enum_expression(builder, left, resources)?;
             let right_address = lower_payload_enum_expression(builder, right, resources)?;
             let mut equal = lower_payload_enum_equal_value(
@@ -11737,8 +11719,8 @@ fn lower_condition_to_branch(
         }
         mir::BoolExpression::NullablePayloadEnumCompare { op, left, right } => {
             let ty = left.ty();
-            let left_owned = nullable_payload_enum_expression_is_owned(left);
-            let right_owned = nullable_payload_enum_expression_is_owned(right);
+            let left_owned = left.owned_temporary();
+            let right_owned = right.owned_temporary();
             let left_address = lower_nullable_payload_enum_expression(builder, left, resources)?;
             let right_address = lower_nullable_payload_enum_expression(builder, right, resources)?;
             let mut equal = lower_nullable_payload_enum_equal_value(

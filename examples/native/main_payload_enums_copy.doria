@@ -11,6 +11,24 @@ enum Label
 
 const Label DEFAULT_LABEL = Label::Text("default");
 
+class LabelReader
+{
+    function __construct(Label $label)
+    {
+        echo " {$label == Label::Text("constructor")}";
+    }
+
+    function matches(Label $label): bool
+    {
+        return $label == Label::Text("instance");
+    }
+
+    static function matchesStatic(Label $label): bool
+    {
+        return $label == Label::Text("static");
+    }
+}
+
 function mark(string $label, int $value): int
 {
     echo $label;
@@ -43,4 +61,7 @@ function main(): void
     echo " {$copy == $point}";
     echo " {$labelCopy == Label::Text("copy")}";
     echo " {usesDefault()} {describe(null)} {describe()}\n";
+    let $reader = new LabelReader(Label::Text("constructor"));
+    echo " {$reader->matches(Label::Text("instance"))}";
+    echo " {LabelReader::matchesStatic(Label::Text("static"))}\n";
 }

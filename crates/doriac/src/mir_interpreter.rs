@@ -12208,6 +12208,7 @@ fn temporary_argument_drop_order(
         let temporary = argument.owned_temporary_class().is_some()
             || argument.owned_temporary_collection().is_some()
             || argument.owned_temporary_shared().is_some()
+            || argument.owned_temporary_payload_enum().is_some()
             || argument.mixed_ownership() == mir::MixedOwnership::Owned;
         if !temporary || promoted(index) {
             continue;
