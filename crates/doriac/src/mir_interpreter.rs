@@ -1141,6 +1141,46 @@ impl Interpreter<'_> {
         statement: mir::Statement,
     ) -> Result<StepOutcome, InterpreterError> {
         match statement {
+            mir::Statement::BindPayloadEnumFields {
+                source,
+                ty,
+                case,
+                nullable,
+                targets,
+            } => {
+                let source_value = read_local(&self.current_frame()?.locals, source)?.clone();
+                let payload = match source_value {
+                    LocalValue::PayloadEnum(value) if !nullable && value.ty == ty => value,
+                    LocalValue::NullablePayloadEnum {
+                        ty: actual,
+                        value: Some(value),
+                    } if nullable && actual == ty => value,
+                    LocalValue::NullablePayloadEnum { value: None, .. } => {
+                        return Err(InterpreterError::new(
+                            "MIR payload binding projected an absent nullable enum",
+                        ));
+                    }
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR payload binding source has an incompatible enum type",
+                        ));
+                    }
+                };
+                if payload.case != case || payload.fields.len() != targets.len() {
+                    return Err(InterpreterError::new(
+                        "MIR payload binding does not match the active enum case",
+                    ));
+                }
+                for (target, value) in targets.into_iter().zip(payload.fields) {
+                    assign_local(
+                        &function.locals,
+                        &mut self.current_frame_mut()?.locals,
+                        target,
+                        value,
+                    )?;
+                }
+            }
+            mir::Statement::MatchResultPlan { .. } => {}
             mir::Statement::AssignLocalGroup { targets, value } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::AssignGroup(targets));
@@ -1581,7 +1621,7 @@ impl Interpreter<'_> {
                     .ok_or_else(|| {
                         InterpreterError::new("string temporary was dropped before initialization")
                     })?;
-                if !matches!(value, LocalValue::String(_)) {
+                if !matches!(value, LocalValue::String(_) | LocalValue::NullableString(_)) {
                     return Err(InterpreterError::new(
                         "string drop references a non-string local",
                     ));
@@ -5323,6 +5363,29 @@ impl Interpreter<'_> {
         condition: mir::BoolExpression,
     ) -> Result<(), InterpreterError> {
         match condition {
+            mir::BoolExpression::PayloadEnumIsCase {
+                local,
+                ty,
+                case,
+                nullable,
+            } => {
+                let matches = match read_local(&self.current_frame()?.locals, local)? {
+                    LocalValue::PayloadEnum(value) if !nullable && value.ty == ty => {
+                        value.case == case
+                    }
+                    LocalValue::NullablePayloadEnum { ty: actual, value }
+                        if nullable && *actual == ty =>
+                    {
+                        value.as_ref().is_some_and(|value| value.case == case)
+                    }
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR payload-enum case test has an incompatible local",
+                        ));
+                    }
+                };
+                self.push_scalar(mir::ScalarValue::Bool(matches))?;
+            }
             mir::BoolExpression::Use { operand } => {
                 if self.queue_collection_scalar_operand(&operand)? {
                     return Ok(());

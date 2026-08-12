@@ -1346,6 +1346,109 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         debug_assert!(self.deferred_class_temporary_drops.is_empty());
         self.defer_class_temporary_drops = true;
         match statement {
+            mir::Statement::BindPayloadEnumFields {
+                source,
+                ty,
+                case,
+                nullable,
+                targets,
+            } => {
+                let source = local_slot(&self.local_slots, *source)?;
+                let source = if *nullable {
+                    self.byte_offset(source, ty.nullable_payload_offset, "payload.binding.value")?
+                } else {
+                    source
+                };
+                let definition = enum_definition(self.program, ty.id)?.clone();
+                let case_definition = definition
+                    .cases
+                    .get(case.index)
+                    .filter(|definition| definition.id == *case)
+                    .ok_or_else(|| malformed_mir("payload binding case does not exist"))?;
+                let case_layout = definition
+                    .layout
+                    .cases
+                    .get(case.index)
+                    .filter(|layout| layout.case_id == *case)
+                    .ok_or_else(|| malformed_mir("payload binding case layout does not exist"))?;
+                for ((field, layout), target) in case_definition
+                    .payload
+                    .iter()
+                    .zip(&case_layout.fields)
+                    .zip(targets)
+                {
+                    let source =
+                        self.byte_offset(source, layout.offset, "payload.binding.field")?;
+                    let target = local_slot(&self.local_slots, *target)?;
+                    match field.ty {
+                        mir::Type::String => {
+                            let value = build(self.builder.build_load(
+                                self.context.ptr_type(AddressSpace::default()),
+                                source,
+                                "payload.binding.string",
+                            ))?
+                            .into_pointer_value();
+                            let value = self.retain_string(value)?;
+                            build(self.builder.build_store(target, value))?;
+                        }
+                        mir::Type::NullableString => {
+                            let value = build(self.builder.build_load(
+                                llvm_type(self.context, self.target_data, field.ty),
+                                source,
+                                "payload.binding.nullable-string",
+                            ))?
+                            .into_struct_value();
+                            let present = build(self.builder.build_extract_value(
+                                value,
+                                0,
+                                "payload.binding.present",
+                            ))?;
+                            let payload = build(self.builder.build_extract_value(
+                                value,
+                                1,
+                                "payload.binding.string-value",
+                            ))?
+                            .into_pointer_value();
+                            let payload = self.retain_string(payload)?;
+                            let value = build(self.builder.build_insert_value(
+                                value,
+                                present,
+                                0,
+                                "payload.binding.copy-present",
+                            ))?
+                            .into_struct_value();
+                            let value = build(self.builder.build_insert_value(
+                                value,
+                                payload,
+                                1,
+                                "payload.binding.copy-string",
+                            ))?;
+                            build(self.builder.build_store(target, value))?;
+                        }
+                        mir::Type::PayloadEnum(payload) => {
+                            self.copy_payload_bytes(target, source, payload, false)?;
+                            if payload.capabilities.copy {
+                                self.retain_payload_enum_at(target, payload, false)?;
+                            }
+                        }
+                        mir::Type::NullablePayloadEnum(payload) => {
+                            self.copy_payload_bytes(target, source, payload, true)?;
+                            if payload.capabilities.copy {
+                                self.retain_payload_enum_at(target, payload, true)?;
+                            }
+                        }
+                        ty => {
+                            let value = build(self.builder.build_load(
+                                llvm_type(self.context, self.target_data, ty),
+                                source,
+                                "payload.binding.load",
+                            ))?;
+                            build(self.builder.build_store(target, value))?;
+                        }
+                    }
+                }
+            }
+            mir::Statement::MatchResultPlan { .. } => {}
             mir::Statement::AssignLocalGroup { targets, value } => {
                 let first = *targets
                     .first()
@@ -1760,11 +1863,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.drop_class_value_checked(value, class)?;
             }
             mir::Statement::DropString { local } => {
-                let pointer = self.context.ptr_type(AddressSpace::default());
                 let slot = local_slot(&self.local_slots, *local)?;
-                let value = build(self.builder.build_load(pointer, slot, "string.drop"))?
-                    .into_pointer_value();
-                build(self.builder.build_store(slot, pointer.const_null()))?;
+                let ty = local_in(self.function, *local)?.ty;
+                let value = build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, ty),
+                    slot,
+                    "string.drop",
+                ))?;
+                let value = if matches!(ty, mir::Type::NullableString) {
+                    self.nullable_parts(value.into_struct_value())?
+                        .1
+                        .into_pointer_value()
+                } else {
+                    value.into_pointer_value()
+                };
+                build(self.builder.build_store(
+                    slot,
+                    llvm_type(self.context, self.target_data, ty).const_zero(),
+                ))?;
                 self.release_string(value)?;
             }
             mir::Statement::CollectionAdd {
@@ -11971,6 +12087,73 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         else_block: BasicBlock<'ctx>,
     ) -> Result<(), BackendError> {
         match condition {
+            mir::BoolExpression::PayloadEnumIsCase {
+                local,
+                ty,
+                case,
+                nullable,
+            } => {
+                let source = local_slot(&self.local_slots, *local)?;
+                let source = if *nullable {
+                    let present = build(self.builder.build_load(
+                        self.context.i8_type(),
+                        source,
+                        "payload.case.present",
+                    ))?
+                    .into_int_value();
+                    let present = build(self.builder.build_int_compare(
+                        IntPredicate::NE,
+                        present,
+                        self.context.i8_type().const_zero(),
+                        "payload.case.is-present",
+                    ))?;
+                    let present_block = self
+                        .context
+                        .append_basic_block(current_function(&self.builder)?, "payload.case.some");
+                    build(self.builder.build_conditional_branch(
+                        present,
+                        present_block,
+                        else_block,
+                    ))?;
+                    self.builder.position_at_end(present_block);
+                    self.byte_offset(source, ty.nullable_payload_offset, "payload.case.value")?
+                } else {
+                    source
+                };
+                let definition = enum_definition(self.program, ty.id)?;
+                let case_definition = definition
+                    .cases
+                    .get(case.index)
+                    .filter(|definition| definition.id == *case)
+                    .ok_or_else(|| malformed_mir("payload-enum case test references no case"))?;
+                let tag_type = match definition.layout.tag_width {
+                    1 => self.context.i8_type(),
+                    2 => self.context.i16_type(),
+                    4 => self.context.i32_type(),
+                    _ => return Err(malformed_mir("payload enum tag has unsupported width")),
+                };
+                let tag_address = self.byte_offset(
+                    source,
+                    definition.layout.tag_offset,
+                    "payload.case.tag-address",
+                )?;
+                let tag = build(self.builder.build_load(
+                    tag_type,
+                    tag_address,
+                    "payload.case.tag",
+                ))?
+                .into_int_value();
+                let matches = build(self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    tag,
+                    tag_type.const_int(u64::from(case_definition.tag), false),
+                    "payload.case.matches",
+                ))?;
+                build(
+                    self.builder
+                        .build_conditional_branch(matches, then_block, else_block),
+                )?;
+            }
             mir::BoolExpression::Use { operand } => {
                 let value = self.lower_bool_operand(operand)?;
                 let condition = build(self.builder.build_int_compare(

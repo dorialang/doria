@@ -1099,7 +1099,54 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Option<Expr> {
-        self.parse_range()
+        self.parse_ternary()
+    }
+
+    fn parse_ternary(&mut self) -> Option<Expr> {
+        let condition = self.parse_range()?;
+        if !self.match_kind(&TokenKind::Question) {
+            return Some(condition);
+        }
+
+        let question = self.previous().span;
+        if self.check(&TokenKind::Colon) {
+            self.error(
+                "Doria does not support the short ternary `?:`; use `??` for null fallback or the full `? :` form for a bool condition",
+                question.merge(self.peek().span),
+            );
+            self.advance();
+            return self.parse_ternary();
+        }
+
+        let when_true = self.parse_expression()?;
+        let colon = self
+            .expect(TokenKind::Colon, "expected `:` in ternary expression")?
+            .span;
+        let when_false = self.parse_ternary()?;
+        let span = condition.span().merge(when_false.span());
+        Some(Expr::Match {
+            scrutinee: Box::new(condition),
+            arms: vec![
+                MatchArm {
+                    pattern: MatchPattern::Expression(Expr::Bool {
+                        value: true,
+                        span: question,
+                    }),
+                    span: question.merge(when_true.span()),
+                    value: when_true,
+                },
+                MatchArm {
+                    pattern: MatchPattern::Expression(Expr::Bool {
+                        value: false,
+                        span: colon,
+                    }),
+                    span: colon.merge(when_false.span()),
+                    value: when_false,
+                },
+            ],
+            origin: MatchOrigin::Ternary,
+            span,
+        })
     }
 
     fn parse_range(&mut self) -> Option<Expr> {
@@ -1429,6 +1476,19 @@ impl Parser {
         while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
             let arm_start = self.peek().span.start;
             let pattern = self.parse_match_pattern()?;
+            if self.is_candidate_match_guard() {
+                self.error(
+                    "match pattern guards are not available; guard syntax must be settled before implementation",
+                    self.peek().span,
+                );
+                let end = self.recover_match_expression();
+                return Some(Expr::Match {
+                    scrutinee: Box::new(scrutinee),
+                    arms,
+                    origin: MatchOrigin::Match,
+                    span: Span::new(start, end),
+                });
+            }
             self.expect(TokenKind::FatArrow, "expected `=>` after match pattern")?;
             let value = self.parse_expression()?;
             let arm_end = value.span().end;
@@ -1448,8 +1508,27 @@ impl Parser {
         Some(Expr::Match {
             scrutinee: Box::new(scrutinee),
             arms,
+            origin: MatchOrigin::Match,
             span: Span::new(start, end),
         })
+    }
+
+    fn recover_match_expression(&mut self) -> usize {
+        let mut brace_depth = 1_usize;
+        while !self.is_at_end() {
+            let token = self.advance().clone();
+            match token.kind {
+                TokenKind::LeftBrace => brace_depth += 1,
+                TokenKind::RightBrace => {
+                    brace_depth -= 1;
+                    if brace_depth == 0 {
+                        return token.span.end;
+                    }
+                }
+                _ => {}
+            }
+        }
+        self.previous().span.end
     }
 
     fn parse_match_pattern(&mut self) -> Option<MatchPattern> {
@@ -1467,14 +1546,15 @@ impl Parser {
                     self.error("expected enum case after `::`", case_token.span);
                     return None;
                 };
-                let mut bindings = Vec::new();
+                let mut bindings = None;
                 let mut end = case_token.span.end;
                 if self.match_kind(&TokenKind::LeftParen) {
+                    let mut parsed = Vec::new();
                     if !self.check(&TokenKind::RightParen) {
                         loop {
                             let (name, span) =
                                 self.expect_variable("expected payload binding variable")?;
-                            bindings.push(MatchBinding { name, span });
+                            parsed.push(MatchBinding { name, span });
                             if !self.match_kind(&TokenKind::Comma) {
                                 break;
                             }
@@ -1484,6 +1564,7 @@ impl Parser {
                         .expect(TokenKind::RightParen, "expected `)` after payload bindings")?
                         .span
                         .end;
+                    bindings = Some(parsed);
                 }
                 return Some(MatchPattern::EnumCase {
                     qualifier: name,
@@ -1497,7 +1578,54 @@ impl Parser {
             self.current -= 1;
         }
 
+        let checkpoint = self.current;
+        if self.can_start_match_type_binding() {
+            if let Some(ty) = self.parse_type_ref() {
+                if let Some((name, binding_span)) = self.consume_variable() {
+                    return Some(MatchPattern::TypeBinding {
+                        ty,
+                        binding: MatchBinding {
+                            name,
+                            span: binding_span,
+                        },
+                        span: Span::new(self.tokens[checkpoint].span.start, binding_span.end),
+                    });
+                }
+            }
+            self.current = checkpoint;
+            self.pending_type_argument_close = None;
+        }
+
         self.parse_expression().map(MatchPattern::Expression)
+    }
+
+    fn can_start_match_type_binding(&self) -> bool {
+        matches!(
+            self.peek().kind,
+            TokenKind::Question
+                | TokenKind::Void
+                | TokenKind::IntType
+                | TokenKind::Int8Type
+                | TokenKind::Int16Type
+                | TokenKind::Int32Type
+                | TokenKind::Int64Type
+                | TokenKind::UInt8Type
+                | TokenKind::UInt16Type
+                | TokenKind::UInt32Type
+                | TokenKind::UInt64Type
+                | TokenKind::FloatType
+                | TokenKind::Float32Type
+                | TokenKind::Float64Type
+                | TokenKind::StringType
+                | TokenKind::BoolType
+                | TokenKind::Identifier(_)
+                | TokenKind::SelfType
+        )
+    }
+
+    fn is_candidate_match_guard(&self) -> bool {
+        matches!(self.peek().kind, TokenKind::If | TokenKind::When)
+            || matches!(&self.peek().kind, TokenKind::Identifier(name) if name == "where")
     }
 
     fn parse_scoped_access(

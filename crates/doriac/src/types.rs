@@ -499,4 +499,71 @@ impl TypeRegistry {
             }
         }
     }
+
+    pub fn intern_resolved(&mut self, ty: &ResolvedType) -> TypeId {
+        let kind = match ty {
+            ResolvedType::Void => TypeKind::Void,
+            ResolvedType::Integer(ty) => TypeKind::Integer(*ty),
+            ResolvedType::Float(ty) => TypeKind::Float(*ty),
+            ResolvedType::String => TypeKind::String,
+            ResolvedType::Bytes => TypeKind::Bytes,
+            ResolvedType::Bool => TypeKind::Bool,
+            ResolvedType::Null => TypeKind::Null,
+            ResolvedType::Mixed => TypeKind::Mixed,
+            ResolvedType::TypeParameter(name) => TypeKind::TypeParameter(name.clone()),
+            ResolvedType::Enum(ty) => TypeKind::Enum(ty.clone()),
+            ResolvedType::Nullable(inner) => {
+                let inner = self.intern_resolved(inner);
+                TypeKind::Nullable(inner)
+            }
+            ResolvedType::Class(class) => TypeKind::Class(ClassType::new(
+                class.name.clone(),
+                class
+                    .arguments
+                    .iter()
+                    .map(|argument| self.intern_resolved(argument))
+                    .collect(),
+            )),
+            ResolvedType::TypedArray(element) => {
+                let element = self.intern_resolved(element);
+                TypeKind::TypedArray(element)
+            }
+            ResolvedType::List(element) => {
+                let element = self.intern_resolved(element);
+                TypeKind::List(element)
+            }
+            ResolvedType::Dictionary(key, value) => {
+                let key = self.intern_resolved(key);
+                let value = self.intern_resolved(value);
+                TypeKind::Dictionary(key, value)
+            }
+            ResolvedType::SortedDictionary(key, value) => {
+                let key = self.intern_resolved(key);
+                let value = self.intern_resolved(value);
+                TypeKind::SortedDictionary(key, value)
+            }
+            ResolvedType::Set(element) => {
+                let element = self.intern_resolved(element);
+                TypeKind::Set(element)
+            }
+            ResolvedType::SortedSet(element) => {
+                let element = self.intern_resolved(element);
+                TypeKind::SortedSet(element)
+            }
+            ResolvedType::PriorityQueue(element) => {
+                let element = self.intern_resolved(element);
+                TypeKind::PriorityQueue(element)
+            }
+            ResolvedType::Deque(element) => {
+                let element = self.intern_resolved(element);
+                TypeKind::Deque(element)
+            }
+            ResolvedType::SharedHandle(kind, payload) => {
+                let payload = self.intern_resolved(payload);
+                TypeKind::SharedHandle(*kind, payload)
+            }
+            ResolvedType::Unsupported => TypeKind::Unknown,
+        };
+        self.intern(kind)
+    }
 }

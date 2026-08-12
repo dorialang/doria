@@ -730,11 +730,14 @@ if ($namingAuthority !== false) {
         || !str_contains($pipeline, 'Stage 27 — Complete; No Performance-Evidence Dependency')
         || !str_contains($pipeline, 'Stage 27 Slice 1 — Complete')
         || !str_contains($pipeline, 'Stage 27 Slice 2 — Complete')
-        || !str_contains($pipeline, 'Stage 28 — Next')
+        || !str_contains($pipeline, 'Stage 28 — In Progress')
+        || !str_contains($pipeline, 'Stage 28 Slice 1 — Complete')
+        || !str_contains($pipeline, 'Stage 28 Slice 2 — Next')
+        || !str_contains($pipeline, 'Stage 28a — Blocked Until Stage 28 Completes')
         || !str_contains($pipeline, 'Stage 36a Public Spellings — Deferred')
         || !str_contains($pipeline, 'Stage 36a — Not Implemented')
     ) {
-        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 through 27 complete, performance measurement pending an available runner without blocking development, Stage 28 next, and Stage 36a scheduled but not implemented with public spellings deferred";
+        $failures[] = "{$pipelinePath}: must keep the String audit review and runtime surface implemented, line input sequenced, Stage 25a complete, the stream audit and review complete, decision 0110's semantic/performance contract accepted, Stages 26 through 27 complete, performance measurement pending an available runner without blocking development, Stage 28 Slice 1 complete with Slice 2 next and Stage 28a blocked, and Stage 36a scheduled but not implemented with public spellings deferred";
     }
 
     if (

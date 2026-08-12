@@ -342,10 +342,32 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+          $uri = "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang%2Bllvm-18.1.8-x86_64-pc-windows-msvc.tar.xz"
           $archive = Join-Path $env:RUNNER_TEMP "clang+llvm-18.1.8-x86_64-pc-windows-msvc.tar.xz"
           $prefix = Join-Path $env:RUNNER_TEMP "clang+llvm-18.1.8-x86_64-pc-windows-msvc"
-          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-18.1.8/clang%2Bllvm-18.1.8-x86_64-pc-windows-msvc.tar.xz" -OutFile $archive
+          for ($attempt = 1; $attempt -le 5; $attempt++) {
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+            try {
+              Invoke-WebRequest -Uri $uri -OutFile $archive
+              if ((Get-Item $archive).Length -eq 0) { throw "downloaded archive is empty" }
+              tar -tf $archive | Out-Null
+              if ($LASTEXITCODE -ne 0) { throw "downloaded archive failed its integrity check" }
+              break
+            } catch {
+              if ($attempt -eq 5) {
+                throw "failed to download a valid LLVM archive after $attempt attempts: $($_.Exception.Message)"
+              }
+              Write-Warning ("LLVM download attempt {0} failed: {1}" -f $attempt, $_.Exception.Message)
+              Start-Sleep -Seconds (5 * $attempt)
+            }
+          }
+          Remove-Item $prefix -Recurse -Force -ErrorAction SilentlyContinue
           tar -xf $archive -C $env:RUNNER_TEMP
+          if ($LASTEXITCODE -ne 0) { throw "failed to extract the LLVM archive" }
+          if (-not (Test-Path (Join-Path $prefix "bin\llvm-config.exe"))) {
+            throw "LLVM archive did not contain the expected llvm-config.exe"
+          }
           $vcpkg = (Get-Command vcpkg -ErrorAction Stop).Source
           for ($attempt = 1; $attempt -le 3; $attempt++) {
             & $vcpkg install "libxml2[core]:x64-windows-static"

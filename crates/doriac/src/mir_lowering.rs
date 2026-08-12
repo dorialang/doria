@@ -515,6 +515,12 @@ pub(crate) struct StructuralMetrics {
     pub(crate) enum_equality_glue_type_count: usize,
     pub(crate) callable_specialization_count: usize,
     pub(crate) class_specialization_count: usize,
+    pub(crate) match_expression_count: usize,
+    pub(crate) match_arm_count: usize,
+    pub(crate) enum_match_count: usize,
+    pub(crate) condition_match_count: usize,
+    pub(crate) type_pattern_count: usize,
+    pub(crate) ternary_count: usize,
     pub(crate) basic_block_count: usize,
     pub(crate) statement_count: usize,
     pub(crate) terminator_count: usize,
@@ -537,6 +543,27 @@ fn lower_program_impl(
     mut metrics: Option<&mut StructuralMetrics>,
 ) -> DiagnosticResult<mir::Program> {
     if let Some(metrics) = metrics.as_deref_mut() {
+        metrics.match_expression_count = program.semantic_info.matches.len();
+        for plan in program.semantic_info.matches.values() {
+            metrics.match_arm_count += plan.arms.len();
+            metrics.enum_match_count += usize::from(match &plan.scrutinee_type {
+                ResolvedType::Enum(_) => true,
+                ResolvedType::Nullable(inner) => matches!(inner.as_ref(), ResolvedType::Enum(_)),
+                _ => false,
+            });
+            metrics.condition_match_count += usize::from(plan.condition_mode);
+            metrics.type_pattern_count += plan
+                .arms
+                .iter()
+                .filter(|arm| {
+                    matches!(
+                        arm.pattern,
+                        crate::semantics::ResolvedMatchPattern::ExactType(_)
+                    )
+                })
+                .count();
+            metrics.ternary_count += usize::from(plan.origin == hir::MatchOrigin::Ternary);
+        }
         metrics.enum_count = program.semantic_info.enums.len();
         for definition in &program.semantic_info.enums {
             metrics.enum_case_count += definition.cases.len();
@@ -3067,6 +3094,7 @@ struct LoweringContext<'semantic> {
 
 #[derive(Clone, Copy)]
 enum DropObligation {
+    String(mir::LocalId),
     Class(mir::LocalId, ClassId),
     Shared(mir::LocalId, ClassId),
     Weak(mir::LocalId, ClassId),
@@ -3301,6 +3329,7 @@ impl<'semantic> LoweringContext<'semantic> {
     fn emit_drop_obligations(&mut self, cleanup: &[DropObligation]) {
         for obligation in cleanup.iter().rev().copied() {
             self.push_statement(match obligation {
+                DropObligation::String(local) => mir::Statement::DropString { local },
                 DropObligation::Class(local, class) => mir::Statement::DropClass { local, class },
                 DropObligation::Shared(local, class) => {
                     mir::Statement::DropSharedReference { local, class }
@@ -3460,6 +3489,34 @@ impl<'semantic> LoweringContext<'semantic> {
             owned: false,
             synthetic: true,
         });
+        id
+    }
+
+    fn declare_pattern_local(&mut self, name: &str, ty: mir::Type, owned: bool) -> mir::LocalId {
+        let id = mir::LocalId(self.locals.len());
+        self.locals.push(mir::Local {
+            id,
+            name: name.to_string(),
+            ty,
+            writable: false,
+            owned,
+            synthetic: true,
+        });
+        self.local_scopes
+            .last_mut()
+            .expect("MIR lowering must have a local scope")
+            .insert(name.to_string(), id);
+        if matches!(ty, mir::Type::String | mir::Type::NullableString) {
+            self.scope_owned_locals
+                .last_mut()
+                .expect("MIR lowering must have an ownership scope")
+                .push(DropObligation::String(id));
+        } else if owned {
+            self.scope_owned_locals
+                .last_mut()
+                .expect("MIR lowering must have an ownership scope")
+                .push(drop_obligation_for_owned_local(id, ty));
+        }
         id
     }
 
@@ -4107,6 +4164,16 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         .first()
         .expect("semantic checking guarantees a local declaration binding")
         .name;
+
+    if matches!(decl.initializer, hir::Expr::Match { .. }) {
+        let value = lower_match_rvalue(&decl.initializer, ty, true, context)?;
+        let local = context.declare_user_local(name, decl.writable, ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value,
+        });
+        return Ok(());
+    }
 
     if ty == mir::Type::String {
         return lower_string_var_decl(decl, context);
@@ -5049,6 +5116,14 @@ fn lower_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::String(value) =
+            lower_match_rvalue(expr, mir::Type::String, false, context)?
+        else {
+            unreachable!("string match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if let Some(call) = lower_string_intrinsic_call(expr, context) {
         let call = call?;
         if call.result != mir::Type::String {
@@ -5268,6 +5343,14 @@ fn lower_nullable_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::NullableString(value) =
+            lower_match_rvalue(expr, mir::Type::NullableString, false, context)?
+        else {
+            unreachable!("nullable-string match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if let Some((enum_id, value)) =
         lower_nullable_enum_backing_receiver(expr, crate::enums::EnumBackingType::String, context)?
     {
@@ -5566,6 +5649,14 @@ fn lower_nullable_scalar_expression(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::NullableScalar(value) =
+            lower_match_rvalue(expr, mir::Type::NullableScalar(expected), false, context)?
+        else {
+            unreachable!("nullable-scalar match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if expected == mir::ScalarType::Integer(IntegerType::Int64) {
         if let Some((enum_id, value)) =
             lower_nullable_enum_backing_receiver(expr, crate::enums::EnumBackingType::Int, context)?
@@ -5950,6 +6041,14 @@ fn lower_nullable_class_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableClassExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::NullableClass(value) =
+            lower_match_rvalue(expr, mir::Type::NullableClass(expected), transfer, context)?
+        else {
+            unreachable!("nullable-class match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if let Some((collection, key, value_type, access)) =
         lower_collection_nullable_property(expr, context)?
     {
@@ -7769,6 +7868,582 @@ fn payload_enum_use_mode(ty: mir::PayloadEnumType, transfer: bool) -> mir::Paylo
     }
 }
 
+fn lower_match_rvalue(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    let hir::Expr::Match {
+        scrutinee,
+        arms,
+        span,
+        ..
+    } = expr
+    else {
+        unreachable!("match lowering requires a match expression");
+    };
+    let info = context
+        .semantic_info
+        .matches
+        .get(&(span.start, span.end))
+        .cloned()
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I2801",
+                "checked match expression has no semantic match plan",
+                *span,
+            )]
+        })?;
+    let result_type = context
+        .mir_resolved_type(&info.result_type)
+        .ok_or_else(|| {
+            vec![unsupported(
+                *span,
+                "match result type has no native representation",
+            )]
+        })?;
+    if result_type != expected || arms.len() != info.arms.len() {
+        return Err(vec![Diagnostic::new(
+            "I2801",
+            "checked match expression disagrees with its native lowering plan",
+            *span,
+        )]);
+    }
+    let scrutinee_type = context
+        .mir_resolved_type(&info.scrutinee_type)
+        .ok_or_else(|| {
+            vec![unsupported(
+                scrutinee.span(),
+                "match scrutinee type has no native representation",
+            )]
+        })?;
+    let scrutinee_value = lower_rvalue_as_borrowed(scrutinee, scrutinee_type, context)?;
+    let scrutinee_owned = rvalue_has_owned_temporary(&scrutinee_value);
+    let scrutinee_local = if scrutinee_owned {
+        context.declare_owned_temp(scrutinee_type)
+    } else {
+        context.declare_borrowed_temp(scrutinee_type, false)
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: scrutinee_local,
+        value: scrutinee_value,
+    });
+
+    let result_local = if expected.has_move_ownership() && transfer {
+        context.declare_return_temp(expected, true)
+    } else {
+        context.declare_borrowed_temp(expected, false)
+    };
+    let plan_block = context.current_block();
+    let merge_block = context.create_block();
+    let mut fallback = None;
+    let mut arm_blocks = Vec::with_capacity(arms.len());
+
+    for (index, (arm, arm_info)) in arms.iter().zip(&info.arms).enumerate() {
+        let arm_block = context.create_block();
+        arm_blocks.push(arm_block);
+        let next_block = if index + 1 == arms.len() {
+            *fallback.get_or_insert_with(|| context.create_block())
+        } else {
+            context.create_block()
+        };
+        lower_match_pattern_to_blocks(
+            &arm.pattern,
+            arm_info,
+            scrutinee_local,
+            scrutinee_type,
+            info.condition_mode,
+            arm_block,
+            next_block,
+            context,
+        )?;
+
+        context.current_block = Some(arm_block);
+        context.push_scope();
+        if let Some(name) = match_scrutinee_binding_name(scrutinee) {
+            context
+                .local_scopes
+                .last_mut()
+                .expect("match arm must have a local scope")
+                .insert(name.to_string(), scrutinee_local);
+        }
+        bind_match_arm(
+            &arm.pattern,
+            arm_info,
+            scrutinee_local,
+            scrutinee_type,
+            context,
+        )?;
+        let arm_value = if transfer {
+            lower_rvalue_as_expected(&arm.value, expected, context)?
+        } else {
+            let value = lower_rvalue_as_borrowed(&arm.value, expected, context)?;
+            if rvalue_has_owned_temporary(&value) {
+                let owner = context.declare_owned_temp(expected);
+                context.push_statement(mir::Statement::AssignLocal {
+                    target: owner,
+                    value,
+                });
+                local_rvalue(owner, expected, false)
+            } else {
+                value
+            }
+        };
+        context.push_statement(mir::Statement::AssignLocal {
+            target: result_local,
+            value: arm_value,
+        });
+        context.pop_scope();
+        if context.current_block.is_some() {
+            context.terminate_current(mir::Terminator::Jump(merge_block));
+        }
+        context.current_block = Some(next_block);
+    }
+
+    if let Some(fallback) = fallback {
+        context.current_block = Some(fallback);
+        context.terminate_current(mir::Terminator::Unreachable);
+    }
+    context.blocks[plan_block.0]
+        .statements
+        .push(mir::Statement::MatchResultPlan {
+            result: result_local,
+            arms: arm_blocks,
+            merge: merge_block,
+        });
+    context.current_block = Some(merge_block);
+    Ok(local_rvalue(result_local, expected, transfer))
+}
+
+fn match_scrutinee_binding_name(expr: &hir::Expr) -> Option<&str> {
+    match expr {
+        hir::Expr::Variable { name, .. } => Some(name),
+        hir::Expr::Grouped { expr, .. } => match_scrutinee_binding_name(expr),
+        _ => None,
+    }
+}
+
+fn rvalue_has_owned_temporary(value: &mir::Rvalue) -> bool {
+    value.owned_temporary_class().is_some()
+        || value.owned_temporary_collection().is_some()
+        || value.owned_temporary_shared().is_some()
+        || value.owned_temporary_payload_enum().is_some()
+        || !matches!(value.mixed_ownership(), mir::MixedOwnership::None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_match_pattern_to_blocks(
+    pattern: &hir::MatchPattern,
+    info: &crate::semantics::MatchArmSemanticInfo,
+    scrutinee: mir::LocalId,
+    scrutinee_type: mir::Type,
+    condition_mode: bool,
+    arm_block: mir::BlockId,
+    next_block: mir::BlockId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    use crate::semantics::ResolvedMatchPattern;
+
+    if condition_mode {
+        return match pattern {
+            hir::MatchPattern::Default { .. } => {
+                context.terminate_current(mir::Terminator::Jump(arm_block));
+                Ok(())
+            }
+            hir::MatchPattern::Expression(condition) => {
+                lower_condition_to_blocks(condition, arm_block, next_block, context)
+            }
+            _ => Err(vec![Diagnostic::new(
+                "I2801",
+                "checked match(true) arm has a non-condition pattern",
+                match_pattern_span(pattern),
+            )]),
+        };
+    }
+
+    match &info.pattern {
+        ResolvedMatchPattern::Default => {
+            context.terminate_current(mir::Terminator::Jump(arm_block));
+        }
+        ResolvedMatchPattern::Null => {
+            let present = match_presence_condition(scrutinee, scrutinee_type, context)?;
+            context.terminate_condition(present, next_block, arm_block);
+        }
+        ResolvedMatchPattern::EnumCase { enum_id, case_id } => {
+            if let Some(ty) = context.enum_types.get(enum_id).copied() {
+                let nullable = matches!(scrutinee_type, mir::Type::NullablePayloadEnum(_));
+                context.terminate_condition(
+                    mir::BoolExpression::PayloadEnumIsCase {
+                        local: scrutinee,
+                        ty,
+                        case: *case_id,
+                        nullable,
+                    },
+                    arm_block,
+                    next_block,
+                );
+            } else {
+                lower_match_constant_to_blocks(
+                    scrutinee,
+                    scrutinee_type,
+                    &crate::const_eval::ConstValue::Enum(crate::enums::EnumValue {
+                        enum_id: *enum_id,
+                        case_id: *case_id,
+                    }),
+                    arm_block,
+                    next_block,
+                    context,
+                )?;
+            }
+        }
+        ResolvedMatchPattern::Constant(value) => {
+            lower_match_constant_to_blocks(
+                scrutinee,
+                scrutinee_type,
+                value,
+                arm_block,
+                next_block,
+                context,
+            )?;
+        }
+        ResolvedMatchPattern::ExactType(ty) => {
+            let narrowed = context.mir_resolved_type(ty).ok_or_else(|| {
+                vec![unsupported(
+                    match_pattern_span(pattern),
+                    "match type pattern has no native representation",
+                )]
+            })?;
+            let condition = match scrutinee_type {
+                mir::Type::Mixed | mir::Type::NullableMixed => mir::BoolExpression::MixedIs {
+                    mixed: Box::new(mir::MixedExpression::Local {
+                        local: scrutinee,
+                        transfer: false,
+                    }),
+                    tag: mixed_tag_for_type(narrowed, match_pattern_span(pattern))?,
+                },
+                _ => match_presence_condition(scrutinee, scrutinee_type, context)?,
+            };
+            context.terminate_condition(condition, arm_block, next_block);
+        }
+        ResolvedMatchPattern::Condition => {
+            return Err(vec![Diagnostic::new(
+                "I2801",
+                "ordinary match arm retained a condition-only pattern",
+                match_pattern_span(pattern),
+            )]);
+        }
+    }
+    Ok(())
+}
+
+fn lower_match_constant_to_blocks(
+    scrutinee: mir::LocalId,
+    scrutinee_type: mir::Type,
+    value: &crate::const_eval::ConstValue,
+    arm_block: mir::BlockId,
+    next_block: mir::BlockId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let (base, nullable) = non_null_match_type(scrutinee_type);
+    if nullable {
+        let compare_block = context.create_block();
+        let present = match_presence_condition(scrutinee, scrutinee_type, context)?;
+        context.terminate_condition(present, compare_block, next_block);
+        context.current_block = Some(compare_block);
+    }
+    let constant = lower_const_rvalue(
+        value,
+        base,
+        Span::default(),
+        &context.enum_types,
+        context.semantic_info,
+    )?;
+    let condition = match (base, constant) {
+        (mir::Type::Scalar(ty), mir::Rvalue::Value(right)) => {
+            let operand = if nullable {
+                mir::Operand::NullablePayload(scrutinee)
+            } else {
+                mir::Operand::Local(scrutinee)
+            };
+            mir::BoolExpression::Compare {
+                op: mir::CompareOp::Equal,
+                left: Box::new(value_expression_from_operand(ty, operand)),
+                right: Box::new(right),
+            }
+        }
+        (mir::Type::String, mir::Rvalue::String(right)) => {
+            let left = if nullable {
+                mir::StringExpression::NullableLocalAssumeNonNull(scrutinee)
+            } else {
+                mir::StringExpression::Local(scrutinee)
+            };
+            mir::BoolExpression::StringCompare {
+                op: mir::CompareOp::Equal,
+                left: Box::new(left),
+                right: Box::new(right),
+            }
+        }
+        (mir::Type::PayloadEnum(ty), mir::Rvalue::PayloadEnum(right)) => {
+            let place = if nullable {
+                mir::PayloadEnumPlace::NullableLocalAssumeNonNull(scrutinee)
+            } else {
+                mir::PayloadEnumPlace::Local(scrutinee)
+            };
+            mir::BoolExpression::PayloadEnumCompare {
+                op: mir::CompareOp::Equal,
+                left: Box::new(mir::PayloadEnumExpression::Use {
+                    ty,
+                    place,
+                    mode: mir::PayloadEnumUseMode::Borrow,
+                }),
+                right: Box::new(right),
+            }
+        }
+        _ => {
+            return Err(vec![Diagnostic::new(
+                "I2801",
+                "checked match constant has no strict native comparison",
+                Span::default(),
+            )]);
+        }
+    };
+    context.terminate_condition(condition, arm_block, next_block);
+    Ok(())
+}
+
+fn non_null_match_type(ty: mir::Type) -> (mir::Type, bool) {
+    match ty {
+        mir::Type::NullableScalar(ty) => (mir::Type::Scalar(ty), true),
+        mir::Type::NullableString => (mir::Type::String, true),
+        mir::Type::NullableClass(class) => (mir::Type::Class(class), true),
+        mir::Type::NullableCollection(collection) => (mir::Type::Collection(collection), true),
+        mir::Type::NullablePayloadEnum(ty) => (mir::Type::PayloadEnum(ty), true),
+        other => (other, false),
+    }
+}
+
+fn match_presence_condition(
+    local: mir::LocalId,
+    ty: mir::Type,
+    _context: &LoweringContext,
+) -> DiagnosticResult<mir::BoolExpression> {
+    let condition = match ty {
+        mir::Type::NullableScalar(ty) => mir::BoolExpression::NullableScalarIsPresent(Box::new(
+            mir::NullableScalarExpression::Local { ty, local },
+        )),
+        mir::Type::NullableString => mir::BoolExpression::NullableStringCompare {
+            op: mir::CompareOp::NotEqual,
+            left: Box::new(mir::NullableStringExpression::Local(local)),
+            right: Box::new(mir::NullableStringExpression::Null),
+        },
+        mir::Type::NullableClass(class) => mir::BoolExpression::NullableClassIsPresent(Box::new(
+            mir::NullableClassExpression::Local {
+                class,
+                local,
+                transfer: false,
+            },
+        )),
+        mir::Type::NullableCollection(collection) => {
+            mir::BoolExpression::NullableCollectionIsPresent(Box::new(
+                mir::NullableCollectionExpression::Local {
+                    collection,
+                    local,
+                    transfer: false,
+                },
+            ))
+        }
+        mir::Type::NullableMixed => mir::BoolExpression::NullableMixedIsPresent(Box::new(
+            mir::NullableMixedExpression::Local {
+                local,
+                transfer: false,
+            },
+        )),
+        mir::Type::NullablePayloadEnum(ty) => mir::BoolExpression::NullablePayloadEnumIsPresent(
+            Box::new(mir::NullablePayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::Local(local),
+                mode: mir::PayloadEnumUseMode::Borrow,
+            }),
+        ),
+        mir::Type::Mixed => mir::BoolExpression::NullableMixedIsPresent(Box::new(
+            mir::NullableMixedExpression::Mixed(mir::MixedExpression::Local {
+                local,
+                transfer: false,
+            }),
+        )),
+        _ => {
+            return Err(vec![Diagnostic::new(
+                "I2801",
+                "match null or exact-type pattern requires a nullable or mixed scrutinee",
+                Span::default(),
+            )]);
+        }
+    };
+    Ok(condition)
+}
+
+fn bind_match_arm(
+    pattern: &hir::MatchPattern,
+    info: &crate::semantics::MatchArmSemanticInfo,
+    scrutinee: mir::LocalId,
+    scrutinee_type: mir::Type,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    match pattern {
+        hir::MatchPattern::EnumCase {
+            bindings: Some(bindings),
+            ..
+        } if !bindings.is_empty() => {
+            let (ty, nullable) = match scrutinee_type {
+                mir::Type::PayloadEnum(ty) => (ty, false),
+                mir::Type::NullablePayloadEnum(ty) => (ty, true),
+                _ => {
+                    return Err(vec![Diagnostic::new(
+                        "I2801",
+                        "payload bindings require a payload-enum scrutinee",
+                        match_pattern_span(pattern),
+                    )]);
+                }
+            };
+            let crate::semantics::ResolvedMatchPattern::EnumCase { case_id, .. } = info.pattern
+            else {
+                return Err(vec![Diagnostic::new(
+                    "I2801",
+                    "payload binding has no resolved enum case",
+                    match_pattern_span(pattern),
+                )]);
+            };
+            let targets = bindings
+                .iter()
+                .zip(&info.bindings)
+                .map(|(binding, binding_info)| {
+                    let ty = context.mir_resolved_type(&binding_info.ty).ok_or_else(|| {
+                        vec![unsupported(
+                            binding.span,
+                            "match payload field has no native representation",
+                        )]
+                    })?;
+                    let owned = !binding_info.borrowed
+                        && matches!(
+                            ty,
+                            mir::Type::PayloadEnum(payload)
+                                | mir::Type::NullablePayloadEnum(payload)
+                                if payload.capabilities.needs_drop
+                        );
+                    Ok(context.declare_pattern_local(&binding.name, ty, owned))
+                })
+                .collect::<DiagnosticResult<Vec<_>>>()?;
+            context.push_statement(mir::Statement::BindPayloadEnumFields {
+                source: scrutinee,
+                ty,
+                case: case_id,
+                nullable,
+                targets,
+            });
+        }
+        hir::MatchPattern::TypeBinding { binding, .. } => {
+            let [binding_info] = &info.bindings[..] else {
+                return Err(vec![Diagnostic::new(
+                    "I2801",
+                    "type-binding pattern has no resolved binding",
+                    binding.span,
+                )]);
+            };
+            let ty = context.mir_resolved_type(&binding_info.ty).ok_or_else(|| {
+                vec![unsupported(
+                    binding.span,
+                    "match type binding has no native representation",
+                )]
+            })?;
+            let target = context.declare_pattern_local(&binding.name, ty, false);
+            let value = narrowed_match_local_rvalue(scrutinee, scrutinee_type, ty, binding.span)?;
+            context.push_statement(mir::Statement::AssignLocal { target, value });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn narrowed_match_local_rvalue(
+    local: mir::LocalId,
+    source: mir::Type,
+    narrowed: mir::Type,
+    span: Span,
+) -> DiagnosticResult<mir::Rvalue> {
+    let value = match (source, narrowed) {
+        (mir::Type::NullableScalar(source), mir::Type::Scalar(target)) if source == target => {
+            mir::Rvalue::Value(value_expression_from_operand(
+                target,
+                mir::Operand::NullablePayload(local),
+            ))
+        }
+        (mir::Type::NullableString, mir::Type::String) => {
+            mir::Rvalue::String(mir::StringExpression::NullableLocalAssumeNonNull(local))
+        }
+        (mir::Type::NullableClass(source), mir::Type::Class(target)) if source == target => {
+            mir::Rvalue::Class(mir::ClassExpression::NullableLocalAssumeNonNull {
+                class: target,
+                local,
+                transfer: false,
+            })
+        }
+        (mir::Type::NullablePayloadEnum(source), mir::Type::PayloadEnum(target))
+            if source == target =>
+        {
+            mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+                ty: target,
+                place: mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local),
+                mode: mir::PayloadEnumUseMode::Borrow,
+            })
+        }
+        (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::Scalar(target)) => {
+            mir::Rvalue::Value(value_expression_from_operand(
+                target,
+                mir::Operand::MixedPayload {
+                    mixed: local,
+                    tag: mixed_tag_for_type(mir::Type::Scalar(target), span)?,
+                },
+            ))
+        }
+        (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::String) => {
+            mir::Rvalue::String(mir::StringExpression::MixedPayload(local))
+        }
+        (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::Class(class)) => {
+            mir::Rvalue::Class(mir::ClassExpression::MixedPayload {
+                mixed: local,
+                class,
+                transfer: false,
+            })
+        }
+        (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::PayloadEnum(ty)) => {
+            mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::MixedPayload { mixed: local },
+                mode: mir::PayloadEnumUseMode::Borrow,
+            })
+        }
+        (source, target) if source == target => local_rvalue(local, target, false),
+        _ => {
+            return Err(vec![Diagnostic::new(
+                "I2801",
+                "match type binding has no native narrowing projection",
+                span,
+            )]);
+        }
+    };
+    Ok(value)
+}
+
+fn match_pattern_span(pattern: &hir::MatchPattern) -> Span {
+    match pattern {
+        hir::MatchPattern::Default { span }
+        | hir::MatchPattern::EnumCase { span, .. }
+        | hir::MatchPattern::TypeBinding { span, .. } => *span,
+        hir::MatchPattern::Expression(expr) => expr.span(),
+    }
+}
+
 fn lower_condition_to_blocks(
     expr: &hir::Expr,
     then_block: mir::BlockId,
@@ -7892,6 +8567,18 @@ fn lower_condition(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::Value(mir::ValueExpression::Bool(value)) = lower_match_rvalue(
+            expr,
+            mir::Type::Scalar(mir::ScalarType::Bool),
+            false,
+            context,
+        )?
+        else {
+            unreachable!("bool match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if let Some(call) = lower_string_intrinsic_call(expr, context) {
         let call = call?;
         if call.result != mir::Type::Scalar(mir::ScalarType::Bool) {
@@ -8800,6 +9487,13 @@ fn lower_value_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ValueExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let expected = context.expression_type(expr)?;
+        let mir::Rvalue::Value(value) = lower_match_rvalue(expr, expected, false, context)? else {
+            unreachable!("scalar match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if let hir::Expr::FunctionCall { name, span, .. } = expr {
         if context.lookup_function(name, *span)?.return_type == mir::ReturnType::Void {
             return Err(vec![unsupported(
@@ -9120,6 +9814,9 @@ fn lower_rvalue_as_expected(
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        return lower_match_rvalue(expr, expected, true, context);
+    }
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != expected {
             return Err(vec![unsupported(
@@ -9210,6 +9907,9 @@ fn lower_rvalue_as_borrowed(
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        return lower_match_rvalue(expr, expected, false, context);
+    }
     match expected {
         mir::Type::Class(class) => {
             lower_class_expression(expr, class, false, context).map(mir::Rvalue::Class)
@@ -9285,6 +9985,14 @@ fn lower_payload_enum_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::PayloadEnumExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::PayloadEnum(value) =
+            lower_match_rvalue(expr, mir::Type::PayloadEnum(ty), transfer, context)?
+        else {
+            unreachable!("payload-enum match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if let hir::Expr::Grouped { expr, .. } = expr {
         return lower_payload_enum_expression(expr, ty, transfer, context);
     }
@@ -9545,6 +10253,14 @@ fn lower_nullable_payload_enum_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullablePayloadEnumExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::NullablePayloadEnum(value) =
+            lower_match_rvalue(expr, mir::Type::NullablePayloadEnum(ty), transfer, context)?
+        else {
+            unreachable!("nullable payload-enum match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if context.expression_is_null(expr) {
         return Ok(mir::NullablePayloadEnumExpression::Null(ty));
     }
@@ -9742,6 +10458,14 @@ fn lower_mixed_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::MixedExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::Mixed(value) =
+            lower_match_rvalue(expr, mir::Type::Mixed, transfer, context)?
+        else {
+            unreachable!("mixed match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     // `List<mixed>::removeAt(i)` is a collection removal, not a class method call, so it
     // must be intercepted before the method-call arm below (which requires a concrete
     // class receiver). It removes the element and hands back the owned box, mirroring the
@@ -9963,6 +10687,14 @@ fn lower_nullable_mixed_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableMixedExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::NullableMixed(value) =
+            lower_match_rvalue(expr, mir::Type::NullableMixed, transfer, context)?
+        else {
+            unreachable!("nullable-mixed match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if context.expression_is_null(expr) {
         return Ok(mir::NullableMixedExpression::Null);
     }
@@ -10050,6 +10782,14 @@ fn lower_collection_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::CollectionExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::Collection(value) =
+            lower_match_rvalue(expr, mir::Type::Collection(expected), transfer, context)?
+        else {
+            unreachable!("collection match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if let Some(call) = lower_string_intrinsic_call(expr, context) {
         let call = call?;
         if call.result != mir::Type::Collection(expected) {
@@ -10447,6 +11187,18 @@ fn lower_nullable_collection_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableCollectionExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::NullableCollection(value) = lower_match_rvalue(
+            expr,
+            mir::Type::NullableCollection(expected),
+            transfer,
+            context,
+        )?
+        else {
+            unreachable!("nullable collection match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     match expr {
         hir::Expr::Null { .. } => Ok(mir::NullableCollectionExpression::Null(expected)),
         hir::Expr::Grouped { expr, .. } => {
@@ -12060,6 +12812,14 @@ fn lower_class_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ClassExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let mir::Rvalue::Class(value) =
+            lower_match_rvalue(expr, mir::Type::Class(expected), transfer, context)?
+        else {
+            unreachable!("class match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if let Some((access, writable)) = lower_shared_access_payload_local(
         expr,
         mir::WritableSharedPayload::Class(expected),
@@ -14777,6 +15537,19 @@ fn lower_float_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::FloatExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let ty = context.float_type(expr)?;
+        let mir::Rvalue::Value(mir::ValueExpression::Float(value)) = lower_match_rvalue(
+            expr,
+            mir::Type::Scalar(mir::ScalarType::Float(ty)),
+            false,
+            context,
+        )?
+        else {
+            unreachable!("float match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if let Some(crate::const_eval::ConstValue::Float(value)) = context.constant_value(expr) {
         return Ok(mir::FloatExpression::constant(*value));
     }
@@ -15020,6 +15793,19 @@ fn lower_integer_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::IntegerExpression> {
+    if matches!(expr, hir::Expr::Match { .. }) {
+        let ty = context.integer_type(expr)?;
+        let mir::Rvalue::Value(mir::ValueExpression::Integer(value)) = lower_match_rvalue(
+            expr,
+            mir::Type::Scalar(mir::ScalarType::Integer(ty)),
+            false,
+            context,
+        )?
+        else {
+            unreachable!("integer match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
     if let Some(call) = lower_string_intrinsic_call(expr, context) {
         let call = call?;
         let mir::Type::Scalar(mir::ScalarType::Integer(ty)) = call.result else {

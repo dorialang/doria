@@ -2,7 +2,7 @@ use doriac::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId}
 use doriac::enums::{EnumBackingType, EnumBackingValue, EnumCaseId, EnumId, EnumValue};
 use doriac::format_string::{FormatConversion, FormatPiece, FormatSpec};
 use doriac::mir::{
-    BasicBlock, BlockId, BoolExpression, Class, ClassExpression, CollectionComparator,
+    self, BasicBlock, BlockId, BoolExpression, Class, ClassExpression, CollectionComparator,
     CollectionExpression, CollectionKind, CollectionMembershipOp, CollectionType, CollectionTypeId,
     EnumExpression, FloatBinaryOp, FloatExpression, FormatArgument, FormatExpression, Function,
     FunctionId, IntegerExpression, Local, LocalId, MixedExpression, NullableClassExpression,
@@ -13,6 +13,287 @@ use doriac::mir::{
     WeakReferenceExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
+
+fn first_payload_binding<'a>(program: &'a mut Program, function_name: &str) -> &'a mut Statement {
+    program
+        .functions
+        .iter_mut()
+        .find(|function| function.name == function_name)
+        .expect("function should exist")
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find(|statement| matches!(statement, Statement::BindPayloadEnumFields { .. }))
+        .expect("payload binding should exist")
+}
+
+#[test]
+fn shared_validator_rejects_malformed_match_dispatch_projection_and_result_plans() {
+    let source = r#"
+class Box { function __construct(int $value) {} }
+enum CopyResult { case Empty; case Text(string $value); }
+enum MoveResult { case Empty; case Value(Box $value); }
+function copyLabel(CopyResult $result): string
+{
+    return match ($result) {
+        CopyResult::Empty => "empty",
+        CopyResult::Text($value) => $value,
+    };
+}
+function moveLabel(MoveResult $result): string
+{
+    return match ($result) {
+        MoveResult::Empty => "empty",
+        MoveResult::Value($value) => "value {$value->value}",
+    };
+}
+function mixedLabel(mixed $value): string
+{
+    return match ($value) { int $number => "{$number}", default => "other", };
+}
+function main(): void { echo copyLabel(CopyResult::Text("ready")); }
+"#;
+    let valid = doriac::lower_source_to_mir("stage28-validation.doria", source)
+        .expect("valid match source should lower");
+    doriac::mir_validation::validate_program(&valid).expect("valid match MIR should validate");
+
+    let malformed = |program: &Program, expected: &str| {
+        let error = doriac::mir_validation::validate_program(program)
+            .expect_err("malformed match MIR must stop before backend emission");
+        assert!(
+            error.message.contains(expected),
+            "expected {expected:?}, got {:?}",
+            error.message
+        );
+    };
+
+    let mut unknown_enum = valid.clone();
+    let (source, unknown_ty) = {
+        let Statement::BindPayloadEnumFields { source, ty, .. } =
+            first_payload_binding(&mut unknown_enum, "copyLabel")
+        else {
+            unreachable!()
+        };
+        ty.id = EnumId(99);
+        (*source, *ty)
+    };
+    let function = unknown_enum
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "copyLabel")
+        .expect("copyLabel should exist");
+    function.locals[source.0].ty = Type::PayloadEnum(unknown_ty);
+    malformed(&unknown_enum, "enum#99");
+
+    let mut unknown_case = valid.clone();
+    let Statement::BindPayloadEnumFields { case, .. } =
+        first_payload_binding(&mut unknown_case, "copyLabel")
+    else {
+        unreachable!()
+    };
+    case.index = 99;
+    malformed(&unknown_case, "payload binding case does not exist");
+
+    let mut wrong_enum_case = valid.clone();
+    let Statement::BindPayloadEnumFields { case, .. } =
+        first_payload_binding(&mut wrong_enum_case, "copyLabel")
+    else {
+        unreachable!()
+    };
+    *case = EnumCaseId {
+        enum_id: EnumId(1),
+        index: 1,
+    };
+    malformed(&wrong_enum_case, "payload binding case does not exist");
+
+    let mut unit_projection = valid.clone();
+    let Statement::BindPayloadEnumFields { case, .. } =
+        first_payload_binding(&mut unit_projection, "copyLabel")
+    else {
+        unreachable!()
+    };
+    case.index = 0;
+    malformed(
+        &unit_projection,
+        "payload binding arity does not match its case",
+    );
+
+    let mut wrong_field = valid.clone();
+    let Statement::BindPayloadEnumFields { targets, .. } =
+        first_payload_binding(&mut wrong_field, "copyLabel")
+    else {
+        unreachable!()
+    };
+    targets.pop();
+    malformed(
+        &wrong_field,
+        "payload binding arity does not match its case",
+    );
+
+    let mut wrong_field_type = valid.clone();
+    let function = wrong_field_type
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "copyLabel")
+        .expect("copyLabel should exist");
+    let target = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::BindPayloadEnumFields { targets, .. } => targets.first().copied(),
+            _ => None,
+        })
+        .expect("payload target should exist");
+    function.locals[target.0].ty = Type::Scalar(ScalarType::Bool);
+    malformed(
+        &wrong_field_type,
+        "payload binding target has incompatible readonly copy/borrow ownership",
+    );
+
+    let mut move_marked_owned = valid.clone();
+    let function = move_marked_owned
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "moveLabel")
+        .expect("moveLabel should exist");
+    let target = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::BindPayloadEnumFields { targets, .. } => targets.first().copied(),
+            _ => None,
+        })
+        .expect("move payload target should exist");
+    function.locals[target.0].owned = true;
+    malformed(
+        &move_marked_owned,
+        "payload binding target has incompatible readonly copy/borrow ownership",
+    );
+
+    let mut no_case_proof = valid.clone();
+    let function = no_case_proof
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "copyLabel")
+        .expect("copyLabel should exist");
+    let condition = function
+        .blocks
+        .iter_mut()
+        .find_map(|block| match &mut block.terminator {
+            Terminator::Branch {
+                condition: BoolExpression::PayloadEnumIsCase { case, .. },
+                ..
+            } if case.index == 1 => Some(case),
+            _ => None,
+        })
+        .expect("payload case test should exist");
+    condition.index = 0;
+    malformed(&no_case_proof, "without a dominating exact case proof");
+
+    let mut nullable_mismatch = valid.clone();
+    let Statement::BindPayloadEnumFields { nullable, .. } =
+        first_payload_binding(&mut nullable_mismatch, "copyLabel")
+    else {
+        unreachable!()
+    };
+    *nullable = true;
+    malformed(
+        &nullable_mismatch,
+        "payload binding source has an incompatible enum type",
+    );
+
+    let mut wrong_mixed_tag = valid.clone();
+    let function = wrong_mixed_tag
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "mixedLabel")
+        .expect("mixedLabel should exist");
+    let tag = function
+        .blocks
+        .iter_mut()
+        .find_map(|block| match &mut block.terminator {
+            Terminator::Branch {
+                condition: BoolExpression::MixedIs { tag, .. },
+                ..
+            } => Some(tag),
+            _ => None,
+        })
+        .expect("mixed type test should exist");
+    *tag = mir::MixedTag::String;
+    malformed(&wrong_mixed_tag, "without a dominating exact `is` proof");
+
+    let mut missing_result = valid.clone();
+    let function = missing_result
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "copyLabel")
+        .expect("copyLabel should exist");
+    let (result, arm) = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::MatchResultPlan { result, arms, .. } => Some((*result, arms[0])),
+            _ => None,
+        })
+        .expect("match result plan should exist");
+    function.blocks[arm.0].statements.retain(
+        |statement| !matches!(statement, Statement::AssignLocal { target, .. } if *target == result),
+    );
+    malformed(
+        &missing_result,
+        "reaches its merge with 0 result assignments",
+    );
+
+    let mut duplicate_result = valid.clone();
+    let function = duplicate_result
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "copyLabel")
+        .expect("copyLabel should exist");
+    let (result, arm) = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::MatchResultPlan { result, arms, .. } => Some((*result, arms[0])),
+            _ => None,
+        })
+        .expect("match result plan should exist");
+    let assignment = function.blocks[arm.0]
+        .statements
+        .iter()
+        .find(|statement| {
+            matches!(statement, Statement::AssignLocal { target, .. } if *target == result)
+        })
+        .cloned()
+        .expect("arm result assignment should exist");
+    function.blocks[arm.0].statements.push(assignment);
+    malformed(
+        &duplicate_result,
+        "assigns its result more than once on one path",
+    );
+
+    let mut wrong_merge_type = valid;
+    let function = wrong_merge_type
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "copyLabel")
+        .expect("copyLabel should exist");
+    let result = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::MatchResultPlan { result, .. } => Some(*result),
+            _ => None,
+        })
+        .expect("match result plan should exist");
+    function.locals[result.0].ty = Type::Scalar(ScalarType::Bool);
+    malformed(&wrong_merge_type, "used as a string operand");
+}
 
 #[test]
 fn shared_validator_rejects_malformed_enum_identity_and_projection_shapes() {

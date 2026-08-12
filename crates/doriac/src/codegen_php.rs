@@ -7,7 +7,7 @@ use crate::diagnostics::Diagnostic;
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::hir::*;
 use crate::numeric::{parse_decimal_magnitude, FloatType, IntegerType};
-use crate::semantics::SemanticInfo;
+use crate::semantics::{MatchSemanticInfo, ResolvedMatchPattern, SemanticInfo};
 use crate::source::Span;
 use crate::types::{ResolvedType, TypeRef};
 
@@ -711,6 +711,21 @@ function __doria_printf(int $start, int $end, string $format, mixed ...$values):
         payload_class_constants,
         payload_enum_expressions,
     );
+    scopes.matches = program.semantic_info.matches.clone();
+    scopes.const_evaluation = program.semantic_info.const_evaluation.clone();
+    scopes.payload_case_tags = program
+        .semantic_info
+        .enums
+        .iter()
+        .filter(|definition| definition.cases.iter().any(|case| !case.payload.is_empty()))
+        .flat_map(|definition| {
+            definition
+                .cases
+                .iter()
+                .map(|case| (case.id, case.tag))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     for item in &program.items {
         emit_item(item, &program.semantic_info, &mut output, 0, &mut scopes);
         if !output.ends_with("\n\n") {
@@ -1392,10 +1407,50 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             validate_expr(start, semantic_info)?;
             validate_expr(end, semantic_info)
         }
-        Expr::Match { span, .. } => Err(BackendError::new(format!(
-            "match expressions must be rejected by Stage 28 semantic checking before PHP emission at {}..{}",
-            span.start, span.end
-        ))),
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+            ..
+        } => {
+            validate_expr(scrutinee, semantic_info)?;
+            let info = semantic_info
+                .matches
+                .get(&(span.start, span.end))
+                .ok_or_else(|| BackendError::new("checked match has no semantic plan"))?;
+            for (arm, arm_info) in arms.iter().zip(&info.arms) {
+                if matches!(info.scrutinee_type, ResolvedType::Mixed) {
+                    let numeric_type = match &arm_info.pattern {
+                        ResolvedMatchPattern::ExactType(ResolvedType::Integer(integer)) => {
+                            Some(integer.source_name())
+                        }
+                        ResolvedMatchPattern::ExactType(ResolvedType::Float(float)) => {
+                            Some(float.source_name())
+                        }
+                        _ => None,
+                    };
+                    if let Some(numeric_type) = numeric_type {
+                        return Err(unsupported_numeric_shape(
+                            arm.span,
+                            format!(
+                                "exact `{numeric_type}` matching after `mixed` erased the numeric width"
+                            ),
+                        ));
+                    }
+                }
+                match (&arm.pattern, &arm_info.pattern) {
+                    (MatchPattern::Expression(pattern), ResolvedMatchPattern::Condition) => {
+                        validate_expr(pattern, semantic_info)?;
+                    }
+                    (_, ResolvedMatchPattern::Constant(value)) => {
+                        validate_const_value(value, arm.span)?;
+                    }
+                    _ => {}
+                }
+                validate_expr(&arm.value, semantic_info)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1657,7 +1712,7 @@ fn is_stage23_runtime_type(ty: &ResolvedType) -> bool {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 struct PhpNameScopes {
     scopes: Vec<HashMap<String, String>>,
     used_php_names: HashSet<String>,
@@ -1667,6 +1722,9 @@ struct PhpNameScopes {
     payload_top_constants: HashSet<String>,
     payload_class_constants: HashSet<(String, String)>,
     payload_enum_expressions: HashSet<(usize, usize)>,
+    payload_case_tags: HashMap<crate::enums::EnumCaseId, u32>,
+    matches: HashMap<(usize, usize), MatchSemanticInfo>,
+    const_evaluation: Evaluation,
 }
 
 impl PhpNameScopes {
@@ -1686,17 +1744,24 @@ impl PhpNameScopes {
             payload_top_constants,
             payload_class_constants,
             payload_enum_expressions,
+            payload_case_tags: HashMap::new(),
+            matches: HashMap::new(),
+            const_evaluation: Evaluation::default(),
         }
     }
 
     fn expression_scope(&self) -> Self {
-        Self::new(
+        let mut scopes = Self::new(
             self.static_properties.clone(),
             self.payload_unit_cases.clone(),
             self.payload_top_constants.clone(),
             self.payload_class_constants.clone(),
             self.payload_enum_expressions.clone(),
-        )
+        );
+        scopes.payload_case_tags = self.payload_case_tags.clone();
+        scopes.matches = self.matches.clone();
+        scopes.const_evaluation = self.const_evaluation.clone();
+        scopes
     }
 
     fn is_static_property(&self, class_name: &str, member: &str) -> bool {
@@ -1757,6 +1822,29 @@ impl PhpNameScopes {
                 return candidate;
             }
         }
+    }
+
+    fn expression_temp(&self, prefix: &str, span: Span) -> String {
+        let base = format!("{prefix}{}", span.start);
+        if !self.used_php_names.contains(&base) {
+            return base;
+        }
+        (1..)
+            .map(|suffix| format!("{base}_{suffix}"))
+            .find(|candidate| !self.used_php_names.contains(candidate))
+            .expect("an unused PHP expression temporary name must exist")
+    }
+
+    fn captured_php_names(&self) -> Vec<String> {
+        let mut names = self
+            .scopes
+            .iter()
+            .flat_map(|scope| scope.values().cloned())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     fn lookup(&self, name: &str) -> Option<&str> {
@@ -1861,6 +1949,25 @@ fn emit_payload_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize) {
     writeln(output, indent + 1, "{");
     writeln(output, indent + 2, "$this->__doriaTag = $tag;");
     writeln(output, indent + 2, "$this->__doriaPayload = $payload;");
+    writeln(output, indent + 1, "}");
+
+    output.push('\n');
+    writeln(
+        output,
+        indent + 1,
+        "public function __doriaMatchesCase(int $tag): bool",
+    );
+    writeln(output, indent + 1, "{");
+    writeln(output, indent + 2, "return $this->__doriaTag === $tag;");
+    writeln(output, indent + 1, "}");
+    output.push('\n');
+    writeln(
+        output,
+        indent + 1,
+        "public function __doriaPayloadAt(int $index): mixed",
+    );
+    writeln(output, indent + 1, "{");
+    writeln(output, indent + 2, "return $this->__doriaPayload[$index];");
     writeln(output, indent + 1, "}");
 
     for (tag, case) in enum_decl.cases.iter().enumerate() {
@@ -3088,8 +3195,163 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
             emit_expr(start, scopes),
             emit_expr(end, scopes)
         ),
-        Expr::Match { .. } => unreachable!("semantic analysis rejects match before PHP lowering"),
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+            ..
+        } => emit_match_expression(scrutinee, arms, *span, scopes),
     }
+}
+
+fn emit_match_expression(
+    scrutinee: &Expr,
+    arms: &[MatchArm],
+    span: Span,
+    scopes: &PhpNameScopes,
+) -> String {
+    let info = scopes
+        .matches
+        .get(&(span.start, span.end))
+        .expect("checked match must have a semantic plan");
+    let temporary = scopes.expression_temp("__doriaMatch", span);
+    let captures = scopes.captured_php_names();
+    let capture_list = if captures.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " use ({})",
+            captures
+                .iter()
+                .map(|name| format!("&${name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let mut output = format!("(function(${temporary}){capture_list} {{ ");
+
+    for (index, (arm, arm_info)) in arms.iter().zip(&info.arms).enumerate() {
+        let mut arm_scopes = scopes.clone();
+        arm_scopes.push();
+        // Semantic analysis proves every checked match exhaustive. Once all
+        // earlier arms fail, the final arm is therefore the remaining case;
+        // emitting it unconditionally keeps PHP from inventing a Doria runtime
+        // "no arm matched" path that cannot exist in valid source.
+        let condition = (index + 1 != arms.len()).then(|| {
+            emit_php_match_condition(&temporary, &arm.pattern, &arm_info.pattern, &arm_scopes)
+                .expect("only the final checked match arm may be unconditional")
+        });
+        if let Some(ref condition) = condition {
+            output.push_str("if (");
+            output.push_str(condition);
+            output.push_str(") { ");
+        }
+        emit_php_match_bindings(
+            &mut output,
+            &temporary,
+            &arm.pattern,
+            &arm_info.pattern,
+            &mut arm_scopes,
+            scopes,
+        );
+        output.push_str("return ");
+        output.push_str(&emit_expr(&arm.value, &arm_scopes));
+        output.push_str("; ");
+        if condition.is_some() {
+            output.push_str("} ");
+        }
+    }
+    output.push_str("})(");
+    output.push_str(&emit_expr(scrutinee, scopes));
+    output.push(')');
+    output
+}
+
+fn emit_php_match_condition(
+    temporary: &str,
+    pattern: &MatchPattern,
+    resolved: &ResolvedMatchPattern,
+    scopes: &PhpNameScopes,
+) -> Option<String> {
+    let value = format!("${temporary}");
+    match resolved {
+        ResolvedMatchPattern::Default => None,
+        ResolvedMatchPattern::Condition => {
+            let MatchPattern::Expression(condition) = pattern else {
+                unreachable!("checked condition match must preserve its expression pattern")
+            };
+            Some(format!("({}) === true", emit_expr(condition, scopes)))
+        }
+        ResolvedMatchPattern::Null => Some(format!("{value} === null")),
+        ResolvedMatchPattern::Constant(constant) => {
+            let pattern = emit_const_value(constant, &scopes.const_evaluation);
+            if matches!(constant, ConstValue::PayloadEnum(_)) {
+                Some(format!("__doria_equal({value}, {pattern})"))
+            } else {
+                Some(format!("{value} === {pattern}"))
+            }
+        }
+        ResolvedMatchPattern::EnumCase { case_id, .. } => {
+            if let Some(tag) = scopes.payload_case_tags.get(case_id) {
+                Some(format!("{value}->__doriaMatchesCase({tag})"))
+            } else {
+                let MatchPattern::EnumCase {
+                    qualifier, case, ..
+                } = pattern
+                else {
+                    unreachable!("checked enum-case match must preserve enum syntax")
+                };
+                Some(format!("{value} === {qualifier}::{case}"))
+            }
+        }
+        ResolvedMatchPattern::ExactType(ty) => Some(php_exact_type_test(&value, ty)),
+    }
+}
+
+fn emit_php_match_bindings(
+    output: &mut String,
+    temporary: &str,
+    pattern: &MatchPattern,
+    resolved: &ResolvedMatchPattern,
+    arm_scopes: &mut PhpNameScopes,
+    shared_scopes: &PhpNameScopes,
+) {
+    match (pattern, resolved) {
+        (
+            MatchPattern::EnumCase {
+                bindings: Some(bindings),
+                ..
+            },
+            ResolvedMatchPattern::EnumCase { case_id, .. },
+        ) if shared_scopes.payload_case_tags.contains_key(case_id) => {
+            for (index, binding) in bindings.iter().enumerate() {
+                let name = arm_scopes.declare(&binding.name);
+                output.push_str(&format!(
+                    "${name} = ${temporary}->__doriaPayloadAt({index}); "
+                ));
+            }
+        }
+        (MatchPattern::TypeBinding { binding, .. }, ResolvedMatchPattern::ExactType(_)) => {
+            let name = arm_scopes.declare(&binding.name);
+            output.push_str(&format!("${name} = ${temporary}; "));
+        }
+        _ => {}
+    }
+}
+
+fn php_exact_type_test(value: &str, ty: &ResolvedType) -> String {
+    let name = match ty {
+        ResolvedType::Integer(_) => "int",
+        ResolvedType::Float(_) => "float",
+        ResolvedType::String => "string",
+        ResolvedType::Bool => "bool",
+        ResolvedType::Enum(ty) => return format!("get_debug_type({value}) === {}::class", ty.name),
+        ResolvedType::Class(ty) => {
+            return format!("get_debug_type({value}) === {}::class", ty.name)
+        }
+        _ => unreachable!("semantic checking rejects non-narrowable exact match types"),
+    };
+    format!("get_debug_type({value}) === '{name}'")
 }
 
 fn emit_member_receiver(expr: &Expr, scopes: &PhpNameScopes) -> String {

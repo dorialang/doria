@@ -74,6 +74,100 @@ function main(): void
 }
 
 #[test]
+fn php_backend_executes_core_match_payloads_narrowing_conditions_and_ternary() {
+    let php = doriac::compile_source_to_php(
+        "stage28.doria",
+        r#"
+enum Delivery { case Waiting; case Sent(string $reference); }
+function condition(string $name, bool $value): bool { echo $name; return $value; }
+function describe(Delivery $delivery): string
+{
+    return match ($delivery) {
+        Delivery::Waiting => "waiting",
+        Delivery::Sent($reference) => "sent {$reference}",
+    };
+}
+function inspect(mixed $value): string
+{
+    return match ($value) {
+        bool $flag => "bool {$flag}",
+        string $text => "string {$text}",
+        default => "other",
+    };
+}
+function choose(): string
+{
+    return match (true) {
+        condition("a", false) => "A",
+        condition("b", true) => "B",
+        condition("c", true) => "C",
+        default => "D",
+    };
+}
+function main(): void
+{
+    echo describe(Delivery::Sent("R-12")) . "\n";
+    echo inspect(true) . " " . inspect("text") . "\n";
+    echo choose() . "\n";
+    echo false ? "wrong" : true ? "ready" : "wrong";
+}
+"#,
+    )
+    .expect("checked Stage 28 match should lower through the PHP compatibility backend");
+
+    assert!(php.contains("__doriaMatchesCase"));
+    assert!(php.contains("__doriaPayloadAt"));
+    assert!(php.contains("get_debug_type("));
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated match PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"sent R-12\nbool true string text\nabB\nready");
+}
+
+#[test]
+fn php_backend_rejects_numeric_type_patterns_after_mixed_erases_width() {
+    for numeric_type in ["int8", "int", "float32", "float"] {
+        let source = format!(
+            r#"
+function inspect(mixed $value): string
+{{
+    return match ($value) {{
+        {numeric_type} $number => "number",
+        default => "other",
+    }};
+}}
+"#
+        );
+        let diagnostics = doriac::compile_source_to_php("stage28.doria", &source)
+            .expect_err("PHP must not collapse Doria's exact numeric type identities");
+
+        assert_eq!(diagnostics[0].code, "B1301");
+        assert!(diagnostics[0].message.contains(&format!(
+            "exact `{numeric_type}` matching after `mixed` erased the numeric width"
+        )));
+    }
+}
+
+#[test]
 fn php_backend_executes_payload_enum_construction_equality_and_storage() {
     let php = doriac::compile_source_to_php(
         "stage27-payload.doria",

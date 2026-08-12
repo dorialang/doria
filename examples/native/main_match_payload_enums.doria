@@ -1,0 +1,22 @@
+enum Delivery
+{
+    case Queued;
+    case Sent(string $reference);
+    case Failed(int $code, string $reason);
+}
+
+function describe(Delivery $delivery): string
+{
+    return match ($delivery) {
+        Delivery::Queued => "queued",
+        Delivery::Sent($reference) => "sent {$reference}",
+        Delivery::Failed($code, $reason) => "failed {$code}: {$reason}",
+    };
+}
+
+function main(): void
+{
+    echo describe(Delivery::Queued) . "\n";
+    echo describe(Delivery::Sent("A-17")) . "\n";
+    echo describe(Delivery::Failed(503, "offline")) . "\n";
+}

@@ -1,0 +1,29 @@
+enum Signal
+{
+    case Ready;
+    case Waiting;
+}
+
+class Marker
+{
+}
+
+function classify(mixed $value): string
+{
+    return match ($value) {
+        int $number => "int {$number}",
+        string $text => "string {$text}",
+        Signal $signal => "signal {$signal == Signal::Ready}",
+        Marker $marker => "marker",
+        default => "other",
+    };
+}
+
+function main(): void
+{
+    echo classify(42) . "\n";
+    echo classify("text") . "\n";
+    echo classify(Signal::Ready) . "\n";
+    echo classify(new Marker()) . "\n";
+    echo classify(true) . "\n";
+}

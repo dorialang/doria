@@ -136,6 +136,65 @@ fn payload_enum_ir_stays_inline_across_mixed_and_collection_storage() {
 }
 
 #[test]
+fn match_ir_uses_inline_dispatch_and_projects_payloads_only_in_selected_arms() {
+    let source = r#"
+enum Outcome { case Empty; case Number(int $value); case Pair(int $left, int $right); }
+
+function value(Outcome $outcome): int
+{
+    return match ($outcome) {
+        Outcome::Empty => 0,
+        Outcome::Number($number) => $number,
+        Outcome::Pair($left, $right) => $left + $right,
+    };
+}
+
+function main(): int { return value(Outcome::Pair(20, 22)); }
+"#;
+    let program = doriac::lower_source_to_mir("llvm-match.doria", source)
+        .expect("match source should lower to validated MIR");
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
+        .expect("match MIR should lower to LLVM IR");
+
+    assert!(
+        ir.contains("payload.case.matches"),
+        "payload match has no inline tag comparison:\n{ir}"
+    );
+    assert!(
+        ir.contains("payload.binding.load"),
+        "selected payload arms do not project their fields:\n{ir}"
+    );
+    assert!(
+        !ir.contains("dr_v1_enum_") && !ir.contains("dr_v4_enum_"),
+        "match dispatch introduced a runtime enum allocation API:\n{ir}"
+    );
+
+    let lines = ir.lines().collect::<Vec<_>>();
+    for binding_line in lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| line.contains("payload.binding.load").then_some(index))
+    {
+        let block = lines[..binding_line]
+            .iter()
+            .rev()
+            .find_map(|line| {
+                (!line.chars().next().is_some_and(char::is_whitespace))
+                    .then(|| line.split_once(':').map(|(label, _)| label))
+                    .flatten()
+            })
+            .expect("payload projection should be inside a named basic block");
+        let branch_target = format!("label %{block}");
+        assert!(
+            lines[..binding_line].iter().any(|line| {
+                line.contains("br i1 %payload.case.matches") && line.contains(&branch_target)
+            }),
+            "payload projection block `{block}` is not selected by its case test:\n{ir}"
+        );
+    }
+}
+
+#[test]
 fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
     let program = Program {
         source: doriac::source::SourceFile::new("llvm-test.doria", ""),
