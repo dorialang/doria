@@ -299,7 +299,7 @@ fn arm_results_share_one_strict_type_with_nullable_unification() {
     .expect("string and null arms should unify to nullable string");
     assert_code(
         "function f(bool $v): string { return match ($v) { true => \"yes\", false => 1, }; }",
-        "E0592",
+        "E0403",
     );
     assert_code(
         "function f(bool $v) { return match ($v) { true => null, false => null, }; }",
@@ -308,6 +308,74 @@ fn arm_results_share_one_strict_type_with_nullable_unification() {
     assert_code(
         "function nothing(): void {} function f(bool $v): int { return match ($v) { true => nothing(), false => 1, }; }",
         "E0593",
+    );
+}
+
+#[test]
+fn surrounding_expected_types_reach_match_arms_in_every_user_call_form() {
+    doriac::check_source(
+        "stage28.doria",
+        r#"
+class Sink
+{
+    function __construct(take mixed $value) {}
+    function accept(mixed $value): void {}
+    static function acceptStatic(mixed $value): void {}
+}
+
+function accept(mixed $value): void {}
+function mixedResult(bool $condition): mixed
+{
+    return match ($condition) { true => 1, false => "text", };
+}
+function nullResult(bool $condition): ?string
+{
+    return match ($condition) { true => null, false => null, };
+}
+
+function main(): void
+{
+    writable mixed $assigned = 0;
+    $assigned = match (false) { true => 1, false => "text", };
+    accept(match (false) { true => 1, false => "text", });
+    let $sink = new Sink(match (false) { true => 1, false => "text", });
+    $sink->accept(match (false) { true => 1, false => "text", });
+    Sink::acceptStatic(match (false) { true => 1, false => "text", });
+    mixed $mixed = mixedResult(true);
+    ?string $nullable = nullResult(false);
+}
+"#,
+    )
+    .expect("every declared destination and user-call parameter should contextualize match arms");
+}
+
+#[test]
+fn copy_pattern_bindings_mask_moved_outer_bindings_without_changing_outer_state() {
+    let valid = r#"
+class Box {}
+function consume(take Box $value): void {}
+function main(): void
+{
+    let $value = new Box();
+    consume($value);
+    mixed $subject = 42;
+    int $selected = match ($subject) {
+        int $value => $value,
+        default => 0,
+    };
+    echo $selected;
+}
+"#;
+    doriac::check_source("stage28.doria", valid)
+        .expect("a Copy pattern binding should hide the moved outer binding inside its arm");
+
+    let invalid = valid.replace("echo $selected;", "echo $selected; consume($value);");
+    let diagnostics = diagnostics(&invalid);
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0470"),
+        "the outer binding must remain moved after the arm scope: {diagnostics:#?}"
     );
 }
 

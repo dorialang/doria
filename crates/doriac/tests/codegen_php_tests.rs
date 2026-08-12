@@ -90,7 +90,7 @@ function describe(Delivery $delivery): string
 function inspect(mixed $value): string
 {
     return match ($value) {
-        int $number => "int {$number}",
+        bool $flag => "bool {$flag}",
         string $text => "string {$text}",
         default => "other",
     };
@@ -107,7 +107,7 @@ function choose(): string
 function main(): void
 {
     echo describe(Delivery::Sent("R-12")) . "\n";
-    echo inspect(42) . " " . inspect("text") . "\n";
+    echo inspect(true) . " " . inspect("text") . "\n";
     echo choose() . "\n";
     echo false ? "wrong" : true ? "ready" : "wrong";
 }
@@ -140,7 +140,31 @@ function main(): void
         "{}",
         String::from_utf8_lossy(&run.stderr)
     );
-    assert_eq!(run.stdout, b"sent R-12\nint 42 string text\nabB\nready");
+    assert_eq!(run.stdout, b"sent R-12\nbool true string text\nabB\nready");
+}
+
+#[test]
+fn php_backend_rejects_numeric_type_patterns_after_mixed_erases_width() {
+    for numeric_type in ["int8", "int", "float32", "float"] {
+        let source = format!(
+            r#"
+function inspect(mixed $value): string
+{{
+    return match ($value) {{
+        {numeric_type} $number => "number",
+        default => "other",
+    }};
+}}
+"#
+        );
+        let diagnostics = doriac::compile_source_to_php("stage28.doria", &source)
+            .expect_err("PHP must not collapse Doria's exact numeric type identities");
+
+        assert_eq!(diagnostics[0].code, "B1301");
+        assert!(diagnostics[0].message.contains(&format!(
+            "exact `{numeric_type}` matching after `mixed` erased the numeric width"
+        )));
+    }
 }
 
 #[test]

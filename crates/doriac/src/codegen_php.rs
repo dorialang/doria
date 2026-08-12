@@ -1419,6 +1419,25 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
                 .get(&(span.start, span.end))
                 .ok_or_else(|| BackendError::new("checked match has no semantic plan"))?;
             for (arm, arm_info) in arms.iter().zip(&info.arms) {
+                if matches!(info.scrutinee_type, ResolvedType::Mixed) {
+                    let numeric_type = match &arm_info.pattern {
+                        ResolvedMatchPattern::ExactType(ResolvedType::Integer(integer)) => {
+                            Some(integer.source_name())
+                        }
+                        ResolvedMatchPattern::ExactType(ResolvedType::Float(float)) => {
+                            Some(float.source_name())
+                        }
+                        _ => None,
+                    };
+                    if let Some(numeric_type) = numeric_type {
+                        return Err(unsupported_numeric_shape(
+                            arm.span,
+                            format!(
+                                "exact `{numeric_type}` matching after `mixed` erased the numeric width"
+                            ),
+                        ));
+                    }
+                }
                 match (&arm.pattern, &arm_info.pattern) {
                     (MatchPattern::Expression(pattern), ResolvedMatchPattern::Condition) => {
                         validate_expr(pattern, semantic_info)?;

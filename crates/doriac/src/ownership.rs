@@ -132,7 +132,7 @@ struct CollectionInfo {
 }
 
 #[derive(Debug, Clone, Default)]
-struct Scopes(Vec<HashMap<String, Binding>>);
+struct Scopes(Vec<HashMap<String, Option<Binding>>>);
 
 impl Scopes {
     fn new() -> Self {
@@ -151,24 +151,41 @@ impl Scopes {
         self.0
             .last_mut()
             .expect("ownership scope")
-            .insert(name, binding);
+            .insert(name, Some(binding));
+    }
+
+    fn mask_untracked(&mut self, name: String) {
+        self.0
+            .last_mut()
+            .expect("ownership scope")
+            .insert(name, None);
     }
 
     fn get(&self, name: &str) -> Option<&Binding> {
-        self.0.iter().rev().find_map(|scope| scope.get(name))
+        for scope in self.0.iter().rev() {
+            if let Some(binding) = scope.get(name) {
+                return binding.as_ref();
+            }
+        }
+        None
     }
 
     fn get_mut(&mut self, name: &str) -> Option<&mut Binding> {
-        self.0
-            .iter_mut()
-            .rev()
-            .find_map(|scope| scope.get_mut(name))
+        for scope in self.0.iter_mut().rev() {
+            if let Some(binding) = scope.get_mut(name) {
+                return binding.as_mut();
+            }
+        }
+        None
     }
 
     fn borrowed_from(&self, root: &str) -> Option<&str> {
         self.0.iter().rev().find_map(|scope| {
             scope.iter().find_map(|(name, binding)| {
-                (binding.borrow_root.as_deref() == Some(root)).then_some(name.as_str())
+                binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.borrow_root.as_deref() == Some(root))
+                    .then_some(name.as_str())
             })
         })
     }
@@ -181,8 +198,10 @@ impl Scopes {
         };
         for scope in &mut self.0[start..] {
             for (name, binding) in scope {
-                if binding.borrow_root.is_some() && !statements_use_variable(remaining, name) {
-                    binding.borrow_root = None;
+                if let Some(binding) = binding {
+                    if binding.borrow_root.is_some() && !statements_use_variable(remaining, name) {
+                        binding.borrow_root = None;
+                    }
                 }
             }
         }
@@ -191,10 +210,23 @@ impl Scopes {
     fn merge_from(&mut self, left: &Self, right: &Self) {
         for (index, scope) in self.0.iter_mut().enumerate() {
             for (name, binding) in scope {
-                let Some(left_state) = left.0.get(index).and_then(|scope| scope.get(name)) else {
+                let Some(binding) = binding else {
                     continue;
                 };
-                let Some(right_state) = right.0.get(index).and_then(|scope| scope.get(name)) else {
+                let Some(left_state) = left
+                    .0
+                    .get(index)
+                    .and_then(|scope| scope.get(name))
+                    .and_then(Option::as_ref)
+                else {
+                    continue;
+                };
+                let Some(right_state) = right
+                    .0
+                    .get(index)
+                    .and_then(|scope| scope.get(name))
+                    .and_then(Option::as_ref)
+                else {
                     continue;
                 };
                 binding.state = join_state(&left_state.state, &right_state.state);
@@ -2290,6 +2322,7 @@ impl Checker<'_> {
         if !resolved_type_is_move_type(ty, &self.move_enum_names)
             && !resolved_type_requires_conservative_move(ty)
         {
+            scopes.mask_untracked(binding.name.clone());
             return;
         }
         scopes.declare(

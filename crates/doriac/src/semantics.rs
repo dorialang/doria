@@ -3552,7 +3552,6 @@ impl<'program> Checker<'program> {
             receiver_mode: None,
             this_available: false,
         };
-        self.check_expr(initializer, &scopes, Some(&initializer_context));
         let target_ty = self
             .classes
             .get(class_name)
@@ -3561,6 +3560,8 @@ impl<'program> Checker<'program> {
             .unwrap_or_else(|| {
                 self.resolve_type_ref_with_class(&property.ty, property.span, Some(class_name))
             });
+        self.record_expected_expression_type(initializer, target_ty);
+        self.check_expr(initializer, &scopes, Some(&initializer_context));
         self.check_expr_assignable(
             target_ty,
             initializer,
@@ -3862,6 +3863,7 @@ impl<'program> Checker<'program> {
                 });
                 let default_context = default_context.as_ref();
 
+                self.record_expected_expression_type(default, ty);
                 self.check_expr(default, &scopes, default_context);
                 self.check_expr_assignable(
                     ty,
@@ -4139,7 +4141,6 @@ impl<'program> Checker<'program> {
                 self.check_local_declaration(decl, scopes, method_context);
             }
             Stmt::Assignment(assignment) => {
-                self.check_expr(&assignment.value, scopes, method_context);
                 if let Some(target) = self.check_writable_place(
                     &assignment.target,
                     &assignment.op,
@@ -4147,7 +4148,11 @@ impl<'program> Checker<'program> {
                     method_context,
                     constructor_init_context,
                 ) {
+                    self.record_expected_expression_type(&assignment.value, target.ty);
+                    self.check_expr(&assignment.value, scopes, method_context);
                     self.check_assignment_value(assignment, target, scopes, method_context);
+                } else {
+                    self.check_expr(&assignment.value, scopes, method_context);
                 }
             }
             Stmt::Echo { expr, .. } => {
@@ -4512,9 +4517,7 @@ impl<'program> Checker<'program> {
             .as_ref()
             .map(|ty| self.resolve_type_ref(ty, decl.span));
         if let Some(target_ty) = explicit_ty {
-            let span = decl.initializer.span();
-            self.contextual_expression_types
-                .insert((span.start, span.end), target_ty);
+            self.record_expected_expression_type(&decl.initializer, target_ty);
         }
         self.check_expr(&decl.initializer, scopes, method_context);
         let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
@@ -4672,7 +4675,6 @@ impl<'program> Checker<'program> {
                 self.check_local_declaration(decl, scopes, method_context);
             }
             ForInitializer::Assignment(assignment) => {
-                self.check_expr(&assignment.value, scopes, method_context);
                 if let Some(target) = self.check_writable_place(
                     &assignment.target,
                     &assignment.op,
@@ -4680,7 +4682,11 @@ impl<'program> Checker<'program> {
                     method_context,
                     constructor_init_context,
                 ) {
+                    self.record_expected_expression_type(&assignment.value, target.ty);
+                    self.check_expr(&assignment.value, scopes, method_context);
                     self.check_assignment_value(assignment, target, scopes, method_context);
+                } else {
+                    self.check_expr(&assignment.value, scopes, method_context);
                 }
             }
         }
@@ -4703,7 +4709,6 @@ impl<'program> Checker<'program> {
                 );
             }
             ForIncrement::Assignment(assignment) => {
-                self.check_expr(&assignment.value, scopes, method_context);
                 if let Some(target) = self.check_writable_place(
                     &assignment.target,
                     &assignment.op,
@@ -4711,7 +4716,11 @@ impl<'program> Checker<'program> {
                     method_context,
                     constructor_init_context,
                 ) {
+                    self.record_expected_expression_type(&assignment.value, target.ty);
+                    self.check_expr(&assignment.value, scopes, method_context);
                     self.check_assignment_value(assignment, target, scopes, method_context);
+                } else {
+                    self.check_expr(&assignment.value, scopes, method_context);
                 }
             }
         }
@@ -4961,6 +4970,13 @@ impl<'program> Checker<'program> {
         };
 
         if let Some(expr) = expr {
+            if context.lifecycle.is_none() {
+                if let Some(expected) = context.expected {
+                    if !self.is_void_type(expected) {
+                        self.record_expected_expression_type(expr, expected);
+                    }
+                }
+            }
             self.check_expr(expr, scopes, method_context);
         }
 
@@ -5071,6 +5087,110 @@ impl<'program> Checker<'program> {
 
     fn requires_return_value(&self, ty: TypeId) -> bool {
         !matches!(self.types.kind(ty), TypeKind::Void | TypeKind::Unknown)
+    }
+
+    fn record_expected_expression_type(&mut self, expr: &Expr, expected: TypeId) {
+        let span = expr.span();
+        self.contextual_expression_types
+            .insert((span.start, span.end), expected);
+        if let Expr::Grouped { expr, .. } = expr {
+            self.record_expected_expression_type(expr, expected);
+        }
+    }
+
+    fn record_expected_argument_types(&mut self, params: &[ParamInfo], args: &[Argument]) {
+        let param_names = params
+            .iter()
+            .map(|param| param.name.as_str())
+            .collect::<Vec<_>>();
+        let param_has_default = params
+            .iter()
+            .map(|param| param.has_default)
+            .collect::<Vec<_>>();
+        let arg_names = args
+            .iter()
+            .map(|arg| arg.name.as_ref().map(|name| name.text.as_str()))
+            .collect::<Vec<_>>();
+        let bound =
+            crate::arg_binding::bind_arguments(&param_names, &param_has_default, &arg_names);
+        for (param_index, arg_index) in bound.param_to_arg.into_iter().enumerate() {
+            if let Some(arg_index) = arg_index {
+                self.record_expected_expression_type(
+                    &args[arg_index].value,
+                    params[param_index].ty,
+                );
+            }
+        }
+    }
+
+    fn record_function_argument_types(&mut self, name: &str, args: &[Argument]) {
+        let params = self
+            .functions
+            .get(name)
+            .map(|function| function.params.clone());
+        if let Some(params) = params {
+            self.record_expected_argument_types(&params, args);
+        }
+    }
+
+    fn record_method_argument_types(
+        &mut self,
+        object: &Expr,
+        method: &str,
+        args: &[Argument],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let object_ty = self.infer_expr_type(object, scopes, method_context);
+        if matches!(self.types.kind(object_ty), TypeKind::String) {
+            if let Some((params, _)) = self.string_companion_signature(method) {
+                self.record_expected_argument_types(&params[1..], args);
+            }
+            return;
+        }
+        let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
+            return;
+        };
+        let method_info = self
+            .classes
+            .get(&class_type.name)
+            .and_then(|class| class.methods.get(method))
+            .cloned();
+        if let Some(method_info) = method_info {
+            let method_info = self.specialize_method_for_class(&method_info, &class_type);
+            self.record_expected_argument_types(&method_info.params, args);
+        }
+    }
+
+    fn record_static_argument_types(
+        &mut self,
+        qualifier: &StaticQualifier,
+        method: &str,
+        args: &[Argument],
+        method_context: Option<&MethodContext>,
+    ) {
+        let Some(class_name) = Self::static_qualifier_class_name(qualifier, method_context) else {
+            return;
+        };
+        let params = self
+            .classes
+            .get(&class_name)
+            .and_then(|class| class.methods.get(method))
+            .map(|method| method.params.clone());
+        if let Some(params) = params {
+            self.record_expected_argument_types(&params, args);
+        }
+    }
+
+    fn record_constructor_argument_types(&mut self, class_type: &TypeRef, args: &[Argument]) {
+        let params = self
+            .classes
+            .get(&class_type.name)
+            .and_then(|class| class.methods.get("__construct"))
+            .map(|constructor| constructor.params.clone());
+        if let Some(params) = params {
+            self.record_expected_argument_types(&params, args);
+        }
     }
 
     fn check_expr(
@@ -5202,6 +5322,7 @@ impl<'program> Checker<'program> {
                 null_safe,
             } => {
                 self.check_expr(object, scopes, method_context);
+                self.record_method_argument_types(object, method, args, scopes, method_context);
                 for arg in args {
                     self.check_expr(&arg.value, scopes, method_context);
                 }
@@ -5256,6 +5377,7 @@ impl<'program> Checker<'program> {
                 self.check_is_type(expr, ty, *span, scopes, method_context);
             }
             Expr::FunctionCall { name, args, span } => {
+                self.record_function_argument_types(name, args);
                 for arg in args {
                     self.check_expr(&arg.value, scopes, method_context);
                 }
@@ -5271,6 +5393,7 @@ impl<'program> Checker<'program> {
                 span,
                 ..
             } => {
+                self.record_static_argument_types(qualifier, method, args, method_context);
                 for arg in args {
                     self.check_expr(&arg.value, scopes, method_context);
                 }
@@ -5315,6 +5438,7 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 let class_name = &class_type.name;
+                self.record_constructor_argument_types(class_type, args);
                 if let Some(kind) = SharedHandleKind::from_source_name(class_name) {
                     for arg in args {
                         self.check_expr(&arg.value, scopes, method_context);
@@ -5591,6 +5715,9 @@ impl<'program> Checker<'program> {
                 shape_valid = false;
             }
 
+            if let Some(target) = expected {
+                self.record_expected_expression_type(&arm.value, target);
+            }
             self.check_expr(&arm.value, &arm_scopes, method_context);
             let arm_ty = self.infer_expr_type(&arm.value, &arm_scopes, method_context);
             if self.is_void_type(arm_ty) {
