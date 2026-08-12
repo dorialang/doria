@@ -470,6 +470,9 @@ fn enum_fixture_reports_additive_structural_counts_without_a_schema_bump() {
             "enum Priority: int { case Low = 1; case High = 10; }\n",
             "enum Transport: string { case Rail = \"rail\"; }\n",
             "enum Shape { case Circle(float $radius); case Rect(float $width, float $height); }\n",
+            "enum Label { case Text(string $value); }\n",
+            "class Document {}\n",
+            "enum LoadResult { case Loaded(Document $document); case Failed(string $message); }\n",
             "function main(): void {}\n",
         ),
     )
@@ -495,12 +498,23 @@ fn enum_fixture_reports_additive_structural_counts_without_a_schema_bump() {
         serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
             .expect("JSON");
     assert_eq!(report["schemaVersion"], 1);
-    assert_eq!(report["metrics"]["enumCount"], 4);
+    assert_eq!(report["metrics"]["enumCount"], 6);
     assert_eq!(report["metrics"]["unitEnumCount"], 1);
     assert_eq!(report["metrics"]["backedEnumCount"], 2);
-    assert_eq!(report["metrics"]["payloadEnumCount"], 1);
-    assert_eq!(report["metrics"]["enumCaseCount"], 7);
-    assert_eq!(report["metrics"]["enumPayloadFieldCount"], 3);
+    assert_eq!(report["metrics"]["payloadEnumCount"], 3);
+    assert_eq!(report["metrics"]["copyPayloadEnumCount"], 2);
+    assert_eq!(report["metrics"]["movePayloadEnumCount"], 1);
+    assert_eq!(report["metrics"]["enumCaseCount"], 10);
+    assert_eq!(report["metrics"]["enumPayloadFieldCount"], 6);
+    assert!(report["metrics"]["maximumPayloadEnumSize"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
+    assert!(report["metrics"]["maximumPayloadEnumAlignment"]
+        .as_u64()
+        .is_some_and(|value| value > 0));
+    assert_eq!(report["metrics"]["enumCopyGlueTypeCount"], 2);
+    assert_eq!(report["metrics"]["enumDropGlueTypeCount"], 2);
+    assert_eq!(report["metrics"]["enumEqualityGlueTypeCount"], 3);
     let _ = fs::remove_dir_all(directory);
 }
 

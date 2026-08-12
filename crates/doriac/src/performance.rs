@@ -74,6 +74,39 @@ pub fn compile_native(
         crate::backend::NativeProfile::Fast => "cranelift",
         crate::backend::NativeProfile::Release => "llvm",
     };
+    let metrics = json!({
+        "sourceLineCount": source_line_count,
+        "astItemCount": ast_item_count,
+        "outputBytes": output_size,
+        "functionCount": mir.functions.len(),
+        "classCount": mir.classes.len(),
+        "enumCount": structure.enum_count,
+        "unitEnumCount": structure.unit_enum_count,
+        "backedEnumCount": structure.backed_enum_count,
+        "payloadEnumCount": structure.payload_enum_count,
+        "copyPayloadEnumCount": structure.copy_payload_enum_count,
+        "movePayloadEnumCount": structure.move_payload_enum_count,
+        "enumCaseCount": structure.enum_case_count,
+        "enumPayloadFieldCount": structure.enum_payload_field_count,
+        "maximumPayloadEnumSize": structure.maximum_payload_enum_size,
+        "maximumPayloadEnumAlignment": structure.maximum_payload_enum_alignment,
+        // Backends may inline this type-aware glue instead of emitting a
+        // standalone symbol. These counts describe enum types requiring each
+        // operation, not a promise about helper-function shape.
+        "enumCopyGlueTypeCount": structure.enum_copy_glue_type_count,
+        "enumDropGlueTypeCount": structure.enum_drop_glue_type_count,
+        "enumEqualityGlueTypeCount": structure.enum_equality_glue_type_count,
+        "collectionTypeCount": mir.collection_types.len(),
+        "mirFunctionCount": mir.functions.len(),
+        "mirBasicBlockCount": structure.basic_block_count,
+        "mirStatementCount": structure.statement_count,
+        "mirTerminatorCount": structure.terminator_count,
+        "callableSpecializationCount": structure.callable_specialization_count,
+        "classSpecializationCount": structure.class_specialization_count,
+        "totalGenericSpecializationCount": structure.callable_specialization_count + structure.class_specialization_count,
+        "runtimeArtifactBytes": runtime_artifact_bytes,
+        "peakRssBytes": {"available": false, "reason": "portable in-process peak RSS collection is unavailable"}
+    });
     let report = json!({
         "schemaVersion": REPORT_SCHEMA_VERSION,
         "compiler": {
@@ -132,29 +165,7 @@ pub fn compile_native(
             "objectEmission": unavailable("integrated into the selected code-generation phase"),
             "link": available(native.linking)
         },
-        "metrics": {
-            "sourceLineCount": source_line_count,
-            "astItemCount": ast_item_count,
-            "outputBytes": output_size,
-            "functionCount": mir.functions.len(),
-            "classCount": mir.classes.len(),
-            "enumCount": structure.enum_count,
-            "unitEnumCount": structure.unit_enum_count,
-            "backedEnumCount": structure.backed_enum_count,
-            "payloadEnumCount": structure.payload_enum_count,
-            "enumCaseCount": structure.enum_case_count,
-            "enumPayloadFieldCount": structure.enum_payload_field_count,
-            "collectionTypeCount": mir.collection_types.len(),
-            "mirFunctionCount": mir.functions.len(),
-            "mirBasicBlockCount": structure.basic_block_count,
-            "mirStatementCount": structure.statement_count,
-            "mirTerminatorCount": structure.terminator_count,
-            "callableSpecializationCount": structure.callable_specialization_count,
-            "classSpecializationCount": structure.class_specialization_count,
-            "totalGenericSpecializationCount": structure.callable_specialization_count + structure.class_specialization_count,
-            "runtimeArtifactBytes": runtime_artifact_bytes,
-            "peakRssBytes": {"available": false, "reason": "portable in-process peak RSS collection is unavailable"}
-        }
+        "metrics": metrics
     });
     Ok(PerformanceCompilation {
         output: BackendOutput::Executable {

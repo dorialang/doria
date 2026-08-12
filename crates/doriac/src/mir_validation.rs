@@ -135,18 +135,7 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
                 property.id.0
             )));
         }
-        let valid = match (&property.initializer, property.ty) {
-            (
-                mir::StaticValue::Scalar(value),
-                mir::Type::Scalar(ty) | mir::Type::NullableScalar(ty),
-            ) => value.ty() == ty,
-            (mir::StaticValue::String(_), mir::Type::String | mir::Type::NullableString)
-            | (mir::StaticValue::Null, mir::Type::NullableScalar(_) | mir::Type::NullableString) => {
-                true
-            }
-            _ => false,
-        };
-        if !valid {
+        if !static_value_matches(program, &property.initializer, property.ty)? {
             return Err(malformed_mir(format!(
                 "static{} initializer does not match {}",
                 property.id.0, property.ty
@@ -233,6 +222,47 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     Ok(())
 }
 
+fn static_value_matches(
+    program: &mir::Program,
+    value: &mir::StaticValue,
+    ty: mir::Type,
+) -> Result<bool, BackendError> {
+    match (value, ty) {
+        (
+            mir::StaticValue::Scalar(value),
+            mir::Type::Scalar(expected) | mir::Type::NullableScalar(expected),
+        ) => Ok(value.ty() == expected),
+        (mir::StaticValue::String(_), mir::Type::String | mir::Type::NullableString) => Ok(true),
+        (
+            mir::StaticValue::Null,
+            mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::NullablePayloadEnum(_),
+        ) => Ok(true),
+        (
+            mir::StaticValue::PayloadEnum(value),
+            mir::Type::PayloadEnum(expected) | mir::Type::NullablePayloadEnum(expected),
+        ) if value.ty == expected && value.case.enum_id == expected.id => {
+            let definition = enum_in(program, expected.id)?;
+            let case = definition
+                .cases
+                .get(value.case.index)
+                .filter(|case| case.id == value.case)
+                .ok_or_else(|| malformed_mir("payload enum static names an unknown case"))?;
+            if case.payload.len() != value.fields.len() {
+                return Ok(false);
+            }
+            for (field, expected) in value.fields.iter().zip(&case.payload) {
+                if !static_value_matches(program, field, expected.ty)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
 fn valid_collection_comparator(ty: mir::Type) -> Option<mir::CollectionComparator> {
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(integer)) if integer.is_signed() => Some(
@@ -254,6 +284,10 @@ fn collection_type_is_copy(ty: mir::Type) -> bool {
             | mir::Type::String
             | mir::Type::NullableScalar(_)
             | mir::Type::NullableString
+    ) || matches!(
+        ty,
+        mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
+            if payload.capabilities.copy
     )
 }
 
@@ -326,7 +360,7 @@ fn validate_class(
         class
             .properties
             .iter()
-            .map(|property| (property.id, field_type(property.ty))),
+            .map(|property| (property.id, field_type(program, property.ty))),
         pointer_size,
     );
     if class.layout != expected_layout {
@@ -387,7 +421,7 @@ fn validate_lifecycle(
     Ok(())
 }
 
-fn field_type(ty: mir::Type) -> FieldType {
+fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(integer)) => FieldType::Integer(integer),
         mir::Type::Scalar(mir::ScalarType::Float(float)) => FieldType::Float(float),
@@ -420,6 +454,20 @@ fn field_type(ty: mir::Type) -> FieldType {
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_) => FieldType::SharedReferenceAccess,
         mir::Type::Collection(_) | mir::Type::NullableCollection(_) => FieldType::Collection,
+        mir::Type::PayloadEnum(ty) => {
+            let layout = &program.enums[ty.id.0].layout;
+            FieldType::Aggregate {
+                size: layout.size,
+                align: layout.align,
+            }
+        }
+        mir::Type::NullablePayloadEnum(ty) => {
+            let layout = &program.enums[ty.id.0].layout;
+            FieldType::Aggregate {
+                size: layout.size + layout.align,
+                align: layout.align,
+            }
+        }
     }
 }
 
@@ -499,7 +547,17 @@ fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendErr
     if let mir::Type::Scalar(mir::ScalarType::Enum(enum_id))
     | mir::Type::NullableScalar(mir::ScalarType::Enum(enum_id)) = ty
     {
-        enum_in(program, enum_id)?;
+        let definition = enum_in(program, enum_id)?;
+        if definition.cases.iter().any(|case| !case.payload.is_empty()) {
+            return Err(malformed_mir(format!(
+                "payload enum#{} is represented as a scalar enum",
+                enum_id.0
+            )));
+        }
+        return Ok(());
+    }
+    if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) = ty {
+        validate_payload_enum_type(program, payload)?;
         return Ok(());
     }
     if let mir::Type::Class(class)
@@ -540,6 +598,44 @@ fn enum_in(
         .ok_or_else(|| malformed_mir(format!("enum#{} does not exist", id.0)))
 }
 
+fn validate_payload_enum_type(
+    program: &mir::Program,
+    ty: mir::PayloadEnumType,
+) -> Result<&mir::EnumDefinition, BackendError> {
+    let definition = enum_in(program, ty.id)?;
+    if !definition.cases.iter().any(|case| !case.payload.is_empty()) {
+        return Err(malformed_mir(format!(
+            "scalar enum#{} is represented as a payload enum",
+            ty.id.0
+        )));
+    }
+    if definition.capabilities != ty.capabilities {
+        return Err(malformed_mir(format!(
+            "payload enum#{} capabilities disagree with its definition",
+            ty.id.0
+        )));
+    }
+    if definition.layout.enum_id != ty.id {
+        return Err(malformed_mir(format!(
+            "payload enum#{} layout has another enum identity",
+            ty.id.0
+        )));
+    }
+    let nullable = crate::enums::nullable_enum_layout(&definition.layout)
+        .map_err(|_| malformed_mir("payload enum has an invalid nullable layout"))?;
+    if ty.size != definition.layout.size
+        || ty.align != definition.layout.align
+        || ty.nullable_size != nullable.size
+        || ty.nullable_payload_offset != nullable.payload_offset
+    {
+        return Err(malformed_mir(format!(
+            "payload enum#{} type layout disagrees with its definition",
+            ty.id.0
+        )));
+    }
+    Ok(definition)
+}
+
 fn validate_writable_shared_payload(
     program: &mir::Program,
     payload: mir::WritableSharedPayload,
@@ -564,6 +660,34 @@ fn validate_statement(
         mir::Statement::AssignLocal { target, value } => {
             let local = local_in(function, *target)?;
             match (local.ty, value) {
+                (mir::Type::PayloadEnum(expected), mir::Rvalue::PayloadEnum(expression))
+                    if expression.ty() == expected =>
+                {
+                    validate_payload_enum_expression(program, function, expression)?;
+                    validate_payload_enum_assignment_ownership(local, expression.use_mode())
+                }
+                (
+                    mir::Type::NullablePayloadEnum(expected),
+                    mir::Rvalue::NullablePayloadEnum(expression),
+                ) if expression.ty() == expected => {
+                    validate_nullable_payload_enum_expression(program, function, expression)?;
+                    validate_payload_enum_assignment_ownership(
+                        local,
+                        nullable_payload_enum_use_mode(expression),
+                    )
+                }
+                (mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_), _) => {
+                    Err(malformed_mir(format!(
+                        "payload enum local local{} receives a mismatched rvalue",
+                        target.0
+                    )))
+                }
+                (_, mir::Rvalue::PayloadEnum(_) | mir::Rvalue::NullablePayloadEnum(_)) => {
+                    Err(malformed_mir(format!(
+                        "non-payload-enum local local{} receives a payload enum rvalue",
+                        target.0
+                    )))
+                }
                 (mir::Type::String, mir::Rvalue::String(expression)) => {
                     validate_string_expression(program, function, expression)
                 }
@@ -954,15 +1078,21 @@ fn validate_statement(
                         "grouped move-type locals may only be initialized from a matching nullable null",
                     ));
                 }
-            } else if first.owned
-                || !matches!(
-                    first.ty,
-                    mir::Type::Scalar(_)
-                        | mir::Type::String
-                        | mir::Type::NullableScalar(_)
-                        | mir::Type::NullableString
-                )
-            {
+            } else if !matches!(
+                first.ty,
+                mir::Type::Scalar(_)
+                    | mir::Type::String
+                    | mir::Type::NullableScalar(_)
+                    | mir::Type::NullableString
+                    | mir::Type::PayloadEnum(mir::PayloadEnumType {
+                        capabilities: crate::enums::EnumCapabilities { copy: true, .. },
+                        ..
+                    })
+                    | mir::Type::NullablePayloadEnum(mir::PayloadEnumType {
+                        capabilities: crate::enums::EnumCapabilities { copy: true, .. },
+                        ..
+                    })
+            ) {
                 return Err(malformed_mir(
                     "grouped local assignment requires a Copy type",
                 ));
@@ -1434,6 +1564,25 @@ fn validate_statement(
             }
             collection_in(program, *collection).map(|_| ())
         }
+        mir::Statement::DropPayloadEnum {
+            local,
+            ty,
+            nullable,
+        } => {
+            let definition = local_in(function, *local)?;
+            let expected = if *nullable {
+                mir::Type::NullablePayloadEnum(*ty)
+            } else {
+                mir::Type::PayloadEnum(*ty)
+            };
+            if definition.ty != expected || !definition.owned || !ty.capabilities.needs_drop {
+                return Err(malformed_mir(format!(
+                    "payload enum drop references incompatible local{}",
+                    local.0
+                )));
+            }
+            validate_payload_enum_type(program, *ty).map(|_| ())
+        }
     }
 }
 
@@ -1442,6 +1591,10 @@ fn grouped_move_rvalue_is_null(ty: mir::Type, value: &mir::Rvalue) -> bool {
         (mir::Type::NullableMixed, mir::Rvalue::NullableMixed(value)) => {
             matches!(value, mir::NullableMixedExpression::Null)
         }
+        (
+            mir::Type::NullablePayloadEnum(expected),
+            mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Null(actual)),
+        ) => *actual == expected,
         (mir::Type::NullableClass(expected), mir::Rvalue::NullableClass(value)) => {
             matches!(value, mir::NullableClassExpression::Null(actual) if *actual == expected)
         }
@@ -1889,6 +2042,12 @@ fn validate_rvalue(
         mir::Rvalue::NullableCollection(value) => {
             validate_nullable_collection_expression(program, function, value)
         }
+        mir::Rvalue::PayloadEnum(value) => {
+            validate_payload_enum_expression(program, function, value)
+        }
+        mir::Rvalue::NullablePayloadEnum(value) => {
+            validate_nullable_payload_enum_expression(program, function, value)
+        }
     }?;
     let mut accesses = ClassLocalAccesses::default();
     collect_rvalue_class_local_accesses(expression, &mut accesses);
@@ -1900,6 +2059,332 @@ fn validate_rvalue(
         &mut HashSet::new(),
     )?;
     Ok(())
+}
+
+fn validate_payload_enum_assignment_ownership(
+    local: &mir::Local,
+    mode: Option<mir::PayloadEnumUseMode>,
+) -> Result<(), BackendError> {
+    let ty = match local.ty {
+        mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) => ty,
+        _ => {
+            return Err(malformed_mir(
+                "payload enum ownership checks a non-enum local",
+            ))
+        }
+    };
+    if local.owned != ty.capabilities.needs_drop {
+        return Err(malformed_mir(format!(
+            "payload enum local local{} has inconsistent drop ownership",
+            local.id.0
+        )));
+    }
+    if ty.capabilities.needs_drop && matches!(mode, Some(mir::PayloadEnumUseMode::Borrow)) {
+        return Err(malformed_mir(format!(
+            "owned payload enum local local{} receives a borrowed value",
+            local.id.0
+        )));
+    }
+    Ok(())
+}
+
+fn nullable_payload_enum_use_mode(
+    expression: &mir::NullablePayloadEnumExpression,
+) -> Option<mir::PayloadEnumUseMode> {
+    match expression {
+        mir::NullablePayloadEnumExpression::Use { mode, .. }
+        | mir::NullablePayloadEnumExpression::CollectionGet { mode, .. }
+        | mir::NullablePayloadEnumExpression::Coalesce { mode, .. } => Some(*mode),
+        mir::NullablePayloadEnumExpression::Null(_)
+        | mir::NullablePayloadEnumExpression::Value(_)
+        | mir::NullablePayloadEnumExpression::Call { .. } => None,
+    }
+}
+
+fn validate_payload_enum_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::PayloadEnumExpression,
+) -> Result<(), BackendError> {
+    let ty = expression.ty();
+    let definition = validate_payload_enum_type(program, ty)?;
+    match expression {
+        mir::PayloadEnumExpression::Construct { case, fields, .. } => {
+            if case.enum_id != ty.id {
+                return Err(malformed_mir(
+                    "payload enum construction uses another enum case",
+                ));
+            }
+            let case_definition = definition
+                .cases
+                .get(case.index)
+                .filter(|candidate| candidate.id == *case)
+                .ok_or_else(|| malformed_mir("payload enum construction uses an unknown case"))?;
+            if fields.len() != case_definition.payload.len() {
+                return Err(malformed_mir(format!(
+                    "payload enum case {} expects {} fields, got {}",
+                    case_definition.name,
+                    case_definition.payload.len(),
+                    fields.len()
+                )));
+            }
+            for (index, (field, expected)) in
+                fields.iter().zip(&case_definition.payload).enumerate()
+            {
+                if field.ty() != expected.ty {
+                    return Err(malformed_mir(format!(
+                        "payload enum case {} field {} has type {}, expected {}",
+                        case_definition.name,
+                        index + 1,
+                        field.ty(),
+                        expected.ty
+                    )));
+                }
+                validate_rvalue(program, function, field)?;
+            }
+            Ok(())
+        }
+        mir::PayloadEnumExpression::Use { place, mode, .. } => {
+            validate_payload_enum_use_mode(ty, *mode)?;
+            validate_payload_enum_place(program, function, place, mir::Type::PayloadEnum(ty), *mode)
+        }
+        mir::PayloadEnumExpression::Call {
+            function: callee,
+            args,
+            ..
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::PayloadEnum(ty)) {
+                return Err(malformed_mir(
+                    "payload enum call targets a function with another return type",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::PayloadEnumExpression::Coalesce {
+            left, right, mode, ..
+        } => {
+            validate_payload_enum_use_mode(ty, *mode)?;
+            if left.ty() != ty || right.ty() != ty {
+                return Err(malformed_mir(
+                    "payload enum coalesce operands have another enum type",
+                ));
+            }
+            validate_nullable_payload_enum_expression(program, function, left)?;
+            validate_payload_enum_expression(program, function, right)
+        }
+    }
+}
+
+fn validate_nullable_payload_enum_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullablePayloadEnumExpression,
+) -> Result<(), BackendError> {
+    let ty = expression.ty();
+    validate_payload_enum_type(program, ty)?;
+    match expression {
+        mir::NullablePayloadEnumExpression::Null(_) => Ok(()),
+        mir::NullablePayloadEnumExpression::Value(value) => {
+            if value.ty() != ty {
+                return Err(malformed_mir(
+                    "nullable payload enum wraps another enum type",
+                ));
+            }
+            validate_payload_enum_expression(program, function, value)
+        }
+        mir::NullablePayloadEnumExpression::Use { place, mode, .. } => {
+            validate_payload_enum_use_mode(ty, *mode)?;
+            validate_payload_enum_place(
+                program,
+                function,
+                place,
+                mir::Type::NullablePayloadEnum(ty),
+                *mode,
+            )
+        }
+        mir::NullablePayloadEnumExpression::Call {
+            function: callee,
+            args,
+            ..
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::NullablePayloadEnum(ty)) {
+                return Err(malformed_mir(
+                    "nullable payload enum call targets a function with another return type",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::NullablePayloadEnumExpression::CollectionGet {
+            collection,
+            key,
+            access,
+            stored_nullable,
+            mode,
+            ..
+        } => {
+            validate_payload_enum_use_mode(ty, *mode)?;
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir(
+                    "payload enum nullable access uses a non-collection local",
+                ));
+            };
+            let definition = collection_in(program, collection_type)?;
+            let expected_value = if *stored_nullable {
+                mir::Type::NullablePayloadEnum(ty)
+            } else {
+                mir::Type::PayloadEnum(ty)
+            };
+            if definition.value != expected_value {
+                return Err(malformed_mir(
+                    "payload enum nullable access has incorrect stored nullability",
+                ));
+            }
+            let mutating = matches!(
+                access,
+                mir::NullableCollectionAccess::Remove
+                    | mir::NullableCollectionAccess::Pop
+                    | mir::NullableCollectionAccess::PopFront
+                    | mir::NullableCollectionAccess::PopBack
+            );
+            if mutating == matches!(mode, mir::PayloadEnumUseMode::Borrow) {
+                return Err(malformed_mir(
+                    "payload enum nullable access transfer mode disagrees with mutation",
+                ));
+            }
+            validate_dictionary_get(
+                program,
+                function,
+                *collection,
+                key,
+                mir::Type::PayloadEnum(ty),
+                *access,
+            )
+        }
+        mir::NullablePayloadEnumExpression::Coalesce {
+            left, right, mode, ..
+        } => {
+            validate_payload_enum_use_mode(ty, *mode)?;
+            if left.ty() != ty || right.ty() != ty {
+                return Err(malformed_mir(
+                    "nullable payload enum coalesce operands have another enum type",
+                ));
+            }
+            validate_nullable_payload_enum_expression(program, function, left)?;
+            validate_nullable_payload_enum_expression(program, function, right)
+        }
+    }
+}
+
+fn validate_payload_enum_use_mode(
+    ty: mir::PayloadEnumType,
+    mode: mir::PayloadEnumUseMode,
+) -> Result<(), BackendError> {
+    match mode {
+        mir::PayloadEnumUseMode::Borrow => Ok(()),
+        mir::PayloadEnumUseMode::Copy if ty.capabilities.copy => Ok(()),
+        mir::PayloadEnumUseMode::Move if !ty.capabilities.copy => Ok(()),
+        mir::PayloadEnumUseMode::Copy => Err(malformed_mir(
+            "move payload enum is copied instead of transferred",
+        )),
+        mir::PayloadEnumUseMode::Move => Err(malformed_mir(
+            "copy payload enum is transferred instead of copied",
+        )),
+    }
+}
+
+fn validate_payload_enum_place(
+    program: &mir::Program,
+    function: &mir::Function,
+    place: &mir::PayloadEnumPlace,
+    expected: mir::Type,
+    mode: mir::PayloadEnumUseMode,
+) -> Result<(), BackendError> {
+    match place {
+        mir::PayloadEnumPlace::Local(local) => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != expected {
+                return Err(malformed_mir(format!(
+                    "payload enum place local{} has type {}, expected {}",
+                    local.0, definition.ty, expected
+                )));
+            }
+            if matches!(mode, mir::PayloadEnumUseMode::Move) && !definition.owned {
+                return Err(malformed_mir(
+                    "payload enum move transfers a borrowed local",
+                ));
+            }
+            Ok(())
+        }
+        mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local) => {
+            let definition = local_in(function, *local)?;
+            let mir::Type::PayloadEnum(expected) = expected else {
+                return Err(malformed_mir(
+                    "nonnull nullable payload enum place is used as a nullable value",
+                ));
+            };
+            if definition.ty != mir::Type::NullablePayloadEnum(expected) {
+                return Err(malformed_mir(format!(
+                    "nonnull payload enum place local{} has type {}, expected ?payload-enum#{}",
+                    local.0, definition.ty, expected.id.0
+                )));
+            }
+            if matches!(mode, mir::PayloadEnumUseMode::Move) && !definition.owned {
+                return Err(malformed_mir(
+                    "payload enum move transfers a borrowed nullable local",
+                ));
+            }
+            Ok(())
+        }
+        mir::PayloadEnumPlace::Static(id) => validate_static_operand(program, *id, expected),
+        mir::PayloadEnumPlace::Property { object, property } => {
+            validate_property_operand(program, function, *object, *property, expected)
+        }
+        mir::PayloadEnumPlace::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir(
+                    "payload enum index source is not a collection",
+                ));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            if collection_type.value != expected {
+                return Err(malformed_mir(
+                    "payload enum collection element type mismatch",
+                ));
+            }
+            if *remove == matches!(mode, mir::PayloadEnumUseMode::Borrow) {
+                return Err(malformed_mir(
+                    "payload enum collection transfer mode disagrees with removal",
+                ));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection_type,
+                index,
+                *remove,
+                *positional,
+            )
+        }
+        mir::PayloadEnumPlace::MixedPayload { mixed } => {
+            let local = local_in(function, *mixed)?;
+            if !matches!(local.ty, mir::Type::Mixed | mir::Type::NullableMixed) {
+                return Err(malformed_mir(
+                    "payload enum mixed projection uses a non-mixed local",
+                ));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn validate_shared_reference_expression(
@@ -3151,6 +3636,9 @@ fn validate_mixed_expression(
             }
             validate_class_expression(program, function, value)
         }
+        mir::MixedExpression::BoxPayloadEnum { value } => {
+            validate_payload_enum_expression(program, function, value)
+        }
         mir::MixedExpression::CollectionIndex {
             positional,
             collection,
@@ -3188,6 +3676,9 @@ fn validate_nullable_mixed_expression(
         mir::NullableMixedExpression::Null => Ok(()),
         mir::NullableMixedExpression::Mixed(value) => {
             validate_mixed_expression(program, function, value)
+        }
+        mir::NullableMixedExpression::BoxNullablePayloadEnum(value) => {
+            validate_nullable_payload_enum_expression(program, function, value)
         }
         mir::NullableMixedExpression::Local { local, transfer } => {
             let definition = local_in(function, *local)?;
@@ -4470,6 +4961,7 @@ fn infer_mixed_expression_return_borrow(
         | mir::MixedExpression::BoxValue(_)
         | mir::MixedExpression::BoxString { .. }
         | mir::MixedExpression::BoxClass { .. }
+        | mir::MixedExpression::BoxPayloadEnum { .. }
         | mir::MixedExpression::CollectionIndex { transfer: true, .. } => Ok(None),
     }
 }
@@ -4484,6 +4976,7 @@ fn infer_nullable_mixed_expression_return_borrow(
         mir::NullableMixedExpression::Mixed(value) => {
             infer_mixed_expression_return_borrow(program, function, value)
         }
+        mir::NullableMixedExpression::BoxNullablePayloadEnum(_) => Ok(None),
         mir::NullableMixedExpression::Local {
             local,
             transfer: false,
@@ -5072,6 +5565,80 @@ fn collect_rvalue_class_local_accesses<'a>(
         mir::Rvalue::NullableSharedReferenceAccess(value) => {
             collect_nullable_shared_access_class_local_accesses(value, accesses)
         }
+        mir::Rvalue::PayloadEnum(value) => {
+            collect_payload_enum_class_local_accesses(value, accesses)
+        }
+        mir::Rvalue::NullablePayloadEnum(value) => {
+            collect_nullable_payload_enum_class_local_accesses(value, accesses)
+        }
+    }
+}
+
+fn collect_payload_enum_class_local_accesses<'a>(
+    value: &'a mir::PayloadEnumExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::PayloadEnumExpression::Construct { fields, .. } => {
+            collect_rvalue_args_class_local_accesses(fields, accesses)
+        }
+        mir::PayloadEnumExpression::Use { place, .. } => {
+            collect_payload_enum_place_class_local_accesses(place, accesses)
+        }
+        mir::PayloadEnumExpression::Call { function, args, .. } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::PayloadEnumExpression::Coalesce { left, right, .. } => {
+            collect_nullable_payload_enum_class_local_accesses(left, accesses);
+            collect_payload_enum_class_local_accesses(right, accesses);
+        }
+    }
+}
+
+fn collect_nullable_payload_enum_class_local_accesses<'a>(
+    value: &'a mir::NullablePayloadEnumExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::NullablePayloadEnumExpression::Null(_) => {}
+        mir::NullablePayloadEnumExpression::Value(value) => {
+            collect_payload_enum_class_local_accesses(value, accesses)
+        }
+        mir::NullablePayloadEnumExpression::Use { place, .. } => {
+            collect_payload_enum_place_class_local_accesses(place, accesses)
+        }
+        mir::NullablePayloadEnumExpression::Call { function, args, .. } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::NullablePayloadEnumExpression::CollectionGet { key, .. } => {
+            collect_rvalue_class_local_accesses(key, accesses)
+        }
+        mir::NullablePayloadEnumExpression::Coalesce { left, right, .. } => {
+            collect_nullable_payload_enum_class_local_accesses(left, accesses);
+            collect_nullable_payload_enum_class_local_accesses(right, accesses);
+        }
+    }
+}
+
+fn collect_payload_enum_place_class_local_accesses<'a>(
+    place: &'a mir::PayloadEnumPlace,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match place {
+        mir::PayloadEnumPlace::Property { object, .. } => accesses.borrow(*object),
+        mir::PayloadEnumPlace::CollectionIndex { index, .. } => {
+            collect_rvalue_class_local_accesses(index, accesses)
+        }
+        mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local) => {
+            accesses.assume_nullable_present(*local)
+        }
+        mir::PayloadEnumPlace::Local(_)
+        | mir::PayloadEnumPlace::Static(_)
+        | mir::PayloadEnumPlace::MixedPayload { .. } => {}
     }
 }
 
@@ -5470,6 +6037,9 @@ fn collect_mixed_class_local_accesses<'a>(
         mir::MixedExpression::BoxClass { value, .. } => {
             collect_class_expression_local_accesses(value, accesses)
         }
+        mir::MixedExpression::BoxPayloadEnum { value } => {
+            collect_payload_enum_class_local_accesses(value, accesses)
+        }
         mir::MixedExpression::Call { function, args, .. } => {
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
@@ -5489,6 +6059,9 @@ fn collect_nullable_mixed_class_local_accesses<'a>(
     match value {
         mir::NullableMixedExpression::Mixed(value) => {
             collect_mixed_class_local_accesses(value, accesses)
+        }
+        mir::NullableMixedExpression::BoxNullablePayloadEnum(value) => {
+            collect_nullable_payload_enum_class_local_accesses(value, accesses)
         }
         mir::NullableMixedExpression::Call { function, args, .. } => {
             accesses.begin_call();
@@ -5887,6 +6460,17 @@ fn collect_bool_class_local_accesses<'a>(
         mir::BoolExpression::NullableMixedIsPresent(value) => {
             collect_nullable_mixed_class_local_accesses(value, accesses);
         }
+        mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
+            collect_nullable_payload_enum_class_local_accesses(value, accesses);
+        }
+        mir::BoolExpression::PayloadEnumCompare { left, right, .. } => {
+            collect_payload_enum_class_local_accesses(left, accesses);
+            collect_payload_enum_class_local_accesses(right, accesses);
+        }
+        mir::BoolExpression::NullablePayloadEnumCompare { left, right, .. } => {
+            collect_nullable_payload_enum_class_local_accesses(left, accesses);
+            collect_nullable_payload_enum_class_local_accesses(right, accesses);
+        }
         mir::BoolExpression::MixedIs { mixed, .. } => {
             collect_mixed_class_local_accesses(mixed, accesses);
         }
@@ -6113,6 +6697,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         | mir::Statement::DropString { .. }
         | mir::Statement::DropMixed { .. }
         | mir::Statement::DropCollection { .. }
+        | mir::Statement::DropPayloadEnum { .. }
         | mir::Statement::DropSharedReference { .. }
         | mir::Statement::DropWeakReference { .. }
         | mir::Statement::DropWritableSharedReference { .. }
@@ -6770,6 +7355,11 @@ fn apply_nullable_presence_condition(
                 set_nullable_presence(local, when_true != equals_null, present);
             }
         }
+        mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
+            if let Some(local) = nullable_payload_enum_presence_local(value) {
+                set_nullable_presence(local, when_true, present);
+            }
+        }
         mir::BoolExpression::Not(value) => {
             apply_nullable_presence_condition(value, !when_true, present)
         }
@@ -6805,6 +7395,18 @@ fn nullable_string_null_comparison_local(
         | (mir::NullableStringExpression::Null, mir::NullableStringExpression::Local(local)) => {
             Some(*local)
         }
+        _ => None,
+    }
+}
+
+fn nullable_payload_enum_presence_local(
+    value: &mir::NullablePayloadEnumExpression,
+) -> Option<mir::LocalId> {
+    match value {
+        mir::NullablePayloadEnumExpression::Use {
+            place: mir::PayloadEnumPlace::Local(local),
+            ..
+        } => Some(*local),
         _ => None,
     }
 }
@@ -7510,6 +8112,7 @@ fn statement_observes_property(
         | mir::Statement::DropMixed { .. }
         | mir::Statement::CollectionClear { .. }
         | mir::Statement::DropCollection { .. }
+        | mir::Statement::DropPayloadEnum { .. }
         | mir::Statement::DropSharedReference { .. }
         | mir::Statement::DropWeakReference { .. }
         | mir::Statement::DropWritableSharedReference { .. }
@@ -7631,6 +8234,78 @@ fn rvalue_observes_property(
         mir::Rvalue::NullableSharedReferenceAccess(value) => {
             nullable_shared_access_observes_property(value, receiver, property)
         }
+        mir::Rvalue::PayloadEnum(value) => {
+            payload_enum_observes_property(value, receiver, property)
+        }
+        mir::Rvalue::NullablePayloadEnum(value) => {
+            nullable_payload_enum_observes_property(value, receiver, property)
+        }
+    }
+}
+
+fn payload_enum_observes_property(
+    value: &mir::PayloadEnumExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::PayloadEnumExpression::Construct { fields, .. }
+        | mir::PayloadEnumExpression::Call { args: fields, .. } => fields
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::PayloadEnumExpression::Use { place, .. } => {
+            payload_enum_place_observes_property(place, receiver, property)
+        }
+        mir::PayloadEnumExpression::Coalesce { left, right, .. } => {
+            nullable_payload_enum_observes_property(left, receiver, property)
+                || payload_enum_observes_property(right, receiver, property)
+        }
+    }
+}
+
+fn nullable_payload_enum_observes_property(
+    value: &mir::NullablePayloadEnumExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::NullablePayloadEnumExpression::Null(_) => false,
+        mir::NullablePayloadEnumExpression::Value(value) => {
+            payload_enum_observes_property(value, receiver, property)
+        }
+        mir::NullablePayloadEnumExpression::Use { place, .. } => {
+            payload_enum_place_observes_property(place, receiver, property)
+        }
+        mir::NullablePayloadEnumExpression::Call { args, .. } => args
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::NullablePayloadEnumExpression::CollectionGet { key, .. } => {
+            rvalue_observes_property(key, receiver, property)
+        }
+        mir::NullablePayloadEnumExpression::Coalesce { left, right, .. } => {
+            nullable_payload_enum_observes_property(left, receiver, property)
+                || nullable_payload_enum_observes_property(right, receiver, property)
+        }
+    }
+}
+
+fn payload_enum_place_observes_property(
+    place: &mir::PayloadEnumPlace,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match place {
+        mir::PayloadEnumPlace::Property {
+            object,
+            property: observed,
+        } => *object == receiver && *observed == property,
+        mir::PayloadEnumPlace::CollectionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
+        mir::PayloadEnumPlace::Local(_)
+        | mir::PayloadEnumPlace::NullableLocalAssumeNonNull(_)
+        | mir::PayloadEnumPlace::Static(_)
+        | mir::PayloadEnumPlace::MixedPayload { .. } => false,
     }
 }
 
@@ -8076,6 +8751,9 @@ fn mixed_observes_property(
         mir::MixedExpression::BoxClass { value, .. } => {
             class_observes_property(value, receiver, property)
         }
+        mir::MixedExpression::BoxPayloadEnum { value } => {
+            payload_enum_observes_property(value, receiver, property)
+        }
         mir::MixedExpression::Call { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
@@ -8094,6 +8772,9 @@ fn nullable_mixed_observes_property(
     match value {
         mir::NullableMixedExpression::Mixed(value) => {
             mixed_observes_property(value, receiver, property)
+        }
+        mir::NullableMixedExpression::BoxNullablePayloadEnum(value) => {
+            nullable_payload_enum_observes_property(value, receiver, property)
         }
         mir::NullableMixedExpression::Call { args, .. } => args
             .iter()
@@ -8371,6 +9052,17 @@ fn bool_observes_property(
         }
         mir::BoolExpression::NullableMixedIsPresent(value) => {
             nullable_mixed_observes_property(value, receiver, property)
+        }
+        mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
+            nullable_payload_enum_observes_property(value, receiver, property)
+        }
+        mir::BoolExpression::PayloadEnumCompare { left, right, .. } => {
+            payload_enum_observes_property(left, receiver, property)
+                || payload_enum_observes_property(right, receiver, property)
+        }
+        mir::BoolExpression::NullablePayloadEnumCompare { left, right, .. } => {
+            nullable_payload_enum_observes_property(left, receiver, property)
+                || nullable_payload_enum_observes_property(right, receiver, property)
         }
         mir::BoolExpression::MixedIs { mixed, .. } => {
             mixed_observes_property(mixed, receiver, property)
@@ -9142,6 +9834,32 @@ fn validate_condition(
         mir::BoolExpression::NullableMixedIsPresent(value) => {
             validate_nullable_mixed_expression(program, function, value)
         }
+        mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
+            validate_nullable_payload_enum_expression(program, function, value)
+        }
+        mir::BoolExpression::PayloadEnumCompare { op, left, right } => {
+            validate_payload_enum_comparison(program, function, *op, left, right)
+        }
+        mir::BoolExpression::NullablePayloadEnumCompare { op, left, right } => {
+            if !matches!(op, mir::CompareOp::Equal | mir::CompareOp::NotEqual) {
+                return Err(malformed_mir(
+                    "ordered nullable payload-enum comparison is invalid",
+                ));
+            }
+            if left.ty() != right.ty() {
+                return Err(malformed_mir(
+                    "nullable payload-enum comparison uses different enum types",
+                ));
+            }
+            let definition = validate_payload_enum_type(program, left.ty())?;
+            if !definition.capabilities.equality {
+                return Err(malformed_mir(
+                    "nullable payload-enum comparison requires equality-capable fields",
+                ));
+            }
+            validate_nullable_payload_enum_expression(program, function, left)?;
+            validate_nullable_payload_enum_expression(program, function, right)
+        }
         mir::BoolExpression::MixedIs { mixed, tag } => {
             validate_mixed_expression(program, function, mixed)?;
             if let mir::MixedTag::Class(class) = tag {
@@ -9149,6 +9867,9 @@ fn validate_condition(
             }
             if let mir::MixedTag::Enum(enum_id) = tag {
                 enum_in(program, *enum_id)?;
+            }
+            if let mir::MixedTag::PayloadEnum(payload) = tag {
+                validate_payload_enum_type(program, *payload)?;
             }
             Ok(())
         }
@@ -9260,6 +9981,31 @@ fn validate_condition(
             validate_bytes_local(program, function, *right)
         }
     }
+}
+
+fn validate_payload_enum_comparison(
+    program: &mir::Program,
+    function: &mir::Function,
+    op: mir::CompareOp,
+    left: &mir::PayloadEnumExpression,
+    right: &mir::PayloadEnumExpression,
+) -> Result<(), BackendError> {
+    if !matches!(op, mir::CompareOp::Equal | mir::CompareOp::NotEqual) {
+        return Err(malformed_mir("ordered payload-enum comparison is invalid"));
+    }
+    if left.ty() != right.ty() {
+        return Err(malformed_mir(
+            "payload-enum comparison uses different enum types",
+        ));
+    }
+    let definition = validate_payload_enum_type(program, left.ty())?;
+    if !definition.capabilities.equality {
+        return Err(malformed_mir(
+            "payload-enum comparison requires equality-capable fields",
+        ));
+    }
+    validate_payload_enum_expression(program, function, left)?;
+    validate_payload_enum_expression(program, function, right)
 }
 
 fn validate_integer_operand(
@@ -10069,11 +10815,13 @@ fn validate_null_safe_call(
             ))
         }
         mir::Type::Collection(collection) => mir::Type::NullableCollection(collection),
+        mir::Type::PayloadEnum(payload) => mir::Type::NullablePayloadEnum(payload),
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
         | mir::Type::NullableCollection(_)
+        | mir::Type::NullablePayloadEnum(_)
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
         | mir::Type::NullableWritableSharedReference(_)

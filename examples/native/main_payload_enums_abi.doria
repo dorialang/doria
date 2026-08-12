@@ -1,0 +1,29 @@
+enum Coordinate
+{
+    case Point(int $x, int $y);
+}
+
+class Box<T>
+{
+    function __construct(take T $value)
+    {
+    }
+}
+
+function make(int $x, int $y): Coordinate
+{
+    return Coordinate::Point($x, $y);
+}
+
+function same(Coordinate $left, Coordinate $right): bool
+{
+    return $left == $right;
+}
+
+function main(): void
+{
+    Coordinate $point = make(20, 22);
+    let $box = new Box<Coordinate>($point);
+    echo "{same($point, Coordinate::Point(20, 22))} ";
+    echo "{$box->value == Coordinate::Point(20, 22)}\n";
+}

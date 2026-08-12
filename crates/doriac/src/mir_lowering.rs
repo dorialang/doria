@@ -13,6 +13,7 @@ use crate::{hir, mir};
 struct ClassIds {
     classes: HashMap<ClassType<ResolvedType>, ClassId>,
     enums: HashMap<String, crate::enums::EnumType>,
+    enum_types: HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
 }
 
 impl ClassIds {
@@ -22,6 +23,13 @@ impl ClassIds {
 
     fn resolve_enum_nominals(&self, ty: ResolvedType) -> ResolvedType {
         resolve_enum_nominals(ty, &self.enums)
+    }
+
+    fn mir_enum_type(&self, id: crate::enums::EnumId) -> mir::Type {
+        self.enum_types.get(&id).copied().map_or(
+            mir::Type::Scalar(mir::ScalarType::Enum(id)),
+            mir::Type::PayloadEnum,
+        )
     }
 }
 
@@ -496,8 +504,15 @@ pub(crate) struct StructuralMetrics {
     pub(crate) unit_enum_count: usize,
     pub(crate) backed_enum_count: usize,
     pub(crate) payload_enum_count: usize,
+    pub(crate) copy_payload_enum_count: usize,
+    pub(crate) move_payload_enum_count: usize,
     pub(crate) enum_case_count: usize,
     pub(crate) enum_payload_field_count: usize,
+    pub(crate) maximum_payload_enum_size: u32,
+    pub(crate) maximum_payload_enum_alignment: u32,
+    pub(crate) enum_copy_glue_type_count: usize,
+    pub(crate) enum_drop_glue_type_count: usize,
+    pub(crate) enum_equality_glue_type_count: usize,
     pub(crate) callable_specialization_count: usize,
     pub(crate) class_specialization_count: usize,
     pub(crate) basic_block_count: usize,
@@ -533,6 +548,24 @@ fn lower_program_impl(
             metrics.enum_payload_field_count += payload_fields;
             if payload_fields != 0 {
                 metrics.payload_enum_count += 1;
+                if definition.capabilities.copy {
+                    metrics.copy_payload_enum_count += 1;
+                    metrics.enum_copy_glue_type_count += 1;
+                } else {
+                    metrics.move_payload_enum_count += 1;
+                }
+                if definition.capabilities.needs_drop {
+                    metrics.enum_drop_glue_type_count += 1;
+                }
+                if definition.capabilities.equality {
+                    metrics.enum_equality_glue_type_count += 1;
+                }
+                metrics.maximum_payload_enum_size = metrics
+                    .maximum_payload_enum_size
+                    .max(definition.layout.size);
+                metrics.maximum_payload_enum_alignment = metrics
+                    .maximum_payload_enum_alignment
+                    .max(definition.layout.align);
             } else if definition.backing_type.is_some() {
                 metrics.backed_enum_count += 1;
             } else {
@@ -560,6 +593,27 @@ fn lower_program_impl(
                 (
                     definition.name.clone(),
                     crate::enums::EnumType::new(definition.id, definition.name.clone()),
+                )
+            })
+            .collect(),
+        enum_types: program
+            .semantic_info
+            .enums
+            .iter()
+            .filter(|definition| definition.cases.iter().any(|case| !case.payload.is_empty()))
+            .map(|definition| {
+                let nullable = crate::enums::nullable_enum_layout(&definition.layout)
+                    .expect("checked payload enum has finite nullable layout");
+                (
+                    definition.id,
+                    mir::PayloadEnumType {
+                        id: definition.id,
+                        capabilities: definition.capabilities,
+                        size: definition.layout.size,
+                        align: definition.layout.align,
+                        nullable_size: nullable.size,
+                        nullable_payload_offset: nullable.payload_offset,
+                    },
                 )
             })
             .collect(),
@@ -622,7 +676,13 @@ fn lower_program_impl(
                         ),
                     )]
                 })?;
-            let initializer = lower_static_value(&evaluated.value, ty, property.span)?;
+            let initializer = lower_static_value(
+                &evaluated.value,
+                ty,
+                property.span,
+                &class_ids.enum_types,
+                &program.semantic_info,
+            )?;
             static_ids.insert((class_id, property.name.clone()), (id, ty));
             statics.push(mir::StaticProperty {
                 id,
@@ -858,6 +918,7 @@ fn lower_program_impl(
             constructor_body_initializers: &constructor_body_initializers,
             static_ids: &static_ids,
             collection_registry: &collection_registry,
+            enum_types: &class_ids.enum_types,
             type_substitutions: &substitutions,
         };
         functions.push(lower_function(
@@ -911,7 +972,8 @@ fn lower_program_impl(
                 properties.iter().map(|property| {
                     (
                         property.id,
-                        field_type(property.ty).expect("checked native property type"),
+                        field_type(property.ty, &program.semantic_info)
+                            .expect("checked native property type"),
                     )
                 }),
                 std::mem::size_of::<usize>() as u32,
@@ -980,7 +1042,8 @@ fn lower_program_impl(
                         })
                     })
                     .collect::<DiagnosticResult<Vec<_>>>()?,
-                copy: enum_info.copy,
+                capabilities: enum_info.capabilities,
+                layout: enum_info.layout.clone(),
             })
         })
         .collect::<DiagnosticResult<Vec<_>>>()?;
@@ -1012,7 +1075,7 @@ fn intern_resolved_collection_types(
         ResolvedType::String => mir::Type::String,
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::Mixed => mir::Type::Mixed,
-        ResolvedType::Enum(enum_type) => mir::Type::Scalar(mir::ScalarType::Enum(enum_type.id)),
+        ResolvedType::Enum(enum_type) => class_ids.mir_enum_type(enum_type.id),
         ResolvedType::Class(class) => mir::Type::Class(*class_ids.get(class)?),
         ResolvedType::SharedHandle(kind, payload) => match kind {
             crate::types::SharedHandleKind::SharedReference => {
@@ -1121,6 +1184,7 @@ fn intern_resolved_collection_types(
                     mir::Type::NullableWritableSharedReferenceAccess(payload)
                 }
                 mir::Type::Collection(collection) => mir::Type::NullableCollection(collection),
+                mir::Type::PayloadEnum(ty) => mir::Type::NullablePayloadEnum(ty),
                 mir::Type::NullableCollection(collection) => {
                     mir::Type::NullableCollection(collection)
                 }
@@ -1133,7 +1197,8 @@ fn intern_resolved_collection_types(
                 | mir::Type::NullableWritableSharedReference(_)
                 | mir::Type::NullableWritableWeakReference(_)
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
-                | mir::Type::NullableWritableSharedReferenceAccess(_) => return None,
+                | mir::Type::NullableWritableSharedReferenceAccess(_)
+                | mir::Type::NullablePayloadEnum(_) => return None,
             }
         }
         // Stage 25a Slice 1 lands the surface and type model only; shared handles
@@ -1244,6 +1309,8 @@ fn lower_static_value(
     value: &crate::const_eval::ConstValue,
     ty: mir::Type,
     span: Span,
+    enum_types: &HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
+    semantic_info: &SemanticInfo,
 ) -> DiagnosticResult<mir::StaticValue> {
     match (value, ty) {
         (
@@ -1276,8 +1343,36 @@ fn lower_static_value(
         ) => Ok(mir::StaticValue::String(value.clone())),
         (
             crate::const_eval::ConstValue::Null,
-            mir::Type::NullableScalar(_) | mir::Type::NullableString | mir::Type::NullableClass(_),
+            mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::NullableClass(_)
+            | mir::Type::NullablePayloadEnum(_),
         ) => Ok(mir::StaticValue::Null),
+        (
+            crate::const_eval::ConstValue::PayloadEnum(value),
+            mir::Type::PayloadEnum(expected) | mir::Type::NullablePayloadEnum(expected),
+        ) if value.enum_id == expected.id => {
+            let fields = value
+                .fields
+                .iter()
+                .zip(&value.field_types)
+                .map(|(field, field_ty)| {
+                    let field_ty = const_type_ref_to_mir(field_ty, enum_types, semantic_info)
+                        .ok_or_else(|| {
+                            vec![unsupported(
+                                span,
+                                "payload enum static field has no native constant representation",
+                            )]
+                        })?;
+                    lower_static_value(field, field_ty, span, enum_types, semantic_info)
+                })
+                .collect::<DiagnosticResult<Vec<_>>>()?;
+            Ok(mir::StaticValue::PayloadEnum(mir::PayloadEnumConstant {
+                ty: expected,
+                case: value.case_id,
+                fields,
+            }))
+        }
         _ => Err(vec![unsupported(
             span,
             "evaluated static initializer does not match its native type",
@@ -1403,7 +1498,7 @@ fn collect_function_signature(
                 ),
             )]);
         };
-        let transfers = matches!(
+        let transfer_capable = matches!(
             parameter_type,
             mir::Type::Class(_)
                 | mir::Type::NullableClass(_)
@@ -1414,7 +1509,12 @@ fn collect_function_signature(
                 | mir::Type::WeakReference(_)
                 | mir::Type::NullableSharedReference(_)
                 | mir::Type::NullableWeakReference(_)
-        ) && param.take;
+        ) || matches!(
+            parameter_type,
+            mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty)
+                if !ty.capabilities.copy
+        );
+        let transfers = transfer_capable && param.take;
         let owns = transfers && param.promoted_access.is_none();
         let default = if param.default.is_some() {
             Some(
@@ -1601,6 +1701,14 @@ fn resolve_enum_nominals(
         ResolvedType::SharedHandle(kind, payload) => {
             ResolvedType::SharedHandle(kind, Box::new(resolve_enum_nominals(*payload, enums)))
         }
+        ResolvedType::Class(class) => ResolvedType::Class(ClassType::new(
+            class.name,
+            class
+                .arguments
+                .into_iter()
+                .map(|argument| resolve_enum_nominals(argument, enums))
+                .collect(),
+        )),
         ty => ty,
     }
 }
@@ -1611,7 +1719,7 @@ fn intern_bytes_type(collections: &mut CollectionRegistry) -> mir::CollectionTyp
     collections.intern(mir::CollectionKind::Bytes, None, byte)
 }
 
-fn field_type(ty: mir::Type) -> Option<FieldType> {
+fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> {
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(FieldType::Integer(ty)),
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Some(FieldType::Float(ty)),
@@ -1655,6 +1763,23 @@ fn field_type(ty: mir::Type) -> Option<FieldType> {
         }
         mir::Type::Collection(_) => Some(FieldType::Collection),
         mir::Type::NullableCollection(_) => Some(FieldType::Collection),
+        mir::Type::PayloadEnum(ty) => semantic_info
+            .enums
+            .iter()
+            .find(|definition| definition.id == ty.id)
+            .map(|definition| FieldType::Aggregate {
+                size: definition.layout.size,
+                align: definition.layout.align,
+            }),
+        mir::Type::NullablePayloadEnum(ty) => semantic_info
+            .enums
+            .iter()
+            .find(|definition| definition.id == ty.id)
+            .and_then(|definition| crate::enums::nullable_enum_layout(&definition.layout).ok())
+            .map(|layout| FieldType::Aggregate {
+                size: layout.size,
+                align: layout.align,
+            }),
     }
 }
 
@@ -1699,6 +1824,7 @@ struct FunctionLoweringInputs<'a> {
     constructor_body_initializers: &'a HashSet<crate::class_layout::PropertyId>,
     static_ids: &'a HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: &'a CollectionRegistry,
+    enum_types: &'a HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
     type_substitutions: &'a HashMap<String, crate::types::ResolvedType>,
 }
 
@@ -2398,7 +2524,9 @@ fn lower_collection_foreach_in_scope(
             mir::Type::Scalar(_)
             | mir::Type::String
             | mir::Type::NullableScalar(_)
-            | mir::Type::NullableString => {
+            | mir::Type::NullableString
+            | mir::Type::PayloadEnum(_)
+            | mir::Type::NullablePayloadEnum(_) => {
                 // Write back to the slot being iterated, matching the
                 // positional read above. Resolving by key here would search for
                 // the element again, and for a values-only pass there is no key
@@ -2615,6 +2743,30 @@ fn collection_value_rvalue(
                 transfer: false,
             }))
         }
+        mir::Type::PayloadEnum(ty) => {
+            Ok(mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::CollectionIndex {
+                    collection,
+                    index: Box::new(index),
+                    positional,
+                    remove: false,
+                },
+                mode: mir::PayloadEnumUseMode::Borrow,
+            }))
+        }
+        mir::Type::NullablePayloadEnum(ty) => Ok(mir::Rvalue::NullablePayloadEnum(
+            mir::NullablePayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::CollectionIndex {
+                    collection,
+                    index: Box::new(index),
+                    positional,
+                    remove: false,
+                },
+                mode: mir::PayloadEnumUseMode::Borrow,
+            },
+        )),
         mir::Type::NullableMixed
         | mir::Type::NullableCollection(_)
         | mir::Type::NullableWritableSharedReference(_)
@@ -2897,6 +3049,7 @@ struct LoweringContext<'semantic> {
     constructor_body_initializers: HashSet<crate::class_layout::PropertyId>,
     static_ids: HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: CollectionRegistry,
+    enum_types: HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
     type_substitutions: HashMap<String, crate::types::ResolvedType>,
     current_class: Option<ClassId>,
     locals: Vec<mir::Local>,
@@ -2922,6 +3075,7 @@ enum DropObligation {
     SharedAccess(mir::LocalId, mir::WritableSharedPayload, bool),
     Mixed(mir::LocalId),
     Collection(mir::LocalId, mir::CollectionTypeId),
+    PayloadEnum(mir::LocalId, mir::PayloadEnumType, bool),
 }
 
 fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropObligation {
@@ -2950,6 +3104,8 @@ fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropOb
         mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
             DropObligation::Collection(local, collection)
         }
+        mir::Type::PayloadEnum(ty) => DropObligation::PayloadEnum(local, ty, false),
+        mir::Type::NullablePayloadEnum(ty) => DropObligation::PayloadEnum(local, ty, true),
         _ => unreachable!("only move locals may own native drop obligations"),
     }
 }
@@ -2964,6 +3120,7 @@ impl<'semantic> LoweringContext<'semantic> {
             constructor_body_initializers: inputs.constructor_body_initializers.clone(),
             static_ids: inputs.static_ids.clone(),
             collection_registry: inputs.collection_registry.clone(),
+            enum_types: inputs.enum_types.clone(),
             type_substitutions: inputs.type_substitutions.clone(),
             current_class: None,
             locals: Vec::new(),
@@ -3168,6 +3325,13 @@ impl<'semantic> LoweringContext<'semantic> {
                 DropObligation::Collection(local, collection) => {
                     mir::Statement::DropCollection { local, collection }
                 }
+                DropObligation::PayloadEnum(local, ty, nullable) => {
+                    mir::Statement::DropPayloadEnum {
+                        local,
+                        ty,
+                        nullable,
+                    }
+                }
             });
         }
     }
@@ -3206,6 +3370,20 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::Mixed
                 | mir::Type::NullableMixed
                 | mir::Type::Collection(_)
+                | mir::Type::PayloadEnum(mir::PayloadEnumType {
+                    capabilities: crate::enums::EnumCapabilities {
+                        needs_drop: true,
+                        ..
+                    },
+                    ..
+                })
+                | mir::Type::NullablePayloadEnum(mir::PayloadEnumType {
+                    capabilities: crate::enums::EnumCapabilities {
+                        needs_drop: true,
+                        ..
+                    },
+                    ..
+                })
         );
         self.declare_user_local_owned(name, writable, ty, owned)
     }
@@ -3672,7 +3850,10 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::String => Some(mir::Type::String),
             ResolvedType::Mixed => Some(mir::Type::Mixed),
             ResolvedType::Enum(enum_type) => {
-                Some(mir::Type::Scalar(mir::ScalarType::Enum(enum_type.id)))
+                Some(self.enum_types.get(&enum_type.id).copied().map_or(
+                    mir::Type::Scalar(mir::ScalarType::Enum(enum_type.id)),
+                    mir::Type::PayloadEnum,
+                ))
             }
             ResolvedType::TypeParameter(name) => self
                 .type_substitutions
@@ -3817,6 +3998,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 mir::Type::Collection(collection) => {
                     Some(mir::Type::NullableCollection(collection))
                 }
+                mir::Type::PayloadEnum(ty) => Some(mir::Type::NullablePayloadEnum(ty)),
                 // `?(?X)` collapses to `?X`: a `?T` field substituted with a
                 // nullable argument is already nullable, not doubly-nullable.
                 already @ (mir::Type::NullableScalar(_)
@@ -3829,7 +4011,8 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullableWritableSharedReference(_)
                 | mir::Type::NullableWritableWeakReference(_)
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
-                | mir::Type::NullableWritableSharedReferenceAccess(_)) => Some(already),
+                | mir::Type::NullableWritableSharedReferenceAccess(_)
+                | mir::Type::NullablePayloadEnum(_)) => Some(already),
             },
             ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
         }
@@ -3871,7 +4054,9 @@ impl<'semantic> LoweringContext<'semantic> {
             | mir::Type::NullableReadonlySharedReferenceAccess(_)
             | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Collection(_)
-            | mir::Type::NullableCollection(_) => Err(vec![Diagnostic::new(
+            | mir::Type::NullableCollection(_)
+            | mir::Type::PayloadEnum(_)
+            | mir::Type::NullablePayloadEnum(_) => Err(vec![Diagnostic::new(
                 "I1401",
                 format!(
                     "internal compiler consistency error: string local local{} used as a scalar",
@@ -4126,9 +4311,38 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         });
         return Ok(());
     }
+    if let mir::Type::PayloadEnum(enum_ty) = ty {
+        let value = lower_payload_enum_expression(&decl.initializer, enum_ty, true, context)?;
+        let local = context.declare_user_local_owned(
+            name,
+            decl.writable,
+            ty,
+            enum_ty.capabilities.needs_drop,
+        );
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::PayloadEnum(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::NullablePayloadEnum(enum_ty) = ty {
+        let value =
+            lower_nullable_payload_enum_expression(&decl.initializer, enum_ty, true, context)?;
+        let local = context.declare_user_local_owned(
+            name,
+            decl.writable,
+            ty,
+            enum_ty.capabilities.needs_drop,
+        );
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullablePayloadEnum(value),
+        });
+        return Ok(());
+    }
 
     let mir::Type::Scalar(scalar_type) = ty else {
-        unreachable!("string locals return through lower_string_var_decl")
+        unreachable!("non-scalar locals return through their typed lowering paths")
     };
     let value = lower_value_expression(&decl.initializer, context)?;
     ensure_value_type(&value, scalar_type, decl.initializer.span())?;
@@ -4211,6 +4425,17 @@ fn lower_grouped_var_decl(
         mir::Type::NullableCollection(collection) => mir::Rvalue::NullableCollection(
             lower_nullable_collection_expression(&decl.initializer, collection, true, context)?,
         ),
+        mir::Type::PayloadEnum(enum_ty) if enum_ty.capabilities.copy => mir::Rvalue::PayloadEnum(
+            lower_payload_enum_expression(&decl.initializer, enum_ty, true, context)?,
+        ),
+        mir::Type::NullablePayloadEnum(enum_ty) if enum_ty.capabilities.copy => {
+            mir::Rvalue::NullablePayloadEnum(lower_nullable_payload_enum_expression(
+                &decl.initializer,
+                enum_ty,
+                true,
+                context,
+            )?)
+        }
         mir::Type::Mixed
         | mir::Type::Class(_)
         | mir::Type::SharedReference(_)
@@ -4219,7 +4444,9 @@ fn lower_grouped_var_decl(
         | mir::Type::WritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
-        | mir::Type::Collection(_) => {
+        | mir::Type::Collection(_)
+        | mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_) => {
             return Err(vec![Diagnostic::new(
                 "I2601",
                 "internal compiler consistency error: grouped move-value declaration reached MIR lowering",
@@ -4231,14 +4458,7 @@ fn lower_grouped_var_decl(
     let targets = decl
         .bindings
         .iter()
-        .map(|binding| {
-            context.declare_user_local_owned(
-                &binding.name,
-                decl.writable,
-                ty,
-                ty.has_move_ownership(),
-            )
-        })
+        .map(|binding| context.declare_user_local(&binding.name, decl.writable, ty))
         .collect();
     context.push_statement(mir::Statement::AssignLocalGroup { targets, value });
     Ok(())
@@ -6242,6 +6462,10 @@ fn lower_display_string_expression(
             expr.span(),
             "collection values do not have an implicit display representation",
         )]),
+        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => Err(vec![unsupported(
+            expr.span(),
+            "payload enum values do not have an implicit display representation",
+        )]),
         mir::Type::WritableSharedReference(_) | mir::Type::WritableWeakReference(_) => {
             Err(vec![unsupported(
                 expr.span(),
@@ -6588,7 +6812,15 @@ fn lower_call_args_with_ownership(
         );
     }
 
-    splice_omitted_parameter_defaults(name, &bound, &signature, span, &mut lowered_args)?;
+    splice_omitted_parameter_defaults(
+        name,
+        &bound,
+        &signature,
+        span,
+        &mut lowered_args,
+        &context.enum_types,
+        context.semantic_info,
+    )?;
 
     Ok(lowered_args
         .into_iter()
@@ -6708,7 +6940,9 @@ fn hoist_argument_temporary(
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_)
-        | mir::Type::NullableCollection(_) => context.declare_owned_temp(ty),
+        | mir::Type::NullableCollection(_)
+        | mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_) => context.declare_owned_temp(ty),
     };
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
@@ -6733,6 +6967,8 @@ fn splice_omitted_parameter_defaults(
     signature: &FunctionSignature,
     span: Span,
     args: &mut [Option<mir::Rvalue>],
+    enum_types: &HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
+    semantic_info: &SemanticInfo,
 ) -> DiagnosticResult<()> {
     for index in 0..signature.parameter_types.len() {
         if bound.param_to_arg[index].is_some() {
@@ -6750,19 +6986,23 @@ fn splice_omitted_parameter_defaults(
                     span,
                 )]
             })?;
-        args[index] = Some(lower_const_parameter_default(
+        args[index] = Some(lower_const_rvalue(
             value,
             signature.parameter_types[index],
             span,
+            enum_types,
+            semantic_info,
         )?);
     }
     Ok(())
 }
 
-fn lower_const_parameter_default(
+fn lower_const_rvalue(
     value: &crate::const_eval::ConstValue,
     expected: mir::Type,
     span: Span,
+    enum_types: &HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
+    semantic_info: &SemanticInfo,
 ) -> DiagnosticResult<mir::Rvalue> {
     if let (crate::const_eval::ConstValue::String(value), mir::Type::String) = (value, expected) {
         return Ok(mir::Rvalue::String(mir::StringExpression::Literal(
@@ -6777,12 +7017,51 @@ fn lower_const_parameter_default(
             mir::Type::NullableString => Ok(mir::Rvalue::NullableString(
                 mir::NullableStringExpression::Null,
             )),
+            mir::Type::NullablePayloadEnum(ty) => Ok(mir::Rvalue::NullablePayloadEnum(
+                mir::NullablePayloadEnumExpression::Null(ty),
+            )),
             _ => Err(vec![Diagnostic::new(
                 "I2003",
                 "checked null parameter default does not match its MIR parameter type",
                 span,
             )]),
         };
+    }
+
+    if let (crate::const_eval::ConstValue::PayloadEnum(value), mir::Type::PayloadEnum(expected)) =
+        (value, expected)
+    {
+        if value.enum_id != expected.id {
+            return Err(vec![Diagnostic::new(
+                "I2003",
+                "checked payload enum default has another enum type",
+                span,
+            )]);
+        }
+        let fields = value
+            .fields
+            .iter()
+            .zip(&value.field_types)
+            .map(|(field, ty)| {
+                let expected =
+                    const_type_ref_to_mir(ty, enum_types, semantic_info).ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "I2003",
+                            "payload enum default field has no MIR constant type",
+                            span,
+                        )]
+                    })?;
+                lower_const_rvalue(field, expected, span, enum_types, semantic_info)
+            })
+            .collect::<DiagnosticResult<Vec<_>>>()?;
+        return Ok(mir::Rvalue::PayloadEnum(
+            mir::PayloadEnumExpression::Construct {
+                ty: expected,
+                case: value.case_id,
+                fields,
+                span,
+            },
+        ));
     }
 
     let value = match (value, expected) {
@@ -6818,6 +7097,65 @@ fn lower_const_parameter_default(
         }
     };
     Ok(mir::Rvalue::Value(value))
+}
+
+fn const_type_ref_to_mir(
+    ty: &crate::types::TypeRef,
+    enum_types: &HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
+    semantic_info: &SemanticInfo,
+) -> Option<mir::Type> {
+    if !ty.arguments.is_empty() {
+        return None;
+    }
+    if let Some(integer) = IntegerType::from_source_name(&ty.name) {
+        let scalar = mir::ScalarType::Integer(integer);
+        return Some(if ty.nullable {
+            mir::Type::NullableScalar(scalar)
+        } else {
+            mir::Type::Scalar(scalar)
+        });
+    }
+    if let Some(float) = FloatType::from_source_name(&ty.name) {
+        let scalar = mir::ScalarType::Float(float);
+        return Some(if ty.nullable {
+            mir::Type::NullableScalar(scalar)
+        } else {
+            mir::Type::Scalar(scalar)
+        });
+    }
+    match ty.name.as_str() {
+        "bool" => Some(if ty.nullable {
+            mir::Type::NullableScalar(mir::ScalarType::Bool)
+        } else {
+            mir::Type::Scalar(mir::ScalarType::Bool)
+        }),
+        "string" => Some(if ty.nullable {
+            mir::Type::NullableString
+        } else {
+            mir::Type::String
+        }),
+        name => {
+            let id = semantic_info
+                .enums
+                .iter()
+                .find(|definition| definition.name == name)?
+                .id;
+            if let Some(payload) = enum_types.get(&id).copied() {
+                Some(if ty.nullable {
+                    mir::Type::NullablePayloadEnum(payload)
+                } else {
+                    mir::Type::PayloadEnum(payload)
+                })
+            } else {
+                let scalar = mir::ScalarType::Enum(id);
+                Some(if ty.nullable {
+                    mir::Type::NullableScalar(scalar)
+                } else {
+                    mir::Type::Scalar(scalar)
+                })
+            }
+        }
+    }
 }
 
 fn lower_string_intrinsic_call(
@@ -7394,6 +7732,28 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
                 transfer,
             })
         }
+        mir::Type::PayloadEnum(ty) => mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+            ty,
+            place: mir::PayloadEnumPlace::Local(local),
+            mode: payload_enum_use_mode(ty, transfer),
+        }),
+        mir::Type::NullablePayloadEnum(ty) => {
+            mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::Local(local),
+                mode: payload_enum_use_mode(ty, transfer),
+            })
+        }
+    }
+}
+
+fn payload_enum_use_mode(ty: mir::PayloadEnumType, transfer: bool) -> mir::PayloadEnumUseMode {
+    if !transfer {
+        mir::PayloadEnumUseMode::Borrow
+    } else if ty.capabilities.copy {
+        mir::PayloadEnumUseMode::Copy
+    } else {
+        mir::PayloadEnumUseMode::Move
     }
 }
 
@@ -7668,6 +8028,48 @@ fn lower_condition(
                     } else {
                         equal
                     })
+                } else if matches!(
+                    context.expression_type(left)?,
+                    mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+                ) {
+                    let left_ty = context.expression_type(left)?;
+                    let right_ty = context.expression_type(right)?;
+                    let enum_ty = match (left_ty, right_ty) {
+                        (mir::Type::PayloadEnum(left_enum), mir::Type::PayloadEnum(right_enum))
+                            if left_enum == right_enum =>
+                        {
+                            return Ok(mir::BoolExpression::PayloadEnumCompare {
+                                op: lower_compare_op(op),
+                                left: Box::new(lower_payload_enum_expression(
+                                    left, left_enum, false, context,
+                                )?),
+                                right: Box::new(lower_payload_enum_expression(
+                                    right, right_enum, false, context,
+                                )?),
+                            });
+                        }
+                        (mir::Type::PayloadEnum(ty), mir::Type::NullablePayloadEnum(other))
+                        | (mir::Type::NullablePayloadEnum(other), mir::Type::PayloadEnum(ty))
+                        | (
+                            mir::Type::NullablePayloadEnum(ty),
+                            mir::Type::NullablePayloadEnum(other),
+                        ) if ty == other => ty,
+                        _ => {
+                            return Err(vec![unsupported(
+                                expr.span(),
+                                "payload enum comparison requires the same nominal enum type",
+                            )]);
+                        }
+                    };
+                    Ok(mir::BoolExpression::NullablePayloadEnumCompare {
+                        op: lower_compare_op(op),
+                        left: Box::new(lower_nullable_payload_enum_expression(
+                            left, enum_ty, false, context,
+                        )?),
+                        right: Box::new(lower_nullable_payload_enum_expression(
+                            right, enum_ty, false, context,
+                        )?),
+                    })
                 } else if is_nullable_string_expression(left, context)
                     || is_nullable_string_expression(right, context)
                 {
@@ -7922,6 +8324,11 @@ fn lower_null_comparison(
                 present
             });
         }
+        mir::Type::NullablePayloadEnum(ty) => {
+            mir::BoolExpression::NullablePayloadEnumIsPresent(Box::new(
+                lower_nullable_payload_enum_expression(value, ty, false, context)?,
+            ))
+        }
         _ => {
             return Err(vec![unsupported(
                 value.span(),
@@ -8045,6 +8452,29 @@ fn lower_is_condition(
                 tag: mixed_tag_for_type(tested_type, type_test_span)?,
             }),
         },
+        mir::Type::NullablePayloadEnum(ty) if tested_type == mir::Type::PayloadEnum(ty) => {
+            mir::BoolExpression::NullablePayloadEnumIsPresent(Box::new(
+                lower_nullable_payload_enum_expression(expr, ty, false, context)?,
+            ))
+        }
+        mir::Type::PayloadEnum(ty) => {
+            let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
+            if tested_type == mir::Type::PayloadEnum(ty) {
+                evaluated
+            } else {
+                mir::BoolExpression::Not(Box::new(evaluated))
+            }
+        }
+        mir::Type::NullablePayloadEnum(ty) => {
+            let present = mir::BoolExpression::NullablePayloadEnumIsPresent(Box::new(
+                lower_nullable_payload_enum_expression(expr, ty, false, context)?,
+            ));
+            if tested_type == mir::Type::PayloadEnum(ty) {
+                present
+            } else {
+                evaluate_then_false(present)
+            }
+        }
         mir::Type::Scalar(_) | mir::Type::String | mir::Type::Class(_) => {
             let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
             if value_type == tested_type {
@@ -8314,6 +8744,20 @@ fn lower_concrete_is_presence(
         mir::Type::NullableCollection(collection) => {
             Ok(mir::BoolExpression::NullableCollectionIsPresent(Box::new(
                 lower_nullable_collection_expression(expr, collection, false, context)?,
+            )))
+        }
+        mir::Type::PayloadEnum(ty) => {
+            lower_discarded_rvalue(
+                mir::Rvalue::PayloadEnum(lower_payload_enum_expression(expr, ty, false, context)?),
+                context,
+            );
+            Ok(mir::BoolExpression::Use {
+                operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+            })
+        }
+        mir::Type::NullablePayloadEnum(ty) => {
+            Ok(mir::BoolExpression::NullablePayloadEnumIsPresent(Box::new(
+                lower_nullable_payload_enum_expression(expr, ty, false, context)?,
             )))
         }
     }
@@ -8739,6 +9183,13 @@ fn lower_rvalue_as_expected(
             lower_nullable_collection_expression(expr, collection, true, context)
                 .map(mir::Rvalue::NullableCollection)
         }
+        mir::Type::PayloadEnum(ty) => {
+            lower_payload_enum_expression(expr, ty, true, context).map(mir::Rvalue::PayloadEnum)
+        }
+        mir::Type::NullablePayloadEnum(ty) => {
+            lower_nullable_payload_enum_expression(expr, ty, true, context)
+                .map(mir::Rvalue::NullablePayloadEnum)
+        }
     }
 }
 
@@ -8801,12 +9252,477 @@ fn lower_rvalue_as_borrowed(
             lower_nullable_collection_expression(expr, collection, false, context)
                 .map(mir::Rvalue::NullableCollection)
         }
+        mir::Type::PayloadEnum(ty) => {
+            lower_payload_enum_expression(expr, ty, false, context).map(mir::Rvalue::PayloadEnum)
+        }
+        mir::Type::NullablePayloadEnum(ty) => {
+            lower_nullable_payload_enum_expression(expr, ty, false, context)
+                .map(mir::Rvalue::NullablePayloadEnum)
+        }
         mir::Type::Mixed => lower_mixed_expression(expr, false, context).map(mir::Rvalue::Mixed),
         mir::Type::NullableMixed => {
             lower_nullable_mixed_expression(expr, false, context).map(mir::Rvalue::NullableMixed)
         }
         _ => lower_rvalue_as_expected(expr, expected, context),
     }
+}
+
+fn lower_payload_enum_expression(
+    expr: &hir::Expr,
+    ty: mir::PayloadEnumType,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::PayloadEnumExpression> {
+    if let hir::Expr::Grouped { expr, .. } = expr {
+        return lower_payload_enum_expression(expr, ty, transfer, context);
+    }
+    if let hir::Expr::Binary {
+        left,
+        op: hir::BinaryOp::Coalesce,
+        right,
+        ..
+    } = expr
+    {
+        return match context.coalesce_selection(left) {
+            CoalesceSelection::Left => lower_payload_enum_expression(left, ty, transfer, context),
+            CoalesceSelection::Right => lower_payload_enum_expression(right, ty, transfer, context),
+            CoalesceSelection::Dynamic => Ok(mir::PayloadEnumExpression::Coalesce {
+                ty,
+                left: Box::new(lower_nullable_payload_enum_expression(
+                    left, ty, transfer, context,
+                )?),
+                right: Box::new(lower_payload_enum_expression(right, ty, transfer, context)?),
+                mode: payload_enum_use_mode(ty, transfer),
+            }),
+        };
+    }
+    if let Some(case) = context
+        .semantic_info
+        .enum_case_values
+        .get(&(expr.span().start, expr.span().end))
+        .copied()
+    {
+        if case.enum_id != ty.id {
+            return Err(vec![Diagnostic::new(
+                "I2702",
+                "payload enum case resolved to another enum type",
+                expr.span(),
+            )]);
+        }
+        return Ok(mir::PayloadEnumExpression::Construct {
+            ty,
+            case: case.case_id,
+            fields: Vec::new(),
+            span: expr.span(),
+        });
+    }
+    if let Some(crate::const_eval::ConstValue::PayloadEnum(value)) =
+        context.constant_value(expr).cloned()
+    {
+        let lowered = lower_const_rvalue(
+            &crate::const_eval::ConstValue::PayloadEnum(value),
+            mir::Type::PayloadEnum(ty),
+            expr.span(),
+            &context.enum_types,
+            context.semantic_info,
+        )?;
+        let mir::Rvalue::PayloadEnum(value) = lowered else {
+            unreachable!("payload enum constant lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type == mir::Type::PayloadEnum(ty) {
+            return Ok(mir::PayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::CollectionIndex {
+                    collection,
+                    index: Box::new(index),
+                    positional: false,
+                    remove: true,
+                },
+                mode: payload_enum_use_mode(ty, true),
+            });
+        }
+    }
+    if let hir::Expr::Variable { name, span } = expr {
+        let local = context.lookup_local(name, *span)?;
+        if matches!(
+            context.local_type(local),
+            mir::Type::Mixed | mir::Type::NullableMixed
+        ) && context.expression_type(expr)? == mir::Type::PayloadEnum(ty)
+        {
+            return Ok(mir::PayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::MixedPayload { mixed: local },
+                mode: payload_enum_use_mode(ty, transfer),
+            });
+        }
+        if context.local_type(local) == mir::Type::PayloadEnum(ty) {
+            return Ok(mir::PayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::Local(local),
+                mode: payload_enum_use_mode(ty, transfer),
+            });
+        }
+        if context.local_type(local) == mir::Type::NullablePayloadEnum(ty)
+            && context.expression_type(expr)? == mir::Type::PayloadEnum(ty)
+        {
+            return Ok(mir::PayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local),
+                mode: payload_enum_use_mode(ty, transfer),
+            });
+        }
+    }
+    if matches!(expr, hir::Expr::PropertyAccess { .. }) {
+        let (object, property, actual) = lower_property_place(expr, context)?;
+        if actual == mir::Type::PayloadEnum(ty) {
+            return Ok(mir::PayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::Property { object, property },
+                mode: payload_enum_use_mode(ty, transfer),
+            });
+        }
+    }
+    if let hir::Expr::Index {
+        collection, index, ..
+    } = unparenthesized_place(expr)
+    {
+        let (collection, index) =
+            lower_collection_index_operand(collection, index, mir::Type::PayloadEnum(ty), context)?;
+        return Ok(mir::PayloadEnumExpression::Use {
+            ty,
+            place: mir::PayloadEnumPlace::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                positional: false,
+                remove: false,
+            },
+            mode: payload_enum_use_mode(ty, transfer),
+        });
+    }
+    if let hir::Expr::StaticCall { args, span, .. } = expr {
+        if let Some(case) = context
+            .semantic_info
+            .enum_case_constructions
+            .get(&(span.start, span.end))
+            .copied()
+        {
+            if case.enum_id != ty.id {
+                return Err(vec![Diagnostic::new(
+                    "I2702",
+                    "payload enum construction resolved to another enum type",
+                    *span,
+                )]);
+            }
+            let definition = context
+                .semantic_info
+                .enums
+                .iter()
+                .find(|definition| definition.id == ty.id)
+                .expect("checked payload enum has semantic metadata");
+            let case_definition = definition
+                .cases
+                .get(case.index)
+                .expect("checked payload case has semantic metadata");
+            let parameter_types = case_definition
+                .payload
+                .iter()
+                .map(|field| {
+                    context.mir_resolved_type(&field.ty).ok_or_else(|| {
+                        vec![unsupported(
+                            *span,
+                            format!(
+                                "payload field `${}` has no native representation",
+                                field.name
+                            ),
+                        )]
+                    })
+                })
+                .collect::<DiagnosticResult<Vec<_>>>()?;
+            let signature = FunctionSignature {
+                id: mir::FunctionId(usize::MAX),
+                return_type: mir::ReturnType::Value(mir::Type::PayloadEnum(ty)),
+                return_borrow: None,
+                parameter_names: case_definition
+                    .payload
+                    .iter()
+                    .map(|field| field.name.clone())
+                    .collect(),
+                parameter_defaults: vec![None; parameter_types.len()],
+                parameter_transfers: parameter_types
+                    .iter()
+                    .map(|field| field.has_move_ownership())
+                    .collect(),
+                parameter_owns: parameter_types
+                    .iter()
+                    .map(|field| field.has_move_ownership())
+                    .collect(),
+                parameter_types,
+                method_class: None,
+                receiver_mode: None,
+            };
+            let fields = lower_call_args_with_ownership(
+                &format!("{}::{}", definition.name, case_definition.name),
+                args,
+                signature,
+                *span,
+                context,
+            )?;
+            return Ok(mir::PayloadEnumExpression::Construct {
+                ty,
+                case,
+                fields,
+                span: *span,
+            });
+        }
+    }
+    if let hir::Expr::FunctionCall { name, args, span } = expr {
+        let signature = context.lookup_function(name, *span)?;
+        if signature.return_type == mir::ReturnType::Value(mir::Type::PayloadEnum(ty)) {
+            return Ok(mir::PayloadEnumExpression::Call {
+                ty,
+                function: signature.id,
+                args: lower_call_args(name, args, signature, *span, context)?,
+            });
+        }
+    }
+    if let hir::Expr::MethodCall {
+        object,
+        method,
+        args,
+        span,
+        null_safe: false,
+    } = expr
+    {
+        let (signature, args) = lower_instance_method_call(object, method, args, *span, context)?;
+        if signature.return_type == mir::ReturnType::Value(mir::Type::PayloadEnum(ty)) {
+            return Ok(mir::PayloadEnumExpression::Call {
+                ty,
+                function: signature.id,
+                args,
+            });
+        }
+    }
+    if let hir::Expr::StaticCall {
+        class_name,
+        method,
+        args,
+        span,
+    } = expr
+    {
+        let (signature, args) = lower_static_method_call(class_name, method, args, *span, context)?;
+        if signature.return_type == mir::ReturnType::Value(mir::Type::PayloadEnum(ty)) {
+            return Ok(mir::PayloadEnumExpression::Call {
+                ty,
+                function: signature.id,
+                args,
+            });
+        }
+    }
+    Err(vec![unsupported(
+        expr.span(),
+        "payload enum expression has no executable MIR form",
+    )])
+}
+
+fn lower_nullable_payload_enum_expression(
+    expr: &hir::Expr,
+    ty: mir::PayloadEnumType,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullablePayloadEnumExpression> {
+    if context.expression_is_null(expr) {
+        return Ok(mir::NullablePayloadEnumExpression::Null(ty));
+    }
+    if let hir::Expr::Grouped { expr, .. } = expr {
+        return lower_nullable_payload_enum_expression(expr, ty, transfer, context);
+    }
+    if let hir::Expr::Binary {
+        left,
+        op: hir::BinaryOp::Coalesce,
+        right,
+        ..
+    } = expr
+    {
+        return match context.coalesce_selection(left) {
+            CoalesceSelection::Left => {
+                lower_nullable_payload_enum_expression(left, ty, transfer, context)
+            }
+            CoalesceSelection::Right => {
+                lower_nullable_payload_enum_expression(right, ty, transfer, context)
+            }
+            CoalesceSelection::Dynamic => Ok(mir::NullablePayloadEnumExpression::Coalesce {
+                ty,
+                left: Box::new(lower_nullable_payload_enum_expression(
+                    left, ty, transfer, context,
+                )?),
+                right: Box::new(lower_nullable_payload_enum_expression(
+                    right, ty, transfer, context,
+                )?),
+                mode: payload_enum_use_mode(ty, transfer),
+            }),
+        };
+    }
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type == mir::Type::NullablePayloadEnum(ty) {
+            return Ok(mir::NullablePayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::CollectionIndex {
+                    collection,
+                    index: Box::new(index),
+                    positional: false,
+                    remove: true,
+                },
+                mode: payload_enum_use_mode(ty, true),
+            });
+        }
+    }
+    if let hir::Expr::MethodCall {
+        object,
+        method,
+        args,
+        null_safe: false,
+        ..
+    } = unparenthesized_place(expr)
+    {
+        if let Some((collection, key, value_type, access)) =
+            lower_dictionary_get(object, method, args, context)?
+        {
+            if nullable_collection_value_matches(value_type, mir::Type::PayloadEnum(ty)) {
+                let mutating = matches!(
+                    access,
+                    mir::NullableCollectionAccess::Remove
+                        | mir::NullableCollectionAccess::Pop
+                        | mir::NullableCollectionAccess::PopFront
+                        | mir::NullableCollectionAccess::PopBack
+                );
+                return Ok(mir::NullablePayloadEnumExpression::CollectionGet {
+                    ty,
+                    collection,
+                    key: Box::new(key),
+                    access,
+                    stored_nullable: value_type == mir::Type::NullablePayloadEnum(ty),
+                    mode: payload_enum_use_mode(ty, transfer || mutating),
+                });
+            }
+        }
+    }
+    if let Some((collection, key, value_type, access)) =
+        lower_collection_nullable_property(expr, context)?
+    {
+        if nullable_collection_value_matches(value_type, mir::Type::PayloadEnum(ty)) {
+            return Ok(mir::NullablePayloadEnumExpression::CollectionGet {
+                ty,
+                collection,
+                key: Box::new(key),
+                access,
+                stored_nullable: value_type == mir::Type::NullablePayloadEnum(ty),
+                mode: payload_enum_use_mode(ty, transfer),
+            });
+        }
+    }
+    if let hir::Expr::Variable { name, span } = expr {
+        let local = context.lookup_local(name, *span)?;
+        if context.local_type(local) == mir::Type::NullablePayloadEnum(ty) {
+            return Ok(mir::NullablePayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::Local(local),
+                mode: payload_enum_use_mode(ty, transfer),
+            });
+        }
+    }
+    if matches!(expr, hir::Expr::PropertyAccess { .. }) {
+        let (object, property, actual) = lower_property_place(expr, context)?;
+        if actual == mir::Type::NullablePayloadEnum(ty) {
+            return Ok(mir::NullablePayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::Property { object, property },
+                mode: payload_enum_use_mode(ty, transfer),
+            });
+        }
+    }
+    if let hir::Expr::Index {
+        collection, index, ..
+    } = unparenthesized_place(expr)
+    {
+        let (collection, index) = lower_collection_index_operand(
+            collection,
+            index,
+            mir::Type::NullablePayloadEnum(ty),
+            context,
+        )?;
+        return Ok(mir::NullablePayloadEnumExpression::Use {
+            ty,
+            place: mir::PayloadEnumPlace::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                positional: false,
+                remove: false,
+            },
+            mode: payload_enum_use_mode(ty, transfer),
+        });
+    }
+    if let hir::Expr::FunctionCall { name, args, span } = expr {
+        let signature = context.lookup_function(name, *span)?;
+        if signature.return_type == mir::ReturnType::Value(mir::Type::NullablePayloadEnum(ty)) {
+            return Ok(mir::NullablePayloadEnumExpression::Call {
+                ty,
+                function: signature.id,
+                args: lower_call_args(name, args, signature, *span, context)?,
+            });
+        }
+    }
+    if let hir::Expr::MethodCall {
+        object,
+        method,
+        args,
+        span,
+        null_safe: false,
+    } = expr
+    {
+        let (signature, args) = lower_instance_method_call(object, method, args, *span, context)?;
+        if signature.return_type == mir::ReturnType::Value(mir::Type::NullablePayloadEnum(ty)) {
+            return Ok(mir::NullablePayloadEnumExpression::Call {
+                ty,
+                function: signature.id,
+                args,
+            });
+        }
+    }
+    if context
+        .semantic_info
+        .enum_case_constructions
+        .contains_key(&(expr.span().start, expr.span().end))
+    {
+        return lower_payload_enum_expression(expr, ty, transfer, context)
+            .map(mir::NullablePayloadEnumExpression::Value);
+    }
+    if let hir::Expr::StaticCall {
+        class_name,
+        method,
+        args,
+        span,
+    } = expr
+    {
+        let (signature, args) = lower_static_method_call(class_name, method, args, *span, context)?;
+        if signature.return_type == mir::ReturnType::Value(mir::Type::NullablePayloadEnum(ty)) {
+            return Ok(mir::NullablePayloadEnumExpression::Call {
+                ty,
+                function: signature.id,
+                args,
+            });
+        }
+    }
+    if context.expression_type(expr)? == mir::Type::PayloadEnum(ty) {
+        return lower_payload_enum_expression(expr, ty, transfer, context)
+            .map(mir::NullablePayloadEnumExpression::Value);
+    }
+    Err(vec![unsupported(
+        expr.span(),
+        "nullable payload enum expression has no executable MIR form",
+    )])
 }
 
 fn lower_mixed_expression(
@@ -8898,6 +9814,18 @@ fn lower_mixed_expression(
             });
         }
     }
+    if let Some(case) = context
+        .semantic_info
+        .enum_case_constructions
+        .get(&(expr.span().start, expr.span().end))
+        .copied()
+    {
+        if let Some(ty) = context.enum_types.get(&case.enum_id).copied() {
+            return Ok(mir::MixedExpression::BoxPayloadEnum {
+                value: Box::new(lower_payload_enum_expression(expr, ty, transfer, context)?),
+            });
+        }
+    }
     if let hir::Expr::StaticCall {
         class_name,
         method,
@@ -8935,6 +9863,9 @@ fn lower_mixed_expression(
                 payload_owned,
             })
         }
+        mir::Type::PayloadEnum(ty) => Ok(mir::MixedExpression::BoxPayloadEnum {
+            value: Box::new(lower_payload_enum_expression(expr, ty, transfer, context)?),
+        }),
         mir::Type::Mixed => Err(vec![unsupported(
             expr.span(),
             "mixed expression could not be lowered as a mixed value",
@@ -8946,6 +9877,10 @@ fn lower_mixed_expression(
             expr.span(),
         )])
         }
+        mir::Type::NullablePayloadEnum(_) => Err(vec![unsupported(
+            expr.span(),
+            "boxing nullable payload enums into mixed requires a present narrowed value",
+        )]),
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
@@ -8979,6 +9914,7 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Ok(mir::MixedTag::Integer(ty)),
         mir::Type::Scalar(mir::ScalarType::Float(ty)) => Ok(mir::MixedTag::Float(ty)),
         mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) => Ok(mir::MixedTag::Enum(enum_id)),
+        mir::Type::PayloadEnum(ty) => Ok(mir::MixedTag::PayloadEnum(ty)),
         mir::Type::String => Ok(mir::MixedTag::String),
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
@@ -9001,7 +9937,8 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         | mir::Type::NullableString
         | mir::Type::NullableClass(_)
         | mir::Type::NullableCollection(_)
-        | mir::Type::Collection(_) => Err(vec![Diagnostic::unsupported_stage(
+        | mir::Type::Collection(_)
+        | mir::Type::NullablePayloadEnum(_) => Err(vec![Diagnostic::unsupported_stage(
             "M1101",
             "only exact bool, integer, float, string, and concrete-class `is` tests unbox `mixed` in Stage 23 Slice 3",
             span,
@@ -9016,6 +9953,13 @@ fn lower_nullable_mixed_expression(
 ) -> DiagnosticResult<mir::NullableMixedExpression> {
     if context.expression_is_null(expr) {
         return Ok(mir::NullableMixedExpression::Null);
+    }
+    if let mir::Type::NullablePayloadEnum(ty) = context.expression_type(expr)? {
+        return Ok(mir::NullableMixedExpression::BoxNullablePayloadEnum(
+            Box::new(lower_nullable_payload_enum_expression(
+                expr, ty, transfer, context,
+            )?),
+        ));
     }
     match expr {
         hir::Expr::Binary {
@@ -9782,6 +10726,30 @@ fn collection_remove_at_rvalue(
                 transfer: true,
             }))
         }
+        mir::Type::PayloadEnum(ty) => {
+            Ok(mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::CollectionIndex {
+                    collection,
+                    index: Box::new(index),
+                    positional: false,
+                    remove: true,
+                },
+                mode: mir::PayloadEnumUseMode::Move,
+            }))
+        }
+        mir::Type::NullablePayloadEnum(ty) => Ok(mir::Rvalue::NullablePayloadEnum(
+            mir::NullablePayloadEnumExpression::Use {
+                ty,
+                place: mir::PayloadEnumPlace::CollectionIndex {
+                    collection,
+                    index: Box::new(index),
+                    positional: false,
+                    remove: true,
+                },
+                mode: mir::PayloadEnumUseMode::Move,
+            },
+        )),
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
@@ -10824,10 +11792,27 @@ fn nullable_collection_access_rvalue(
             "nullable accessors returning `?mixed` from collections land with the next mixed collection slice",
             object.span(),
         )]),
-        mir::Type::Collection(_)
-        | mir::Type::NullableCollection(_)
-        | mir::Type::NullableMixed
-        => Err(vec![unsupported(
+        mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) => {
+            let stored_nullable = matches!(value_type, mir::Type::NullablePayloadEnum(_));
+            let mutating = matches!(
+                access,
+                mir::NullableCollectionAccess::Remove
+                    | mir::NullableCollectionAccess::Pop
+                    | mir::NullableCollectionAccess::PopFront
+                    | mir::NullableCollectionAccess::PopBack
+            );
+            Ok(mir::Rvalue::NullablePayloadEnum(
+                mir::NullablePayloadEnumExpression::CollectionGet {
+                    ty,
+                    collection,
+                    key,
+                    access,
+                    stored_nullable,
+                    mode: payload_enum_use_mode(ty, mutating),
+                },
+            ))
+        }
+        mir::Type::Collection(_) | mir::Type::NullableCollection(_) | mir::Type::NullableMixed => Err(vec![unsupported(
             object.span(),
             "discarding this nullable collection element type is not yet supported",
         )]),
@@ -10862,7 +11847,9 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         | mir::Type::Mixed
         | mir::Type::NullableMixed
         | mir::Type::Collection(_)
-        | mir::Type::NullableCollection(_) => true,
+        | mir::Type::NullableCollection(_)
+        | mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_) => true,
         _ => false,
     };
     let local = context.declare_return_temp(ty, owned);
@@ -10907,6 +11894,20 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         }
         mir::Type::Mixed | mir::Type::NullableMixed => {
             context.push_statement(mir::Statement::DropMixed { local });
+        }
+        mir::Type::PayloadEnum(ty) => {
+            context.push_statement(mir::Statement::DropPayloadEnum {
+                local,
+                ty,
+                nullable: false,
+            });
+        }
+        mir::Type::NullablePayloadEnum(ty) => {
+            context.push_statement(mir::Statement::DropPayloadEnum {
+                local,
+                ty,
+                nullable: true,
+            });
         }
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)

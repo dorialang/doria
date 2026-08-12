@@ -144,10 +144,13 @@ pub struct DrStringV1 {
 
 pub use bytes::DrBytesV1;
 pub use collection::{
-    DrCollectionV1, DR_COLLECTION_ALIGN, DR_COLLECTION_CAPACITY_OFFSET, DR_COLLECTION_FIXED_OFFSET,
-    DR_COLLECTION_HEAD_OFFSET, DR_COLLECTION_INDEX_OFFSET, DR_COLLECTION_KEYED_OFFSET,
-    DR_COLLECTION_KEYS_OFFSET, DR_COLLECTION_KIND_OFFSET, DR_COLLECTION_LENGTH_OFFSET,
-    DR_COLLECTION_SIZE, DR_COLLECTION_VALUES_OFFSET, DR_COLLECTION_VALUE_WIDTH_OFFSET,
+    DrCollectionV1, DR_COLLECTION_AGGREGATE_OFFSET, DR_COLLECTION_ALIGN,
+    DR_COLLECTION_CAPACITY_OFFSET, DR_COLLECTION_FIXED_OFFSET, DR_COLLECTION_HEAD_OFFSET,
+    DR_COLLECTION_INDEX_OFFSET, DR_COLLECTION_KEYED_OFFSET, DR_COLLECTION_KEYS_OFFSET,
+    DR_COLLECTION_KIND_OFFSET, DR_COLLECTION_LENGTH_OFFSET, DR_COLLECTION_SIZE,
+    DR_COLLECTION_VALUES_OFFSET, DR_COLLECTION_VALUE_ALIGNMENT_OFFSET,
+    DR_COLLECTION_VALUE_SIZE_OFFSET, DR_COLLECTION_VALUE_STRIDE_OFFSET,
+    DR_COLLECTION_VALUE_WIDTH_OFFSET,
 };
 pub use mixed::DrMixedV1;
 
@@ -277,6 +280,36 @@ pub unsafe extern "C" fn dr_v2_collection_new(
     comparator: u8,
 ) -> *mut DrCollectionV1 {
     collection::new_stage26(length, keyed != 0, value_width, kind, comparator)
+}
+
+/// Allocates inline aggregate element storage. Values are initialized by
+/// generated code through the address-based slot API; the runtime never
+/// interprets their bytes.
+///
+/// # Safety
+///
+/// The size, alignment, kind, and key shape must come from validated MIR.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_new_aggregate(
+    current_frame: *const DrStackFrameV2,
+    length: usize,
+    keyed: u8,
+    fixed: u8,
+    value_size: usize,
+    value_alignment: usize,
+    kind: u8,
+    comparator: u8,
+) -> *mut DrCollectionV1 {
+    collection::new_aggregate(
+        current_frame,
+        length,
+        keyed != 0,
+        fixed != 0,
+        value_size,
+        value_alignment,
+        kind,
+        comparator,
+    )
 }
 
 /// Completes bulk sorting, heapification, or deque initialization.
@@ -437,6 +470,182 @@ pub unsafe extern "C" fn dr_v3_collection_finish_detached_cleanup(
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_collection_length(collection: *const DrCollectionV1) -> usize {
     collection::length(collection)
+}
+
+/// Returns the address of a validated aggregate collection slot.
+///
+/// # Safety
+///
+/// `collection` must be a live aggregate collection. The access shape and key
+/// representation must come from validated MIR, and `current_frame` must be
+/// null or point to a live Doria stack frame.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_aggregate_value_at(
+    current_frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    index_or_key: u64,
+    positional: u8,
+    key_kind: u8,
+) -> *mut u8 {
+    collection::aggregate_value_at(
+        current_frame,
+        collection,
+        index_or_key,
+        positional != 0,
+        key_kind,
+    )
+}
+
+/// Appends an uninitialized aggregate slot and returns its address.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed, live, growable aggregate
+/// collection. Generated code must initialize the complete slot before any
+/// operation can observe it.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_aggregate_push_slot(
+    collection: *mut DrCollectionV1,
+) -> *mut u8 {
+    collection::aggregate_push_slot(collection)
+}
+
+/// Prepends an uninitialized aggregate slot and returns its address.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed, live aggregate deque. Generated
+/// code must initialize the complete slot before any operation can observe it.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_aggregate_push_front_slot(
+    collection: *mut DrCollectionV1,
+) -> *mut u8 {
+    collection::aggregate_push_front_slot(collection)
+}
+
+/// Inserts an uninitialized aggregate slot and returns its address.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed, live, growable aggregate
+/// collection, `index` must be a valid insertion position, and `current_frame`
+/// must be null or point to a live Doria stack frame. Generated code must
+/// initialize the complete slot before any operation can observe it.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_aggregate_insert_slot(
+    current_frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    index: usize,
+) -> *mut u8 {
+    collection::aggregate_insert_slot(current_frame, collection, index)
+}
+
+/// Removes an aggregate slot into caller-owned storage.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live aggregate collection,
+/// `index` must be in bounds, and `destination` must be writable for the
+/// collection's declared value size. `current_frame` must be null or live.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_aggregate_remove_at_into(
+    current_frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    index: usize,
+    destination: *mut u8,
+) {
+    collection::aggregate_remove_at_into(current_frame, collection, index, destination)
+}
+
+/// Removes an endpoint aggregate slot into caller-owned storage when present.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live aggregate collection,
+/// `found` must be writable for one byte, and `destination` must be writable
+/// for the collection's declared value size.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_aggregate_pop_into(
+    collection: *mut DrCollectionV1,
+    front: u8,
+    found: *mut u8,
+    destination: *mut u8,
+) {
+    collection::aggregate_pop_into(collection, front != 0, found, destination)
+}
+
+/// Finds or inserts a keyed aggregate slot and returns its address.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live keyed aggregate collection,
+/// the key representation must match `key_kind`, and `replaced` must be
+/// writable for one byte. The returned slot must be initialized before use.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_aggregate_keyed_set_slot(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    replaced: *mut u8,
+) -> *mut u8 {
+    collection::aggregate_keyed_set_slot(collection, key, key_kind, replaced)
+}
+
+/// Removes a keyed aggregate slot into caller-owned storage when present.
+///
+/// # Safety
+///
+/// `collection` must be a uniquely borrowed live keyed aggregate collection;
+/// the key representation must match `key_kind`; `found` and `removed_key`
+/// must be writable; and `destination` must fit the declared value size.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_aggregate_keyed_remove_into(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    found: *mut u8,
+    removed_key: *mut u64,
+    destination: *mut u8,
+) {
+    collection::aggregate_keyed_remove_into(
+        collection,
+        key,
+        key_kind,
+        found,
+        removed_key,
+        destination,
+    )
+}
+
+/// Performs a validated nullable aggregate collection access.
+///
+/// # Safety
+///
+/// `collection` must be a live aggregate collection and uniquely borrowed for
+/// mutating access codes. The key and access code must come from validated MIR;
+/// `found` and `removed_key` must be writable; and `destination` must fit the
+/// collection's declared value size.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_aggregate_nullable_access_into(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    access: u8,
+    stored_nullable: u8,
+    found: *mut u8,
+    removed_key: *mut u64,
+    destination: *mut u8,
+) {
+    collection::aggregate_nullable_access_into(
+        collection,
+        key,
+        key_kind,
+        access,
+        stored_nullable != 0,
+        found,
+        removed_key,
+        destination,
+    )
 }
 
 /// # Safety
@@ -787,6 +996,27 @@ pub unsafe extern "C" fn dr_v1_mixed_new_borrowed(
     payload: u64,
 ) -> *mut DrMixedV1 {
     let value = mixed::new_borrowed(tag, type_id, payload);
+    if value.is_null() {
+        panic_catalogued(ptr::null(), b"P1320");
+    }
+    value
+}
+
+/// Copies one compiler-laid-out aggregate into the existing mixed owner allocation.
+///
+/// # Safety
+///
+/// `source` must point to `byte_length` readable bytes whose alignment is described by
+/// `alignment`. Generated code remains responsible for the payload's type-aware drop.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v2_mixed_new_aggregate(
+    tag: u8,
+    type_id: u32,
+    source: *const u8,
+    byte_length: usize,
+    alignment: usize,
+) -> *mut DrMixedV1 {
+    let value = mixed::new_owned_aggregate(tag, type_id, source, byte_length, alignment);
     if value.is_null() {
         panic_catalogued(ptr::null(), b"P1320");
     }

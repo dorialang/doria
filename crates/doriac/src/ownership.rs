@@ -237,6 +237,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
         &HashMap::new(),
         &HashMap::new(),
         &flow_facts,
+        &HashSet::new(),
     )
 }
 
@@ -246,6 +247,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
     return_borrows: &HashMap<usize, ReturnBorrow>,
     resolved_types: &HashMap<(usize, usize), crate::types::ResolvedType>,
     flow_facts: &FactsByUse,
+    move_enum_names: &HashSet<String>,
 ) -> Vec<Diagnostic> {
     let classes = program
         .items
@@ -266,6 +268,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
     let mut signatures = HashMap::new();
     let mut constructors = HashMap::new();
     let mut methods = HashMap::new();
+    let mut enum_cases = HashMap::new();
     let mut properties = HashMap::new();
     let mut static_properties = HashMap::new();
 
@@ -277,6 +280,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     signature(
                         function,
                         &classes,
+                        move_enum_names,
                         inferred_move_returns,
                         return_borrows,
                         None,
@@ -297,11 +301,12 @@ pub(crate) fn check_program_with_inferred_move_returns(
                             let property_class =
                                 type_ref_class_name(&property.ty, &classes, Some(&class.name));
                             let move_type =
-                                type_ref_is_move_type(&property.ty, &classes, Some(&class.name))
-                                    || type_ref_mentions_parameter(
-                                        &property.ty,
-                                        &class.type_params,
-                                    );
+                                type_ref_is_move_type_with_enums(
+                                    &property.ty,
+                                    &classes,
+                                    move_enum_names,
+                                    Some(&class.name),
+                                ) || type_ref_mentions_parameter(&property.ty, &class.type_params);
                             properties.insert(
                                 (class.name.clone(), property.name.clone()),
                                 PropertyInfo {
@@ -309,6 +314,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                     collection: type_ref_collection_info(
                                         &property.ty,
                                         &classes,
+                                        move_enum_names,
                                         Some(&class.name),
                                         &class.type_params,
                                         &[],
@@ -324,6 +330,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                             let method_signature = signature(
                                 method,
                                 &classes,
+                                move_enum_names,
                                 inferred_move_returns,
                                 return_borrows,
                                 Some(&class.name),
@@ -338,9 +345,10 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                 for param in &method.params {
                                     let property_class =
                                         type_ref_class_name(&param.ty, &classes, Some(&class.name));
-                                    let move_type = type_ref_is_move_type(
+                                    let move_type = type_ref_is_move_type_with_enums(
                                         &param.ty,
                                         &classes,
+                                        move_enum_names,
                                         Some(&class.name),
                                     ) || type_ref_mentions_parameter(
                                         &param.ty,
@@ -354,6 +362,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                                 collection: type_ref_collection_info(
                                                     &param.ty,
                                                     &classes,
+                                                    move_enum_names,
                                                     Some(&class.name),
                                                     &class.type_params,
                                                     &[],
@@ -370,11 +379,46 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     }
                 }
             }
-            Item::Enum(_)
-            | Item::Interface(_)
-            | Item::Trait(_)
-            | Item::Constant(_)
-            | Item::Statement(_) => {}
+            Item::Enum(declaration) => {
+                for case in &declaration.cases {
+                    if case.payload.is_empty() {
+                        continue;
+                    }
+                    enum_cases.insert(
+                        (declaration.name.clone(), case.name.clone()),
+                        Signature {
+                            params: case
+                                .payload
+                                .iter()
+                                .map(|field| {
+                                    let generic = type_ref_mentions_parameter(
+                                        &field.ty,
+                                        &declaration.type_params,
+                                    );
+                                    let move_type = type_ref_is_move_type_with_enums(
+                                        &field.ty,
+                                        &classes,
+                                        move_enum_names,
+                                        None,
+                                    ) || generic;
+                                    Parameter {
+                                        name: field.name.clone(),
+                                        move_type,
+                                        class_type: type_ref_class_name(&field.ty, &classes, None)
+                                            .is_some(),
+                                        generic,
+                                        take: move_type,
+                                        writable: false,
+                                    }
+                                })
+                                .collect(),
+                            returns_move_type: move_enum_names.contains(&declaration.name),
+                            ..Signature::default()
+                        },
+                    );
+                }
+            }
+            Item::Interface(_) | Item::Trait(_) | Item::Constant(_) | Item::Statement(_) => {}
         }
     }
 
@@ -384,11 +428,13 @@ pub(crate) fn check_program_with_inferred_move_returns(
         signatures,
         constructors,
         methods,
+        enum_cases,
         properties,
         static_properties,
         inferred_move_returns: inferred_move_returns.clone(),
         return_borrows: return_borrows.clone(),
         resolved_types,
+        move_enum_names: move_enum_names.clone(),
         receiver_class: None,
         receiver_writable: false,
         current_type_params: Vec::new(),
@@ -413,9 +459,10 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                 let previous_receiver =
                                     checker.receiver_class.replace(class.name.clone());
                                 let mut scopes = Scopes::new();
-                                if type_ref_is_move_type(
+                                if type_ref_is_move_type_with_enums(
                                     &property.ty,
                                     &checker.classes,
+                                    &checker.move_enum_names,
                                     Some(&class.name),
                                 ) || type_ref_mentions_parameter(
                                     &property.ty,
@@ -799,6 +846,7 @@ fn argument_bound_to_parameter<'a>(
 fn signature(
     function: &ast::FunctionDecl,
     classes: &HashSet<String>,
+    move_enum_names: &HashSet<String>,
     inferred_move_returns: &HashSet<usize>,
     return_borrows: &HashMap<usize, ReturnBorrow>,
     receiver_class: Option<&str>,
@@ -826,7 +874,12 @@ fn signature(
             .iter()
             .map(|param| Parameter {
                 name: param.name.clone(),
-                move_type: type_ref_is_move_type(&param.ty, classes, receiver_class),
+                move_type: type_ref_is_move_type_with_enums(
+                    &param.ty,
+                    classes,
+                    move_enum_names,
+                    receiver_class,
+                ),
                 class_type: type_ref_class_name(&param.ty, classes, receiver_class).is_some(),
                 generic: type_ref_mentions_any_parameter(
                     &param.ty,
@@ -845,13 +898,14 @@ fn signature(
             type_ref_collection_info(
                 ty,
                 classes,
+                move_enum_names,
                 receiver_class,
                 &function.type_params,
                 enclosing_type_params,
             )
         }),
         returns_move_type: function.return_type.as_ref().is_some_and(|ty| {
-            (type_ref_is_move_type(ty, classes, receiver_class)
+            (type_ref_is_move_type_with_enums(ty, classes, move_enum_names, receiver_class)
                 || type_ref_mentions_potential_move_parameter(
                     ty,
                     &function.type_params,
@@ -958,11 +1012,13 @@ struct Checker<'a> {
     signatures: HashMap<String, Signature>,
     constructors: HashMap<String, Signature>,
     methods: HashMap<(String, String), Signature>,
+    enum_cases: HashMap<(String, String), Signature>,
     properties: HashMap<(String, String), PropertyInfo>,
     static_properties: HashMap<(String, String), bool>,
     inferred_move_returns: HashSet<usize>,
     return_borrows: HashMap<usize, ReturnBorrow>,
     resolved_types: &'a HashMap<(usize, usize), crate::types::ResolvedType>,
+    move_enum_names: HashSet<String>,
     receiver_class: Option<String>,
     receiver_writable: bool,
     current_type_params: Vec<ast::TypeParamDecl>,
@@ -1032,13 +1088,16 @@ impl Checker<'_> {
             let class =
                 type_ref_class_name(&param.ty, &self.classes, self.receiver_class.as_deref());
             let mixed = param.ty.name == "mixed";
-            if type_ref_is_move_type(&param.ty, &self.classes, self.receiver_class.as_deref())
-                || type_ref_mentions_any_parameter(
-                    &param.ty,
-                    &function.type_params,
-                    &enclosing_type_params,
-                )
-            {
+            if type_ref_is_move_type_with_enums(
+                &param.ty,
+                &self.classes,
+                &self.move_enum_names,
+                self.receiver_class.as_deref(),
+            ) || type_ref_mentions_any_parameter(
+                &param.ty,
+                &function.type_params,
+                &enclosing_type_params,
+            ) {
                 scopes.declare(
                     param.name.clone(),
                     Binding {
@@ -1047,6 +1106,7 @@ impl Checker<'_> {
                         collection: type_ref_collection_info(
                             &param.ty,
                             &self.classes,
+                            &self.move_enum_names,
                             self.receiver_class.as_deref(),
                             &self.current_type_params,
                             &[],
@@ -1067,8 +1127,12 @@ impl Checker<'_> {
             }
         }
         let return_move_type = function.return_type.as_ref().is_some_and(|ty| {
-            (type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref())
-                || type_ref_mentions_potential_move_parameter(ty, &self.current_type_params, &[]))
+            (type_ref_is_move_type_with_enums(
+                ty,
+                &self.classes,
+                &self.move_enum_names,
+                self.receiver_class.as_deref(),
+            ) || type_ref_mentions_potential_move_parameter(ty, &self.current_type_params, &[]))
                 && self.current_return_borrow.is_none()
         }) || (function.return_type.is_none()
             && self.inferred_move_returns.contains(&function.span.start));
@@ -1140,7 +1204,12 @@ impl Checker<'_> {
                 let mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
                     || (decl.ty.is_none() && class.is_none() && initializer_moves);
                 let declared_move_type = decl.ty.as_ref().is_some_and(|ty| {
-                    type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref())
+                    type_ref_is_move_type_with_enums(
+                        ty,
+                        &self.classes,
+                        &self.move_enum_names,
+                        self.receiver_class.as_deref(),
+                    )
                 });
                 let borrowed_owning_value = borrowed_initializer
                     && !borrowed_mixed_index
@@ -1207,6 +1276,7 @@ impl Checker<'_> {
                             type_ref_collection_info(
                                 ty,
                                 &self.classes,
+                                &self.move_enum_names,
                                 self.receiver_class.as_deref(),
                                 &self.current_type_params,
                                 &[],
@@ -1626,7 +1696,12 @@ impl Checker<'_> {
         let Some(ty) = &binding.ty else {
             return;
         };
-        if !type_ref_is_move_type(ty, &self.classes, self.receiver_class.as_deref()) {
+        if !type_ref_is_move_type_with_enums(
+            ty,
+            &self.classes,
+            &self.move_enum_names,
+            self.receiver_class.as_deref(),
+        ) {
             return;
         }
         scopes.declare(
@@ -1637,6 +1712,7 @@ impl Checker<'_> {
                 collection: type_ref_collection_info(
                     ty,
                     &self.classes,
+                    &self.move_enum_names,
                     self.receiver_class.as_deref(),
                     &self.current_type_params,
                     &[],
@@ -1978,9 +2054,7 @@ impl Checker<'_> {
                     return;
                 }
                 let signature = self
-                    .qualifier_class(qualifier)
-                    .and_then(|class_name| self.methods.get(&(class_name, method.clone())))
-                    .cloned()
+                    .static_call_signature(qualifier, method)
                     .unwrap_or_default();
                 self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
             }
@@ -2402,8 +2476,7 @@ impl Checker<'_> {
                 ..
             } => {
                 let signature = self
-                    .qualifier_class(qualifier)
-                    .and_then(|class| self.methods.get(&(class, method.clone())).cloned())
+                    .static_call_signature(qualifier, method)
                     .unwrap_or_default();
                 self.activate_nested_call_property_borrows(None, args, &signature, scopes);
             }
@@ -2784,7 +2857,7 @@ impl Checker<'_> {
     fn expr_is_move_value(&self, expr: &Expr, scopes: &Scopes) -> bool {
         if let Some(ty) = self.resolved_type(expr) {
             if !resolved_type_requires_conservative_move(ty) {
-                return resolved_type_is_move_type(ty);
+                return resolved_type_is_move_type(ty, &self.move_enum_names);
             }
         }
         match expr {
@@ -3070,7 +3143,10 @@ impl Checker<'_> {
     }
 
     fn expr_collection_info(&self, expr: &Expr, scopes: &Scopes) -> Option<CollectionInfo> {
-        if let Some(collection) = self.resolved_type(expr).and_then(resolved_collection_info) {
+        if let Some(collection) = self
+            .resolved_type(expr)
+            .and_then(|ty| resolved_collection_info(ty, &self.move_enum_names))
+        {
             return Some(collection);
         }
         match expr {
@@ -3223,6 +3299,18 @@ impl Checker<'_> {
         }
     }
 
+    fn static_call_signature(
+        &self,
+        qualifier: &ast::StaticQualifier,
+        method: &str,
+    ) -> Option<Signature> {
+        let class = self.qualifier_class(qualifier)?;
+        self.enum_cases
+            .get(&(class.clone(), method.to_string()))
+            .or_else(|| self.methods.get(&(class, method.to_string())))
+            .cloned()
+    }
+
     fn resolved_type(&self, expr: &Expr) -> Option<&crate::types::ResolvedType> {
         self.resolved_types
             .get(&(expr.span().start, expr.span().end))
@@ -3235,7 +3323,7 @@ impl Checker<'_> {
         let move_type = param.move_type
             || (param.generic
                 && self.resolved_type(arg).is_some_and(|ty| {
-                    resolved_type_is_move_type(ty)
+                    resolved_type_is_move_type(ty, &self.move_enum_names)
                         || matches!(ty, crate::types::ResolvedType::TypeParameter(_))
                 }));
         if param.take && move_type {
@@ -3480,7 +3568,10 @@ fn resolved_type_class(ty: &crate::types::ResolvedType) -> Option<&str> {
     }
 }
 
-fn resolved_type_is_move_type(ty: &crate::types::ResolvedType) -> bool {
+fn resolved_type_is_move_type(
+    ty: &crate::types::ResolvedType,
+    move_enum_names: &HashSet<String>,
+) -> bool {
     match ty {
         crate::types::ResolvedType::Bytes
         | crate::types::ResolvedType::Mixed
@@ -3494,7 +3585,10 @@ fn resolved_type_is_move_type(ty: &crate::types::ResolvedType) -> bool {
         | crate::types::ResolvedType::SortedSet(_)
         | crate::types::ResolvedType::PriorityQueue(_)
         | crate::types::ResolvedType::Deque(_) => true,
-        crate::types::ResolvedType::Nullable(inner) => resolved_type_is_move_type(inner),
+        crate::types::ResolvedType::Enum(enum_type) => move_enum_names.contains(&enum_type.name),
+        crate::types::ResolvedType::Nullable(inner) => {
+            resolved_type_is_move_type(inner, move_enum_names)
+        }
         _ => false,
     }
 }
@@ -3539,7 +3633,10 @@ fn resolved_type_requires_conservative_move(ty: &crate::types::ResolvedType) -> 
     }
 }
 
-fn resolved_collection_info(ty: &crate::types::ResolvedType) -> Option<CollectionInfo> {
+fn resolved_collection_info(
+    ty: &crate::types::ResolvedType,
+    move_enum_names: &HashSet<String>,
+) -> Option<CollectionInfo> {
     use crate::types::ResolvedType;
     let (family, value) = match ty {
         ResolvedType::Bytes => {
@@ -3561,16 +3658,18 @@ fn resolved_collection_info(ty: &crate::types::ResolvedType) -> Option<Collectio
         }
         ResolvedType::PriorityQueue(value) => (CollectionFamily::PriorityQueue, value.as_ref()),
         ResolvedType::Deque(value) => (CollectionFamily::Deque, value.as_ref()),
-        ResolvedType::Nullable(inner) => return resolved_collection_info(inner),
+        ResolvedType::Nullable(inner) => {
+            return resolved_collection_info(inner, move_enum_names);
+        }
         _ => return None,
     };
     Some(CollectionInfo {
         family,
-        value_move: resolved_type_is_move_type(value)
+        value_move: resolved_type_is_move_type(value, move_enum_names)
             || resolved_type_requires_conservative_move(value),
         value_mixed: resolved_type_is_mixed(value),
         value_class: resolved_type_class(value).map(str::to_string),
-        value_collection: resolved_collection_info(value).map(Box::new),
+        value_collection: resolved_collection_info(value, move_enum_names).map(Box::new),
     })
 }
 
@@ -3585,6 +3684,7 @@ fn resolved_type_is_mixed(ty: &crate::types::ResolvedType) -> bool {
 fn type_ref_collection_info(
     ty: &crate::types::TypeRef,
     classes: &HashSet<String>,
+    move_enum_names: &HashSet<String>,
     receiver_class: Option<&str>,
     type_params: &[ast::TypeParamDecl],
     enclosing_type_params: &[ast::TypeParamDecl],
@@ -3615,17 +3715,22 @@ fn type_ref_collection_info(
     };
     Some(CollectionInfo {
         family,
-        value_move: type_ref_is_move_type(value, classes, receiver_class)
-            || type_ref_mentions_potential_move_parameter(
-                value,
-                type_params,
-                enclosing_type_params,
-            ),
+        value_move: type_ref_is_move_type_with_enums(
+            value,
+            classes,
+            move_enum_names,
+            receiver_class,
+        ) || type_ref_mentions_potential_move_parameter(
+            value,
+            type_params,
+            enclosing_type_params,
+        ),
         value_mixed: value.name == "mixed",
         value_class: type_ref_class_name(value, classes, receiver_class),
         value_collection: type_ref_collection_info(
             value,
             classes,
+            move_enum_names,
             receiver_class,
             type_params,
             enclosing_type_params,
@@ -3659,10 +3764,20 @@ pub(crate) fn type_ref_is_move_type(
     classes: &HashSet<String>,
     receiver_class: Option<&str>,
 ) -> bool {
+    type_ref_is_move_type_with_enums(ty, classes, &HashSet::new(), receiver_class)
+}
+
+fn type_ref_is_move_type_with_enums(
+    ty: &crate::types::TypeRef,
+    classes: &HashSet<String>,
+    move_enum_names: &HashSet<String>,
+    receiver_class: Option<&str>,
+) -> bool {
     // Every Stage 25a handle and access object is a move type (record 0106):
     // plain assignment transfers the handle and never silently retains.
     crate::types::SharedHandleKind::from_source_name(&ty.name).is_some()
         || type_ref_class_name(ty, classes, receiver_class).is_some()
+        || move_enum_names.contains(&ty.name)
         || matches!(
             ty.name.as_str(),
             "mixed"

@@ -82,7 +82,7 @@ require_all($decisionPath, $decision, [
     '**Slice 3 — Complete.**',
     '**Slice 4 — Complete.**',
     '**Decision 0113 — Complete.**',
-    '**Stage 27 — In Progress.**',
+    '**Stage 27 — Complete.**',
     '`List::indexOf` | O(n) | None',
     '`List::remove` | O(n), including one tail shift | None',
     '`Dictionary::containsValue` | O(n) | None',
@@ -97,7 +97,7 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Decision 0113 Slice 3 — Complete',
         'Decision 0113 Slice 4 — Complete',
         'Decision 0113 — Complete',
-        'Stage 27 — In Progress',
+        'Stage 27 — Complete',
     ], $failures);
 }
 

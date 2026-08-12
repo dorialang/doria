@@ -1,0 +1,39 @@
+enum Coordinate
+{
+    case Origin;
+    case Point(int $x, int $y);
+}
+
+enum Label
+{
+    case Text(string $value);
+}
+
+const Label DEFAULT_LABEL = Label::Text("default");
+
+function mark(string $label, int $value): int
+{
+    echo $label;
+    return $value;
+}
+
+function usesDefault(Label $label = Label::Text("default")): bool
+{
+    return $label == DEFAULT_LABEL;
+}
+
+function main(): void
+{
+    Coordinate $point = Coordinate::Point(
+        y: mark("y", 22),
+        x: mark("x", 20),
+    );
+    Coordinate $copy = $point;
+    Label $label = Label::Text("copy");
+    Label $labelCopy = $label;
+
+    echo " {$point == Coordinate::Point(20, 22)}";
+    echo " {$copy == $point}";
+    echo " {$labelCopy == Label::Text("copy")}";
+    echo " {usesDefault()}\n";
+}

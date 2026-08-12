@@ -1,0 +1,35 @@
+class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->name}\n";
+    }
+}
+
+enum Pair
+{
+    case Values(Token $first, Token $second);
+    case Single(Token $only);
+}
+
+function dropPair(): void
+{
+    Pair $pair = Pair::Values(new Token("first"), new Token("second"));
+    echo "leave pair\n";
+}
+
+function dropSingle(): void
+{
+    Pair $single = Pair::Single(new Token("only"));
+    echo "leave single\n";
+}
+
+function main(): void
+{
+    dropPair();
+    dropSingle();
+}

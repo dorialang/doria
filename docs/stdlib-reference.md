@@ -61,7 +61,7 @@ object's lifetime before the surrounding function continues.
 ### Enums
 - **Unit enums** — nominal inline Copy values selected as `Type::Case`; equality compares exact case identity and no enum container allocation occurs.
 - **Backed enums** — exactly `int` or `string` backed; the readonly `value` property exposes the associated value without converting the enum itself.
-- **Payload enums** — declaration and owned-field schemas are accepted; runtime construction, aggregate placement, and payload equality land in Stage 27 Slice 2 under decision 0114.
+- **Payload enums** — inline nominal values constructed with positional or named case arguments. They are Copy only when every case payload is Copy, otherwise move; equality compares case plus active fields, and payload observation belongs to `match`.
 
 Enums are not implicitly displayable and do not receive `name`, `cases`,
 `from`, `tryFrom`, automatic hashing, or automatic ordering APIs.
@@ -132,6 +132,6 @@ Hosted modules under the reserved `Doria\Std` namespace. Most are direction-only
 - The collection inventory now documents decision 0102's `[value; count]` sequence constructor and its v1.0 restrictions.
 - Stage 23c implements the core-language sequence constructor described above;
   the `Doria\Std\*` module inventory remains a catalogue of planned APIs.
-- Decision 0114 replaces the unauthored enum subject. Unit and backed enums are
-  executable core-language values; payload execution remains the next Stage 27
-  slice and `match` semantics remain Stage 28.
+- Decision 0114 replaces the unauthored enum subject. Unit, backed, and payload
+  enums are executable core-language values; generic enums remain deferred and
+  `match` semantics remain Stage 28.

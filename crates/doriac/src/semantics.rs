@@ -9,7 +9,10 @@ use crate::collection_diagnostics::{
 use crate::diagnostics::{
     Diagnostic, DiagnosticResult, DiagnosticSource, FixApplicability, FixEdit,
 };
-use crate::enums::{EnumBackingType, EnumBackingValue, EnumCaseId, EnumId, EnumType, EnumValue};
+use crate::enums::{
+    EnumBackingType, EnumBackingValue, EnumCapabilities, EnumCaseId, EnumId, EnumLayout, EnumType,
+    EnumValue, LayoutShape,
+};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
@@ -43,6 +46,8 @@ pub struct SemanticInfo {
     pub expression_types: HashMap<(usize, usize), ResolvedType>,
     /// Resolved enum case for each unit/backed case expression.
     pub enum_case_values: HashMap<(usize, usize), EnumValue>,
+    /// Resolved payload-enum construction for each checked case call.
+    pub enum_case_constructions: HashMap<(usize, usize), EnumCaseId>,
     /// Resolved concrete target for each checked `is` expression.
     pub type_test_types: HashMap<(usize, usize), ResolvedType>,
     /// Compiler-resolved callable target for each user-defined call expression.
@@ -124,7 +129,8 @@ pub struct EnumSemanticInfo {
     pub name: String,
     pub backing_type: Option<EnumBackingType>,
     pub cases: Vec<EnumCaseSemanticInfo>,
-    pub copy: bool,
+    pub capabilities: EnumCapabilities,
+    pub layout: EnumLayout,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,12 +230,19 @@ pub fn analyze_program_for_ide_with_source<'source>(
             .iter()
             .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
             .collect();
+        let move_enum_names = checker
+            .enums
+            .values()
+            .filter(|definition| !definition.capabilities.copy)
+            .map(|definition| definition.name.clone())
+            .collect();
         let ownership_diagnostics = crate::ownership::check_program_with_inferred_move_returns(
             program,
             &inferred_move_returns,
             &return_borrows,
             &checker.expression_types,
             &checker.flow_facts,
+            &move_enum_names,
         );
         checker.diagnostics.extend(ownership_diagnostics);
     }
@@ -246,6 +259,7 @@ pub fn analyze_program_for_ide_with_source<'source>(
             float_expression_types: checker.float_expression_types,
             expression_types: checker.expression_types,
             enum_case_values: checker.enum_case_values,
+            enum_case_constructions: checker.enum_case_constructions,
             type_test_types: checker.type_test_types,
             call_targets: checker.call_targets,
             generic_call_specializations: checker.generic_call_specializations,
@@ -266,29 +280,37 @@ fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo
     enums.sort_by_key(|definition| definition.id);
     enums
         .into_iter()
-        .map(|definition| EnumSemanticInfo {
-            id: definition.id,
-            name: definition.name,
-            backing_type: definition.backing_type,
-            cases: definition
-                .cases
-                .into_iter()
-                .map(|case| EnumCaseSemanticInfo {
-                    id: case.id,
-                    name: case.name,
-                    tag: case.tag,
-                    backing_value: case.backing_value,
-                    payload: case
-                        .payload
-                        .into_iter()
-                        .map(|field| EnumPayloadSemanticInfo {
-                            name: field.name,
-                            ty: checker.types.resolved(field.ty),
-                        })
-                        .collect(),
-                })
-                .collect(),
-            copy: definition.copy,
+        .map(|definition| {
+            let case_count = definition.cases.len();
+            EnumSemanticInfo {
+                id: definition.id,
+                name: definition.name,
+                backing_type: definition.backing_type,
+                cases: definition
+                    .cases
+                    .into_iter()
+                    .map(|case| EnumCaseSemanticInfo {
+                        id: case.id,
+                        name: case.name,
+                        tag: case.tag,
+                        backing_value: case.backing_value,
+                        payload: case
+                            .payload
+                            .into_iter()
+                            .map(|field| EnumPayloadSemanticInfo {
+                                name: field.name,
+                                ty: checker.types.resolved(field.ty),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                capabilities: definition.capabilities,
+                layout: definition.layout.unwrap_or_else(|| {
+                    let empty_cases = vec![Vec::new(); case_count.max(1)];
+                    crate::enums::compute_enum_layout(definition.id, &empty_cases)
+                        .expect("an empty recovery enum layout is finite")
+                }),
+            }
         })
         .collect()
 }
@@ -876,6 +898,7 @@ struct Checker<'program> {
     float_expression_types: HashMap<(usize, usize), FloatType>,
     expression_types: HashMap<(usize, usize), ResolvedType>,
     enum_case_values: HashMap<(usize, usize), EnumValue>,
+    enum_case_constructions: HashMap<(usize, usize), EnumCaseId>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
     call_targets: HashMap<(usize, usize), CallableTarget>,
     generic_call_specializations: HashMap<(usize, usize), GenericSpecialization>,
@@ -903,7 +926,9 @@ struct EnumDefinition {
     backing_type: Option<EnumBackingType>,
     cases: Vec<EnumCaseDefinition>,
     case_by_name: HashMap<String, usize>,
-    copy: bool,
+    capabilities: EnumCapabilities,
+    layout: Option<EnumLayout>,
+    span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -919,6 +944,239 @@ struct EnumCaseDefinition {
 struct EnumPayloadDefinition {
     name: String,
     ty: TypeId,
+    span: Span,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detect_inline_enum_cycles(
+    id: EnumId,
+    definitions: &HashMap<EnumId, EnumDefinition>,
+    types: &TypeRegistry,
+    states: &mut [u8],
+    stack: &mut Vec<EnumId>,
+    recursive: &mut HashSet<EnumId>,
+    reported: &mut HashSet<Vec<usize>>,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    if states[id.0] == 2 {
+        return;
+    }
+    if states[id.0] == 1 {
+        return;
+    }
+    states[id.0] = 1;
+    stack.push(id);
+    let Some(definition) = definitions.get(&id) else {
+        stack.pop();
+        states[id.0] = 2;
+        return;
+    };
+    for (case, field) in definition
+        .cases
+        .iter()
+        .flat_map(|case| case.payload.iter().map(move |field| (case, field)))
+    {
+        let Some(dependency) = inline_enum_dependency(types, field.ty) else {
+            continue;
+        };
+        if states[dependency.0] == 1 {
+            let start = stack
+                .iter()
+                .position(|candidate| *candidate == dependency)
+                .unwrap_or(0);
+            let cycle = stack[start..].to_vec();
+            recursive.extend(cycle.iter().copied());
+            let mut identity = cycle.iter().map(|value| value.0).collect::<Vec<_>>();
+            identity.sort_unstable();
+            identity.dedup();
+            if reported.insert(identity) {
+                let mut names = cycle
+                    .iter()
+                    .filter_map(|value| definitions.get(value).map(|value| value.name.as_str()))
+                    .collect::<Vec<_>>();
+                names.push(
+                    definitions
+                        .get(&dependency)
+                        .map_or("<unknown>", |value| value.name.as_str()),
+                );
+                diagnostics.push(
+                    Diagnostic::new(
+                        "E0581",
+                        format!(
+                            "recursive inline enum layout through `{}::{}` payload `${}`: {}",
+                            definition.name,
+                            case.name,
+                            field.name,
+                            names.join(" -> ")
+                        ),
+                        field.span,
+                    )
+                    .with_title("Recursive Inline Enum Layout")
+                    .with_help(
+                        "break the by-value cycle with a pointer-shaped owner such as a class or collection",
+                    ),
+                );
+            }
+            continue;
+        }
+        detect_inline_enum_cycles(
+            dependency,
+            definitions,
+            types,
+            states,
+            stack,
+            recursive,
+            reported,
+            diagnostics,
+        );
+    }
+    stack.pop();
+    states[id.0] = 2;
+}
+
+fn inline_enum_dependency(types: &TypeRegistry, ty: TypeId) -> Option<EnumId> {
+    match types.kind(ty) {
+        TypeKind::Enum(enum_type) => Some(enum_type.id),
+        TypeKind::Nullable(inner) => inline_enum_dependency(types, *inner),
+        _ => None,
+    }
+}
+
+fn semantic_type_capabilities(
+    types: &TypeRegistry,
+    ty: TypeId,
+    enums: &HashMap<EnumId, EnumCapabilities>,
+) -> EnumCapabilities {
+    let copy_trivial = EnumCapabilities {
+        copy: true,
+        trivial_copy: true,
+        needs_drop: false,
+        equality: true,
+    };
+    match types.kind(ty) {
+        TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool | TypeKind::Null => copy_trivial,
+        TypeKind::String => EnumCapabilities {
+            copy: true,
+            trivial_copy: false,
+            needs_drop: true,
+            equality: true,
+        },
+        TypeKind::Enum(enum_type) => {
+            enums
+                .get(&enum_type.id)
+                .copied()
+                .unwrap_or(EnumCapabilities {
+                    copy: false,
+                    trivial_copy: false,
+                    needs_drop: true,
+                    equality: false,
+                })
+        }
+        TypeKind::Nullable(inner) => semantic_type_capabilities(types, *inner, enums),
+        TypeKind::Class(_) => EnumCapabilities {
+            copy: false,
+            trivial_copy: false,
+            needs_drop: true,
+            equality: true,
+        },
+        TypeKind::Bytes => EnumCapabilities {
+            copy: false,
+            trivial_copy: false,
+            needs_drop: true,
+            equality: true,
+        },
+        TypeKind::Void
+        | TypeKind::Mixed
+        | TypeKind::TypedArray(_)
+        | TypeKind::Unknown
+        | TypeKind::Heterogeneous
+        | TypeKind::EmptyCollection
+        | TypeKind::TypeParameter(_)
+        | TypeKind::List(_)
+        | TypeKind::Dictionary(_, _)
+        | TypeKind::SortedDictionary(_, _)
+        | TypeKind::Set(_)
+        | TypeKind::SortedSet(_)
+        | TypeKind::PriorityQueue(_)
+        | TypeKind::Deque(_)
+        | TypeKind::SharedHandle(_, _) => EnumCapabilities {
+            copy: false,
+            trivial_copy: false,
+            needs_drop: true,
+            equality: false,
+        },
+    }
+}
+
+fn semantic_layout_shape(
+    types: &TypeRegistry,
+    ty: TypeId,
+    enum_layouts: &HashMap<EnumId, EnumLayout>,
+) -> Option<LayoutShape> {
+    const POINTER: u32 = 8;
+    let scalar = |bytes| LayoutShape {
+        size: bytes,
+        align: bytes,
+    };
+    match types.kind(ty) {
+        TypeKind::Integer(value) => Some(scalar(value.storage_bytes())),
+        TypeKind::Float(value) => Some(scalar(value.storage_bytes())),
+        TypeKind::Bool => Some(scalar(1)),
+        TypeKind::String
+        | TypeKind::Bytes
+        | TypeKind::Mixed
+        | TypeKind::Class(_)
+        | TypeKind::TypedArray(_)
+        | TypeKind::List(_)
+        | TypeKind::Dictionary(_, _)
+        | TypeKind::SortedDictionary(_, _)
+        | TypeKind::Set(_)
+        | TypeKind::SortedSet(_)
+        | TypeKind::PriorityQueue(_)
+        | TypeKind::Deque(_)
+        | TypeKind::SharedHandle(_, _) => Some(scalar(POINTER)),
+        TypeKind::Enum(enum_type) => enum_layouts.get(&enum_type.id).map(|layout| LayoutShape {
+            size: layout.size,
+            align: layout.align,
+        }),
+        TypeKind::Nullable(inner) => {
+            let inner_kind = types.kind(*inner);
+            if matches!(
+                inner_kind,
+                TypeKind::Class(_)
+                    | TypeKind::Mixed
+                    | TypeKind::Bytes
+                    | TypeKind::TypedArray(_)
+                    | TypeKind::List(_)
+                    | TypeKind::Dictionary(_, _)
+                    | TypeKind::SortedDictionary(_, _)
+                    | TypeKind::Set(_)
+                    | TypeKind::SortedSet(_)
+                    | TypeKind::PriorityQueue(_)
+                    | TypeKind::Deque(_)
+                    | TypeKind::SharedHandle(_, _)
+            ) {
+                return Some(scalar(POINTER));
+            }
+            let payload = semantic_layout_shape(types, *inner, enum_layouts)?;
+            let align = POINTER.max(payload.align);
+            let payload_offset = checked_layout_align(POINTER, payload.align)?;
+            let size = checked_layout_align(payload_offset.checked_add(payload.size)?, align)?;
+            Some(LayoutShape { size, align })
+        }
+        TypeKind::Null => Some(LayoutShape { size: 0, align: 1 }),
+        TypeKind::Void
+        | TypeKind::Unknown
+        | TypeKind::Heterogeneous
+        | TypeKind::EmptyCollection
+        | TypeKind::TypeParameter(_) => None,
+    }
+}
+
+fn checked_layout_align(value: u32, alignment: u32) -> Option<u32> {
+    value
+        .checked_add(alignment - 1)
+        .map(|sum| sum & !(alignment - 1))
 }
 
 #[derive(Debug, Clone)]
@@ -1116,6 +1374,7 @@ impl<'program> Checker<'program> {
             float_expression_types: HashMap::new(),
             expression_types: HashMap::new(),
             enum_case_values: HashMap::new(),
+            enum_case_constructions: HashMap::new(),
             type_test_types: HashMap::new(),
             call_targets: HashMap::new(),
             generic_call_specializations: HashMap::new(),
@@ -1430,7 +1689,14 @@ impl<'program> Checker<'program> {
                     backing_type: None,
                     cases: Vec::new(),
                     case_by_name: HashMap::new(),
-                    copy: true,
+                    capabilities: EnumCapabilities {
+                        copy: true,
+                        trivial_copy: true,
+                        needs_drop: false,
+                        equality: true,
+                    },
+                    layout: None,
+                    span: declaration.span,
                 },
             );
         }
@@ -1440,7 +1706,7 @@ impl<'program> Checker<'program> {
             if !processed.insert(declaration.name.clone()) {
                 continue;
             }
-            let Some(mut definition) = self.enums.remove(&declaration.name) else {
+            let Some(mut definition) = self.enums.get(&declaration.name).cloned() else {
                 continue;
             };
             if !Self::uses_pascal_case(&declaration.name) {
@@ -1546,6 +1812,7 @@ impl<'program> Checker<'program> {
                         Some(EnumPayloadDefinition {
                             name: field.name.clone(),
                             ty: self.resolve_type_ref(&field.ty, field.span),
+                            span: field.span,
                         })
                     })
                     .collect::<Vec<_>>();
@@ -1617,16 +1884,140 @@ impl<'program> Checker<'program> {
                     payload,
                 });
             }
-            definition.copy = definition
-                .cases
-                .iter()
-                .flat_map(|case| &case.payload)
-                .all(|field| !self.type_is_move_type(field.ty));
             self.enums.insert(declaration.name.clone(), definition);
         }
+        self.finalize_enum_metadata();
     }
 
     fn check_enum(&mut self, _declaration: &EnumDecl) {}
+
+    fn finalize_enum_metadata(&mut self) {
+        let definitions = self
+            .enums
+            .values()
+            .cloned()
+            .map(|definition| (definition.id, definition))
+            .collect::<HashMap<_, _>>();
+        let mut states = vec![0_u8; definitions.len()];
+        let mut stack = Vec::new();
+        let mut recursive = HashSet::new();
+        let mut reported_cycles = HashSet::new();
+        let mut diagnostics = Vec::new();
+        for id in definitions.keys().copied() {
+            detect_inline_enum_cycles(
+                id,
+                &definitions,
+                &self.types,
+                &mut states,
+                &mut stack,
+                &mut recursive,
+                &mut reported_cycles,
+                &mut diagnostics,
+            );
+        }
+        self.diagnostics.extend(diagnostics);
+
+        let mut capabilities = definitions
+            .keys()
+            .copied()
+            .map(|id| {
+                (
+                    id,
+                    if recursive.contains(&id) {
+                        EnumCapabilities {
+                            copy: false,
+                            trivial_copy: false,
+                            needs_drop: true,
+                            equality: false,
+                        }
+                    } else {
+                        EnumCapabilities {
+                            copy: true,
+                            trivial_copy: true,
+                            needs_drop: false,
+                            equality: true,
+                        }
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        loop {
+            let mut changed = false;
+            for definition in definitions.values() {
+                if recursive.contains(&definition.id) {
+                    continue;
+                }
+                let mut next = EnumCapabilities {
+                    copy: true,
+                    trivial_copy: true,
+                    needs_drop: false,
+                    equality: true,
+                };
+                for field in definition.cases.iter().flat_map(|case| &case.payload) {
+                    let field = semantic_type_capabilities(&self.types, field.ty, &capabilities);
+                    next.copy &= field.copy;
+                    next.trivial_copy &= field.trivial_copy;
+                    next.needs_drop |= field.needs_drop;
+                    next.equality &= field.equality;
+                }
+                if capabilities.get(&definition.id) != Some(&next) {
+                    capabilities.insert(definition.id, next);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        let mut layouts = HashMap::<EnumId, EnumLayout>::new();
+        loop {
+            let mut changed = false;
+            for definition in definitions.values() {
+                if recursive.contains(&definition.id) || layouts.contains_key(&definition.id) {
+                    continue;
+                }
+                let case_fields = definition
+                    .cases
+                    .iter()
+                    .map(|case| {
+                        case.payload
+                            .iter()
+                            .map(|field| semantic_layout_shape(&self.types, field.ty, &layouts))
+                            .collect::<Option<Vec<_>>>()
+                    })
+                    .collect::<Option<Vec<_>>>();
+                let Some(case_fields) = case_fields else {
+                    continue;
+                };
+                match crate::enums::compute_enum_layout(definition.id, &case_fields) {
+                    Ok(layout) => {
+                        layouts.insert(definition.id, layout);
+                        changed = true;
+                    }
+                    Err(error) => self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0582",
+                            format!(
+                                "enum `{}` has no representable finite inline layout: {error:?}",
+                                definition.name
+                            ),
+                            definition.span,
+                        )
+                        .with_title("Enum Layout Is Too Large"),
+                    ),
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+
+        for definition in self.enums.values_mut() {
+            definition.capabilities = capabilities[&definition.id];
+            definition.layout = layouts.get(&definition.id).cloned();
+        }
+    }
 
     fn uses_pascal_case(name: &str) -> bool {
         name.chars()
@@ -5589,6 +5980,53 @@ impl<'program> Checker<'program> {
                 );
                 return;
             }
+            (TypeKind::Enum(left), TypeKind::Enum(right)) if left.id == right.id => {
+                if let Some(definition) = self
+                    .enums
+                    .values()
+                    .find(|definition| definition.id == left.id)
+                    .filter(|definition| !definition.capabilities.equality)
+                {
+                    let unavailable = definition.cases.iter().find_map(|case| {
+                        case.payload.iter().find_map(|field| {
+                            (!semantic_type_capabilities(
+                                &self.types,
+                                field.ty,
+                                &self
+                                    .enums
+                                    .values()
+                                    .map(|definition| (definition.id, definition.capabilities))
+                                    .collect(),
+                            )
+                            .equality)
+                                .then_some((case, field))
+                        })
+                    });
+                    let detail = unavailable.map_or_else(
+                        || "one of its payload types has no Doria equality".to_string(),
+                        |(case, field)| {
+                            format!(
+                                "case `{}` field `${}` has type `{}` without Doria equality",
+                                case.name,
+                                field.name,
+                                self.types.display(field.ty)
+                            )
+                        },
+                    );
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0584",
+                            format!(
+                                "payload enum `{}` cannot be compared because {detail}",
+                                definition.name
+                            ),
+                            span,
+                        )
+                        .with_title("Payload Enum Equality Is Unavailable"),
+                    );
+                    return;
+                }
+            }
             (TypeKind::Enum(enum_type), _) | (_, TypeKind::Enum(enum_type))
                 if !matches!(
                     (&left_kind, &right_kind),
@@ -5940,7 +6378,7 @@ impl<'program> Checker<'program> {
                 .enums
                 .values()
                 .find(|definition| definition.id == enum_type.id)
-                .is_some_and(|definition| !definition.copy),
+                .is_some_and(|definition| !definition.capabilities.copy),
             TypeKind::Class(_)
             | TypeKind::SharedHandle(_, _)
             | TypeKind::TypeParameter(_)
@@ -7290,7 +7728,7 @@ impl<'program> Checker<'program> {
             return;
         }
         if let Some(definition) = self.enums.get(class_name).cloned() {
-            self.check_enum_case_call(&definition, access, args);
+            self.check_enum_case_call(&definition, access, args, scopes, method_context);
             return;
         }
         if class_name == "String" {
@@ -7772,15 +8210,19 @@ impl<'program> Checker<'program> {
         let case = &definition.cases[index];
         if !case.payload.is_empty() {
             self.diagnostics.push(
-                Diagnostic::unsupported_stage(
-                    "E0573",
+                Diagnostic::new(
+                    "E0583",
                     format!(
-                        "payload case `{}::{}` requires arguments; payload enum execution lands in Stage 27 Slice 2",
+                        "payload case `{}::{}` requires an argument list",
                         definition.name, case.name
                     ),
                     access.span,
                 )
-                .with_title("Payload Enum Execution Lands In Stage 27 Slice 2"),
+                .with_title("Payload Case Requires Arguments")
+                .with_help(format!(
+                    "construct it as `{}::{}(...)`",
+                    definition.name, case.name
+                )),
             );
             return;
         }
@@ -7797,7 +8239,9 @@ impl<'program> Checker<'program> {
         &mut self,
         definition: &EnumDefinition,
         access: StaticAccess<'_>,
-        _args: &[Argument],
+        args: &[Argument],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
     ) {
         let Some(index) = definition.case_by_name.get(access.member).copied() else {
             let candidates = definition
@@ -7823,17 +8267,27 @@ impl<'program> Checker<'program> {
         };
         let case = &definition.cases[index];
         if !case.payload.is_empty() {
-            self.diagnostics.push(
-                Diagnostic::unsupported_stage(
-                    "E0573",
-                    format!(
-                        "payload enum case `{}::{}` is accepted; payload enum execution lands in Stage 27 Slice 2",
-                        definition.name, case.name
-                    ),
-                    access.span,
-                )
-                .with_title("Payload Enum Execution Lands In Stage 27 Slice 2"),
+            let params = case
+                .payload
+                .iter()
+                .map(|field| ParamInfo {
+                    name: field.name.clone(),
+                    ty: field.ty,
+                    take: self.type_is_move_type(field.ty),
+                    writable: false,
+                    has_default: false,
+                })
+                .collect::<Vec<_>>();
+            self.check_call_arguments(
+                &format!("payload case `{}::{}`", definition.name, case.name),
+                &params,
+                args,
+                access.span,
+                scopes,
+                method_context,
             );
+            self.enum_case_constructions
+                .insert((access.span.start, access.span.end), case.id);
             return;
         }
         let parentheses = Span::new(access.member_span.end, access.span.end);
@@ -11045,8 +11499,11 @@ impl<'program> Checker<'program> {
                 else {
                     return self.types.unknown();
                 };
-                if self.enums.contains_key(&class_name) {
-                    return self.types.unknown();
+                if let Some(definition) = self.enums.get(&class_name) {
+                    return self.types.intern(TypeKind::Enum(EnumType::new(
+                        definition.id,
+                        definition.name.clone(),
+                    )));
                 }
                 if class_name == "Int" && method == "toFloat" {
                     return self.types.intern(TypeKind::Float(FloatType::Float64));
@@ -11874,12 +12331,35 @@ impl<'program> Checker<'program> {
         let TypeKind::Enum(enum_type) = self.types.kind(ty).clone() else {
             return false;
         };
-        let backed = self
+        let definition = self
             .enums
             .values()
-            .find(|definition| definition.id == enum_type.id)
-            .is_some_and(|definition| definition.backing_type.is_some());
+            .find(|definition| definition.id == enum_type.id);
+        let backed = definition.is_some_and(|definition| definition.backing_type.is_some());
         if method != "value" {
+            let payload_field = definition.is_some_and(|definition| {
+                definition
+                    .cases
+                    .iter()
+                    .any(|case| case.payload.iter().any(|field| field.name == method))
+            });
+            if payload_field {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0577",
+                        format!(
+                            "payload field `${method}` on enum `{}` is observed through pattern matching",
+                            enum_type.name
+                        ),
+                        member_span,
+                    )
+                    .with_title("Enum Payload Requires Pattern Matching")
+                    .with_help(
+                        "payload fields are not properties; observe them through an enum case pattern",
+                    ),
+                );
+                return true;
+            }
             self.diagnostics.push(
                 Diagnostic::new(
                     "E0577",
@@ -12079,6 +12559,29 @@ impl<'program> Checker<'program> {
                 .values()
                 .find(|definition| definition.id == enum_type.id);
             if property == "value" && definition.is_some_and(|value| value.backing_type.is_some()) {
+                return;
+            }
+            let payload_field = definition.is_some_and(|definition| {
+                definition
+                    .cases
+                    .iter()
+                    .any(|case| case.payload.iter().any(|field| field.name == property))
+            });
+            if payload_field {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0577",
+                        format!(
+                            "payload field `${property}` on enum `{}` is observed through pattern matching",
+                            enum_type.name
+                        ),
+                        member_span,
+                    )
+                    .with_title("Enum Payload Requires Pattern Matching")
+                    .with_help(
+                        "payload fields are not properties; observe them through an enum case pattern",
+                    ),
+                );
                 return;
             }
             let message = if property == "value" {

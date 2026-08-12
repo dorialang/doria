@@ -49,7 +49,7 @@ function check_performance_foundation(string $root): array
             'Decision 0113 Slice 3 — Complete',
             'Decision 0113 Slice 4 — Complete',
             'Decision 0113 — Complete',
-            'Stage 27 — Enums + payload cases — In Progress; No Performance-Evidence Dependency.',
+            'Stage 27 — Enums + payload cases — Complete; No Performance-Evidence Dependency.',
         ],
         'docs/performance-and-benchmarking.md' => [
             'Decision 0112',
@@ -75,7 +75,7 @@ function check_performance_foundation(string $root): array
             'Decision 0113 Slice 4 — Complete.',
             'Decision 0113 — Complete.',
             'all three slices are complete',
-            'Stage 27 — In Progress; No Performance-Evidence Dependency.',
+            'Stage 27 — Complete; No Performance-Evidence Dependency.',
         ],
         'AGENTS.md' => [
             '`dorialang/benchmarks` repository',

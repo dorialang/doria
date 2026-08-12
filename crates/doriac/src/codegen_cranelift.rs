@@ -6,6 +6,7 @@ use cranelift_codegen::ir::{
     types, AbiParam, Block, BlockArg, InstBuilder, MemFlagsData, Signature, StackSlot,
     StackSlotData, StackSlotKind, TrapCode, Type as ClifType, Value,
 };
+use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{default_libcall_names, DataDescription, DataId, FuncId, Linkage, Module};
@@ -17,9 +18,13 @@ use crate::mir;
 use crate::mir_validation;
 use crate::native_abi::{
     collection_comparator_code, collection_header_size, collection_value_width, function_symbol,
-    nullable_payload_type, stage26_collection_kind, APPEND_FILE, APPEND_FILE_BYTES, BYTES_EQUAL,
-    BYTES_FREE, BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION,
-    CLASS_ALLOCATE, CLASS_FREE, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64,
+    nullable_collection_access_code, nullable_payload_type, stage26_collection_kind, APPEND_FILE,
+    APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE, BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH,
+    BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE, CLASS_FREE, COLLECTION_AGGREGATE_INSERT_SLOT,
+    COLLECTION_AGGREGATE_KEYED_SET_SLOT, COLLECTION_AGGREGATE_NEW,
+    COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO, COLLECTION_AGGREGATE_PUSH_FRONT_SLOT,
+    COLLECTION_AGGREGATE_PUSH_SLOT, COLLECTION_AGGREGATE_REMOVE_AT_INTO,
+    COLLECTION_AGGREGATE_VALUE_AT, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64,
     COLLECTION_COMPARE_STRING, COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS,
     COLLECTION_DETACH_FOR_CLEANUP, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
     COLLECTION_FINISH_DETACHED_CLEANUP, COLLECTION_FREE, COLLECTION_INDEX_OF, COLLECTION_INSERT_AT,
@@ -32,26 +37,26 @@ use crate::native_abi::{
     COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY,
     COLLECTION_STAGE26_NEW, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
     FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
-    MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL,
-    MIXED_TAG_CLASS, MIXED_TAG_ENUM, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_INT16,
-    MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_STRING, MIXED_TAG_UINT16,
-    MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL,
-    PROCESS_EXIT, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED,
-    SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE,
-    SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT,
-    STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA,
-    STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL,
-    STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64,
-    STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE,
-    STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE,
-    STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE,
-    STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
-    STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
-    STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
-    WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
-    WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS, WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK,
-    WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
-    WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
+    MIXED_NEW_AGGREGATE, MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG,
+    MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64,
+    MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_PAYLOAD_ENUM,
+    MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
+    MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES,
+    READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK,
+    SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH,
+    STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE,
+    STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE,
+    STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32,
+    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH,
+    STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN,
+    STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST,
+    STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN,
+    STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE,
+    STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER,
+    STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE,
+    WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS, WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS,
+    WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK, WRITABLE_SHARED_READONLY_PAYLOAD,
+    WRITABLE_SHARED_RELEASE, WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
     WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_RETAIN,
     WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES,
     WRITE_STDOUT_BYTES,
@@ -147,6 +152,7 @@ pub(crate) fn lower_validated_mir_to_object(
         process_main_id,
         &process_signature,
         &function_ids,
+        &static_ids,
     )?;
 
     module
@@ -209,6 +215,14 @@ fn function_signature(
     signature
         .params
         .push(AbiParam::new(module.target_config().pointer_type()));
+    if matches!(
+        function.return_type,
+        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
+    ) {
+        signature
+            .params
+            .push(AbiParam::new(module.target_config().pointer_type()));
+    }
     for parameter in &function.params {
         append_type_abi_params(
             &mut signature.params,
@@ -217,11 +231,16 @@ fn function_signature(
         );
     }
     if let mir::ReturnType::Value(ty) = function.return_type {
-        append_type_abi_params(
-            &mut signature.returns,
+        if !matches!(
             ty,
-            module.target_config().pointer_type(),
-        );
+            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+        ) {
+            append_type_abi_params(
+                &mut signature.returns,
+                ty,
+                module.target_config().pointer_type(),
+            );
+        }
     }
     Ok(signature)
 }
@@ -289,7 +308,9 @@ fn append_type_abi_params(params: &mut Vec<AbiParam>, ty: mir::Type, pointer_typ
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_)
-        | mir::Type::NullableCollection(_) => {
+        | mir::Type::NullableCollection(_)
+        | mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_) => {
             params.push(AbiParam::new(pointer_type));
         }
         mir::Type::NullableScalar(ty) => {
@@ -420,8 +441,14 @@ fn define_static_data(
             "__doria_static_{}_{}_{}",
             property.class.0, property.id.0, property.name
         );
+        let runtime_initialized = matches!(property.initializer, mir::StaticValue::PayloadEnum(_));
         let id = module
-            .declare_data(&symbol, Linkage::Local, property.writable, false)
+            .declare_data(
+                &symbol,
+                Linkage::Local,
+                property.writable || runtime_initialized,
+                false,
+            )
             .map_err(|error| backend_failure(error.to_string()))?;
         let mut description = DataDescription::new();
         description.set_align(pointer_bytes as u64);
@@ -479,6 +506,11 @@ fn define_static_data(
                 };
                 let object_reference = module.declare_data_in_data(object_id, &mut description);
                 description.write_data_addr(pointer_offset as u32, object_reference, 0);
+            }
+            mir::StaticValue::PayloadEnum(value) => {
+                let nullable = matches!(property.ty, mir::Type::NullablePayloadEnum(_));
+                description.set_align(value.ty.align.into());
+                description.define_zeroinit(value.ty.storage_size(nullable) as usize);
             }
         }
         module
@@ -588,6 +620,14 @@ fn define_function(
                         pointer_bytes.trailing_zeros() as u8,
                     )))
                 }
+                mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) => {
+                    let nullable = matches!(local.ty, mir::Type::NullablePayloadEnum(_));
+                    Some(builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        ty.storage_size(nullable),
+                        ty.align.trailing_zeros() as u8,
+                    )))
+                }
             })
             .collect::<Vec<_>>();
         let pointer_type = module.target_config().pointer_type();
@@ -608,13 +648,18 @@ fn define_function(
         ));
 
         builder.switch_to_block(entry);
-        initialize_locals(&mut builder, function, &local_slots, pointer_type)?;
+        initialize_locals(&mut builder, function, &local_slots, module.target_config())?;
         let zero = builder.ins().iconst(pointer_type, 0);
         for slot in &deferred_class_temporary_slots {
             builder.ins().stack_store(pointer_type, zero, *slot, 0);
         }
         bind_parameters(&mut builder, function, &local_slots, entry, pointer_type)?;
         let parent_frame = builder.block_params(entry)[0];
+        let return_address = matches!(
+            function.return_type,
+            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
+        )
+        .then(|| builder.block_params(entry)[1]);
         let function_name = define_named_data(
             &mut builder,
             function.name.as_bytes(),
@@ -716,6 +761,7 @@ fn define_function(
             next_data_id: 0,
             function_id: function.id,
             current_frame,
+            return_address,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
         };
@@ -786,6 +832,7 @@ fn define_class_drop_function(
             next_data_id: 0,
             function_id: program.entry,
             current_frame,
+            return_address: None,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
         };
@@ -842,6 +889,7 @@ fn define_collection_drop_function(
             next_data_id: 0,
             function_id: program.entry,
             current_frame,
+            return_address: None,
             defer_class_temporary_drops: false,
             deferred_class_temporary_drops: Vec::new(),
         };
@@ -861,9 +909,21 @@ fn initialize_locals(
     builder: &mut FunctionBuilder,
     function: &mir::Function,
     slots: &[Option<StackSlot>],
-    pointer_type: ClifType,
+    frontend_config: TargetFrontendConfig,
 ) -> Result<(), BackendError> {
+    let pointer_type = frontend_config.pointer_type();
     for local in &function.locals {
+        if let mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) = local.ty {
+            let nullable = matches!(local.ty, mir::Type::NullablePayloadEnum(_));
+            let slot = local_slot(slots, local.id)?;
+            let address = builder.ins().stack_addr(pointer_type, slot, 0);
+            let zero = builder.ins().iconst(types::I8, 0);
+            let size = builder
+                .ins()
+                .iconst(pointer_type, i64::from(ty.storage_size(nullable)));
+            builder.call_memset(frontend_config, address, zero, size);
+            continue;
+        }
         let zero = match local.ty {
             mir::Type::Scalar(mir::ScalarType::Integer(ty)) => {
                 builder.ins().iconst(clif_integer_type(ty), 0)
@@ -903,6 +963,7 @@ fn initialize_locals(
                     .stack_store(pointer_type, zero, slot, pointer_type.bytes() as i32);
                 zero
             }
+            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => unreachable!(),
         };
         builder
             .ins()
@@ -919,7 +980,11 @@ fn bind_parameters(
     pointer_type: ClifType,
 ) -> Result<(), BackendError> {
     let params = builder.block_params(entry).to_vec();
-    let mut params = params.into_iter().skip(1);
+    let hidden_return = usize::from(matches!(
+        function.return_type,
+        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
+    ));
+    let mut params = params.into_iter().skip(1 + hidden_return);
     for parameter in &function.params {
         let slot = local_slot(slots, *parameter)?;
         let ty = local_in(function, *parameter)?.ty;
@@ -927,7 +992,18 @@ fn bind_parameters(
             .next()
             .ok_or_else(|| malformed_mir("function parameter is missing an ABI value"))?;
         let first = value_from_doria_abi(builder, first, ty);
-        builder.ins().stack_store(pointer_type, first, slot, 0);
+        if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) = ty {
+            let destination = builder.ins().stack_addr(pointer_type, slot, 0);
+            copy_inline_bytes(
+                builder,
+                destination,
+                first,
+                payload.storage_size(matches!(ty, mir::Type::NullablePayloadEnum(_))),
+                pointer_type,
+            );
+        } else {
+            builder.ins().stack_store(pointer_type, first, slot, 0);
+        }
         if matches!(ty, mir::Type::NullableScalar(_) | mir::Type::NullableString) {
             let payload = params.next().ok_or_else(|| {
                 malformed_mir("nullable function parameter is missing its ABI payload")
@@ -1184,6 +1260,7 @@ fn define_process_main(
     process_main_id: FuncId,
     process_signature: &Signature,
     function_ids: &[FuncId],
+    static_ids: &[DataId],
 ) -> Result<(), BackendError> {
     let entry = program
         .functions
@@ -1206,6 +1283,7 @@ fn define_process_main(
         let argv = builder.block_params(block)[1];
 
         let pointer_type = module.target_config().pointer_type();
+        initialize_payload_statics(&mut builder, module, program, static_ids)?;
         let entry_ref = module.declare_func_in_func(entry_id, builder.func);
         let entry_pointer = builder.ins().func_addr(pointer_type, entry_ref);
         // Decision 0099: an entry that declares the argument list is invoked
@@ -1331,6 +1409,169 @@ fn define_process_main(
     Ok(())
 }
 
+fn initialize_payload_statics(
+    builder: &mut FunctionBuilder,
+    module: &mut ObjectModule,
+    program: &mir::Program,
+    static_ids: &[DataId],
+) -> Result<(), BackendError> {
+    let pointer = module.target_config().pointer_type();
+    for property in &program.statics {
+        let mir::StaticValue::PayloadEnum(value) = &property.initializer else {
+            continue;
+        };
+        let id = *static_ids
+            .get(property.id.0)
+            .ok_or_else(|| malformed_mir("payload enum static was not declared"))?;
+        let global = module.declare_data_in_func(id, builder.func);
+        let address = builder.ins().symbol_value(pointer, global);
+        initialize_payload_static_value(
+            builder,
+            module,
+            program,
+            &property.initializer,
+            property.ty,
+            address,
+            &format!("__doria_static_init_{}", property.id.0),
+        )?;
+        debug_assert_eq!(
+            value.ty.id,
+            match property.ty {
+                mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty) => ty.id,
+                _ => unreachable!(),
+            }
+        );
+    }
+    Ok(())
+}
+
+fn initialize_payload_static_value(
+    builder: &mut FunctionBuilder,
+    module: &mut ObjectModule,
+    program: &mir::Program,
+    value: &mir::StaticValue,
+    ty: mir::Type,
+    mut address: Value,
+    symbol: &str,
+) -> Result<(), BackendError> {
+    let pointer = module.target_config().pointer_type();
+    let flags = MemFlagsData::new();
+    match (value, ty) {
+        (mir::StaticValue::Scalar(value), mir::Type::Scalar(expected))
+            if value.ty() == expected =>
+        {
+            let value = cranelift_scalar_constant(builder, *value);
+            builder.ins().store(flags, value, address, 0);
+        }
+        (mir::StaticValue::Scalar(value), mir::Type::NullableScalar(expected))
+            if value.ty() == expected =>
+        {
+            let present = builder.ins().iconst(pointer, 1);
+            builder.ins().store(flags, present, address, 0);
+            let value = cranelift_scalar_constant(builder, *value);
+            builder
+                .ins()
+                .store(flags, value, address, pointer.bytes() as i32);
+        }
+        (mir::StaticValue::String(value), mir::Type::String | mir::Type::NullableString) => {
+            let mut bytes = Vec::with_capacity(pointer.bytes() as usize * 2 + value.len());
+            append_target_word(&mut bytes, u64::MAX, pointer.bytes() as usize);
+            append_target_word(&mut bytes, value.len() as u64, pointer.bytes() as usize);
+            bytes.extend_from_slice(value.as_bytes());
+            let string = define_named_data(builder, &bytes, module, &format!("{symbol}_string"))?;
+            if matches!(ty, mir::Type::NullableString) {
+                let present = builder.ins().iconst(pointer, 1);
+                builder.ins().store(flags, present, address, 0);
+                builder
+                    .ins()
+                    .store(flags, string, address, pointer.bytes() as i32);
+            } else {
+                builder.ins().store(flags, string, address, 0);
+            }
+        }
+        (mir::StaticValue::Null, _) => {}
+        (
+            mir::StaticValue::PayloadEnum(value),
+            mir::Type::PayloadEnum(expected) | mir::Type::NullablePayloadEnum(expected),
+        ) if value.ty == expected => {
+            if matches!(ty, mir::Type::NullablePayloadEnum(_)) {
+                let present = builder.ins().iconst(types::I8, 1);
+                builder.ins().store(flags, present, address, 0);
+                address = builder
+                    .ins()
+                    .iadd_imm_u(address, i64::from(expected.nullable_payload_offset));
+            }
+            let definition = enum_definition(program, expected.id)?;
+            let case = definition
+                .cases
+                .get(value.case.index)
+                .filter(|case| case.id == value.case)
+                .ok_or_else(|| malformed_mir("payload enum static case does not exist"))?;
+            let layout = definition
+                .layout
+                .cases
+                .get(value.case.index)
+                .filter(|layout| layout.case_id == value.case)
+                .ok_or_else(|| malformed_mir("payload enum static case layout does not exist"))?;
+            let tag = builder
+                .ins()
+                .iconst(clif_tag_type(definition.layout.tag_width)?, case.tag as i64);
+            builder
+                .ins()
+                .store(flags, tag, address, definition.layout.tag_offset as i32);
+            for (index, ((field, field_definition), field_layout)) in value
+                .fields
+                .iter()
+                .zip(&case.payload)
+                .zip(&layout.fields)
+                .enumerate()
+            {
+                let field_address = builder
+                    .ins()
+                    .iadd_imm_u(address, i64::from(field_layout.offset));
+                initialize_payload_static_value(
+                    builder,
+                    module,
+                    program,
+                    field,
+                    field_definition.ty,
+                    field_address,
+                    &format!("{symbol}_field_{index}"),
+                )?;
+            }
+        }
+        _ => {
+            return Err(malformed_mir(
+                "payload enum static initializer type mismatch",
+            ))
+        }
+    }
+    Ok(())
+}
+
+fn cranelift_scalar_constant(builder: &mut FunctionBuilder, value: mir::ScalarValue) -> Value {
+    match value {
+        mir::ScalarValue::Integer(value) => integer_constant(builder, value),
+        mir::ScalarValue::Float(value) => match value.ty {
+            FloatType::Float32 => builder.ins().f32const(Ieee32::with_bits(value.bits as u32)),
+            FloatType::Float64 => builder.ins().f64const(Ieee64::with_bits(value.bits)),
+        },
+        mir::ScalarValue::Bool(value) => builder.ins().iconst(types::I8, i64::from(value)),
+        mir::ScalarValue::Enum(value) => {
+            builder.ins().iconst(types::I32, value.case_id.index as i64)
+        }
+    }
+}
+
+fn clif_tag_type(width: u32) -> Result<ClifType, BackendError> {
+    match width {
+        1 => Ok(types::I8),
+        2 => Ok(types::I16),
+        4 => Ok(types::I32),
+        _ => Err(malformed_mir("payload enum tag has unsupported width")),
+    }
+}
+
 struct LoweringResources<'module, 'program> {
     module: &'module mut ObjectModule,
     program: &'program mir::Program,
@@ -1347,6 +1588,7 @@ struct LoweringResources<'module, 'program> {
     next_data_id: usize,
     function_id: mir::FunctionId,
     current_frame: Value,
+    return_address: Option<Value>,
     defer_class_temporary_drops: bool,
     deferred_class_temporary_drops: Vec<(StackSlot, DeferredOwnedTemporary)>,
 }
@@ -1730,6 +1972,19 @@ fn lower_statement(
                     .nullable()?
                     .1,
                 ),
+                mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
+                    let nullable =
+                        matches!(property_definition.ty, mir::Type::NullablePayloadEnum(_));
+                    let old = create_payload_storage(builder, payload, nullable, resources);
+                    copy_inline_bytes(
+                        builder,
+                        old,
+                        address,
+                        payload.storage_size(nullable),
+                        pointer_type,
+                    );
+                    Some(old)
+                }
                 mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => None,
             };
             store_lowered_to_address(
@@ -1768,6 +2023,12 @@ fn lower_statement(
                 (mir::Type::Mixed | mir::Type::NullableMixed, Some(old_value)) => {
                     lower_drop_mixed_value(builder, old_value, resources)?;
                 }
+                (mir::Type::PayloadEnum(payload), Some(old_value)) => {
+                    lower_drop_payload_enum_at(builder, old_value, payload, false, resources)?;
+                }
+                (mir::Type::NullablePayloadEnum(payload), Some(old_value)) => {
+                    lower_drop_payload_enum_at(builder, old_value, payload, true, resources)?;
+                }
                 _ => {}
             }
         }
@@ -1785,12 +2046,28 @@ fn lower_statement(
                         .nullable()?
                         .1,
                 ),
+                mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
+                    let nullable = matches!(property.ty, mir::Type::NullablePayloadEnum(_));
+                    let old = create_payload_storage(builder, payload, nullable, resources);
+                    copy_inline_bytes(
+                        builder,
+                        old,
+                        address,
+                        payload.storage_size(nullable),
+                        pointer,
+                    );
+                    Some(old)
+                }
                 _ => None,
             };
             store_lowered_to_address(builder, property.ty, address, new_value, pointer)?;
             if let Some(old_value) = old_value {
                 if matches!(property.ty, mir::Type::Mixed | mir::Type::NullableMixed) {
                     lower_drop_mixed_value(builder, old_value, resources)?;
+                } else if let mir::Type::PayloadEnum(payload) = property.ty {
+                    lower_drop_payload_enum_at(builder, old_value, payload, false, resources)?;
+                } else if let mir::Type::NullablePayloadEnum(payload) = property.ty {
+                    lower_drop_payload_enum_at(builder, old_value, payload, true, resources)?;
                 } else {
                     release_string(builder, old_value, resources)?;
                 }
@@ -1911,6 +2188,19 @@ fn lower_statement(
                 resources,
             )?;
         }
+        mir::Statement::DropPayloadEnum {
+            local,
+            ty,
+            nullable,
+        } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let address =
+                builder
+                    .ins()
+                    .stack_addr(pointer, local_slot(resources.local_slots, *local)?, 0);
+            lower_drop_payload_enum_at(builder, address, *ty, *nullable, resources)?;
+            zero_inline_bytes(builder, address, ty.storage_size(*nullable), pointer);
+        }
     }
     resources.defer_class_temporary_drops = false;
     flush_deferred_class_temporary_drops(builder, resources)
@@ -1959,6 +2249,9 @@ fn load_lowered_from_stack(
             slot,
             0,
         )),
+        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
+            LoweredValue::Single(builder.ins().stack_addr(pointer, slot, 0))
+        }
         mir::Type::String
         | mir::Type::Mixed
         | mir::Type::Class(_)
@@ -1991,6 +2284,17 @@ fn store_lowered_to_stack(
     pointer: ClifType,
 ) -> Result<(), BackendError> {
     match ty {
+        mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
+            let nullable = matches!(ty, mir::Type::NullablePayloadEnum(_));
+            let destination = builder.ins().stack_addr(pointer, slot, 0);
+            copy_inline_bytes(
+                builder,
+                destination,
+                value.single()?,
+                payload.storage_size(nullable),
+                pointer,
+            );
+        }
         mir::Type::NullableScalar(_) | mir::Type::NullableString => {
             let (present, payload) = value.nullable()?;
             builder.ins().stack_store(pointer, present, slot, 0);
@@ -2034,6 +2338,9 @@ fn load_lowered_from_address(
             address,
             0,
         )),
+        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
+            LoweredValue::Single(address)
+        }
         mir::Type::String
         | mir::Type::Mixed
         | mir::Type::Class(_)
@@ -2067,6 +2374,16 @@ fn store_lowered_to_address(
 ) -> Result<(), BackendError> {
     let flags = cranelift_codegen::ir::MachMemFlags::trusted();
     match ty {
+        mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
+            let nullable = matches!(ty, mir::Type::NullablePayloadEnum(_));
+            copy_inline_bytes(
+                builder,
+                address,
+                value.single()?,
+                payload.storage_size(nullable),
+                pointer,
+            );
+        }
         mir::Type::NullableScalar(_) | mir::Type::NullableString => {
             let (present, payload) = value.nullable()?;
             builder.ins().store(flags, present, address, 0);
@@ -2079,6 +2396,32 @@ fn store_lowered_to_address(
         }
     }
     Ok(())
+}
+
+fn copy_inline_bytes(
+    builder: &mut FunctionBuilder,
+    destination: Value,
+    source: Value,
+    size: u32,
+    pointer: ClifType,
+) {
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let word_bytes = pointer.bytes();
+    let mut offset = 0_u32;
+    while size - offset >= word_bytes {
+        let value = builder.ins().load(pointer, flags, source, offset as i32);
+        builder
+            .ins()
+            .store(flags, value, destination, offset as i32);
+        offset += word_bytes;
+    }
+    while offset < size {
+        let value = builder.ins().load(types::I8, flags, source, offset as i32);
+        builder
+            .ins()
+            .store(flags, value, destination, offset as i32);
+        offset += 1;
+    }
 }
 
 fn lower_terminator(
@@ -2096,6 +2439,23 @@ fn lower_terminator(
             flush_deferred_class_temporary_drops(builder, resources)?;
             cleanup_class_locals(builder, resources)?;
             cleanup_string_locals(builder, resources)?;
+            if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
+                expression.ty()
+            {
+                let destination = resources.return_address.ok_or_else(|| {
+                    malformed_mir("payload enum return has no hidden result address")
+                })?;
+                copy_inline_bytes(
+                    builder,
+                    destination,
+                    value.single()?,
+                    payload
+                        .storage_size(matches!(expression.ty(), mir::Type::NullablePayloadEnum(_))),
+                    resources.module.target_config().pointer_type(),
+                );
+                builder.ins().return_(&[]);
+                return Ok(());
+            }
             let mut values = Vec::with_capacity(2);
             value_to_doria_abi(builder, value, expression.ty()).append_to(&mut values);
             builder.ins().return_(&values);
@@ -2300,6 +2660,1156 @@ fn lower_rvalue(
             lower_nullable_collection_expression(builder, value, resources)
                 .map(LoweredValue::Single)
         }
+        mir::Rvalue::PayloadEnum(value) => {
+            lower_payload_enum_expression(builder, value, resources).map(LoweredValue::Single)
+        }
+        mir::Rvalue::NullablePayloadEnum(value) => {
+            lower_nullable_payload_enum_expression(builder, value, resources)
+                .map(LoweredValue::Single)
+        }
+    }
+}
+
+fn create_payload_storage(
+    builder: &mut FunctionBuilder,
+    ty: mir::PayloadEnumType,
+    nullable: bool,
+    resources: &LoweringResources<'_, '_>,
+) -> Value {
+    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        ty.storage_size(nullable),
+        ty.align.trailing_zeros() as u8,
+    ));
+    builder
+        .ins()
+        .stack_addr(resources.module.target_config().pointer_type(), slot, 0)
+}
+
+fn zero_inline_bytes(builder: &mut FunctionBuilder, address: Value, size: u32, pointer: ClifType) {
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let zero_word = builder.ins().iconst(pointer, 0);
+    let zero_byte = builder.ins().iconst(types::I8, 0);
+    let word_bytes = pointer.bytes();
+    let mut offset = 0_u32;
+    while size - offset >= word_bytes {
+        builder
+            .ins()
+            .store(flags, zero_word, address, offset as i32);
+        offset += word_bytes;
+    }
+    while offset < size {
+        builder
+            .ins()
+            .store(flags, zero_byte, address, offset as i32);
+        offset += 1;
+    }
+}
+
+fn lower_payload_enum_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::PayloadEnumExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let ty = expression.ty();
+    match expression {
+        mir::PayloadEnumExpression::Construct { case, fields, .. } => {
+            let definition = enum_definition(resources.program, ty.id)?;
+            let case_definition = definition
+                .cases
+                .get(case.index)
+                .filter(|candidate| candidate.id == *case)
+                .ok_or_else(|| malformed_mir("payload enum construction case does not exist"))?;
+            let case_layout = definition
+                .layout
+                .cases
+                .get(case.index)
+                .filter(|candidate| candidate.case_id == *case)
+                .ok_or_else(|| malformed_mir("payload enum construction layout is missing"))?;
+            let address = create_payload_storage(builder, ty, false, resources);
+            let pointer = resources.module.target_config().pointer_type();
+            zero_inline_bytes(builder, address, ty.size, pointer);
+            store_payload_enum_tag(
+                builder,
+                address,
+                definition.layout.tag_width,
+                case_definition.tag,
+            )?;
+            for ((field, field_definition), field_layout) in fields
+                .iter()
+                .zip(&case_definition.payload)
+                .zip(&case_layout.fields)
+            {
+                let mut value = lower_rvalue(builder, field, resources)?;
+                if field_definition.ty == mir::Type::String {
+                    value =
+                        LoweredValue::Single(retain_string(builder, value.single()?, resources)?);
+                }
+                let field_address = builder
+                    .ins()
+                    .iadd_imm_u(address, i64::from(field_layout.offset));
+                store_lowered_to_address(
+                    builder,
+                    field_definition.ty,
+                    field_address,
+                    value,
+                    pointer,
+                )?;
+            }
+            Ok(address)
+        }
+        mir::PayloadEnumExpression::Use { place, mode, .. } => {
+            lower_payload_enum_place(builder, place, ty, false, *mode, resources)
+        }
+        mir::PayloadEnumExpression::Call { function, args, .. } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("payload enum call returned void"))?
+                .single()
+        }
+        mir::PayloadEnumExpression::Coalesce { left, right, .. } => {
+            let left = lower_nullable_payload_enum_expression(builder, left, resources)?;
+            let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+            let present = builder.ins().load(types::I8, flags, left, 0);
+            let zero = builder.ins().iconst(types::I8, 0);
+            let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+            let left_block = builder.create_block();
+            let right_block = builder.create_block();
+            let done = builder.create_block();
+            let pointer = resources.module.target_config().pointer_type();
+            builder.append_block_param(done, pointer);
+            builder
+                .ins()
+                .brif(is_present, left_block, &[], right_block, &[]);
+            builder.switch_to_block(left_block);
+            let payload = builder
+                .ins()
+                .iadd_imm_u(left, i64::from(ty.nullable_payload_offset));
+            builder.ins().jump(done, &[BlockArg::Value(payload)]);
+            builder.switch_to_block(right_block);
+            let right = lower_payload_enum_expression(builder, right, resources)?;
+            builder.ins().jump(done, &[BlockArg::Value(right)]);
+            builder.switch_to_block(done);
+            Ok(builder.block_params(done)[0])
+        }
+    }
+}
+
+fn lower_nullable_payload_enum_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::NullablePayloadEnumExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let ty = expression.ty();
+    match expression {
+        mir::NullablePayloadEnumExpression::Null(_) => {
+            let address = create_payload_storage(builder, ty, true, resources);
+            zero_inline_bytes(
+                builder,
+                address,
+                ty.nullable_size,
+                resources.module.target_config().pointer_type(),
+            );
+            Ok(address)
+        }
+        mir::NullablePayloadEnumExpression::Value(value) => {
+            let payload = lower_payload_enum_expression(builder, value, resources)?;
+            let address = create_payload_storage(builder, ty, true, resources);
+            zero_inline_bytes(
+                builder,
+                address,
+                ty.nullable_size,
+                resources.module.target_config().pointer_type(),
+            );
+            let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+            let present = builder.ins().iconst(types::I8, 1);
+            builder.ins().store(flags, present, address, 0);
+            let destination = builder
+                .ins()
+                .iadd_imm_u(address, i64::from(ty.nullable_payload_offset));
+            copy_inline_bytes(
+                builder,
+                destination,
+                payload,
+                ty.size,
+                resources.module.target_config().pointer_type(),
+            );
+            Ok(address)
+        }
+        mir::NullablePayloadEnumExpression::Use { place, mode, .. } => {
+            lower_payload_enum_place(builder, place, ty, true, *mode, resources)
+        }
+        mir::NullablePayloadEnumExpression::Call { function, args, .. } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("nullable payload enum call returned void"))?
+                .single()
+        }
+        mir::NullablePayloadEnumExpression::CollectionGet {
+            collection,
+            key,
+            access,
+            stored_nullable,
+            mode,
+            ..
+        } => lower_nullable_payload_enum_collection_get(
+            builder,
+            ty,
+            *collection,
+            key,
+            *access,
+            *stored_nullable,
+            *mode,
+            resources,
+        ),
+        mir::NullablePayloadEnumExpression::Coalesce { left, right, .. } => {
+            let left = lower_nullable_payload_enum_expression(builder, left, resources)?;
+            let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+            let present = builder.ins().load(types::I8, flags, left, 0);
+            let zero = builder.ins().iconst(types::I8, 0);
+            let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+            let left_block = builder.create_block();
+            let right_block = builder.create_block();
+            let done = builder.create_block();
+            let pointer = resources.module.target_config().pointer_type();
+            builder.append_block_param(done, pointer);
+            builder
+                .ins()
+                .brif(is_present, left_block, &[], right_block, &[]);
+            builder.switch_to_block(left_block);
+            builder.ins().jump(done, &[BlockArg::Value(left)]);
+            builder.switch_to_block(right_block);
+            let right = lower_nullable_payload_enum_expression(builder, right, resources)?;
+            builder.ins().jump(done, &[BlockArg::Value(right)]);
+            builder.switch_to_block(done);
+            Ok(builder.block_params(done)[0])
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_nullable_payload_enum_collection_get(
+    builder: &mut FunctionBuilder,
+    ty: mir::PayloadEnumType,
+    collection: mir::LocalId,
+    key: &mir::Rvalue,
+    access: mir::NullableCollectionAccess,
+    stored_nullable: bool,
+    mode: mir::PayloadEnumUseMode,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let local = local_definition(resources.program, resources.function_id, collection)?;
+    let mir::Type::Collection(collection_type) = local.ty else {
+        return Err(malformed_mir(
+            "payload enum nullable access uses a non-collection local",
+        ));
+    };
+    let definition = collection_definition(resources.program, collection_type)?.clone();
+    let key_type = match access {
+        mir::NullableCollectionAccess::Get
+        | mir::NullableCollectionAccess::Index
+        | mir::NullableCollectionAccess::Remove => definition
+            .key
+            .ok_or_else(|| malformed_mir("dictionary access has no key type"))?,
+        _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+    };
+    let collection = lower_collection_pointer(builder, collection, resources)?;
+    let key_value = lower_rvalue(builder, key, resources)?.single()?;
+    let key_word = value_to_collection_word(builder, key_value, key_type, pointer)?;
+    let raw = create_payload_storage(builder, ty, stored_nullable, resources);
+    zero_inline_bytes(builder, raw, ty.storage_size(stored_nullable), pointer);
+    let found_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
+    let found_pointer = builder.ins().stack_addr(pointer, found_slot, 0);
+    let removed_key_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+    let removed_key_pointer = builder.ins().stack_addr(pointer, removed_key_slot, 0);
+    let key_kind = builder
+        .ins()
+        .iconst(types::I8, collection_compare_kind(key_type)?);
+    let access_value = builder.ins().iconst(
+        types::I8,
+        i64::from(nullable_collection_access_code(access).ok_or_else(|| {
+            malformed_mir("aggregate nullable index must use the direct index path")
+        })?),
+    );
+    let stored_nullable_value = builder.ins().iconst(types::I8, i64::from(stored_nullable));
+    let _ = runtime_call(
+        builder,
+        COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO,
+        &[
+            pointer,
+            types::I64,
+            types::I8,
+            types::I8,
+            types::I8,
+            pointer,
+            pointer,
+            pointer,
+        ],
+        None,
+        &[
+            collection,
+            key_word,
+            key_kind,
+            access_value,
+            stored_nullable_value,
+            found_pointer,
+            removed_key_pointer,
+            raw,
+        ],
+        resources,
+    )?;
+    if key_type == mir::Type::String {
+        release_string(builder, key_value, resources)?;
+        if access == mir::NullableCollectionAccess::Remove {
+            let removed_key = builder
+                .ins()
+                .stack_load(pointer, types::I64, removed_key_slot, 0);
+            let removed_key =
+                collection_word_to_value(builder, removed_key, mir::Type::String, pointer)?;
+            release_string(builder, removed_key, resources)?;
+        }
+    }
+    let result = create_payload_storage(builder, ty, true, resources);
+    zero_inline_bytes(builder, result, ty.nullable_size, pointer);
+    if stored_nullable {
+        copy_inline_bytes(builder, result, raw, ty.nullable_size, pointer);
+    } else {
+        let found = builder.ins().stack_load(pointer, types::I8, found_slot, 0);
+        builder.ins().store(
+            cranelift_codegen::ir::MachMemFlags::trusted(),
+            found,
+            result,
+            0,
+        );
+        let destination = builder
+            .ins()
+            .iadd_imm_u(result, i64::from(ty.nullable_payload_offset));
+        copy_inline_bytes(builder, destination, raw, ty.size, pointer);
+    }
+    let mutating = matches!(
+        access,
+        mir::NullableCollectionAccess::Remove
+            | mir::NullableCollectionAccess::Pop
+            | mir::NullableCollectionAccess::PopFront
+            | mir::NullableCollectionAccess::PopBack
+    );
+    if !mutating && matches!(mode, mir::PayloadEnumUseMode::Copy) {
+        retain_payload_enum_at(builder, result, ty, true, resources)?;
+    }
+    Ok(result)
+}
+
+fn store_payload_enum_tag(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    width: u32,
+    tag: u32,
+) -> Result<(), BackendError> {
+    let ty = match width {
+        1 => types::I8,
+        2 => types::I16,
+        4 => types::I32,
+        _ => return Err(malformed_mir("payload enum tag has unsupported width")),
+    };
+    let value = builder.ins().iconst(ty, i64::from(tag));
+    builder.ins().store(
+        cranelift_codegen::ir::MachMemFlags::trusted(),
+        value,
+        address,
+        0,
+    );
+    Ok(())
+}
+
+fn lower_payload_enum_place(
+    builder: &mut FunctionBuilder,
+    place: &mir::PayloadEnumPlace,
+    ty: mir::PayloadEnumType,
+    nullable: bool,
+    mode: mir::PayloadEnumUseMode,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    if let mir::PayloadEnumPlace::MixedPayload { mixed } = place {
+        if nullable {
+            return Err(malformed_mir(
+                "mixed payload projection cannot produce a nullable aggregate",
+            ));
+        }
+        let mixed_slot = local_slot(resources.local_slots, *mixed)?;
+        let mixed_value =
+            load_lowered_from_stack(builder, mir::Type::Mixed, mixed_slot, pointer).single()?;
+        let payload_word = runtime_call(
+            builder,
+            MIXED_PAYLOAD,
+            &[pointer],
+            Some(types::I64),
+            &[mixed_value],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("mixed aggregate payload read produced no result"))?;
+        let source = collection_word_to_value(
+            builder,
+            payload_word,
+            mir::Type::Class(crate::class_layout::ClassId(0)),
+            pointer,
+        )?;
+        if matches!(mode, mir::PayloadEnumUseMode::Borrow) {
+            return Ok(source);
+        }
+        let destination = create_payload_storage(builder, ty, false, resources);
+        copy_inline_bytes(builder, destination, source, ty.size, pointer);
+        if matches!(mode, mir::PayloadEnumUseMode::Copy) {
+            retain_payload_enum_at(builder, destination, ty, false, resources)?;
+            return Ok(destination);
+        }
+        let zero = builder.ins().iconst(pointer, 0);
+        builder.ins().stack_store(pointer, zero, mixed_slot, 0);
+        let final_claim = runtime_call(
+            builder,
+            MIXED_RELEASE_OWNED,
+            &[pointer],
+            Some(types::I8),
+            &[mixed_value],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("mixed payload move released no ownership claim"))?;
+        let no_claim = builder.ins().icmp_imm_u(IntCC::Equal, final_claim, 0);
+        lower_panic_if_code(
+            builder,
+            no_claim,
+            "P1321",
+            function_in(resources.program, resources.function_id)?.source_span,
+            resources,
+        )?;
+        runtime_call(
+            builder,
+            MIXED_FREE,
+            &[pointer],
+            None,
+            &[mixed_value],
+            resources,
+        )?;
+        return Ok(destination);
+    }
+    let (source, narrowed_nullable_source) = match place {
+        mir::PayloadEnumPlace::Local(local) => (
+            builder
+                .ins()
+                .stack_addr(pointer, local_slot(resources.local_slots, *local)?, 0),
+            None,
+        ),
+        mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local) => {
+            let storage =
+                builder
+                    .ins()
+                    .stack_addr(pointer, local_slot(resources.local_slots, *local)?, 0);
+            (
+                builder
+                    .ins()
+                    .iadd_imm_u(storage, i64::from(ty.nullable_payload_offset)),
+                Some(storage),
+            )
+        }
+        mir::PayloadEnumPlace::Static(id) => (lower_static_address(builder, *id, resources)?, None),
+        mir::PayloadEnumPlace::Property { object, property } => (
+            lower_property_address(builder, *object, *property, resources)?,
+            None,
+        ),
+        mir::PayloadEnumPlace::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+        } => {
+            let collection_local =
+                local_definition(resources.program, resources.function_id, *collection)?;
+            let mir::Type::Collection(collection_type) = collection_local.ty else {
+                return Err(malformed_mir(
+                    "payload enum collection place uses a non-collection local",
+                ));
+            };
+            let definition = collection_definition(resources.program, collection_type)?;
+            let collection_value = lower_collection_pointer(builder, *collection, resources)?;
+            let index_value = lower_rvalue(builder, index, resources)?.single()?;
+            let index_type = match (*positional, definition.key) {
+                (false, Some(key)) => key,
+                _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+            };
+            let index_word = value_to_collection_word(builder, index_value, index_type, pointer)?;
+            if *remove {
+                let destination = create_payload_storage(builder, ty, nullable, resources);
+                let index = if pointer == types::I64 {
+                    index_word
+                } else {
+                    builder.ins().ireduce(pointer, index_word)
+                };
+                let _ = runtime_call(
+                    builder,
+                    COLLECTION_AGGREGATE_REMOVE_AT_INTO,
+                    &[pointer, pointer, pointer, pointer],
+                    None,
+                    &[
+                        resources.current_frame,
+                        collection_value,
+                        index,
+                        destination,
+                    ],
+                    resources,
+                )?;
+                return Ok(destination);
+            }
+            if matches!(mode, mir::PayloadEnumUseMode::Move) {
+                return Err(malformed_mir(
+                    "payload enum collection move requires a removing operation",
+                ));
+            }
+            let positional_value = builder.ins().iconst(types::I8, i64::from(*positional));
+            let key_kind = builder
+                .ins()
+                .iconst(types::I8, collection_compare_kind(index_type)?);
+            (
+                runtime_call(
+                    builder,
+                    COLLECTION_AGGREGATE_VALUE_AT,
+                    &[pointer, pointer, types::I64, types::I8, types::I8],
+                    Some(pointer),
+                    &[
+                        resources.current_frame,
+                        collection_value,
+                        index_word,
+                        positional_value,
+                        key_kind,
+                    ],
+                    resources,
+                )?
+                .ok_or_else(|| backend_failure("aggregate collection read produced no slot"))?,
+                None,
+            )
+        }
+        mir::PayloadEnumPlace::MixedPayload { .. } => unreachable!(),
+    };
+    if matches!(mode, mir::PayloadEnumUseMode::Borrow) {
+        return Ok(source);
+    }
+    let destination = create_payload_storage(builder, ty, nullable, resources);
+    copy_inline_bytes(
+        builder,
+        destination,
+        source,
+        ty.storage_size(nullable),
+        pointer,
+    );
+    if matches!(mode, mir::PayloadEnumUseMode::Copy) {
+        retain_payload_enum_at(builder, destination, ty, nullable, resources)?;
+    } else if let Some(storage) = narrowed_nullable_source {
+        zero_inline_bytes(builder, storage, ty.storage_size(true), pointer);
+    } else {
+        zero_inline_bytes(builder, source, ty.storage_size(nullable), pointer);
+    }
+    Ok(destination)
+}
+
+fn retain_payload_enum_at(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    ty: mir::PayloadEnumType,
+    nullable: bool,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    if nullable {
+        let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+        let present = builder.ins().load(types::I8, flags, address, 0);
+        let zero = builder.ins().iconst(types::I8, 0);
+        let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+        let some = builder.create_block();
+        let done = builder.create_block();
+        builder.ins().brif(is_present, some, &[], done, &[]);
+        builder.switch_to_block(some);
+        let payload = builder
+            .ins()
+            .iadd_imm_u(address, i64::from(ty.nullable_payload_offset));
+        retain_payload_enum_at(builder, payload, ty, false, resources)?;
+        builder.ins().jump(done, &[]);
+        builder.switch_to_block(done);
+        return Ok(());
+    }
+    if !ty.capabilities.needs_drop {
+        return Ok(());
+    }
+    let definition = enum_definition(resources.program, ty.id)?.clone();
+    lower_payload_case_dispatch(
+        builder,
+        address,
+        &definition,
+        resources,
+        |builder, field, field_address, resources| match field.ty {
+            mir::Type::String => {
+                let pointer = resources.module.target_config().pointer_type();
+                let value = builder.ins().load(
+                    pointer,
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    field_address,
+                    0,
+                );
+                let retained = retain_string(builder, value, resources)?;
+                builder.ins().store(
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    retained,
+                    field_address,
+                    0,
+                );
+                Ok(())
+            }
+            mir::Type::PayloadEnum(nested) => {
+                retain_payload_enum_at(builder, field_address, nested, false, resources)
+            }
+            mir::Type::NullablePayloadEnum(nested) => {
+                retain_payload_enum_at(builder, field_address, nested, true, resources)
+            }
+            _ => Ok(()),
+        },
+    )
+}
+
+fn lower_drop_payload_enum_at(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    ty: mir::PayloadEnumType,
+    nullable: bool,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    if nullable {
+        let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+        let present = builder.ins().load(types::I8, flags, address, 0);
+        let zero = builder.ins().iconst(types::I8, 0);
+        let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+        let some = builder.create_block();
+        let done = builder.create_block();
+        builder.ins().brif(is_present, some, &[], done, &[]);
+        builder.switch_to_block(some);
+        let payload = builder
+            .ins()
+            .iadd_imm_u(address, i64::from(ty.nullable_payload_offset));
+        lower_drop_payload_enum_at(builder, payload, ty, false, resources)?;
+        builder.ins().jump(done, &[]);
+        builder.switch_to_block(done);
+        return Ok(());
+    }
+    if !ty.capabilities.needs_drop {
+        return Ok(());
+    }
+    let definition = enum_definition(resources.program, ty.id)?.clone();
+    lower_payload_case_dispatch_reverse(
+        builder,
+        address,
+        &definition,
+        resources,
+        |builder, field, field_address, resources| {
+            lower_drop_value_at_address(builder, field.ty, field_address, resources)
+        },
+    )
+}
+
+fn lower_payload_case_dispatch(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    definition: &mir::EnumDefinition,
+    resources: &mut LoweringResources<'_, '_>,
+    mut field_action: impl FnMut(
+        &mut FunctionBuilder,
+        &mir::EnumPayloadDefinition,
+        Value,
+        &mut LoweringResources<'_, '_>,
+    ) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    lower_payload_case_dispatch_ordered(
+        builder,
+        address,
+        definition,
+        resources,
+        false,
+        &mut field_action,
+    )
+}
+
+fn lower_payload_case_dispatch_reverse(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    definition: &mir::EnumDefinition,
+    resources: &mut LoweringResources<'_, '_>,
+    mut field_action: impl FnMut(
+        &mut FunctionBuilder,
+        &mir::EnumPayloadDefinition,
+        Value,
+        &mut LoweringResources<'_, '_>,
+    ) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    lower_payload_case_dispatch_ordered(
+        builder,
+        address,
+        definition,
+        resources,
+        true,
+        &mut field_action,
+    )
+}
+
+fn lower_payload_case_dispatch_ordered(
+    builder: &mut FunctionBuilder,
+    address: Value,
+    definition: &mir::EnumDefinition,
+    resources: &mut LoweringResources<'_, '_>,
+    reverse_fields: bool,
+    field_action: &mut impl FnMut(
+        &mut FunctionBuilder,
+        &mir::EnumPayloadDefinition,
+        Value,
+        &mut LoweringResources<'_, '_>,
+    ) -> Result<(), BackendError>,
+) -> Result<(), BackendError> {
+    let tag_type = match definition.layout.tag_width {
+        1 => types::I8,
+        2 => types::I16,
+        4 => types::I32,
+        _ => return Err(malformed_mir("payload enum tag has unsupported width")),
+    };
+    let tag = builder.ins().load(
+        tag_type,
+        cranelift_codegen::ir::MachMemFlags::trusted(),
+        address,
+        definition.layout.tag_offset as i32,
+    );
+    let done = builder.create_block();
+    for (case, layout) in definition.cases.iter().zip(&definition.layout.cases) {
+        let case_block = builder.create_block();
+        let next = builder.create_block();
+        let expected = builder.ins().iconst(tag_type, i64::from(case.tag));
+        let matches = builder.ins().icmp(IntCC::Equal, tag, expected);
+        builder.ins().brif(matches, case_block, &[], next, &[]);
+        builder.switch_to_block(case_block);
+        if reverse_fields {
+            for (field, layout) in case.payload.iter().zip(&layout.fields).rev() {
+                let field_address = builder.ins().iadd_imm_u(address, i64::from(layout.offset));
+                field_action(builder, field, field_address, resources)?;
+            }
+        } else {
+            for (field, layout) in case.payload.iter().zip(&layout.fields) {
+                let field_address = builder.ins().iadd_imm_u(address, i64::from(layout.offset));
+                field_action(builder, field, field_address, resources)?;
+            }
+        }
+        builder.ins().jump(done, &[]);
+        builder.switch_to_block(next);
+    }
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
+    builder.switch_to_block(done);
+    Ok(())
+}
+
+fn lower_payload_enum_equal_value(
+    builder: &mut FunctionBuilder,
+    left: Value,
+    right: Value,
+    ty: mir::PayloadEnumType,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let equal = builder.create_block();
+    let not_equal = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I8);
+    lower_payload_enum_equal_to_branch(builder, left, right, ty, equal, not_equal, resources)?;
+    builder.switch_to_block(equal);
+    let yes = builder.ins().iconst(types::I8, 1);
+    builder.ins().jump(done, &[BlockArg::Value(yes)]);
+    builder.switch_to_block(not_equal);
+    let no = builder.ins().iconst(types::I8, 0);
+    builder.ins().jump(done, &[BlockArg::Value(no)]);
+    builder.switch_to_block(done);
+    Ok(builder.block_params(done)[0])
+}
+
+fn lower_nullable_payload_enum_equal_value(
+    builder: &mut FunctionBuilder,
+    left: Value,
+    right: Value,
+    ty: mir::PayloadEnumType,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let left_present = builder.ins().load(types::I8, flags, left, 0);
+    let right_present = builder.ins().load(types::I8, flags, right, 0);
+    let equal = builder.create_block();
+    let not_equal = builder.create_block();
+    let both_present = builder.create_block();
+    let same_presence = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I8);
+
+    let presence_equal = builder
+        .ins()
+        .icmp(IntCC::Equal, left_present, right_present);
+    builder
+        .ins()
+        .brif(presence_equal, same_presence, &[], not_equal, &[]);
+    builder.switch_to_block(same_presence);
+    let zero = builder.ins().iconst(types::I8, 0);
+    let present = builder.ins().icmp(IntCC::NotEqual, left_present, zero);
+    builder.ins().brif(present, both_present, &[], equal, &[]);
+    builder.switch_to_block(both_present);
+    let left_payload = builder
+        .ins()
+        .iadd_imm_u(left, i64::from(ty.nullable_payload_offset));
+    let right_payload = builder
+        .ins()
+        .iadd_imm_u(right, i64::from(ty.nullable_payload_offset));
+    lower_payload_enum_equal_to_branch(
+        builder,
+        left_payload,
+        right_payload,
+        ty,
+        equal,
+        not_equal,
+        resources,
+    )?;
+
+    builder.switch_to_block(equal);
+    let yes = builder.ins().iconst(types::I8, 1);
+    builder.ins().jump(done, &[BlockArg::Value(yes)]);
+    builder.switch_to_block(not_equal);
+    let no = builder.ins().iconst(types::I8, 0);
+    builder.ins().jump(done, &[BlockArg::Value(no)]);
+    builder.switch_to_block(done);
+    Ok(builder.block_params(done)[0])
+}
+
+fn lower_payload_enum_equal_to_branch(
+    builder: &mut FunctionBuilder,
+    left: Value,
+    right: Value,
+    ty: mir::PayloadEnumType,
+    equal: Block,
+    not_equal: Block,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let definition = enum_definition(resources.program, ty.id)?.clone();
+    let tag_type = match definition.layout.tag_width {
+        1 => types::I8,
+        2 => types::I16,
+        4 => types::I32,
+        _ => return Err(malformed_mir("payload enum tag has unsupported width")),
+    };
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let left_tag = builder
+        .ins()
+        .load(tag_type, flags, left, definition.layout.tag_offset as i32);
+    let right_tag = builder
+        .ins()
+        .load(tag_type, flags, right, definition.layout.tag_offset as i32);
+    let dispatch = builder.create_block();
+    let tags_equal = builder.ins().icmp(IntCC::Equal, left_tag, right_tag);
+    builder
+        .ins()
+        .brif(tags_equal, dispatch, &[], not_equal, &[]);
+    builder.switch_to_block(dispatch);
+
+    for (case, layout) in definition.cases.iter().zip(&definition.layout.cases) {
+        let case_block = builder.create_block();
+        let next_case = builder.create_block();
+        let expected = builder.ins().iconst(tag_type, i64::from(case.tag));
+        let matches = builder.ins().icmp(IntCC::Equal, left_tag, expected);
+        builder.ins().brif(matches, case_block, &[], next_case, &[]);
+        builder.switch_to_block(case_block);
+        if case.payload.is_empty() {
+            builder.ins().jump(equal, &[]);
+        } else {
+            for (index, (field, field_layout)) in
+                case.payload.iter().zip(&layout.fields).enumerate()
+            {
+                let left_field = builder
+                    .ins()
+                    .iadd_imm_u(left, i64::from(field_layout.offset));
+                let right_field = builder
+                    .ins()
+                    .iadd_imm_u(right, i64::from(field_layout.offset));
+                let field_equal = lower_value_at_address_equal(
+                    builder,
+                    left_field,
+                    right_field,
+                    field.ty,
+                    resources,
+                )?;
+                if index + 1 == case.payload.len() {
+                    builder.ins().brif(field_equal, equal, &[], not_equal, &[]);
+                } else {
+                    let next_field = builder.create_block();
+                    builder
+                        .ins()
+                        .brif(field_equal, next_field, &[], not_equal, &[]);
+                    builder.switch_to_block(next_field);
+                }
+            }
+        }
+        builder.switch_to_block(next_case);
+    }
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
+    Ok(())
+}
+
+fn lower_value_at_address_equal(
+    builder: &mut FunctionBuilder,
+    left: Value,
+    right: Value,
+    ty: mir::Type,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    match ty {
+        mir::Type::Scalar(scalar) => {
+            let left = builder.ins().load(clif_scalar_type(scalar), flags, left, 0);
+            let right = builder
+                .ins()
+                .load(clif_scalar_type(scalar), flags, right, 0);
+            Ok(match scalar {
+                mir::ScalarType::Float(_) => builder.ins().fcmp(FloatCC::Equal, left, right),
+                _ => builder.ins().icmp(IntCC::Equal, left, right),
+            })
+        }
+        mir::Type::NullableScalar(scalar) => {
+            let left = load_lowered_from_address(builder, ty, left, pointer);
+            let right = load_lowered_from_address(builder, ty, right, pointer);
+            let (left_present, left_value) = left.nullable()?;
+            let (right_present, right_value) = right.nullable()?;
+            let presence_equal = builder
+                .ins()
+                .icmp(IntCC::Equal, left_present, right_present);
+            let payload_equal = match scalar {
+                mir::ScalarType::Float(_) => {
+                    builder.ins().fcmp(FloatCC::Equal, left_value, right_value)
+                }
+                _ => builder.ins().icmp(IntCC::Equal, left_value, right_value),
+            };
+            let zero = builder.ins().iconst(pointer, 0);
+            let absent = builder.ins().icmp(IntCC::Equal, left_present, zero);
+            let absent_or_payload_equal = builder.ins().bor(absent, payload_equal);
+            Ok(builder.ins().band(presence_equal, absent_or_payload_equal))
+        }
+        mir::Type::String => {
+            let left = builder.ins().load(pointer, flags, left, 0);
+            let right = builder.ins().load(pointer, flags, right, 0);
+            let compared = runtime_call(
+                builder,
+                STRING_COMPARE,
+                &[pointer, pointer],
+                Some(types::I32),
+                &[left, right],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("string comparison produced no result"))?;
+            let zero = builder.ins().iconst(types::I32, 0);
+            Ok(builder.ins().icmp(IntCC::Equal, compared, zero))
+        }
+        mir::Type::NullableString => {
+            let left = load_lowered_from_address(builder, ty, left, pointer)
+                .nullable()?
+                .1;
+            let right = load_lowered_from_address(builder, ty, right, pointer)
+                .nullable()?
+                .1;
+            runtime_call(
+                builder,
+                NULLABLE_STRING_EQUAL,
+                &[pointer, pointer],
+                Some(types::I8),
+                &[left, right],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("nullable-string comparison produced no result"))
+        }
+        mir::Type::Class(_) | mir::Type::NullableClass(_) => {
+            let left = builder.ins().load(pointer, flags, left, 0);
+            let right = builder.ins().load(pointer, flags, right, 0);
+            Ok(builder.ins().icmp(IntCC::Equal, left, right))
+        }
+        mir::Type::Collection(collection) => {
+            if collection_definition(resources.program, collection)?.kind
+                != mir::CollectionKind::Bytes
+            {
+                return Err(malformed_mir(
+                    "payload enum field uses collection equality without Bytes semantics",
+                ));
+            }
+            let left = builder.ins().load(pointer, flags, left, 0);
+            let right = builder.ins().load(pointer, flags, right, 0);
+            runtime_call(
+                builder,
+                BYTES_EQUAL,
+                &[pointer, pointer],
+                Some(types::I8),
+                &[left, right],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("Bytes equality produced no result"))
+        }
+        mir::Type::NullableCollection(collection) => {
+            if collection_definition(resources.program, collection)?.kind
+                != mir::CollectionKind::Bytes
+            {
+                return Err(malformed_mir(
+                    "nullable payload enum field uses collection equality without Bytes semantics",
+                ));
+            }
+            let left = builder.ins().load(pointer, flags, left, 0);
+            let right = builder.ins().load(pointer, flags, right, 0);
+            lower_nullable_bytes_equal_value(builder, left, right, resources)
+        }
+        mir::Type::PayloadEnum(payload) => {
+            lower_payload_enum_equal_value(builder, left, right, payload, resources)
+        }
+        mir::Type::NullablePayloadEnum(payload) => {
+            lower_nullable_payload_enum_equal_value(builder, left, right, payload, resources)
+        }
+        _ => Err(malformed_mir(format!(
+            "payload enum field type {ty} has no equality lowering"
+        ))),
+    }
+}
+
+fn lower_nullable_bytes_equal_value(
+    builder: &mut FunctionBuilder,
+    left: Value,
+    right: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let both_non_null = builder.create_block();
+    let compare_identity = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(done, types::I8);
+    let zero = builder.ins().iconst(pointer, 0);
+    let left_present = builder.ins().icmp(IntCC::NotEqual, left, zero);
+    let right_present = builder.ins().icmp(IntCC::NotEqual, right, zero);
+    let both_present = builder.ins().band(left_present, right_present);
+    builder
+        .ins()
+        .brif(both_present, both_non_null, &[], compare_identity, &[]);
+    builder.switch_to_block(both_non_null);
+    let equal = runtime_call(
+        builder,
+        BYTES_EQUAL,
+        &[pointer, pointer],
+        Some(types::I8),
+        &[left, right],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("Bytes equality produced no result"))?;
+    builder.ins().jump(done, &[BlockArg::Value(equal)]);
+    builder.switch_to_block(compare_identity);
+    let equal = builder.ins().icmp(IntCC::Equal, left, right);
+    builder.ins().jump(done, &[BlockArg::Value(equal)]);
+    builder.switch_to_block(done);
+    Ok(builder.block_params(done)[0])
+}
+
+fn payload_enum_expression_is_owned(value: &mir::PayloadEnumExpression) -> bool {
+    match value {
+        mir::PayloadEnumExpression::Construct { .. } | mir::PayloadEnumExpression::Call { .. } => {
+            true
+        }
+        mir::PayloadEnumExpression::Use { mode, .. }
+        | mir::PayloadEnumExpression::Coalesce { mode, .. } => {
+            !matches!(mode, mir::PayloadEnumUseMode::Borrow)
+        }
+    }
+}
+
+fn nullable_payload_enum_expression_is_owned(value: &mir::NullablePayloadEnumExpression) -> bool {
+    match value {
+        mir::NullablePayloadEnumExpression::Null(_) => false,
+        mir::NullablePayloadEnumExpression::Value(value) => payload_enum_expression_is_owned(value),
+        mir::NullablePayloadEnumExpression::Call { .. } => true,
+        mir::NullablePayloadEnumExpression::Use { mode, .. }
+        | mir::NullablePayloadEnumExpression::CollectionGet { mode, .. }
+        | mir::NullablePayloadEnumExpression::Coalesce { mode, .. } => {
+            !matches!(mode, mir::PayloadEnumUseMode::Borrow)
+        }
+    }
+}
+
+fn lower_drop_value_at_address(
+    builder: &mut FunctionBuilder,
+    ty: mir::Type,
+    address: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    match ty {
+        mir::Type::String | mir::Type::NullableString => {
+            let value = if ty == mir::Type::NullableString {
+                load_lowered_from_address(builder, ty, address, pointer)
+                    .nullable()?
+                    .1
+            } else {
+                builder.ins().load(pointer, flags, address, 0)
+            };
+            release_string(builder, value, resources)
+        }
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+            let value = builder.ins().load(pointer, flags, address, 0);
+            lower_drop_class_value_checked(builder, value, class, resources)
+        }
+        mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
+            let value = builder.ins().load(pointer, flags, address, 0);
+            lower_drop_collection_value(builder, value, collection, resources)
+        }
+        mir::Type::Mixed | mir::Type::NullableMixed => {
+            let value = builder.ins().load(pointer, flags, address, 0);
+            lower_drop_mixed_value(builder, value, resources)
+        }
+        mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_) => {
+            let value = builder.ins().load(pointer, flags, address, 0);
+            lower_drop_shared_value(builder, value, false, resources)
+        }
+        mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_) => {
+            let value = builder.ins().load(pointer, flags, address, 0);
+            lower_drop_shared_value(builder, value, true, resources)
+        }
+        mir::Type::PayloadEnum(payload) => {
+            lower_drop_payload_enum_at(builder, address, payload, false, resources)
+        }
+        mir::Type::NullablePayloadEnum(payload) => {
+            lower_drop_payload_enum_at(builder, address, payload, true, resources)
+        }
+        mir::Type::WritableSharedReference(_)
+        | mir::Type::NullableWritableSharedReference(_)
+        | mir::Type::WritableWeakReference(_)
+        | mir::Type::NullableWritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_)
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+            let value = builder.ins().load(pointer, flags, address, 0);
+            let symbol = match ty {
+                mir::Type::WritableSharedReference(_)
+                | mir::Type::NullableWritableSharedReference(_) => WRITABLE_SHARED_RELEASE,
+                mir::Type::WritableWeakReference(_)
+                | mir::Type::NullableWritableWeakReference(_) => WRITABLE_SHARED_RELEASE_WEAK,
+                mir::Type::ReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_) => {
+                    WRITABLE_SHARED_RELEASE_READONLY_ACCESS
+                }
+                _ => WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS,
+            };
+            lower_drop_writable_shared_value(builder, value, symbol, resources)
+        }
+        mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
     }
 }
 
@@ -2363,11 +3873,15 @@ fn collection_compare_kind(ty: mir::Type) -> Result<i64, BackendError> {
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_) => Ok(i64::from(COLLECTION_COMPARE_WORD)),
+        mir::Type::PayloadEnum(_) => Err(malformed_mir(
+            "payload enum equality requires the aggregate collection path",
+        )),
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
-        | mir::Type::NullableCollection(_) => Err(malformed_mir(
+        | mir::Type::NullableCollection(_)
+        | mir::Type::NullablePayloadEnum(_) => Err(malformed_mir(
             "nullable collection elements are not supported by Stage 23 Slice 3",
         )),
     }
@@ -2425,9 +3939,11 @@ fn value_to_collection_word(
         | mir::Type::NullableString
         | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
-        | mir::Type::NullableCollection(_) => {
+        | mir::Type::NullableCollection(_)
+        | mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_) => {
             return Err(malformed_mir(
-                "nullable collection elements are not supported by Stage 23 Slice 3",
+                "aggregate values cannot use scalar collection word transport",
             ))
         }
     })
@@ -2483,12 +3999,248 @@ fn collection_word_to_value(
         | mir::Type::NullableString
         | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
-        | mir::Type::NullableCollection(_) => {
+        | mir::Type::NullableCollection(_)
+        | mir::Type::PayloadEnum(_)
+        | mir::Type::NullablePayloadEnum(_) => {
             return Err(malformed_mir(
-                "nullable collection elements are not supported by Stage 23 Slice 3",
+                "aggregate values cannot use scalar collection word transport",
             ))
         }
     })
+}
+
+const fn payload_enum_storage(ty: mir::Type) -> Option<(mir::PayloadEnumType, bool)> {
+    match ty {
+        mir::Type::PayloadEnum(ty) => Some((ty, false)),
+        mir::Type::NullablePayloadEnum(ty) => Some((ty, true)),
+        _ => None,
+    }
+}
+
+fn payload_enum_rvalue_is_owned(value: &mir::Rvalue) -> bool {
+    match value {
+        mir::Rvalue::PayloadEnum(value) => payload_enum_expression_is_owned(value),
+        mir::Rvalue::NullablePayloadEnum(value) => nullable_payload_enum_expression_is_owned(value),
+        _ => false,
+    }
+}
+
+fn lower_payload_enum_collection_search(
+    builder: &mut FunctionBuilder,
+    collection: Value,
+    needle: Value,
+    ty: mir::PayloadEnumType,
+    nullable: bool,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(Value, Value), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let length = runtime_call(
+        builder,
+        COLLECTION_LENGTH,
+        &[pointer],
+        Some(pointer),
+        &[collection],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("aggregate collection length produced no result"))?;
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let found = builder.create_block();
+    let missing = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(header, pointer);
+    builder.append_block_param(found, pointer);
+    builder.append_block_param(done, types::I8);
+    builder.append_block_param(done, pointer);
+
+    let zero = builder.ins().iconst(pointer, 0);
+    builder.ins().jump(header, &[BlockArg::Value(zero)]);
+    builder.switch_to_block(header);
+    let index = builder.block_params(header)[0];
+    let in_bounds = builder.ins().icmp(IntCC::UnsignedLessThan, index, length);
+    builder.ins().brif(in_bounds, body, &[], missing, &[]);
+
+    builder.switch_to_block(body);
+    let index_word = if pointer == types::I64 {
+        index
+    } else {
+        builder.ins().uextend(types::I64, index)
+    };
+    let positional = builder.ins().iconst(types::I8, 1);
+    let key_kind = builder
+        .ins()
+        .iconst(types::I8, i64::from(COLLECTION_COMPARE_WORD));
+    let candidate = runtime_call(
+        builder,
+        COLLECTION_AGGREGATE_VALUE_AT,
+        &[pointer, pointer, types::I64, types::I8, types::I8],
+        Some(pointer),
+        &[
+            resources.current_frame,
+            collection,
+            index_word,
+            positional,
+            key_kind,
+        ],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("aggregate collection search produced no slot"))?;
+    let equal = if nullable {
+        lower_nullable_payload_enum_equal_value(builder, candidate, needle, ty, resources)?
+    } else {
+        lower_payload_enum_equal_value(builder, candidate, needle, ty, resources)?
+    };
+    let next = builder.create_block();
+    builder
+        .ins()
+        .brif(equal, found, &[BlockArg::Value(index)], next, &[]);
+    builder.switch_to_block(next);
+    let one = builder.ins().iconst(pointer, 1);
+    let next_index = builder.ins().iadd(index, one);
+    builder.ins().jump(header, &[BlockArg::Value(next_index)]);
+
+    builder.switch_to_block(found);
+    let found_index = builder.block_params(found)[0];
+    let yes = builder.ins().iconst(types::I8, 1);
+    builder
+        .ins()
+        .jump(done, &[BlockArg::Value(yes), BlockArg::Value(found_index)]);
+    builder.switch_to_block(missing);
+    let no = builder.ins().iconst(types::I8, 0);
+    builder
+        .ins()
+        .jump(done, &[BlockArg::Value(no), BlockArg::Value(zero)]);
+    builder.switch_to_block(done);
+    Ok((builder.block_params(done)[0], builder.block_params(done)[1]))
+}
+
+fn lower_payload_enum_collection_literal(
+    builder: &mut FunctionBuilder,
+    definition: &mir::CollectionType,
+    entries: &[mir::CollectionEntry],
+    ty: mir::PayloadEnumType,
+    nullable: bool,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let fixed = definition.kind == mir::CollectionKind::TypedArray;
+    let length = builder.ins().iconst(pointer, entries.len() as i64);
+    let keyed = builder
+        .ins()
+        .iconst(types::I8, i64::from(definition.key.is_some()));
+    let fixed_value = builder.ins().iconst(types::I8, i64::from(fixed));
+    let value_size = builder
+        .ins()
+        .iconst(pointer, i64::from(ty.storage_size(nullable)));
+    let value_alignment = builder.ins().iconst(pointer, i64::from(ty.align));
+    let kind = builder.ins().iconst(
+        types::I8,
+        i64::from(stage26_collection_kind(definition.kind).unwrap_or(0)),
+    );
+    let comparator = builder.ins().iconst(
+        types::I8,
+        i64::from(
+            definition
+                .comparator
+                .map(collection_comparator_code)
+                .unwrap_or(COLLECTION_COMPARE_WORD),
+        ),
+    );
+    let result = runtime_call(
+        builder,
+        COLLECTION_AGGREGATE_NEW,
+        &[
+            pointer,
+            pointer,
+            types::I8,
+            types::I8,
+            pointer,
+            pointer,
+            types::I8,
+            types::I8,
+        ],
+        Some(pointer),
+        &[
+            resources.current_frame,
+            length,
+            keyed,
+            fixed_value,
+            value_size,
+            value_alignment,
+            kind,
+            comparator,
+        ],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("aggregate collection allocation produced no result"))?;
+    for (index, entry) in entries.iter().enumerate() {
+        let source = lower_rvalue(builder, &entry.value, resources)?.single()?;
+        let destination = if let (Some(key_ty), Some(key)) = (definition.key, &entry.key) {
+            let key = lower_rvalue(builder, key, resources)?.single()?;
+            let key = value_to_collection_word(builder, key, key_ty, pointer)?;
+            let key_kind = builder
+                .ins()
+                .iconst(types::I8, collection_compare_kind(key_ty)?);
+            let replaced_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let replaced = builder.ins().stack_addr(pointer, replaced_slot, 0);
+            runtime_call(
+                builder,
+                COLLECTION_AGGREGATE_KEYED_SET_SLOT,
+                &[pointer, types::I64, types::I8, pointer],
+                Some(pointer),
+                &[result, key, key_kind, replaced],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("aggregate dictionary insertion produced no slot"))?
+        } else if fixed {
+            let index = builder.ins().iconst(types::I64, index as i64);
+            let positional = builder.ins().iconst(types::I8, 1);
+            let key_kind = builder
+                .ins()
+                .iconst(types::I8, i64::from(COLLECTION_COMPARE_WORD));
+            runtime_call(
+                builder,
+                COLLECTION_AGGREGATE_VALUE_AT,
+                &[pointer, pointer, types::I64, types::I8, types::I8],
+                Some(pointer),
+                &[resources.current_frame, result, index, positional, key_kind],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("aggregate array initialization produced no slot"))?
+        } else {
+            runtime_call(
+                builder,
+                COLLECTION_AGGREGATE_PUSH_SLOT,
+                &[pointer],
+                Some(pointer),
+                &[result],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("aggregate collection insertion produced no slot"))?
+        };
+        copy_inline_bytes(
+            builder,
+            destination,
+            source,
+            ty.storage_size(nullable),
+            pointer,
+        );
+    }
+    if stage26_collection_kind(definition.kind).is_some() {
+        let _ = runtime_call(
+            builder,
+            COLLECTION_STAGE26_FINALIZE,
+            &[pointer],
+            None,
+            &[result],
+            resources,
+        )?;
+    }
+    Ok(result)
 }
 
 fn lower_collection_expression(
@@ -2517,6 +4269,16 @@ fn lower_collection_expression(
             entries,
         } => {
             let definition = collection_definition(resources.program, *collection)?.clone();
+            if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
+                return lower_payload_enum_collection_literal(
+                    builder,
+                    &definition,
+                    entries,
+                    ty,
+                    nullable,
+                    resources,
+                );
+            }
             let fixed = definition.kind == mir::CollectionKind::TypedArray;
             let length = builder.ins().iconst(pointer, entries.len() as i64);
             let keyed = builder
@@ -3175,17 +4937,10 @@ fn lower_dictionary_get(
     }
     let access_value = builder.ins().iconst(
         types::I8,
-        match access {
-            mir::NullableCollectionAccess::Get => 0,
-            mir::NullableCollectionAccess::Index => unreachable!("index handled above"),
-            mir::NullableCollectionAccess::Remove => 1,
-            mir::NullableCollectionAccess::First => 2,
-            mir::NullableCollectionAccess::Last => 3,
-            mir::NullableCollectionAccess::Pop => 4,
-            mir::NullableCollectionAccess::PopFront => 5,
-            mir::NullableCollectionAccess::PopBack => 6,
-            mir::NullableCollectionAccess::At => 7,
-        },
+        i64::from(
+            nullable_collection_access_code(access)
+                .ok_or_else(|| malformed_mir("nullable index must use the direct index path"))?,
+        ),
     );
     let word = runtime_call(
         builder,
@@ -3247,6 +5002,57 @@ fn lower_collection_add(
     } else {
         None
     };
+    if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
+        if op == mir::CollectionMutationOp::Remove {
+            return Err(malformed_mir(
+                "payload enum remove-by-value requires generated enum equality",
+            ));
+        }
+        let source = lower_rvalue(builder, value, resources)?.single()?;
+        let destination = if op == mir::CollectionMutationOp::InsertAt {
+            runtime_call(
+                builder,
+                COLLECTION_AGGREGATE_INSERT_SLOT,
+                &[pointer, pointer, pointer],
+                Some(pointer),
+                &[
+                    resources.current_frame,
+                    collection_value,
+                    index.expect("insertAt index was lowered"),
+                ],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("aggregate insertion produced no slot"))?
+        } else if op == mir::CollectionMutationOp::PushFront {
+            runtime_call(
+                builder,
+                COLLECTION_AGGREGATE_PUSH_FRONT_SLOT,
+                &[pointer],
+                Some(pointer),
+                &[collection_value],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("aggregate front insertion produced no slot"))?
+        } else {
+            runtime_call(
+                builder,
+                COLLECTION_AGGREGATE_PUSH_SLOT,
+                &[pointer],
+                Some(pointer),
+                &[collection_value],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("aggregate insertion produced no slot"))?
+        };
+        copy_inline_bytes(
+            builder,
+            destination,
+            source,
+            ty.storage_size(nullable),
+            pointer,
+        );
+        return Ok(());
+    }
     if nullable_payload_type(definition.value).is_some()
         && matches!(
             op,
@@ -3468,6 +5274,82 @@ fn lower_collection_set(
     let definition = collection_definition(resources.program, collection_type)?.clone();
     let collection_value = lower_collection_pointer(builder, collection, resources)?;
     let index = lower_rvalue(builder, index, resources)?.single()?;
+    if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
+        let replacement = lower_rvalue(builder, value, resources)?.single()?;
+        let (destination, replaced) = if let Some(key_type) = definition.key.filter(|_| !positional)
+        {
+            let key_word = value_to_collection_word(builder, index, key_type, pointer)?;
+            let key_kind = builder
+                .ins()
+                .iconst(types::I8, collection_compare_kind(key_type)?);
+            let replaced_slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                1,
+                0,
+            ));
+            let replaced_pointer = builder.ins().stack_addr(pointer, replaced_slot, 0);
+            let destination = runtime_call(
+                builder,
+                COLLECTION_AGGREGATE_KEYED_SET_SLOT,
+                &[pointer, types::I64, types::I8, pointer],
+                Some(pointer),
+                &[collection_value, key_word, key_kind, replaced_pointer],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("aggregate dictionary write produced no slot"))?;
+            let replaced = builder
+                .ins()
+                .stack_load(pointer, types::I8, replaced_slot, 0);
+            (destination, Some(replaced))
+        } else {
+            let positional = builder.ins().iconst(types::I8, 1);
+            let key_kind = builder
+                .ins()
+                .iconst(types::I8, i64::from(COLLECTION_COMPARE_WORD));
+            let index_word = if builder.func.dfg.value_type(index) == types::I64 {
+                index
+            } else {
+                builder.ins().uextend(types::I64, index)
+            };
+            let destination = runtime_call(
+                builder,
+                COLLECTION_AGGREGATE_VALUE_AT,
+                &[pointer, pointer, types::I64, types::I8, types::I8],
+                Some(pointer),
+                &[
+                    resources.current_frame,
+                    collection_value,
+                    index_word,
+                    positional,
+                    key_kind,
+                ],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("aggregate collection write produced no slot"))?;
+            (destination, None)
+        };
+        if let Some(replaced) = replaced {
+            let zero = builder.ins().iconst(types::I8, 0);
+            let has_old = builder.ins().icmp(IntCC::NotEqual, replaced, zero);
+            let drop_block = builder.create_block();
+            let done = builder.create_block();
+            builder.ins().brif(has_old, drop_block, &[], done, &[]);
+            builder.switch_to_block(drop_block);
+            lower_drop_payload_enum_at(builder, destination, ty, nullable, resources)?;
+            builder.ins().jump(done, &[]);
+            builder.switch_to_block(done);
+        } else {
+            lower_drop_payload_enum_at(builder, destination, ty, nullable, resources)?;
+        }
+        copy_inline_bytes(
+            builder,
+            destination,
+            replacement,
+            ty.storage_size(nullable),
+            pointer,
+        );
+        return Ok(());
+    }
     if let Some(payload_ty) = nullable_payload_type(definition.value) {
         let (present, value, actual_payload_ty) =
             lower_nullable_collection_parts(builder, value, definition.value, resources)?;
@@ -3703,6 +5585,16 @@ fn lower_set_from(
         )?
         .ok_or_else(|| backend_failure("set algebra produced no result"));
     }
+    if let Some((ty, nullable)) = payload_enum_storage(target_definition.value) {
+        return lower_payload_enum_collection_from(
+            builder,
+            &target_definition,
+            source_value,
+            ty,
+            nullable,
+            resources,
+        );
+    }
     if let Some(kind) = stage26_collection_kind(target_definition.kind) {
         if transfer {
             return Err(malformed_mir(
@@ -3863,6 +5755,169 @@ fn lower_set_from(
     Ok(target_value)
 }
 
+fn lower_payload_enum_collection_from(
+    builder: &mut FunctionBuilder,
+    target: &mir::CollectionType,
+    source: Value,
+    ty: mir::PayloadEnumType,
+    nullable: bool,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let kind = stage26_collection_kind(target.kind)
+        .ok_or_else(|| malformed_mir("aggregate collection conversion targets a legacy kind"))?;
+    let length = runtime_call(
+        builder,
+        COLLECTION_LENGTH,
+        &[pointer],
+        Some(pointer),
+        &[source],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("aggregate collection length produced no result"))?;
+    let keyed = builder
+        .ins()
+        .iconst(types::I8, i64::from(target.key.is_some()));
+    let fixed = builder.ins().iconst(types::I8, 0);
+    let value_size = builder
+        .ins()
+        .iconst(pointer, i64::from(ty.storage_size(nullable)));
+    let value_alignment = builder.ins().iconst(pointer, i64::from(ty.align));
+    let kind_value = builder.ins().iconst(types::I8, i64::from(kind));
+    let comparator = builder.ins().iconst(
+        types::I8,
+        i64::from(
+            target
+                .comparator
+                .map(collection_comparator_code)
+                .unwrap_or(COLLECTION_COMPARE_WORD),
+        ),
+    );
+    let result = runtime_call(
+        builder,
+        COLLECTION_AGGREGATE_NEW,
+        &[
+            pointer,
+            pointer,
+            types::I8,
+            types::I8,
+            pointer,
+            pointer,
+            types::I8,
+            types::I8,
+        ],
+        Some(pointer),
+        &[
+            resources.current_frame,
+            length,
+            keyed,
+            fixed,
+            value_size,
+            value_alignment,
+            kind_value,
+            comparator,
+        ],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("aggregate collection allocation produced no result"))?;
+
+    let header = builder.create_block();
+    let body = builder.create_block();
+    let done = builder.create_block();
+    builder.append_block_param(header, pointer);
+    let zero = builder.ins().iconst(pointer, 0);
+    builder.ins().jump(header, &[BlockArg::Value(zero)]);
+    builder.switch_to_block(header);
+    let index = builder.block_params(header)[0];
+    let more = builder.ins().icmp(IntCC::UnsignedLessThan, index, length);
+    builder.ins().brif(more, body, &[], done, &[]);
+    builder.switch_to_block(body);
+    let index_word = if pointer == types::I64 {
+        index
+    } else {
+        builder.ins().uextend(types::I64, index)
+    };
+    let positional = builder.ins().iconst(types::I8, 1);
+    let word_kind = builder
+        .ins()
+        .iconst(types::I8, i64::from(COLLECTION_COMPARE_WORD));
+    let source_slot = runtime_call(
+        builder,
+        COLLECTION_AGGREGATE_VALUE_AT,
+        &[pointer, pointer, types::I64, types::I8, types::I8],
+        Some(pointer),
+        &[
+            resources.current_frame,
+            source,
+            index_word,
+            positional,
+            word_kind,
+        ],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("aggregate collection read produced no slot"))?;
+    let destination = if let Some(key_ty) = target.key {
+        let mut key = runtime_call(
+            builder,
+            COLLECTION_KEY_AT,
+            &[pointer, pointer, pointer],
+            Some(types::I64),
+            &[resources.current_frame, source, index],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("aggregate collection key read produced no result"))?;
+        if key_ty == mir::Type::String {
+            key = retain_string(builder, key, resources)?;
+        }
+        let key_kind = builder
+            .ins()
+            .iconst(types::I8, collection_compare_kind(key_ty)?);
+        let replaced_slot =
+            builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 1, 0));
+        let replaced = builder.ins().stack_addr(pointer, replaced_slot, 0);
+        runtime_call(
+            builder,
+            COLLECTION_AGGREGATE_KEYED_SET_SLOT,
+            &[pointer, types::I64, types::I8, pointer],
+            Some(pointer),
+            &[result, key, key_kind, replaced],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("aggregate dictionary insertion produced no slot"))?
+    } else {
+        runtime_call(
+            builder,
+            COLLECTION_AGGREGATE_PUSH_SLOT,
+            &[pointer],
+            Some(pointer),
+            &[result],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("aggregate collection insertion produced no slot"))?
+    };
+    copy_inline_bytes(
+        builder,
+        destination,
+        source_slot,
+        ty.storage_size(nullable),
+        pointer,
+    );
+    retain_payload_enum_at(builder, destination, ty, nullable, resources)?;
+    let one = builder.ins().iconst(pointer, 1);
+    let next = builder.ins().iadd(index, one);
+    builder.ins().jump(header, &[BlockArg::Value(next)]);
+    builder.switch_to_block(done);
+    let _ = runtime_call(
+        builder,
+        COLLECTION_STAGE26_FINALIZE,
+        &[pointer],
+        None,
+        &[result],
+        resources,
+    )?;
+    Ok(result)
+}
+
 fn lower_drop_value_if(
     builder: &mut FunctionBuilder,
     condition: Value,
@@ -3951,6 +6006,12 @@ fn lower_drop_stored_value(
         }
         mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
             lower_drop_collection_value(builder, value, collection, resources)
+        }
+        mir::Type::PayloadEnum(ty) => {
+            lower_drop_payload_enum_at(builder, value, ty, false, resources)
+        }
+        mir::Type::NullablePayloadEnum(ty) => {
+            lower_drop_payload_enum_at(builder, value, ty, true, resources)
         }
         mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
     }
@@ -4083,18 +6144,46 @@ fn lower_finish_collection_value(
     builder.switch_to_block(body);
     let one = builder.ins().iconst(pointer, 1);
     let index = builder.ins().isub(remaining, one);
-    let value_word = runtime_call(
-        builder,
-        COLLECTION_VALUE_AT,
-        &[pointer, pointer, pointer],
-        Some(types::I64),
-        &[resources.current_frame, cleanup_collection, index],
-        resources,
-    )?
-    .ok_or_else(|| backend_failure("collection value read produced no result"))?;
-    let stored_value_type = nullable_payload_type(definition.value).unwrap_or(definition.value);
-    let value = collection_word_to_value(builder, value_word, stored_value_type, pointer)?;
-    lower_drop_stored_value(builder, value, stored_value_type, resources)?;
+    if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
+        let index_word = if pointer == types::I64 {
+            index
+        } else {
+            builder.ins().uextend(types::I64, index)
+        };
+        let positional = builder.ins().iconst(types::I8, 1);
+        let key_kind = builder
+            .ins()
+            .iconst(types::I8, i64::from(COLLECTION_COMPARE_WORD));
+        let value = runtime_call(
+            builder,
+            COLLECTION_AGGREGATE_VALUE_AT,
+            &[pointer, pointer, types::I64, types::I8, types::I8],
+            Some(pointer),
+            &[
+                resources.current_frame,
+                cleanup_collection,
+                index_word,
+                positional,
+                key_kind,
+            ],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("aggregate collection value read produced no slot"))?;
+        lower_drop_payload_enum_at(builder, value, ty, nullable, resources)?;
+    } else {
+        let value_word = runtime_call(
+            builder,
+            COLLECTION_VALUE_AT,
+            &[pointer, pointer, pointer],
+            Some(types::I64),
+            &[resources.current_frame, cleanup_collection, index],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("collection value read produced no result"))?;
+        let stored_value_type = nullable_payload_type(definition.value).unwrap_or(definition.value);
+        let value = collection_word_to_value(builder, value_word, stored_value_type, pointer)?;
+        lower_drop_stored_value(builder, value, stored_value_type, resources)?;
+    }
     if let Some(key_type) = definition.key {
         let key_word = runtime_call(
             builder,
@@ -6137,6 +8226,12 @@ fn lower_drop_class_value(
                 lower_drop_writable_shared_value(builder, value, symbol, resources)?;
             }
             mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {}
+            mir::Type::PayloadEnum(payload) => {
+                lower_drop_payload_enum_at(builder, address, payload, false, resources)?;
+            }
+            mir::Type::NullablePayloadEnum(payload) => {
+                lower_drop_payload_enum_at(builder, address, payload, true, resources)?;
+            }
         }
     }
     let _ = runtime_call(
@@ -6391,6 +8486,63 @@ fn lower_drop_mixed_value(
     }
 
     builder.switch_to_block(after_class);
+    let payload_enum_block = builder.create_block();
+    let after_payload_enum = builder.create_block();
+    let payload_enum_tag = builder
+        .ins()
+        .iconst(types::I8, i64::from(MIXED_TAG_PAYLOAD_ENUM));
+    let is_payload_enum = builder.ins().icmp(IntCC::Equal, tag, payload_enum_tag);
+    builder.ins().brif(
+        is_payload_enum,
+        payload_enum_block,
+        &[],
+        after_payload_enum,
+        &[],
+    );
+    builder.switch_to_block(payload_enum_block);
+    let type_id = runtime_call(
+        builder,
+        MIXED_TYPE_ID,
+        &[pointer],
+        Some(types::I32),
+        &[value],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed payload-enum type-id read produced no result"))?;
+    let payload_address = collection_word_to_value(
+        builder,
+        payload,
+        mir::Type::Class(crate::class_layout::ClassId(0)),
+        pointer,
+    )?;
+    let payload_enums = resources
+        .program
+        .enums
+        .iter()
+        .filter_map(|definition| definition.payload_type())
+        .collect::<Vec<_>>();
+    if payload_enums.is_empty() {
+        builder.ins().jump(after_payload_enum, &[]);
+    } else {
+        let checks = payload_enums
+            .iter()
+            .map(|_| builder.create_block())
+            .collect::<Vec<_>>();
+        builder.ins().jump(checks[0], &[]);
+        for (index, payload_ty) in payload_enums.iter().enumerate() {
+            let check = checks[index];
+            let next = checks.get(index + 1).copied().unwrap_or(after_payload_enum);
+            builder.switch_to_block(check);
+            let expected = builder.ins().iconst(types::I32, payload_ty.id.0 as i64);
+            let matches = builder.ins().icmp(IntCC::Equal, type_id, expected);
+            let drop_payload = builder.create_block();
+            builder.ins().brif(matches, drop_payload, &[], next, &[]);
+            builder.switch_to_block(drop_payload);
+            lower_drop_payload_enum_at(builder, payload_address, *payload_ty, false, resources)?;
+            builder.ins().jump(after_payload_enum, &[]);
+        }
+    }
+    builder.switch_to_block(after_payload_enum);
     builder.ins().jump(free_shell, &[]);
     builder.switch_to_block(free_shell);
     runtime_call(builder, MIXED_FREE, &[pointer], None, &[value], resources)?;
@@ -6506,6 +8658,7 @@ fn mixed_tag_value(tag: mir::MixedTag) -> (u8, u32) {
         mir::MixedTag::String => (MIXED_TAG_STRING, 0),
         mir::MixedTag::Class(class) => (MIXED_TAG_CLASS, class.0 as u32),
         mir::MixedTag::Enum(enum_id) => (MIXED_TAG_ENUM, enum_id.0 as u32),
+        mir::MixedTag::PayloadEnum(ty) => (MIXED_TAG_PAYLOAD_ENUM, ty.id.0 as u32),
     }
 }
 
@@ -6606,6 +8759,24 @@ fn lower_mixed_expression(
                 resources,
             )
         }
+        mir::MixedExpression::BoxPayloadEnum { value } => {
+            let ty = value.ty();
+            let source = lower_payload_enum_expression(builder, value, resources)?;
+            let (tag_value, type_id) = mixed_tag_value(mir::MixedTag::PayloadEnum(ty));
+            let tag = builder.ins().iconst(types::I8, i64::from(tag_value));
+            let type_id = builder.ins().iconst(types::I32, i64::from(type_id));
+            let size = builder.ins().iconst(pointer, i64::from(ty.size));
+            let alignment = builder.ins().iconst(pointer, i64::from(ty.align));
+            runtime_call(
+                builder,
+                MIXED_NEW_AGGREGATE,
+                &[types::I8, types::I32, pointer, pointer, pointer],
+                Some(pointer),
+                &[tag, type_id, source, size, alignment],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("mixed aggregate allocation produced no result"))
+        }
         mir::MixedExpression::CollectionIndex {
             positional,
             collection,
@@ -6645,6 +8816,49 @@ fn lower_nullable_mixed_expression(
         mir::NullableMixedExpression::Null => Ok(builder.ins().iconst(pointer, 0)),
         mir::NullableMixedExpression::Mixed(value) => {
             lower_mixed_expression(builder, value, resources)
+        }
+        mir::NullableMixedExpression::BoxNullablePayloadEnum(value) => {
+            let ty = value.ty();
+            let source = lower_nullable_payload_enum_expression(builder, value, resources)?;
+            let present = builder.ins().load(
+                types::I8,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                source,
+                0,
+            );
+            let box_value = builder.create_block();
+            let absent = builder.create_block();
+            let done = builder.create_block();
+            builder.append_block_param(done, pointer);
+            let zero = builder.ins().iconst(types::I8, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+            builder.ins().brif(present, box_value, &[], absent, &[]);
+            builder.switch_to_block(box_value);
+            let payload = builder
+                .ins()
+                .iadd_imm_u(source, i64::from(ty.nullable_payload_offset));
+            let (tag_value, type_id) = mixed_tag_value(mir::MixedTag::PayloadEnum(ty));
+            let tag = builder.ins().iconst(types::I8, i64::from(tag_value));
+            let type_id = builder.ins().iconst(types::I32, i64::from(type_id));
+            let size = builder.ins().iconst(pointer, i64::from(ty.size));
+            let alignment = builder.ins().iconst(pointer, i64::from(ty.align));
+            let boxed = runtime_call(
+                builder,
+                MIXED_NEW_AGGREGATE,
+                &[types::I8, types::I32, pointer, pointer, pointer],
+                Some(pointer),
+                &[tag, type_id, payload, size, alignment],
+                resources,
+            )?
+            .ok_or_else(|| {
+                backend_failure("nullable mixed aggregate allocation produced no result")
+            })?;
+            builder.ins().jump(done, &[boxed.into()]);
+            builder.switch_to_block(absent);
+            let null = builder.ins().iconst(pointer, 0);
+            builder.ins().jump(done, &[null.into()]);
+            builder.switch_to_block(done);
+            Ok(builder.block_params(done)[0])
         }
         mir::NullableMixedExpression::Local { local, transfer } => {
             let slot = local_slot(resources.local_slots, *local)?;
@@ -6808,7 +9022,10 @@ fn lower_mixed_is(
     let (expected_tag, expected_type_id) = mixed_tag_value(tag);
     let expected_tag = builder.ins().iconst(types::I8, i64::from(expected_tag));
     let tag_matches = builder.ins().icmp(IntCC::Equal, actual_tag, expected_tag);
-    let result = if matches!(tag, mir::MixedTag::Class(_) | mir::MixedTag::Enum(_)) {
+    let result = if matches!(
+        tag,
+        mir::MixedTag::Class(_) | mir::MixedTag::Enum(_) | mir::MixedTag::PayloadEnum(_)
+    ) {
         let actual_type_id = runtime_call(
             builder,
             MIXED_TYPE_ID,
@@ -7396,6 +9613,27 @@ fn lower_nullable_scalar_expression(
                 return Err(malformed_mir("List::indexOf uses a non-collection local"));
             };
             let definition = collection_definition(resources.program, collection_type)?.clone();
+            if let Some((payload, nullable)) = payload_enum_storage(definition.value) {
+                let owned = payload_enum_rvalue_is_owned(value);
+                let needle = lower_rvalue(builder, value, resources)?.single()?;
+                let collection = lower_collection_pointer(builder, *collection, resources)?;
+                let (found, index) = lower_payload_enum_collection_search(
+                    builder, collection, needle, payload, nullable, resources,
+                )?;
+                if owned {
+                    lower_drop_payload_enum_at(builder, needle, payload, nullable, resources)?;
+                }
+                let present = builder.ins().uextend(pointer, found);
+                let position = if pointer == types::I64 {
+                    index
+                } else {
+                    builder.ins().uextend(types::I64, index)
+                };
+                return Ok(LoweredValue::Nullable {
+                    present,
+                    payload: position,
+                });
+            }
             let (needle_present, needle, needle_type) =
                 if nullable_payload_type(definition.value).is_some() {
                     lower_nullable_collection_parts(builder, value, definition.value, resources)?
@@ -9097,11 +11335,21 @@ fn lower_function_call(
 ) -> Result<Option<LoweredValue>, BackendError> {
     let lowered = lower_call_args(builder, args, resources)?;
     let mut values = vec![resources.current_frame];
+    let callee_definition = function_in(resources.program, function)?;
+    let payload_result = match callee_definition.return_type {
+        mir::ReturnType::Value(
+            ty @ (mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)),
+        ) => {
+            let address = create_payload_result_storage(builder, ty, resources)?;
+            values.push(address);
+            Some(address)
+        }
+        _ => None,
+    };
     values.extend(lowered.abi_values.iter().copied());
     let callee = declared_function(builder, resources, function)?;
     let call = builder.ins().call(callee, &values);
     let results = builder.inst_results(call);
-    let callee_definition = function_in(resources.program, function)?;
     let result = match callee_definition.return_type {
         mir::ReturnType::Void => None,
         mir::ReturnType::Value(mir::Type::NullableScalar(_) | mir::Type::NullableString) => {
@@ -9121,6 +11369,11 @@ fn lower_function_call(
                     ty,
                 ),
             })
+        }
+        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)) => {
+            Some(LoweredValue::Single(payload_result.ok_or_else(|| {
+                malformed_mir("payload enum call has no result storage")
+            })?))
         }
         mir::ReturnType::Value(ty) => {
             let value = *results
@@ -9177,6 +11430,30 @@ fn lower_function_call(
     Ok(result)
 }
 
+fn create_payload_result_storage(
+    builder: &mut FunctionBuilder,
+    ty: mir::Type,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let (payload, nullable) = match ty {
+        mir::Type::PayloadEnum(payload) => (payload, false),
+        mir::Type::NullablePayloadEnum(payload) => (payload, true),
+        _ => {
+            return Err(malformed_mir(
+                "payload result storage received another type",
+            ))
+        }
+    };
+    let slot = builder.create_sized_stack_slot(StackSlotData::new(
+        StackSlotKind::ExplicitSlot,
+        payload.storage_size(nullable),
+        payload.align.trailing_zeros() as u8,
+    ));
+    Ok(builder
+        .ins()
+        .stack_addr(resources.module.target_config().pointer_type(), slot, 0))
+}
+
 fn defer_or_drop_owned_shared_temporary(
     builder: &mut FunctionBuilder,
     value: Value,
@@ -9225,11 +11502,22 @@ fn lower_method_call_with_receiver(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Option<LoweredValue>, BackendError> {
     let lowered = lower_call_args(builder, args, resources)?;
-    let mut values = vec![resources.current_frame, receiver];
+    let definition = function_in(resources.program, function)?;
+    let mut values = vec![resources.current_frame];
+    let payload_result = match definition.return_type {
+        mir::ReturnType::Value(
+            ty @ (mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)),
+        ) => {
+            let address = create_payload_result_storage(builder, ty, resources)?;
+            values.push(address);
+            Some(address)
+        }
+        _ => None,
+    };
+    values.push(receiver);
     values.extend(lowered.abi_values.iter().copied());
     let callee = declared_function(builder, resources, function)?;
     let call = builder.ins().call(callee, &values);
-    let definition = function_in(resources.program, function)?;
     let results = builder.inst_results(call);
     let result = match definition.return_type {
         mir::ReturnType::Void => None,
@@ -9250,6 +11538,11 @@ fn lower_method_call_with_receiver(
                     ty,
                 ),
             })
+        }
+        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)) => {
+            Some(LoweredValue::Single(payload_result.ok_or_else(|| {
+                malformed_mir("payload enum method call has no result storage")
+            })?))
         }
         mir::ReturnType::Value(ty) => {
             let value = *results
@@ -9414,6 +11707,75 @@ fn lower_condition_to_branch(
                 _ => return Err(malformed_mir("ordered nullable comparison is invalid")),
             };
             builder.ins().brif(value, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
+            let owned = nullable_payload_enum_expression_is_owned(value);
+            let ty = value.ty();
+            let address = lower_nullable_payload_enum_expression(builder, value, resources)?;
+            let present = builder.ins().load(
+                types::I8,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                address,
+                0,
+            );
+            if owned {
+                lower_drop_payload_enum_at(builder, address, ty, true, resources)?;
+            }
+            let zero = builder.ins().iconst(types::I8, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+            builder
+                .ins()
+                .brif(present, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::PayloadEnumCompare { op, left, right } => {
+            let ty = left.ty();
+            let left_owned = payload_enum_expression_is_owned(left);
+            let right_owned = payload_enum_expression_is_owned(right);
+            let left_address = lower_payload_enum_expression(builder, left, resources)?;
+            let right_address = lower_payload_enum_expression(builder, right, resources)?;
+            let mut equal = lower_payload_enum_equal_value(
+                builder,
+                left_address,
+                right_address,
+                ty,
+                resources,
+            )?;
+            if right_owned {
+                lower_drop_payload_enum_at(builder, right_address, ty, false, resources)?;
+            }
+            if left_owned {
+                lower_drop_payload_enum_at(builder, left_address, ty, false, resources)?;
+            }
+            if matches!(op, mir::CompareOp::NotEqual) {
+                let zero = builder.ins().iconst(types::I8, 0);
+                equal = builder.ins().icmp(IntCC::Equal, equal, zero);
+            }
+            builder.ins().brif(equal, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::NullablePayloadEnumCompare { op, left, right } => {
+            let ty = left.ty();
+            let left_owned = nullable_payload_enum_expression_is_owned(left);
+            let right_owned = nullable_payload_enum_expression_is_owned(right);
+            let left_address = lower_nullable_payload_enum_expression(builder, left, resources)?;
+            let right_address = lower_nullable_payload_enum_expression(builder, right, resources)?;
+            let mut equal = lower_nullable_payload_enum_equal_value(
+                builder,
+                left_address,
+                right_address,
+                ty,
+                resources,
+            )?;
+            if right_owned {
+                lower_drop_payload_enum_at(builder, right_address, ty, true, resources)?;
+            }
+            if left_owned {
+                lower_drop_payload_enum_at(builder, left_address, ty, true, resources)?;
+            }
+            if matches!(op, mir::CompareOp::NotEqual) {
+                let zero = builder.ins().iconst(types::I8, 0);
+                equal = builder.ins().icmp(IntCC::Equal, equal, zero);
+            }
+            builder.ins().brif(equal, then_block, &[], else_block, &[]);
         }
         mir::BoolExpression::Not(condition) => {
             lower_condition_to_branch(builder, condition, else_block, then_block, resources)?;
@@ -9618,6 +11980,52 @@ fn lower_condition_to_branch(
             } else {
                 definition.value
             };
+            if let Some((payload, nullable)) = payload_enum_storage(stored_needle_type) {
+                if *op == mir::CollectionMembershipOp::Add {
+                    return Err(malformed_mir(
+                        "payload enum elements cannot use set insertion",
+                    ));
+                }
+                let owned = payload_enum_rvalue_is_owned(value);
+                let needle = lower_rvalue(builder, value, resources)?.single()?;
+                let collection_value = lower_collection_pointer(builder, *collection, resources)?;
+                let (found, index) = lower_payload_enum_collection_search(
+                    builder,
+                    collection_value,
+                    needle,
+                    payload,
+                    nullable,
+                    resources,
+                )?;
+                if *op == mir::CollectionMembershipOp::Remove {
+                    let remove = builder.create_block();
+                    let removed = builder.create_block();
+                    builder.ins().brif(found, remove, &[], removed, &[]);
+                    builder.switch_to_block(remove);
+                    let destination = create_payload_storage(builder, payload, nullable, resources);
+                    let _ = runtime_call(
+                        builder,
+                        COLLECTION_AGGREGATE_REMOVE_AT_INTO,
+                        &[pointer, pointer, pointer, pointer],
+                        None,
+                        &[
+                            resources.current_frame,
+                            collection_value,
+                            index,
+                            destination,
+                        ],
+                        resources,
+                    )?;
+                    lower_drop_payload_enum_at(builder, destination, payload, nullable, resources)?;
+                    builder.ins().jump(removed, &[]);
+                    builder.switch_to_block(removed);
+                }
+                if owned {
+                    lower_drop_payload_enum_at(builder, needle, payload, nullable, resources)?;
+                }
+                builder.ins().brif(found, then_block, &[], else_block, &[]);
+                return Ok(());
+            }
             let mixed_ownership = value.mixed_ownership();
             let (needle_present, needle, needle_type) =
                 if nullable_payload_type(stored_needle_type).is_some() {

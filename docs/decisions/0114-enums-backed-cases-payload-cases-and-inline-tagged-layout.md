@@ -127,9 +127,9 @@ the enum without a hidden clone or share. A moved source becomes unusable. Only
 the active case owns payloads, and active payloads are destroyed in reverse
 declaration order.
 
-Stage 27 Slice 1 parses and preserves payload schemas but stops payload case
-construction before MIR with one Stage 27 Slice 2 diagnostic. Slice 2 owns
-payload execution.
+During Stage 27 Slice 1, the compiler parsed and preserved payload schemas but
+stopped payload case construction before MIR with one Slice 2 diagnostic.
+Slice 2 removed that temporary boundary and delivered payload execution.
 
 ## Generic Enum Deferral
 
@@ -257,6 +257,11 @@ Generated comparisons remain strict. Payload enums stop before backend
 lowering in Slice 1; Slice 2 owns faithful payload lowering rather than a class
 approximation.
 
+Implementation status: Slice 2 emits an immutable generated representation for
+the complete payload enum, including nominal helper identity and explicit
+case-aware equality. This backend representation does not define Doria
+ownership, layout, or equality semantics.
+
 PHP output does not define Doria enum semantics.
 
 ## Performance Impact
@@ -272,6 +277,14 @@ PHP output does not define Doria enum semantics.
 | `mixed` boxing | existing mixed-box allocation |
 | Enum container allocation | none |
 
+For payload enums, construction is proportional to active static payload size;
+trivial Copy uses one bounded aggregate copy, string-bearing Copy additionally
+retains its handles, move performs bounded relocation without cloning, drop
+visits active owned fields only, and equality checks the tag then active fields
+with short-circuiting. Nullable values add presence beside the inline aggregate;
+boxing uses the one existing `mixed` allocation. Ordinary enum containers and
+collection elements add no enum allocation.
+
 No reflection registry, virtual dispatch, runtime case-name lookup, reference
 count, metadata pointer, or enum allocation is introduced. Controlled timing
 remains pending an available runner and does not block this work.
@@ -280,7 +293,7 @@ remains pending an available runner and does not block this work.
 
 This decision does not add enum methods, user properties, reflection, implicit
 display, automatic hashing/ordering, generic execution, property hooks, or
-Stage 28 semantics. Slice 1 specifically excludes payload construction,
+Stage 28 semantics. Slice 1 specifically excluded payload construction,
 aggregate ABI, payload storage, payload copy/move/drop glue, payload `mixed`
 boxing, and payload PHP execution.
 
@@ -290,8 +303,8 @@ boxing, and payload PHP execution.
 - MIR carries enum and case metadata and validates all enum operations before a
   backend sees them.
 - The interpreter stores explicit enum values rather than untyped integers.
-- Native backends use inline tags for Slice 1 and remain extensible to Slice 2
-  aggregates.
+- Native backends use central inline layouts for scalar-tag and aggregate enum
+  values.
 - Constant evaluation, nullability, `mixed`, collections, PHP lowering, editor
   tooling, diagnostics, and structural reporting all share the same enum model.
 
@@ -316,6 +329,15 @@ placement, PHP native lowering, editor integration, and Stage 28 `match` grammar
 Payload execution, finite inline payload layout, Copy/Move classification,
 case-aware copy/drop glue, aggregate ABI, all storage positions, payload
 equality, payload `mixed` boxing, payload PHP lowering, and Stage 27 closure.
+
+**Implementation status: Complete.** Both Stage 27 slices are complete. Payload
+construction, layout, ownership, destruction, equality, nullable and `mixed`
+transport, Copy constants/defaults, aggregate ABI, class/generic/collection
+storage, PHP lowering, and durable interpreter/Cranelift/LLVM parity are
+implemented. Generic enums remain deferred and `match` remains Stage 28.
+
+Controlled payload-enum timing is `Pending Available Runner` and non-blocking.
+No unmeasured result is recorded as a performance pass.
 
 ## Invalidated Elsewhere
 

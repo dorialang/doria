@@ -74,6 +74,68 @@ function main(): void
 }
 
 #[test]
+fn php_backend_executes_payload_enum_construction_equality_and_storage() {
+    let php = doriac::compile_source_to_php(
+        "stage27-payload.doria",
+        r#"
+enum Coordinate
+{
+    case Origin;
+    case Point(int $x, int $y);
+}
+
+class Drawing
+{
+    function __construct(Coordinate $coordinate)
+    {
+    }
+}
+
+function main(): void
+{
+    Coordinate $point = Coordinate::Point(y: 22, x: 20);
+    Coordinate $copy = $point;
+    ?Coordinate $nullable = $copy;
+    List<Coordinate> $items = [Coordinate::Origin, $copy];
+    let $drawing = new Drawing($point);
+
+    echo $copy == Coordinate::Point(20, 22);
+    echo " {$nullable == $point}";
+    echo " {$drawing->coordinate == $point}\n";
+}
+"#,
+    )
+    .expect("payload enum compatibility lowering should compile");
+
+    assert!(php.contains("final class Coordinate implements __DoriaValueEquatable"));
+    assert!(!php.contains("enum Coordinate"));
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated payload enum PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"true true true\n");
+}
+
+#[test]
 fn php_grouped_declarations_use_one_collision_safe_temporary_in_order() {
     let php = doriac::compile_source_to_php(
         "stage26a.doria",

@@ -60,6 +60,13 @@ pub struct DrCollectionV1 {
     index_kind: u8,
     /// 1 when the index maps keys, 0 when it maps values.
     index_keyed: u8,
+    // Aggregate element metadata. These compatible tail fields leave every
+    // established scalar-header offset unchanged. Scalar collections keep the
+    // legacy width transport; aggregate collections use address-based slots.
+    value_size: usize,
+    value_stride: usize,
+    value_alignment: usize,
+    aggregate: u8,
 }
 
 pub const DR_COLLECTION_LENGTH_OFFSET: usize = mem::offset_of!(DrCollectionV1, length);
@@ -72,6 +79,11 @@ pub const DR_COLLECTION_VALUE_WIDTH_OFFSET: usize = mem::offset_of!(DrCollection
 pub const DR_COLLECTION_KIND_OFFSET: usize = mem::offset_of!(DrCollectionV1, kind);
 pub const DR_COLLECTION_HEAD_OFFSET: usize = mem::offset_of!(DrCollectionV1, head);
 pub const DR_COLLECTION_INDEX_OFFSET: usize = mem::offset_of!(DrCollectionV1, index);
+pub const DR_COLLECTION_VALUE_SIZE_OFFSET: usize = mem::offset_of!(DrCollectionV1, value_size);
+pub const DR_COLLECTION_VALUE_STRIDE_OFFSET: usize = mem::offset_of!(DrCollectionV1, value_stride);
+pub const DR_COLLECTION_VALUE_ALIGNMENT_OFFSET: usize =
+    mem::offset_of!(DrCollectionV1, value_alignment);
+pub const DR_COLLECTION_AGGREGATE_OFFSET: usize = mem::offset_of!(DrCollectionV1, aggregate);
 pub const DR_COLLECTION_SIZE: usize = mem::size_of::<DrCollectionV1>();
 pub const DR_COLLECTION_ALIGN: usize = mem::align_of::<DrCollectionV1>();
 
@@ -85,9 +97,18 @@ unsafe fn value_address(collection: *const DrCollectionV1, index: usize) -> *mut
     } else {
         index
     };
-    (*collection)
-        .values
-        .add(index * usize::from((*collection).value_width))
+    (*collection).values.add(index * (*collection).value_stride)
+}
+
+fn align_to(value: usize, alignment: usize) -> Option<usize> {
+    let mask = alignment - 1;
+    value.checked_add(mask).map(|value| value & !mask)
+}
+
+unsafe fn require_aggregate(collection: *const DrCollectionV1) {
+    if collection.is_null() || (*collection).aggregate == 0 {
+        collection_panic(b"P1001");
+    }
 }
 
 unsafe fn read_value(collection: *const DrCollectionV1, index: usize) -> u64 {
@@ -165,7 +186,7 @@ unsafe fn allocate_words(capacity: usize) -> *mut u64 {
 unsafe fn allocate_values_with_frame(
     frame: *const DrStackFrameV2,
     capacity: usize,
-    value_width: u8,
+    value_stride: usize,
 ) -> *mut u8 {
     if capacity == 0 {
         return ptr::null_mut();
@@ -176,7 +197,7 @@ unsafe fn allocate_values_with_frame(
         .checked_mul(mem::size_of::<u64>())
         .unwrap_or_else(|| collection_panic_with_frame(frame, b"P1313"));
     let bytes = capacity
-        .checked_mul(usize::from(value_width))
+        .checked_mul(value_stride)
         .unwrap_or_else(|| collection_panic_with_frame(frame, b"P1313"));
     let values = allocate(bytes);
     if values.is_null() {
@@ -195,23 +216,21 @@ unsafe fn grow(collection: *mut DrCollectionV1) {
         .checked_mul(2)
         .unwrap_or_else(|| collection_panic(b"P1313"))
         .max(4);
-    let values = allocate_values_with_frame(ptr::null(), next, (*collection).value_width);
+    let values = allocate_values_with_frame(ptr::null(), next, (*collection).value_stride);
     if (*collection).length != 0 {
         if (*collection).kind == KIND_DEQUE {
             for index in 0..(*collection).length {
-                write_raw_value(
-                    values,
-                    (*collection).value_width,
-                    index,
-                    read_present(collection, index),
-                    read_value(collection, index),
+                ptr::copy_nonoverlapping(
+                    value_address(collection, index),
+                    values.add(index * (*collection).value_stride),
+                    (*collection).value_stride,
                 );
             }
         } else {
             ptr::copy_nonoverlapping(
                 (*collection).values,
                 values,
-                (*collection).length * usize::from((*collection).value_width),
+                (*collection).length * (*collection).value_stride,
             );
         }
     }
@@ -233,21 +252,6 @@ unsafe fn grow(collection: *mut DrCollectionV1) {
     (*collection).capacity = next;
     if (*collection).kind == KIND_DEQUE {
         (*collection).head = 0;
-    }
-}
-
-unsafe fn write_raw_value(values: *mut u8, width: u8, index: usize, present: bool, value: u64) {
-    let address = values.add(index * usize::from(width));
-    match width {
-        1 => *address = value as u8,
-        2 => *address.cast::<u16>() = value as u16,
-        4 => *address.cast::<u32>() = value as u32,
-        8 => *address.cast::<u64>() = value,
-        16 => {
-            *address.cast::<u64>() = u64::from(present);
-            *address.add(8).cast::<u64>() = value;
-        }
-        _ => collection_panic(b"P1001"),
     }
 }
 
@@ -280,7 +284,7 @@ unsafe fn new_with_frame(
             } else {
                 ptr::null_mut()
             },
-            values: allocate_values_with_frame(frame, capacity, value_width),
+            values: allocate_values_with_frame(frame, capacity, usize::from(value_width)),
             keyed: u8::from(keyed),
             fixed: u8::from(fixed),
             value_width,
@@ -293,6 +297,68 @@ unsafe fn new_with_frame(
             index_slots: 0,
             index_kind: 0,
             index_keyed: 0,
+            value_size: usize::from(value_width),
+            value_stride: usize::from(value_width),
+            value_alignment: usize::from(value_width).min(mem::align_of::<u64>()),
+            aggregate: 0,
+        },
+    );
+    collection
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn new_aggregate(
+    frame: *const DrStackFrameV2,
+    length: usize,
+    keyed: bool,
+    fixed: bool,
+    value_size: usize,
+    value_alignment: usize,
+    kind: u8,
+    comparator: u8,
+) -> *mut DrCollectionV1 {
+    if value_size == 0
+        || value_alignment == 0
+        || !value_alignment.is_power_of_two()
+        || value_alignment > mem::align_of::<u128>()
+        || !matches!(kind, KIND_LEGACY | KIND_SORTED_DICTIONARY | KIND_DEQUE)
+    {
+        collection_panic_with_frame(frame, b"P1001");
+    }
+    let value_stride = align_to(value_size, value_alignment)
+        .unwrap_or_else(|| collection_panic_with_frame(frame, b"P1313"));
+    let capacity = if fixed { length } else { length.max(4) };
+    let collection = allocate(mem::size_of::<DrCollectionV1>()).cast::<DrCollectionV1>();
+    if collection.is_null() {
+        collection_panic_with_frame(frame, b"P1313");
+    }
+    ptr::write(
+        collection,
+        DrCollectionV1 {
+            length: if fixed { length } else { 0 },
+            capacity,
+            keys: if keyed {
+                allocate_words_with_frame(frame, capacity)
+            } else {
+                ptr::null_mut()
+            },
+            values: allocate_values_with_frame(frame, capacity, value_stride),
+            keyed: u8::from(keyed),
+            fixed: u8::from(fixed),
+            value_width: 0,
+            kind,
+            comparator,
+            finalized: u8::from(kind == KIND_LEGACY),
+            value_nullable: 0,
+            head: 0,
+            index: ptr::null_mut(),
+            index_slots: 0,
+            index_kind: 0,
+            index_keyed: 0,
+            value_size,
+            value_stride,
+            value_alignment,
+            aggregate: 1,
         },
     );
     collection
@@ -479,6 +545,10 @@ pub unsafe fn detach_for_cleanup(
             index_slots: 0,
             index_kind: 0,
             index_keyed: 0,
+            value_size: (*detached).value_size,
+            value_stride: (*detached).value_stride,
+            value_alignment: (*detached).value_alignment,
+            aggregate: (*detached).aggregate,
         },
     );
 }
@@ -576,7 +646,7 @@ pub unsafe fn insert_at(
         ptr::copy(
             value_address(collection, index),
             value_address(collection, index + 1),
-            tail * usize::from((*collection).value_width),
+            tail * (*collection).value_stride,
         );
     }
     write_value(collection, index, value);
@@ -602,7 +672,7 @@ pub unsafe fn insert_at_nullable(
         ptr::copy(
             value_address(collection, index),
             value_address(collection, index + 1),
-            tail * usize::from((*collection).value_width),
+            tail * (*collection).value_stride,
         );
     }
     write_nullable_value(collection, index, present, value);
@@ -624,7 +694,7 @@ pub unsafe fn remove_at(
         ptr::copy(
             value_address(collection, index + 1),
             value_address(collection, index),
-            tail * usize::from((*collection).value_width),
+            tail * (*collection).value_stride,
         );
     }
     (*collection).length -= 1;
@@ -656,7 +726,7 @@ unsafe fn swap_values(collection: *mut DrCollectionV1, left: usize, right: usize
     ptr::swap_nonoverlapping(
         value_address(collection, left),
         value_address(collection, right),
-        usize::from((*collection).value_width),
+        (*collection).value_stride,
     );
 }
 
@@ -664,7 +734,7 @@ unsafe fn copy_value_slot(collection: *mut DrCollectionV1, source: usize, target
     ptr::copy_nonoverlapping(
         value_address(collection, source),
         value_address(collection, target),
-        usize::from((*collection).value_width),
+        (*collection).value_stride,
     );
 }
 
@@ -909,6 +979,298 @@ pub unsafe fn value_at(
         collection_bounds_panic(frame, index, (*collection).length);
     }
     read_value(collection, index)
+}
+
+pub unsafe fn aggregate_value_at(
+    frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    index_or_key: u64,
+    positional: bool,
+    key_kind: u8,
+) -> *mut u8 {
+    require_aggregate(collection);
+    let index = if (*collection).keyed != 0 && !positional {
+        find(collection, index_or_key, key_kind)
+            .unwrap_or_else(|| collection_bounds_panic(frame, 0, (*collection).length))
+    } else {
+        index_or_key as usize
+    };
+    if index >= (*collection).length {
+        collection_bounds_panic(frame, index, (*collection).length);
+    }
+    value_address(collection, index)
+}
+
+pub unsafe fn aggregate_push_slot(collection: *mut DrCollectionV1) -> *mut u8 {
+    require_aggregate(collection);
+    if (*collection).length == (*collection).capacity {
+        grow(collection);
+    }
+    let index = (*collection).length;
+    (*collection).length += 1;
+    value_address(collection, index)
+}
+
+pub unsafe fn aggregate_push_front_slot(collection: *mut DrCollectionV1) -> *mut u8 {
+    require_aggregate(collection);
+    if (*collection).kind != KIND_DEQUE {
+        collection_panic(b"P1001");
+    }
+    if (*collection).length == (*collection).capacity {
+        grow(collection);
+    }
+    (*collection).head = if (*collection).head == 0 {
+        (*collection).capacity - 1
+    } else {
+        (*collection).head - 1
+    };
+    (*collection).length += 1;
+    value_address(collection, 0)
+}
+
+pub unsafe fn aggregate_insert_slot(
+    frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    index: usize,
+) -> *mut u8 {
+    require_aggregate(collection);
+    index_discard(collection);
+    if index > (*collection).length {
+        collection_bounds_panic(frame, index, (*collection).length);
+    }
+    if (*collection).length == (*collection).capacity {
+        grow(collection);
+    }
+    let tail = (*collection).length - index;
+    if tail != 0 {
+        ptr::copy(
+            value_address(collection, index),
+            value_address(collection, index + 1),
+            tail * (*collection).value_stride,
+        );
+    }
+    (*collection).length += 1;
+    value_address(collection, index)
+}
+
+pub unsafe fn aggregate_remove_at_into(
+    frame: *const DrStackFrameV2,
+    collection: *mut DrCollectionV1,
+    index: usize,
+    destination: *mut u8,
+) {
+    require_aggregate(collection);
+    if destination.is_null() || index >= (*collection).length {
+        collection_bounds_panic(frame, index, (*collection).length);
+    }
+    ptr::copy_nonoverlapping(
+        value_address(collection, index),
+        destination,
+        (*collection).value_size,
+    );
+    index_note_removal(collection, index);
+    let tail = (*collection).length - index - 1;
+    if tail != 0 {
+        ptr::copy(
+            value_address(collection, index + 1),
+            value_address(collection, index),
+            tail * (*collection).value_stride,
+        );
+    }
+    (*collection).length -= 1;
+}
+
+pub unsafe fn aggregate_pop_into(
+    collection: *mut DrCollectionV1,
+    front: bool,
+    found: *mut u8,
+    destination: *mut u8,
+) {
+    require_aggregate(collection);
+    index_discard(collection);
+    if (*collection).length == 0 {
+        *found = 0;
+        return;
+    }
+    *found = 1;
+    let index = if front { 0 } else { (*collection).length - 1 };
+    ptr::copy_nonoverlapping(
+        value_address(collection, index),
+        destination,
+        (*collection).value_size,
+    );
+    if front {
+        if (*collection).kind == KIND_DEQUE {
+            (*collection).head = ((*collection).head + 1) % (*collection).capacity;
+        } else if (*collection).length > 1 {
+            ptr::copy(
+                value_address(collection, 1),
+                value_address(collection, 0),
+                ((*collection).length - 1) * (*collection).value_stride,
+            );
+        }
+    }
+    (*collection).length -= 1;
+}
+
+pub unsafe fn aggregate_keyed_set_slot(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    replaced: *mut u8,
+) -> *mut u8 {
+    require_aggregate(collection);
+    if let Some(index) = find(collection, key, key_kind) {
+        *replaced = 1;
+        return value_address(collection, index);
+    }
+    *replaced = 0;
+    if (*collection).length == (*collection).capacity {
+        grow(collection);
+    }
+    let index = if (*collection).kind == KIND_SORTED_DICTIONARY && (*collection).finalized != 0 {
+        ordered_position(collection, key, true).unwrap_or_else(|index| index)
+    } else {
+        (*collection).length
+    };
+    if index < (*collection).length {
+        ptr::copy(
+            (*collection).keys.add(index),
+            (*collection).keys.add(index + 1),
+            (*collection).length - index,
+        );
+        ptr::copy(
+            value_address(collection, index),
+            value_address(collection, index + 1),
+            ((*collection).length - index) * (*collection).value_stride,
+        );
+    }
+    *(*collection).keys.add(index) = key;
+    (*collection).length += 1;
+    index_discard(collection);
+    value_address(collection, index)
+}
+
+pub unsafe fn aggregate_keyed_remove_into(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    found: *mut u8,
+    removed_key: *mut u64,
+    destination: *mut u8,
+) {
+    require_aggregate(collection);
+    let Some(index) = find(collection, key, key_kind) else {
+        *found = 0;
+        *removed_key = 0;
+        return;
+    };
+    *found = 1;
+    *removed_key = *(*collection).keys.add(index);
+    ptr::copy_nonoverlapping(
+        value_address(collection, index),
+        destination,
+        (*collection).value_size,
+    );
+    index_note_removal(collection, index);
+    let tail = (*collection).length - index - 1;
+    if tail != 0 {
+        ptr::copy(
+            (*collection).keys.add(index + 1),
+            (*collection).keys.add(index),
+            tail,
+        );
+        ptr::copy(
+            value_address(collection, index + 1),
+            value_address(collection, index),
+            tail * (*collection).value_stride,
+        );
+    }
+    (*collection).length -= 1;
+}
+
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn aggregate_nullable_access_into(
+    collection: *mut DrCollectionV1,
+    key: u64,
+    key_kind: u8,
+    access: u8,
+    stored_nullable: bool,
+    found: *mut u8,
+    removed_key: *mut u64,
+    destination: *mut u8,
+) {
+    require_aggregate(collection);
+    if found.is_null() || removed_key.is_null() || destination.is_null() {
+        collection_panic(b"P1001");
+    }
+    *found = 0;
+    *removed_key = 0;
+
+    let copied = match access {
+        0 => find(collection, key, key_kind).map(|index| {
+            ptr::copy_nonoverlapping(
+                value_address(collection, index),
+                destination,
+                (*collection).value_size,
+            );
+        }),
+        1 => {
+            let mut existed = 0;
+            aggregate_keyed_remove_into(
+                collection,
+                key,
+                key_kind,
+                &mut existed,
+                removed_key,
+                destination,
+            );
+            (existed != 0).then_some(())
+        }
+        2 | 3 => {
+            if (*collection).length == 0 {
+                None
+            } else {
+                let index = if access == 2 {
+                    0
+                } else {
+                    (*collection).length - 1
+                };
+                ptr::copy_nonoverlapping(
+                    value_address(collection, index),
+                    destination,
+                    (*collection).value_size,
+                );
+                Some(())
+            }
+        }
+        4..=6 => {
+            let mut existed = 0;
+            aggregate_pop_into(collection, access == 5, &mut existed, destination);
+            (existed != 0).then_some(())
+        }
+        7 => {
+            let index = key as usize;
+            if index >= (*collection).length {
+                None
+            } else {
+                ptr::copy_nonoverlapping(
+                    value_address(collection, index),
+                    destination,
+                    (*collection).value_size,
+                );
+                Some(())
+            }
+        }
+        _ => collection_panic(b"P1001"),
+    };
+    if copied.is_some() {
+        *found = if stored_nullable {
+            u8::from(*destination != 0)
+        } else {
+            1
+        };
+    }
 }
 
 pub unsafe fn key_at(
@@ -1443,7 +1805,7 @@ unsafe fn insert_keyed_value(
         ptr::copy(
             value_address(collection, index),
             value_address(collection, index + 1),
-            ((*collection).length - index) * usize::from((*collection).value_width),
+            ((*collection).length - index) * (*collection).value_stride,
         );
     }
     *(*collection).keys.add(index) = key;
@@ -1493,7 +1855,7 @@ pub unsafe fn keyed_remove(
         ptr::copy(
             value_address(collection, index + 1),
             value_address(collection, index),
-            tail * usize::from((*collection).value_width),
+            tail * (*collection).value_stride,
         );
     }
     (*collection).length -= 1;
@@ -1655,7 +2017,7 @@ pub unsafe fn push_unique(
                 ptr::copy(
                     value_address(collection, index),
                     value_address(collection, index + 1),
-                    tail * usize::from((*collection).value_width),
+                    tail * (*collection).value_stride,
                 );
             }
             if (*collection).value_nullable != 0 {
@@ -1703,7 +2065,7 @@ pub unsafe fn remove_value(
         ptr::copy(
             value_address(collection, index + 1),
             value_address(collection, index),
-            tail * usize::from((*collection).value_width),
+            tail * (*collection).value_stride,
         );
     }
     (*collection).length -= 1;
@@ -2492,6 +2854,71 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert_eq!(actual, expected.iter().copied().collect::<Vec<_>>());
             }
+            free(collection);
+        }
+    }
+
+    #[test]
+    fn aggregate_deque_growth_preserves_wrapped_values() {
+        unsafe {
+            type Value = [u64; 3];
+
+            let collection = new_aggregate(
+                ptr::null(),
+                0,
+                false,
+                false,
+                mem::size_of::<Value>(),
+                mem::align_of::<Value>(),
+                KIND_DEQUE,
+                COMPARE_UNSIGNED_64,
+            );
+            finalize_stage26(collection);
+            let push = |collection, value| {
+                aggregate_push_slot(collection).cast::<Value>().write([
+                    value,
+                    value + 10,
+                    value + 20,
+                ]);
+            };
+            for value in 0..4 {
+                push(collection, value);
+            }
+
+            let mut found = 0;
+            let mut removed: Value = [0; 3];
+            aggregate_pop_into(collection, true, &mut found, removed.as_mut_ptr().cast());
+            assert_eq!((found, removed), (1, [0, 10, 20]));
+            aggregate_pop_into(collection, true, &mut found, removed.as_mut_ptr().cast());
+            assert_eq!((found, removed), (1, [1, 11, 21]));
+
+            push(collection, 4);
+            push(collection, 5);
+            push(collection, 6);
+
+            let actual = (0..length(collection))
+                .map(|index| {
+                    aggregate_value_at(
+                        ptr::null(),
+                        collection,
+                        index as u64,
+                        true,
+                        COMPARE_UNSIGNED_64,
+                    )
+                    .cast::<Value>()
+                    .read()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                actual,
+                vec![
+                    [2, 12, 22],
+                    [3, 13, 23],
+                    [4, 14, 24],
+                    [5, 15, 25],
+                    [6, 16, 26]
+                ]
+            );
             free(collection);
         }
     }

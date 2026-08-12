@@ -78,10 +78,11 @@ runtime access-check cost.
 - **Concise initialization without hidden work.** Grouped locals such as
   `let writable $red, $green, $blue = 0;` evaluate one Copy initializer once,
   create independent bindings in source order, and never hide cloning, sharing, or a runtime tuple.
-- **Nominal choices without object overhead.** Unit and `int`/`string`-backed
-  enums are inline Copy values with exact case identity. Backed values are
-  explicit through the readonly `value` property; enums never silently become
-  integers, strings, or display text.
+- **Nominal choices without object overhead.** Unit, backed, and payload enums
+  are inline values with exact case identity. Payloads are Copy only when every
+  field is Copy; otherwise ownership moves with the enum. Backed values are
+  explicit through readonly `value`, and enums never silently become integers,
+  strings, objects, or display text.
 
 ## What people build with it
 

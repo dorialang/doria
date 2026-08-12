@@ -1,0 +1,27 @@
+enum Coordinate
+{
+    case Origin;
+    case Point(int $x, int $y);
+}
+
+function maybe(bool $present): ?Coordinate
+{
+    if ($present) {
+        return Coordinate::Origin;
+    }
+    return null;
+}
+
+function main(): void
+{
+    ?Coordinate $missing = maybe(false);
+    ?Coordinate $first = maybe(true);
+    ?Coordinate $point = Coordinate::Point(20, 22);
+
+    echo "{$missing == null} {$first != null} ";
+    echo "{($first ?? Coordinate::Point(0, 0)) == Coordinate::Origin} ";
+    if ($point != null) {
+        echo $point == Coordinate::Point(20, 22);
+    }
+    echo "\n";
+}

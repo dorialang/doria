@@ -77,7 +77,7 @@ function main(): void
             name: "value".to_string(),
             ty: Type::Scalar(ScalarType::Integer(IntegerType::Int64)),
         });
-    malformed(&payload_case, "constructs a payload case");
+    malformed(&payload_case, "represented as a scalar enum");
 
     let mut backing_on_unit = valid.clone();
     *assignment_rvalue(&mut backing_on_unit, "priority") =
@@ -165,6 +165,143 @@ function main(): void
     value.enum_id = EnumId(99);
     value.case_id.enum_id = EnumId(99);
     malformed(&mixed_identity, "enum#99");
+}
+
+#[test]
+fn shared_validator_requires_a_dominating_proof_for_narrowed_payload_enum_locals() {
+    let source = r#"
+enum Coordinate { case Point(int $x, int $y); }
+function main(): void
+{
+    ?Coordinate $point = Coordinate::Point(20, 22);
+    if ($point != null) {
+        bool $same = $point == Coordinate::Point(20, 22);
+    }
+}
+"#;
+    let valid = doriac::lower_source_to_mir("nullable-payload-enum.doria", source)
+        .expect("narrowed nullable payload enum should lower");
+    doriac::mir_validation::validate_program(&valid)
+        .expect("the null comparison should dominate the narrowed payload enum use");
+
+    let mut malformed = valid;
+    let entry = malformed.entry.0;
+    let entry_block = malformed.functions[entry].entry_block.0;
+    let Terminator::Branch { condition, .. } =
+        &mut malformed.functions[entry].blocks[entry_block].terminator
+    else {
+        panic!("expected nullable guard branch");
+    };
+    *condition = BoolExpression::Use {
+        operand: Operand::Scalar(ScalarValue::Bool(true)),
+    };
+
+    let error = doriac::mir_validation::validate_program(&malformed)
+        .expect_err("a narrowed payload enum use without its proof must be malformed MIR");
+    assert!(
+        error
+            .message
+            .contains("assumed non-null without a dominating presence proof"),
+        "unexpected malformed nullable payload enum diagnostic: {}",
+        error.message
+    );
+}
+
+#[test]
+fn shared_validator_rejects_malformed_payload_enum_shapes_and_transfer_modes() {
+    let source = r#"
+class Document {}
+enum Pair { case Values(int $number, string $label); }
+enum Coordinate { case Point(int $x, int $y); }
+enum LoadResult { case Loaded(Document $document); }
+function main(): void
+{
+    Pair $pair = Pair::Values(42, "answer");
+    Pair $pairCopy = $pair;
+    Coordinate $point = Coordinate::Point(20, 22);
+    Document $document = new Document();
+    LoadResult $result = LoadResult::Loaded($document);
+    LoadResult $moved = $result;
+}
+"#;
+    let valid = doriac::lower_source_to_mir("payload-enum-validation.doria", source)
+        .expect("valid payload enum source should lower");
+    doriac::mir_validation::validate_program(&valid)
+        .expect("valid payload enum MIR should validate");
+
+    let malformed = |program: &Program, expected: &str| {
+        let error = doriac::mir_validation::validate_program(program)
+            .expect_err("malformed payload enum MIR must stop before backend emission");
+        assert!(
+            error.message.contains(expected),
+            "expected {expected:?}, got {:?}",
+            error.message
+        );
+    };
+
+    let mut wrong_field_count = valid.clone();
+    let Rvalue::PayloadEnum(doriac::mir::PayloadEnumExpression::Construct { fields, .. }) =
+        assignment_rvalue(&mut wrong_field_count, "pair")
+    else {
+        panic!("expected payload enum construction");
+    };
+    fields.pop();
+    malformed(&wrong_field_count, "expects 2 fields, got 1");
+
+    let mut wrong_field_order = valid.clone();
+    let Rvalue::PayloadEnum(doriac::mir::PayloadEnumExpression::Construct { fields, .. }) =
+        assignment_rvalue(&mut wrong_field_order, "pair")
+    else {
+        panic!("expected payload enum construction");
+    };
+    fields.swap(0, 1);
+    malformed(&wrong_field_order, "field 1 has type string, expected int");
+
+    let mut wrong_case = valid.clone();
+    let Rvalue::PayloadEnum(doriac::mir::PayloadEnumExpression::Construct { case, .. }) =
+        assignment_rvalue(&mut wrong_case, "pair")
+    else {
+        panic!("expected payload enum construction");
+    };
+    *case = EnumCaseId {
+        enum_id: EnumId(1),
+        index: 0,
+    };
+    malformed(&wrong_case, "uses another enum case");
+
+    let mut wrong_layout = valid.clone();
+    let pair_copy = assignment_rvalue(&mut wrong_layout, "pairCopy");
+    let Rvalue::PayloadEnum(doriac::mir::PayloadEnumExpression::Use { ty, .. }) = pair_copy else {
+        panic!("expected payload enum copy");
+    };
+    ty.size += 1;
+    malformed(
+        &wrong_layout,
+        "payload enum local local1 receives a mismatched rvalue",
+    );
+
+    let mut copy_as_move = valid.clone();
+    let pair_copy = assignment_rvalue(&mut copy_as_move, "pairCopy");
+    let Rvalue::PayloadEnum(doriac::mir::PayloadEnumExpression::Use { mode, .. }) = pair_copy
+    else {
+        panic!("expected payload enum copy");
+    };
+    *mode = doriac::mir::PayloadEnumUseMode::Move;
+    malformed(
+        &copy_as_move,
+        "copy payload enum is transferred instead of copied",
+    );
+
+    let mut move_as_copy = valid;
+    let moved = assignment_rvalue(&mut move_as_copy, "moved");
+    let Rvalue::PayloadEnum(doriac::mir::PayloadEnumExpression::Use { mode, .. }) = moved else {
+        panic!("expected payload enum move");
+    };
+    *mode = doriac::mir::PayloadEnumUseMode::Copy;
+    malformed(
+        &move_as_copy,
+        "move payload enum is copied instead of transferred",
+    );
 }
 
 fn assignment_rvalue<'a>(program: &'a mut Program, local_name: &str) -> &'a mut Rvalue {

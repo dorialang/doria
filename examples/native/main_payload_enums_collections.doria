@@ -1,0 +1,64 @@
+enum Coordinate
+{
+    case Origin;
+    case Point(int $x, int $y);
+}
+
+function main(): void
+{
+    writable Coordinate[] $fixed = [Coordinate::Origin, Coordinate::Point(1, 2)];
+    $fixed[0] = Coordinate::Point(20, 22);
+    echo "fixed {$fixed[0] == Coordinate::Point(20, 22)} ";
+
+    writable List<Coordinate> $items = [];
+    foreach (0..20 as int $value) {
+        $items->add(Coordinate::Point($value, $value));
+    }
+    $items->insertAt(1, Coordinate::Origin);
+    Coordinate $removed = $items->removeAt(1);
+    ?Coordinate $popped = $items->pop();
+    echo "list {$items->count} {$removed == Coordinate::Origin} " .
+        "{($popped ?? Coordinate::Origin) == Coordinate::Point(20, 20)} ";
+    writable int $visited = 0;
+    foreach ($items as Coordinate $item) {
+        if ($item == Coordinate::Point($visited, $visited)) {
+            $visited++;
+        }
+    }
+    echo "{$visited} ";
+
+    writable Dictionary<string, Coordinate> $named = [
+        "answer" => Coordinate::Point(1, 2),
+    ];
+    $named->set("answer", Coordinate::Point(20, 22));
+    $named["other"] = Coordinate::Origin;
+    ?Coordinate $removedNamed = $named->remove("other");
+    echo "dictionary {$named->containsValue(Coordinate::Point(20, 22))} " .
+        "{($removedNamed ?? Coordinate::Point(-1, -1)) == Coordinate::Origin} ";
+
+    writable SortedDictionary<string, Coordinate> $sorted = SortedDictionary::from($named);
+    $sorted->set("zero", Coordinate::Origin);
+    echo "sorted {$sorted->containsValue(Coordinate::Origin)} ";
+
+    writable Deque<Coordinate> $queue = Deque::from([]);
+    foreach (0..20 as int $value) {
+        $queue->pushBack(Coordinate::Point($value, $value));
+    }
+    Coordinate $front = $queue->popFront() ?? Coordinate::Origin;
+    $queue->pushFront(Coordinate::Origin);
+    $queue->pushBack(Coordinate::Point(20, 20));
+    echo "deque {$front == Coordinate::Point(0, 0)} " .
+        "{$queue->contains(Coordinate::Point(20, 20))} ";
+
+    writable List<?Coordinate> $nullable = [null, Coordinate::Origin];
+    echo "nullable {$nullable->contains(null)} " .
+        ($nullable->indexOf(Coordinate::Origin) ?? -1) . " ";
+
+    $items->clear();
+    $named->clear();
+    $sorted->clear();
+    $queue->clear();
+    $nullable->clear();
+    echo "clear {$items->count} {$named->count} {$sorted->count} " .
+        "{$queue->count} {$nullable->count}\n";
+}

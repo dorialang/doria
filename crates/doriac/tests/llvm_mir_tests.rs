@@ -65,6 +65,7 @@ function main(): void
     echo $nullable != null;
     echo $boxed is Status;
 }
+
 "#;
     let program = doriac::lower_source_to_mir("llvm-enum.doria", source)
         .expect("enum source should lower to validated MIR");
@@ -99,6 +100,39 @@ function main(): void
         !ir.contains("dr_v1_enum_"),
         "unit/backed enums gained a runtime allocation API:\n{ir}"
     );
+}
+
+#[test]
+fn payload_enum_ir_stays_inline_across_mixed_and_collection_storage() {
+    let source = include_str!("../../../examples/native/main_payload_enums_mixed.doria");
+    let collections = include_str!("../../../examples/native/main_payload_enums_collections.doria");
+
+    for (name, source) in [("mixed", source), ("collections", collections)] {
+        let program = doriac::lower_source_to_mir(format!("llvm-payload-{name}.doria"), source)
+            .expect("payload enum source should lower to validated MIR");
+        let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
+            .expect("payload enum MIR should lower to LLVM IR");
+
+        assert!(
+            ir.contains("payload.enum.construct"),
+            "payload construction is not represented as inline storage:\n{ir}"
+        );
+        assert!(
+            !ir.contains("dr_v1_enum_") && !ir.contains("dr_v4_enum_"),
+            "ordinary payload enums gained a runtime allocation API:\n{ir}"
+        );
+        if name == "mixed" {
+            assert!(
+                ir.contains("dr_v2_mixed_new_aggregate"),
+                "mixed payload enums do not use the existing aggregate box:\n{ir}"
+            );
+        } else {
+            assert!(
+                ir.contains("dr_v4_collection_new_aggregate"),
+                "payload enum collections do not use inline aggregate slots:\n{ir}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -271,7 +305,7 @@ fn scan_alloca_placement(ir: &str) -> AllocaPlacement {
 /// how many times the surrounding code runs.
 #[test]
 fn allocates_every_scratch_slot_in_the_entry_block() {
-    let sources: [&str; 7] = [
+    let sources: [&str; 8] = [
         // Dictionary get, set, index, and remove: the shape that first failed.
         r#"
 function main(): void
@@ -295,6 +329,9 @@ function main(): void
     echo "{$total}:{$values->count}\n";
 }
 "#,
+        // Aggregate enum collection reads, nullable removals, conversion, and
+        // cleanup must also reuse fixed entry-block scratch.
+        include_str!("../../../examples/native/main_payload_enums_collections.doria"),
         // Set construction, membership, and removal inside a loop.
         r#"
 function main(): void
