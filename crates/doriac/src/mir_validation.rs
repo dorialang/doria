@@ -7191,7 +7191,10 @@ fn validate_match_binding_plans(function: &mir::Function) -> Result<(), BackendE
 
     for block in &function.blocks {
         for statement in &block.statements {
-            let mir::Statement::MatchResultPlan { mode, arms, .. } = statement else {
+            let mir::Statement::MatchResultPlan {
+                mode, arms, merge, ..
+            } = statement
+            else {
                 continue;
             };
             let binding_mode = match mode {
@@ -7216,13 +7219,29 @@ fn validate_match_binding_plans(function: &mir::Function) -> Result<(), BackendE
                         "match guard block overlaps another match guard or binding",
                     ));
                 }
-                match &block_in(function, guard)?.terminator {
-                    mir::Terminator::Branch { then_block, .. } if *then_block == arm.binding => {}
-                    _ => {
-                        return Err(malformed_mir(
-                            "match guard must branch to its final binding block on success",
-                        ));
-                    }
+            }
+
+            let arm_boundaries = arms
+                .iter()
+                .flat_map(|arm| std::iter::once(arm.binding).chain(arm.guard))
+                .collect::<HashSet<_>>();
+            for arm in arms {
+                let Some(guard) = arm.guard else {
+                    continue;
+                };
+                if !matches!(
+                    block_in(function, guard)?.terminator,
+                    mir::Terminator::Branch { .. }
+                ) || !match_guard_reaches_binding(
+                    function,
+                    guard,
+                    arm.binding,
+                    *merge,
+                    &arm_boundaries,
+                )? {
+                    return Err(malformed_mir(
+                        "match guard must branch through a success path to its final binding block",
+                    ));
                 }
             }
         }
@@ -7242,6 +7261,32 @@ fn validate_match_binding_plans(function: &mir::Function) -> Result<(), BackendE
     }
 
     Ok(())
+}
+
+fn match_guard_reaches_binding(
+    function: &mir::Function,
+    guard: mir::BlockId,
+    binding: mir::BlockId,
+    merge: mir::BlockId,
+    arm_boundaries: &HashSet<mir::BlockId>,
+) -> Result<bool, BackendError> {
+    let mut pending = VecDeque::from([guard]);
+    let mut visited = HashSet::new();
+    while let Some(block_id) = pending.pop_front() {
+        if block_id == binding {
+            return Ok(true);
+        }
+        if !visited.insert(block_id)
+            || block_id == merge
+            || (block_id != guard && arm_boundaries.contains(&block_id))
+        {
+            continue;
+        }
+        pending.extend(terminator_targets(
+            &block_in(function, block_id)?.terminator,
+        ));
+    }
+    Ok(false)
 }
 
 fn validate_match_arm_result_path(

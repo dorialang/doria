@@ -397,7 +397,7 @@ function main(): void { echo copyLabel(CopyResult::Text("ready")); }
     *then_block = merge;
     malformed(
         &guard_skips_binding,
-        "match guard must branch to its final binding block on success",
+        "match guard must branch through a success path to its final binding block",
     );
 
     let mut duplicate_consumed_extraction = valid;
@@ -429,6 +429,29 @@ function main(): void { echo copyLabel(CopyResult::Text("ready")); }
         &duplicate_consumed_extraction,
         "without a dominating exact case proof",
     );
+}
+
+#[test]
+fn shared_validator_accepts_negated_and_short_circuit_match_guard_cfgs() {
+    let source = r#"
+enum Value { case Number(int $number); }
+function select(Value $value, bool $left, bool $right): int
+{
+    return match ($value) {
+        Value::Number($number) if !$left => $number,
+        Value::Number($number) if $left && $right => $number + 1,
+        Value::Number($number) => $number + 2,
+    };
+}
+function main(): void
+{
+    echo select(Value::Number(1), false, true);
+}
+"#;
+    let program = doriac::lower_source_to_mir("match-guard-cfg.doria", source)
+        .expect("multi-block match guards should lower");
+    doriac::mir_validation::validate_program(&program)
+        .expect("multi-block match guard success paths should reach their binding blocks");
 }
 
 #[test]

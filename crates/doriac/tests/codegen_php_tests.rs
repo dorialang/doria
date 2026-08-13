@@ -193,6 +193,11 @@ function inspect(mixed $value): string
     };
 }
 
+function makeInt(): mixed
+{
+    return 7;
+}
+
 function main(): void
 {
     int8 $int8Value = 1;
@@ -208,7 +213,8 @@ function main(): void
     echo inspect($int8Value) . " " . inspect($int16Value) . " " . inspect($int32Value) . " " . inspect($intValue) . "\n";
     echo inspect($uint8Value) . " " . inspect($uint16Value) . " " . inspect($uint32Value) . " " . inspect($uint64Value) . "\n";
     echo inspect($float32Value) . " " . inspect($floatValue) . " " . inspect(true) . " " . inspect("text") . "\n";
-    echo inspect(UnitState::Ready) . " " . inspect(BackedState::Ready) . " " . inspect(PayloadState::Ready(7)) . " " . inspect(new Document());
+    echo inspect(UnitState::Ready) . " " . inspect(BackedState::Ready) . " " . inspect(PayloadState::Ready(7)) . " " . inspect(new Document()) . "\n";
+    echo inspect(makeInt());
 }
 "#,
     )
@@ -240,7 +246,7 @@ function main(): void
     );
     assert_eq!(
         run.stdout,
-        b"int8 int16 int32 int\nuint8 uint16 uint32 uint64\nfloat32 float bool string\nunit backed payload class"
+        b"int8 int16 int32 int\nuint8 uint16 uint32 uint64\nfloat32 float bool string\nunit backed payload class\nint"
     );
 }
 

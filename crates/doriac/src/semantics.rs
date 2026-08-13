@@ -10423,7 +10423,6 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let got = self.infer_expr_type(arg, scopes, method_context);
-        self.record_mixed_boundary(param.ty, arg, got);
         let parameter_is_class_like = self.type_is_class_or_nullable_class(param.ty);
 
         if self.is_expr_assignable(param.ty, arg, scopes, method_context)
@@ -11938,7 +11937,6 @@ impl<'program> Checker<'program> {
         }
 
         let value = self.infer_expr_type(value_expr, scopes, method_context);
-        self.record_mixed_boundary(target, value_expr, value);
         if self.is_expr_assignable(target, value_expr, scopes, method_context)
             || self.is_assignable(target, value)
         {
@@ -12017,14 +12015,29 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
+        self.is_expr_assignable_impl(target, value_expr, scopes, method_context, true)
+    }
+
+    fn is_expr_assignable_impl(
+        &mut self,
+        target: TypeId,
+        value_expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+        record_boundary: bool,
+    ) -> bool {
         self.complete_generic_call_from_expected(value_expr, target);
+        if record_boundary && matches!(self.types.kind(target), TypeKind::Mixed) {
+            let value = self.infer_expr_type(value_expr, scopes, method_context);
+            self.record_mixed_boundary(target, value_expr, value);
+        }
         if let Some(fits) = self.contextualize_scalar_literals(target, value_expr) {
             return fits;
         }
 
         match value_expr {
             Expr::Grouped { expr, .. } => {
-                self.is_expr_assignable(target, expr, scopes, method_context)
+                self.is_expr_assignable_impl(target, expr, scopes, method_context, false)
             }
             Expr::Array { elements, .. } => {
                 self.is_array_literal_assignable(target, elements, scopes, method_context)
