@@ -1547,15 +1547,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             Some(class),
                         ))
                     }
-                    mir::Type::Collection(_) if local.owned => Some((
-                        build(self.builder.build_load(
-                            self.context.ptr_type(AddressSpace::default()),
-                            slot,
-                            "collection.old",
-                        ))?
-                        .into_pointer_value(),
-                        None,
-                    )),
+                    mir::Type::Collection(_) | mir::Type::NullableCollection(_) if local.owned => {
+                        Some((
+                            build(self.builder.build_load(
+                                self.context.ptr_type(AddressSpace::default()),
+                                slot,
+                                "collection.old",
+                            ))?
+                            .into_pointer_value(),
+                            None,
+                        ))
+                    }
                     mir::Type::Mixed | mir::Type::NullableMixed if local.owned => Some((
                         build(self.builder.build_load(
                             self.context.ptr_type(AddressSpace::default()),
@@ -1589,6 +1591,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             None,
                         ))
                     }
+                    mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
+                        if local.owned =>
+                    {
+                        let nullable = matches!(local.ty, mir::Type::NullablePayloadEnum(_));
+                        let old =
+                            self.entry_payload_alloca(payload, nullable, "local.payload.old")?;
+                        self.copy_payload_bytes(old, slot, payload, nullable)?;
+                        Some((old, None))
+                    }
                     _ => None,
                 };
                 let value = self.lower_rvalue(value)?;
@@ -1605,7 +1616,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     build(self.builder.build_store(slot, value))?;
                 }
                 if let Some((old, class)) = old {
-                    if let mir::Type::Collection(collection) = local.ty {
+                    if let mir::Type::Collection(collection)
+                    | mir::Type::NullableCollection(collection) = local.ty
+                    {
                         self.drop_collection_value(old, collection)?;
                     } else if matches!(local.ty, mir::Type::Mixed | mir::Type::NullableMixed) {
                         self.drop_mixed_value(old)?;
@@ -1623,6 +1636,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         self.drop_shared_value(old, false)?;
                     } else if let Some(class) = class {
                         self.drop_class_value_checked(old, class)?;
+                    } else if let mir::Type::PayloadEnum(payload) = local.ty {
+                        self.drop_payload_enum_at(old, payload, false)?;
+                    } else if let mir::Type::NullablePayloadEnum(payload) = local.ty {
+                        self.drop_payload_enum_at(old, payload, true)?;
                     } else {
                         self.release_string(old)?;
                     }

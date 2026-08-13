@@ -3106,6 +3106,44 @@ enum DropObligation {
     PayloadEnum(mir::LocalId, mir::PayloadEnumType, bool),
 }
 
+fn user_local_type_owns_value(ty: mir::Type) -> bool {
+    matches!(
+        ty,
+        mir::Type::Class(_)
+            | mir::Type::NullableClass(_)
+            | mir::Type::SharedReference(_)
+            | mir::Type::WeakReference(_)
+            | mir::Type::NullableSharedReference(_)
+            | mir::Type::NullableWeakReference(_)
+            | mir::Type::WritableSharedReference(_)
+            | mir::Type::WritableWeakReference(_)
+            | mir::Type::NullableWritableSharedReference(_)
+            | mir::Type::NullableWritableWeakReference(_)
+            | mir::Type::ReadonlySharedReferenceAccess(_)
+            | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_)
+            | mir::Type::Mixed
+            | mir::Type::NullableMixed
+            | mir::Type::Collection(_)
+            | mir::Type::NullableCollection(_)
+            | mir::Type::PayloadEnum(mir::PayloadEnumType {
+                capabilities: crate::enums::EnumCapabilities {
+                    needs_drop: true,
+                    ..
+                },
+                ..
+            })
+            | mir::Type::NullablePayloadEnum(mir::PayloadEnumType {
+                capabilities: crate::enums::EnumCapabilities {
+                    needs_drop: true,
+                    ..
+                },
+                ..
+            })
+    )
+}
+
 fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropObligation {
     if let Some(access) = ty.shared_access() {
         return DropObligation::SharedAccess(local, access.payload, access.writable);
@@ -3380,40 +3418,7 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn declare_user_local(&mut self, name: &str, writable: bool, ty: mir::Type) -> mir::LocalId {
-        let owned = matches!(
-            ty,
-            mir::Type::Class(_)
-                | mir::Type::NullableClass(_)
-                | mir::Type::SharedReference(_)
-                | mir::Type::WeakReference(_)
-                | mir::Type::NullableSharedReference(_)
-                | mir::Type::NullableWeakReference(_)
-                | mir::Type::WritableSharedReference(_)
-                | mir::Type::WritableWeakReference(_)
-                | mir::Type::NullableWritableSharedReference(_)
-                | mir::Type::NullableWritableWeakReference(_)
-                | mir::Type::ReadonlySharedReferenceAccess(_)
-                | mir::Type::WritableSharedReferenceAccess(_)
-                | mir::Type::NullableReadonlySharedReferenceAccess(_)
-                | mir::Type::NullableWritableSharedReferenceAccess(_)
-                | mir::Type::Mixed
-                | mir::Type::NullableMixed
-                | mir::Type::Collection(_)
-                | mir::Type::PayloadEnum(mir::PayloadEnumType {
-                    capabilities: crate::enums::EnumCapabilities {
-                        needs_drop: true,
-                        ..
-                    },
-                    ..
-                })
-                | mir::Type::NullablePayloadEnum(mir::PayloadEnumType {
-                    capabilities: crate::enums::EnumCapabilities {
-                        needs_drop: true,
-                        ..
-                    },
-                    ..
-                })
-        );
+        let owned = user_local_type_owns_value(ty);
         self.declare_user_local_owned(name, writable, ty, owned)
     }
 
@@ -4091,42 +4096,6 @@ impl<'semantic> LoweringContext<'semantic> {
                 Some(mir::WritableSharedPayload::Collection(collection))
             }
             _ => None,
-        }
-    }
-
-    fn local_scalar_type(&self, id: mir::LocalId) -> DiagnosticResult<mir::ScalarType> {
-        match self.local_type(id) {
-            mir::Type::Scalar(ty) => Ok(ty),
-            mir::Type::String
-            | mir::Type::Mixed
-            | mir::Type::NullableScalar(_)
-            | mir::Type::NullableString
-            | mir::Type::NullableMixed
-            | mir::Type::Class(_)
-            | mir::Type::NullableClass(_)
-            | mir::Type::SharedReference(_)
-            | mir::Type::WeakReference(_)
-            | mir::Type::NullableSharedReference(_)
-            | mir::Type::NullableWeakReference(_)
-            | mir::Type::WritableSharedReference(_)
-            | mir::Type::WritableWeakReference(_)
-            | mir::Type::NullableWritableSharedReference(_)
-            | mir::Type::NullableWritableWeakReference(_)
-            | mir::Type::ReadonlySharedReferenceAccess(_)
-            | mir::Type::WritableSharedReferenceAccess(_)
-            | mir::Type::NullableReadonlySharedReferenceAccess(_)
-            | mir::Type::NullableWritableSharedReferenceAccess(_)
-            | mir::Type::Collection(_)
-            | mir::Type::NullableCollection(_)
-            | mir::Type::PayloadEnum(_)
-            | mir::Type::NullablePayloadEnum(_) => Err(vec![Diagnostic::new(
-                "I1401",
-                format!(
-                    "internal compiler consistency error: string local local{} used as a scalar",
-                    id.0
-                ),
-                Span::default(),
-            )]),
         }
     }
 }
@@ -4851,175 +4820,25 @@ fn lower_assignment(
         return Ok(());
     }
     let target = lower_assignment_target(target, context)?;
-    if context.local_type(target) == mir::Type::String {
-        let value = mir::Rvalue::String(lower_string_expression(&assignment.value, context)?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-    if context.local_type(target) == mir::Type::NullableString {
-        let value = mir::Rvalue::NullableString(lower_nullable_string_expression(
-            &assignment.value,
-            context,
-        )?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-    if let mir::Type::NullableScalar(scalar) = context.local_type(target) {
-        let value = mir::Rvalue::NullableScalar(lower_nullable_scalar_expression(
-            &assignment.value,
-            scalar,
-            context,
-        )?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-    if let mir::Type::NullableClass(class) = context.local_type(target) {
-        if !context.local_owns(target) {
-            return Err(vec![unsupported(
+    let target_type = context.local_type(target);
+    if user_local_type_owns_value(target_type) && !context.local_owns(target) {
+        let diagnostic = if matches!(target_type, mir::Type::Class(_)) {
+            Diagnostic::new(
+                "E0505",
+                "this compiler version cannot replace the class value held through a borrowed parameter",
                 assignment.span,
-                "this compiler version cannot replace a borrowed nullable class value",
-            )]);
-        }
-        let value = mir::Rvalue::NullableClass(lower_nullable_class_expression(
-            &assignment.value,
-            class,
-            true,
-            context,
-        )?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-    if context.local_type(target) == mir::Type::Mixed {
-        if !context.local_owns(target) {
-            return Err(vec![unsupported(
+            )
+            .with_help("mutate the object's writable properties, or use a `take` parameter when the callee should own a replacement")
+        } else {
+            unsupported(
                 assignment.span,
-                "this compiler version cannot replace a borrowed mixed value",
-            )]);
-        }
-        let value = mir::Rvalue::Mixed(lower_mixed_expression(&assignment.value, true, context)?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
+                format!("this compiler version cannot replace a borrowed {target_type} value"),
+            )
+        };
+        return Err(vec![diagnostic]);
     }
-    if context.local_type(target) == mir::Type::NullableMixed {
-        if !context.local_owns(target) {
-            return Err(vec![unsupported(
-                assignment.span,
-                "this compiler version cannot replace a borrowed nullable mixed value",
-            )]);
-        }
-        let value = mir::Rvalue::NullableMixed(lower_nullable_mixed_expression(
-            &assignment.value,
-            true,
-            context,
-        )?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-    if let mir::Type::Class(class) = context.local_type(target) {
-        if !context.local_owns(target) {
-            return Err(vec![
-                Diagnostic::new(
-                    "E0505",
-                    "this compiler version cannot replace the class value held through a borrowed parameter",
-                    assignment.span,
-                )
-                .with_help("mutate the object's writable properties, or use a `take` parameter when the callee should own a replacement"),
-            ]);
-        }
-        let value = mir::Rvalue::Class(lower_class_expression(
-            &assignment.value,
-            class,
-            true,
-            context,
-        )?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-    if let mir::Type::SharedReference(class) = context.local_type(target) {
-        if !context.local_owns(target) {
-            return Err(vec![unsupported(
-                assignment.span,
-                "this compiler version cannot replace a borrowed shared reference",
-            )]);
-        }
-        let value = mir::Rvalue::SharedReference(lower_shared_reference_expression(
-            &assignment.value,
-            class,
-            true,
-            context,
-        )?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-    if let mir::Type::WeakReference(class) = context.local_type(target) {
-        if !context.local_owns(target) {
-            return Err(vec![unsupported(
-                assignment.span,
-                "this compiler version cannot replace a borrowed weak reference",
-            )]);
-        }
-        let value = mir::Rvalue::WeakReference(lower_weak_reference_expression(
-            &assignment.value,
-            class,
-            true,
-            context,
-        )?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-    if let mir::Type::NullableSharedReference(class) = context.local_type(target) {
-        if !context.local_owns(target) {
-            return Err(vec![unsupported(
-                assignment.span,
-                "this compiler version cannot replace a borrowed nullable shared reference",
-            )]);
-        }
-        let value = mir::Rvalue::NullableSharedReference(
-            lower_nullable_shared_reference_expression(&assignment.value, class, true, context)?,
-        );
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-    if let mir::Type::NullableWeakReference(class) = context.local_type(target) {
-        if !context.local_owns(target) {
-            return Err(vec![unsupported(
-                assignment.span,
-                "this compiler version cannot replace a borrowed nullable weak reference",
-            )]);
-        }
-        let value = mir::Rvalue::NullableWeakReference(lower_nullable_weak_reference_expression(
-            &assignment.value,
-            class,
-            true,
-            context,
-        )?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-    if let mir::Type::Collection(collection) = context.local_type(target) {
-        if !context.local_owns(target) {
-            return Err(vec![unsupported(
-                assignment.span,
-                "this compiler version cannot replace a borrowed collection value",
-            )]);
-        }
-        let value = mir::Rvalue::Collection(lower_collection_expression(
-            &assignment.value,
-            collection,
-            true,
-            context,
-        )?);
-        context.push_statement(mir::Statement::AssignLocal { target, value });
-        return Ok(());
-    }
-
-    let scalar_type = context.local_scalar_type(target)?;
-    let value = lower_value_expression(&assignment.value, context)?;
-    ensure_value_type(&value, scalar_type, assignment.value.span())?;
-    context.push_statement(mir::Statement::AssignLocal {
-        target,
-        value: mir::Rvalue::Value(value),
-    });
+    let value = lower_rvalue_as_expected(&assignment.value, target_type, context)?;
+    context.push_statement(mir::Statement::AssignLocal { target, value });
     Ok(())
 }
 
@@ -9914,7 +9733,11 @@ fn lower_rvalue_as_expected(
         mir::Type::NullableMixed => {
             lower_nullable_mixed_expression(expr, true, context).map(mir::Rvalue::NullableMixed)
         }
-        mir::Type::Scalar(_) => lower_value_expression(expr, context).map(mir::Rvalue::Value),
+        mir::Type::Scalar(expected) => {
+            let value = lower_value_expression(expr, context)?;
+            ensure_value_type(&value, expected, expr.span())?;
+            Ok(mir::Rvalue::Value(value))
+        }
         mir::Type::Class(class) => {
             lower_class_expression(expr, class, true, context).map(mir::Rvalue::Class)
         }

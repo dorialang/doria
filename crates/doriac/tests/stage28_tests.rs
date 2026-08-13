@@ -81,6 +81,41 @@ function main(): void
 }
 
 #[test]
+fn writable_payload_enum_locals_can_replace_their_active_case() {
+    let output = interpret(
+        r#"
+enum DeliveryStatus
+{
+    case Pending;
+    case InTransit(string $city);
+    case Delivered(string $recipient);
+}
+
+function describe(DeliveryStatus $status): string
+{
+    return match ($status) {
+        DeliveryStatus::Pending => "waiting to leave",
+        DeliveryStatus::InTransit($city) => "in transit through {$city}",
+        DeliveryStatus::Delivered($recipient) => "delivered to {$recipient}",
+    };
+}
+
+function main(): void
+{
+    let writable $status = DeliveryStatus::InTransit("Lusaka");
+    echo describe($status) . "\n";
+    $status = DeliveryStatus::Delivered("Kitwe");
+    echo describe($status) . "\n";
+}
+"#,
+    );
+    assert_eq!(
+        output.stdout,
+        b"in transit through Lusaka\ndelivered to Kitwe\n"
+    );
+}
+
+#[test]
 fn match_evaluates_one_scrutinee_and_only_the_selected_arm() {
     let output = interpret(
         r#"

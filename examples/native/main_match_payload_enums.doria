@@ -17,6 +17,8 @@ function describe(Delivery $delivery): string
 function main(): void
 {
     echo describe(Delivery::Queued) . "\n";
-    echo describe(Delivery::Sent("A-17")) . "\n";
-    echo describe(Delivery::Failed(503, "offline")) . "\n";
+    let writable $delivery = Delivery::Sent("A-17");
+    echo describe($delivery) . "\n";
+    $delivery = Delivery::Failed(503, "offline");
+    echo describe($delivery) . "\n";
 }
