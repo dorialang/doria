@@ -1020,6 +1020,8 @@ struct Flow {
     falls_through: bool,
     backedges: Vec<Scopes>,
     breaks: Vec<Scopes>,
+    returns: Vec<Scopes>,
+    yields: Vec<Scopes>,
 }
 
 impl Flow {
@@ -1028,6 +1030,8 @@ impl Flow {
             falls_through: true,
             backedges: Vec::new(),
             breaks: Vec::new(),
+            returns: Vec::new(),
+            yields: Vec::new(),
         }
     }
 
@@ -1036,6 +1040,8 @@ impl Flow {
             falls_through: false,
             backedges: Vec::new(),
             breaks: Vec::new(),
+            returns: Vec::new(),
+            yields: Vec::new(),
         }
     }
 
@@ -1044,6 +1050,28 @@ impl Flow {
             falls_through: false,
             backedges: Vec::new(),
             breaks: vec![scopes.clone()],
+            returns: Vec::new(),
+            yields: Vec::new(),
+        }
+    }
+
+    fn returns(scopes: &Scopes) -> Self {
+        Self {
+            falls_through: false,
+            backedges: Vec::new(),
+            breaks: Vec::new(),
+            returns: vec![scopes.clone()],
+            yields: Vec::new(),
+        }
+    }
+
+    fn yields(scopes: &Scopes) -> Self {
+        Self {
+            falls_through: false,
+            backedges: Vec::new(),
+            breaks: Vec::new(),
+            returns: Vec::new(),
+            yields: vec![scopes.clone()],
         }
     }
 }
@@ -1207,6 +1235,8 @@ impl Checker<'_> {
             flow.falls_through = statement_flow.falls_through;
             flow.backedges.extend(statement_flow.backedges);
             flow.breaks.extend(statement_flow.breaks);
+            flow.returns.extend(statement_flow.returns);
+            flow.yields.extend(statement_flow.yields);
         }
         if nested {
             scopes.pop();
@@ -1215,6 +1245,12 @@ impl Checker<'_> {
             }
             for break_exit in &mut flow.breaks {
                 break_exit.pop();
+            }
+            for return_exit in &mut flow.returns {
+                return_exit.pop();
+            }
+            for yield_exit in &mut flow.yields {
+                yield_exit.pop();
             }
         }
         flow
@@ -1532,7 +1568,7 @@ impl Checker<'_> {
                         } else {
                             self.use_expr(expr, scopes, mode);
                         }
-                        return Flow::stops();
+                        return Flow::yields(scopes);
                     }
                     if return_move_type
                         && self.current_return_borrow.is_none()
@@ -1561,9 +1597,20 @@ impl Checker<'_> {
                         },
                     );
                 }
-                Flow::stops()
+                Flow::returns(scopes)
             }
             Stmt::If(statement) => {
+                if let Some(finally) = &statement.finally {
+                    let mut attached = statement.clone();
+                    attached.finally = None;
+                    let flow = self.check_statement(&Stmt::If(attached), scopes, return_move_type);
+                    return self.apply_finally_to_flow(
+                        &finally.block,
+                        scopes,
+                        flow,
+                        return_move_type,
+                    );
+                }
                 if let Some(given) = &statement.given {
                     scopes.push();
                     self.check_given_setup(given, scopes, return_move_type);
@@ -1631,13 +1678,29 @@ impl Checker<'_> {
                 }
                 then_flow.backedges.append(&mut else_flow.backedges);
                 then_flow.breaks.append(&mut else_flow.breaks);
+                then_flow.returns.append(&mut else_flow.returns);
+                then_flow.yields.append(&mut else_flow.yields);
                 Flow {
                     falls_through: then_flow.falls_through || else_flow.falls_through,
                     backedges: then_flow.backedges,
                     breaks: then_flow.breaks,
+                    returns: then_flow.returns,
+                    yields: then_flow.yields,
                 }
             }
             Stmt::While(statement) => {
+                if let Some(finally) = &statement.finally {
+                    let mut attached = statement.clone();
+                    attached.finally = None;
+                    let flow =
+                        self.check_statement(&Stmt::While(attached), scopes, return_move_type);
+                    return self.apply_finally_to_flow(
+                        &finally.block,
+                        scopes,
+                        flow,
+                        return_move_type,
+                    );
+                }
                 if let Some(given) = &statement.given {
                     scopes.push();
                     let predicates = self.check_given_setup(given, scopes, return_move_type);
@@ -1657,6 +1720,18 @@ impl Checker<'_> {
                 }
             }
             Stmt::DoWhile(statement) => {
+                if let Some(finally) = &statement.finally {
+                    let mut attached = statement.clone();
+                    attached.finally = None;
+                    let flow =
+                        self.check_statement(&Stmt::DoWhile(attached), scopes, return_move_type);
+                    return self.apply_finally_to_flow(
+                        &finally.block,
+                        scopes,
+                        flow,
+                        return_move_type,
+                    );
+                }
                 let before = scopes.clone();
                 let mut body = before.clone();
                 let mut body_flow =
@@ -1674,14 +1749,21 @@ impl Checker<'_> {
                 );
                 let condition = constant_bool(&statement.condition);
                 let mut exits = body_flow.breaks;
+                let returns = body_flow.returns;
                 if condition != Some(true) {
                     exits.extend(body_flow.backedges);
                 }
                 if exits.is_empty() {
-                    Flow::stops()
+                    Flow {
+                        returns,
+                        ..Flow::stops()
+                    }
                 } else {
                     merge_reachable_states(scopes, &exits);
-                    Flow::fallthrough()
+                    Flow {
+                        returns,
+                        ..Flow::fallthrough()
+                    }
                 }
             }
             Stmt::For(statement) => {
@@ -1722,11 +1804,18 @@ impl Checker<'_> {
                     self.check_for_tail(statement, repeat, return_move_type);
                 }
                 self.check_for_second_iteration(statement, &body_flow.backedges, return_move_type);
+                let mut returns = body_flow.returns;
                 let mut exits = body_flow.backedges;
                 exits.extend(body_flow.breaks);
                 merge_loop_exit(scopes, &before, &exits);
                 scopes.pop();
-                Flow::fallthrough()
+                for return_exit in &mut returns {
+                    return_exit.pop();
+                }
+                Flow {
+                    returns,
+                    ..Flow::fallthrough()
+                }
             }
             Stmt::Foreach(statement) => {
                 self.use_expr(&statement.iterable, scopes, UseMode::Read);
@@ -1742,10 +1831,14 @@ impl Checker<'_> {
                     &body_flow.backedges,
                     return_move_type,
                 );
+                let returns = body_flow.returns;
                 let mut exits = body_flow.backedges;
                 exits.extend(body_flow.breaks);
                 merge_loop_exit(scopes, &before, &exits);
-                Flow::fallthrough()
+                Flow {
+                    returns,
+                    ..Flow::fallthrough()
+                }
             }
             Stmt::Increment(increment) => {
                 self.use_expr(&increment.target, scopes, UseMode::Read);
@@ -1756,8 +1849,41 @@ impl Checker<'_> {
                 falls_through: false,
                 backedges: vec![scopes.clone()],
                 breaks: Vec::new(),
+                returns: Vec::new(),
+                yields: Vec::new(),
             },
         }
+    }
+
+    fn apply_finally_to_flow(
+        &mut self,
+        finally: &ast::Block,
+        scopes: &mut Scopes,
+        mut flow: Flow,
+        return_move_type: bool,
+    ) -> Flow {
+        if flow.falls_through {
+            flow.falls_through = self
+                .check_block(finally, scopes, return_move_type, true)
+                .falls_through;
+        }
+        flow.backedges.retain_mut(|state| {
+            self.check_block(finally, state, return_move_type, true)
+                .falls_through
+        });
+        flow.breaks.retain_mut(|state| {
+            self.check_block(finally, state, return_move_type, true)
+                .falls_through
+        });
+        flow.returns.retain_mut(|state| {
+            self.check_block(finally, state, return_move_type, true)
+                .falls_through
+        });
+        flow.yields.retain_mut(|state| {
+            self.check_block(finally, state, return_move_type, true)
+                .falls_through
+        });
+        flow
     }
 
     fn check_given_setup<'a>(
@@ -1817,10 +1943,14 @@ impl Checker<'_> {
             self.use_expr(&statement.condition, repeat, UseMode::Read);
         }
         self.check_second_iteration(&statement.body, &body_flow.backedges, return_move_type);
+        let returns = body_flow.returns;
         let mut exits = body_flow.backedges;
         exits.extend(body_flow.breaks);
         merge_loop_exit(scopes, &before, &exits);
-        Flow::fallthrough()
+        Flow {
+            returns,
+            ..Flow::fallthrough()
+        }
     }
 
     fn check_foreach_iteration(
@@ -1843,6 +1973,12 @@ impl Checker<'_> {
         }
         for break_exit in &mut flow.breaks {
             break_exit.pop();
+        }
+        for return_exit in &mut flow.returns {
+            return_exit.pop();
+        }
+        for yield_exit in &mut flow.yields {
+            yield_exit.pop();
         }
         self.active_borrows.truncate(borrow_depth);
         flow
@@ -2391,8 +2527,17 @@ impl Checker<'_> {
                     if let Some(condition) = &branch.condition {
                         self.use_expr(condition, &mut branch_scopes, UseMode::Read);
                     }
-                    let _ = self.check_block(&branch.block, &mut branch_scopes, false, true);
-                    outcomes.push(branch_scopes);
+                    let mut branch_flow =
+                        self.check_block(&branch.block, &mut branch_scopes, false, true);
+                    if let Some(finally) = &when.finally {
+                        branch_flow = self.apply_finally_to_flow(
+                            &finally.block,
+                            &mut branch_scopes,
+                            branch_flow,
+                            false,
+                        );
+                    }
+                    outcomes.extend(branch_flow.yields);
                 }
                 self.when_result_modes.pop();
                 if let Some(first) = outcomes.first().cloned() {
@@ -4248,5 +4393,11 @@ fn pop_flow_scope(flow: &mut Flow) {
     }
     for break_exit in &mut flow.breaks {
         break_exit.pop();
+    }
+    for return_exit in &mut flow.returns {
+        return_exit.pop();
+    }
+    for yield_exit in &mut flow.yields {
+        yield_exit.pop();
     }
 }

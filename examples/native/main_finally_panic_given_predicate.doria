@@ -1,0 +1,18 @@
+function stop(): bool
+{
+    panic("stop in given predicate");
+    return false;
+}
+
+function main(): void
+{
+    echo "before\n";
+
+    given {
+        stop();
+    } if (true) {
+        echo "wrong body\n";
+    } finally {
+        echo "wrong cleanup\n";
+    }
+}

@@ -104,6 +104,12 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
         "mirBasicBlockCount",
         "mirStatementCount",
         "mirTerminatorCount",
+        "finalizerCount",
+        "structuredExitCount",
+        "finalizedReturnCount",
+        "finalizedBreakCount",
+        "finalizedContinueCount",
+        "maximumFinalizerNestingDepth",
     ] {
         assert!(report["metrics"][field].as_u64().is_some(), "{field}");
     }

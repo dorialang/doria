@@ -74,7 +74,7 @@ pub fn compile_native(
         crate::backend::NativeProfile::Fast => "cranelift",
         crate::backend::NativeProfile::Release => "llvm",
     };
-    let metrics = json!({
+    let mut metrics = json!({
         "sourceLineCount": source_line_count,
         "astItemCount": ast_item_count,
         "outputBytes": output_size,
@@ -118,6 +118,23 @@ pub fn compile_native(
         "runtimeArtifactBytes": runtime_artifact_bytes,
         "peakRssBytes": {"available": false, "reason": "portable in-process peak RSS collection is unavailable"}
     });
+    let finalizer_facts = [
+        ("finalizerCount", structure.finalizer_count),
+        ("structuredExitCount", structure.structured_exit_count),
+        ("finalizedReturnCount", structure.finalized_return_count),
+        ("finalizedBreakCount", structure.finalized_break_count),
+        ("finalizedContinueCount", structure.finalized_continue_count),
+        (
+            "maximumFinalizerNestingDepth",
+            structure.maximum_finalizer_nesting_depth,
+        ),
+    ];
+    let metrics_object = metrics
+        .as_object_mut()
+        .expect("performance metrics are emitted as an object");
+    for (name, value) in finalizer_facts {
+        metrics_object.insert(name.to_string(), json!(value));
+    }
     let report = json!({
         "schemaVersion": REPORT_SCHEMA_VERSION,
         "compiler": {

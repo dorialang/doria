@@ -8,9 +8,9 @@ Doria should support familiar control flow while also exploring a Gherkin-inspir
 
 This note records broad control-flow direction only. Decision 0020 later accepted
 the `given { ... }` predicate-block direction and the `if` / `when` distinction.
-Decision 0116 now settles and implements the Stage 28a Slice 1 grammar and
-semantics, and is authoritative where this early direction note was open or
-illustrative.
+Decision 0116 now settles and implements the complete Stage 28a grammar,
+semantics, and finalizer model, and is authoritative where this early direction
+note was open or illustrative.
 
 Planned control-flow families:
 
@@ -118,4 +118,5 @@ Decision 0115 settles `match`: match selects one expression by pattern, while
 ## Notes
 
 Use Decision 0116, not this direction note alone, for current implementation.
-Executable `finally` remains its Stage 28a Slice 2 work.
+Stage 28a Slice 2 implements executable `finally` through shared finalizer
+regions and structured-exit routing.

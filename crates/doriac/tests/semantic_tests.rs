@@ -4402,7 +4402,7 @@ function main(): void
 }
 
 #[test]
-fn accepted_control_flow_finalizers_stop_once_at_the_slice2_boundary() {
+fn accepted_control_flow_finalizers_reach_validated_mir() {
     for source in [
         include_str!("fixtures/stage28a_pending/finally_if.doria"),
         include_str!("fixtures/stage28a_pending/finally_given_if.doria"),
@@ -4412,27 +4412,282 @@ fn accepted_control_flow_finalizers_stop_once_at_the_slice2_boundary() {
         include_str!("fixtures/stage28a_pending/finally_given_while.doria"),
         include_str!("fixtures/stage28a_pending/finally_do_while.doria"),
     ] {
-        let diagnostics = doriac::check_source("test.doria", source)
-            .expect_err("executable finalizers must stop at the Slice 2 boundary");
-        assert_eq!(
-            diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.code == "E0611")
-                .count(),
-            1,
-            "expected one E0611 for {source}, got {diagnostics:?}"
-        );
-        assert!(diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.code.starts_with('P')));
-        let lowering = doriac::lower_source_to_mir("test.doria", source)
-            .expect_err("pending finalizer syntax must not produce MIR");
-        assert_eq!(
-            lowering
-                .iter()
-                .filter(|diagnostic| diagnostic.code == "E0611")
-                .count(),
-            1
-        );
+        doriac::check_source("test.doria", source)
+            .expect("every accepted finalizer attachment should check");
+        doriac::lower_source_to_mir("test.doria", source)
+            .expect("every accepted finalizer attachment should produce validated MIR");
     }
+}
+
+#[test]
+fn finalizer_transfers_are_checked_by_destination() {
+    let diagnostics = doriac::check_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    if (true) {
+        echo "body";
+    } finally {
+        return;
+    }
+
+    while (true) {
+        break;
+    } finally {
+        break;
+        continue;
+    }
+}
+"#,
+    )
+    .expect_err("transfers leaving a finalizer must be rejected");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0612")
+            .count(),
+        3,
+        "expected one finalizer-transfer diagnostic per escaping transfer: {diagnostics:?}"
+    );
+
+    doriac::check_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    if (true) {
+        echo "body";
+    } finally {
+        int $choice = when (true): int {
+            return 42;
+        } else {
+            return 0;
+        };
+        while ($choice > 0) {
+            break;
+        }
+    }
+}
+"#,
+    )
+    .expect("returns and loop transfers wholly contained in a finalizer are valid");
+}
+
+#[test]
+fn finalizer_scope_follows_the_complete_attached_construct() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    let writable $finished = false;
+    given {
+        let writable $prepared = 1;
+    } if (true) {
+        $prepared = 2;
+    } finally {
+        $prepared = 3;
+        $finished = true;
+        let $cleanupLocal = $prepared;
+        echo $cleanupLocal;
+    }
+
+    echo $finished;
+}
+"#,
+    )
+    .expect("given and outer locals should remain available to the finalizer");
+
+    for source in [
+        r#"
+function main(): void
+{
+    if (true) {
+        let $branchLocal = 1;
+    } finally {
+        echo $branchLocal;
+    }
+}
+"#,
+        r#"
+function main(): void
+{
+    while (false) {
+        let $bodyLocal = 1;
+    } finally {
+        echo $bodyLocal;
+    }
+}
+"#,
+        r#"
+function main(): void
+{
+    if (true) {
+    } finally {
+        let $cleanupLocal = 1;
+    }
+    echo $cleanupLocal;
+}
+"#,
+        r#"
+function main(): void
+{
+    given {
+        let $prepared = 1;
+    } if (true) {
+    } finally {
+        echo $prepared;
+    }
+    echo $prepared;
+}
+"#,
+    ] {
+        assert_diagnostic_code(source, "E0101");
+    }
+}
+
+#[test]
+fn finalizer_assignments_update_nullable_flow_after_the_construct() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Box
+{
+}
+
+function useString(string $value): void
+{
+}
+
+function useInt(int $value): void
+{
+}
+
+function useBox(Box $value): void
+{
+}
+
+function main(): void
+{
+    writable ?string $text = null;
+    if (true) {
+    } finally {
+        $text = "ready";
+    }
+    useString($text);
+
+    writable ?int $number = null;
+    while (false) {
+    } finally {
+        $number = 42;
+    }
+    useInt($number);
+
+    writable ?Box $box = null;
+    do {
+    } while (false) finally {
+        $box = new Box();
+    }
+    useBox($box);
+
+    writable ?string $prepared = null;
+    given {
+        let $replacement = "given";
+    } if (true) {
+    } finally {
+        $prepared = $replacement;
+    }
+    useString($prepared);
+}
+"#,
+    )
+    .expect("every normally completing finalizer assignment should update later flow facts");
+}
+
+#[test]
+fn branch_narrowing_does_not_escape_through_a_finalizer() {
+    assert_diagnostic_code(
+        r#"
+function useString(string $value): void
+{
+}
+
+function main(): void
+{
+    writable ?string $value = null;
+    if ($value != null) {
+        useString($value);
+    } finally {
+        echo "cleanup";
+    }
+    useString($value);
+}
+"#,
+        "E0408",
+    );
+}
+
+#[test]
+fn constructor_finalizers_participate_in_definite_initialization() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Session
+{
+    string $state;
+    writable int $attempts;
+
+    function __construct(bool $ready)
+    {
+        if ($ready) {
+            echo "ready";
+        } finally {
+            $this->state = "initialized";
+            $this->attempts = 1;
+        }
+    }
+}
+"#,
+    )
+    .expect("a finalizer that runs on every normal path may initialize properties");
+
+    assert_diagnostic_code(
+        r#"
+class Session
+{
+    string $state;
+
+    function __construct(bool $ready)
+    {
+        if ($ready) {
+            $this->state = "ready";
+        } finally {
+            $this->state = "initialized";
+        }
+    }
+}
+"#,
+        "E0502",
+    );
+
+    assert_diagnostic_code(
+        r#"
+class Session
+{
+    string $state;
+
+    function __construct(bool $ready)
+    {
+        if ($ready) {
+        } finally {
+            if ($ready) {
+                $this->state = "initialized";
+            }
+        }
+    }
+}
+"#,
+        "E0500",
+    );
 }

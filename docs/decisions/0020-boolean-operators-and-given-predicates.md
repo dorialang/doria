@@ -8,7 +8,8 @@ Doria accepts typed equality, bool-only boolean operators, integer bitwise
 operators, and `given` predicate blocks. Later compiler stages implemented the
 operator family. Decision 0116 implements `given` on `if`, `when`, and `while`,
 plus executable `when` and base `do ... while`, in Stage 28a Slice 1.
-Executable `finally` remains Stage 28a Slice 2.
+Stage 28a Slice 2 implements executable `finally` through the shared finalizer
+model settled by Decision 0116.
 
 Backend support may lag this decision. Unsupported backend coverage must be described as unsupported backend coverage, not invalid Doria syntax.
 
@@ -309,6 +310,9 @@ Rules:
 
 `when` is the value-returning conditional expression. Decisions 0097 and 0116
 fully specify it, and Stage 28a Slice 1 implements it.
+
+Decision 0116 also specifies control-flow `finally`, and Stage 28a Slice 2
+implements it for `if`, `when`, `while`, and `do ... while`.
 
 ## Valid Doria vs Backend Coverage
 

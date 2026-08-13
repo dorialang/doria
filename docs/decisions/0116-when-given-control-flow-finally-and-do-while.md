@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-13
 - **Date:** 2026-08-13
-- **Implementation status:** Stage 28a Slice 1 implemented; executable `finally` is Slice 2
+- **Implementation status:** Implemented; Stage 28a Slices 1 and 2 complete
 - **Scope:** Value-returning conditional control flow, prepared predicates,
   post-tested loops, and the bounded control-flow finalizer model
 
@@ -53,7 +53,7 @@ to `do`, `for`, `foreach`, `match`, or a bare block. No alias is accepted.
 
 Declarations and expression statements returning `void` are setup. They execute
 once in source order. A declaration is visible to later setup, predicates, the
-attached condition and bodies, and a future attached `finally`.
+attached condition and bodies, and the attached `finally`.
 
 ## `given` Predicate Phase
 
@@ -77,7 +77,7 @@ predicates and the attached condition. Doria does not evaluate an `if`,
 ## `given` Scope
 
 Given declarations are visible throughout the complete attached construct and
-future finalizer, then leave scope. Branch and loop-body locals do not become
+its finalizer, then leave scope. Branch and loop-body locals do not become
 visible in `finally`. Ordinary lexical shadowing applies.
 
 ## `given` On `if`
@@ -156,7 +156,7 @@ Unselected branches neither move nor drop their values. A value borrowed from a
 ## `when` Cleanup
 
 The selected result is acquired before branch locals are destroyed. Branch
-locals then drop, future `finally` runs, and `given` locals drop after the
+locals then drop, `finally` runs, and `given` locals drop after the
 finalizer. Unselected branch locals never exist.
 
 ## `do ... while` Grammar
@@ -240,17 +240,29 @@ Stage 29 checked errors reuse the same structured-exit and finalizer regions.
 They must not invent a second cleanup model. This decision does not implement
 `try`, `catch`, `throw`, or `throws`.
 
+A future checked-error exit will identify crossed regions exactly as return and
+loop exits do. Its pending payload belongs in a typed synthetic local acquired
+before ordinary cleanup; crossed regions run before propagation continues. A
+matching catch consumes that pending route and stops propagation. A finalizer
+cannot replace or cancel the pending error. Fatal panic remains a separate
+abort-only edge and bypasses every region. Checked errors are neither panic nor
+ordinary return values.
+
 ## MIR And Structured Exit Regions
 
-Slice 1 lowers `given`, `when`, and `do ... while` once into explicit validated
-CFG. Validation-only plans preserve their source control-flow identity so shared
-validation can prove predicate routing, `continue` targets, and one result write
-per completing `when` path. Backends execute the ordinary blocks and branches;
-there is no runtime control-flow object.
+`given`, `when`, `do ... while`, and `finally` lower once into explicit validated
+CFG. Each source finalizer owns one backend-neutral region with one body, a
+stack-local exit discriminator, and explicit continuations. A structured exit
+first acquires any outgoing value, drops branch/body locals, enters each crossed
+region exactly once from inner to outer, drops `given` locals, and resumes its
+original destination. Same-loop `continue` does not cross the loop's region.
 
-Executable `finally` is Slice 2. Slice 1 preserves its AST/HIR identity but emits
-one stage-named diagnostic before MIR. Any finalizer marker reaching MIR is a
-malformed-IR error.
+Validation plans preserve source control-flow identity and prove entry,
+discriminator selection, value acquisition, continuation routing, and lexical
+nesting. Backends execute ordinary blocks and branches; there is no runtime
+finalizer object, heap cleanup stack, per-iteration registration, or unwind path.
+`StructuredExitKind::CheckedError` reserves Stage 29's extension point and is
+rejected if it appears in executable MIR before checked errors are implemented.
 
 ## PHP Compatibility
 
@@ -258,15 +270,21 @@ The PHP backend preserves setup frequency, source-order short-circuiting,
 condition skipping, result typing established by Doria, and post-tested loop
 behavior. Backend-private closures may materialize a `when` expression, but they
 do not define Doria return or ownership semantics. PHP truthiness is not used.
-Executable `finally` remains unavailable until Slice 2.
+PHP emits a host `try`/`finally` only after Doria has established the legal
+control-flow and ownership model. PHP `exit(101)` bypasses host `finally`, which
+preserves Doria's fatal-panic rule; checked errors will use orderly structured
+routing rather than panic or ordinary returns.
 
 ## Performance Impact
 
-These constructs lower to direct CFG. There is no runtime `given`, `when`, or
-loop object and no required heap allocation. Loop scratch remains function-entry
-storage. Opt-in structural reports count `when`, `else when`, `given` predicates,
-and `do ... while` while walking MIR already being materialized. Controlled
-timing remains **Pending Available Runner** and does not block development.
+These constructs lower to direct CFG. There is no runtime `given`, `when`, loop,
+or finalizer object and no required heap allocation. Loop scratch and finalizer
+discriminators remain function-entry storage. Same-loop `continue` pays no
+loop-finalizer cost; other exits cost one direct region traversal per crossed
+finalizer, so nesting is O(crossed regions). Opt-in structural reports add
+finalizer, structured-exit, finalized-return/break/continue, and maximum nesting
+facts while MIR is already being materialized. Controlled timing remains
+**Pending Available Runner** and does not block development.
 
 ## Implementation Slices
 
@@ -275,14 +293,24 @@ Stage 28a Slice 1 implements this decision's authority, executable `when`,
 preservation, backend parity, and tooling synchronization.
 
 Slice 2 implements shared finalizer regions and routes normal completion,
-`return`, `break`, `continue`, and future checked-error crossings through them.
-Stage 29 remains blocked until Slice 2 completes.
+`return`, `break`, `continue`, and `when` yields through them. The same region
+model reserves, but does not execute, future checked-error crossings. Stage 28a
+is complete and Stage 29 is next.
+
+## PR #134 Closure Audit
+
+| Finding | Current Fix | Regression Test | Semantic Analysis | Ownership Analysis | PHP | Native Paths | Remaining Risk |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `given ... while` backedges | Initial entry, body fallthrough, and `continue` target the shared predicate header; predicate failure exits before the condition. | `shared_validator_rejects_malformed_stage28a_control_flow_plans` rejects a `continue` that skips predicate reevaluation. | `stage28a_control_flow_analysis_honors_given_gates_and_enclosing_loops` preserves the predicate-false exit. | Loop backedges merge through the same shared CFG and flow state. | `php_backend_executes_stage28a_control_flow` observes the predicate before and after the body. | Durable `main_given_while` and `main_given_while_finally` fixtures run through the interpreter, Cranelift, and LLVM. | Future checked-error edges must enter the same predicate/finalizer regions rather than adding a second loop model. |
+| PHP `given ... when` gate caching | PHP materializes the gate once before selecting the head, `else when`, or `else` branch. | `php_backend_executes_stage28a_control_flow` observes one side-effecting gate evaluation. | Branch selection consumes one classified `given` predicate sequence. | Only the selected branch contributes ownership state. | The cached gate is reused across the complete chain. | The native paths consume the shared validated `given` and `when` CFG plans. | None for current exits; Stage 29 must not reevaluate the gate while routing errors. |
+| Loop depth inside `when` | A `when` branch retains the nearest enclosing loop target while return-to-yield remains local to the `when`. | `stage28a_control_flow_analysis_honors_given_gates_and_enclosing_loops` accepts `break` and `continue` from branches. | Loop depth is captured before checking the `when` and restored afterward. | Branch flows preserve backedge and break states. | Generated branch control flow targets the enclosing host loop without redefining Doria semantics. | Shared MIR target identity drives interpreter, Cranelift, and LLVM branches. | Nested future error handlers must preserve the same lexical target identity. |
+| `do ... while` exit state | The body is the only entry; only post-body false-condition and `break` exits reach code after the loop. | `do_while_ownership_exit_excludes_the_unexecuted_pre_body_state` and the malformed continue-target test reject a synthetic zero-iteration route. | Return and definite-state analysis use the post-tested CFG. | Move-state merging excludes a pre-body exit. | Generated PHP executes the body before testing the condition. | The validated MIR plan and durable `do ... while` fixtures are shared by all native paths. | None for current exits; future checked errors remain separate abortible paths. |
 
 ## Explicit Exclusions
 
-This decision does not add executable finalizers in Slice 1, `given` on `do`,
-finalizers on excluded constructs, truthiness, block expressions, general
-`yield`, checked errors, closures, namespaces, autoloading, or reflection.
+This decision does not add `given` on `do`, finalizers on excluded constructs,
+truthiness, block expressions, general `yield`, checked errors, closures,
+namespaces, autoloading, or reflection.
 
 ## Consequences
 
@@ -306,7 +334,7 @@ grammars, website examples, and authority guards are affected.
   reevaluate before every condition check.
 - Decision 0097's result inference is amended: a surrounding expected type may
   type an unannotated `when` before head-branch inference.
-- Stage 28a Slice 2 must implement this exact finalizer model.
+- Stage 28a Slice 2 implements this exact finalizer model.
 - Stage 29 must reuse the same structured finalizer regions.
 - Stage 31 namespace and compile-time autoload authority, Stage 33 Baton work,
   self-hosting, and the performance workstream gain no new semantics here.

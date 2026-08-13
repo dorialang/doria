@@ -1,0 +1,18 @@
+function stop(): bool
+{
+    panic("stop in when condition");
+    return false;
+}
+
+function main(): void
+{
+    echo "before\n";
+
+    string $value = when (stop()): string {
+        return "wrong";
+    } else {
+        return "wrong";
+    } finally {
+        echo "wrong cleanup\n";
+    };
+}

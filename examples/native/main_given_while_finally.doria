@@ -1,0 +1,12 @@
+function main(): void
+{
+    let writable $index = 0;
+    given {
+        int $limit = 2;
+        true;
+    } while ($index < $limit) {
+        $index++;
+    } finally {
+        echo "cleanup {$index}/{$limit}\n";
+    }
+}

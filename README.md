@@ -128,9 +128,10 @@ string $message = given {
 };
 ```
 
-Base `do ... while` is executable. Control-flow `finally` is accepted syntax on
-`if`, `when`, `while`, and `do ... while`; the compiler currently preserves it
-and reports that execution support is pending.
+Base `do ... while` and control-flow `finally` are executable. `finally` attaches
+to `if`, `when`, `while`, and `do ... while`, runs once for each normal or
+structured exit, and preserves Doria's abort-only rule that fatal panic runs no
+cleanup.
 
 ## Tooling
 

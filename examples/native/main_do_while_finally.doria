@@ -1,0 +1,9 @@
+function main(): void
+{
+    let writable $count = 0;
+    do {
+        $count++;
+    } while ($count < 2) finally {
+        echo "cleanup {$count}\n";
+    }
+}

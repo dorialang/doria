@@ -1,0 +1,14 @@
+function stop(): bool
+{
+    panic("stop in do condition");
+    return false;
+}
+
+function main(): void
+{
+    do {
+        echo "before\n";
+    } while (stop()) finally {
+        echo "wrong cleanup\n";
+    }
+}

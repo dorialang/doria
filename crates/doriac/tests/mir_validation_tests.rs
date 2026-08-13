@@ -875,20 +875,6 @@ function main(): void { echo "{choose(true)}"; }
         &non_bool_do_condition,
         "do-while condition is not bool control flow between its body and exit",
     );
-
-    let mut pending_finally = valid;
-    let entry = pending_finally.functions[pending_finally.entry.0].entry_block;
-    pending_finally.functions[pending_finally.entry.0].blocks[entry.0]
-        .statements
-        .push(Statement::ControlFlowPlan(
-            mir::ControlFlowPlan::PendingFinally {
-                span: doriac::source::Span::new(0, 0),
-            },
-        ));
-    malformed(
-        &pending_finally,
-        "pending Stage 28a Slice 2 finalizer reached MIR",
-    );
 }
 
 #[test]
@@ -907,6 +893,7 @@ function main(): void
     LoadResult $result = LoadResult::Loaded($document);
     LoadResult $moved = $result;
 }
+
 "#;
     let valid = doriac::lower_source_to_mir("payload-enum-validation.doria", source)
         .expect("valid payload enum source should lower");
@@ -1014,6 +1001,149 @@ fn enum_case_assignment<'a>(program: &'a mut Program, local_name: &str) -> &'a m
         panic!("expected enum case assignment for {local_name}");
     };
     value
+}
+
+#[test]
+fn shared_validator_rejects_malformed_finalizer_regions_and_exit_routes() {
+    let source = r#"
+function choose(): int
+{
+    if (true) {
+        return 42;
+    } finally {
+        echo "cleanup";
+    }
+    return 0;
+}
+function main(): void { echo "{choose()}"; }
+"#;
+    let valid = doriac::lower_source_to_mir("finalizer-validation.doria", source)
+        .expect("valid finalizer source should lower");
+    doriac::mir_validation::validate_program(&valid).expect("valid finalizer MIR should validate");
+
+    let malformed = |program: &Program, expected: &str| {
+        let error = doriac::mir_validation::validate_program(program)
+            .expect_err("malformed finalizer MIR must stop before backend emission");
+        assert!(
+            error.message.contains(expected),
+            "expected {expected:?}, got {:?}",
+            error.message
+        );
+    };
+
+    let mutate_plan =
+        |program: &mut mir::Program, mutate: &mut dyn FnMut(&mut mir::FinalizerRegionPlan)| {
+            let plan = program
+                .functions
+                .iter_mut()
+                .flat_map(|function| &mut function.blocks)
+                .flat_map(|block| &mut block.statements)
+                .find_map(|statement| match statement {
+                    Statement::ControlFlowPlan(mir::ControlFlowPlan::Finalizer(plan)) => Some(plan),
+                    _ => None,
+                })
+                .expect("finalizer plan should exist");
+            mutate(plan);
+        };
+
+    let mut unknown_parent = valid.clone();
+    mutate_plan(&mut unknown_parent, &mut |plan| {
+        plan.parent = Some(mir::FinalizerRegionId(999));
+    });
+    malformed(
+        &unknown_parent,
+        "finalizer region has an invalid lexical parent",
+    );
+
+    let mut wrong_anchor = valid.clone();
+    mutate_plan(&mut wrong_anchor, &mut |plan| {
+        plan.activation = plan.entry;
+    });
+    malformed(
+        &wrong_anchor,
+        "finalizer region is not anchored at its activation block",
+    );
+
+    let mut skipped_entry = valid.clone();
+    let (function_id, source, continuation) = skipped_entry
+        .functions
+        .iter()
+        .enumerate()
+        .find_map(|(function_id, function)| {
+            function.blocks.iter().find_map(|block| {
+                block
+                    .statements
+                    .iter()
+                    .find_map(|statement| match statement {
+                        Statement::ControlFlowPlan(mir::ControlFlowPlan::Finalizer(plan)) => plan
+                            .exits
+                            .first()
+                            .map(|exit| (function_id, exit.source, exit.continuation)),
+                        _ => None,
+                    })
+            })
+        })
+        .expect("finalizer exit should exist");
+    skipped_entry.functions[function_id].blocks[source.0].terminator =
+        Terminator::Jump(continuation);
+    malformed(
+        &skipped_entry,
+        "finalizer entry edges disagree with its structured-exit table",
+    );
+
+    let mut duplicate_source = valid.clone();
+    mutate_plan(&mut duplicate_source, &mut |plan| {
+        plan.exits.push(plan.exits[0]);
+    });
+    malformed(
+        &duplicate_source,
+        "finalizer region repeats a structured-exit source",
+    );
+
+    let mut wrong_dispatch = valid.clone();
+    let (function_id, completion, activation) = wrong_dispatch
+        .functions
+        .iter()
+        .enumerate()
+        .find_map(|(function_id, function)| {
+            function.blocks.iter().find_map(|block| {
+                block
+                    .statements
+                    .iter()
+                    .find_map(|statement| match statement {
+                        Statement::ControlFlowPlan(mir::ControlFlowPlan::Finalizer(plan)) => {
+                            Some((function_id, plan.completion, plan.activation))
+                        }
+                        _ => None,
+                    })
+            })
+        })
+        .expect("finalizer plan should exist");
+    wrong_dispatch.functions[function_id].blocks[completion.0].terminator =
+        Terminator::Jump(activation);
+    malformed(
+        &wrong_dispatch,
+        "finalizer completion does not select its final continuation",
+    );
+
+    let mut future_error = valid.clone();
+    mutate_plan(&mut future_error, &mut |plan| {
+        plan.exits[0].kind = mir::StructuredExitKind::CheckedError;
+    });
+    malformed(
+        &future_error,
+        "Stage 29 checked-error finalizer routing is not executable yet",
+    );
+
+    let mut same_loop_continue = valid;
+    mutate_plan(&mut same_loop_continue, &mut |plan| {
+        plan.attachment = mir::FinalizerAttachment::While;
+        plan.exits[0].kind = mir::StructuredExitKind::Continue;
+    });
+    malformed(
+        &same_loop_continue,
+        "same-loop continue incorrectly routes through its loop finalizer",
+    );
 }
 
 #[test]

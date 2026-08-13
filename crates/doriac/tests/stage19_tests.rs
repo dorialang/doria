@@ -861,3 +861,68 @@ function choose(?Box $maybe): Box
         .iter()
         .any(|diagnostic| diagnostic.code == "E0474"));
 }
+
+#[test]
+fn finalizer_ownership_updates_every_normally_crossing_exit() {
+    doriac::check_source(
+        "finalizer-owner.doria",
+        r#"
+class Guard {}
+function consume(take Guard $guard): void {}
+function route(bool $ready): void
+{
+    given {
+        let $guard = new Guard();
+    } if ($ready) {
+        echo "body";
+    } finally {
+        consume($guard);
+    }
+}
+"#,
+    )
+    .expect("a given owner may be consumed once by its finalizer");
+
+    let diagnostics = doriac::check_source(
+        "finalizer-owner-exit.doria",
+        r#"
+class Guard {}
+function consume(take Guard $guard): void {}
+function route(): void
+{
+    let $guard = new Guard();
+    if (true) {
+    } finally {
+        consume($guard);
+    }
+    consume($guard);
+}
+"#,
+    )
+    .expect_err("ownership transferred by a finalizer must remain ended afterward");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0470"));
+}
+
+#[test]
+fn fatal_panic_bypasses_finalizer_ownership_flow() {
+    doriac::check_source(
+        "finalizer-panic-owner.doria",
+        r#"
+class Guard {}
+function consume(take Guard $guard): void {}
+function route(): void
+{
+    let $guard = new Guard();
+    if (true) {
+        consume($guard);
+        panic("stop");
+    } finally {
+        consume($guard);
+    }
+}
+"#,
+    )
+    .expect("the abort-only panic path must not enter finalizer ownership flow");
+}

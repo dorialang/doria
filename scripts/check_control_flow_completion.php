@@ -29,15 +29,19 @@ $pipelinePath = 'docs/notes/current-pipeline.md';
 $specPath = 'SPEC.md';
 $parserPath = 'crates/doriac/src/parser.rs';
 $semanticsPath = 'crates/doriac/src/semantics.rs';
+$controlFlowPath = 'crates/doriac/src/control_flow.rs';
+$ownershipPath = 'crates/doriac/src/ownership.rs';
 $mirPath = 'crates/doriac/src/mir.rs';
 $loweringPath = 'crates/doriac/src/mir_lowering.rs';
 $validationPath = 'crates/doriac/src/mir_validation.rs';
+$phpPath = 'crates/doriac/src/codegen_php.rs';
 $parserTestsPath = 'crates/doriac/tests/parser_tests.rs';
 $semanticTestsPath = 'crates/doriac/tests/semantic_tests.rs';
 $malformedTestsPath = 'crates/doriac/tests/mir_validation_tests.rs';
 $llvmTestsPath = 'crates/doriac/tests/llvm_mir_tests.rs';
 $phpTestsPath = 'crates/doriac/tests/codegen_php_tests.rs';
 $performancePath = 'crates/doriac/src/performance.rs';
+$ownershipTestsPath = 'crates/doriac/tests/stage19_tests.rs';
 $manifestPath = 'crates/doriac/tests/fixtures/native_parity_examples.txt';
 
 $decision = $read($decisionPath);
@@ -46,20 +50,24 @@ $pipeline = $read($pipelinePath);
 $spec = $read($specPath);
 $parser = $read($parserPath);
 $semantics = $read($semanticsPath);
+$controlFlow = $read($controlFlowPath);
+$ownership = $read($ownershipPath);
 $mir = $read($mirPath);
 $lowering = $read($loweringPath);
 $validation = $read($validationPath);
+$php = $read($phpPath);
 $parserTests = $read($parserTestsPath);
 $semanticTests = $read($semanticTestsPath);
 $malformedTests = $read($malformedTestsPath);
 $llvmTests = $read($llvmTestsPath);
 $phpTests = $read($phpTestsPath);
 $performance = $read($performancePath);
+$ownershipTests = $read($ownershipTestsPath);
 $manifest = $read($manifestPath);
 
 $require($decisionPath, $decision, [
     '**Status:** Accepted',
-    '**Implementation status:** Stage 28a Slice 1 implemented; executable `finally` is Slice 2',
+    '**Implementation status:** Implemented; Stage 28a Slices 1 and 2 complete',
     '`when` is the value-returning form of `if`',
     '`else` is mandatory',
     '`return expression;` in a branch yields from the nearest enclosing `when`',
@@ -79,8 +87,16 @@ $require($decisionPath, $decision, [
     'The v1 set is `if`, `when`, `while`, and `do ... while`',
     '`for`, `foreach`, `match`, and bare blocks reject `finally`',
     'Fatal panic remains abort-without-cleanup',
+    'An outgoing `when` result or function return is acquired first',
+    'Branch locals',
+    'drop next',
+    'Given locals drop afterward',
+    'checked-error exit will identify crossed regions',
+    'Fatal panic remains a separate',
+    'abort-only edge and bypasses every region',
     'Controlled',
-    'timing remains **Pending Available Runner** and does not block development',
+    '**Pending Available Runner**',
+    'does not block development',
 ]);
 
 foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
@@ -88,10 +104,10 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 26b — Complete',
         'Measurement Status: Pending Available Runner',
         'Stage 28 — Complete',
-        'Stage 28a — In Progress',
+        'Stage 28a — Complete',
         'Stage 28a Slice 1 — Complete',
-        'Stage 28a Slice 2 — Next',
-        'Stage 29 — Blocked Until Stage 28a Completes',
+        'Stage 28a Slice 2 — Complete',
+        'Stage 29 — Next',
     ]);
 }
 
@@ -106,7 +122,8 @@ $require($specPath, $spec, [
     'A failed gate skips every attached conditional condition',
     '`do ... while`',
     'ordinary form requires its semicolon',
-    'Stage 28a Slice 2',
+    'It runs once',
+    'fatal panic',
 ]);
 $require($parserPath, $parser, [
     'fn parse_given_prelude(',
@@ -120,19 +137,35 @@ $require($semanticsPath, $semantics, [
     'fn check_given_prelude(',
     'fn check_when_expression(',
     'Given Setup Appears After A Predicate',
-    'Control-Flow Finally Is Not Executable Yet',
-    'E0611',
+    'Control Transfer Cannot Leave Finally',
+    'E0612',
+]);
+$require($controlFlowPath, $controlFlow, [
+    'route_finalizers',
+    'finalizer_depth',
+    'NodeKind::ReturnExit',
+    'NodeKind::DivergeExit',
+]);
+$require($ownershipPath, $ownership, [
+    'apply_finally_to_flow',
+    'flow.returns',
+    'flow.yields',
 ]);
 $require($mirPath, $mir, [
     'GivenControlFlowPlan',
     'WhenResultPlan',
     'DoWhilePlan',
-    'PendingFinally',
+    'FinalizerRegionPlan',
+    'StructuredExitKind',
+    'FinalizerExitPlan',
 ]);
 $require($loweringPath, $lowering, [
     'ControlFlowPlan::Given',
     'ControlFlowPlan::When',
     'ControlFlowPlan::DoWhile',
+    'ControlFlowPlan::Finalizer',
+    'route_structured_exit',
+    'finish_finalizer_region',
 ]);
 $require($validationPath, $validation, [
     'fn validate_control_flow_plans(',
@@ -140,10 +173,19 @@ $require($validationPath, $validation, [
     'given while continue skips predicate reevaluation',
     '{path_name} reaches its merge with {assignments} result assignments',
     'do-while continue does not target its condition',
-    'pending Stage 28a Slice 2 finalizer reached MIR',
+    'finalizer region has an invalid lexical parent',
+    'finalizer completion does not select its final continuation',
+    'same-loop continue incorrectly routes through its loop finalizer',
+    'finalizer entry edges disagree with its structured-exit table',
+    'Stage 29 checked-error finalizer routing is not executable yet',
+]);
+$require($phpPath, $php, [
+    'fn emit_with_finally(',
+    'writeln(output, indent, "try")',
+    'writeln(output, indent, "finally")',
 ]);
 $require($parserTestsPath, $parserTests, [
-    'parses_given_when_and_preserves_the_pending_finalizer',
+    'parses_given_when_and_preserves_its_finalizer',
     'parses_do_while_and_requires_its_ordinary_semicolon',
     'rejects_finally_on_excluded_control_flow_families',
     'rejects_when_without_else_and_given_on_do',
@@ -151,7 +193,10 @@ $require($parserTestsPath, $parserTests, [
 $require($semanticTestsPath, $semanticTests, [
     'checks_stage28a_when_typing_and_nearest_yields',
     'checks_stage28a_given_phases_scope_and_do_while_conditions',
-    'accepted_control_flow_finalizers_stop_once_at_the_slice2_boundary',
+    'accepted_control_flow_finalizers_reach_validated_mir',
+    'finalizer_transfers_are_checked_by_destination',
+    'finalizer_scope_follows_the_complete_attached_construct',
+    'constructor_finalizers_participate_in_definite_initialization',
 ]);
 $require($malformedTestsPath, $malformedTests, [
     'shared_validator_rejects_malformed_stage28a_control_flow_plans',
@@ -159,15 +204,28 @@ $require($malformedTestsPath, $malformedTests, [
     'incompatible ownership',
     'given predicate does not have bool type',
     'do-while condition is not bool control flow between its body and exit',
+    'shared_validator_rejects_malformed_finalizer_regions_and_exit_routes',
 ]);
 $require($llvmTestsPath, $llvmTests, [
     'stage28a_control_flow_keeps_one_validated_cfg_without_runtime_objects',
     'dr_v1_when',
     'dr_v1_given',
     'dr_v1_do_while',
+    'dr_v1_finalizer',
+    'dr_v1_cleanup_stack',
+    'StructuredExitKind::FunctionReturn',
+    'StructuredExitKind::Break',
+    'StructuredExitKind::Continue',
 ]);
 $require($phpTestsPath, $phpTests, [
     'php_backend_executes_stage28a_slice1_control_flow',
+    'php_backend_executes_stage28a_finalizers',
+    'wrong inner',
+    'wrong outer',
+]);
+$require($ownershipTestsPath, $ownershipTests, [
+    'finalizer_ownership_updates_every_normally_crossing_exit',
+    'fatal_panic_bypasses_finalizer_ownership_flow',
 ]);
 $require($performancePath, $performance, [
     'whenExpressionCount',
@@ -175,6 +233,12 @@ $require($performancePath, $performance, [
     'givenPreludeCount',
     'givenPredicateCount',
     'doWhileCount',
+    'finalizerCount',
+    'structuredExitCount',
+    'finalizedReturnCount',
+    'finalizedBreakCount',
+    'finalizedContinueCount',
+    'maximumFinalizerNestingDepth',
 ]);
 
 foreach ([
@@ -185,6 +249,18 @@ foreach ([
     'examples/native/main_given_while.doria',
     'examples/native/main_do_while.doria',
     'examples/native/main_when_ownership.doria',
+    'examples/native/main_if_finally.doria',
+    'examples/native/main_given_if_finally.doria',
+    'examples/native/main_when_finally.doria',
+    'examples/native/main_given_when_finally.doria',
+    'examples/native/main_while_finally.doria',
+    'examples/native/main_given_while_finally.doria',
+    'examples/native/main_do_while_finally.doria',
+    'examples/native/main_nested_finally.doria',
+    'examples/native/main_finally_structured_exits.doria',
+    'examples/native/main_finally_ownership.doria',
+    'examples/native/main_finally_contained_control.doria',
+    'examples/native/main_finally_panic.doria',
 ] as $fixture) {
     if (!str_contains($manifest, $fixture)) {
         $failures[] = "{$manifestPath}: missing durable Stage 28a fixture `{$fixture}`";
@@ -194,11 +270,32 @@ foreach ([
 $fixtureContents = '';
 foreach (array_merge(
     glob($root . '/examples/native/main_{when,given,do_while}*.doria', GLOB_BRACE) ?: [],
+    glob($root . '/examples/native/main_*finally*.doria') ?: [],
     glob($root . '/crates/doriac/tests/fixtures/stage28a_pending/*.doria') ?: []
 ) as $fixture) {
     $contents = @file_get_contents($fixture);
     if (is_string($contents)) {
         $fixtureContents .= $contents;
+    }
+}
+
+foreach ([
+    $decisionPath => $decision,
+    $planPath => $plan,
+    $pipelinePath => $pipeline,
+    $specPath => $spec,
+    $semanticsPath => $semantics,
+    $mirPath => $mir,
+] as $path => $contents) {
+    foreach ([
+        'Control-Flow Finally Is Not Executable Yet',
+        'PendingFinally',
+        'Stage 28a Slice 2 — Next',
+        'Stage 29 — Blocked Until Stage 28a Completes',
+    ] as $obsolete) {
+        if (str_contains($contents, $obsolete)) {
+            $failures[] = "{$path}: obsolete Stage 28a boundary returned: `{$obsolete}`";
+        }
     }
 }
 foreach (['Andrew', 'Lucy', 'Masiye'] as $privateName) {

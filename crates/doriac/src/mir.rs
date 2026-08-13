@@ -29,6 +29,9 @@ pub struct StaticId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct CollectionTypeId(pub usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FinalizerRegionId(pub usize);
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub source: SourceFile,
@@ -3385,11 +3388,52 @@ pub enum ControlFlowPlan {
     Given(GivenControlFlowPlan),
     When(WhenResultPlan),
     DoWhile(DoWhilePlan),
-    /// Reserved solely so validation can prove that pending finalizer lowering
-    /// never reaches a Slice 1 backend.
-    PendingFinally {
-        span: Span,
+    Finalizer(FinalizerRegionPlan),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinalizerAttachment {
+    If,
+    When,
+    While,
+    DoWhile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StructuredExitKind {
+    Normal,
+    WhenYield {
+        result: LocalId,
     },
+    FunctionReturn {
+        value: Option<LocalId>,
+    },
+    Break,
+    Continue,
+    /// Reserved for Stage 29. Current MIR validation rejects executable uses.
+    CheckedError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalizerExitPlan {
+    pub kind: StructuredExitKind,
+    pub source: BlockId,
+    pub continuation: BlockId,
+}
+
+/// Validation identity for one source `finally`. Execution uses the ordinary
+/// CFG described here; backends never receive a runtime finalizer object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizerRegionPlan {
+    pub id: FinalizerRegionId,
+    pub parent: Option<FinalizerRegionId>,
+    pub attachment: FinalizerAttachment,
+    pub activation: BlockId,
+    pub entry: BlockId,
+    pub completion: BlockId,
+    pub discriminator: LocalId,
+    pub body_blocks: Vec<BlockId>,
+    pub exits: Vec<FinalizerExitPlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5723,7 +5767,19 @@ impl fmt::Display for ControlFlowPlan {
                 "do block{} while block{} -> block{}",
                 plan.body.0, plan.condition.0, plan.exit.0
             ),
-            Self::PendingFinally { .. } => write!(formatter, "pending finally"),
+            Self::Finalizer(plan) => write!(
+                formatter,
+                "finalizer{} {:?} block{}..block{} exits [{}]",
+                plan.id.0,
+                plan.attachment,
+                plan.entry.0,
+                plan.completion.0,
+                plan.exits
+                    .iter()
+                    .map(|exit| format!("{:?}:block{}", exit.kind, exit.source.0))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
         }
     }
 }
