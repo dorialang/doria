@@ -1,0 +1,12 @@
+function main(): void
+{
+    int $value = when (false): int {
+        return 10;
+    } else when (true) {
+        return 42;
+    } else {
+        return 0;
+    };
+
+    echo "{$value}\n";
+}

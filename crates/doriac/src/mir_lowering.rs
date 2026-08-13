@@ -521,6 +521,11 @@ pub(crate) struct StructuralMetrics {
     pub(crate) condition_match_count: usize,
     pub(crate) type_pattern_count: usize,
     pub(crate) ternary_count: usize,
+    pub(crate) when_expression_count: usize,
+    pub(crate) else_when_branch_count: usize,
+    pub(crate) given_prelude_count: usize,
+    pub(crate) given_predicate_count: usize,
+    pub(crate) do_while_count: usize,
     pub(crate) basic_block_count: usize,
     pub(crate) statement_count: usize,
     pub(crate) terminator_count: usize,
@@ -1259,8 +1264,24 @@ fn intern_block_collection_types(
                 intern_if_collection_types(if_statement, class_ids, collections, substitutions);
             }
             hir::Stmt::While(while_statement) => {
+                if let Some(given) = &while_statement.given {
+                    intern_block_collection_types(
+                        &given.block,
+                        class_ids,
+                        collections,
+                        substitutions,
+                    );
+                }
                 intern_block_collection_types(
                     &while_statement.body,
+                    class_ids,
+                    collections,
+                    substitutions,
+                );
+            }
+            hir::Stmt::DoWhile(do_while) => {
+                intern_block_collection_types(
+                    &do_while.body,
                     class_ids,
                     collections,
                     substitutions,
@@ -1319,6 +1340,9 @@ fn intern_if_collection_types(
     collections: &mut CollectionRegistry,
     substitutions: &HashMap<String, crate::types::ResolvedType>,
 ) {
+    if let Some(given) = &statement.given {
+        intern_block_collection_types(&given.block, class_ids, collections, substitutions);
+    }
     intern_block_collection_types(&statement.then_block, class_ids, collections, substitutions);
     if let Some(branch) = &statement.else_branch {
         match branch {
@@ -1990,9 +2014,13 @@ fn lower_statement_sequence(
             }
             hir::Stmt::Return { expr, span } => {
                 lower_with_statement_temporaries(context, |context| {
-                    let terminator = lower_return(expr.as_ref(), *span, return_type, context)?;
-                    context.terminate_current(terminator);
-                    Ok(())
+                    if let Some(target) = context.when_targets.last().copied() {
+                        lower_when_yield(expr.as_ref(), *span, target, context)
+                    } else {
+                        let terminator = lower_return(expr.as_ref(), *span, return_type, context)?;
+                        context.terminate_current(terminator);
+                        Ok(())
+                    }
                 })?;
             }
             hir::Stmt::VarDecl(decl) => {
@@ -2011,6 +2039,9 @@ fn lower_statement_sequence(
             hir::Stmt::If(if_stmt) => lower_if_statement(if_stmt, return_type, context)?,
             hir::Stmt::While(while_stmt) => {
                 lower_while_statement(while_stmt, return_type, context)?;
+            }
+            hir::Stmt::DoWhile(do_while) => {
+                lower_do_while_statement(do_while, return_type, context)?;
             }
             hir::Stmt::For(for_stmt) => {
                 lower_for_statement(for_stmt, return_type, context)?;
@@ -2168,6 +2199,12 @@ fn lower_if_statement(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if let Some(given) = &if_stmt.given {
+        context.push_scope();
+        let result = lower_if_statement_with_given(if_stmt, given, return_type, context);
+        context.pop_scope();
+        return result;
+    }
     let condition_block = context.current_block();
     let fallthrough_blocks = lower_if_tree(if_stmt, condition_block, return_type, context)?;
 
@@ -2184,16 +2221,95 @@ fn lower_if_statement(
     Ok(())
 }
 
+fn lower_if_statement_with_given(
+    if_stmt: &hir::IfStmt,
+    given: &hir::GivenPrelude,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let setup_block = context.current_block();
+    let predicates = lower_given_setup(given, return_type, context)?;
+    let setup_exit = context.current_block();
+    let gated_condition_block = context.create_block();
+    let gate_failed_block = context.create_block();
+    let predicate_blocks = lower_predicates_to_blocks(
+        &predicates,
+        gated_condition_block,
+        gate_failed_block,
+        context,
+    )?;
+    let mut fallthrough_blocks =
+        lower_if_tree(if_stmt, gated_condition_block, return_type, context)?;
+    if let Some(else_block) = final_else_block(if_stmt) {
+        fallthrough_blocks.extend(lower_scoped_block(
+            else_block,
+            gate_failed_block,
+            return_type,
+            context,
+        )?);
+    } else {
+        fallthrough_blocks.push(gate_failed_block);
+    }
+    let gate_failed = (!predicate_blocks.is_empty()).then_some(gate_failed_block);
+    context.blocks[setup_block.0]
+        .statements
+        .push(mir::Statement::ControlFlowPlan(
+            mir::ControlFlowPlan::Given(mir::GivenControlFlowPlan {
+                attachment: mir::GivenAttachment::If,
+                setup_entry: setup_block,
+                setup_exit,
+                predicates: predicate_blocks,
+                condition: gated_condition_block,
+                condition_type: mir::Type::Scalar(mir::ScalarType::Bool),
+                gate_failed,
+                continue_sources: Vec::new(),
+            }),
+        ));
+    if fallthrough_blocks.is_empty() {
+        context.current_block = None;
+        return Ok(());
+    }
+    let continuation = context.create_block();
+    for block in fallthrough_blocks {
+        context.terminate_block(block, mir::Terminator::Jump(continuation));
+    }
+    context.current_block = context.is_reachable(continuation).then_some(continuation);
+    Ok(())
+}
+
+fn final_else_block(if_stmt: &hir::IfStmt) -> Option<&hir::Block> {
+    match if_stmt.else_branch.as_ref()? {
+        hir::ElseBranch::If(nested) => final_else_block(nested),
+        hir::ElseBranch::Block(block) => Some(block),
+    }
+}
+
 fn lower_if_tree(
     if_stmt: &hir::IfStmt,
     condition_block: mir::BlockId,
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Vec<mir::BlockId>> {
+    lower_if_tree_with_predicates(if_stmt, condition_block, &[], return_type, context)
+}
+
+fn lower_if_tree_with_predicates(
+    if_stmt: &hir::IfStmt,
+    condition_block: mir::BlockId,
+    predicates: &[&hir::Expr],
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Vec<mir::BlockId>> {
     context.current_block = Some(condition_block);
     let then_block = context.create_block();
     let else_block = context.create_block();
-    lower_condition_to_blocks(&if_stmt.condition, then_block, else_block, context)?;
+    lower_predicates_and_condition_to_blocks(
+        predicates,
+        &if_stmt.condition,
+        then_block,
+        else_block,
+        context,
+    )?;
 
     let mut fallthrough_blocks =
         lower_scoped_block(&if_stmt.then_block, then_block, return_type, context)?;
@@ -2216,28 +2332,231 @@ fn lower_while_statement(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if let Some(given) = &while_stmt.given {
+        context.push_scope();
+        let result = lower_while_statement_with_given(while_stmt, given, return_type, context);
+        context.pop_scope();
+        return result;
+    }
+    lower_while_statement_with_predicates(while_stmt, &[], return_type, context).map(|_| ())
+}
+
+fn lower_while_statement_with_given(
+    while_stmt: &hir::WhileStmt,
+    given: &hir::GivenPrelude,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let setup_block = context.current_block();
+    let predicates = lower_given_setup(given, return_type, context)?;
+    let setup_exit = context.current_block();
+    let plan =
+        lower_while_statement_with_predicates(while_stmt, &predicates, return_type, context)?;
+    let gate_failed = (!plan.predicates.is_empty()).then_some(plan.exit);
+    context.blocks[setup_block.0]
+        .statements
+        .push(mir::Statement::ControlFlowPlan(
+            mir::ControlFlowPlan::Given(mir::GivenControlFlowPlan {
+                attachment: mir::GivenAttachment::While,
+                setup_entry: setup_block,
+                setup_exit,
+                predicates: plan.predicates,
+                condition: plan.condition,
+                condition_type: mir::Type::Scalar(mir::ScalarType::Bool),
+                gate_failed,
+                continue_sources: plan.continue_sources,
+            }),
+        ));
+    Ok(())
+}
+
+struct LoweredWhilePlan {
+    predicates: Vec<mir::GivenPredicatePlan>,
+    condition: mir::BlockId,
+    exit: mir::BlockId,
+    continue_sources: Vec<mir::BlockId>,
+}
+
+fn lower_while_statement_with_predicates(
+    while_stmt: &hir::WhileStmt,
+    predicates: &[&hir::Expr],
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<LoweredWhilePlan> {
     let header_block = context.create_block();
     let body_block = context.create_block();
     let exit_block = context.create_block();
 
     context.terminate_current(mir::Terminator::Jump(header_block));
     context.current_block = Some(header_block);
-    lower_condition_to_blocks(&while_stmt.condition, body_block, exit_block, context)?;
+    let predicate_plan = lower_predicates_and_condition_to_blocks(
+        predicates,
+        &while_stmt.condition,
+        body_block,
+        exit_block,
+        context,
+    )?;
 
     context.push_loop_targets(LoopTargets {
         continue_block: header_block,
         break_block: exit_block,
         cleanup_depth: context.local_scopes.len(),
+        continue_sources: Vec::new(),
     });
     let body_result = lower_scoped_block(&while_stmt.body, body_block, return_type, context);
-    context.pop_loop_targets();
+    let targets = context.pop_loop_targets();
     let fallthrough_blocks = body_result?;
 
     for block in fallthrough_blocks {
         context.terminate_block(block, mir::Terminator::Jump(header_block));
     }
     context.current_block = context.is_reachable(exit_block).then_some(exit_block);
+    Ok(LoweredWhilePlan {
+        predicates: predicate_plan.predicates,
+        condition: predicate_plan.condition,
+        exit: exit_block,
+        continue_sources: targets.continue_sources,
+    })
+}
+
+fn lower_do_while_statement(
+    do_while: &hir::DoWhileStmt,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let entry_block = context.current_block();
+    let body_block = context.create_block();
+    let condition_block = context.create_block();
+    let exit_block = context.create_block();
+    context.terminate_current(mir::Terminator::Jump(body_block));
+
+    context.push_loop_targets(LoopTargets {
+        continue_block: condition_block,
+        break_block: exit_block,
+        cleanup_depth: context.local_scopes.len(),
+        continue_sources: Vec::new(),
+    });
+    let body_result = lower_scoped_block(&do_while.body, body_block, return_type, context);
+    let targets = context.pop_loop_targets();
+    let fallthrough_blocks = body_result?;
+    for block in fallthrough_blocks {
+        context.terminate_block(block, mir::Terminator::Jump(condition_block));
+    }
+
+    context.current_block = Some(condition_block);
+    lower_condition_to_blocks(&do_while.condition, body_block, exit_block, context)?;
+    context.blocks[entry_block.0]
+        .statements
+        .push(mir::Statement::ControlFlowPlan(
+            mir::ControlFlowPlan::DoWhile(mir::DoWhilePlan {
+                entry: entry_block,
+                body: body_block,
+                condition: condition_block,
+                condition_type: mir::Type::Scalar(mir::ScalarType::Bool),
+                exit: exit_block,
+                continue_sources: targets.continue_sources,
+            }),
+        ));
+    context.current_block = context.is_reachable(exit_block).then_some(exit_block);
     Ok(())
+}
+
+fn lower_given_setup<'a>(
+    given: &'a hir::GivenPrelude,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Vec<&'a hir::Expr>> {
+    let info = context
+        .semantic_info
+        .given_preludes
+        .get(&(given.span.start, given.span.end))
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I2802",
+                "checked `given` prelude has no semantic execution plan",
+                given.span,
+            )]
+        })?;
+    let predicate_indices = info
+        .predicate_statement_indices
+        .iter()
+        .copied()
+        .collect::<HashSet<_>>();
+    let mut predicates = Vec::new();
+    for (index, statement) in given.block.statements.iter().enumerate() {
+        if predicate_indices.contains(&index) {
+            let hir::Stmt::Expr { expr, .. } = statement else {
+                return Err(vec![Diagnostic::new(
+                    "I2802",
+                    "`given` predicate plan does not identify an expression statement",
+                    stmt_span(statement),
+                )]);
+            };
+            predicates.push(expr);
+        } else {
+            lower_statement_sequence(std::slice::from_ref(statement), return_type, context)?;
+        }
+    }
+    Ok(predicates)
+}
+
+struct LoweredPredicatePlan {
+    predicates: Vec<mir::GivenPredicatePlan>,
+    condition: mir::BlockId,
+}
+
+fn lower_predicates_and_condition_to_blocks(
+    predicates: &[&hir::Expr],
+    condition: &hir::Expr,
+    true_block: mir::BlockId,
+    false_block: mir::BlockId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<LoweredPredicatePlan> {
+    if predicates.is_empty() {
+        let condition_block = context.current_block();
+        lower_condition_to_blocks(condition, true_block, false_block, context)?;
+        return Ok(LoweredPredicatePlan {
+            predicates: Vec::new(),
+            condition: condition_block,
+        });
+    }
+
+    let condition_block = context.create_block();
+    let predicate_blocks =
+        lower_predicates_to_blocks(predicates, condition_block, false_block, context)?;
+    context.current_block = Some(condition_block);
+    lower_condition_to_blocks(condition, true_block, false_block, context)?;
+    Ok(LoweredPredicatePlan {
+        predicates: predicate_blocks,
+        condition: condition_block,
+    })
+}
+
+fn lower_predicates_to_blocks(
+    predicates: &[&hir::Expr],
+    true_block: mir::BlockId,
+    false_block: mir::BlockId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Vec<mir::GivenPredicatePlan>> {
+    if predicates.is_empty() {
+        context.terminate_current(mir::Terminator::Jump(true_block));
+        return Ok(Vec::new());
+    }
+    let mut blocks = Vec::with_capacity(predicates.len());
+    for (index, predicate) in predicates.iter().enumerate() {
+        blocks.push(mir::GivenPredicatePlan {
+            block: context.current_block(),
+            ty: mir::Type::Scalar(mir::ScalarType::Bool),
+        });
+        let next = if index + 1 == predicates.len() {
+            true_block
+        } else {
+            context.create_block()
+        };
+        lower_condition_to_blocks(predicate, next, false_block, context)?;
+        context.current_block = Some(next);
+    }
+    Ok(blocks)
 }
 
 fn lower_for_statement(
@@ -2286,6 +2605,7 @@ fn lower_for_statement_in_scope(
         continue_block: increment_block,
         break_block: exit_block,
         cleanup_depth: context.local_scopes.len(),
+        continue_sources: Vec::new(),
     });
     let body_result = lower_scoped_block(&for_stmt.body, body_block, return_type, context);
     context.pop_loop_targets();
@@ -2534,6 +2854,7 @@ fn lower_collection_foreach_in_scope(
         continue_block: update_block,
         break_block: exit_block,
         cleanup_depth: context.local_scopes.len(),
+        continue_sources: Vec::new(),
     });
     context.push_scope();
     let body_result = lower_statement_sequence(&foreach.body.statements, return_type, context);
@@ -2931,6 +3252,7 @@ fn lower_range_foreach_in_scope(
         continue_block: update_block,
         break_block: exit_block,
         cleanup_depth: context.local_scopes.len(),
+        continue_sources: Vec::new(),
     });
     context.push_scope();
     context.current_block = Some(body_block);
@@ -3014,7 +3336,7 @@ fn lower_loop_control(
     control: LoopControl,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    let targets = context.current_loop_targets().ok_or_else(|| {
+    let (target, cleanup_depth) = context.current_loop_targets().ok_or_else(|| {
         let keyword = match control {
             LoopControl::Break => "break",
             LoopControl::Continue => "continue",
@@ -3025,10 +3347,14 @@ fn lower_loop_control(
         )]
     })?;
     let target = match control {
-        LoopControl::Break => targets.break_block,
-        LoopControl::Continue => targets.continue_block,
+        LoopControl::Break => target.break_block,
+        LoopControl::Continue => target.continue_block,
     };
-    context.cleanup_scopes_from(targets.cleanup_depth);
+    context.cleanup_scopes_from(cleanup_depth);
+    if matches!(control, LoopControl::Continue) {
+        let source = context.current_block();
+        context.record_continue_source(source);
+    }
     context.terminate_current(mir::Terminator::Jump(target));
     Ok(())
 }
@@ -3054,10 +3380,19 @@ struct BlockBuilder {
     terminator: Option<mir::Terminator>,
 }
 
-#[derive(Clone, Copy)]
 struct LoopTargets {
     continue_block: mir::BlockId,
     break_block: mir::BlockId,
+    cleanup_depth: usize,
+    continue_sources: Vec<mir::BlockId>,
+}
+
+#[derive(Clone, Copy)]
+struct WhenTarget {
+    result_local: mir::LocalId,
+    result_type: mir::Type,
+    merge_block: mir::BlockId,
+    transfer: bool,
     cleanup_depth: usize,
 }
 
@@ -3089,6 +3424,7 @@ struct LoweringContext<'semantic> {
     reachable_blocks: Vec<bool>,
     current_block: Option<mir::BlockId>,
     loop_targets: Vec<LoopTargets>,
+    when_targets: Vec<WhenTarget>,
     return_borrow: Option<mir::ReturnBorrow>,
 }
 
@@ -3203,6 +3539,7 @@ impl<'semantic> LoweringContext<'semantic> {
             reachable_blocks: vec![true],
             current_block: Some(mir::BlockId(0)),
             loop_targets: Vec::new(),
+            when_targets: Vec::new(),
             return_borrow: None,
         }
     }
@@ -3220,6 +3557,24 @@ impl<'semantic> LoweringContext<'semantic> {
                     metrics.basic_block_count += 1;
                     metrics.statement_count += block.statements.len();
                     metrics.terminator_count += 1;
+                    for statement in &block.statements {
+                        let mir::Statement::ControlFlowPlan(plan) = statement else {
+                            continue;
+                        };
+                        match plan {
+                            mir::ControlFlowPlan::When(plan) => {
+                                metrics.when_expression_count += 1;
+                                metrics.else_when_branch_count +=
+                                    plan.branches.len().saturating_sub(2);
+                            }
+                            mir::ControlFlowPlan::Given(plan) => {
+                                metrics.given_prelude_count += 1;
+                                metrics.given_predicate_count += plan.predicates.len();
+                            }
+                            mir::ControlFlowPlan::DoWhile(_) => metrics.do_while_count += 1,
+                            mir::ControlFlowPlan::PendingFinally { .. } => {}
+                        }
+                    }
                 }
                 mir::BasicBlock {
                     id: block.id,
@@ -3407,14 +3762,34 @@ impl<'semantic> LoweringContext<'semantic> {
         self.loop_targets.push(targets);
     }
 
-    fn pop_loop_targets(&mut self) {
+    fn pop_loop_targets(&mut self) -> LoopTargets {
         self.loop_targets
             .pop()
-            .expect("MIR lowering cannot pop an empty loop-target stack");
+            .expect("MIR lowering cannot pop an empty loop-target stack")
     }
 
-    fn current_loop_targets(&self) -> Option<LoopTargets> {
-        self.loop_targets.last().copied()
+    fn current_loop_targets(&self) -> Option<(&LoopTargets, usize)> {
+        self.loop_targets
+            .last()
+            .map(|targets| (targets, targets.cleanup_depth))
+    }
+
+    fn record_continue_source(&mut self, source: mir::BlockId) {
+        self.loop_targets
+            .last_mut()
+            .expect("MIR lowering cannot record continue without an active loop")
+            .continue_sources
+            .push(source);
+    }
+
+    fn push_when_target(&mut self, target: WhenTarget) {
+        self.when_targets.push(target);
+    }
+
+    fn pop_when_target(&mut self) {
+        self.when_targets
+            .pop()
+            .expect("MIR lowering cannot pop an empty when-target stack");
     }
 
     fn declare_user_local(&mut self, name: &str, writable: bool, ty: mir::Type) -> mir::LocalId {
@@ -4140,8 +4515,8 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         .expect("semantic checking guarantees a local declaration binding")
         .name;
 
-    if matches!(decl.initializer, hir::Expr::Match { .. }) {
-        let value = lower_match_rvalue(&decl.initializer, ty, true, context)?;
+    if is_branching_expr(&decl.initializer) {
+        let value = lower_branching_rvalue(&decl.initializer, ty, true, context)?;
         let local = context.declare_user_local(name, decl.writable, ty);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
@@ -4941,9 +5316,9 @@ fn lower_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let mir::Rvalue::String(value) =
-            lower_match_rvalue(expr, mir::Type::String, false, context)?
+            lower_branching_rvalue(expr, mir::Type::String, false, context)?
         else {
             unreachable!("string match lowering returned another MIR type");
         };
@@ -5168,9 +5543,9 @@ fn lower_nullable_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let mir::Rvalue::NullableString(value) =
-            lower_match_rvalue(expr, mir::Type::NullableString, false, context)?
+            lower_branching_rvalue(expr, mir::Type::NullableString, false, context)?
         else {
             unreachable!("nullable-string match lowering returned another MIR type");
         };
@@ -5474,9 +5849,9 @@ fn lower_nullable_scalar_expression(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let mir::Rvalue::NullableScalar(value) =
-            lower_match_rvalue(expr, mir::Type::NullableScalar(expected), false, context)?
+            lower_branching_rvalue(expr, mir::Type::NullableScalar(expected), false, context)?
         else {
             unreachable!("nullable-scalar match lowering returned another MIR type");
         };
@@ -5866,9 +6241,9 @@ fn lower_nullable_class_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableClassExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let mir::Rvalue::NullableClass(value) =
-            lower_match_rvalue(expr, mir::Type::NullableClass(expected), transfer, context)?
+            lower_branching_rvalue(expr, mir::Type::NullableClass(expected), transfer, context)?
         else {
             unreachable!("nullable-class match lowering returned another MIR type");
         };
@@ -7688,6 +8063,33 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
     }
 }
 
+fn lower_when_yield(
+    expr: Option<&hir::Expr>,
+    span: Span,
+    target: WhenTarget,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let Some(expr) = expr else {
+        return Err(vec![Diagnostic::new(
+            "I2803",
+            "checked `when` branch has a bare return",
+            span,
+        )]);
+    };
+    let value = if target.transfer {
+        lower_rvalue_as_expected(expr, target.result_type, context)?
+    } else {
+        lower_rvalue_as_borrowed(expr, target.result_type, context)?
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: target.result_local,
+        value,
+    });
+    context.cleanup_scopes_from(target.cleanup_depth);
+    context.terminate_current(mir::Terminator::Jump(target.merge_block));
+    Ok(())
+}
+
 fn payload_enum_use_mode(ty: mir::PayloadEnumType, transfer: bool) -> mir::PayloadEnumUseMode {
     if !transfer {
         mir::PayloadEnumUseMode::Borrow
@@ -7695,6 +8097,23 @@ fn payload_enum_use_mode(ty: mir::PayloadEnumType, transfer: bool) -> mir::Paylo
         mir::PayloadEnumUseMode::Copy
     } else {
         mir::PayloadEnumUseMode::Move
+    }
+}
+
+fn is_branching_expr(expr: &hir::Expr) -> bool {
+    matches!(expr, hir::Expr::Match { .. } | hir::Expr::When(_))
+}
+
+fn lower_branching_rvalue(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    match expr {
+        hir::Expr::Match { .. } => lower_match_rvalue(expr, expected, transfer, context),
+        hir::Expr::When(_) => lower_when_rvalue(expr, expected, transfer, context),
+        _ => unreachable!("branching lowering requires match or when"),
     }
 }
 
@@ -7885,6 +8304,152 @@ fn lower_match_rvalue(
             merge: merge_block,
         });
     context.current_block = Some(merge_block);
+    Ok(local_rvalue(result_local, expected, result_transfer))
+}
+
+fn lower_when_rvalue(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    let hir::Expr::When(when) = expr else {
+        unreachable!("when lowering requires a when expression")
+    };
+    let given = &when.given;
+    let branches = &when.branches;
+    let span = when.span;
+    let info = context
+        .semantic_info
+        .whens
+        .get(&(span.start, span.end))
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I2803",
+                "checked `when` expression has no semantic result plan",
+                span,
+            )]
+        })?;
+    let result_type = context
+        .mir_resolved_type(&info.result_type)
+        .ok_or_else(|| {
+            vec![unsupported(
+                span,
+                "when result type has no native representation",
+            )]
+        })?;
+    if result_type != expected {
+        return Err(vec![Diagnostic::new(
+            "I2803",
+            "checked `when` expression disagrees with its native result type",
+            span,
+        )]);
+    }
+
+    let result_transfer = expected.has_move_ownership() && transfer;
+    let result_local = if result_transfer {
+        context.declare_return_temp(expected, true)
+    } else {
+        context.declare_borrowed_temp(expected, false)
+    };
+    let merge_block = context.create_block();
+    context.push_scope();
+    let plan_block = context.current_block();
+    let predicates = if let Some(given) = given {
+        lower_given_setup(given, mir::ReturnType::Void, context)?
+    } else {
+        Vec::new()
+    };
+    let setup_exit = context.current_block();
+    let cleanup_depth = context.local_scopes.len();
+    let target = WhenTarget {
+        result_local,
+        result_type: expected,
+        merge_block,
+        transfer: result_transfer,
+        cleanup_depth,
+    };
+
+    let mut next_condition = context.current_block();
+    let mut predicate_blocks = Vec::new();
+    let gate_failed = if predicates.is_empty() {
+        None
+    } else {
+        let gate_passed = context.create_block();
+        let gate_failed = context.create_block();
+        predicate_blocks =
+            lower_predicates_to_blocks(&predicates, gate_passed, gate_failed, context)?;
+        next_condition = gate_passed;
+        Some(gate_failed)
+    };
+    let attached_condition = next_condition;
+    let mut branch_blocks = Vec::with_capacity(branches.len());
+    for branch in branches {
+        context.current_block = Some(next_condition);
+        let branch_block = context.create_block();
+        branch_blocks.push(branch_block);
+        let next = context.create_block();
+        if let Some(condition) = &branch.condition {
+            lower_condition_to_blocks(condition, branch_block, next, context)?;
+        } else {
+            context.terminate_current(mir::Terminator::Jump(branch_block));
+            if let Some(gate_failed) = gate_failed {
+                context.terminate_block(gate_failed, mir::Terminator::Jump(branch_block));
+            }
+        }
+
+        context.current_block = Some(branch_block);
+        context.push_scope();
+        context.push_when_target(target);
+        let result =
+            lower_statement_sequence(&branch.block.statements, mir::ReturnType::Void, context);
+        context.pop_when_target();
+        context.pop_scope();
+        result?;
+        if context.current_block.is_some() {
+            return Err(vec![Diagnostic::new(
+                "I2803",
+                "checked `when` branch reaches MIR fallthrough",
+                branch.block.span,
+            )]);
+        }
+        next_condition = next;
+    }
+
+    context.current_block = Some(next_condition);
+    context.terminate_current(mir::Terminator::Unreachable);
+    context.blocks[plan_block.0]
+        .statements
+        .push(mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::When(
+            mir::WhenResultPlan {
+                result: result_local,
+                ownership: if result_transfer {
+                    mir::WhenResultOwnership::Owned
+                } else {
+                    mir::WhenResultOwnership::Borrowed
+                },
+                branches: branch_blocks,
+                merge: merge_block,
+            },
+        )));
+    if given.is_some() {
+        context.blocks[plan_block.0]
+            .statements
+            .push(mir::Statement::ControlFlowPlan(
+                mir::ControlFlowPlan::Given(mir::GivenControlFlowPlan {
+                    attachment: mir::GivenAttachment::When,
+                    setup_entry: plan_block,
+                    setup_exit,
+                    predicates: predicate_blocks,
+                    condition: attached_condition,
+                    condition_type: mir::Type::Scalar(mir::ScalarType::Bool),
+                    gate_failed,
+                    continue_sources: Vec::new(),
+                }),
+            ));
+    }
+    context.current_block = Some(merge_block);
+    context.pop_scope();
     Ok(local_rvalue(result_local, expected, result_transfer))
 }
 
@@ -8462,8 +9027,8 @@ fn lower_condition(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
-        let mir::Rvalue::Value(mir::ValueExpression::Bool(value)) = lower_match_rvalue(
+    if is_branching_expr(expr) {
+        let mir::Rvalue::Value(mir::ValueExpression::Bool(value)) = lower_branching_rvalue(
             expr,
             mir::Type::Scalar(mir::ScalarType::Bool),
             false,
@@ -9382,9 +9947,10 @@ fn lower_value_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ValueExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let expected = context.expression_type(expr)?;
-        let mir::Rvalue::Value(value) = lower_match_rvalue(expr, expected, false, context)? else {
+        let mir::Rvalue::Value(value) = lower_branching_rvalue(expr, expected, false, context)?
+        else {
             unreachable!("scalar match lowering returned another MIR type");
         };
         return Ok(value);
@@ -9709,8 +10275,8 @@ fn lower_rvalue_as_expected(
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
-    if matches!(expr, hir::Expr::Match { .. }) {
-        return lower_match_rvalue(expr, expected, true, context);
+    if is_branching_expr(expr) {
+        return lower_branching_rvalue(expr, expected, true, context);
     }
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != expected {
@@ -9806,8 +10372,8 @@ fn lower_rvalue_as_borrowed(
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
-    if matches!(expr, hir::Expr::Match { .. }) {
-        return lower_match_rvalue(expr, expected, false, context);
+    if is_branching_expr(expr) {
+        return lower_branching_rvalue(expr, expected, false, context);
     }
     match expected {
         mir::Type::Class(class) => {
@@ -9884,9 +10450,9 @@ fn lower_payload_enum_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::PayloadEnumExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let mir::Rvalue::PayloadEnum(value) =
-            lower_match_rvalue(expr, mir::Type::PayloadEnum(ty), transfer, context)?
+            lower_branching_rvalue(expr, mir::Type::PayloadEnum(ty), transfer, context)?
         else {
             unreachable!("payload-enum match lowering returned another MIR type");
         };
@@ -10152,9 +10718,9 @@ fn lower_nullable_payload_enum_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullablePayloadEnumExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let mir::Rvalue::NullablePayloadEnum(value) =
-            lower_match_rvalue(expr, mir::Type::NullablePayloadEnum(ty), transfer, context)?
+            lower_branching_rvalue(expr, mir::Type::NullablePayloadEnum(ty), transfer, context)?
         else {
             unreachable!("nullable payload-enum match lowering returned another MIR type");
         };
@@ -10357,9 +10923,9 @@ fn lower_mixed_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::MixedExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let mir::Rvalue::Mixed(value) =
-            lower_match_rvalue(expr, mir::Type::Mixed, transfer, context)?
+            lower_branching_rvalue(expr, mir::Type::Mixed, transfer, context)?
         else {
             unreachable!("mixed match lowering returned another MIR type");
         };
@@ -10586,9 +11152,9 @@ fn lower_nullable_mixed_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableMixedExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let mir::Rvalue::NullableMixed(value) =
-            lower_match_rvalue(expr, mir::Type::NullableMixed, transfer, context)?
+            lower_branching_rvalue(expr, mir::Type::NullableMixed, transfer, context)?
         else {
             unreachable!("nullable-mixed match lowering returned another MIR type");
         };
@@ -10681,9 +11247,9 @@ fn lower_collection_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::CollectionExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let mir::Rvalue::Collection(value) =
-            lower_match_rvalue(expr, mir::Type::Collection(expected), transfer, context)?
+            lower_branching_rvalue(expr, mir::Type::Collection(expected), transfer, context)?
         else {
             unreachable!("collection match lowering returned another MIR type");
         };
@@ -11086,8 +11652,8 @@ fn lower_nullable_collection_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableCollectionExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
-        let mir::Rvalue::NullableCollection(value) = lower_match_rvalue(
+    if is_branching_expr(expr) {
+        let mir::Rvalue::NullableCollection(value) = lower_branching_rvalue(
             expr,
             mir::Type::NullableCollection(expected),
             transfer,
@@ -11591,7 +12157,8 @@ fn materialize_nested_collection_places(
         | hir::Expr::Bool { .. }
         | hir::Expr::Null { .. }
         | hir::Expr::StaticMember { .. }
-        | hir::Expr::Match { .. } => {}
+        | hir::Expr::Match { .. }
+        | hir::Expr::When(_) => {}
     }
     Ok(())
 }
@@ -12711,9 +13278,9 @@ fn lower_class_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ClassExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let mir::Rvalue::Class(value) =
-            lower_match_rvalue(expr, mir::Type::Class(expected), transfer, context)?
+            lower_branching_rvalue(expr, mir::Type::Class(expected), transfer, context)?
         else {
             unreachable!("class match lowering returned another MIR type");
         };
@@ -15440,9 +16007,9 @@ fn lower_float_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::FloatExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let ty = context.float_type(expr)?;
-        let mir::Rvalue::Value(mir::ValueExpression::Float(value)) = lower_match_rvalue(
+        let mir::Rvalue::Value(mir::ValueExpression::Float(value)) = lower_branching_rvalue(
             expr,
             mir::Type::Scalar(mir::ScalarType::Float(ty)),
             false,
@@ -15696,9 +16263,9 @@ fn lower_integer_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::IntegerExpression> {
-    if matches!(expr, hir::Expr::Match { .. }) {
+    if is_branching_expr(expr) {
         let ty = context.integer_type(expr)?;
-        let mir::Rvalue::Value(mir::ValueExpression::Integer(value)) = lower_match_rvalue(
+        let mir::Rvalue::Value(mir::ValueExpression::Integer(value)) = lower_branching_rvalue(
             expr,
             mir::Type::Scalar(mir::ScalarType::Integer(ty)),
             false,
@@ -16271,6 +16838,7 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
         hir::Expr::Unary { .. } => "this unary expression cannot be used as an integer expression",
         hir::Expr::Range { .. } => "a range cannot be used as an integer expression",
         hir::Expr::Match { .. } => "a match expression cannot be used before Stage 28",
+        hir::Expr::When(_) => "this when expression has no executable MIR form",
         hir::Expr::Binary {
             op:
                 hir::BinaryOp::Equal
@@ -16299,6 +16867,7 @@ fn stmt_span(statement: &hir::Stmt) -> Span {
         hir::Stmt::Echo { span, .. } | hir::Stmt::Return { span, .. } => *span,
         hir::Stmt::If(if_stmt) => if_stmt.span,
         hir::Stmt::While(while_stmt) => while_stmt.span,
+        hir::Stmt::DoWhile(do_while) => do_while.span,
         hir::Stmt::For(for_stmt) => for_stmt.span,
         hir::Stmt::Break { span } | hir::Stmt::Continue { span } => *span,
         hir::Stmt::Foreach(foreach) => foreach.span,

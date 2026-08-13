@@ -1155,6 +1155,82 @@ while ($count < 10) {
 }
 
 #[test]
+fn php_backend_executes_stage28a_slice1_control_flow() {
+    let php = doriac::compile_source_to_php(
+        "stage28a.doria",
+        r#"
+function probe(bool $value): bool
+{
+    echo $value ? "predicate true\n" : "predicate false\n";
+    return $value;
+}
+
+function skipped(): bool
+{
+    echo "condition\n";
+    return true;
+}
+
+function main(): void
+{
+    string $label = given {
+        let $prepared = "ready";
+        false;
+    } when (skipped()): string {
+        return $prepared;
+    } else when (skipped()) {
+        return "alternate";
+    } else {
+        return "fallback {$prepared}";
+    };
+    echo $label . "\n";
+
+    given {
+        let writable $running = true;
+        probe($running);
+    } while ($running) {
+        echo "body\n";
+        $running = false;
+        continue;
+    }
+
+    do {
+        echo "once\n";
+    } while (false);
+}
+"#,
+    )
+    .expect("Stage 28a Slice 1 control flow should lower to PHP");
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated Stage 28a PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout,
+        b"fallback ready\npredicate true\nbody\npredicate false\nonce\n"
+    );
+}
+
+#[test]
 fn emits_php_for_loop_control() {
     let php = doriac::compile_source_to_php(
         "test.doria",

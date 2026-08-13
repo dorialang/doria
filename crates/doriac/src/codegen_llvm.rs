@@ -1472,6 +1472,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
             }
             mir::Statement::MatchResultPlan { .. } => {}
+            mir::Statement::ControlFlowPlan(_) => {}
             mir::Statement::AssignLocalGroup { targets, value } => {
                 let first = *targets
                     .first()

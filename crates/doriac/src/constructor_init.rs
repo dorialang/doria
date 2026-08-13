@@ -346,6 +346,7 @@ fn inspect_statement(
         ),
         Stmt::If(_)
         | Stmt::While(_)
+        | Stmt::DoWhile(_)
         | Stmt::For(_)
         | Stmt::Foreach(_)
         | Stmt::Break { .. }
@@ -545,6 +546,50 @@ fn inspect_expr(
         } => {
             inspect_expr(class, properties, state, left, diagnostics);
             inspect_expr(class, properties, state, right, diagnostics);
+        }
+        Expr::When(when) => {
+            let mut nested = state.clone();
+            if let Some(given) = &when.given {
+                for statement in &given.block.statements {
+                    inspect_statement(
+                        class,
+                        properties,
+                        &mut nested,
+                        statement,
+                        false,
+                        diagnostics,
+                    );
+                }
+            }
+            for branch in &when.branches {
+                if let Some(condition) = &branch.condition {
+                    inspect_expr(class, properties, &nested, condition, diagnostics);
+                }
+                let mut branch_state = nested.clone();
+                for statement in &branch.block.statements {
+                    inspect_statement(
+                        class,
+                        properties,
+                        &mut branch_state,
+                        statement,
+                        false,
+                        diagnostics,
+                    );
+                }
+            }
+            if let Some(finally) = &when.finally {
+                let mut final_state = nested;
+                for statement in &finally.block.statements {
+                    inspect_statement(
+                        class,
+                        properties,
+                        &mut final_state,
+                        statement,
+                        false,
+                        diagnostics,
+                    );
+                }
+            }
         }
         Expr::Variable { .. }
         | Expr::Identifier { .. }

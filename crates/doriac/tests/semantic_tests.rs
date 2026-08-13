@@ -4218,3 +4218,136 @@ string $value = leak(0, 1);
 "#,
     );
 }
+
+#[test]
+fn checks_stage28a_when_typing_and_nearest_yields() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function choose(bool $outer, bool $inner): int
+{
+    return when ($outer) {
+        return when ($inner): int {
+            return 42;
+        } else {
+            return 21;
+        };
+    } else {
+        return 0;
+    };
+}
+
+?string $allNull = when (true) {
+    return null;
+} else {
+    return null;
+};
+"#,
+    )
+    .expect("contextual, inferred, and nested when results should check");
+
+    for (source, code) in [
+        (
+            "let $value = when (true) { return; } else { return 1; };",
+            "E0608",
+        ),
+        (
+            "let $value = when (true): int { return 1; } else { return \"wrong\"; };",
+            "E0609",
+        ),
+        (
+            "let $value = when (true): int { echo \"missing\"; } else { return 1; };",
+            "E0610",
+        ),
+        (
+            "let $value = when (true) { return null; } else { return null; };",
+            "E0610",
+        ),
+        (
+            "let $value = when (true): void { return; } else { return; };",
+            "E0608",
+        ),
+    ] {
+        assert_diagnostic_code(source, code);
+    }
+}
+
+#[test]
+fn checks_stage28a_given_phases_scope_and_do_while_conditions() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+function prepare(): void {}
+function ready(): bool { return true; }
+function main(): void
+{
+    given {
+        prepare();
+        let $value = 42;
+        ready();
+    } if ($value == 42) {
+        echo $value;
+    }
+
+    do {
+        prepare();
+    } while (false);
+}
+"#,
+    )
+    .expect("valid given phases and do-while should check");
+
+    assert_diagnostic_code(
+        "function main(): void { given { true; let $late = 1; } if (true) {} }",
+        "E0605",
+    );
+    assert_diagnostic_code(
+        "function main(): void { given { 42; } if (true) {} }",
+        "E0606",
+    );
+    assert_diagnostic_code(
+        "function main(): void { given { if (true) {} } if (true) {} }",
+        "E0607",
+    );
+    assert_diagnostic_code("function main(): void { do {} while (1); }", "E0416");
+    assert_diagnostic_code(
+        "function main(): void { given { let $inside = 1; } if (true) {} echo $inside; }",
+        "E0101",
+    );
+}
+
+#[test]
+fn accepted_control_flow_finalizers_stop_once_at_the_slice2_boundary() {
+    for source in [
+        include_str!("fixtures/stage28a_pending/finally_if.doria"),
+        include_str!("fixtures/stage28a_pending/finally_given_if.doria"),
+        include_str!("fixtures/stage28a_pending/finally_when.doria"),
+        include_str!("fixtures/stage28a_pending/finally_given_when.doria"),
+        include_str!("fixtures/stage28a_pending/finally_while.doria"),
+        include_str!("fixtures/stage28a_pending/finally_given_while.doria"),
+        include_str!("fixtures/stage28a_pending/finally_do_while.doria"),
+    ] {
+        let diagnostics = doriac::check_source("test.doria", source)
+            .expect_err("executable finalizers must stop at the Slice 2 boundary");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "E0611")
+                .count(),
+            1,
+            "expected one E0611 for {source}, got {diagnostics:?}"
+        );
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| !diagnostic.code.starts_with('P')));
+        let lowering = doriac::lower_source_to_mir("test.doria", source)
+            .expect_err("pending finalizer syntax must not produce MIR");
+        assert_eq!(
+            lowering
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "E0611")
+                .count(),
+            1
+        );
+    }
+}

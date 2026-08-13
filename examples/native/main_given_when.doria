@@ -1,0 +1,21 @@
+function skippedCondition(): bool
+{
+    echo "condition\n";
+    return true;
+}
+
+function main(): void
+{
+    string $label = given {
+        let $prepared = "ready";
+        false;
+    } when (skippedCondition()): string {
+        return $prepared;
+    } else when (skippedCondition()) {
+        return "alternate";
+    } else {
+        return "fallback {$prepared}";
+    };
+
+    echo $label . "\n";
+}

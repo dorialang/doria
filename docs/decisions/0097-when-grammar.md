@@ -24,9 +24,15 @@ Conditions are `bool`. Doria applies no truthiness, exactly as for `if`.
 
 ### The one difference: `when` always yields a value
 
-- **One result type governs every branch**, established one of two ways and never written on an `else when` or `else`:
+- **One result type governs every branch**, established by the first available
+  source in this priority order and never written on an `else when` or `else`:
   - **Head-annotated** (`when (cond): T`) — `T` is the annotation, and **every** branch, including the head's own body, must `return` a `T`.
-  - **Inferred** (no head annotation) — `T` is the type the **first (head) block** returns, and every subsequent branch must match it.
+  - **Expected-context typed** (no head annotation) — the surrounding declaration,
+    assignment, return, callable argument, initializer, nested expression,
+    nullable, or `mixed` context supplies `T`.
+  - **Head-inferred** (no annotation or expected context) — `T` is the type the
+    first reachable value the head block returns, and every subsequent branch
+    must match it.
 
   Either way, the first branch that disagrees is a compile error:
 
@@ -82,3 +88,6 @@ Lexer and parser (accept `when` / `given` / `finally` ahead of semantics, per §
 - Record 0009's "whether `when` is an expression, a statement, or both remains open" — resolved: `when` is an expression.
 - Plan §4.4's assertion that `when`'s grammar decision is authored "in Phase E" **and** the §13 Stage 36 roadmap entry — these disagreed on `when`'s stage. Reconciled: `when` is basic control flow, so it is re-slotted from Stage 36 (property hooks) to **Stage 28a — control-flow completion**, right after `match`, together with `given`, control-flow `finally`, and `do … while … finally` (the rest of record 0009's accepted-but-unimplemented control-flow family). Stage 36 keeps only property hooks.
 - Any assertion that `when` / `given` / `finally` grammar remains undecided.
+- The earlier two-source result-inference wording is amended by Decision 0116:
+  a surrounding expected type has priority over head-branch inference, including
+  the otherwise ambiguous all-null nullable case.

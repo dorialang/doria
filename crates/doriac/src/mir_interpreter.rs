@@ -1213,6 +1213,7 @@ impl Interpreter<'_> {
                 }
             }
             mir::Statement::MatchResultPlan { .. } => {}
+            mir::Statement::ControlFlowPlan(_) => {}
             mir::Statement::AssignLocalGroup { targets, value } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::AssignGroup(targets));

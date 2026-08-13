@@ -1,0 +1,9 @@
+function main(): void
+{
+    given {
+        true;
+    } while (false) {
+    } finally {
+        echo "cleanup\n";
+    }
+}

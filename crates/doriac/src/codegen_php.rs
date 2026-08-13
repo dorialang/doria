@@ -7,7 +7,9 @@ use crate::diagnostics::Diagnostic;
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::hir::*;
 use crate::numeric::{parse_decimal_magnitude, FloatType, IntegerType};
-use crate::semantics::{MatchSemanticInfo, ResolvedMatchPattern, SemanticInfo};
+use crate::semantics::{
+    GivenSemanticInfo, MatchSemanticInfo, ResolvedMatchPattern, SemanticInfo, WhenSemanticInfo,
+};
 use crate::source::Span;
 use crate::types::{ResolvedType, TypeRef};
 
@@ -712,6 +714,8 @@ function __doria_printf(int $start, int $end, string $format, mixed ...$values):
         payload_enum_expressions,
     );
     scopes.matches = program.semantic_info.matches.clone();
+    scopes.whens = program.semantic_info.whens.clone();
+    scopes.given_preludes = program.semantic_info.given_preludes.clone();
     scopes.expression_types = program.semantic_info.expression_types.clone();
     scopes.type_test_types = program.semantic_info.type_test_types.clone();
     scopes.mixed_box_types = program.semantic_info.mixed_box_types.clone();
@@ -999,8 +1003,23 @@ fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<
         }
         Stmt::If(if_stmt) => validate_if(if_stmt, semantic_info),
         Stmt::While(while_stmt) => {
+            if let Some(given) = &while_stmt.given {
+                validate_given(given, semantic_info)?;
+            }
             validate_expr(&while_stmt.condition, semantic_info)?;
-            validate_block(&while_stmt.body, semantic_info)
+            validate_block(&while_stmt.body, semantic_info)?;
+            if let Some(finally) = &while_stmt.finally {
+                validate_block(&finally.block, semantic_info)?;
+            }
+            Ok(())
+        }
+        Stmt::DoWhile(do_while) => {
+            validate_block(&do_while.body, semantic_info)?;
+            validate_expr(&do_while.condition, semantic_info)?;
+            if let Some(finally) = &do_while.finally {
+                validate_block(&finally.block, semantic_info)?;
+            }
+            Ok(())
         }
         Stmt::For(for_stmt) => {
             if let Some(initializer) = &for_stmt.initializer {
@@ -1072,6 +1091,9 @@ fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<
 }
 
 fn validate_if(if_stmt: &IfStmt, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
+    if let Some(given) = &if_stmt.given {
+        validate_given(given, semantic_info)?;
+    }
     validate_expr(&if_stmt.condition, semantic_info)?;
     validate_block(&if_stmt.then_block, semantic_info)?;
     if let Some(else_branch) = &if_stmt.else_branch {
@@ -1079,6 +1101,16 @@ fn validate_if(if_stmt: &IfStmt, semantic_info: &SemanticInfo) -> Result<(), Bac
             ElseBranch::If(else_if) => validate_if(else_if, semantic_info)?,
             ElseBranch::Block(block) => validate_block(block, semantic_info)?,
         }
+    }
+    if let Some(finally) = &if_stmt.finally {
+        validate_block(&finally.block, semantic_info)?;
+    }
+    Ok(())
+}
+
+fn validate_given(given: &GivenPrelude, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
+    for statement in &given.block.statements {
+        validate_statement(statement, semantic_info)?;
     }
     Ok(())
 }
@@ -1441,6 +1473,21 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             }
             Ok(())
         }
+        Expr::When(when) => {
+            if let Some(given) = &when.given {
+                validate_given(given, semantic_info)?;
+            }
+            for branch in &when.branches {
+                if let Some(condition) = &branch.condition {
+                    validate_expr(condition, semantic_info)?;
+                }
+                validate_block(&branch.block, semantic_info)?;
+            }
+            if let Some(finally) = &when.finally {
+                validate_block(&finally.block, semantic_info)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1601,6 +1648,10 @@ fn unsupported_php_property_default(
         Expr::Match { span, .. } => {
             Some((*span, "match expressions in instance property initializers"))
         }
+        Expr::When(when) => Some((
+            when.span,
+            "when expressions in instance property initializers",
+        )),
         Expr::IsType { span, .. } => Some((*span, "type tests in instance property initializers")),
         Expr::Identifier { .. }
         | Expr::String { .. }
@@ -1715,6 +1766,8 @@ struct PhpNameScopes {
     payload_enum_expressions: HashSet<(usize, usize)>,
     payload_case_tags: HashMap<crate::enums::EnumCaseId, u32>,
     matches: HashMap<(usize, usize), MatchSemanticInfo>,
+    whens: HashMap<(usize, usize), WhenSemanticInfo>,
+    given_preludes: HashMap<(usize, usize), GivenSemanticInfo>,
     expression_types: HashMap<(usize, usize), ResolvedType>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
     mixed_box_types: HashMap<(usize, usize), ResolvedType>,
@@ -1741,6 +1794,8 @@ impl PhpNameScopes {
             payload_enum_expressions,
             payload_case_tags: HashMap::new(),
             matches: HashMap::new(),
+            whens: HashMap::new(),
+            given_preludes: HashMap::new(),
             expression_types: HashMap::new(),
             type_test_types: HashMap::new(),
             mixed_box_types: HashMap::new(),
@@ -1758,6 +1813,8 @@ impl PhpNameScopes {
         );
         scopes.payload_case_tags = self.payload_case_tags.clone();
         scopes.matches = self.matches.clone();
+        scopes.whens = self.whens.clone();
+        scopes.given_preludes = self.given_preludes.clone();
         scopes.expression_types = self.expression_types.clone();
         scopes.type_test_types = self.type_test_types.clone();
         scopes.mixed_box_types = self.mixed_box_types.clone();
@@ -2648,13 +2705,41 @@ fn emit_statement(
                 writeln(output, indent, "return;");
             }
         }
-        Stmt::If(if_stmt) => emit_if(if_stmt, output, indent, "if", scopes),
+        Stmt::If(if_stmt) => {
+            if if_stmt.given.is_some() {
+                emit_given_if(if_stmt, output, indent, scopes);
+            } else {
+                emit_if(if_stmt, output, indent, "if", None, scopes);
+            }
+        }
         Stmt::While(while_stmt) => {
+            if let Some(given) = &while_stmt.given {
+                scopes.push();
+                let mut predicates = emit_given_setup(given, output, indent, scopes);
+                predicates.push(emit_expr(&while_stmt.condition, scopes));
+                write_indent(output, indent);
+                output.push_str("while (");
+                output.push_str(&emit_bool_chain(predicates.iter().map(String::as_str)));
+                output.push_str(")\n");
+                emit_block(&while_stmt.body, output, indent, scopes);
+                scopes.pop();
+                return;
+            }
             write_indent(output, indent);
             output.push_str("while (");
             output.push_str(&emit_expr(&while_stmt.condition, scopes));
             output.push_str(")\n");
             emit_block(&while_stmt.body, output, indent, scopes);
+        }
+        Stmt::DoWhile(do_while) => {
+            write_indent(output, indent);
+            output.push_str("do\n");
+            emit_block(&do_while.body, output, indent, scopes);
+            writeln(
+                output,
+                indent,
+                &format!("while ({});", emit_expr(&do_while.condition, scopes)),
+            );
         }
         Stmt::For(for_stmt) => emit_for(for_stmt, output, indent, scopes),
         Stmt::Break { .. } => {
@@ -2832,24 +2917,92 @@ fn emit_if(
     output: &mut String,
     indent: usize,
     keyword: &str,
+    gate: Option<&str>,
     scopes: &mut PhpNameScopes,
 ) {
     write_indent(output, indent);
     output.push_str(keyword);
     output.push_str(" (");
+    if let Some(gate) = gate {
+        output.push_str(gate);
+        output.push_str(" && ");
+    }
     output.push_str(&emit_expr(&if_stmt.condition, scopes));
     output.push_str(")\n");
     emit_block(&if_stmt.then_block, output, indent, scopes);
 
     if let Some(else_branch) = &if_stmt.else_branch {
         match else_branch {
-            ElseBranch::If(else_if) => emit_if(else_if, output, indent, "else if", scopes),
+            ElseBranch::If(else_if) => emit_if(else_if, output, indent, "else if", gate, scopes),
             ElseBranch::Block(block) => {
                 write_indent(output, indent);
                 output.push_str("else\n");
                 emit_block(block, output, indent, scopes);
             }
         }
+    }
+}
+
+fn emit_given_if(if_stmt: &IfStmt, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {
+    let given = if_stmt
+        .given
+        .as_ref()
+        .expect("given-if emission requires a prelude");
+    scopes.push();
+    let predicates = emit_given_setup(given, output, indent, scopes);
+    let gate = if predicates.is_empty() {
+        None
+    } else {
+        let gate = scopes.fresh_temp("__doria_given_gate");
+        writeln(
+            output,
+            indent,
+            &format!(
+                "${gate} = {};",
+                emit_bool_chain(predicates.iter().map(String::as_str))
+            ),
+        );
+        Some(format!("${gate}"))
+    };
+    emit_if(if_stmt, output, indent, "if", gate.as_deref(), scopes);
+    scopes.pop();
+}
+
+fn emit_given_setup(
+    given: &GivenPrelude,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) -> Vec<String> {
+    let info = scopes
+        .given_preludes
+        .get(&(given.span.start, given.span.end))
+        .cloned()
+        .expect("checked given prelude must have a semantic plan");
+    let predicate_indices = info
+        .predicate_statement_indices
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let mut predicates = Vec::new();
+    for (index, statement) in given.block.statements.iter().enumerate() {
+        if predicate_indices.contains(&index) {
+            let Stmt::Expr { expr, .. } = statement else {
+                unreachable!("checked given predicate must be an expression statement")
+            };
+            predicates.push(emit_expr(expr, scopes));
+        } else {
+            emit_statement(statement, output, indent, scopes);
+        }
+    }
+    predicates
+}
+
+fn emit_bool_chain<'a>(values: impl Iterator<Item = &'a str>) -> String {
+    let values = values.map(|value| format!("({value})")).collect::<Vec<_>>();
+    if values.is_empty() {
+        "true".to_string()
+    } else {
+        values.join(" && ")
     }
 }
 
@@ -3282,7 +3435,61 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             span,
             ..
         } => emit_match_expression(scrutinee, arms, *span, scopes),
+        Expr::When(when) => {
+            emit_when_expression(when.given.as_ref(), &when.branches, when.span, scopes)
+        }
     }
+}
+
+fn emit_when_expression(
+    given: Option<&GivenPrelude>,
+    branches: &[WhenBranch],
+    span: Span,
+    scopes: &PhpNameScopes,
+) -> String {
+    scopes
+        .whens
+        .get(&(span.start, span.end))
+        .expect("checked when expression must have a semantic plan");
+    let captures = scopes.captured_php_names();
+    let capture_list = if captures.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " use ({})",
+            captures
+                .iter()
+                .map(|name| format!("&${name}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    let mut when_scopes = scopes.clone();
+    when_scopes.push();
+    let mut body = String::new();
+    let predicates = given
+        .map(|given| emit_given_setup(given, &mut body, 1, &mut when_scopes))
+        .unwrap_or_default();
+    let gate =
+        (!predicates.is_empty()).then(|| emit_bool_chain(predicates.iter().map(String::as_str)));
+
+    for (index, branch) in branches.iter().enumerate() {
+        write_indent(&mut body, 1);
+        if let Some(condition) = &branch.condition {
+            body.push_str(if index == 0 { "if (" } else { "else if (" });
+            if let Some(gate) = &gate {
+                body.push_str(gate);
+                body.push_str(" && ");
+            }
+            body.push_str(&emit_expr(condition, &when_scopes));
+            body.push_str(")\n");
+        } else {
+            body.push_str("else\n");
+        }
+        emit_block(&branch.block, &mut body, 1, &mut when_scopes);
+    }
+    when_scopes.pop();
+    format!("(function(){capture_list} {{\n{body}}})()")
 }
 
 fn emit_match_expression(

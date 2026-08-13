@@ -1099,8 +1099,8 @@ class Parser
 }
 
 #[test]
-fn accepted_when_grammar_reports_its_implementation_stage_without_parse_errors() {
-    let diagnostics = doriac::parse_source(
+fn parses_given_when_and_preserves_the_pending_finalizer() {
+    let program = doriac::parse_source(
         "test.doria",
         r#"
 let $value = given {
@@ -1115,14 +1115,92 @@ let $value = given {
 };
 "#,
     )
-    .expect_err("accepted future control flow must stop before semantics");
+    .expect("Stage 28a Slice 1 control flow must parse without diagnostics");
 
+    let Item::Statement(Stmt::VarDecl(declaration)) = &program.items[0] else {
+        panic!("expected a top-level declaration");
+    };
+    let Expr::When(when) = &declaration.initializer else {
+        panic!("expected a when expression");
+    };
+    assert!(when.given.is_some());
+    assert_eq!(
+        when.result_type.as_ref().map(|ty| ty.name.as_str()),
+        Some("int")
+    );
+    assert_eq!(when.branches.len(), 3);
+    assert!(when.branches[0].condition.is_some());
+    assert!(when.branches[1].condition.is_some());
+    assert!(when.branches[2].condition.is_none());
+    assert!(when.finally.is_some());
+}
+
+#[test]
+fn parses_do_while_and_requires_its_ordinary_semicolon() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+function main(): void
+{
+    do {
+        echo "once";
+    } while (false);
+}
+"#,
+    )
+    .expect("ordinary do-while should parse");
+    let Item::Function(main) = &program.items[0] else {
+        panic!("expected main");
+    };
+    assert!(matches!(
+        &main.body.statements[0],
+        Stmt::DoWhile(statement) if statement.semicolon_span.is_some()
+    ));
+
+    let diagnostics = doriac::parse_source(
+        "test.doria",
+        "function main(): void { do {} while (false) }",
+    )
+    .expect_err("missing do-while semicolon must fail");
     assert!(diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == "E0513"));
-    assert!(diagnostics
+        .any(|diagnostic| diagnostic.code == "P0018"));
+}
+
+#[test]
+fn rejects_finally_on_excluded_control_flow_families() {
+    for source in [
+        "function main(): void { for (;;) {} finally {} }",
+        "function main(): void { foreach (0..1 as int $item) {} finally {} }",
+        "function main(): void { let $value = match (true) { true => 1, default => 0 } finally {}; }",
+        "function main(): void { {} finally {} }",
+    ] {
+        let diagnostics = doriac::parse_source("test.doria", source)
+            .expect_err("excluded finally attachment must fail in parsing");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "P0021"),
+            "expected P0021 for {source}, got {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_when_without_else_and_given_on_do() {
+    let missing_else =
+        doriac::parse_source("test.doria", "let $value = when (true): int { return 1; };")
+            .expect_err("value-returning when requires else");
+    assert!(missing_else
         .iter()
-        .all(|diagnostic| !diagnostic.code.starts_with('P')));
+        .any(|diagnostic| diagnostic.message.contains("requires an `else` block")));
+
+    let given_do = doriac::parse_source(
+        "test.doria",
+        "function main(): void { given {} do {} while (false); }",
+    )
+    .expect_err("given must not attach to do-while");
+    assert!(given_do.iter().any(|diagnostic| diagnostic.code == "P0019"));
 }
 
 #[test]

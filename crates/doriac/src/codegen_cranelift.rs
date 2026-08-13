@@ -1779,6 +1779,7 @@ fn lower_statement(
             }
         }
         mir::Statement::MatchResultPlan { .. } => {}
+        mir::Statement::ControlFlowPlan(_) => {}
         mir::Statement::AssignLocalGroup { targets, value } => {
             let definition = local_definition(
                 resources.program,

@@ -300,10 +300,11 @@ fn lexes_future_reserved_words() {
 
 #[test]
 fn lexes_accepted_control_flow_keywords() {
-    let kinds = token_kinds("when given finally");
+    let kinds = token_kinds("when given finally do");
     assert!(matches!(kinds[0], TokenKind::When));
     assert!(matches!(kinds[1], TokenKind::Given));
     assert!(matches!(kinds[2], TokenKind::Finally));
+    assert!(matches!(kinds[3], TokenKind::Do));
 }
 
 #[test]

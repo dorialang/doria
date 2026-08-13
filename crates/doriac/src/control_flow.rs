@@ -183,8 +183,16 @@ impl Builder {
                 );
                 Vec::new()
             }
-            Stmt::If(if_stmt) => self.build_if(if_stmt, incoming),
+            Stmt::If(if_stmt) => {
+                let incoming = if_stmt.given.as_ref().map_or(incoming.clone(), |given| {
+                    self.build_statements(&given.block.statements, incoming)
+                });
+                self.build_if(if_stmt, incoming)
+            }
             Stmt::While(while_stmt) => {
+                let incoming = while_stmt.given.as_ref().map_or(incoming.clone(), |given| {
+                    self.build_statements(&given.block.statements, incoming)
+                });
                 let header = self.graph.add_node(
                     NodeKind::LoopHeader,
                     while_stmt.condition.span(),
@@ -209,6 +217,38 @@ impl Builder {
                 let mut outgoing = loop_context.breaks;
                 if condition != ConstantCondition::AlwaysTrue {
                     outgoing.push(self.assumption(&while_stmt.condition, false, header));
+                }
+                deduplicate(outgoing)
+            }
+            Stmt::DoWhile(do_while) => {
+                let body_entry = self.graph.add_node(
+                    NodeKind::LoopHeader,
+                    do_while.body.span,
+                    NodeAction::None,
+                    true,
+                );
+                self.graph.connect_all(&incoming, body_entry);
+                let condition_node = self.graph.add_node(
+                    NodeKind::LoopHeader,
+                    do_while.condition.span(),
+                    NodeAction::Expression(do_while.condition.clone()),
+                    true,
+                );
+                self.loops.push(LoopContext {
+                    continue_target: condition_node,
+                    breaks: Vec::new(),
+                });
+                let body_outgoing =
+                    self.build_statements(&do_while.body.statements, vec![body_entry]);
+                self.graph.connect_all(&body_outgoing, condition_node);
+                let condition = constant_condition(&do_while.condition);
+                if condition != ConstantCondition::AlwaysFalse {
+                    let repeat = self.assumption(&do_while.condition, true, condition_node);
+                    self.graph.add_edge(repeat, body_entry);
+                }
+                let mut outgoing = self.loops.pop().expect("do-while loop context").breaks;
+                if condition != ConstantCondition::AlwaysTrue {
+                    outgoing.push(self.assumption(&do_while.condition, false, condition_node));
                 }
                 deduplicate(outgoing)
             }
@@ -410,6 +450,7 @@ fn statement_span(statement: &Stmt) -> Span {
         Stmt::Echo { span, .. } | Stmt::Return { span, .. } | Stmt::Expr { span, .. } => *span,
         Stmt::If(if_stmt) => if_stmt.span,
         Stmt::While(while_stmt) => while_stmt.span,
+        Stmt::DoWhile(do_while) => do_while.span,
         Stmt::For(for_stmt) => for_stmt.span,
         Stmt::Break { span } | Stmt::Continue { span } => *span,
         Stmt::Foreach(foreach) => foreach.span,

@@ -6,7 +6,11 @@ Status: Accepted
 
 Doria should support familiar control flow while also exploring a Gherkin-inspired setup/condition/action style for stateful conditional and looping code.
 
-This note records broad control-flow direction only. `docs/decisions/0020-boolean-operators-and-given-predicates.md` later accepts the `given { ... }` predicate-block direction and the `if` / `when` distinction. Neither note implements grammar, lowering, borrow-checking behavior, or compiler work by itself.
+This note records broad control-flow direction only. Decision 0020 later accepted
+the `given { ... }` predicate-block direction and the `if` / `when` distinction.
+Decision 0116 now settles and implements the Stage 28a Slice 1 grammar and
+semantics, and is authoritative where this early direction note was open or
+illustrative.
 
 Planned control-flow families:
 
@@ -45,7 +49,9 @@ when ($condition): int {
 }
 ```
 
-If a return type is declared, all successful paths should return that type. Whether `when` is an expression, a statement, or both remains open.
+`when` is an expression, requires a total `else`, and uses branch-local
+`return expression;` to yield from the nearest `when`, as settled by decisions
+0097 and 0116.
 
 ### given ... when
 
@@ -99,24 +105,17 @@ Use `else if` as the spelling for now.
 
 Doria should eventually support `match` as a pattern/value selection construct. The exact match grammar is open.
 
-## Open questions
+## Questions Settled By Later Decisions
 
-- Does `finally` run after `return`?
-- Does `finally` run after `break` or `continue`?
-- Does `finally` run if the `given` precondition is false?
-- Does `finally` run if the `when` condition is false?
-- Does `finally` run after zero `while` iterations?
-- Is `when` an expression, a statement, or both?
-- Does `when` require an `else` or default branch when used as an expression?
-- What ownership/borrow-checking rules apply across `given`, the attached control construct, and `finally`?
-- Are variables declared in `given` mutable across `while` iterations?
-- Does `finally` have access to variables declared in `given`?
-- Does `finally` have access to variables declared inside `when`/`while`?
-- How does this interact with borrow checking and writable values?
-- How does this lower into Doria IR?
-- How does `match` differ from `when`?
-- Do we spell else-if as `else if` or `elseif`?
+Decision 0116 settles the finalizer trigger paths, activation, scope, transfer
+rules, ownership order, nested order, and `do ... while` punctuation that this
+record left open. It also settles `given` execution and MIR lowering. Decisions
+0097 and 0116 settle `when` as an exhaustive expression with mandatory `else`.
+Decision 0115 settles `match`: match selects one expression by pattern, while
+`when` runs statement branches that yield a value. The spelling is `else if`;
+`elseif` is not Doria syntax.
 
 ## Notes
 
-Do not implement lexer, parser, semantic, Doria IR, or backend behavior from this note alone. Each construct needs a specific grammar and semantics pass before compiler work begins.
+Use Decision 0116, not this direction note alone, for current implementation.
+Executable `finally` remains its Stage 28a Slice 2 work.

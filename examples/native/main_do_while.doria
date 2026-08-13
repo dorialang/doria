@@ -1,0 +1,12 @@
+function main(): void
+{
+    let writable $count = 0;
+
+    do {
+        $count++;
+        if ($count < 3) {
+            continue;
+        }
+        echo "body {$count}\n";
+    } while ($count < 3);
+}

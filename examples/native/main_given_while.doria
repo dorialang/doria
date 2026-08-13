@@ -1,0 +1,23 @@
+function prepare(): void
+{
+    echo "setup\n";
+}
+
+function ready(int $remaining): bool
+{
+    echo "predicate {$remaining}\n";
+    return true;
+}
+
+function main(): void
+{
+    given {
+        prepare();
+        let writable $remaining = 3;
+        ready($remaining);
+    } while ($remaining > 0) {
+        echo "body {$remaining}\n";
+        $remaining--;
+        continue;
+    }
+}

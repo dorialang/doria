@@ -58,6 +58,10 @@ pub struct SemanticInfo {
     pub type_test_types: HashMap<(usize, usize), ResolvedType>,
     /// Fully checked match plans consumed by backend-independent MIR lowering.
     pub matches: HashMap<(usize, usize), MatchSemanticInfo>,
+    /// Fully checked value type for each `when` expression.
+    pub whens: HashMap<(usize, usize), WhenSemanticInfo>,
+    /// Source-order statement classification for each `given` prelude.
+    pub given_preludes: HashMap<(usize, usize), GivenSemanticInfo>,
     /// Compiler-resolved callable target for each user-defined call expression.
     pub call_targets: HashMap<(usize, usize), CallableTarget>,
     /// Concrete generic arguments selected for each checked user-defined call.
@@ -167,6 +171,16 @@ pub struct MatchSemanticInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhenSemanticInfo {
+    pub result_type: ResolvedType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GivenSemanticInfo {
+    pub predicate_statement_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchArmSemanticInfo {
     pub pattern: ResolvedMatchPattern,
     pub guard: MatchGuardSemanticInfo,
@@ -184,6 +198,25 @@ pub enum MatchGuardSemanticInfo {
 impl MatchGuardSemanticInfo {
     const fn covers_pattern(self) -> bool {
         matches!(self, Self::None | Self::AlwaysTrue)
+    }
+}
+
+fn statement_span(statement: &Stmt) -> Span {
+    match statement {
+        Stmt::Block(block) => block.span,
+        Stmt::VarDecl(declaration) => declaration.span,
+        Stmt::Assignment(assignment) => assignment.span,
+        Stmt::Echo { span, .. }
+        | Stmt::Return { span, .. }
+        | Stmt::Break { span }
+        | Stmt::Continue { span }
+        | Stmt::Expr { span, .. } => *span,
+        Stmt::If(statement) => statement.span,
+        Stmt::While(statement) => statement.span,
+        Stmt::DoWhile(statement) => statement.span,
+        Stmt::For(statement) => statement.span,
+        Stmt::Foreach(statement) => statement.span,
+        Stmt::Increment(statement) => statement.span,
     }
 }
 
@@ -302,6 +335,7 @@ pub fn analyze_program_for_ide_with_source<'source>(
             &checker.expression_types,
             &checker.flow_facts,
             &move_enum_names,
+            &checker.given_preludes,
         );
         checker.diagnostics.extend(ownership_diagnostics);
     }
@@ -322,6 +356,8 @@ pub fn analyze_program_for_ide_with_source<'source>(
             enum_case_constructions: checker.enum_case_constructions,
             type_test_types: checker.type_test_types,
             matches: checker.matches,
+            whens: checker.whens,
+            given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
             generic_call_specializations: checker.generic_call_specializations,
             constrained_display_calls: checker.constrained_display_calls,
@@ -963,6 +999,8 @@ struct Checker<'program> {
     enum_case_constructions: HashMap<(usize, usize), EnumCaseId>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
     matches: HashMap<(usize, usize), MatchSemanticInfo>,
+    whens: HashMap<(usize, usize), WhenSemanticInfo>,
+    given_preludes: HashMap<(usize, usize), GivenSemanticInfo>,
     call_targets: HashMap<(usize, usize), CallableTarget>,
     generic_call_specializations: HashMap<(usize, usize), GenericSpecialization>,
     constrained_display_calls: HashSet<(usize, usize)>,
@@ -980,6 +1018,14 @@ struct Checker<'program> {
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
     flow_facts: crate::narrowing::FactsByUse,
     contextual_expression_types: HashMap<(usize, usize), TypeId>,
+    when_contexts: Vec<WhenCheckContext>,
+}
+
+#[derive(Debug, Clone)]
+struct WhenCheckContext {
+    expected: Option<TypeId>,
+    inferred: Option<TypeId>,
+    saw_value: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1441,6 +1487,8 @@ impl<'program> Checker<'program> {
             enum_case_constructions: HashMap::new(),
             type_test_types: HashMap::new(),
             matches: HashMap::new(),
+            whens: HashMap::new(),
+            given_preludes: HashMap::new(),
             call_targets: HashMap::new(),
             generic_call_specializations: HashMap::new(),
             constrained_display_calls: HashSet::new(),
@@ -1457,6 +1505,7 @@ impl<'program> Checker<'program> {
             parameter_defaults: HashMap::new(),
             flow_facts: crate::narrowing::analyze_program(program),
             contextual_expression_types: HashMap::new(),
+            when_contexts: Vec::new(),
         }
     }
 
@@ -4215,17 +4264,26 @@ impl<'program> Checker<'program> {
                 _ => self.check_expr(expr, scopes, method_context),
             },
             Stmt::Return { expr, span } => {
-                self.check_return_statement(
-                    expr.as_ref(),
-                    *span,
-                    scopes,
-                    method_context,
-                    return_context,
-                );
+                if self.when_contexts.is_empty() {
+                    self.check_return_statement(
+                        expr.as_ref(),
+                        *span,
+                        scopes,
+                        method_context,
+                        return_context,
+                    );
+                } else {
+                    self.check_when_yield(expr.as_ref(), *span, scopes, method_context);
+                }
             }
             Stmt::If(if_stmt) => {
-                self.check_condition(&if_stmt.condition, scopes, method_context);
-                let mut then_scopes = scopes.clone();
+                let mut construct_scopes = scopes.clone();
+                construct_scopes.push();
+                if let Some(given) = &if_stmt.given {
+                    self.check_given_prelude(given, &mut construct_scopes, method_context);
+                }
+                self.check_condition(&if_stmt.condition, &construct_scopes, method_context);
+                let mut then_scopes = construct_scopes.clone();
                 let mut then_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::nested);
@@ -4240,17 +4298,23 @@ impl<'program> Checker<'program> {
                 if let Some(else_branch) = &if_stmt.else_branch {
                     self.check_else_branch(
                         else_branch,
-                        scopes,
+                        &construct_scopes,
                         method_context,
                         constructor_init_context.as_deref(),
                         return_context,
                         loop_depth,
                     );
                 }
+                self.reject_executable_finally(if_stmt.finally.as_ref());
             }
             Stmt::While(while_stmt) => {
-                self.check_condition(&while_stmt.condition, scopes, method_context);
-                let mut body_scopes = scopes.clone();
+                let mut construct_scopes = scopes.clone();
+                construct_scopes.push();
+                if let Some(given) = &while_stmt.given {
+                    self.check_given_prelude(given, &mut construct_scopes, method_context);
+                }
+                self.check_condition(&while_stmt.condition, &construct_scopes, method_context);
+                let mut body_scopes = construct_scopes;
                 let mut loop_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::repeatable);
@@ -4262,6 +4326,23 @@ impl<'program> Checker<'program> {
                     return_context,
                     loop_depth + 1,
                 );
+                self.reject_executable_finally(while_stmt.finally.as_ref());
+            }
+            Stmt::DoWhile(do_while) => {
+                let mut body_scopes = scopes.clone();
+                let mut loop_constructor_init_context = constructor_init_context
+                    .as_deref()
+                    .map(ConstructorInitContext::repeatable);
+                self.check_block(
+                    &do_while.body,
+                    &mut body_scopes,
+                    method_context,
+                    loop_constructor_init_context.as_mut(),
+                    return_context,
+                    loop_depth + 1,
+                );
+                self.check_condition(&do_while.condition, scopes, method_context);
+                self.reject_executable_finally(do_while.finally.as_ref());
             }
             Stmt::For(for_stmt) => {
                 let mut loop_scopes = scopes.clone();
@@ -4984,6 +5065,173 @@ impl<'program> Checker<'program> {
         ));
     }
 
+    fn check_given_prelude(
+        &mut self,
+        given: &GivenPrelude,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let mut predicates_started = false;
+        let mut predicate_statement_indices = Vec::new();
+        for (index, statement) in given.block.statements.iter().enumerate() {
+            match statement {
+                Stmt::VarDecl(declaration) => {
+                    if predicates_started {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0605",
+                                "`given` setup must appear before its first predicate",
+                                declaration.span,
+                            )
+                            .with_title("Given Setup Appears After A Predicate")
+                            .with_help("move this declaration before the first bool predicate"),
+                        );
+                    }
+                    self.check_local_declaration(declaration, scopes, method_context);
+                }
+                Stmt::Expr { expr, span } => {
+                    self.check_expr(expr, scopes, method_context);
+                    let ty = self.infer_expr_type(expr, scopes, method_context);
+                    if self.is_void_type(ty) {
+                        if predicates_started {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "E0605",
+                                    "`given` setup must appear before its first predicate",
+                                    *span,
+                                )
+                                .with_title("Given Setup Appears After A Predicate")
+                                .with_help(
+                                    "move this void setup call before the first bool predicate",
+                                ),
+                            );
+                        }
+                    } else if matches!(self.types.kind(ty), TypeKind::Bool | TypeKind::Unknown) {
+                        predicates_started = true;
+                        predicate_statement_indices.push(index);
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0606",
+                                format!(
+                                    "`given` predicate must be `bool`, got `{}`",
+                                    self.types.display(ty)
+                                ),
+                                expr.span(),
+                            )
+                            .with_title("Given Predicate Must Be Bool")
+                            .with_help("use a bool expression, or make this a void setup call"),
+                        );
+                    }
+                }
+                _ => {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0607",
+                            "`given` accepts only setup declarations, void setup calls, and bool predicates",
+                            statement_span(statement),
+                        )
+                        .with_title("Nested Control Flow Is Not Allowed In Given")
+                        .with_help("move control flow into the attached construct"),
+                    );
+                }
+            }
+        }
+        self.given_preludes.insert(
+            (given.span.start, given.span.end),
+            GivenSemanticInfo {
+                predicate_statement_indices,
+            },
+        );
+    }
+
+    fn reject_executable_finally(&mut self, finally: Option<&ControlFlowFinally>) {
+        let Some(finally) = finally else {
+            return;
+        };
+        self.diagnostics.push(
+            Diagnostic::unsupported_stage(
+                "E0611",
+                "control-flow `finally` is preserved by the compiler but does not execute until Stage 28a Slice 2",
+                finally.keyword_span,
+            )
+            .with_title("Control-Flow Finally Is Not Executable Yet")
+            .with_help("remove `finally` until Slice 2, or move required cleanup into explicit control flow"),
+        );
+    }
+
+    fn check_when_yield(
+        &mut self,
+        expr: Option<&Expr>,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let Some(expr) = expr else {
+            self.diagnostics.push(
+                Diagnostic::new("E0608", "a `when` branch must return a value", span)
+                    .with_title("When Cannot Yield Void")
+                    .with_help("return a value from this branch"),
+            );
+            return;
+        };
+        let index = self.when_contexts.len() - 1;
+        let expected = self.when_contexts[index].expected;
+        if let Some(expected) = expected {
+            self.record_expected_expression_type(expr, expected);
+        }
+        self.check_expr(expr, scopes, method_context);
+        let value = self.infer_expr_type(expr, scopes, method_context);
+        if self.is_void_type(value) {
+            self.diagnostics.push(
+                Diagnostic::new("E0608", "a `when` branch cannot yield `void`", expr.span())
+                    .with_title("When Cannot Yield Void"),
+            );
+            return;
+        }
+        self.when_contexts[index].saw_value = true;
+        if let Some(expected) = expected {
+            if !self.is_expr_assignable(expected, expr, scopes, method_context)
+                && !self.is_assignable(expected, value)
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0609",
+                        format!(
+                            "when branch yields `{}` but the result type is `{}`",
+                            self.types.display(value),
+                            self.types.display(expected)
+                        ),
+                        expr.span(),
+                    )
+                    .with_title("When Branch Result Type Mismatch"),
+                );
+            }
+            return;
+        }
+
+        let inferred = self.when_contexts[index].inferred;
+        match inferred {
+            None => self.when_contexts[index].inferred = Some(value),
+            Some(target) if self.is_assignable(target, value) => {}
+            Some(target) => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0609",
+                        format!(
+                            "when branch yields `{}` but the head branch yields `{}`",
+                            self.types.display(value),
+                            self.types.display(target)
+                        ),
+                        expr.span(),
+                    )
+                    .with_title("When Branch Result Type Mismatch")
+                    .with_help("add an explicit `when (...): Type` result type when a broader context is intended"),
+                );
+            }
+        }
+    }
+
     fn check_return_statement(
         &mut self,
         expr: Option<&Expr>,
@@ -5569,6 +5817,7 @@ impl<'program> Checker<'program> {
                 }
             }
             Expr::Match { .. } => self.check_match_expression(expr, scopes, method_context),
+            Expr::When(_) => self.check_when_expression(expr, scopes, method_context),
             Expr::Float { .. } => self.check_float_literal_range(expr, FloatType::Float64),
             Expr::Identifier { name, span } => {
                 if name.contains('\\') {
@@ -5933,6 +6182,103 @@ impl<'program> Checker<'program> {
                 },
             );
         }
+    }
+
+    fn check_when_expression(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let Expr::When(when) = expr else {
+            unreachable!("when checking requires a when expression")
+        };
+        let given = &when.given;
+        let result_type = &when.result_type;
+        let branches = &when.branches;
+        let finally = &when.finally;
+        let span = when.span;
+
+        let mut when_scopes = scopes.clone();
+        when_scopes.push();
+        if let Some(given) = given {
+            self.check_given_prelude(given, &mut when_scopes, method_context);
+        }
+
+        let explicit = result_type
+            .as_ref()
+            .map(|ty| self.resolve_type_ref(ty, span));
+        if explicit.is_some_and(|ty| self.is_void_type(ty)) {
+            self.diagnostics.push(
+                Diagnostic::new("E0608", "a `when` expression cannot have type `void`", span)
+                    .with_title("When Cannot Produce Void"),
+            );
+        }
+        let contextual = self
+            .contextual_expression_types
+            .get(&(span.start, span.end))
+            .copied();
+        let expected = explicit.or(contextual);
+        self.when_contexts.push(WhenCheckContext {
+            expected,
+            inferred: None,
+            saw_value: false,
+        });
+
+        for branch in branches {
+            if let Some(condition) = &branch.condition {
+                self.check_condition(condition, &when_scopes, method_context);
+            }
+            let mut branch_scopes = when_scopes.clone();
+            self.check_block(
+                &branch.block,
+                &mut branch_scopes,
+                method_context,
+                None,
+                None,
+                0,
+            );
+            if crate::return_analysis::block_falls_through(&branch.block) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0610",
+                        "every normal path through a `when` branch must return a value",
+                        branch.block.span,
+                    )
+                    .with_title("When Branch Does Not Yield On Every Path")
+                    .with_help("add `return value;` on the branch's remaining path"),
+                );
+            }
+        }
+
+        let context = self.when_contexts.pop().expect("when result context");
+        let result = context
+            .expected
+            .or(context.inferred)
+            .unwrap_or_else(|| self.types.unknown());
+        if context.expected.is_none()
+            && context.saw_value
+            && matches!(self.types.kind(result), TypeKind::Null)
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0610",
+                    "a `when` whose branches all yield `null` needs an expected nullable type",
+                    span,
+                )
+                .with_title("When Result Type Cannot Be Inferred")
+                .with_help("add an explicit nullable result type or use a nullable destination"),
+            );
+        }
+        self.expression_types
+            .insert((span.start, span.end), self.types.resolved(result));
+        self.whens.insert(
+            (span.start, span.end),
+            WhenSemanticInfo {
+                result_type: self.types.resolved(result),
+            },
+        );
+        self.reject_executable_finally(finally.as_ref());
     }
 
     fn classify_match_guard(&self, guard: Option<&MatchGuard>) -> MatchGuardSemanticInfo {
@@ -12849,6 +13195,17 @@ impl<'program> Checker<'program> {
                 .expression_types
                 .get(&(span.start, span.end))
                 .cloned()
+                .map(|ty| self.types.intern_resolved(&ty))
+                .unwrap_or_else(|| self.types.unknown()),
+            Expr::When(when) => self
+                .whens
+                .get(&(when.span.start, when.span.end))
+                .map(|info| info.result_type.clone())
+                .or_else(|| {
+                    self.expression_types
+                        .get(&(when.span.start, when.span.end))
+                        .cloned()
+                })
                 .map(|ty| self.types.intern_resolved(&ty))
                 .unwrap_or_else(|| self.types.unknown()),
         }

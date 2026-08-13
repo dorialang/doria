@@ -1,0 +1,21 @@
+class Label
+{
+    function __construct(string $text)
+    {
+    }
+}
+
+function choose(bool $primary): Label
+{
+    return when ($primary): Label {
+        return new Label("primary");
+    } else {
+        return new Label("fallback");
+    };
+}
+
+function main(): void
+{
+    let $label = choose(true);
+    echo "owned\n";
+}

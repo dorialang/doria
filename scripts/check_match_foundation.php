@@ -96,8 +96,7 @@ $require($decisionPath, $decision, [
     'Stage 28 Slice 1 — Complete',
     'Stage 28 Slice 2 — Complete',
     'Stage 28 is **Complete**',
-    'Stage 28a is **Next**',
-    'Stage 29 is **Sequenced After Stage 28a**',
+    'Decision 0116 now owns the separate Stage 28a',
     'backend-private',
     'former PHP B1301 boundary for valid exact numeric tests after `mixed` is',
     'Stage 28 controlled timing is **Pending Available Runner** and non-blocking',
@@ -111,8 +110,6 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 28 — Complete',
         'Stage 28 Slice 1 — Complete',
         'Stage 28 Slice 2 — Complete',
-        'Stage 28a — Next',
-        'Stage 29 — Sequenced After Stage 28a',
     ]);
 }
 
@@ -172,9 +169,9 @@ $require($loweringPath, $lowering, [
 $require($validationPath, $validation, [
     'fn validate_match_result_plans(',
     'fn validate_match_binding_plans(',
-    'match guard must branch to its final binding block on success',
+    'match guard must branch through a success path to its final binding block',
     'is destructured without a dominating exact case proof',
-    'match arm reaches its merge with {assignments} result assignments',
+    '{path_name} reaches its merge with {assignments} result assignments',
 ]);
 foreach ([$interpreterPath => $interpreter, $craneliftPath => $cranelift, $llvmPath => $llvm] as $path => $contents) {
     $require($path, $contents, ['PayloadEnumIsCase', 'BindPayloadEnumFields', 'MatchResultPlan']);

@@ -113,17 +113,24 @@ Planned near-term syntax includes:
 - Attribute lists using `#[...]`, which reuse the named-argument syntax above.
 - Richer property initializer expressions, including object construction.
 
-Planned future control-flow design includes:
+Implemented control-flow also includes:
 
-- `do ... while ... finally`.
-- `given ... when ... finally`.
-- `given ... while ... finally`.
-- `finally` attached to `if` / `else if` / `else` chains.
+- base `do ... while`;
+- `given` attached to `if`, `when`, and `while`;
 - `when` as a value-returning conditional form.
 - `match` as a pattern/value selection construct.
+
+Stage 28a Slice 1 also accepts and preserves `finally` grammar on `if`, `when`,
+`while`, and `do ... while`, including the corresponding `given` forms. Its
+execution is the next Slice 2 boundary. `finally` on `for`, `foreach`, `match`,
+or a bare block is not Doria syntax.
+
+Planned future control flow includes:
+
+- executable control-flow `finally`;
 - checked `throw` / `throws` error handling.
 
-These advanced control-flow forms are not MVP syntax. See `docs/decisions/0009-control-flow-direction.md`.
+See Decision 0116 for the current control-flow authority.
 
 ### Source organization and compiler directives
 
@@ -1108,7 +1115,21 @@ Each `if`, `else if`, `else`, and `while` body has its own block scope. Variable
 
 `if` is statement control flow and does not return a value. `if` without `else` is valid Doria. `else`, `else if`, `given`, and `finally` are optional. A base `if`, `while`, `foreach`, or future control construct does not require `given` or `finally`.
 
-`when` is the value-returning form of `if`: the same `given` / `else when` / `else` / `finally` structure (`when` / `else when` in place of `if` / `else if`), differing only in that it always yields a value. Its one result type is written on the head only (`when (cond): T`) or, when omitted, inferred from the value the first block returns — never on an `else when`; every other branch is checked against that type and a mismatch is a compile error. It requires a total `else`, and each branch produces the value with a block-scoped `return` that completes the `when` rather than returning from the enclosing function. `when` is an expression, used where a value of its result type is expected. A `given` prelude runs its setup once, then its `bool` predicates are AND-ed with each `when` and `else when` condition: a branch is selected only when the predicates and that branch's own condition all hold, and when no such conjunction holds the `else` value is returned. A false `given` predicate disqualifies every conditional branch at once and selects `else` — it never falls through to the next `else when`. The grammar is settled in decision 0097; `when`, `given`, and `finally` parse as accepted syntax but are not yet implemented in the current compiler slice, so they produce a stage-named unsupported-feature diagnostic per §0.
+`when` is the value-returning form of `if`: the same `given` / `else when` /
+`else` / future `finally` structure (`when` / `else when` in place of `if` /
+`else if`), differing only in that it always yields a value. Its one result type
+is written on the head only (`when (cond): T`), supplied by a surrounding
+expected type when omitted, or inferred from the first reachable head-branch
+yield when neither exists. It requires a total `else`, and each branch produces
+the value with `return expression;`, which completes the nearest enclosing
+`when` rather than returning from the function. Bare `return;` and `void` result
+types are invalid. Every normally completing branch path must yield.
+
+Conditions are strict `bool` and run in source order until one branch is
+selected. An unannotated all-null `when` is valid only in an expected nullable
+context. Copy results copy; Move results are acquired exactly once into the
+merge result before selected-branch cleanup. Decision 0116 defines the complete
+Stage 28a model.
 
 ### Checked errors
 
@@ -1165,7 +1186,29 @@ given {
 
 Separate bool predicate lines are implicitly AND-ed in source order with the attached control condition. Bool predicates short-circuit the attached condition and body when false. Inside a predicate, normal boolean short-circuiting applies for `&&` / `and` and `||` / `or`; `xor` does not short-circuit.
 
-The scoped declarations remain scoped to the whole `given` plus attached control construct. The exact lowering, ownership/borrow-checker interaction, cleanup behavior, and `finally` execution guarantees remain future decisions.
+Setup declarations and `void` actions must precede the first predicate. Setup
+runs once. Predicates run once for `if` and `when`; for `while` they reevaluate
+before every condition check, including after body completion and `continue`.
+A failed gate skips every attached conditional condition and selects only the
+unconditional `else` when present.
+
+The scoped declarations remain visible through the complete attached construct
+and future finalizer, then leave scope. Ownership and borrow checking use the
+ordinary lexical rules. Decision 0116 settles lowering and cleanup order;
+executable `finally` remains Stage 28a Slice 2.
+
+### do while
+
+```doria
+do {
+    advance();
+} while ($ready);
+```
+
+The body executes before the first strict-`bool` condition. `continue` reaches
+the condition and `break` exits. The ordinary form requires its semicolon. In
+the accepted pending finalizer form, `while ($ready) finally { ... }` has no
+intervening or trailing semicolon. `given` does not attach to `do`.
 
 ## 8. Class syntax
 
@@ -1528,7 +1571,9 @@ Future work includes:
 - Attribute syntax and metadata representation.
 - Richer instance property initializers.
 - Named arguments.
-- Advanced control-flow design for `do ... while ... finally`, `given ... when`, `given ... while`, `if` chains with possible `finally`, value-returning `when`, `match`, and labeled or numeric loop control.
+- Executable Stage 28a Slice 2 control-flow finalizers and any future labeled or
+  numeric loop-control surface. Base `do ... while`, `given`, `when`, and
+  `match` are implemented.
 - Careful evaluation of `goto`, labeled loop control, and structured conditional compilation without adopting C/C++ textual macros.
 - Async/await and structured concurrency.
 - The decision-0110 hosted stream/file foundation and the later terminal APIs beyond the existing text and binary intrinsics.
