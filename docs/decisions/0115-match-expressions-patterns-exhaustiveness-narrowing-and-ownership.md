@@ -343,8 +343,8 @@ enums; reflection; automatic hashing and ordering.
 
 Core match, pattern guards, explicit consuming match, and full ternary share one
 typed, ownership-aware, validated CFG across the interpreter, Cranelift, LLVM,
-and PHP. Stage 28 is complete. Stage 28a is next and remains separate work;
-Stage 29 is sequenced after Stage 28a.
+and PHP. Stage 28 is complete. Decision 0116 now owns the separate Stage 28a
+control-flow work; Stage 29 remains dependent on its finalizer slice.
 
 ## Affected Components
 
@@ -363,7 +363,8 @@ grammars, examples, website UAT, and authority guards.
   selected payload transfer and cleanup; rejected writable patterns; exact PHP
   `mixed` identity; backend parity; and tooling integration.
 
-Stage 28 is **Complete**. Stage 28a is **Next**. Stage 29 is **Sequenced After Stage 28a**.
+Stage 28 is **Complete**. Current sequencing is maintained by Decision 0116 and
+the end-to-end plan rather than frozen in this Stage 28 record.
 
 ## PR #132 Review Closure
 

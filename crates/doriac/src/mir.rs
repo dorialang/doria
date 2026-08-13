@@ -3248,6 +3248,9 @@ pub enum Statement {
         arms: Vec<MatchArmPlan>,
         merge: BlockId,
     },
+    /// Validation-only identity for source control flow that lowers to ordinary
+    /// blocks and branches. Backends execute the CFG and ignore this statement.
+    ControlFlowPlan(ControlFlowPlan),
     EchoStringLiteral(String),
     EchoString(StringExpression),
     CallVoid {
@@ -3377,6 +3380,67 @@ pub struct MatchArmPlan {
     pub binding: BlockId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlFlowPlan {
+    Given(GivenControlFlowPlan),
+    When(WhenResultPlan),
+    DoWhile(DoWhilePlan),
+    /// Reserved solely so validation can prove that pending finalizer lowering
+    /// never reaches a Slice 1 backend.
+    PendingFinally {
+        span: Span,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GivenAttachment {
+    If,
+    When,
+    While,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GivenControlFlowPlan {
+    pub attachment: GivenAttachment,
+    pub setup_entry: BlockId,
+    pub setup_exit: BlockId,
+    pub predicates: Vec<GivenPredicatePlan>,
+    pub condition: BlockId,
+    pub condition_type: Type,
+    pub gate_failed: Option<BlockId>,
+    pub continue_sources: Vec<BlockId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GivenPredicatePlan {
+    pub block: BlockId,
+    pub ty: Type,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhenResultOwnership {
+    Borrowed,
+    Owned,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WhenResultPlan {
+    pub result: LocalId,
+    pub ownership: WhenResultOwnership,
+    pub branches: Vec<BlockId>,
+    pub merge: BlockId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoWhilePlan {
+    pub entry: BlockId,
+    pub body: BlockId,
+    pub condition: BlockId,
+    pub condition_type: Type,
+    pub exit: BlockId,
+    pub continue_sources: Vec<BlockId>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectionMutationOp {
     Add,
@@ -3435,6 +3499,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         Statement::EchoStringLiteral(_)
         | Statement::BindPayloadEnumFields { .. }
         | Statement::MatchResultPlan { .. }
+        | Statement::ControlFlowPlan(_)
         | Statement::DropClass { .. }
         | Statement::DropSharedReference { .. }
         | Statement::DropWeakReference { .. }
@@ -5483,6 +5548,7 @@ impl fmt::Display for Statement {
                     .join(", "),
                 merge.0
             ),
+            Statement::ControlFlowPlan(plan) => write!(formatter, "{plan}"),
             Statement::EchoStringLiteral(value) => {
                 write!(formatter, "echo \"{}\"", escape_debug_string(value))
             }
@@ -5617,6 +5683,47 @@ impl fmt::Display for Statement {
                 ty.id.0,
                 local.0
             ),
+        }
+    }
+}
+
+impl fmt::Display for ControlFlowPlan {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Given(plan) => write!(
+                formatter,
+                "given {:?} setup block{}..block{} predicates [{}] condition block{} false {}",
+                plan.attachment,
+                plan.setup_entry.0,
+                plan.setup_exit.0,
+                plan.predicates
+                    .iter()
+                    .map(|predicate| format!("block{}", predicate.block.0))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                plan.condition.0,
+                plan.gate_failed
+                    .map(|block| format!("block{}", block.0))
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+            Self::When(plan) => write!(
+                formatter,
+                "when {:?} local{} branches [{}] -> block{}",
+                plan.ownership,
+                plan.result.0,
+                plan.branches
+                    .iter()
+                    .map(|block| format!("block{}", block.0))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                plan.merge.0
+            ),
+            Self::DoWhile(plan) => write!(
+                formatter,
+                "do block{} while block{} -> block{}",
+                plan.body.0, plan.condition.0, plan.exit.0
+            ),
+            Self::PendingFinally { .. } => write!(formatter, "pending finally"),
         }
     }
 }

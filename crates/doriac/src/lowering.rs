@@ -285,9 +285,27 @@ fn lower_stmt(statement: &ast::Stmt, class_name: Option<ClassContext<'_>>) -> hi
         },
         ast::Stmt::If(if_stmt) => hir::Stmt::If(lower_if_stmt(if_stmt, class_name)),
         ast::Stmt::While(while_stmt) => hir::Stmt::While(hir::WhileStmt {
+            given: while_stmt
+                .given
+                .as_ref()
+                .map(|given| lower_given_prelude(given, class_name)),
             condition: lower_expr(&while_stmt.condition, class_name),
             body: lower_block(&while_stmt.body, class_name),
+            finally: while_stmt
+                .finally
+                .as_ref()
+                .map(|finally| lower_finally(finally, class_name)),
             span: while_stmt.span,
+        }),
+        ast::Stmt::DoWhile(do_while) => hir::Stmt::DoWhile(hir::DoWhileStmt {
+            body: lower_block(&do_while.body, class_name),
+            condition: lower_expr(&do_while.condition, class_name),
+            semicolon_span: do_while.semicolon_span,
+            finally: do_while
+                .finally
+                .as_ref()
+                .map(|finally| lower_finally(finally, class_name)),
+            span: do_while.span,
         }),
         ast::Stmt::For(for_stmt) => hir::Stmt::For(Box::new(hir::ForStmt {
             initializer: for_stmt
@@ -386,13 +404,42 @@ fn lower_for_increment(
 
 fn lower_if_stmt(if_stmt: &ast::IfStmt, class_name: Option<ClassContext<'_>>) -> hir::IfStmt {
     hir::IfStmt {
+        given: if_stmt
+            .given
+            .as_ref()
+            .map(|given| lower_given_prelude(given, class_name)),
         condition: lower_expr(&if_stmt.condition, class_name),
         then_block: lower_block(&if_stmt.then_block, class_name),
         else_branch: if_stmt
             .else_branch
             .as_ref()
             .map(|branch| lower_else_branch(branch, class_name)),
+        finally: if_stmt
+            .finally
+            .as_ref()
+            .map(|finally| lower_finally(finally, class_name)),
         span: if_stmt.span,
+    }
+}
+
+fn lower_given_prelude(
+    given: &ast::GivenPrelude,
+    class_name: Option<ClassContext<'_>>,
+) -> hir::GivenPrelude {
+    hir::GivenPrelude {
+        block: lower_block(&given.block, class_name),
+        span: given.span,
+    }
+}
+
+fn lower_finally(
+    finally: &ast::ControlFlowFinally,
+    class_name: Option<ClassContext<'_>>,
+) -> hir::ControlFlowFinally {
+    hir::ControlFlowFinally {
+        keyword_span: finally.keyword_span,
+        block: lower_block(&finally.block, class_name),
+        span: finally.span,
     }
 }
 
@@ -620,6 +667,33 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
             origin: *origin,
             span: *span,
         },
+        ast::Expr::When(when) => hir::Expr::When(Box::new(hir::WhenExpression {
+            given: when
+                .given
+                .as_ref()
+                .map(|given| lower_given_prelude(given, class_name)),
+            result_type: when
+                .result_type
+                .as_ref()
+                .map(|ty| lower_type_ref(ty, class_name)),
+            branches: when
+                .branches
+                .iter()
+                .map(|branch| hir::WhenBranch {
+                    condition: branch
+                        .condition
+                        .as_ref()
+                        .map(|condition| lower_expr(condition, class_name)),
+                    block: lower_block(&branch.block, class_name),
+                    span: branch.span,
+                })
+                .collect(),
+            finally: when
+                .finally
+                .as_ref()
+                .map(|finally| lower_finally(finally, class_name)),
+            span: when.span,
+        })),
     }
 }
 

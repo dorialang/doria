@@ -114,6 +114,24 @@ uses `if`, runs only after its pattern matches, and may fall through to a later
 arm. `match (take $value)` explicitly gives the whole value to the match so a
 selected Move payload can become an owned arm binding.
 
+`when` handles branch-local work that must produce one value, while `given`
+prepares shared state and strict-bool predicates for `if`, `when`, or `while`:
+
+```doria
+string $message = given {
+    let $ready = serviceIsReady();
+    $ready;
+} when ($hasWork): string {
+    return "ready";
+} else {
+    return "waiting";
+};
+```
+
+Base `do ... while` is executable. Control-flow `finally` is accepted syntax on
+`if`, `when`, `while`, and `do ... while`; the compiler currently preserves it
+and reports that execution support is pending.
+
 ## Tooling
 
 Official language-server and editor integrations are developed separately in [`dorialang/doria-language-server`](https://github.com/dorialang/doria-language-server), which consumes reusable `doriac` frontend services without duplicating compiler semantics.

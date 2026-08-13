@@ -1,0 +1,10 @@
+function main(): void
+{
+    ?string $label = when (false) {
+        return null;
+    } else {
+        return "fallback";
+    };
+
+    echo ($label ?? "missing") . "\n";
+}

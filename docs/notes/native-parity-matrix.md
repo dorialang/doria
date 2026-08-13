@@ -82,6 +82,10 @@ three execution paths.
 | Stage 28 pattern guards | Covered | Covered | Covered | Covered | Pattern tests precede one strict-bool guard evaluation; false continues in source order and true alone materializes final arm bindings. |
 | Stage 28 consuming match | Covered | Covered | Covered | Covered | `match (take $value)` moves one whole scrutinee, extracts a selected Move payload once, and drops ignored or remaining payloads exactly once. |
 | Stage 28 PHP exact `mixed` identity | N/A | N/A | N/A | Covered | Backend-private tags preserve Doria numeric width/signedness, float width, enum identity, class identity, and payload across `is` and match. |
+| Stage 28a `when` expressions | Covered | Covered | Covered | Covered | Strict conditions select one branch, nearest-`when` returns write one typed merge result, and Copy/Move ownership is acquired before selected-branch cleanup. |
+| Stage 28a `given` gates | Covered | Covered | Covered | Covered | Setup executes once; predicates short-circuit in source order; failed gates skip attached conditions; `while` predicates reevaluate before every condition check and `continue`. |
+| Stage 28a base `do ... while` | Covered | Covered | Covered | Covered | The body precedes the first strict-bool condition and `continue` targets that condition through the shared CFG. |
+| Stage 28a control-flow `finally` | Pending Slice 2 | Pending Slice 2 | Pending Slice 2 | Pending Slice 2 | Accepted grammar is preserved for `if`, `when`, `while`, and `do ... while`; E0611 stops valid finalizer source before MIR or backend execution. |
 | Integer range `foreach` | Covered | Covered | Covered | Covered | Inclusive/exclusive ranges and terminal overflow guards are covered. |
 | Top-level integer helpers | Covered | Covered | Covered | Covered | Parameters and returns preserve every declared width and signedness. |
 | Void helper calls | Covered | Covered | Covered | Covered | Shared stdout preserves source call order. |
@@ -194,6 +198,6 @@ front-to-back iteration across the interpreter, Cranelift, and LLVM. The Stage
 independent writable bindings, shared immutable strings, and nullable empty
 move bindings across the same three execution paths.
 
-Status: Passed through Stage 28.
+Status: Passed through Stage 28a Slice 1. Executable control-flow finalizers remain Stage 28a Slice 2.
 
 All accepted native scalar, string, interpolation, checked-format, text-I/O, ownership, native-class, method, static, constant, concrete-display, nullable, collection, `Bytes`, boxed-`mixed`, monomorphized generic, and Stage 25a shared-ownership lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; Linux CI memory-checks the ownership-bearing native fixtures, including readonly collision projection, writable shared class, all writable payload domains, weak-cycle breaking, bounded stress, access lifetime, and stored-access paths; and the Stage 7-10 native smoke module remains retired and deleted. Stage 21 ordinary borrowing and constructor definite initialization and Stage 22 narrowing use the same backend-independent control-flow/dataflow foundation. Stage 24 specializes reachable free functions and instance/static methods once per concrete generic-argument set before any backend consumes the program. Stage 25 specializes generic classes. Stage 25a Slices 1 through 4 provide the two distinct non-atomic control models, per-allocation writable access state, owned access objects, collision projection, exact conflict reasons, and complete parity/tooling closure.

@@ -231,6 +231,163 @@ fn guarded_consuming_match_ir_keeps_storage_inline_and_scratch_in_entry() {
 }
 
 #[test]
+fn stage28a_control_flow_keeps_one_validated_cfg_without_runtime_objects() {
+    let source = r#"
+function select(bool $ready): int
+{
+    return when ($ready): int { return 42; } else { return 0; };
+}
+function gated(bool $ready): void
+{
+    let writable $count = 0;
+    given {
+        let $limit = 2;
+        $ready;
+    } while ($count < $limit) {
+        $count++;
+        continue;
+    }
+}
+function repeat(): void
+{
+    let writable $count = 0;
+    do {
+        $count++;
+        if ($count < 2) { continue; }
+    } while ($count < 3);
+}
+function main(): void { echo "{select(true)}"; gated(true); repeat(); }
+"#;
+    let program = doriac::lower_source_to_mir("llvm-stage28a.doria", source)
+        .expect("Stage 28a source should lower to validated MIR");
+
+    let select = program
+        .functions
+        .iter()
+        .find(|function| function.name == "select")
+        .expect("select should exist");
+    let when = select
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            doriac::mir::Statement::ControlFlowPlan(doriac::mir::ControlFlowPlan::When(plan)) => {
+                Some(plan)
+            }
+            _ => None,
+        })
+        .expect("when result plan should exist");
+    for branch in &when.branches {
+        let block = &select.blocks[branch.0];
+        assert_eq!(
+            block
+                .statements
+                .iter()
+                .filter(|statement| matches!(
+                    statement,
+                    doriac::mir::Statement::AssignLocal { target, .. } if *target == when.result
+                ))
+                .count(),
+            1,
+            "each selected when branch must write one merge result"
+        );
+        assert!(matches!(block.terminator, Terminator::Jump(target) if target == when.merge));
+    }
+
+    let gated = program
+        .functions
+        .iter()
+        .find(|function| function.name == "gated")
+        .expect("gated should exist");
+    let given = gated
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            doriac::mir::Statement::ControlFlowPlan(doriac::mir::ControlFlowPlan::Given(plan)) => {
+                Some(plan)
+            }
+            _ => None,
+        })
+        .expect("given while plan should exist");
+    assert_eq!(given.attachment, doriac::mir::GivenAttachment::While);
+    assert_ne!(given.setup_entry, given.predicates[0].block);
+    let Terminator::Branch { else_block, .. } =
+        gated.blocks[given.predicates[0].block.0].terminator
+    else {
+        panic!("given predicate should be a bool branch");
+    };
+    assert_eq!(Some(else_block), given.gate_failed);
+    for source in &given.continue_sources {
+        assert!(matches!(
+            gated.blocks[source.0].terminator,
+            Terminator::Jump(target) if target == given.predicates[0].block
+        ));
+    }
+
+    let repeat = program
+        .functions
+        .iter()
+        .find(|function| function.name == "repeat")
+        .expect("repeat should exist");
+    let do_while = repeat
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            doriac::mir::Statement::ControlFlowPlan(doriac::mir::ControlFlowPlan::DoWhile(
+                plan,
+            )) => Some(plan),
+            _ => None,
+        })
+        .expect("do-while plan should exist");
+    assert!(matches!(
+        repeat.blocks[do_while.entry.0].terminator,
+        Terminator::Jump(target) if target == do_while.body
+    ));
+    assert!(matches!(
+        repeat.blocks[do_while.condition.0].terminator,
+        Terminator::Branch { then_block, else_block, .. }
+            if then_block == do_while.body && else_block == do_while.exit
+    ));
+    for source in &do_while.continue_sources {
+        assert!(matches!(
+            repeat.blocks[source.0].terminator,
+            Terminator::Jump(target) if target == do_while.condition
+        ));
+    }
+
+    assert!(program
+        .functions
+        .iter()
+        .all(|function| function.blocks.iter().all(|block| {
+            block.statements.iter().all(|statement| {
+                !matches!(
+                    statement,
+                    doriac::mir::Statement::ControlFlowPlan(
+                        doriac::mir::ControlFlowPlan::PendingFinally { .. }
+                    )
+                )
+            })
+        })));
+
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
+        .expect("validated Stage 28a MIR should lower to LLVM IR");
+    let placement = scan_alloca_placement(&ir);
+    assert!(
+        placement.escaped.is_empty(),
+        "Stage 28a control flow allocated loop scratch outside entry:\n{}",
+        placement.escaped.join("\n")
+    );
+    assert!(
+        !["dr_v1_when", "dr_v1_given", "dr_v1_do_while"]
+            .iter()
+            .any(|name| ir.contains(name)),
+        "Stage 28a control flow introduced runtime control-flow objects:\n{ir}"
+    );
+}
+
+#[test]
 fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
     let program = Program {
         source: doriac::source::SourceFile::new("llvm-test.doria", ""),

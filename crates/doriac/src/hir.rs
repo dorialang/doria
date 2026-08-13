@@ -144,6 +144,7 @@ pub enum Stmt {
     Return { expr: Option<Expr>, span: Span },
     If(IfStmt),
     While(WhileStmt),
+    DoWhile(DoWhileStmt),
     For(Box<ForStmt>),
     Break { span: Span },
     Continue { span: Span },
@@ -177,9 +178,11 @@ pub struct Assignment {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfStmt {
+    pub given: Option<GivenPrelude>,
     pub condition: Expr,
     pub then_block: Block,
     pub else_branch: Option<ElseBranch>,
+    pub finally: Option<ControlFlowFinally>,
     pub span: Span,
 }
 
@@ -191,8 +194,32 @@ pub enum ElseBranch {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WhileStmt {
+    pub given: Option<GivenPrelude>,
     pub condition: Expr,
     pub body: Block,
+    pub finally: Option<ControlFlowFinally>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DoWhileStmt {
+    pub body: Block,
+    pub condition: Expr,
+    pub semicolon_span: Option<Span>,
+    pub finally: Option<ControlFlowFinally>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GivenPrelude {
+    pub block: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ControlFlowFinally {
+    pub keyword_span: Span,
+    pub block: Block,
     pub span: Span,
 }
 
@@ -371,6 +398,23 @@ pub enum Expr {
         origin: MatchOrigin,
         span: Span,
     },
+    When(Box<WhenExpression>),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhenExpression {
+    pub given: Option<GivenPrelude>,
+    pub result_type: Option<TypeRef>,
+    pub branches: Vec<WhenBranch>,
+    pub finally: Option<ControlFlowFinally>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WhenBranch {
+    pub condition: Option<Expr>,
+    pub block: Block,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -454,6 +498,7 @@ impl Expr {
             | Expr::Binary { span, .. }
             | Expr::Range { span, .. }
             | Expr::Match { span, .. } => *span,
+            Expr::When(when) => when.span,
         }
     }
 }

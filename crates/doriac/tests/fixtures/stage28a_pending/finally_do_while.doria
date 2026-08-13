@@ -1,0 +1,8 @@
+function main(): void
+{
+    do {
+        echo "body\n";
+    } while (false) finally {
+        echo "cleanup\n";
+    }
+}

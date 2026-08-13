@@ -208,3 +208,10 @@ examples/native/main_match_take_nullable.doria
 examples/native/main_match_take_mixed.doria
 examples/native/main_match_guarded_take.doria
 examples/native/main_match_take_drop_order.doria
+examples/native/main_when_basic.doria
+examples/native/main_when_expected_types.doria
+examples/native/main_given_if.doria
+examples/native/main_given_when.doria
+examples/native/main_given_while.doria
+examples/native/main_do_while.doria
+examples/native/main_when_ownership.doria

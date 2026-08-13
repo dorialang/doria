@@ -1,0 +1,19 @@
+function checkedCondition(): bool
+{
+    echo "condition\n";
+    return true;
+}
+
+function main(): void
+{
+    given {
+        let $prepared = 42;
+        false;
+    } if (checkedCondition()) {
+        echo "selected {$prepared}\n";
+    } else if (checkedCondition()) {
+        echo "alternate\n";
+    } else {
+        echo "gate closed {$prepared}\n";
+    }
+}

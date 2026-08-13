@@ -1,0 +1,12 @@
+function main(): void
+{
+    int $value = given {
+        true;
+    } when (true): int {
+        return 42;
+    } else {
+        return 0;
+    } finally {
+        echo "cleanup\n";
+    };
+}

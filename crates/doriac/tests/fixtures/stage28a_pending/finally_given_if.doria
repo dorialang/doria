@@ -1,0 +1,10 @@
+function main(): void
+{
+    given {
+        true;
+    } if (true) {
+        echo "body\n";
+    } finally {
+        echo "cleanup\n";
+    }
+}

@@ -535,7 +535,13 @@ fn match_fixture_reports_additive_structural_counts_without_a_schema_bump() {
             "  string $kind = match ($value) { string $text => $text, default => \"other\", };\n",
             "  return $ready ? $state . $grade . $kind : \"missing\";\n",
             "}\n",
-            "function main(): void { echo classify(\"value\", 90, true); }\n",
+            "function control(bool $ready): int {\n",
+            "  let writable $count = 0;\n",
+            "  given { let $limit = 1; $ready; true; } while ($count < $limit) { $count++; }\n",
+            "  do { $count++; } while ($count < 2);\n",
+            "  return given { $ready; } when ($ready): int { return 1; } else when (false) { return 2; } else { return 0; };\n",
+            "}\n",
+            "function main(): void { echo classify(\"value\", 90, true); echo \"{control(true)}\"; }\n",
         ),
     )
     .expect("source");
@@ -566,6 +572,11 @@ fn match_fixture_reports_additive_structural_counts_without_a_schema_bump() {
     assert_eq!(report["metrics"]["conditionMatchCount"], 1);
     assert_eq!(report["metrics"]["typePatternCount"], 1);
     assert_eq!(report["metrics"]["ternaryCount"], 1);
+    assert_eq!(report["metrics"]["whenExpressionCount"], 1);
+    assert_eq!(report["metrics"]["elseWhenBranchCount"], 1);
+    assert_eq!(report["metrics"]["givenPreludeCount"], 2);
+    assert_eq!(report["metrics"]["givenPredicateCount"], 3);
+    assert_eq!(report["metrics"]["doWhileCount"], 1);
     let _ = fs::remove_dir_all(directory);
 }
 

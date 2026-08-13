@@ -625,13 +625,17 @@ function main(): void
         .expect("the null comparison should dominate the narrowed payload enum use");
 
     let mut malformed = valid;
-    let entry = malformed.entry.0;
-    let entry_block = malformed.functions[entry].entry_block.0;
-    let Terminator::Branch { condition, .. } =
-        &mut malformed.functions[entry].blocks[entry_block].terminator
-    else {
-        panic!("expected nullable guard branch");
-    };
+    let condition = malformed.functions[malformed.entry.0]
+        .blocks
+        .iter_mut()
+        .find_map(|block| match &mut block.terminator {
+            Terminator::Branch {
+                condition: condition @ BoolExpression::NullablePayloadEnumIsPresent(_),
+                ..
+            } => Some(condition),
+            _ => None,
+        })
+        .expect("expected nullable guard branch");
     *condition = BoolExpression::Use {
         operand: Operand::Scalar(ScalarValue::Bool(true)),
     };
@@ -644,6 +648,246 @@ function main(): void
             .contains("assumed non-null without a dominating presence proof"),
         "unexpected malformed nullable payload enum diagnostic: {}",
         error.message
+    );
+}
+
+#[test]
+fn shared_validator_rejects_malformed_stage28a_control_flow_plans() {
+    let source = r#"
+function choose(bool $ready): int
+{
+    return when ($ready): int { return 42; } else { return 0; };
+}
+function gated(bool $ready): void
+{
+    let writable $count = 0;
+    given {
+        let $limit = 2;
+        $ready;
+    } while ($count < $limit) {
+        $count++;
+        continue;
+    }
+}
+function repeat(): void
+{
+    let writable $count = 0;
+    do {
+        $count++;
+        if ($count < 2) { continue; }
+    } while ($count < 3);
+}
+function main(): void { echo "{choose(true)}"; }
+"#;
+    let valid = doriac::lower_source_to_mir("stage28a-validation.doria", source)
+        .expect("valid Stage 28a source should lower");
+    doriac::mir_validation::validate_program(&valid).expect("valid Stage 28a MIR should validate");
+
+    let malformed = |program: &Program, expected: &str| {
+        let error = doriac::mir_validation::validate_program(program)
+            .expect_err("malformed Stage 28a MIR must stop before backend emission");
+        assert!(
+            error.message.contains(expected),
+            "expected {expected:?}, got {:?}",
+            error.message
+        );
+    };
+
+    let mut missing_when_result = valid.clone();
+    let function = missing_when_result
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "choose")
+        .expect("choose should exist");
+    let (result, branch) = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::When(plan)) => {
+                Some((plan.result, plan.branches[0]))
+            }
+            _ => None,
+        })
+        .expect("when plan should exist");
+    function.blocks[branch.0].statements.retain(
+        |statement| !matches!(statement, Statement::AssignLocal { target, .. } if *target == result),
+    );
+    malformed(
+        &missing_when_result,
+        "when branch reaches its merge with 0 result assignments",
+    );
+
+    let mut when_yields_as_function_return = valid.clone();
+    let function = when_yields_as_function_return
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "choose")
+        .expect("choose should exist");
+    let branch = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::When(plan)) => Some(plan.branches[0]),
+            _ => None,
+        })
+        .expect("when plan should exist");
+    function.blocks[branch.0].terminator = Terminator::Return(Rvalue::Value(
+        ValueExpression::Integer(IntegerExpression::constant(
+            IntegerValue::from_i128(IntegerType::Int64, 42).expect("42 is an int"),
+        )),
+    ));
+    malformed(
+        &when_yields_as_function_return,
+        "when branch terminates before assigning and merging its result",
+    );
+
+    let mut wrong_when_ownership = valid.clone();
+    let function = wrong_when_ownership
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "choose")
+        .expect("choose should exist");
+    let ownership = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::When(plan)) => {
+                Some(&mut plan.ownership)
+            }
+            _ => None,
+        })
+        .expect("when plan should exist");
+    *ownership = mir::WhenResultOwnership::Owned;
+    malformed(&wrong_when_ownership, "incompatible ownership");
+
+    let mut non_bool_given_predicate = valid.clone();
+    let function = non_bool_given_predicate
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "gated")
+        .expect("gated should exist");
+    let predicate = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::Given(plan)) => {
+                Some(&mut plan.predicates[0])
+            }
+            _ => None,
+        })
+        .expect("given plan should exist");
+    predicate.ty = Type::Scalar(ScalarType::Integer(IntegerType::Int64));
+    malformed(
+        &non_bool_given_predicate,
+        "given predicate does not have bool type",
+    );
+
+    let mut skipped_given_setup = valid.clone();
+    let function = skipped_given_setup
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "gated")
+        .expect("gated should exist");
+    let plan = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::Given(plan)) => Some(plan),
+            _ => None,
+        })
+        .expect("given plan should exist");
+    plan.setup_exit = plan
+        .gate_failed
+        .expect("given predicate has a false target");
+    malformed(
+        &skipped_given_setup,
+        "given setup does not lead to its predicate phase",
+    );
+
+    let mut skipped_given_predicate = valid.clone();
+    let function = skipped_given_predicate
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "gated")
+        .expect("gated should exist");
+    let (source, condition) = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::Given(plan)) => {
+                Some((plan.continue_sources[0], plan.condition))
+            }
+            _ => None,
+        })
+        .expect("given plan should exist");
+    function.blocks[source.0].terminator = Terminator::Jump(condition);
+    malformed(
+        &skipped_given_predicate,
+        "given while continue skips predicate reevaluation",
+    );
+
+    let mut skipped_do_condition = valid.clone();
+    let function = skipped_do_condition
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "repeat")
+        .expect("repeat should exist");
+    let (source, body) = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::DoWhile(plan)) => {
+                Some((plan.continue_sources[0], plan.body))
+            }
+            _ => None,
+        })
+        .expect("do-while plan should exist");
+    function.blocks[source.0].terminator = Terminator::Jump(body);
+    malformed(
+        &skipped_do_condition,
+        "do-while continue does not target its condition",
+    );
+
+    let mut non_bool_do_condition = valid.clone();
+    let function = non_bool_do_condition
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "repeat")
+        .expect("repeat should exist");
+    let plan = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::DoWhile(plan)) => Some(plan),
+            _ => None,
+        })
+        .expect("do-while plan should exist");
+    plan.condition_type = Type::Scalar(ScalarType::Integer(IntegerType::Int64));
+    malformed(
+        &non_bool_do_condition,
+        "do-while condition is not bool control flow between its body and exit",
+    );
+
+    let mut pending_finally = valid;
+    let entry = pending_finally.functions[pending_finally.entry.0].entry_block;
+    pending_finally.functions[pending_finally.entry.0].blocks[entry.0]
+        .statements
+        .push(Statement::ControlFlowPlan(
+            mir::ControlFlowPlan::PendingFinally {
+                span: doriac::source::Span::new(0, 0),
+            },
+        ));
+    malformed(
+        &pending_finally,
+        "pending Stage 28a Slice 2 finalizer reached MIR",
     );
 }
 

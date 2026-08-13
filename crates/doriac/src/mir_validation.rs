@@ -510,6 +510,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     validate_payload_case_proofs(program, function)?;
     validate_match_result_plans(function)?;
     validate_match_binding_plans(function)?;
+    validate_control_flow_plans(function)?;
     validate_class_local_lifetimes(function)
 }
 
@@ -1693,6 +1694,68 @@ fn validate_statement(
             }
             validate_payload_enum_type(program, *ty).map(|_| ())
         }
+        mir::Statement::ControlFlowPlan(plan) => match plan {
+            mir::ControlFlowPlan::Given(plan) => {
+                block_in(function, plan.setup_entry)?;
+                block_in(function, plan.setup_exit)?;
+                block_in(function, plan.condition)?;
+                if let Some(gate_failed) = plan.gate_failed {
+                    block_in(function, gate_failed)?;
+                }
+                for predicate in &plan.predicates {
+                    block_in(function, predicate.block)?;
+                }
+                for block in &plan.continue_sources {
+                    block_in(function, *block)?;
+                }
+                Ok(())
+            }
+            mir::ControlFlowPlan::When(plan) => {
+                let result = local_in(function, plan.result)?;
+                if !result.synthetic || result.writable {
+                    return Err(malformed_mir(
+                        "when result plan must target a readonly synthetic local",
+                    ));
+                }
+                let expected_owned = matches!(plan.ownership, mir::WhenResultOwnership::Owned);
+                if result.owned != expected_owned
+                    || (expected_owned && !result.ty.has_move_ownership())
+                {
+                    return Err(malformed_mir(
+                        "when result local has incompatible ownership",
+                    ));
+                }
+                block_in(function, plan.merge)?;
+                if plan.branches.len() < 2 {
+                    return Err(malformed_mir(
+                        "when result plan must include a head branch and mandatory else",
+                    ));
+                }
+                let mut unique = HashSet::new();
+                for branch in &plan.branches {
+                    block_in(function, *branch)?;
+                    if *branch == plan.merge || !unique.insert(*branch) {
+                        return Err(malformed_mir(
+                            "when result plan has an invalid or repeated branch block",
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            mir::ControlFlowPlan::DoWhile(plan) => {
+                block_in(function, plan.entry)?;
+                block_in(function, plan.body)?;
+                block_in(function, plan.condition)?;
+                block_in(function, plan.exit)?;
+                for source in &plan.continue_sources {
+                    block_in(function, *source)?;
+                }
+                Ok(())
+            }
+            mir::ControlFlowPlan::PendingFinally { .. } => Err(malformed_mir(
+                "pending Stage 28a Slice 2 finalizer reached MIR",
+            )),
+        },
     }
 }
 
@@ -6750,7 +6813,9 @@ fn collect_format_class_local_accesses<'a>(
 fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLocalAccesses<'_> {
     let mut accesses = ClassLocalAccesses::default();
     match statement {
-        mir::Statement::BindPayloadEnumFields { .. } | mir::Statement::MatchResultPlan { .. } => {}
+        mir::Statement::BindPayloadEnumFields { .. }
+        | mir::Statement::MatchResultPlan { .. }
+        | mir::Statement::ControlFlowPlan(_) => {}
         mir::Statement::AssignLocal { value, .. }
         | mir::Statement::AssignLocalGroup { value, .. }
         | mir::Statement::AssignStatic { value, .. } => {
@@ -7186,6 +7251,171 @@ fn validate_match_result_plans(function: &mir::Function) -> Result<(), BackendEr
     Ok(())
 }
 
+fn validate_control_flow_plans(function: &mir::Function) -> Result<(), BackendError> {
+    for block in &function.blocks {
+        for statement in &block.statements {
+            let mir::Statement::ControlFlowPlan(plan) = statement else {
+                continue;
+            };
+            match plan {
+                mir::ControlFlowPlan::Given(plan) => {
+                    if block.id != plan.setup_entry {
+                        return Err(malformed_mir(
+                            "given execution plan is not anchored in its setup entry",
+                        ));
+                    }
+                    let first_gate = plan
+                        .predicates
+                        .first()
+                        .map(|predicate| predicate.block)
+                        .unwrap_or(plan.condition);
+                    if !cfg_reaches(function, plan.setup_exit, first_gate)? {
+                        return Err(malformed_mir(
+                            "given setup does not lead to its predicate phase",
+                        ));
+                    }
+                    if plan.predicates.is_empty() != plan.gate_failed.is_none() {
+                        return Err(malformed_mir(
+                            "given gate-failure target disagrees with its predicate phase",
+                        ));
+                    }
+                    for (index, predicate) in plan.predicates.iter().enumerate() {
+                        if predicate.ty != mir::Type::Scalar(mir::ScalarType::Bool) {
+                            return Err(malformed_mir("given predicate does not have bool type"));
+                        }
+                        let next = plan
+                            .predicates
+                            .get(index + 1)
+                            .map(|predicate| predicate.block)
+                            .unwrap_or(plan.condition);
+                        let gate_failed = plan
+                            .gate_failed
+                            .expect("a non-empty given predicate plan has a false target");
+                        let predicate_block = block_in(function, predicate.block)?;
+                        if !matches!(
+                            predicate_block.terminator,
+                            mir::Terminator::Branch { .. } | mir::Terminator::Jump(_)
+                        ) || (!cfg_reaches(function, predicate.block, next)?
+                            && !cfg_reaches(function, predicate.block, gate_failed)?)
+                        {
+                            return Err(malformed_mir(
+                                "given predicate chain does not preserve source-order short-circuiting",
+                            ));
+                        }
+                    }
+                    if plan.condition_type != mir::Type::Scalar(mir::ScalarType::Bool)
+                        || !matches!(
+                            block_in(function, plan.condition)?.terminator,
+                            mir::Terminator::Branch { .. } | mir::Terminator::Jump(_)
+                        )
+                    {
+                        return Err(malformed_mir(
+                            "given attached condition is not represented by bool control flow",
+                        ));
+                    }
+                    let continue_target = plan
+                        .predicates
+                        .first()
+                        .map(|predicate| predicate.block)
+                        .unwrap_or(plan.condition);
+                    if matches!(plan.attachment, mir::GivenAttachment::While) {
+                        for source in &plan.continue_sources {
+                            if !matches!(
+                                block_in(function, *source)?.terminator,
+                                mir::Terminator::Jump(target) if target == continue_target
+                            ) {
+                                return Err(malformed_mir(
+                                    "given while continue skips predicate reevaluation",
+                                ));
+                            }
+                        }
+                    } else if !plan.continue_sources.is_empty() {
+                        return Err(malformed_mir(
+                            "non-loop given plan contains continue sources",
+                        ));
+                    }
+                }
+                mir::ControlFlowPlan::When(plan) => {
+                    for branch in &plan.branches {
+                        validate_result_path(
+                            function,
+                            plan.result,
+                            *branch,
+                            plan.merge,
+                            "when branch",
+                        )?;
+                    }
+                }
+                mir::ControlFlowPlan::DoWhile(plan) => {
+                    if block.id != plan.entry
+                        || !matches!(
+                            block_in(function, plan.entry)?.terminator,
+                            mir::Terminator::Jump(target) if target == plan.body
+                        )
+                    {
+                        return Err(malformed_mir(
+                            "do-while body is not entered before its first condition",
+                        ));
+                    }
+                    let condition = block_in(function, plan.condition)?;
+                    if plan.condition_type != mir::Type::Scalar(mir::ScalarType::Bool)
+                        || !matches!(
+                            condition.terminator,
+                            mir::Terminator::Branch {
+                                then_block,
+                                else_block,
+                                ..
+                            } if then_block == plan.body && else_block == plan.exit
+                        ) && !matches!(
+                            condition.terminator,
+                            mir::Terminator::Jump(target)
+                                if target == plan.body || target == plan.exit
+                        )
+                    {
+                        return Err(malformed_mir(
+                            "do-while condition is not bool control flow between its body and exit",
+                        ));
+                    }
+                    for source in &plan.continue_sources {
+                        if !matches!(
+                            block_in(function, *source)?.terminator,
+                            mir::Terminator::Jump(target) if target == plan.condition
+                        ) {
+                            return Err(malformed_mir(
+                                "do-while continue does not target its condition",
+                            ));
+                        }
+                    }
+                }
+                mir::ControlFlowPlan::PendingFinally { .. } => {
+                    return Err(malformed_mir(
+                        "pending Stage 28a Slice 2 finalizer reached MIR",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cfg_reaches(
+    function: &mir::Function,
+    start: mir::BlockId,
+    target: mir::BlockId,
+) -> Result<bool, BackendError> {
+    let mut pending = VecDeque::from([start]);
+    let mut visited = HashSet::new();
+    while let Some(block) = pending.pop_front() {
+        if block == target {
+            return Ok(true);
+        }
+        if visited.insert(block) {
+            pending.extend(terminator_targets(&block_in(function, block)?.terminator));
+        }
+    }
+    Ok(false)
+}
+
 fn validate_match_binding_plans(function: &mir::Function) -> Result<(), BackendError> {
     let mut expected_modes = HashMap::new();
 
@@ -7295,6 +7525,16 @@ fn validate_match_arm_result_path(
     arm: mir::BlockId,
     merge: mir::BlockId,
 ) -> Result<(), BackendError> {
+    validate_result_path(function, result, arm, merge, "match arm")
+}
+
+fn validate_result_path(
+    function: &mir::Function,
+    result: mir::LocalId,
+    arm: mir::BlockId,
+    merge: mir::BlockId,
+    path_name: &str,
+) -> Result<(), BackendError> {
     let mut pending = VecDeque::from([(arm, 0_u8)]);
     let mut visited = HashSet::new();
     let mut reached_merge = false;
@@ -7303,7 +7543,7 @@ fn validate_match_arm_result_path(
             reached_merge = true;
             if assignments != 1 {
                 return Err(malformed_mir(format!(
-                    "match arm reaches its merge with {assignments} result assignments"
+                    "{path_name} reaches its merge with {assignments} result assignments"
                 )));
             }
             continue;
@@ -7322,9 +7562,9 @@ fn validate_match_arm_result_path(
                 )))
             });
         if assignments > 1 {
-            return Err(malformed_mir(
-                "match arm assigns its result more than once on one path",
-            ));
+            return Err(malformed_mir(format!(
+                "{path_name} assigns its result more than once on one path"
+            )));
         }
         match &block.terminator {
             mir::Terminator::Jump(target) => pending.push_back((*target, assignments)),
@@ -7339,15 +7579,17 @@ fn validate_match_arm_result_path(
             mir::Terminator::Return(_)
             | mir::Terminator::ReturnVoid
             | mir::Terminator::Panic { .. } => {
-                return Err(malformed_mir(
-                    "match arm terminates before assigning and merging its result",
-                ));
+                return Err(malformed_mir(format!(
+                    "{path_name} terminates before assigning and merging its result"
+                )));
             }
             mir::Terminator::Unreachable => {}
         }
     }
     if !reached_merge {
-        return Err(malformed_mir("match arm cannot reach its result merge"));
+        return Err(malformed_mir(format!(
+            "{path_name} cannot reach its result merge"
+        )));
     }
     Ok(())
 }
@@ -8569,6 +8811,7 @@ fn statement_observes_property(
         mir::Statement::EchoStringLiteral(_)
         | mir::Statement::BindPayloadEnumFields { .. }
         | mir::Statement::MatchResultPlan { .. }
+        | mir::Statement::ControlFlowPlan(_)
         | mir::Statement::DropClass { .. }
         | mir::Statement::DropString { .. }
         | mir::Statement::DropMixed { .. }

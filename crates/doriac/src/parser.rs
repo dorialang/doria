@@ -537,6 +537,10 @@ impl Parser {
         if self.check(&TokenKind::LeftBrace) {
             return self.parse_block().map(Stmt::Block);
         }
+        if self.check(&TokenKind::Finally) {
+            self.reject_disallowed_finally();
+            return None;
+        }
         if matches!(&self.peek().kind, TokenKind::Identifier(name) if name == "print") {
             let span = self.advance().span;
             self.diagnostics.push(
@@ -607,6 +611,14 @@ impl Parser {
             return self.parse_while().map(Stmt::While);
         }
 
+        if self.match_kind(&TokenKind::Do) {
+            return self.parse_do_while().map(Stmt::DoWhile);
+        }
+
+        if self.match_kind(&TokenKind::Given) {
+            return self.parse_given_statement();
+        }
+
         if self.match_kind(&TokenKind::For) {
             return self
                 .parse_for()
@@ -632,6 +644,9 @@ impl Parser {
                     let bindings = self.parse_local_bindings(name, name_span)?;
                     self.expect(TokenKind::Equals, "expected `=` in variable declaration")?;
                     let initializer = self.parse_expression()?;
+                    if self.reject_disallowed_finally() {
+                        return None;
+                    }
                     if self.reject_additional_group_initializer() {
                         return None;
                     }
@@ -657,6 +672,9 @@ impl Parser {
         }
 
         let expr = self.parse_expression()?;
+        if self.reject_disallowed_finally() {
+            return None;
+        }
         if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
             return self.parse_post_increment_statement(expr);
         }
@@ -705,6 +723,9 @@ impl Parser {
         let bindings = self.parse_local_bindings(name, name_span)?;
         self.expect(TokenKind::Equals, "expected `=` in let declaration")?;
         let initializer = self.parse_expression()?;
+        if self.reject_disallowed_finally() {
+            return None;
+        }
         if self.reject_additional_group_initializer() {
             return None;
         }
@@ -831,6 +852,25 @@ impl Parser {
         true
     }
 
+    fn reject_disallowed_finally(&mut self) -> bool {
+        if !self.match_kind(&TokenKind::Finally) {
+            return false;
+        }
+        let keyword_span = self.previous().span;
+        self.diagnostics.push(
+            Diagnostic::new(
+                "P0021",
+                "`finally` attaches only to `if`, `when`, `while`, or `do ... while`",
+                keyword_span,
+            )
+            .with_title("Finally Is Not Available On This Construct")
+            .with_help("attach cleanup to one of the supported control-flow constructs"),
+        );
+        let _ = self.parse_block();
+        self.match_kind(&TokenKind::Semicolon);
+        true
+    }
+
     fn parse_loop_control_statement(
         &mut self,
         kind: TokenKind,
@@ -860,45 +900,191 @@ impl Parser {
 
     fn parse_if_statement(&mut self) -> Option<IfStmt> {
         let start = self.previous().span.start;
+        self.parse_if_statement_after_keyword(start, None, true)
+    }
+
+    fn parse_if_statement_after_keyword(
+        &mut self,
+        start: usize,
+        given: Option<GivenPrelude>,
+        allow_finally: bool,
+    ) -> Option<IfStmt> {
         self.expect(TokenKind::LeftParen, "expected `(` after if")?;
         let condition = self.parse_expression()?;
         self.expect(TokenKind::RightParen, "expected `)` after if condition")?;
         let then_block = self.parse_block()?;
         let else_branch = if self.match_kind(&TokenKind::Else) {
             if self.match_kind(&TokenKind::If) {
-                Some(ElseBranch::If(Box::new(self.parse_if_statement()?)))
+                let nested_start = self.previous().span.start;
+                Some(ElseBranch::If(Box::new(
+                    self.parse_if_statement_after_keyword(nested_start, None, false)?,
+                )))
             } else {
                 Some(ElseBranch::Block(self.parse_block()?))
             }
         } else {
             None
         };
-        let end = else_branch
+        let branch_end = else_branch
             .as_ref()
             .map(ElseBranch::span)
             .unwrap_or(then_block.span)
             .end;
+        let finally = if allow_finally {
+            self.parse_optional_finally()?
+        } else {
+            None
+        };
+        let end = finally
+            .as_ref()
+            .map_or(branch_end, |clause| clause.span.end);
 
         Some(IfStmt {
+            given,
             condition,
             then_block,
             else_branch,
+            finally,
             span: Span::new(start, end),
         })
     }
 
     fn parse_while(&mut self) -> Option<WhileStmt> {
         let start = self.previous().span.start;
+        self.parse_while_after_keyword(start, None)
+    }
+
+    fn parse_while_after_keyword(
+        &mut self,
+        start: usize,
+        given: Option<GivenPrelude>,
+    ) -> Option<WhileStmt> {
         self.expect(TokenKind::LeftParen, "expected `(` after while")?;
         let condition = self.parse_expression()?;
         self.expect(TokenKind::RightParen, "expected `)` after while condition")?;
         let body = self.parse_block()?;
-        let span = Span::new(start, body.span.end);
+        let finally = self.parse_optional_finally()?;
+        let end = finally
+            .as_ref()
+            .map_or(body.span.end, |clause| clause.span.end);
         Some(WhileStmt {
+            given,
             condition,
             body,
-            span,
+            finally,
+            span: Span::new(start, end),
         })
+    }
+
+    fn parse_do_while(&mut self) -> Option<DoWhileStmt> {
+        let start = self.previous().span.start;
+        let body = self.parse_block()?;
+        self.expect(TokenKind::While, "expected `while` after `do` block")?;
+        self.expect(TokenKind::LeftParen, "expected `(` after while")?;
+        let condition = self.parse_expression()?;
+        let condition_end = self
+            .expect(
+                TokenKind::RightParen,
+                "expected `)` after do-while condition",
+            )?
+            .span
+            .end;
+
+        let (semicolon_span, finally, end) = if self.check(&TokenKind::Finally) {
+            let finally = self.parse_optional_finally()?.expect("checked finally");
+            let end = finally.span.end;
+            (None, Some(finally), end)
+        } else if self.match_kind(&TokenKind::Semicolon) {
+            let semicolon = self.previous().span;
+            (Some(semicolon), None, semicolon.end)
+        } else {
+            let insertion = Span::new(condition_end, condition_end);
+            self.diagnostics.push(
+                Diagnostic::new("P0018", "expected `;` after do-while condition", insertion)
+                    .with_help("terminate `do ... while` with `;` when no `finally` clause follows")
+                    .with_fix(insertion, ";"),
+            );
+            (None, None, condition_end)
+        };
+
+        Some(DoWhileStmt {
+            body,
+            condition,
+            semicolon_span,
+            finally,
+            span: Span::new(start, end),
+        })
+    }
+
+    fn parse_given_statement(&mut self) -> Option<Stmt> {
+        let start = self.previous().span.start;
+        let given = self.parse_given_prelude(start)?;
+        if self.match_kind(&TokenKind::If) {
+            return self
+                .parse_if_statement_after_keyword(start, Some(given), true)
+                .map(Stmt::If);
+        }
+        if self.match_kind(&TokenKind::While) {
+            return self
+                .parse_while_after_keyword(start, Some(given))
+                .map(Stmt::While);
+        }
+        if self.match_kind(&TokenKind::When) {
+            let expr = self.parse_when_expression(start, Some(given))?;
+            let end = self
+                .expect(
+                    TokenKind::Semicolon,
+                    "expected `;` after `given ... when` expression statement",
+                )?
+                .span
+                .end;
+            return Some(Stmt::Expr {
+                span: Span::new(start, end),
+                expr,
+            });
+        }
+        if self.check(&TokenKind::Do) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0019",
+                    "`given` does not attach to `do ... while`",
+                    self.peek().span,
+                )
+                .with_help("put setup before the `do` statement"),
+            );
+            return None;
+        }
+
+        self.diagnostics.push(
+            Diagnostic::new(
+                "P0020",
+                "`given` must attach to `if`, `when`, or `while`",
+                given.span,
+            )
+            .with_help("place the governed control-flow construct immediately after the block"),
+        );
+        None
+    }
+
+    fn parse_given_prelude(&mut self, start: usize) -> Option<GivenPrelude> {
+        let block = self.parse_block()?;
+        Some(GivenPrelude {
+            span: Span::new(start, block.span.end),
+            block,
+        })
+    }
+
+    fn parse_optional_finally(&mut self) -> Option<Option<ControlFlowFinally>> {
+        if !self.match_kind(&TokenKind::Finally) {
+            return Some(None);
+        }
+        let keyword_span = self.previous().span;
+        let block = self.parse_block()?;
+        Some(Some(ControlFlowFinally {
+            keyword_span,
+            span: keyword_span.merge(block.span),
+            block,
+        }))
     }
 
     fn parse_for(&mut self) -> Option<ForStmt> {
@@ -1444,8 +1630,12 @@ impl Parser {
                 span: token.span,
             }),
             TokenKind::Null => Some(Expr::Null { span: token.span }),
-            TokenKind::When => self.parse_unsupported_when(token.span.start, false),
-            TokenKind::Given => self.parse_unsupported_when(token.span.start, true),
+            TokenKind::When => self.parse_when_expression(token.span.start, None),
+            TokenKind::Given => {
+                let given = self.parse_given_prelude(token.span.start)?;
+                self.expect(TokenKind::When, "expected `when` after `given` block")?;
+                self.parse_when_expression(token.span.start, Some(given))
+            }
             TokenKind::Match => self.parse_match_expression(token.span.start),
             TokenKind::New => self.parse_new(token.span.start, false),
             TokenKind::Shared => self.parse_shared_new(token.span.start),
@@ -1942,7 +2132,7 @@ impl Parser {
             Expr::Range { start, end, .. } => {
                 Self::contains_bare_identifier(start) || Self::contains_bare_identifier(end)
             }
-            Expr::Match { .. } => false,
+            Expr::Match { .. } | Expr::When(_) => false,
             Expr::Variable { .. }
             | Expr::This { .. }
             | Expr::StaticMember { .. }
@@ -2143,30 +2333,45 @@ impl Parser {
         Some(args)
     }
 
-    fn parse_unsupported_when(&mut self, start: usize, has_given: bool) -> Option<Expr> {
-        if has_given {
-            self.parse_block()?;
-            self.expect(TokenKind::When, "expected `when` after `given` block")?;
-        }
-
+    fn parse_when_expression(&mut self, start: usize, given: Option<GivenPrelude>) -> Option<Expr> {
         self.expect(TokenKind::LeftParen, "expected `(` after when")?;
-        self.parse_expression()?;
+        let condition = self.parse_expression()?;
         self.expect(TokenKind::RightParen, "expected `)` after when condition")?;
-        if self.match_kind(&TokenKind::Colon) {
-            self.parse_type_ref()?;
-        }
-        let mut end = self.parse_block()?.span.end;
+        let result_type = if self.match_kind(&TokenKind::Colon) {
+            Some(self.parse_type_ref()?)
+        } else {
+            None
+        };
+        let block = self.parse_block()?;
+        let mut end = block.span.end;
+        let mut branches = vec![WhenBranch {
+            span: condition.span().merge(block.span),
+            condition: Some(condition),
+            block,
+        }];
 
         let mut has_else = false;
         while self.match_kind(&TokenKind::Else) {
             if self.match_kind(&TokenKind::When) {
                 self.expect(TokenKind::LeftParen, "expected `(` after `else when`")?;
-                self.parse_expression()?;
+                let condition = self.parse_expression()?;
                 self.expect(TokenKind::RightParen, "expected `)` after when condition")?;
-                end = self.parse_block()?.span.end;
+                let block = self.parse_block()?;
+                end = block.span.end;
+                branches.push(WhenBranch {
+                    span: condition.span().merge(block.span),
+                    condition: Some(condition),
+                    block,
+                });
             } else {
                 has_else = true;
-                end = self.parse_block()?.span.end;
+                let block = self.parse_block()?;
+                end = block.span.end;
+                branches.push(WhenBranch {
+                    span: block.span,
+                    condition: None,
+                    block,
+                });
                 break;
             }
         }
@@ -2177,17 +2382,18 @@ impl Parser {
                 self.peek().span,
             );
         }
-        if self.match_kind(&TokenKind::Finally) {
-            end = self.parse_block()?.span.end;
+        let finally = self.parse_optional_finally()?;
+        if let Some(clause) = &finally {
+            end = clause.span.end;
         }
 
-        let span = Span::new(start, end);
-        self.diagnostics.push(Diagnostic::unsupported_stage(
-            "E0513",
-            "`when`, `given`, and control-flow `finally` are accepted syntax but are not available until Stage 28a",
-            span,
-        ));
-        Some(Expr::Null { span })
+        Some(Expr::When(Box::new(WhenExpression {
+            given,
+            result_type,
+            branches,
+            finally,
+            span: Span::new(start, end),
+        })))
     }
 
     fn parse_type_ref(&mut self) -> Option<TypeRef> {
@@ -2524,6 +2730,8 @@ impl Parser {
                 | TokenKind::Continue
                 | TokenKind::If
                 | TokenKind::While
+                | TokenKind::Do
+                | TokenKind::Given
                 | TokenKind::For
                 | TokenKind::Foreach
                 | TokenKind::Internal => return,
@@ -2569,6 +2777,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Given => "given",
         TokenKind::Finally => "finally",
         TokenKind::While => "while",
+        TokenKind::Do => "do",
         TokenKind::For => "for",
         TokenKind::Break => "break",
         TokenKind::Continue => "continue",

@@ -4,7 +4,11 @@ Status: Accepted
 
 ## Decision
 
-Doria accepts typed equality, bool-only boolean operators, integer bitwise operators, and `given` predicate block rules as language design direction. The compiler now has an initial implementation slice for typed equality, bool-only boolean operators, Doria IR lowering, PHP backend lowering, and Stage 4b native lowering for supported `if` conditions. This decision still does not implement integer bitwise operators, broad native expression lowering, `Bool` helper APIs, `given`, `finally`, or `when`.
+Doria accepts typed equality, bool-only boolean operators, integer bitwise
+operators, and `given` predicate blocks. Later compiler stages implemented the
+operator family. Decision 0116 implements `given` on `if`, `when`, and `while`,
+plus executable `when` and base `do ... while`, in Stage 28a Slice 1.
+Executable `finally` remains Stage 28a Slice 2.
 
 Backend support may lag this decision. Unsupported backend coverage must be described as unsupported backend coverage, not invalid Doria syntax.
 
@@ -264,6 +268,12 @@ The scoped declarations remain scoped to the whole `given` plus attached control
 - Inside a bool predicate, normal boolean short-circuiting applies for `&&` / `and` and `||` / `or`.
 - `xor` does not short-circuit.
 
+Setup executes once for every accepted attachment. Predicates execute once for
+`given ... if` and `given ... when`. For `given ... while`, predicates are
+reevaluated before every loop-condition check, including checks reached through
+body completion or `continue`. A false predicate skips later predicates and the
+attached condition.
+
 Example:
 
 ```doria
@@ -281,7 +291,8 @@ given {
 }
 ```
 
-This decision does not decide destructor scheduling, cleanup guarantees, ownership/borrow-checking behavior, or whether `finally` runs after every possible exit path. Those remain separate control-flow/runtime decisions.
+Decision 0116 supersedes this former deferral with the accepted finalizer
+activation, trigger, scope, transfer, and cleanup-order rules.
 
 ## if, when, given, and finally
 
@@ -296,7 +307,8 @@ Rules:
 - `finally` is optional.
 - A base `if`, `while`, `foreach`, or future control construct does not require `given` or `finally`.
 
-`when` is the value-returning conditional/control construct. This decision does not implement or fully specify `when`.
+`when` is the value-returning conditional expression. Decisions 0097 and 0116
+fully specify it, and Stage 28a Slice 1 implements it.
 
 ## Valid Doria vs Backend Coverage
 
@@ -316,7 +328,7 @@ This is especially important for:
 
 ## Non-goals
 
-This decision does not:
+This early record itself did not:
 
 - implement `and`, `or`, `not`, or `xor`
 - implement bitwise operators
@@ -327,3 +339,6 @@ This decision does not:
 - design nullable type syntax
 - design cleanup/destruction semantics
 - change parser, lexer, semantic checker, Doria IR, PHP backend, or native backend behavior
+
+Those historical non-goals do not override the later implementation in Decision
+0116. `Bool` helper APIs and executable `finally` remain separate work.

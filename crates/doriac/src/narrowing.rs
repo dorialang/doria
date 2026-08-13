@@ -561,6 +561,7 @@ fn statement_span(statement: &Stmt) -> Span {
         | Stmt::Expr { span, .. } => *span,
         Stmt::If(statement) => statement.span,
         Stmt::While(statement) => statement.span,
+        Stmt::DoWhile(statement) => statement.span,
         Stmt::For(statement) => statement.span,
         Stmt::Foreach(statement) => statement.span,
         Stmt::Increment(statement) => statement.span,
@@ -807,6 +808,7 @@ fn transfer_statement(
         }
         Stmt::If(_)
         | Stmt::While(_)
+        | Stmt::DoWhile(_)
         | Stmt::For(_)
         | Stmt::Foreach(_)
         | Stmt::Break { .. }
@@ -1061,6 +1063,46 @@ fn kill_mutated_call_arguments(
                 *state = joined;
             }
         }
+        Expr::When(when) => {
+            if let Some(given) = &when.given {
+                for statement in &given.block.statements {
+                    kill_mutated_calls_in_statement(statement, state, resolution, mutations);
+                }
+            }
+            let incoming = state.clone();
+            let mut outcomes = Vec::new();
+            for branch in &when.branches {
+                let mut branch_state = incoming.clone();
+                if let Some(condition) = &branch.condition {
+                    kill_mutated_call_arguments(
+                        condition,
+                        &mut branch_state,
+                        resolution,
+                        mutations,
+                    );
+                }
+                for statement in &branch.block.statements {
+                    kill_mutated_calls_in_statement(
+                        statement,
+                        &mut branch_state,
+                        resolution,
+                        mutations,
+                    );
+                }
+                outcomes.push(branch_state);
+            }
+            if let Some(joined) = outcomes
+                .into_iter()
+                .reduce(|left, right| joined_state(&left, &right))
+            {
+                *state = joined;
+            }
+            if let Some(finally) = &when.finally {
+                for statement in &finally.block.statements {
+                    kill_mutated_calls_in_statement(statement, state, resolution, mutations);
+                }
+            }
+        }
         Expr::Variable { .. }
         | Expr::This { .. }
         | Expr::Identifier { .. }
@@ -1070,6 +1112,46 @@ fn kill_mutated_call_arguments(
         | Expr::Bool { .. }
         | Expr::Null { .. }
         | Expr::StaticMember { .. } => {}
+    }
+}
+
+fn kill_mutated_calls_in_statement(
+    statement: &Stmt,
+    state: &mut State,
+    resolution: &Resolution,
+    mutations: &MutationCatalog,
+) {
+    match statement {
+        Stmt::Block(block) => {
+            for statement in &block.statements {
+                kill_mutated_calls_in_statement(statement, state, resolution, mutations);
+            }
+        }
+        Stmt::VarDecl(declaration) => {
+            kill_mutated_call_arguments(&declaration.initializer, state, resolution, mutations)
+        }
+        Stmt::Assignment(assignment) => {
+            kill_mutated_call_arguments(&assignment.target, state, resolution, mutations);
+            kill_mutated_call_arguments(&assignment.value, state, resolution, mutations);
+        }
+        Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
+            kill_mutated_call_arguments(expr, state, resolution, mutations)
+        }
+        Stmt::Return { expr, .. } => {
+            if let Some(expr) = expr {
+                kill_mutated_call_arguments(expr, state, resolution, mutations);
+            }
+        }
+        Stmt::If(_)
+        | Stmt::While(_)
+        | Stmt::DoWhile(_)
+        | Stmt::For(_)
+        | Stmt::Foreach(_)
+        | Stmt::Break { .. }
+        | Stmt::Continue { .. } => {}
+        Stmt::Increment(increment) => {
+            kill_mutated_call_arguments(&increment.target, state, resolution, mutations)
+        }
     }
 }
 
@@ -1187,7 +1269,7 @@ fn expression_fact(
         | Expr::This { .. }
         | Expr::Unary { .. }
         | Expr::IsType { .. } => Some(Fact::NonNull),
-        Expr::Match { .. } => None,
+        Expr::Match { .. } | Expr::When(_) => None,
         Expr::Variable { .. } => variable_binding(value, resolution).and_then(|binding| {
             state.facts.get(&binding).cloned().or_else(|| {
                 resolution
@@ -1395,6 +1477,7 @@ fn collect_statement(
         }
         Stmt::If(_)
         | Stmt::While(_)
+        | Stmt::DoWhile(_)
         | Stmt::For(_)
         | Stmt::Foreach(_)
         | Stmt::Break { .. }
@@ -1575,6 +1658,36 @@ fn collect_expr(
                 .into_iter()
                 .reduce(|left, right| joined_state(&left, &right))
                 .unwrap_or(incoming)
+        }
+        Expr::When(when) => {
+            let mut incoming = state.clone();
+            if let Some(given) = &when.given {
+                for statement in &given.block.statements {
+                    collect_statement(statement, &incoming, resolution, mutations, facts);
+                }
+            }
+            let mut outcomes = Vec::new();
+            for branch in &when.branches {
+                let mut branch_state = incoming.clone();
+                if let Some(condition) = &branch.condition {
+                    branch_state =
+                        collect_expr(condition, &branch_state, resolution, mutations, facts);
+                }
+                for statement in &branch.block.statements {
+                    collect_statement(statement, &branch_state, resolution, mutations, facts);
+                }
+                outcomes.push(branch_state);
+            }
+            incoming = outcomes
+                .into_iter()
+                .reduce(|left, right| joined_state(&left, &right))
+                .unwrap_or(incoming);
+            if let Some(finally) = &when.finally {
+                for statement in &finally.block.statements {
+                    collect_statement(statement, &incoming, resolution, mutations, facts);
+                }
+            }
+            incoming
         }
         Expr::This { .. }
         | Expr::Identifier { .. }
@@ -1833,6 +1946,11 @@ impl Resolver {
                 }
             }
             Stmt::If(statement) => {
+                let has_given = statement.given.is_some();
+                if let Some(given) = &statement.given {
+                    self.scopes.push(HashMap::new());
+                    self.resolve_statements(&given.block.statements);
+                }
                 self.resolve_expr(&statement.condition);
                 self.resolve_block(&statement.then_block);
                 if let Some(branch) = &statement.else_branch {
@@ -1843,10 +1961,25 @@ impl Resolver {
                         ElseBranch::Block(block) => self.resolve_block(block),
                     }
                 }
+                if has_given {
+                    self.scopes.pop();
+                }
             }
             Stmt::While(statement) => {
+                let has_given = statement.given.is_some();
+                if let Some(given) = &statement.given {
+                    self.scopes.push(HashMap::new());
+                    self.resolve_statements(&given.block.statements);
+                }
                 self.resolve_expr(&statement.condition);
                 self.resolve_block(&statement.body);
+                if has_given {
+                    self.scopes.pop();
+                }
+            }
+            Stmt::DoWhile(statement) => {
+                self.resolve_block(&statement.body);
+                self.resolve_expr(&statement.condition);
             }
             Stmt::For(statement) => {
                 self.scopes.push(HashMap::new());
@@ -1999,6 +2132,25 @@ impl Resolver {
                         | crate::ast::MatchPattern::Expression(_) => {}
                     }
                     self.resolve_expr(&arm.value);
+                    self.scopes.pop();
+                }
+            }
+            Expr::When(when) => {
+                let has_given = when.given.is_some();
+                if let Some(given) = &when.given {
+                    self.scopes.push(HashMap::new());
+                    self.resolve_statements(&given.block.statements);
+                }
+                for branch in &when.branches {
+                    if let Some(condition) = &branch.condition {
+                        self.resolve_expr(condition);
+                    }
+                    self.resolve_block(&branch.block);
+                }
+                if let Some(finally) = &when.finally {
+                    self.resolve_block(&finally.block);
+                }
+                if has_given {
                     self.scopes.pop();
                 }
             }

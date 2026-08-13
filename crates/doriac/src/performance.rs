@@ -110,6 +110,11 @@ pub fn compile_native(
         "conditionMatchCount": structure.condition_match_count,
         "typePatternCount": structure.type_pattern_count,
         "ternaryCount": structure.ternary_count,
+        "whenExpressionCount": structure.when_expression_count,
+        "elseWhenBranchCount": structure.else_when_branch_count,
+        "givenPreludeCount": structure.given_prelude_count,
+        "givenPredicateCount": structure.given_predicate_count,
+        "doWhileCount": structure.do_while_count,
         "runtimeArtifactBytes": runtime_artifact_bytes,
         "peakRssBytes": {"available": false, "reason": "portable in-process peak RSS collection is unavailable"}
     });

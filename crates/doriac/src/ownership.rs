@@ -270,6 +270,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
         &HashMap::new(),
         &flow_facts,
         &HashSet::new(),
+        &HashMap::new(),
     )
 }
 
@@ -280,6 +281,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
     resolved_types: &HashMap<(usize, usize), crate::types::ResolvedType>,
     flow_facts: &FactsByUse,
     move_enum_names: &HashSet<String>,
+    given_preludes: &HashMap<(usize, usize), crate::semantics::GivenSemanticInfo>,
 ) -> Vec<Diagnostic> {
     let classes = program
         .items
@@ -466,6 +468,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         inferred_move_returns: inferred_move_returns.clone(),
         return_borrows: return_borrows.clone(),
         resolved_types,
+        given_preludes,
         move_enum_names: move_enum_names.clone(),
         receiver_class: None,
         receiver_writable: false,
@@ -474,6 +477,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         active_assignment_writes: HashSet::new(),
         active_assignment_targets: HashSet::new(),
         active_borrows: Vec::new(),
+        when_result_modes: Vec::new(),
         flow_facts,
         next_binding_id: 0,
         diagnostics: Vec::new(),
@@ -645,6 +649,12 @@ fn statement_return_borrow(
             }
             Some(crate::return_analysis::statement_falls_through(
                 &Stmt::While(statement.clone()),
+            ))
+        }
+        Stmt::DoWhile(statement) => {
+            block_return_borrow(&statement.body, function, resolve_call, shadowed, borrow)?;
+            Some(crate::return_analysis::statement_falls_through(
+                &Stmt::DoWhile(statement.clone()),
             ))
         }
         Stmt::For(statement) => {
@@ -1050,6 +1060,7 @@ struct Checker<'a> {
     inferred_move_returns: HashSet<usize>,
     return_borrows: HashMap<usize, ReturnBorrow>,
     resolved_types: &'a HashMap<(usize, usize), crate::types::ResolvedType>,
+    given_preludes: &'a HashMap<(usize, usize), crate::semantics::GivenSemanticInfo>,
     move_enum_names: HashSet<String>,
     receiver_class: Option<String>,
     receiver_writable: bool,
@@ -1058,6 +1069,7 @@ struct Checker<'a> {
     active_assignment_writes: HashSet<String>,
     active_assignment_targets: HashSet<String>,
     active_borrows: Vec<ActiveBorrow>,
+    when_result_modes: Vec<UseMode>,
     flow_facts: &'a FactsByUse,
     next_binding_id: usize,
     diagnostics: Vec<Diagnostic>,
@@ -1506,6 +1518,22 @@ impl Checker<'_> {
             }
             Stmt::Return { expr, .. } => {
                 if let Some(expr) = expr {
+                    if let Some(mode) = self.when_result_modes.last().copied() {
+                        if mode == UseMode::Give && self.expr_returns_borrow(expr, scopes) {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "E0478",
+                                    "borrowed result cannot satisfy an owning `when` result",
+                                    expr.span(),
+                                )
+                                .with_help("yield an independently owned value from this branch"),
+                            );
+                            self.use_expr(expr, scopes, UseMode::Read);
+                        } else {
+                            self.use_expr(expr, scopes, mode);
+                        }
+                        return Flow::stops();
+                    }
                     if return_move_type
                         && self.current_return_borrow.is_none()
                         && self.expr_returns_borrow(expr, scopes)
@@ -1536,6 +1564,17 @@ impl Checker<'_> {
                 Flow::stops()
             }
             Stmt::If(statement) => {
+                if let Some(given) = &statement.given {
+                    scopes.push();
+                    self.check_given_setup(given, scopes, return_move_type);
+                    let mut attached = statement.clone();
+                    attached.given = None;
+                    let mut flow =
+                        self.check_statement(&Stmt::If(attached), scopes, return_move_type);
+                    scopes.pop();
+                    pop_flow_scope(&mut flow);
+                    return flow;
+                }
                 self.use_expr(&statement.condition, scopes, UseMode::Read);
                 if let Some(condition) = constant_bool(&statement.condition) {
                     if condition {
@@ -1599,10 +1638,25 @@ impl Checker<'_> {
                 }
             }
             Stmt::While(statement) => {
-                self.use_expr(&statement.condition, scopes, UseMode::Read);
-                if constant_bool(&statement.condition) == Some(false) {
-                    return Flow::fallthrough();
+                if let Some(given) = &statement.given {
+                    scopes.push();
+                    let predicates = self.check_given_setup(given, scopes, return_move_type);
+                    let mut attached = statement.clone();
+                    attached.given = None;
+                    let mut flow = self.check_while_statement(
+                        &attached,
+                        &predicates,
+                        scopes,
+                        return_move_type,
+                    );
+                    scopes.pop();
+                    pop_flow_scope(&mut flow);
+                    flow
+                } else {
+                    self.check_while_statement(statement, &[], scopes, return_move_type)
                 }
+            }
+            Stmt::DoWhile(statement) => {
                 let before = scopes.clone();
                 let mut body = before.clone();
                 let mut body_flow =
@@ -1618,10 +1672,17 @@ impl Checker<'_> {
                     &body_flow.backedges,
                     return_move_type,
                 );
-                let mut exits = body_flow.backedges;
-                exits.extend(body_flow.breaks);
-                merge_loop_exit(scopes, &before, &exits);
-                Flow::fallthrough()
+                let condition = constant_bool(&statement.condition);
+                let mut exits = body_flow.breaks;
+                if condition != Some(true) {
+                    exits.extend(body_flow.backedges);
+                }
+                if exits.is_empty() {
+                    Flow::stops()
+                } else {
+                    merge_reachable_states(scopes, &exits);
+                    Flow::fallthrough()
+                }
             }
             Stmt::For(statement) => {
                 scopes.push();
@@ -1697,6 +1758,69 @@ impl Checker<'_> {
                 breaks: Vec::new(),
             },
         }
+    }
+
+    fn check_given_setup<'a>(
+        &mut self,
+        given: &'a ast::GivenPrelude,
+        scopes: &mut Scopes,
+        return_move_type: bool,
+    ) -> Vec<&'a Expr> {
+        let predicate_indices = self
+            .given_preludes
+            .get(&(given.span.start, given.span.end))
+            .map(|info| {
+                info.predicate_statement_indices
+                    .iter()
+                    .copied()
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut predicates = Vec::new();
+        for (index, statement) in given.block.statements.iter().enumerate() {
+            if predicate_indices.contains(&index) {
+                let Stmt::Expr { expr, .. } = statement else {
+                    unreachable!("checked given predicate plan identifies an expression")
+                };
+                predicates.push(expr);
+            }
+            let _ = self.check_statement(statement, scopes, return_move_type);
+        }
+        predicates
+    }
+
+    fn check_while_statement(
+        &mut self,
+        statement: &ast::WhileStmt,
+        predicates: &[&Expr],
+        scopes: &mut Scopes,
+        return_move_type: bool,
+    ) -> Flow {
+        self.use_expr(&statement.condition, scopes, UseMode::Read);
+        if predicates
+            .iter()
+            .any(|predicate| constant_bool(predicate) == Some(false))
+            || constant_bool(&statement.condition) == Some(false)
+        {
+            return Flow::fallthrough();
+        }
+        let before = scopes.clone();
+        let mut body = before.clone();
+        let mut body_flow = self.check_block(&statement.body, &mut body, return_move_type, true);
+        if body_flow.falls_through {
+            body_flow.backedges.push(body);
+        }
+        for repeat in &mut body_flow.backedges {
+            for predicate in predicates {
+                self.use_expr(predicate, repeat, UseMode::Read);
+            }
+            self.use_expr(&statement.condition, repeat, UseMode::Read);
+        }
+        self.check_second_iteration(&statement.body, &body_flow.backedges, return_move_type);
+        let mut exits = body_flow.backedges;
+        exits.extend(body_flow.breaks);
+        merge_loop_exit(scopes, &before, &exits);
+        Flow::fallthrough()
     }
 
     fn check_foreach_iteration(
@@ -2253,6 +2377,36 @@ impl Checker<'_> {
                 arms,
                 ..
             } => self.use_match_expression(scrutinee, *match_mode, arms, scopes, mode),
+            Expr::When(when) => {
+                let has_given = when.given.is_some();
+                if let Some(given) = &when.given {
+                    scopes.push();
+                    self.check_given_setup(given, scopes, false);
+                }
+                let before = scopes.clone();
+                let mut outcomes = Vec::new();
+                self.when_result_modes.push(mode);
+                for branch in &when.branches {
+                    let mut branch_scopes = before.clone();
+                    if let Some(condition) = &branch.condition {
+                        self.use_expr(condition, &mut branch_scopes, UseMode::Read);
+                    }
+                    let _ = self.check_block(&branch.block, &mut branch_scopes, false, true);
+                    outcomes.push(branch_scopes);
+                }
+                self.when_result_modes.pop();
+                if let Some(first) = outcomes.first().cloned() {
+                    let mut merged = first;
+                    for outcome in outcomes.iter().skip(1) {
+                        let current = merged.clone();
+                        merged.merge_from(&current, outcome);
+                    }
+                    *scopes = merged;
+                }
+                if has_given {
+                    scopes.pop();
+                }
+            }
             Expr::Identifier { .. }
             | Expr::String { .. }
             | Expr::Int { .. }
@@ -3558,7 +3712,11 @@ fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
             .as_ref()
             .is_some_and(|expr| expr_uses_variable(expr, name)),
         Stmt::If(statement) => {
-            expr_uses_variable(&statement.condition, name)
+            statement
+                .given
+                .as_ref()
+                .is_some_and(|given| statements_use_variable(&given.block.statements, name))
+                || expr_uses_variable(&statement.condition, name)
                 || statements_use_variable(&statement.then_block.statements, name)
                 || statement
                     .else_branch
@@ -3571,10 +3729,30 @@ fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
                             statements_use_variable(&block.statements, name)
                         }
                     })
+                || statement
+                    .finally
+                    .as_ref()
+                    .is_some_and(|finally| statements_use_variable(&finally.block.statements, name))
         }
         Stmt::While(statement) => {
-            expr_uses_variable(&statement.condition, name)
+            statement
+                .given
+                .as_ref()
+                .is_some_and(|given| statements_use_variable(&given.block.statements, name))
+                || expr_uses_variable(&statement.condition, name)
                 || statements_use_variable(&statement.body.statements, name)
+                || statement
+                    .finally
+                    .as_ref()
+                    .is_some_and(|finally| statements_use_variable(&finally.block.statements, name))
+        }
+        Stmt::DoWhile(statement) => {
+            statements_use_variable(&statement.body.statements, name)
+                || expr_uses_variable(&statement.condition, name)
+                || statement
+                    .finally
+                    .as_ref()
+                    .is_some_and(|finally| statements_use_variable(&finally.block.statements, name))
         }
         Stmt::For(statement) => {
             let initializer_uses = statement
@@ -3688,6 +3866,22 @@ fn expr_uses_variable(expr: &Expr, name: &str) -> bool {
                         || (!match_pattern_binds(&arm.pattern, name)
                             && expr_uses_variable(&arm.value, name))
                 })
+        }
+        Expr::When(when) => {
+            when.given
+                .as_ref()
+                .is_some_and(|given| statements_use_variable(&given.block.statements, name))
+                || when.branches.iter().any(|branch| {
+                    branch
+                        .condition
+                        .as_ref()
+                        .is_some_and(|condition| expr_uses_variable(condition, name))
+                        || statements_use_variable(&branch.block.statements, name)
+                })
+                || when
+                    .finally
+                    .as_ref()
+                    .is_some_and(|finally| statements_use_variable(&finally.block.statements, name))
         }
         Expr::This { .. }
         | Expr::Identifier { .. }
@@ -4034,4 +4228,25 @@ fn merge_loop_exit(scopes: &mut Scopes, before: &Scopes, backedges: &[Scopes]) {
         repeated.merge_from(&left, state);
     }
     scopes.merge_from(before, &repeated);
+}
+
+fn merge_reachable_states(scopes: &mut Scopes, states: &[Scopes]) {
+    let Some((first, rest)) = states.split_first() else {
+        return;
+    };
+    let mut merged = first.clone();
+    for state in rest {
+        let left = merged.clone();
+        merged.merge_from(&left, state);
+    }
+    *scopes = merged;
+}
+
+fn pop_flow_scope(flow: &mut Flow) {
+    for backedge in &mut flow.backedges {
+        backedge.pop();
+    }
+    for break_exit in &mut flow.breaks {
+        break_exit.pop();
+    }
 }

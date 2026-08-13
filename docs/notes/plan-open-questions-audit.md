@@ -38,7 +38,7 @@ No unresolved items remain from this audit. F1-F8 are archived in the resolution
 above; their accepted decisions and scheduled work are the authority.
 
 ## Minor / spec-tightening (lower priority)
-- **`given` + chained `if`.** 0020 AND-s `given` predicates with *"the attached control condition"* (singular); 0097 generalized this to each `when`/`else when` and noted the `if`/`else if` mirror. 0020/SPEC's `if`-chain wording should be tightened to say the same (predicates AND with each `else if`), so the two constructs match on paper.
+- **`given` + chained `if`: RESOLVED.** Decision 0116 defines one gate for the complete chain. A failed predicate skips every `if`/`else if` condition and selects only the unconditional `else`, when present. Decision 0020 and SPEC now use the same rule.
 - **Collection method surface.** Line 632 sketches List/Dictionary/Set methods but says the surface "gets its own decision record." The names look settled (inventory is 0092); this is closer to an authoring task than an open fork — noted for completeness.
 
 ## Recommended deferrals (reason · reopen trigger)
