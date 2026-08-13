@@ -195,6 +195,42 @@ function main(): int { return value(Outcome::Pair(20, 22)); }
 }
 
 #[test]
+fn guarded_consuming_match_ir_keeps_storage_inline_and_scratch_in_entry() {
+    let source = include_str!("../../../examples/native/main_match_guarded_take.doria");
+    let program = doriac::lower_source_to_mir("llvm-guarded-take.doria", source)
+        .expect("guarded consuming match should lower to validated MIR");
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
+        .expect("guarded consuming match MIR should lower to LLVM IR");
+
+    let case_test = ir
+        .find("payload.enum.case.matches")
+        .expect("guarded match should test the inline enum tag");
+    let extraction = ir[case_test..]
+        .find("llvm.memset")
+        .map(|offset| case_test + offset)
+        .expect("selected consuming arm should clear its moved payload slot");
+    assert!(
+        case_test < extraction,
+        "payload extraction preceded its exact case test:\n{ir}"
+    );
+    assert!(
+        ir.matches("payload.enum.case.matches").count() >= 2,
+        "guard fallthrough did not retain the later repeated case test:\n{ir}"
+    );
+    assert!(
+        !ir.contains("dr_v1_enum_") && !ir.contains("dr_v4_enum_"),
+        "guarded consuming match introduced a runtime match/enum allocation:\n{ir}"
+    );
+
+    let placement = scan_alloca_placement(&ir);
+    assert!(
+        placement.escaped.is_empty(),
+        "guarded consuming match allocated scratch outside entry:\n{}",
+        placement.escaped.join("\n")
+    );
+}
+
+#[test]
 fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
     let program = Program {
         source: doriac::source::SourceFile::new("llvm-test.doria", ""),

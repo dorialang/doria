@@ -79,12 +79,24 @@ fn php_backend_executes_core_match_payloads_narrowing_conditions_and_ternary() {
         "stage28.doria",
         r#"
 enum Delivery { case Waiting; case Sent(string $reference); }
+class Note { function __construct(string $text) {} }
+enum NoteResult { case Found(Note $note); case Missing; }
 function condition(string $name, bool $value): bool { echo $name; return $value; }
 function describe(Delivery $delivery): string
 {
     return match ($delivery) {
         Delivery::Waiting => "waiting",
+        Delivery::Sent($reference) if condition("g", false) => "wrong",
         Delivery::Sent($reference) => "sent {$reference}",
+    };
+}
+function consume(): string
+{
+    NoteResult $result = NoteResult::Found(new Note("owned"));
+    return match (take $result) {
+        NoteResult::Found($note) if $note->text == "skip" => "wrong",
+        NoteResult::Found($note) => $note->text,
+        NoteResult::Missing => "missing",
     };
 }
 function inspect(mixed $value): string
@@ -110,6 +122,7 @@ function main(): void
     echo inspect(true) . " " . inspect("text") . "\n";
     echo choose() . "\n";
     echo false ? "wrong" : true ? "ready" : "wrong";
+    echo " " . consume();
 }
 "#,
     )
@@ -117,7 +130,8 @@ function main(): void
 
     assert!(php.contains("__doriaMatchesCase"));
     assert!(php.contains("__doriaPayloadAt"));
-    assert!(php.contains("get_debug_type("));
+    assert!(php.contains("__doria_mixed_is("));
+    assert!(!php.contains("get_debug_type("));
     let Ok(version) = Command::new("php").arg("--version").output() else {
         return;
     };
@@ -140,31 +154,100 @@ function main(): void
         "{}",
         String::from_utf8_lossy(&run.stderr)
     );
-    assert_eq!(run.stdout, b"sent R-12\nbool true string text\nabB\nready");
+    assert_eq!(
+        run.stdout,
+        b"gsent R-12\nbool true string text\nabB\nready owned"
+    );
 }
 
 #[test]
-fn php_backend_rejects_numeric_type_patterns_after_mixed_erases_width() {
-    for numeric_type in ["int8", "int", "float32", "float"] {
-        let source = format!(
-            r#"
-function inspect(mixed $value): string
-{{
-    return match ($value) {{
-        {numeric_type} $number => "number",
-        default => "other",
-    }};
-}}
-"#
-        );
-        let diagnostics = doriac::compile_source_to_php("stage28.doria", &source)
-            .expect_err("PHP must not collapse Doria's exact numeric type identities");
+fn php_backend_preserves_exact_doria_types_after_mixed() {
+    let php = doriac::compile_source_to_php(
+        "stage28-exact-mixed.doria",
+        r#"
+enum UnitState { case Ready; }
+enum BackedState: string { case Ready = "ready"; }
+enum PayloadState { case Ready(int $code); }
+class Document {}
 
-        assert_eq!(diagnostics[0].code, "B1301");
-        assert!(diagnostics[0].message.contains(&format!(
-            "exact `{numeric_type}` matching after `mixed` erased the numeric width"
-        )));
+function inspect(mixed $value): string
+{
+    return match ($value) {
+        int8 $item => "int8",
+        int16 $item => "int16",
+        int32 $item => "int32",
+        int $item => "int",
+        uint8 $item => "uint8",
+        uint16 $item => "uint16",
+        uint32 $item => "uint32",
+        uint64 $item => "uint64",
+        float32 $item => "float32",
+        float $item => "float",
+        bool $item => "bool",
+        string $item => "string",
+        UnitState $item => "unit",
+        BackedState $item => "backed",
+        PayloadState $item => "payload",
+        Document $item => "class",
+        default => "other",
+    };
+}
+
+function makeInt(): mixed
+{
+    return 7;
+}
+
+function main(): void
+{
+    int8 $int8Value = 1;
+    int16 $int16Value = 1;
+    int32 $int32Value = 1;
+    int $intValue = 1;
+    uint8 $uint8Value = 1;
+    uint16 $uint16Value = 1;
+    uint32 $uint32Value = 1;
+    uint64 $uint64Value = 1;
+    float32 $float32Value = 1.25;
+    float $floatValue = 1.25;
+    echo inspect($int8Value) . " " . inspect($int16Value) . " " . inspect($int32Value) . " " . inspect($intValue) . "\n";
+    echo inspect($uint8Value) . " " . inspect($uint16Value) . " " . inspect($uint32Value) . " " . inspect($uint64Value) . "\n";
+    echo inspect($float32Value) . " " . inspect($floatValue) . " " . inspect(true) . " " . inspect("text") . "\n";
+    echo inspect(UnitState::Ready) . " " . inspect(BackedState::Ready) . " " . inspect(PayloadState::Ready(7)) . " " . inspect(new Document()) . "\n";
+    echo inspect(makeInt());
+}
+"#,
+    )
+    .expect("PHP mixed values must retain exact Doria type tags");
+
+    assert!(!php.contains("get_debug_type("));
+    assert!(php.contains("__doria_box_mixed("));
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
     }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated exact-type PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout,
+        b"int8 int16 int32 int\nuint8 uint16 uint32 uint64\nfloat32 float bool string\nunit backed payload class\nint"
+    );
 }
 
 #[test]
@@ -585,16 +668,6 @@ function mask(int $left, int $right): int
             "fixed-width Doria bitwise semantics for `&`",
         ),
         (
-            "nondefault width",
-            r#"
-function identity(int8 $value): int8
-{
-    return $value;
-}
-"#,
-            "Doria `int8` width and signedness",
-        ),
-        (
             "uint64 maximum",
             r#"
 function maximum(): uint64
@@ -602,17 +675,7 @@ function maximum(): uint64
     return 18446744073709551615;
 }
 "#,
-            "Doria `uint64` width and signedness",
-        ),
-        (
-            "unsigned comparison",
-            r#"
-function isLess(uint32 $left, uint32 $right): bool
-{
-    return $left < $right;
-}
-"#,
-            "Doria `uint32` width and signedness",
+            "integer literal `18446744073709551615` outside PHP's signed integer range",
         ),
         (
             "checked conversion",
@@ -733,8 +796,8 @@ function divide(float $left, float64 $right): float
 }
 
 #[test]
-fn php_backend_rejects_float32_precision() {
-    let diagnostics = doriac::compile_source_to_php(
+fn php_backend_accepts_float32_storage_but_rejects_unrounded_arithmetic() {
+    let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
 function identity(float32 $value): float32
@@ -743,29 +806,27 @@ function identity(float32 $value): float32
 }
 "#,
     )
-    .expect_err("PHP must not emit `float32` as an unknown PHP type");
+    .expect("PHP can carry an already-quantized float32 value without arithmetic");
+    assert!(php.contains("function identity(float $value): float"));
 
+    let diagnostics = doriac::compile_source_to_php(
+        "test.doria",
+        "function add(float32 $left, float32 $right): float32 { return $left + $right; }",
+    )
+    .expect_err("PHP must reject float32 operations without binary32 rounding");
     assert_eq!(diagnostics[0].code, "B1301");
-    assert!(diagnostics[0].message.contains("`float32` precision"));
+    assert!(diagnostics[0].message.contains("binary32 rounding"));
 }
 
 #[test]
-fn php_backend_rejects_exact_type_tests_for_unrepresentable_numeric_widths() {
-    for tested_type in [
-        "int8", "int16", "int32", "uint8", "uint16", "uint32", "uint64", "float32",
-    ] {
-        let source =
-            format!("function test(int $value): bool {{ return $value is {tested_type}; }}");
-        let diagnostics = doriac::compile_source_to_php("test.doria", &source)
-            .expect_err("PHP must not erase the width of an exact Doria type test");
-        assert_eq!(diagnostics[0].code, "B1301");
-    }
-
-    doriac::compile_source_to_php(
+fn php_backend_constant_folds_exact_tests_on_concrete_numeric_types() {
+    let php = doriac::compile_source_to_php(
         "test.doria",
-        "function test(mixed $value): bool { return $value is int64; }",
+        "function narrow(int $value): bool { return $value is int8; } function exact(int8 $value): bool { return $value is int8; }",
     )
-    .expect("PHP can preserve the exact default signed integer test");
+    .expect("known concrete Doria types do not need PHP host-type inference");
+    assert!(php.contains("function narrow(int $value): bool\n{\n    return (false);"));
+    assert!(php.contains("function exact(int $value): bool\n{\n    return (true);"));
 }
 
 #[test]
@@ -776,7 +837,7 @@ fn php_backend_parenthesizes_type_tests_as_expression_atoms() {
     )
     .expect("PHP should preserve nested type-test precedence");
 
-    assert!(php.contains("return (get_debug_type($value) === 'int') === true;"));
+    assert!(php.contains("return (__doria_mixed_is($value, \"int\")) === true;"));
 }
 
 #[test]
@@ -2120,11 +2181,15 @@ fn php_backend_preserves_the_exact_displayable_contract() {
 }
 
 #[test]
-fn php_backend_reserves_display_helper_class_name_case_insensitively() {
-    for name in [
-        "__DoriaDisplayable",
-        "__doriadisplayable",
-        "__DORIADISPLAYABLE",
+fn php_backend_reserves_helper_class_names_case_insensitively() {
+    for (name, canonical) in [
+        ("__DoriaDisplayable", "__DoriaDisplayable"),
+        ("__doriadisplayable", "__DoriaDisplayable"),
+        ("__DORIADISPLAYABLE", "__DoriaDisplayable"),
+        ("__DoriaValueEquatable", "__DoriaValueEquatable"),
+        ("__doriavalueequatable", "__DoriaValueEquatable"),
+        ("__DoriaMixedValue", "__DoriaMixedValue"),
+        ("__doriamixedvalue", "__DoriaMixedValue"),
     ] {
         let diagnostics = doriac::compile_source_to_php(
             "reserved_display_helper.doria",
@@ -2134,7 +2199,7 @@ fn php_backend_reserves_display_helper_class_name_case_insensitively() {
 
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "E0309"
-                && diagnostic.message.contains("`__DoriaDisplayable`")
+                && diagnostic.message.contains(&format!("`{canonical}`"))
                 && diagnostic.message.contains("reserved")
         }));
     }

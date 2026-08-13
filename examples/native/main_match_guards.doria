@@ -1,0 +1,23 @@
+enum Access
+{
+    case Granted(int $level);
+    case Denied;
+}
+
+function label(Access $access): string
+{
+    return match ($access) {
+        Access::Granted($level) if $level >= 10 => "priority",
+        Access::Granted($level) if $level >= 1 => "standard",
+        Access::Granted($level) => "limited",
+        Access::Denied => "denied",
+    };
+}
+
+function main(): void
+{
+    echo label(Access::Granted(12)) . "\n";
+    echo label(Access::Granted(4)) . "\n";
+    echo label(Access::Granted(0)) . "\n";
+    echo label(Access::Denied) . "\n";
+}

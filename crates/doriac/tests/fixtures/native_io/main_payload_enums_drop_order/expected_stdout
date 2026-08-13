@@ -3,6 +3,9 @@ drop second
 drop first
 leave single
 drop only
+drop local first
+leave local
+drop local second
 drop literal first
 drop literal second
 drop indexed

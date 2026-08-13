@@ -597,15 +597,22 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
         },
         ast::Expr::Match {
             scrutinee,
+            mode,
             arms,
             origin,
             span,
         } => hir::Expr::Match {
             scrutinee: Box::new(lower_expr(scrutinee, class_name)),
+            mode: *mode,
             arms: arms
                 .iter()
                 .map(|arm| hir::MatchArm {
                     pattern: lower_match_pattern(&arm.pattern, class_name),
+                    guard: arm.guard.as_ref().map(|guard| hir::MatchGuard {
+                        condition: lower_expr(&guard.condition, class_name),
+                        keyword_span: guard.keyword_span,
+                        span: guard.span,
+                    }),
                     value: lower_expr(&arm.value, class_name),
                     span: arm.span,
                 })

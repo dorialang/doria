@@ -1,0 +1,38 @@
+class Task
+{
+    function __construct(string $label, bool $ready)
+    {
+    }
+
+    function getLabel(): string
+    {
+        return $this->label;
+    }
+
+    function isReady(): bool
+    {
+        return $this->ready;
+    }
+}
+
+enum QueueResult
+{
+    case Item(Task $task);
+    case Empty;
+}
+
+function consume(take QueueResult $result): string
+{
+    return match (take $result) {
+        QueueResult::Item($task) if $task->isReady() => "ready {$task->getLabel()}",
+        QueueResult::Item($task) => "pending {$task->getLabel()}",
+        QueueResult::Empty => "empty",
+    };
+}
+
+function main(): void
+{
+    echo consume(QueueResult::Item(new Task("alpha", true))) . "\n";
+    echo consume(QueueResult::Item(new Task("beta", false))) . "\n";
+    echo consume(QueueResult::Empty) . "\n";
+}

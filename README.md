@@ -101,14 +101,18 @@ evaluating its input once and executing one arm:
 
 ```doria
 string $message = match ($result) {
-    Delivery::Queued => "queued",
+    Delivery::Queued($attempt) if $attempt > 1 => "retried",
+    Delivery::Queued($attempt) => "queued",
     Delivery::Sent($reference) => "sent {$reference}",
     Delivery::Failed($code, $reason) => "failed {$code}: {$reason}",
 };
 ```
 
 Open domains use a final `default`. `match (true)` provides ordered strict-bool
-conditions, and full ternary uses the same typing and ownership rules.
+conditions, and full ternary uses the same typing and ownership rules. A guard
+uses `if`, runs only after its pattern matches, and may fall through to a later
+arm. `match (take $value)` explicitly gives the whole value to the match so a
+selected Move payload can become an owned arm binding.
 
 ## Tooling
 

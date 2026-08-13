@@ -1,0 +1,31 @@
+class Record
+{
+    function __construct(string $label)
+    {
+    }
+
+    function getLabel(): string
+    {
+        return $this->label;
+    }
+}
+
+enum Lookup
+{
+    case Found(Record $record);
+    case Missing;
+}
+
+function consume(take Lookup $lookup): string
+{
+    return match (take $lookup) {
+        Lookup::Found($record) => $record->getLabel(),
+        Lookup::Missing => "missing",
+    };
+}
+
+function main(): void
+{
+    echo consume(Lookup::Found(new Record("found"))) . "\n";
+    echo consume(Lookup::Missing) . "\n";
+}

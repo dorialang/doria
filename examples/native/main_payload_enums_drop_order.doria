@@ -33,6 +33,13 @@ enum Entry
     case Value(Token $token);
 }
 
+function replaceLocalEntry(): void
+{
+    writable Entry $entry = Entry::Value(new Token("local first"));
+    $entry = Entry::Value(new Token("local second"));
+    echo "leave local\n";
+}
+
 function replaceDictionaryEntries(): void
 {
     writable Dictionary<string, Entry> $items = [
@@ -48,5 +55,6 @@ function main(): void
 {
     dropPair();
     dropSingle();
+    replaceLocalEntry();
     replaceDictionaryEntries();
 }

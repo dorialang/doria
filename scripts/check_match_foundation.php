@@ -66,6 +66,7 @@ $manifest = $read($manifestPath);
 
 $require($decisionPath, $decision, [
     '**Status:** Accepted',
+    '**Implementation status:** Implemented',
     '## Expression Shape',
     '## Exhaustiveness',
     '## Payload Destructuring',
@@ -73,9 +74,32 @@ $require($decisionPath, $decision, [
     '## Readonly Ownership',
     '## `match (true)`',
     '## Ternary Desugaring',
-    '## Pattern Guard Boundary',
+    '## Pattern Guards',
+    'The only guard spelling is `if`',
+    '`when` is Doria\'s future value-returning conditional',
+    '`where`',
+    'must produce `bool`',
+    'the pattern is tested first',
+    'A runtime-guarded arm does not complete coverage',
+    'A later unguarded copy of the pattern may complete',
+    '`default` is unconditional and cannot have a guard',
+    '`match (true)` arms do not',
+    '## Consuming Match',
+    '`match (take $value)` transfers the whole scrutinee',
+    'Consumption is deliberately whole-value only',
+    'Payload-level `take`',
+    'writable payload bindings are rejected',
+    'a Move payload becomes one owned binding',
+    'If it fails, no ownership moves',
+    '## Guarded Consumption',
+    '## PR #132 Review Closure',
     'Stage 28 Slice 1 — Complete',
-    'Stage 28 Slice 2 — Next',
+    'Stage 28 Slice 2 — Complete',
+    'Stage 28 is **Complete**',
+    'Stage 28a is **Next**',
+    'Stage 29 is **Sequenced After Stage 28a**',
+    'backend-private',
+    'former PHP B1301 boundary for valid exact numeric tests after `mixed` is',
     'Stage 28 controlled timing is **Pending Available Runner** and non-blocking',
 ]);
 
@@ -84,10 +108,11 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 26b — Complete',
         'Measurement Status: Pending Available Runner',
         'Stage 27 — Complete',
-        'Stage 28 — In Progress',
+        'Stage 28 — Complete',
         'Stage 28 Slice 1 — Complete',
-        'Stage 28 Slice 2 — Next',
-        'Stage 28a — Blocked Until Stage 28 Completes',
+        'Stage 28 Slice 2 — Complete',
+        'Stage 28a — Next',
+        'Stage 29 — Sequenced After Stage 28a',
     ]);
 }
 
@@ -97,19 +122,22 @@ $require($specPath, $spec, [
     'case-only pattern ignores all payloads',
     'and `mixed` open domains use a',
     'move payload bindings are readonly borrows',
+    'An arm guard is written `Pattern if',
+    '`match (take $value)` explicitly consumes',
 ]);
 $require($stdlibPath, $stdlib, [
-    'Decision 0115 makes guard-free',
-    'core `match` executable',
-    'pattern guards and',
-    'remain Stage 28 Slice 2',
+    'implemented Decision 0115',
+    'completes core `match`',
+    '`if` pattern guards',
 ]);
-$require($cataloguePath, $catalogue, ['"E0576"', '"E0585"', '"E0595"', '"I2801"']);
+$require($cataloguePath, $catalogue, ['"E0576"', '"E0585"', '"E0595"', '"E0604"', '"I2801"']);
 $require($parserPath, $parser, [
     'fn parse_match_expression(',
+    'fn parse_match_guard(',
     'fn parse_match_pattern(',
-    'fn is_candidate_match_guard(',
-    'pattern guards are not available; guard syntax must be settled before implementation',
+    '`when` is not a match guard; use `if`',
+    '`where` is not a match guard; use `if`',
+    'consume the complete value with `match (take $value)` instead',
     'fn parse_ternary(',
     'Doria does not support the short ternary `?:`',
 ]);
@@ -120,21 +148,31 @@ $require($semanticsPath, $semantics, [
     'Match Pattern Is Not Constant',
     'Match Arm Type Mismatch',
     'Match Condition Must Be Bool',
+    'match guard must have type `bool`',
+    'Copy match scrutinee does not need `take`',
     'Ternary Condition Must Be Bool',
 ]);
 $require($mirPath, $mir, [
     'PayloadEnumIsCase',
     'BindPayloadEnumFields',
     'MatchResultPlan',
+    'MatchOwnershipMode',
+    'MatchBindingMode',
+    'GuardView',
+    'ConsumedArm',
 ]);
 $require($loweringPath, $lowering, [
     'fn lower_match_rvalue(',
     'fn lower_match_pattern_to_blocks(',
     'fn bind_match_arm(',
     'MatchResultPlan',
+    'mir::MatchBindingMode::GuardView',
+    'mir::MatchBindingMode::ConsumedArm',
 ]);
 $require($validationPath, $validation, [
     'fn validate_match_result_plans(',
+    'fn validate_match_binding_plans(',
+    'match guard must branch to its final binding block on success',
     'is destructured without a dominating exact case proof',
     'match arm reaches its merge with {assignments} result assignments',
 ]);
@@ -142,6 +180,9 @@ foreach ([$interpreterPath => $interpreter, $craneliftPath => $cranelift, $llvmP
     $require($path, $contents, ['PayloadEnumIsCase', 'BindPayloadEnumFields', 'MatchResultPlan']);
 }
 $require($phpPath, $php, [
+    'final class __DoriaMixedValue',
+    'function __doria_box_mixed',
+    'function __doria_mixed_is',
     'fn emit_match_expression(',
     'fn emit_php_match_condition(',
     'fn emit_php_match_bindings(',
@@ -163,7 +204,11 @@ $require($testsPath, $tests, [
     'match_true_is_strict_ordered_lazy_and_requires_default',
     'arm_results_share_one_strict_type_with_nullable_unification',
     'named_and_temporary_move_scrutinees_are_borrowed_through_the_selected_arm',
-    'candidate_pattern_guard_spellings_stop_at_one_targeted_boundary',
+    'pattern_guards_use_if_require_bool_and_reject_redundant_positions',
+    'guarded_patterns_preserve_coverage_and_reachability_rules',
+    'consuming_match_moves_whole_values_and_materializes_payloads_after_guards',
+    'consuming_nullable_and_mixed_matches_execute_without_hidden_aliases',
+    'payload_level_take_and_writable_patterns_are_deliberately_rejected',
     'integer patterns should preserve contextual width and signedness',
     'ternary_is_right_associative_strict_lazy_and_rejects_elvis',
 ]);
@@ -172,6 +217,7 @@ $require($malformedPath, $malformed, [
 ]);
 $require($llvmTestsPath, $llvmTests, [
     'match_ir_uses_inline_dispatch_and_projects_payloads_only_in_selected_arms',
+    'guarded_consuming_match_ir_keeps_storage_inline_and_scratch_in_entry',
 ]);
 $require($manifestPath, $manifest, [
     'examples/native/main_match_unit_enums.doria',
@@ -181,6 +227,13 @@ $require($manifestPath, $manifest, [
     'examples/native/main_match_true.doria',
     'examples/native/main_match_ternary.doria',
     'examples/native/main_match_ownership.doria',
+    'examples/native/main_match_guards.doria',
+    'examples/native/main_match_guard_exhaustiveness.doria',
+    'examples/native/main_match_take_enum.doria',
+    'examples/native/main_match_take_nullable.doria',
+    'examples/native/main_match_take_mixed.doria',
+    'examples/native/main_match_guarded_take.doria',
+    'examples/native/main_match_take_drop_order.doria',
 ]);
 
 if (str_contains($semantics, '"E0576"')) {
@@ -188,6 +241,9 @@ if (str_contains($semantics, '"E0576"')) {
 }
 if (str_contains($php, "non-exhaustive Doria match")) {
     $failures[] = "{$phpPath}: PHP lowering invented a runtime exhaustiveness failure";
+}
+if (str_contains($php, 'get_debug_type(')) {
+    $failures[] = "{$phpPath}: PHP exact Doria type identity regressed to host reflection";
 }
 
 $fixtureContents = $tests;

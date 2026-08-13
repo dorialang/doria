@@ -1,0 +1,25 @@
+class Entry
+{
+    function __construct(string $label)
+    {
+    }
+
+    function getLabel(): string
+    {
+        return $this->label;
+    }
+}
+
+function consume(take ?Entry $entry): string
+{
+    return match (take $entry) {
+        Entry $present => $present->getLabel(),
+        null => "absent",
+    };
+}
+
+function main(): void
+{
+    echo consume(new Entry("present")) . "\n";
+    echo consume(null) . "\n";
+}

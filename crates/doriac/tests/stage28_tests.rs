@@ -81,6 +81,41 @@ function main(): void
 }
 
 #[test]
+fn writable_payload_enum_locals_can_replace_their_active_case() {
+    let output = interpret(
+        r#"
+enum DeliveryStatus
+{
+    case Pending;
+    case InTransit(string $city);
+    case Delivered(string $recipient);
+}
+
+function describe(DeliveryStatus $status): string
+{
+    return match ($status) {
+        DeliveryStatus::Pending => "waiting to leave",
+        DeliveryStatus::InTransit($city) => "in transit through {$city}",
+        DeliveryStatus::Delivered($recipient) => "delivered to {$recipient}",
+    };
+}
+
+function main(): void
+{
+    let writable $status = DeliveryStatus::InTransit("Lusaka");
+    echo describe($status) . "\n";
+    $status = DeliveryStatus::Delivered("Kitwe");
+    echo describe($status) . "\n";
+}
+"#,
+    );
+    assert_eq!(
+        output.stdout,
+        b"in transit through Lusaka\ndelivered to Kitwe\n"
+    );
+}
+
+#[test]
 fn match_evaluates_one_scrutinee_and_only_the_selected_arm() {
     let output = interpret(
         r#"
@@ -318,6 +353,8 @@ fn surrounding_expected_types_reach_match_arms_in_every_user_call_form() {
         r#"
 class Sink
 {
+    mixed $property = match (1 == 2) { true => 1, false => "text", };
+
     function __construct(take mixed $value) {}
     function accept(mixed $value): void {}
     static function acceptStatic(mixed $value): void {}
@@ -332,15 +369,30 @@ function nullResult(bool $condition): ?string
 {
     return match ($condition) { true => null, false => null, };
 }
+enum State { case First; case Second; }
+class Box {}
 
 function main(): void
 {
+    bool $condition = true;
+    mixed $local = match ($condition) { true => 1, false => "text", };
+    int $left, $right = match ($condition) { true => 20, false => 22, };
     writable mixed $assigned = 0;
     $assigned = match (false) { true => 1, false => "text", };
     accept(match (false) { true => 1, false => "text", });
     let $sink = new Sink(match (false) { true => 1, false => "text", });
     $sink->accept(match (false) { true => 1, false => "text", });
     Sink::acceptStatic(match (false) { true => 1, false => "text", });
+    mixed $nested = match ($condition) {
+        true => match (false) { true => 1, false => "nested", },
+        false => false,
+    };
+    mixed $ternary = true ? match (false) { true => 1, false => "ternary", } : false;
+    State $state = match ($condition) {
+        true => match (false) { true => State::First, false => State::Second, },
+        false => State::First,
+    };
+    Box $box = match ($condition) { true => new Box(), false => new Box(), };
     mixed $mixed = mixedResult(true);
     ?string $nullable = nullResult(false);
 }
@@ -479,19 +531,156 @@ function main(): void
 }
 
 #[test]
-fn candidate_pattern_guard_spellings_stop_at_one_targeted_boundary() {
-    for guard in ["if true", "when true", "where true"] {
+fn pattern_guards_use_if_require_bool_and_reject_redundant_positions() {
+    let output = interpret(
+        r#"
+enum State { case Ready(int $value); case Waiting; }
+function mark(string $name, bool $result): bool { echo $name; return $result; }
+function main(): void
+{
+    State $state = State::Ready(42);
+    echo match ($state) {
+        State::Waiting if mark("x", true) => "wrong",
+        State::Ready($value) if mark("a", false) => "wrong",
+        State::Ready($value) if mark("b", $value == 42) => "{$value}",
+        State::Ready($value) => "fallback",
+        State::Waiting => "waiting",
+    };
+}
+"#,
+    );
+    assert_eq!(output.stdout, b"ab42");
+
+    for keyword in ["when", "where"] {
         let source = format!(
-            "enum State {{ case Ready; }} function f(State $state): string {{ return match ($state) {{ State::Ready {guard} => \"ready\", }}; }}"
+            "enum State {{ case Ready; }} function f(State $state, bool $enabled): string {{ return match ($state) {{ State::Ready {keyword} $enabled => \"ready\", State::Ready => \"other\", }}; }}"
         );
         let diagnostics = doriac::parse_source("stage28.doria", &source)
-            .expect_err("pattern guards must remain unavailable");
-        assert_eq!(diagnostics.len(), 1, "{guard}: {diagnostics:#?}");
-        assert!(diagnostics[0]
-            .message
-            .contains("pattern guards are not available"));
-        assert!(diagnostics[0]
-            .message
-            .contains("settled before implementation"));
+            .expect_err("only `if` is a Doria match guard");
+        assert_eq!(diagnostics.len(), 1, "{keyword}: {diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, "E0596");
+        assert!(diagnostics[0].message.contains("use `if`"));
+        assert_eq!(diagnostics[0].fixes[0].edits[0].replacement, "if");
+    }
+
+    assert_code(
+        "enum State { case Ready; } function f(State $state): string { return match ($state) { State::Ready if 1 => \"ready\", State::Ready => \"other\", }; }",
+        "E0597",
+    );
+    assert_code(
+        "function f(int $value, bool $enabled): string { return match ($value) { default if $enabled => \"value\", }; }",
+        "E0598",
+    );
+    assert_code(
+        "function f(bool $enabled): string { return match (true) { $enabled if $enabled => \"yes\", default => \"no\", }; }",
+        "E0599",
+    );
+}
+
+#[test]
+fn guarded_patterns_preserve_coverage_and_reachability_rules() {
+    assert_code(
+        "enum State { case Ready; case Waiting; } function f(State $state, bool $enabled): string { return match ($state) { State::Ready if $enabled => \"ready\", State::Waiting => \"waiting\", }; }",
+        "E0585",
+    );
+    doriac::check_source(
+        "stage28.doria",
+        "enum State { case Ready; case Waiting; } function f(State $state, bool $first, bool $second): string { return match ($state) { State::Ready if $first => \"first\", State::Ready if $second => \"second\", State::Ready => \"ready\", State::Waiting => \"waiting\", }; }",
+    )
+    .expect("a later unguarded arm should complete guarded coverage");
+    assert_code(
+        "enum State { case Ready; } function f(State $state, bool $enabled): string { return match ($state) { State::Ready => \"ready\", State::Ready if $enabled => \"other\", }; }",
+        "E0586",
+    );
+    assert_code(
+        "enum State { case Ready; } function f(State $state): string { return match ($state) { State::Ready if true => \"ready\", }; }",
+        "E0601",
+    );
+    assert_code(
+        "enum State { case Ready; } function f(State $state): string { return match ($state) { State::Ready if false => \"ready\", State::Ready => \"other\", }; }",
+        "E0589",
+    );
+}
+
+#[test]
+fn consuming_match_moves_whole_values_and_materializes_payloads_after_guards() {
+    let output = interpret(
+        r#"
+class Document { function __construct(string $name) {} }
+enum LoadResult { case Loaded(Document $document); case Missing; }
+function select(take LoadResult $result): Document
+{
+    return match (take $result) {
+        LoadResult::Loaded($document) if $document->name == "cached" => $document,
+        LoadResult::Loaded($document) => $document,
+        LoadResult::Missing => new Document("fallback"),
+    };
+}
+function main(): void
+{
+    LoadResult $result = LoadResult::Loaded(new Document("ready"));
+    let $document = select($result);
+    echo $document->name;
+}
+"#,
+    );
+    assert_eq!(output.stdout, b"ready");
+
+    assert_code(
+        "enum State { case Ready; } function main(): void { State $state = State::Ready; string $name = match (take $state) { State::Ready => \"ready\", }; }",
+        "E0600",
+    );
+    assert_code(
+        "class Box {} enum Result { case Value(Box $box); } function main(): void { Result $result = Result::Value(new Box()); Box $box = match (take $result) { Result::Value($box) => $box, }; Result $again = $result; }",
+        "E0470",
+    );
+}
+
+#[test]
+fn consuming_nullable_and_mixed_matches_execute_without_hidden_aliases() {
+    let output = interpret(
+        r#"
+class Document { function __construct(string $name) {} }
+function fromNullable(take ?Document $value): Document
+{
+    return match (take $value) { null => new Document("none"), Document $present => $present, };
+}
+function fromMixed(take mixed $value): Document
+{
+    return match (take $value) { Document $present => $present, default => new Document("other"), };
+}
+function main(): void
+{
+    ?Document $none = null;
+    mixed $boxed = new Document("mixed");
+    echo fromNullable($none)->name . " " . fromMixed($boxed)->name;
+}
+"#,
+    );
+    assert_eq!(output.stdout, b"none mixed");
+}
+
+#[test]
+fn payload_level_take_and_writable_patterns_are_deliberately_rejected() {
+    for (source, code) in [
+        (
+            "class Box {} enum Result { case Value(Box $box); } function f(Result $result): Box { return match ($result) { Result::Value(take $box) => $box, }; }",
+            "E0603",
+        ),
+        (
+            "enum Result { case Value(int $value); } function f(Result $result): int { return match (writable $result) { Result::Value($value) => $value, }; }",
+            "E0602",
+        ),
+        (
+            "enum Result { case Value(int $value); } function f(Result $result): int { return match ($result) { Result::Value(writable $value) => $value, }; }",
+            "E0604",
+        ),
+    ] {
+        let diagnostics = doriac::parse_source("stage28.doria", source)
+            .expect_err("the rejected v1 pattern form must produce a parser diagnostic");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "expected {code}, got {diagnostics:#?}"
+        );
     }
 }

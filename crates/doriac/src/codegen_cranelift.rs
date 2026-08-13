@@ -1696,6 +1696,7 @@ fn lower_statement(
             ty,
             case,
             nullable,
+            mode,
             targets,
         } => {
             let pointer = resources.module.target_config().pointer_type();
@@ -1730,6 +1731,20 @@ fn lower_statement(
                 let value = load_lowered_from_address(builder, field.ty, field_address, pointer);
                 let target_slot = local_slot(resources.local_slots, *target)?;
                 store_lowered_to_stack(builder, field.ty, target_slot, value, pointer)?;
+                if matches!(mode, mir::MatchBindingMode::ConsumedArm)
+                    && field.ty.has_move_ownership()
+                {
+                    let size = match field.ty {
+                        mir::Type::PayloadEnum(payload) => payload.storage_size(false),
+                        mir::Type::NullablePayloadEnum(payload) => payload.storage_size(true),
+                        _ => pointer.bytes(),
+                    };
+                    zero_inline_bytes(builder, field_address, size, pointer);
+                    continue;
+                }
+                if matches!(mode, mir::MatchBindingMode::GuardView) {
+                    continue;
+                }
                 match field.ty {
                     mir::Type::String => {
                         let value = builder.ins().stack_load(pointer, pointer, target_slot, 0);
@@ -1843,16 +1858,41 @@ fn lower_statement(
                         None,
                     ))
                 }
-                mir::Type::Collection(_) if definition.owned => Some((
+                mir::Type::Mixed | mir::Type::NullableMixed if definition.owned => Some((
                     load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
                     None,
                 )),
+                mir::Type::Collection(_) | mir::Type::NullableCollection(_) if definition.owned => {
+                    Some((
+                        load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
+                        None,
+                    ))
+                }
+                mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
+                    if definition.owned =>
+                {
+                    let nullable = matches!(definition.ty, mir::Type::NullablePayloadEnum(_));
+                    let old = create_payload_storage(builder, payload, nullable, resources);
+                    let address = builder.ins().stack_addr(pointer, slot, 0);
+                    copy_inline_bytes(
+                        builder,
+                        old,
+                        address,
+                        payload.storage_size(nullable),
+                        pointer,
+                    );
+                    Some((old, None))
+                }
                 _ => None,
             };
             store_lowered_to_stack(builder, definition.ty, slot, new_value, pointer)?;
             if let Some((old, class)) = old_value {
-                if let mir::Type::Collection(collection) = definition.ty {
+                if let mir::Type::Collection(collection)
+                | mir::Type::NullableCollection(collection) = definition.ty
+                {
                     lower_drop_collection_value(builder, old, collection, resources)?;
+                } else if matches!(definition.ty, mir::Type::Mixed | mir::Type::NullableMixed) {
+                    lower_drop_mixed_value(builder, old, resources)?;
                 } else if matches!(
                     definition.ty,
                     mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_)
@@ -1867,6 +1907,10 @@ fn lower_statement(
                     lower_drop_writable_shared_value(builder, old, symbol, resources)?;
                 } else if let Some(class) = class {
                     lower_drop_class_value_checked(builder, old, class, resources)?;
+                } else if let mir::Type::PayloadEnum(payload) = definition.ty {
+                    lower_drop_payload_enum_at(builder, old, payload, false, resources)?;
+                } else if let mir::Type::NullablePayloadEnum(payload) = definition.ty {
+                    lower_drop_payload_enum_at(builder, old, payload, true, resources)?;
                 } else {
                     release_string(builder, old, resources)?;
                 }

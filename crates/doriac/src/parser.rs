@@ -1126,12 +1126,14 @@ impl Parser {
         let span = condition.span().merge(when_false.span());
         Some(Expr::Match {
             scrutinee: Box::new(condition),
+            mode: MatchMode::Borrowed,
             arms: vec![
                 MatchArm {
                     pattern: MatchPattern::Expression(Expr::Bool {
                         value: true,
                         span: question,
                     }),
+                    guard: None,
                     span: question.merge(when_true.span()),
                     value: when_true,
                 },
@@ -1140,6 +1142,7 @@ impl Parser {
                         value: false,
                         span: colon,
                     }),
+                    guard: None,
                     span: colon.merge(when_false.span()),
                     value: when_false,
                 },
@@ -1468,6 +1471,28 @@ impl Parser {
 
     fn parse_match_expression(&mut self, start: usize) -> Option<Expr> {
         self.expect(TokenKind::LeftParen, "expected `(` after `match`")?;
+        let mode = if self.match_kind(&TokenKind::Take) {
+            MatchMode::Consumed {
+                take_span: self.previous().span,
+            }
+        } else {
+            MatchMode::Borrowed
+        };
+        if self.match_kind(&TokenKind::Writable) {
+            let span = self.previous().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0602",
+                    "Doria v1 does not support writable match scrutinees",
+                    span,
+                )
+                .with_title("Writable Match Is Not Supported")
+                .with_help(
+                    "consume the whole value with `match (take $value)` and assign the result to a writable destination",
+                )
+                .with_fix(span, ""),
+            );
+        }
         let scrutinee = self.parse_expression()?;
         self.expect(TokenKind::RightParen, "expected `)` after match value")?;
         self.expect(TokenKind::LeftBrace, "expected `{` before match arms")?;
@@ -1476,24 +1501,13 @@ impl Parser {
         while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
             let arm_start = self.peek().span.start;
             let pattern = self.parse_match_pattern()?;
-            if self.is_candidate_match_guard() {
-                self.error(
-                    "match pattern guards are not available; guard syntax must be settled before implementation",
-                    self.peek().span,
-                );
-                let end = self.recover_match_expression();
-                return Some(Expr::Match {
-                    scrutinee: Box::new(scrutinee),
-                    arms,
-                    origin: MatchOrigin::Match,
-                    span: Span::new(start, end),
-                });
-            }
+            let guard = self.parse_match_guard()?;
             self.expect(TokenKind::FatArrow, "expected `=>` after match pattern")?;
             let value = self.parse_expression()?;
             let arm_end = value.span().end;
             arms.push(MatchArm {
                 pattern,
+                guard,
                 value,
                 span: Span::new(arm_start, arm_end),
             });
@@ -1507,31 +1521,66 @@ impl Parser {
             .end;
         Some(Expr::Match {
             scrutinee: Box::new(scrutinee),
+            mode,
             arms,
             origin: MatchOrigin::Match,
             span: Span::new(start, end),
         })
     }
 
-    fn recover_match_expression(&mut self) -> usize {
-        let mut brace_depth = 1_usize;
-        while !self.is_at_end() {
+    fn parse_match_guard(&mut self) -> Option<Option<MatchGuard>> {
+        let keyword = if self.match_kind(&TokenKind::If) {
+            Some(self.previous().clone())
+        } else if self.match_kind(&TokenKind::When) {
+            let token = self.previous().clone();
+            self.diagnostics.push(
+                Diagnostic::new("E0596", "`when` is not a match guard; use `if`", token.span)
+                    .with_title("Match Guard Uses The Wrong Keyword")
+                    .with_fix(token.span, "if"),
+            );
+            Some(token)
+        } else if matches!(&self.peek().kind, TokenKind::Identifier(name) if name == "where") {
             let token = self.advance().clone();
-            match token.kind {
-                TokenKind::LeftBrace => brace_depth += 1,
-                TokenKind::RightBrace => {
-                    brace_depth -= 1;
-                    if brace_depth == 0 {
-                        return token.span.end;
-                    }
-                }
-                _ => {}
-            }
-        }
-        self.previous().span.end
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0596",
+                    "`where` is not a match guard; use `if`",
+                    token.span,
+                )
+                .with_title("Match Guard Uses The Wrong Keyword")
+                .with_fix(token.span, "if"),
+            );
+            Some(token)
+        } else {
+            None
+        };
+        let Some(keyword) = keyword else {
+            return Some(None);
+        };
+        let condition = self.parse_expression()?;
+        Some(Some(MatchGuard {
+            span: keyword.span.merge(condition.span()),
+            keyword_span: keyword.span,
+            condition,
+        }))
     }
 
     fn parse_match_pattern(&mut self) -> Option<MatchPattern> {
+        if self.match_kind(&TokenKind::Writable) {
+            let span = self.previous().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0604",
+                    "Doria v1 does not support writable match patterns",
+                    span,
+                )
+                .with_title("Writable Payload Pattern Is Not Supported")
+                .with_help(
+                    "consume the matched value into a writable destination when mutation is required",
+                )
+                .with_fix(span, ""),
+            );
+        }
         if self.match_kind(&TokenKind::Default) {
             return Some(MatchPattern::Default {
                 span: self.previous().span,
@@ -1552,6 +1601,35 @@ impl Parser {
                     let mut parsed = Vec::new();
                     if !self.check(&TokenKind::RightParen) {
                         loop {
+                            if self.match_kind(&TokenKind::Take) {
+                                let span = self.previous().span;
+                                self.diagnostics.push(
+                                    Diagnostic::new(
+                                        "E0603",
+                                        "payload-level `take` is not allowed in match patterns",
+                                        span,
+                                    )
+                                    .with_title("Payload-Level Take Is Not Allowed")
+                                    .with_help(
+                                        "consume the complete value with `match (take $value)` instead",
+                                    )
+                                    .with_fix(span, ""),
+                                );
+                            } else if self.match_kind(&TokenKind::Writable) {
+                                let span = self.previous().span;
+                                self.diagnostics.push(
+                                    Diagnostic::new(
+                                        "E0604",
+                                        "Doria v1 does not support writable payload patterns",
+                                        span,
+                                    )
+                                    .with_title("Writable Payload Pattern Is Not Supported")
+                                    .with_help(
+                                        "consume the enum into a writable destination when mutation is required",
+                                    )
+                                    .with_fix(span, ""),
+                                );
+                            }
                             let (name, span) =
                                 self.expect_variable("expected payload binding variable")?;
                             parsed.push(MatchBinding { name, span });
@@ -1621,11 +1699,6 @@ impl Parser {
                 | TokenKind::Identifier(_)
                 | TokenKind::SelfType
         )
-    }
-
-    fn is_candidate_match_guard(&self) -> bool {
-        matches!(self.peek().kind, TokenKind::If | TokenKind::When)
-            || matches!(&self.peek().kind, TokenKind::Identifier(name) if name == "where")
     }
 
     fn parse_scoped_access(

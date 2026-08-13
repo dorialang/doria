@@ -1,0 +1,43 @@
+class Marker
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->name}\n";
+    }
+}
+
+enum Bundle
+{
+    case Pair(Marker $first, Marker $second);
+    case Single(Marker $marker);
+}
+
+function ignorePair(): void
+{
+    Bundle $bundle = Bundle::Pair(new Marker("first"), new Marker("second"));
+    string $result = match (take $bundle) {
+        Bundle::Pair => "pair acquired",
+        Bundle::Single => "single acquired",
+    };
+    echo "{$result}\n";
+}
+
+function takeSingle(): void
+{
+    Bundle $bundle = Bundle::Single(new Marker("selected"));
+    Marker $selected = match (take $bundle) {
+        Bundle::Pair($first, $second) => $first,
+        Bundle::Single($marker) => $marker,
+    };
+    echo "selected acquired\n";
+}
+
+function main(): void
+{
+    ignorePair();
+    takeSingle();
+}

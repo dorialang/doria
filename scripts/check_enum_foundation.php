@@ -85,9 +85,9 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 27 — Complete',
         'Stage 27 Slice 1 — Complete',
         'Stage 27 Slice 2 — Complete',
-        'Stage 28 — In Progress',
+        'Stage 28 — Complete',
         'Stage 28 Slice 1 — Complete',
-        'Stage 28 Slice 2 — Next',
+        'Stage 28 Slice 2 — Complete',
     ]);
 }
 
