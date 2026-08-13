@@ -208,6 +208,7 @@ struct PayloadEnumValue {
     ty: mir::PayloadEnumType,
     case: crate::enums::EnumCaseId,
     fields: Vec<LocalValue>,
+    moved_fields: Vec<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1073,6 +1074,7 @@ fn static_local_value(
             let value = PayloadEnumValue {
                 ty: expected,
                 case: value.case,
+                moved_fields: vec![false; fields.len()],
                 fields,
             };
             Ok(if matches!(ty, mir::Type::NullablePayloadEnum(_)) {
@@ -1146,15 +1148,37 @@ impl Interpreter<'_> {
                 ty,
                 case,
                 nullable,
+                mode,
                 targets,
             } => {
-                let source_value = read_local(&self.current_frame()?.locals, source)?.clone();
+                let definition = self
+                    .program
+                    .enums
+                    .get(ty.id.0)
+                    .filter(|definition| definition.id == ty.id)
+                    .ok_or_else(|| InterpreterError::new("payload enum type does not exist"))?;
+                let case_definition = definition
+                    .cases
+                    .get(case.index)
+                    .filter(|definition| definition.id == case)
+                    .ok_or_else(|| InterpreterError::new("payload enum case does not exist"))?;
+                let field_types = case_definition
+                    .payload
+                    .iter()
+                    .map(|field| field.ty)
+                    .collect::<Vec<_>>();
+                let source_value = self
+                    .current_frame_mut()?
+                    .locals
+                    .get_mut(source.0)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| InterpreterError::new("payload binding source is empty"))?;
                 let payload = match source_value {
                     LocalValue::PayloadEnum(value) if !nullable && value.ty == ty => value,
                     LocalValue::NullablePayloadEnum {
                         ty: actual,
                         value: Some(value),
-                    } if nullable && actual == ty => value,
+                    } if nullable && *actual == ty => value,
                     LocalValue::NullablePayloadEnum { value: None, .. } => {
                         return Err(InterpreterError::new(
                             "MIR payload binding projected an absent nullable enum",
@@ -1171,7 +1195,15 @@ impl Interpreter<'_> {
                         "MIR payload binding does not match the active enum case",
                     ));
                 }
-                for (target, value) in targets.into_iter().zip(payload.fields) {
+                let values = payload.fields.clone();
+                if matches!(mode, mir::MatchBindingMode::ConsumedArm) {
+                    for (index, field) in field_types.iter().enumerate() {
+                        if field.has_move_ownership() {
+                            payload.moved_fields[index] = true;
+                        }
+                    }
+                }
+                for (target, value) in targets.into_iter().zip(values) {
                     assign_local(
                         &function.locals,
                         &mut self.current_frame_mut()?.locals,
@@ -2546,6 +2578,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::PayloadEnum(PayloadEnumValue {
                         ty,
                         case,
+                        moved_fields: vec![false; fields.len()],
                         fields,
                     }));
             }
@@ -11751,15 +11784,29 @@ fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop
         LocalValue::PayloadEnum(value) => {
             // Drop tasks execute LIFO, so declaration order here produces the
             // required reverse-field destruction order.
-            for field in value.fields {
-                collect_owned_objects_from_value(field, drops);
+            let PayloadEnumValue {
+                fields,
+                moved_fields,
+                ..
+            } = value;
+            for (index, field) in fields.into_iter().enumerate() {
+                if !moved_fields[index] {
+                    collect_owned_objects_from_value(field, drops);
+                }
             }
         }
         LocalValue::NullablePayloadEnum {
             value: Some(value), ..
         } => {
-            for field in value.fields {
-                collect_owned_objects_from_value(field, drops);
+            let PayloadEnumValue {
+                fields,
+                moved_fields,
+                ..
+            } = value;
+            for (index, field) in fields.into_iter().enumerate() {
+                if !moved_fields[index] {
+                    collect_owned_objects_from_value(field, drops);
+                }
             }
         }
         LocalValue::NullablePayloadEnum { value: None, .. } => {}
@@ -11777,8 +11824,15 @@ fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop
             if claims != 0 {
                 owner.set(claims - 1);
                 if claims == 1 && payload_owned {
-                    for field in value.fields {
-                        collect_owned_objects_from_value(field, drops);
+                    let PayloadEnumValue {
+                        fields,
+                        moved_fields,
+                        ..
+                    } = *value;
+                    for (index, field) in fields.into_iter().enumerate() {
+                        if !moved_fields[index] {
+                            collect_owned_objects_from_value(field, drops);
+                        }
                     }
                 }
             }

@@ -3236,13 +3236,16 @@ pub enum Statement {
         ty: PayloadEnumType,
         case: EnumCaseId,
         nullable: bool,
+        mode: MatchBindingMode,
         targets: Vec<LocalId>,
     },
     /// Validation-only identity for a lowered match result. Backends execute the
     /// explicit CFG and ignore this statement after shared validation.
     MatchResultPlan {
+        scrutinee: LocalId,
+        mode: MatchOwnershipMode,
         result: LocalId,
-        arms: Vec<BlockId>,
+        arms: Vec<MatchArmPlan>,
         merge: BlockId,
     },
     EchoStringLiteral(String),
@@ -3353,6 +3356,25 @@ pub enum Statement {
         ty: PayloadEnumType,
         nullable: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchOwnershipMode {
+    Borrowed,
+    Consumed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchBindingMode {
+    GuardView,
+    BorrowedArm,
+    ConsumedArm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatchArmPlan {
+    pub guard: Option<BlockId>,
+    pub binding: BlockId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5442,15 +5464,21 @@ impl fmt::Display for Statement {
                 write!(formatter, "]")
             }
             Statement::MatchResultPlan {
+                mode,
                 result,
                 arms,
                 merge,
+                ..
             } => write!(
                 formatter,
-                "match local{} arms [{}] -> block{}",
+                "match {:?} local{} arms [{}] -> block{}",
+                mode,
                 result.0,
                 arms.iter()
-                    .map(|block| format!("block{}", block.0))
+                    .map(|arm| match arm.guard {
+                        Some(guard) => format!("block{}=>block{}", guard.0, arm.binding.0),
+                        None => format!("block{}", arm.binding.0),
+                    })
                     .collect::<Vec<_>>()
                     .join(", "),
                 merge.0

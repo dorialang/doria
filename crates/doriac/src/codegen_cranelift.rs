@@ -1696,6 +1696,7 @@ fn lower_statement(
             ty,
             case,
             nullable,
+            mode,
             targets,
         } => {
             let pointer = resources.module.target_config().pointer_type();
@@ -1730,6 +1731,20 @@ fn lower_statement(
                 let value = load_lowered_from_address(builder, field.ty, field_address, pointer);
                 let target_slot = local_slot(resources.local_slots, *target)?;
                 store_lowered_to_stack(builder, field.ty, target_slot, value, pointer)?;
+                if matches!(mode, mir::MatchBindingMode::ConsumedArm)
+                    && field.ty.has_move_ownership()
+                {
+                    let size = match field.ty {
+                        mir::Type::PayloadEnum(payload) => payload.storage_size(false),
+                        mir::Type::NullablePayloadEnum(payload) => payload.storage_size(true),
+                        _ => pointer.bytes(),
+                    };
+                    zero_inline_bytes(builder, field_address, size, pointer);
+                    continue;
+                }
+                if matches!(mode, mir::MatchBindingMode::GuardView) {
+                    continue;
+                }
                 match field.ty {
                     mir::Type::String => {
                         let value = builder.ins().stack_load(pointer, pointer, target_slot, 0);

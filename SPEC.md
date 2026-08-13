@@ -862,8 +862,17 @@ match semantically. Short ternary/Elvis `?:` is not Doria.
 Named move scrutinees are borrowed rather than consumed. Temporary move
 scrutinees live through the selected arm. Copy payload bindings copy, including
 the normal immutable string retain; move payload bindings are readonly borrows
-and may not escape their provenance. Pattern guards and writable or consuming
-payload patterns remain Stage 28 Slice 2. Decision 0115 is authoritative.
+and may not escape their provenance. An arm guard is written `Pattern if
+condition => value`, requires `bool`, runs once only after the pattern succeeds,
+and falls through to the next arm when false. A guarded arm does not complete
+coverage unless the guard is compile-time `true`; a later unguarded copy may
+complete it. `default` and `match (true)` arms do not take guards.
+
+`match (take $value)` explicitly consumes the complete Move scrutinee. During a
+guard, payload bindings are readonly views; after a successful guard, selected
+Move payloads become owned arm bindings. Failed guards transfer nothing.
+Payload-level `take`, writable match scrutinees, and writable payload patterns
+are rejected in Doria v1. Decision 0115 is authoritative.
 
 Typed arrays use C-style suffix spelling:
 

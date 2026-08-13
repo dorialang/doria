@@ -2248,8 +2248,11 @@ impl Checker<'_> {
                 }
             }
             Expr::Match {
-                scrutinee, arms, ..
-            } => self.use_match_expression(scrutinee, arms, scopes, mode),
+                scrutinee,
+                mode: match_mode,
+                arms,
+                ..
+            } => self.use_match_expression(scrutinee, *match_mode, arms, scopes, mode),
             Expr::Identifier { .. }
             | Expr::String { .. }
             | Expr::Int { .. }
@@ -2262,14 +2265,26 @@ impl Checker<'_> {
     fn use_match_expression(
         &mut self,
         scrutinee: &Expr,
+        match_mode: ast::MatchMode,
         arms: &[ast::MatchArm],
         scopes: &mut Scopes,
         mode: UseMode,
     ) {
         let borrow_depth = self.active_borrows.len();
-        self.use_expr(scrutinee, scopes, UseMode::Read);
+        let consuming = matches!(match_mode, ast::MatchMode::Consumed { .. });
+        self.use_expr(
+            scrutinee,
+            scopes,
+            if consuming {
+                UseMode::Give
+            } else {
+                UseMode::Read
+            },
+        );
         let borrow_root = self.borrow_root_key(scrutinee, scopes);
-        self.activate_place_borrow(scrutinee, UseMode::Read, scopes);
+        if !consuming {
+            self.activate_place_borrow(scrutinee, UseMode::Read, scopes);
+        }
 
         let mut remaining = scopes.clone();
         let mut outcomes = Vec::with_capacity(arms.len());
@@ -2280,9 +2295,21 @@ impl Checker<'_> {
             }
 
             let mut selected = remaining.clone();
+            if let Some(guard) = &arm.guard {
+                selected.push();
+                for binding in match_pattern_bindings(&arm.pattern) {
+                    self.declare_match_binding(binding, borrow_root.clone(), true, &mut selected);
+                }
+                self.use_expr(&guard.condition, &mut selected, UseMode::Read);
+                selected.pop();
+
+                let before_guard = remaining.clone();
+                remaining.merge_from(&before_guard, &selected);
+            }
+
             selected.push();
             for binding in match_pattern_bindings(&arm.pattern) {
-                self.declare_match_binding(binding, borrow_root.clone(), &mut selected);
+                self.declare_match_binding(binding, borrow_root.clone(), !consuming, &mut selected);
             }
             self.use_expr(&arm.value, &mut selected, mode);
             selected.pop();
@@ -2311,6 +2338,7 @@ impl Checker<'_> {
         &mut self,
         binding: &ast::MatchBinding,
         borrow_root: Option<String>,
+        borrowed: bool,
         scopes: &mut Scopes,
     ) {
         let Some(ty) = self
@@ -2332,10 +2360,14 @@ impl Checker<'_> {
                 class: resolved_type_class(ty).map(str::to_string),
                 collection: resolved_collection_info(ty, &self.move_enum_names),
                 mixed: resolved_type_is_mixed(ty),
-                borrowed_place: true,
-                borrow_root,
+                borrowed_place: borrowed,
+                borrow_root: borrowed.then_some(borrow_root).flatten(),
                 writable: false,
-                state: State::Borrowed,
+                state: if borrowed {
+                    State::Borrowed
+                } else {
+                    State::Owned
+                },
             },
         );
     }

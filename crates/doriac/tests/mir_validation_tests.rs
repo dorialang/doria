@@ -51,6 +51,14 @@ function mixedLabel(mixed $value): string
 {
     return match ($value) { int $number => "{$number}", default => "other", };
 }
+function takeMove(take MoveResult $result): Box
+{
+    return match (take $result) {
+        MoveResult::Value($value) if $value->value > 0 => $value,
+        MoveResult::Value($value) => $value,
+        MoveResult::Empty => new Box(0),
+    };
+}
 function main(): void { echo copyLabel(CopyResult::Text("ready")); }
 "#;
     let valid = doriac::lower_source_to_mir("stage28-validation.doria", source)
@@ -239,7 +247,7 @@ function main(): void { echo copyLabel(CopyResult::Text("ready")); }
             _ => None,
         })
         .expect("match result plan should exist");
-    function.blocks[arm.0].statements.retain(
+    function.blocks[arm.binding.0].statements.retain(
         |statement| !matches!(statement, Statement::AssignLocal { target, .. } if *target == result),
     );
     malformed(
@@ -262,7 +270,7 @@ function main(): void { echo copyLabel(CopyResult::Text("ready")); }
             _ => None,
         })
         .expect("match result plan should exist");
-    let assignment = function.blocks[arm.0]
+    let assignment = function.blocks[arm.binding.0]
         .statements
         .iter()
         .find(|statement| {
@@ -270,13 +278,13 @@ function main(): void { echo copyLabel(CopyResult::Text("ready")); }
         })
         .cloned()
         .expect("arm result assignment should exist");
-    function.blocks[arm.0].statements.push(assignment);
+    function.blocks[arm.binding.0].statements.push(assignment);
     malformed(
         &duplicate_result,
         "assigns its result more than once on one path",
     );
 
-    let mut wrong_merge_type = valid;
+    let mut wrong_merge_type = valid.clone();
     let function = wrong_merge_type
         .functions
         .iter_mut()
@@ -293,6 +301,134 @@ function main(): void { echo copyLabel(CopyResult::Text("ready")); }
         .expect("match result plan should exist");
     function.locals[result.0].ty = Type::Scalar(ScalarType::Bool);
     malformed(&wrong_merge_type, "used as a string operand");
+
+    let mut copy_marked_consumed = valid.clone();
+    let function = copy_marked_consumed
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "copyLabel")
+        .expect("copyLabel should exist");
+    let mode = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::MatchResultPlan { mode, .. } => Some(mode),
+            _ => None,
+        })
+        .expect("copy match result plan should exist");
+    *mode = mir::MatchOwnershipMode::Consumed;
+    malformed(
+        &copy_marked_consumed,
+        "consuming match must own a Move scrutinee temporary",
+    );
+
+    let mut wrong_selected_binding_mode = valid.clone();
+    let function = wrong_selected_binding_mode
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "takeMove")
+        .expect("takeMove should exist");
+    let mode = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::MatchResultPlan { mode, .. } => Some(mode),
+            _ => None,
+        })
+        .expect("consuming match result plan should exist");
+    *mode = mir::MatchOwnershipMode::Borrowed;
+    malformed(
+        &wrong_selected_binding_mode,
+        "payload match binding does not match its planned guard or arm mode",
+    );
+
+    let mut wrong_guard_binding_mode = valid.clone();
+    let function = wrong_guard_binding_mode
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "takeMove")
+        .expect("takeMove should exist");
+    let statement = function
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find(|statement| {
+            matches!(
+                statement,
+                Statement::BindPayloadEnumFields {
+                    mode: mir::MatchBindingMode::GuardView,
+                    ..
+                }
+            )
+        })
+        .expect("guard payload view should exist");
+    let Statement::BindPayloadEnumFields { mode, .. } = statement else {
+        unreachable!()
+    };
+    *mode = mir::MatchBindingMode::BorrowedArm;
+    malformed(
+        &wrong_guard_binding_mode,
+        "payload match binding does not match its planned guard or arm mode",
+    );
+
+    let mut guard_skips_binding = valid.clone();
+    let function = guard_skips_binding
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "takeMove")
+        .expect("takeMove should exist");
+    let (guard, binding, merge) = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::MatchResultPlan { arms, merge, .. } => arms
+                .iter()
+                .find_map(|arm| arm.guard.map(|guard| (guard, arm.binding, *merge))),
+            _ => None,
+        })
+        .expect("guarded consuming arm should exist");
+    let Terminator::Branch { then_block, .. } = &mut function.blocks[guard.0].terminator else {
+        panic!("guard block should branch");
+    };
+    assert_eq!(*then_block, binding);
+    *then_block = merge;
+    malformed(
+        &guard_skips_binding,
+        "match guard must branch to its final binding block on success",
+    );
+
+    let mut duplicate_consumed_extraction = valid;
+    let function = duplicate_consumed_extraction
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "takeMove")
+        .expect("takeMove should exist");
+    let binding = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::MatchResultPlan { arms, .. } => arms
+                .iter()
+                .find(|arm| arm.guard.is_some())
+                .map(|arm| arm.binding),
+            _ => None,
+        })
+        .expect("guarded consuming binding block should exist");
+    let extraction = function.blocks[binding.0]
+        .statements
+        .iter()
+        .find(|statement| matches!(statement, Statement::BindPayloadEnumFields { .. }))
+        .cloned()
+        .expect("consumed payload extraction should exist");
+    function.blocks[binding.0].statements.push(extraction);
+    malformed(
+        &duplicate_consumed_extraction,
+        "without a dominating exact case proof",
+    );
 }
 
 #[test]

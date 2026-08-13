@@ -1,0 +1,21 @@
+enum State
+{
+    case Ready(int $attempt);
+    case Waiting;
+}
+
+function describe(State $state): string
+{
+    return match ($state) {
+        State::Ready($attempt) if $attempt > 1 => "retried",
+        State::Ready($attempt) => "ready {$attempt}",
+        State::Waiting => "waiting",
+    };
+}
+
+function main(): void
+{
+    echo describe(State::Ready(3)) . "\n";
+    echo describe(State::Ready(1)) . "\n";
+    echo describe(State::Waiting) . "\n";
+}

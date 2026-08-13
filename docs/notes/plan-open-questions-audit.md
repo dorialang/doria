@@ -30,7 +30,7 @@
 
 ## Already settled / correctly scheduled (not open — do not re-decide)
 
-Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: checked errors (29), closures (30), namespaces (31), inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Enums and guard-free core match are no longer in that list: decisions 0114 and 0115 own their semantics. Match guards remain the bounded Stage 28 Slice 2 authoring task rather than an open-ended compiler guess. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
+Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: checked errors (29), closures (30), namespaces (31), inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Enums and complete core match are no longer in that list: decisions 0114 and 0115 own their semantics, including `if` pattern guards and explicit whole-scrutinee consumption. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
 
 ## Open questions (answerable now)
 

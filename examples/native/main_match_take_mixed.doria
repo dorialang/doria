@@ -1,0 +1,27 @@
+class Message
+{
+    function __construct(string $text)
+    {
+    }
+
+    function getText(): string
+    {
+        return $this->text;
+    }
+}
+
+function consume(take mixed $value): string
+{
+    return match (take $value) {
+        Message $message => $message->getText(),
+        string $text => $text,
+        default => "other",
+    };
+}
+
+function main(): void
+{
+    echo consume(new Message("class")) . "\n";
+    echo consume("string") . "\n";
+    echo consume(42) . "\n";
+}

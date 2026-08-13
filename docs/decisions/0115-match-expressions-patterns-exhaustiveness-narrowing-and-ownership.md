@@ -4,9 +4,10 @@
 - **Accepted:** 2026-08-12 by Andrew Masiye
 - **Date:** 2026-08-12
 - **Owners:** Doria language, compiler, runtime, and tooling design
-- **Scope:** Core `match` expressions, guard-free patterns, exhaustiveness,
-  narrowing, readonly payload observation, ternary desugaring, and the Stage 28
-  Slice 1/Slice 2 boundary
+- **Implementation status:** Implemented
+- **Scope:** Core `match` expressions, pattern guards, exhaustiveness,
+  narrowing, readonly and consuming payload access, ternary desugaring, and
+  complete Stage 28 behavior
 
 ## Context
 
@@ -17,9 +18,9 @@ Stage 22 supplied shared narrowing and dataflow. This decision joins those
 foundations without making any backend, including PHP, the source of language
 semantics.
 
-Stage 28 is split by implementation risk. Slice 1 executes guard-free core
-patterns and full ternary. Slice 2 owns pattern guards, guard-aware
-exhaustiveness, and the explicit writable/consuming payload-pattern review.
+Stage 28 was split by implementation risk. Slice 1 delivered guard-free core
+patterns and full ternary. Slice 2 completes pattern guards, guard-aware
+exhaustiveness, and explicit whole-scrutinee consumption.
 
 ## Expression Shape
 
@@ -160,10 +161,84 @@ Only the selected arm acquires a move result.
 
 ## Pattern Binding Scope
 
-Every arm has its own lexical scope. Payload and type bindings are readonly by
-default, obey existing duplicate/shadowing rules, and disappear at the arm
-boundary. Narrowing facts likewise do not leak to another arm or beyond the
-match.
+Every arm has its own lexical scope. Payload and type bindings are readonly,
+obey existing duplicate/shadowing rules, and disappear at the arm boundary.
+They are visible in that arm's guard and result expression. A binding masks an
+outer name consistently whether the binding is Copy or Move. Narrowing facts
+likewise do not leak to another arm or beyond the match.
+
+## Pattern Guards
+
+The only guard spelling is `if`:
+
+```doria
+string $label = match ($state) {
+    State::Ready($attempt) if $attempt > 1 => "retried",
+    State::Ready($attempt) => "ready {$attempt}",
+    State::Waiting => "waiting",
+};
+```
+
+`when` is Doria's future value-returning conditional and `where` has no guard
+role. Either token in guard position is rejected with a structured replacement
+to `if`. A guard belongs to its arm, must produce `bool`, and uses no truthiness.
+
+For each reached arm, the pattern is tested first. On a pattern hit the compiler
+establishes readonly pattern views and evaluates the guard exactly once. A false
+guard ends those views and continues to the next pattern. A true guard
+materializes the selected arm bindings and evaluates the result. Pattern misses
+do not run guards. Ordinary guard side effects remain observable in source order.
+
+`default` is unconditional and cannot have a guard. `match (true)` arms do not
+accept guards; combine their bool conditions with the ordinary short-circuit
+operators instead.
+
+## Guard-Aware Coverage And Reachability
+
+A runtime-guarded arm does not complete coverage because its pattern may match
+while its guard is false. A later unguarded copy of the pattern may complete
+coverage. Once an unguarded arm covers a pattern, later guarded or unguarded
+copies are unreachable. The rule applies uniformly to enum cases, literals,
+`null`, and exact type patterns.
+
+A compile-time `true` guard counts as unguarded coverage and is diagnosed as
+redundant. A compile-time `false` guard is unreachable and contributes no
+coverage. The compiler does not try to prove arbitrary runtime predicates.
+
+## Consuming Match
+
+`match (take $value)` transfers the whole scrutinee to the match. `take` here is
+a scrutinee modifier, not a general unary operator. The source becomes unusable
+when the match begins, and one match-owned temporary carries its active payload
+and cleanup obligation.
+
+Copy scrutinees reject unnecessary `take`. Named Move sources must satisfy the
+existing movable-place rules; match does not widen nested-property moves or
+bypass alias checking. Current consuming domains are Move payload enums,
+nullable Move values, `mixed`, concrete class values where exact matching is
+already supported, and owned temporaries of those types.
+
+In a selected consuming arm, a Move payload becomes one owned binding and a Copy
+payload follows ordinary Copy behavior. Moved fields are removed from the
+match-owned cleanup obligation. Ignored active payloads remain owned by the
+temporary and drop after the arm result is safely acquired, in the ordinary
+reverse field order. Nullable presence and a `mixed` box's payload obligation
+are cleared before final cleanup when their Move payload is extracted.
+
+Consumption is deliberately whole-value only. Payload-level `take`,
+`match (writable $value)`, and writable payload bindings are rejected. Writable
+patterns are not part of Doria v1: failed guards must not mutate data observed by
+later arms. Mutation begins after an owned selected result is assigned to a
+writable destination.
+
+## Guarded Consumption
+
+Consuming guards use a two-phase binding. During the guard, each payload name is
+a readonly, non-owning view. If the guard succeeds, the same source name denotes
+the selected arm's final Copy or owned binding. If it fails, no ownership moves,
+no retain survives, and the match temporary remains intact for later arms.
+Tooling presents this as one coherent arm-local source binding even though the
+compiler tracks the guard view and selected owner separately.
 
 ## Narrowing
 
@@ -208,10 +283,12 @@ diagnostics explain `??` for null fallback and full `? :` for bool selection.
 ## MIR And CFG
 
 Shared MIR evaluates one scrutinee temporary, dispatches through explicit test
-blocks, enters one arm block, creates arm-local bindings, assigns one merge
-local, and reaches one merge block. MIR carries enum/case identity, central
-payload type/layout identity, nullable and `mixed` tests, payload Copy/borrow
-mode, and result-plan identity sufficient for independent validation.
+blocks, optionally enters a guard-view block, materializes final bindings only
+on the guard's true edge, assigns one merge local, and reaches one merge block.
+MIR carries an explicit borrowed/consumed match mode and distinct guard-view,
+borrowed-arm, and consumed-arm binding modes. It also carries enum/case identity,
+central payload type/layout identity, nullable and `mixed` tests, and result-plan
+identity sufficient for independent validation.
 
 The shared validator rejects malformed dispatch, projection, ownership, and
 merge paths before the interpreter or either native backend sees them.
@@ -219,10 +296,13 @@ merge paths before the interpreter or either native backend sees them.
 ## PHP Compatibility
 
 PHP consumes the checked semantic plan and preserves strict Doria comparisons,
-ordered conditions, exact type identity, arm-local payload projections, and
-one-time scrutinee evaluation. Generated PHP may use backend-private helpers,
-but PHP object identity, truthiness, reflection, and match behavior do not
-define Doria semantics.
+ordered guards, exact type identity, arm-local payload projections, and one-time
+scrutinee evaluation. Values crossing into `mixed` use one backend-private
+tagged representation that preserves Doria integer width and signedness, float
+width, enum identity, class identity, payload, and cleanup obligation. `is` and
+type-binding match read the same tag. Ordinary non-`mixed` values stay on their
+existing fast paths. Generated PHP does not use `get_debug_type`, host
+truthiness, loose equality, or reflection to define Doria semantics.
 
 ## Performance Impact
 
@@ -235,27 +315,25 @@ define Doria semantics.
 | `match (true)` | O(number of reached conditions) |
 | Type pattern | O(1) tag/type test |
 | Payload projection | O(1), no allocation |
+| Guarded arm | Pattern test plus one reached bool guard |
+| Guard false | One branch to the next pattern |
+| Consuming enum match | One bounded move plus selected extraction |
+| Exact PHP `mixed` test | O(1) backend-private tag comparison |
 | Ternary | O(1), one selected branch |
 
-Match creates no runtime object, reflection, inactive payload read, hidden
-clone, whole-enum readonly move copy, runtime exhaustiveness check, or loop-body
-dynamic stack allocation. The opt-in performance report adds structural match
-counters during existing lowering; ordinary compilation gains no reporting
-traversal.
+Match creates no runtime match or guard object, reflection, inactive payload
+read, hidden clone/share, whole-enum readonly move copy, runtime exhaustiveness
+check, second `mixed` box, or loop-body dynamic stack allocation. The existing
+single `mixed` box remains the only allocation at that boundary. The opt-in
+performance report adds structural match counters during existing lowering;
+ordinary compilation gains no reporting traversal.
 
 Stage 28 controlled timing is **Pending Available Runner** and non-blocking.
 This is not a performance-pass claim.
 
-## Pattern Guard Boundary
-
-Slice 1 does not assign or accept guard syntax. `if`, `when`, and `where`
-candidate spellings are not silently selected. Slice 2 must settle the keyword,
-scope, order, side effects, borrow lifetime, repeated cases, reachability, and
-guard-aware exhaustiveness before guards execute.
-
 ## Explicit Exclusions
 
-Slice 1 excludes pattern guards; writable or consuming payload patterns;
+Stage 28 excludes writable match and payload patterns; payload-level `take`;
 partial moves; nested, wildcard, or-pattern, and range patterns; class and
 collection destructuring; `when`, `given`, and control-flow `finally`; checked
 errors; closures; namespaces/autoloading; hierarchy/interface patterns; generic
@@ -263,10 +341,10 @@ enums; reflection; automatic hashing and ordering.
 
 ## Consequences
 
-Core match and full ternary now share one typed, ownership-aware, validated CFG
-across the interpreter, Cranelift, LLVM, and PHP. Stage 28 remains in progress
-because guard semantics and explicit payload mutation/consumption have not yet
-been reviewed or implemented.
+Core match, pattern guards, explicit consuming match, and full ternary share one
+typed, ownership-aware, validated CFG across the interpreter, Cranelift, LLVM,
+and PHP. Stage 28 is complete. Stage 28a is next and remains separate work;
+Stage 29 is sequenced after Stage 28a.
 
 ## Affected Components
 
@@ -280,11 +358,20 @@ grammars, examples, website UAT, and authority guards.
 - **Stage 28 Slice 1 — Complete.** Guard-free core match, enum and exact
   type-binding patterns, exhaustiveness, narrowing, readonly payload observation,
   `match (true)`, ternary, backend parity, and tooling integration.
-- **Stage 28 Slice 2 — Next.** Pattern guards, guard-aware diagnostics and
-  exhaustiveness, and explicit writable/consuming payload-pattern review.
+- **Stage 28 Slice 2 — Complete.** `if` pattern guards, guard-aware scope,
+  evaluation, coverage and reachability; explicit `match (take $value)`;
+  selected payload transfer and cleanup; rejected writable patterns; exact PHP
+  `mixed` identity; backend parity; and tooling integration.
 
-Stage 28 is **In Progress**. Stage 28a remains **Blocked Until Stage 28
-Completes**.
+Stage 28 is **Complete**. Stage 28a is **Next**. Stage 29 is **Sequenced After Stage 28a**.
+
+## PR #132 Review Closure
+
+| Finding | Current code | Regression coverage | Compiler paths | Remaining gap | Disposition |
+| --- | --- | --- | --- | --- | --- |
+| Expected match-result types were not propagated from every context | One shared expected-expression-type path reaches match and ternary arms | Typed/grouped locals, returns, assignments, free/instance/static/constructor arguments, instance initializers, nullable/`mixed`, nested match, ternary, enum and Move destinations | Semantic checking and ownership | Runtime static match initializers remain outside the current static-initializer model | Closed |
+| Copy pattern bindings could expose an outer moved binding | Arm scopes mask outer identities for Copy and Move bindings | Shadowed outer Move regression plus arm-scope diagnostics | Semantic, ownership, and tooling projections | None | Closed |
+| PHP exact numeric type patterns after `mixed` lost width identity | Backend-private tagged `mixed` values drive both `is` and match | Executable signed/unsigned width, float width, bool, string, enum, and class identity matrix | PHP lowering and runtime helpers | PHP still rejects operations whose value semantics it cannot faithfully preserve | Closed |
 
 ## Invalidated Elsewhere
 
@@ -293,6 +380,8 @@ Completes**.
 - Decision 0094's ternary direction is now executable through match rather than
   pending implementation.
 - The open-questions audit no longer lists match as an unauthored subject.
+- The former PHP B1301 boundary for valid exact numeric tests after `mixed` is
+  removed; faithful backend-private tags preserve Doria identity instead.
 - Stage 31 still requires a pre-implementation authority amendment for public
   `autoload` vocabulary, namespace-prefix-to-path mappings, main/test/generated
   autoload scopes, dependency source discovery, deterministic package graphs,

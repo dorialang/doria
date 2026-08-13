@@ -201,3 +201,10 @@ examples/native/main_match_mixed.doria
 examples/native/main_match_true.doria
 examples/native/main_match_ternary.doria
 examples/native/main_match_ownership.doria
+examples/native/main_match_guards.doria
+examples/native/main_match_guard_exhaustiveness.doria
+examples/native/main_match_take_enum.doria
+examples/native/main_match_take_nullable.doria
+examples/native/main_match_take_mixed.doria
+examples/native/main_match_guarded_take.doria
+examples/native/main_match_take_drop_order.doria

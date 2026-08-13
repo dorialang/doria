@@ -19,7 +19,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 23 Slice 2 is complete on the current branch. The owned `Bytes` move type provides explicit copying conversion to and from `uint8[]`, length, byte indexing and indexed read-modify-write, and byte-wise equality. `read_file_bytes`/`write_file_bytes`/`append_file_bytes`, `read_stdin_bytes`/`write_stdout_bytes`/`write_stderr_bytes`, and text `append_file` use shared validated MIR and `doria-rt`, with exact non-UTF-8 bytes and interpreter/Cranelift/LLVM parity.
 - Stage 23 Slice 3 is complete on the current branch. The boxed `dr_mixed` runtime representation stores a tag, class type id when needed, and owned payload; bool, fixed-width integers, floats, string, and concrete classes box into `mixed`, narrow back out through exact `is`, and execute through the interpreter, Cranelift, and LLVM. `?mixed`, `List<mixed>`, `Dictionary<K, mixed>`, and `Set<mixed>` value paths use the same shared MIR/runtime box. Collection/interface/subtype `is` and boxing collections, typed arrays, or `Bytes` into `mixed` remain deferred with stage-named diagnostics.
 - Stage 27 is complete under decision 0114. Unit, `int`/`string`-backed, and payload enums are nominal inline values with one central layout authority. Payload construction supports positional and named arguments, recursive Copy/Move classification, active-case copy/drop/equality, aggregate function ABI, nullable and `mixed` transport, Copy constants/defaults, class and generic-class properties, permitted collection value positions, and faithful PHP compatibility lowering. The interpreter, Cranelift, and LLVM consume the same validated payload-enum MIR and durable fixtures. Generic enums remain deferred.
-- Stage 28 is in progress under decision 0115. Slice 1 is complete: guard-free core `match`, exhaustive unit/payload enum cases, case-only payload ignore, exact constants, `null`, exact type-binding narrowing, strict arm typing, readonly payload ownership, ordered `match (true)`, and full right-associative ternary use one validated MIR CFG across the interpreter, Cranelift, LLVM, and PHP. Slice 2 is next for guard syntax, guard-aware exhaustiveness and diagnostics, and explicit writable/consuming payload-pattern review. Stage 28a remains blocked until Stage 28 completes.
+- Stage 28 is complete under implemented decision 0115. Slice 1 delivered guard-free core `match`, exhaustive unit/payload enum cases, case-only payload ignore, exact constants, `null`, exact type-binding narrowing, strict arm typing, readonly payload ownership, ordered `match (true)`, and full right-associative ternary. Slice 2 adds `if` pattern guards with ordered one-time evaluation and guard-aware coverage/reachability, explicit `match (take $value)` whole-scrutinee consumption, selected Move payload ownership and exact cleanup, rejected writable patterns, and PHP exact tagged `mixed` identity. One validated MIR CFG drives the interpreter, Cranelift, and LLVM; PHP preserves the same checked behavior. Stage 28a is next; Stage 29 is sequenced after Stage 28a.
 - Stage 25a Slices 1 through 4 are implemented and Stage 25a is complete. The readonly `SharedReference<T>` / `WeakReference<T>` family and the permanently disjoint writable family lower through validated MIR to the interpreter, Cranelift, LLVM, and separate `doria-rt` control structures. `WritableSharedReference<T>` executes class, generic-class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through owned readonly/writable access objects. One access state is shared by every writable-family handle to an allocation; access objects move through returns, parameters, properties, and collection slots; nullable strong, weak, and readonly/writable access forms remain in-family and lazy; and destruction releases access before strong ownership. P1501 carries one of the three exact Decision 0106 conflict conditions as a typed runtime fact. The allocation-free `referencedValue` projection resolves wrapper/payload collisions without changing either ownership count, and durable weak-cycle and bounded-stress fixtures agree across all native paths. Scalar/string payload access and all shared handles through `mixed` remain runtime-pending rather than being given an invented value projection or misrepresented as class pointers. The PHP backend still refuses shared ownership.
 - PHP Stream And I/O Completeness Audit — Implemented. The canonical human
   artifact expands `docs/notes/io-surface-audit.md`; the stored 153-row PHP
@@ -165,11 +165,12 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 27 — Complete; No Performance-Evidence Dependency.
 - Stage 27 Slice 1 — Complete.
 - Stage 27 Slice 2 — Complete.
-- Decision 0115 — Accepted.
-- Stage 28 — In Progress.
+- Decision 0115 — Implemented.
+- Stage 28 — Complete.
 - Stage 28 Slice 1 — Complete.
-- Stage 28 Slice 2 — Next.
-- Stage 28a — Blocked Until Stage 28 Completes.
+- Stage 28 Slice 2 — Complete.
+- Stage 28a — Next.
+- Stage 29 — Sequenced After Stage 28a.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36a — Scheduled, Not Implemented.
 
@@ -184,6 +185,6 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Runtime-initialized and owned statics until separately accepted lifetime/concurrency decisions.
 - Parent lookup/dispatch until Stage 34 and trait composition until Stage 35; their accepted grammar is already represented.
 - Growable/slice/search `Bytes` members until a future method-surface decision.
-- Pattern guards and writable/consuming payload patterns until Stage 28 Slice 2, hierarchy `is` until Stage 34, and interface `is` until Stage 35.
+- Writable match and writable payload patterns are rejected for Doria v1; hierarchy `is` remains deferred until Stage 34, and interface `is` until Stage 35.
 - Collection/interface/subtype `is`, plus boxing collections, typed arrays, or `Bytes` into `mixed`, until their authored stages.
 - Variadic/spread user parameters stay deferred from Stage 23a as their own slice, per decisions 0095 and 0098.

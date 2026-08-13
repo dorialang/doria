@@ -1351,6 +1351,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ty,
                 case,
                 nullable,
+                mode,
                 targets,
             } => {
                 let source = local_slot(&self.local_slots, *source)?;
@@ -1381,10 +1382,45 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         self.byte_offset(source, layout.offset, "payload.binding.field")?;
                     let target = local_slot(&self.local_slots, *target)?;
                     match field.ty {
+                        mir::Type::PayloadEnum(payload) => {
+                            self.copy_payload_bytes(target, source, payload, false)?;
+                        }
+                        mir::Type::NullablePayloadEnum(payload) => {
+                            self.copy_payload_bytes(target, source, payload, true)?;
+                        }
+                        ty => {
+                            let value = build(self.builder.build_load(
+                                llvm_type(self.context, self.target_data, ty),
+                                source,
+                                "payload.binding.load",
+                            ))?;
+                            build(self.builder.build_store(target, value))?;
+                        }
+                    }
+                    if matches!(mode, mir::MatchBindingMode::ConsumedArm)
+                        && field.ty.has_move_ownership()
+                    {
+                        let size = match field.ty {
+                            mir::Type::PayloadEnum(payload) => payload.storage_size(false),
+                            mir::Type::NullablePayloadEnum(payload) => payload.storage_size(true),
+                            _ => self.target_data.get_pointer_byte_size(None),
+                        };
+                        build(self.builder.build_memset(
+                            source,
+                            1,
+                            self.context.i8_type().const_zero(),
+                            self.context.i64_type().const_int(u64::from(size), false),
+                        ))?;
+                        continue;
+                    }
+                    if matches!(mode, mir::MatchBindingMode::GuardView) {
+                        continue;
+                    }
+                    match field.ty {
                         mir::Type::String => {
                             let value = build(self.builder.build_load(
                                 self.context.ptr_type(AddressSpace::default()),
-                                source,
+                                target,
                                 "payload.binding.string",
                             ))?
                             .into_pointer_value();
@@ -1394,7 +1430,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         mir::Type::NullableString => {
                             let value = build(self.builder.build_load(
                                 llvm_type(self.context, self.target_data, field.ty),
-                                source,
+                                target,
                                 "payload.binding.nullable-string",
                             ))?
                             .into_struct_value();
@@ -1425,26 +1461,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             ))?;
                             build(self.builder.build_store(target, value))?;
                         }
-                        mir::Type::PayloadEnum(payload) => {
-                            self.copy_payload_bytes(target, source, payload, false)?;
-                            if payload.capabilities.copy {
-                                self.retain_payload_enum_at(target, payload, false)?;
-                            }
+                        mir::Type::PayloadEnum(payload) if payload.capabilities.copy => {
+                            self.retain_payload_enum_at(target, payload, false)?;
                         }
-                        mir::Type::NullablePayloadEnum(payload) => {
-                            self.copy_payload_bytes(target, source, payload, true)?;
-                            if payload.capabilities.copy {
-                                self.retain_payload_enum_at(target, payload, true)?;
-                            }
+                        mir::Type::NullablePayloadEnum(payload) if payload.capabilities.copy => {
+                            self.retain_payload_enum_at(target, payload, true)?;
                         }
-                        ty => {
-                            let value = build(self.builder.build_load(
-                                llvm_type(self.context, self.target_data, ty),
-                                source,
-                                "payload.binding.load",
-                            ))?;
-                            build(self.builder.build_store(target, value))?;
-                        }
+                        _ => {}
                     }
                 }
             }

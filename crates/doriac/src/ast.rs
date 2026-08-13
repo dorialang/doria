@@ -441,6 +441,7 @@ pub enum Expr {
     },
     Match {
         scrutinee: Box<Expr>,
+        mode: MatchMode,
         arms: Vec<MatchArm>,
         origin: MatchOrigin,
         span: Span,
@@ -453,10 +454,24 @@ pub enum MatchOrigin {
     Ternary,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchMode {
+    Borrowed,
+    Consumed { take_span: Span },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
     pub pattern: MatchPattern,
+    pub guard: Option<MatchGuard>,
     pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchGuard {
+    pub condition: Expr,
+    pub keyword_span: Span,
     pub span: Span,
 }
 

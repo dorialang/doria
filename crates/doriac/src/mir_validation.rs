@@ -509,6 +509,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     validate_mixed_tag_proofs(program, function)?;
     validate_payload_case_proofs(program, function)?;
     validate_match_result_plans(function)?;
+    validate_match_binding_plans(function)?;
     validate_class_local_lifetimes(function)
 }
 
@@ -664,6 +665,7 @@ fn validate_statement(
             ty,
             case,
             nullable,
+            mode,
             targets,
         } => {
             let expected = if *nullable {
@@ -690,12 +692,19 @@ fn validate_statement(
             let mut unique_targets = HashSet::new();
             for (target, field) in targets.iter().zip(&case_definition.payload) {
                 let target = local_in(function, *target)?;
-                let expected_owned = matches!(
+                let copy_payload_owned = matches!(
                     field.ty,
                     mir::Type::PayloadEnum(payload)
                         | mir::Type::NullablePayloadEnum(payload)
                         if payload.capabilities.copy && payload.capabilities.needs_drop
                 );
+                let expected_owned = match mode {
+                    mir::MatchBindingMode::GuardView => false,
+                    mir::MatchBindingMode::BorrowedArm => copy_payload_owned,
+                    mir::MatchBindingMode::ConsumedArm => {
+                        field.ty.has_move_ownership() || copy_payload_owned
+                    }
+                };
                 if target.ty != field.ty || target.writable || target.owned != expected_owned {
                     return Err(malformed_mir(
                         "payload binding target has incompatible readonly copy/borrow ownership",
@@ -708,10 +717,25 @@ fn validate_statement(
             Ok(())
         }
         mir::Statement::MatchResultPlan {
+            scrutinee,
+            mode,
             result,
             arms,
             merge,
         } => {
+            let scrutinee = local_in(function, *scrutinee)?;
+            if !scrutinee.synthetic {
+                return Err(malformed_mir(
+                    "match result plan must use a synthetic scrutinee local",
+                ));
+            }
+            if matches!(mode, mir::MatchOwnershipMode::Consumed)
+                && (!scrutinee.owned || !scrutinee.ty.has_move_ownership())
+            {
+                return Err(malformed_mir(
+                    "consuming match must own a Move scrutinee temporary",
+                ));
+            }
             let result = local_in(function, *result)?;
             if !result.synthetic || result.writable {
                 return Err(malformed_mir(
@@ -724,11 +748,19 @@ fn validate_statement(
             }
             let mut unique = HashSet::new();
             for arm in arms {
-                block_in(function, *arm)?;
-                if *arm == *merge || !unique.insert(*arm) {
+                block_in(function, arm.binding)?;
+                if arm.binding == *merge || !unique.insert(arm.binding) {
                     return Err(malformed_mir(
                         "match result plan has an invalid or repeated arm block",
                     ));
+                }
+                if let Some(guard) = arm.guard {
+                    block_in(function, guard)?;
+                    if guard == *merge || guard == arm.binding || !unique.insert(guard) {
+                        return Err(malformed_mir(
+                            "match result plan has an invalid or repeated guard block",
+                        ));
+                    }
                 }
             }
             Ok(())
@@ -7141,15 +7173,74 @@ fn validate_match_result_plans(function: &mir::Function) -> Result<(), BackendEr
                 result,
                 arms,
                 merge,
+                ..
             } = statement
             else {
                 continue;
             };
             for arm in arms {
-                validate_match_arm_result_path(function, *result, *arm, *merge)?;
+                validate_match_arm_result_path(function, *result, arm.binding, *merge)?;
             }
         }
     }
+    Ok(())
+}
+
+fn validate_match_binding_plans(function: &mir::Function) -> Result<(), BackendError> {
+    let mut expected_modes = HashMap::new();
+
+    for block in &function.blocks {
+        for statement in &block.statements {
+            let mir::Statement::MatchResultPlan { mode, arms, .. } = statement else {
+                continue;
+            };
+            let binding_mode = match mode {
+                mir::MatchOwnershipMode::Borrowed => mir::MatchBindingMode::BorrowedArm,
+                mir::MatchOwnershipMode::Consumed => mir::MatchBindingMode::ConsumedArm,
+            };
+
+            for arm in arms {
+                if expected_modes.insert(arm.binding, binding_mode).is_some() {
+                    return Err(malformed_mir(
+                        "match binding block belongs to more than one match arm",
+                    ));
+                }
+                let Some(guard) = arm.guard else {
+                    continue;
+                };
+                if expected_modes
+                    .insert(guard, mir::MatchBindingMode::GuardView)
+                    .is_some()
+                {
+                    return Err(malformed_mir(
+                        "match guard block overlaps another match guard or binding",
+                    ));
+                }
+                match &block_in(function, guard)?.terminator {
+                    mir::Terminator::Branch { then_block, .. } if *then_block == arm.binding => {}
+                    _ => {
+                        return Err(malformed_mir(
+                            "match guard must branch to its final binding block on success",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for block in &function.blocks {
+        for statement in &block.statements {
+            let mir::Statement::BindPayloadEnumFields { mode, .. } = statement else {
+                continue;
+            };
+            if expected_modes.get(&block.id) != Some(mode) {
+                return Err(malformed_mir(
+                    "payload match binding does not match its planned guard or arm mode",
+                ));
+            }
+        }
+    }
+
     Ok(())
 }
 

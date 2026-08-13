@@ -2,8 +2,8 @@ use crate::source::Span;
 use crate::types::TypeRef;
 
 pub use crate::ast::{
-    ArgumentName, AssignOp, BinaryOp, IncrementOp, IncrementPosition, MatchOrigin, MemberAccess,
-    UnaryOp,
+    ArgumentName, AssignOp, BinaryOp, IncrementOp, IncrementPosition, MatchMode, MatchOrigin,
+    MemberAccess, UnaryOp,
 };
 
 /// Current Doria IR implementation.
@@ -366,6 +366,7 @@ pub enum Expr {
     },
     Match {
         scrutinee: Box<Expr>,
+        mode: MatchMode,
         arms: Vec<MatchArm>,
         origin: MatchOrigin,
         span: Span,
@@ -375,7 +376,15 @@ pub enum Expr {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MatchArm {
     pub pattern: MatchPattern,
+    pub guard: Option<MatchGuard>,
     pub value: Expr,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchGuard {
+    pub condition: Expr,
+    pub keyword_span: Span,
     pub span: Span,
 }
 

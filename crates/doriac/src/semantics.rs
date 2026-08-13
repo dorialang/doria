@@ -44,6 +44,12 @@ pub struct SemanticInfo {
     pub float_expression_types: HashMap<(usize, usize), FloatType>,
     /// Resolved semantic type for checked expressions, independent of backend layout.
     pub expression_types: HashMap<(usize, usize), ResolvedType>,
+    /// Concrete source type at each value-to-`mixed` boundary.
+    ///
+    /// Compatibility backends use this semantic fact to preserve Doria's exact
+    /// runtime identity instead of reconstructing it from a host value after
+    /// width, signedness, or nominal identity has been erased.
+    pub mixed_box_types: HashMap<(usize, usize), ResolvedType>,
     /// Resolved enum case for each unit/backed case expression.
     pub enum_case_values: HashMap<(usize, usize), EnumValue>,
     /// Resolved payload-enum construction for each checked case call.
@@ -155,6 +161,7 @@ pub struct MatchSemanticInfo {
     pub scrutinee_type: ResolvedType,
     pub result_type: ResolvedType,
     pub origin: MatchOrigin,
+    pub mode: MatchMode,
     pub condition_mode: bool,
     pub arms: Vec<MatchArmSemanticInfo>,
 }
@@ -162,7 +169,22 @@ pub struct MatchSemanticInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchArmSemanticInfo {
     pub pattern: ResolvedMatchPattern,
+    pub guard: MatchGuardSemanticInfo,
     pub bindings: Vec<MatchBindingSemanticInfo>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatchGuardSemanticInfo {
+    None,
+    Runtime,
+    AlwaysTrue,
+    AlwaysFalse,
+}
+
+impl MatchGuardSemanticInfo {
+    const fn covers_pattern(self) -> bool {
+        matches!(self, Self::None | Self::AlwaysTrue)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,6 +317,7 @@ pub fn analyze_program_for_ide_with_source<'source>(
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
             expression_types: checker.expression_types,
+            mixed_box_types: checker.mixed_box_types,
             enum_case_values: checker.enum_case_values,
             enum_case_constructions: checker.enum_case_constructions,
             type_test_types: checker.type_test_types,
@@ -935,6 +958,7 @@ struct Checker<'program> {
     integer_expression_types: HashMap<(usize, usize), IntegerType>,
     float_expression_types: HashMap<(usize, usize), FloatType>,
     expression_types: HashMap<(usize, usize), ResolvedType>,
+    mixed_box_types: HashMap<(usize, usize), ResolvedType>,
     enum_case_values: HashMap<(usize, usize), EnumValue>,
     enum_case_constructions: HashMap<(usize, usize), EnumCaseId>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
@@ -1412,6 +1436,7 @@ impl<'program> Checker<'program> {
             integer_expression_types: HashMap::new(),
             float_expression_types: HashMap::new(),
             expression_types: HashMap::new(),
+            mixed_box_types: HashMap::new(),
             enum_case_values: HashMap::new(),
             enum_case_constructions: HashMap::new(),
             type_test_types: HashMap::new(),
@@ -2265,11 +2290,16 @@ impl<'program> Checker<'program> {
                 "`{name}` is a compiler-known integer companion and cannot be redeclared"
             ));
         }
-        if name.eq_ignore_ascii_case("__DoriaDisplayable") {
-            return Some(
-                "`__DoriaDisplayable` is reserved for compiler-generated PHP compatibility output"
-                    .to_string(),
-            );
+        let php_helper = match name.to_ascii_lowercase().as_str() {
+            "__doriadisplayable" => Some("__DoriaDisplayable"),
+            "__doriavalueequatable" => Some("__DoriaValueEquatable"),
+            "__doriamixedvalue" => Some("__DoriaMixedValue"),
+            _ => None,
+        };
+        if let Some(helper) = php_helper {
+            return Some(format!(
+                "`{helper}` is reserved for compiler-generated PHP compatibility output"
+            ));
         }
         match name {
             "self" => Some(
@@ -5538,14 +5568,7 @@ impl<'program> Checker<'program> {
                     ));
                 }
             }
-            Expr::Match {
-                scrutinee,
-                arms,
-                origin,
-                span,
-            } => {
-                self.check_match_expression(scrutinee, arms, *origin, *span, scopes, method_context)
-            }
+            Expr::Match { .. } => self.check_match_expression(expr, scopes, method_context),
             Expr::Float { .. } => self.check_float_literal_range(expr, FloatType::Float64),
             Expr::Identifier { name, span } => {
                 if name.contains('\\') {
@@ -5576,22 +5599,43 @@ impl<'program> Checker<'program> {
 
     fn check_match_expression(
         &mut self,
-        scrutinee: &Expr,
-        arms: &[MatchArm],
-        origin: MatchOrigin,
-        span: Span,
+        expr: &Expr,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        let Expr::Match {
+            scrutinee,
+            mode,
+            arms,
+            origin,
+            span,
+        } = expr
+        else {
+            unreachable!("match checking requires a match expression")
+        };
         self.check_expr(scrutinee, scopes, method_context);
         let scrutinee_ty = self.infer_expr_type(scrutinee, scopes, method_context);
-        let condition_mode = origin == MatchOrigin::Match
+        if let MatchMode::Consumed { take_span } = *mode {
+            if !self.type_is_move_type(scrutinee_ty) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0600",
+                        "Copy match scrutinee does not need `take`",
+                        take_span,
+                    )
+                    .with_title("Copy Match Does Not Need Take")
+                    .with_help("remove `take`; Copy values remain available after matching")
+                    .with_fix(Span::new(take_span.start, scrutinee.span().start), ""),
+                );
+            }
+        }
+        let condition_mode = *origin == MatchOrigin::Match
             && matches!(
                 Self::ungroup_expr(scrutinee),
                 Expr::Bool { value: true, .. }
             );
 
-        if origin == MatchOrigin::Ternary
+        if *origin == MatchOrigin::Ternary
             && !matches!(
                 self.types.kind(scrutinee_ty),
                 TypeKind::Bool | TypeKind::Unknown
@@ -5624,6 +5668,8 @@ impl<'program> Checker<'program> {
 
         for (index, arm) in arms.iter().enumerate() {
             let pattern_span = Self::match_pattern_span(&arm.pattern);
+            let guard_info = self.classify_match_guard(arm.guard.as_ref());
+            let covers_pattern = guard_info.covers_pattern();
             if seen_default {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -5693,9 +5739,76 @@ impl<'program> Checker<'program> {
                     &mut seen_constants,
                     &mut seen_types,
                     &mut seen_null,
+                    covers_pattern,
+                    matches!(mode, MatchMode::Consumed { .. }),
                     &mut shape_valid,
                 )
             };
+
+            if let Some(guard) = &arm.guard {
+                if matches!(resolved_pattern, ResolvedMatchPattern::Default) {
+                    self.diagnostics.push(
+                        Diagnostic::new("E0598", "`default` cannot have a match guard", guard.span)
+                            .with_title("Default Cannot Have A Guard")
+                            .with_help(
+                                "move the condition to an earlier pattern or use a nested match",
+                            ),
+                    );
+                    shape_valid = false;
+                } else if condition_mode {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0599",
+                            "`match (true)` arms do not use pattern guards",
+                            guard.span,
+                        )
+                        .with_title("Match True Arm Cannot Have A Guard")
+                        .with_help("combine the arm condition and guard with `&&`"),
+                    );
+                    shape_valid = false;
+                }
+                self.check_expr(&guard.condition, &arm_scopes, method_context);
+                let guard_ty = self.infer_expr_type(&guard.condition, &arm_scopes, method_context);
+                if !matches!(
+                    self.types.kind(guard_ty),
+                    TypeKind::Bool | TypeKind::Unknown
+                ) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0597",
+                            "match guard must have type `bool`",
+                            guard.condition.span(),
+                        )
+                        .with_title("Match Guard Must Be Bool")
+                        .with_help("use an explicit comparison that produces `bool`"),
+                    );
+                    shape_valid = false;
+                }
+                match guard_info {
+                    MatchGuardSemanticInfo::AlwaysTrue => {
+                        self.diagnostics.push(
+                            Diagnostic::new("E0601", "match guard is always `true`", guard.span)
+                                .with_title("Match Guard Is Redundant")
+                                .with_help("remove the redundant guard")
+                                .with_fix(guard.span, ""),
+                        );
+                        shape_valid = false;
+                    }
+                    MatchGuardSemanticInfo::AlwaysFalse => {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0589",
+                                "match arm is unreachable because its guard is always `false`",
+                                arm.span,
+                            )
+                            .with_title("Unreachable Match Arm")
+                            .with_help("remove the arm or change its guard"),
+                        );
+                        shape_valid = false;
+                    }
+                    MatchGuardSemanticInfo::None | MatchGuardSemanticInfo::Runtime => {}
+                }
+            }
 
             if matches!(resolved_pattern, ResolvedMatchPattern::Default) {
                 default_span = Some(pattern_span);
@@ -5741,13 +5854,14 @@ impl<'program> Checker<'program> {
 
             resolved_arms.push(MatchArmSemanticInfo {
                 pattern: resolved_pattern,
+                guard: guard_info,
                 bindings,
             });
         }
 
         if arms.is_empty() {
             self.diagnostics.push(
-                Diagnostic::new("E0585", "match expression has no arms", span)
+                Diagnostic::new("E0585", "match expression has no arms", *span)
                     .with_title("Non-Exhaustive Match"),
             );
             shape_valid = false;
@@ -5758,7 +5872,7 @@ impl<'program> Checker<'program> {
                 Diagnostic::new(
                     "E0585",
                     "`match (true)` requires a final `default` arm",
-                    span,
+                    *span,
                 )
                 .with_title("Non-Exhaustive Match")
                 .with_help("add `default => value` as the final arm"),
@@ -5778,7 +5892,7 @@ impl<'program> Checker<'program> {
                         Diagnostic::new(
                             "E0589",
                             "`default` is unreachable because earlier arms cover the match domain",
-                            default_span.unwrap_or(span),
+                            default_span.unwrap_or(*span),
                         )
                         .with_title("Unreachable Match Arm")
                         .with_help("remove the redundant `default` arm"),
@@ -5786,7 +5900,7 @@ impl<'program> Checker<'program> {
                     shape_valid = false;
                 }
             } else if !missing.is_empty() {
-                self.report_missing_match_coverage(&missing, span);
+                self.report_missing_match_coverage(&missing, *span);
                 shape_valid = false;
             }
         }
@@ -5797,7 +5911,7 @@ impl<'program> Checker<'program> {
                 Diagnostic::new(
                     "E0592",
                     "a match whose arms are all `null` needs an expected nullable type",
-                    span,
+                    *span,
                 )
                 .with_title("Match Result Type Cannot Be Inferred")
                 .with_help("add an explicit nullable destination type"),
@@ -5812,11 +5926,50 @@ impl<'program> Checker<'program> {
                 MatchSemanticInfo {
                     scrutinee_type: self.types.resolved(scrutinee_ty),
                     result_type: self.types.resolved(result_ty),
-                    origin,
+                    origin: *origin,
+                    mode: *mode,
                     condition_mode,
                     arms: resolved_arms,
                 },
             );
+        }
+    }
+
+    fn classify_match_guard(&self, guard: Option<&MatchGuard>) -> MatchGuardSemanticInfo {
+        let Some(guard) = guard else {
+            return MatchGuardSemanticInfo::None;
+        };
+        let value = match Self::ungroup_expr(&guard.condition) {
+            Expr::Bool { value, .. } => Some(*value),
+            Expr::Identifier { name, .. } => self
+                .const_evaluation
+                .values
+                .get(&crate::const_eval::ConstKey::TopLevel(name.clone()))
+                .and_then(|value| match &value.value {
+                    crate::const_eval::ConstValue::Bool(value) => Some(*value),
+                    _ => None,
+                }),
+            Expr::StaticMember {
+                qualifier: StaticQualifier::Class(class_name),
+                member,
+                ..
+            } => self
+                .const_evaluation
+                .values
+                .get(&crate::const_eval::ConstKey::Class {
+                    class_name: class_name.clone(),
+                    name: member.clone(),
+                })
+                .and_then(|value| match &value.value {
+                    crate::const_eval::ConstValue::Bool(value) => Some(*value),
+                    _ => None,
+                }),
+            _ => None,
+        };
+        match value {
+            Some(true) => MatchGuardSemanticInfo::AlwaysTrue,
+            Some(false) => MatchGuardSemanticInfo::AlwaysFalse,
+            None => MatchGuardSemanticInfo::Runtime,
         }
     }
 
@@ -5833,6 +5986,8 @@ impl<'program> Checker<'program> {
         seen_constants: &mut Vec<crate::const_eval::ConstValue>,
         seen_types: &mut HashSet<ResolvedType>,
         seen_null: &mut bool,
+        covers_pattern: bool,
+        consuming: bool,
         shape_valid: &mut bool,
     ) -> ResolvedMatchPattern {
         let pattern_span = Self::match_pattern_span(pattern);
@@ -5873,11 +6028,11 @@ impl<'program> Checker<'program> {
                         }
                         if seen_constants.contains(&value) {
                             self.duplicate_match_pattern(
-                                "duplicate literal or constant pattern",
+                                "literal or constant pattern is unreachable after an earlier unguarded arm",
                                 pattern_span,
                             );
                             *shape_valid = false;
-                        } else {
+                        } else if covers_pattern {
                             seen_constants.push(value.clone());
                         }
                         return ResolvedMatchPattern::Constant(value);
@@ -5935,12 +6090,17 @@ impl<'program> Checker<'program> {
                     };
                 };
                 let case_definition = &definition.cases[case_index];
-                if !seen_enum_cases.insert(case_definition.id) {
+                if seen_enum_cases.contains(&case_definition.id) {
                     self.duplicate_match_pattern(
-                        &format!("duplicate match arm for `{}::{case}`", definition.name),
+                        &format!(
+                            "match arm for `{}::{case}` is unreachable after an earlier unguarded arm",
+                            definition.name
+                        ),
                         pattern_span,
                     );
                     *shape_valid = false;
+                } else if covers_pattern {
+                    seen_enum_cases.insert(case_definition.id);
                 }
                 if let Some(authored_bindings) = authored_bindings {
                     if authored_bindings.len() != case_definition.payload.len() {
@@ -5978,7 +6138,7 @@ impl<'program> Checker<'program> {
                             *shape_valid = false;
                             continue;
                         }
-                        let borrowed = self.type_is_move_type(field.ty);
+                        let borrowed = !consuming && self.type_is_move_type(field.ty);
                         self.declare_binding(
                             scopes,
                             binding.name.clone(),
@@ -6050,9 +6210,14 @@ impl<'program> Checker<'program> {
                     *shape_valid = false;
                 }
                 let resolved = self.types.resolved(pattern_ty);
-                if !seen_types.insert(resolved.clone()) {
-                    self.duplicate_match_pattern("duplicate exact type pattern", pattern_span);
+                if seen_types.contains(&resolved) {
+                    self.duplicate_match_pattern(
+                        "exact type pattern is unreachable after an earlier unguarded arm",
+                        pattern_span,
+                    );
                     *shape_valid = false;
+                } else if covers_pattern {
+                    seen_types.insert(resolved.clone());
                 }
                 self.declare_binding(
                     scopes,
@@ -6071,7 +6236,7 @@ impl<'program> Checker<'program> {
                 bindings.push(MatchBindingSemanticInfo {
                     name: binding.name.clone(),
                     ty: resolved.clone(),
-                    borrowed: self.type_is_move_type(pattern_ty),
+                    borrowed: !consuming && self.type_is_move_type(pattern_ty),
                 });
                 ResolvedMatchPattern::ExactType(resolved)
             }
@@ -6084,10 +6249,14 @@ impl<'program> Checker<'program> {
                     *shape_valid = false;
                 }
                 if *seen_null {
-                    self.duplicate_match_pattern("duplicate `null` pattern", pattern_span);
+                    self.duplicate_match_pattern(
+                        "`null` pattern is unreachable after an earlier unguarded arm",
+                        pattern_span,
+                    );
                     *shape_valid = false;
+                } else if covers_pattern {
+                    *seen_null = true;
                 }
-                *seen_null = true;
                 ResolvedMatchPattern::Null
             }
             MatchPattern::Expression(expr) => {
@@ -6125,11 +6294,11 @@ impl<'program> Checker<'program> {
                 }
                 if seen_constants.contains(&value) {
                     self.duplicate_match_pattern(
-                        "duplicate literal or constant pattern",
+                        "literal or constant pattern is unreachable after an earlier unguarded arm",
                         pattern_span,
                     );
                     *shape_valid = false;
-                } else {
+                } else if covers_pattern {
                     seen_constants.push(value.clone());
                 }
                 ResolvedMatchPattern::Constant(value)
@@ -10254,6 +10423,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let got = self.infer_expr_type(arg, scopes, method_context);
+        self.record_mixed_boundary(param.ty, arg, got);
         let parameter_is_class_like = self.type_is_class_or_nullable_class(param.ty);
 
         if self.is_expr_assignable(param.ty, arg, scopes, method_context)
@@ -10295,6 +10465,17 @@ impl<'program> Checker<'program> {
             ),
             arg.span(),
         ));
+    }
+
+    fn record_mixed_boundary(&mut self, target: TypeId, value_expr: &Expr, value: TypeId) {
+        if matches!(self.types.kind(target), TypeKind::Mixed)
+            && !matches!(self.types.kind(value), TypeKind::Mixed | TypeKind::Unknown)
+        {
+            self.mixed_box_types.insert(
+                (value_expr.span().start, value_expr.span().end),
+                self.types.resolved(value),
+            );
+        }
     }
 
     fn type_is_class_or_nullable_class(&self, ty: TypeId) -> bool {
@@ -11757,6 +11938,7 @@ impl<'program> Checker<'program> {
         }
 
         let value = self.infer_expr_type(value_expr, scopes, method_context);
+        self.record_mixed_boundary(target, value_expr, value);
         if self.is_expr_assignable(target, value_expr, scopes, method_context)
             || self.is_assignable(target, value)
         {

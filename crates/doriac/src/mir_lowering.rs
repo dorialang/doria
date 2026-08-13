@@ -3492,7 +3492,13 @@ impl<'semantic> LoweringContext<'semantic> {
         id
     }
 
-    fn declare_pattern_local(&mut self, name: &str, ty: mir::Type, owned: bool) -> mir::LocalId {
+    fn declare_pattern_local(
+        &mut self,
+        name: &str,
+        ty: mir::Type,
+        owned: bool,
+        cleanup: bool,
+    ) -> mir::LocalId {
         let id = mir::LocalId(self.locals.len());
         self.locals.push(mir::Local {
             id,
@@ -3506,12 +3512,12 @@ impl<'semantic> LoweringContext<'semantic> {
             .last_mut()
             .expect("MIR lowering must have a local scope")
             .insert(name.to_string(), id);
-        if matches!(ty, mir::Type::String | mir::Type::NullableString) {
+        if cleanup && matches!(ty, mir::Type::String | mir::Type::NullableString) {
             self.scope_owned_locals
                 .last_mut()
                 .expect("MIR lowering must have an ownership scope")
                 .push(DropObligation::String(id));
-        } else if owned {
+        } else if cleanup && owned {
             self.scope_owned_locals
                 .last_mut()
                 .expect("MIR lowering must have an ownership scope")
@@ -7004,6 +7010,11 @@ fn hoist_argument_temporary(
         | mir::Type::NullableScalar(_)
         | mir::Type::String
         | mir::Type::NullableString => context.declare_borrowed_temp(ty, false),
+        mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
+            if !payload.capabilities.needs_drop =>
+        {
+            context.declare_borrowed_temp(ty, false)
+        }
         mir::Type::Class(_)
         | mir::Type::NullableClass(_)
         | mir::Type::SharedReference(_)
@@ -7876,6 +7887,7 @@ fn lower_match_rvalue(
 ) -> DiagnosticResult<mir::Rvalue> {
     let hir::Expr::Match {
         scrutinee,
+        mode,
         arms,
         span,
         ..
@@ -7918,8 +7930,20 @@ fn lower_match_rvalue(
                 "match scrutinee type has no native representation",
             )]
         })?;
-    let scrutinee_value = lower_rvalue_as_borrowed(scrutinee, scrutinee_type, context)?;
-    let scrutinee_owned = rvalue_has_owned_temporary(&scrutinee_value);
+    let ownership_mode = match mode {
+        hir::MatchMode::Borrowed => mir::MatchOwnershipMode::Borrowed,
+        hir::MatchMode::Consumed { .. } => mir::MatchOwnershipMode::Consumed,
+    };
+    let scrutinee_value = match ownership_mode {
+        mir::MatchOwnershipMode::Borrowed => {
+            lower_rvalue_as_borrowed(scrutinee, scrutinee_type, context)?
+        }
+        mir::MatchOwnershipMode::Consumed => {
+            lower_rvalue_as_expected(scrutinee, scrutinee_type, context)?
+        }
+    };
+    let scrutinee_owned = matches!(ownership_mode, mir::MatchOwnershipMode::Consumed)
+        || rvalue_has_owned_temporary(&scrutinee_value);
     let scrutinee_local = if scrutinee_owned {
         context.declare_owned_temp(scrutinee_type)
     } else {
@@ -7930,7 +7954,9 @@ fn lower_match_rvalue(
         value: scrutinee_value,
     });
 
-    let result_local = if expected.has_move_ownership() && transfer {
+    let result_transfer = expected.has_move_ownership()
+        && (transfer || matches!(ownership_mode, mir::MatchOwnershipMode::Consumed));
+    let result_local = if result_transfer {
         context.declare_return_temp(expected, true)
     } else {
         context.declare_borrowed_temp(expected, false)
@@ -7938,11 +7964,15 @@ fn lower_match_rvalue(
     let plan_block = context.current_block();
     let merge_block = context.create_block();
     let mut fallback = None;
-    let mut arm_blocks = Vec::with_capacity(arms.len());
+    let mut arm_plans = Vec::with_capacity(arms.len());
 
     for (index, (arm, arm_info)) in arms.iter().zip(&info.arms).enumerate() {
-        let arm_block = context.create_block();
-        arm_blocks.push(arm_block);
+        let binding_block = context.create_block();
+        let guard_block = arm.guard.as_ref().map(|_| context.create_block());
+        arm_plans.push(mir::MatchArmPlan {
+            guard: guard_block,
+            binding: binding_block,
+        });
         let next_block = if index + 1 == arms.len() {
             *fallback.get_or_insert_with(|| context.create_block())
         } else {
@@ -7954,28 +7984,49 @@ fn lower_match_rvalue(
             scrutinee_local,
             scrutinee_type,
             info.condition_mode,
-            arm_block,
+            guard_block.unwrap_or(binding_block),
             next_block,
             context,
         )?;
 
-        context.current_block = Some(arm_block);
+        if let (Some(guard), Some(guard_block)) = (&arm.guard, guard_block) {
+            context.current_block = Some(guard_block);
+            context.push_scope();
+            bind_match_arm(
+                &arm.pattern,
+                arm_info,
+                scrutinee_local,
+                scrutinee_type,
+                mir::MatchBindingMode::GuardView,
+                context,
+            )?;
+            lower_condition_to_blocks(&guard.condition, binding_block, next_block, context)?;
+            context.pop_scope();
+        }
+
+        context.current_block = Some(binding_block);
         context.push_scope();
-        if let Some(name) = match_scrutinee_binding_name(scrutinee) {
-            context
-                .local_scopes
-                .last_mut()
-                .expect("match arm must have a local scope")
-                .insert(name.to_string(), scrutinee_local);
+        if matches!(ownership_mode, mir::MatchOwnershipMode::Borrowed) {
+            if let Some(name) = match_scrutinee_binding_name(scrutinee) {
+                context
+                    .local_scopes
+                    .last_mut()
+                    .expect("match arm must have a local scope")
+                    .insert(name.to_string(), scrutinee_local);
+            }
         }
         bind_match_arm(
             &arm.pattern,
             arm_info,
             scrutinee_local,
             scrutinee_type,
+            match ownership_mode {
+                mir::MatchOwnershipMode::Borrowed => mir::MatchBindingMode::BorrowedArm,
+                mir::MatchOwnershipMode::Consumed => mir::MatchBindingMode::ConsumedArm,
+            },
             context,
         )?;
-        let arm_value = if transfer {
+        let arm_value = if result_transfer {
             lower_rvalue_as_expected(&arm.value, expected, context)?
         } else {
             let value = lower_rvalue_as_borrowed(&arm.value, expected, context)?;
@@ -8008,12 +8059,14 @@ fn lower_match_rvalue(
     context.blocks[plan_block.0]
         .statements
         .push(mir::Statement::MatchResultPlan {
+            scrutinee: scrutinee_local,
+            mode: ownership_mode,
             result: result_local,
-            arms: arm_blocks,
+            arms: arm_plans,
             merge: merge_block,
         });
     context.current_block = Some(merge_block);
-    Ok(local_rvalue(result_local, expected, transfer))
+    Ok(local_rvalue(result_local, expected, result_transfer))
 }
 
 fn match_scrutinee_binding_name(expr: &hir::Expr) -> Option<&str> {
@@ -8028,7 +8081,9 @@ fn rvalue_has_owned_temporary(value: &mir::Rvalue) -> bool {
     value.owned_temporary_class().is_some()
         || value.owned_temporary_collection().is_some()
         || value.owned_temporary_shared().is_some()
-        || value.owned_temporary_payload_enum().is_some()
+        || value
+            .owned_temporary_payload_enum()
+            .is_some_and(|(ty, _)| ty.capabilities.needs_drop)
         || !matches!(value.mixed_ownership(), mir::MixedOwnership::None)
 }
 
@@ -8288,6 +8343,7 @@ fn bind_match_arm(
     info: &crate::semantics::MatchArmSemanticInfo,
     scrutinee: mir::LocalId,
     scrutinee_type: mir::Type,
+    mode: mir::MatchBindingMode,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     match pattern {
@@ -8324,14 +8380,20 @@ fn bind_match_arm(
                             "match payload field has no native representation",
                         )]
                     })?;
-                    let owned = !binding_info.borrowed
-                        && matches!(
-                            ty,
-                            mir::Type::PayloadEnum(payload)
-                                | mir::Type::NullablePayloadEnum(payload)
-                                if payload.capabilities.needs_drop
-                        );
-                    Ok(context.declare_pattern_local(&binding.name, ty, owned))
+                    let copy_payload_cleanup = matches!(
+                        ty,
+                        mir::Type::PayloadEnum(payload)
+                            | mir::Type::NullablePayloadEnum(payload)
+                            if payload.capabilities.copy && payload.capabilities.needs_drop
+                    );
+                    let owned = (matches!(mode, mir::MatchBindingMode::ConsumedArm)
+                        && ty.has_move_ownership())
+                        || copy_payload_cleanup;
+                    let cleanup = !matches!(mode, mir::MatchBindingMode::GuardView)
+                        && (owned
+                            || matches!(ty, mir::Type::String | mir::Type::NullableString)
+                            || copy_payload_cleanup);
+                    Ok(context.declare_pattern_local(&binding.name, ty, owned, cleanup))
                 })
                 .collect::<DiagnosticResult<Vec<_>>>()?;
             context.push_statement(mir::Statement::BindPayloadEnumFields {
@@ -8339,6 +8401,7 @@ fn bind_match_arm(
                 ty,
                 case: case_id,
                 nullable,
+                mode,
                 targets,
             });
         }
@@ -8356,8 +8419,20 @@ fn bind_match_arm(
                     "match type binding has no native representation",
                 )]
             })?;
-            let target = context.declare_pattern_local(&binding.name, ty, false);
-            let value = narrowed_match_local_rvalue(scrutinee, scrutinee_type, ty, binding.span)?;
+            let transfer =
+                matches!(mode, mir::MatchBindingMode::ConsumedArm) && ty.has_move_ownership();
+            let copy_payload_cleanup = matches!(
+                ty,
+                mir::Type::PayloadEnum(payload)
+                    | mir::Type::NullablePayloadEnum(payload)
+                    if payload.capabilities.copy && payload.capabilities.needs_drop
+            );
+            let owned = transfer || copy_payload_cleanup;
+            let cleanup = !matches!(mode, mir::MatchBindingMode::GuardView)
+                && (owned || matches!(ty, mir::Type::String | mir::Type::NullableString));
+            let target = context.declare_pattern_local(&binding.name, ty, owned, cleanup);
+            let value =
+                narrowed_match_local_rvalue(scrutinee, scrutinee_type, ty, transfer, binding.span)?;
             context.push_statement(mir::Statement::AssignLocal { target, value });
         }
         _ => {}
@@ -8369,6 +8444,7 @@ fn narrowed_match_local_rvalue(
     local: mir::LocalId,
     source: mir::Type,
     narrowed: mir::Type,
+    transfer: bool,
     span: Span,
 ) -> DiagnosticResult<mir::Rvalue> {
     let value = match (source, narrowed) {
@@ -8385,7 +8461,7 @@ fn narrowed_match_local_rvalue(
             mir::Rvalue::Class(mir::ClassExpression::NullableLocalAssumeNonNull {
                 class: target,
                 local,
-                transfer: false,
+                transfer,
             })
         }
         (mir::Type::NullablePayloadEnum(source), mir::Type::PayloadEnum(target))
@@ -8394,7 +8470,7 @@ fn narrowed_match_local_rvalue(
             mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
                 ty: target,
                 place: mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local),
-                mode: mir::PayloadEnumUseMode::Borrow,
+                mode: payload_enum_use_mode(target, transfer),
             })
         }
         (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::Scalar(target)) => {
@@ -8413,17 +8489,17 @@ fn narrowed_match_local_rvalue(
             mir::Rvalue::Class(mir::ClassExpression::MixedPayload {
                 mixed: local,
                 class,
-                transfer: false,
+                transfer,
             })
         }
         (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::PayloadEnum(ty)) => {
             mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
                 ty,
                 place: mir::PayloadEnumPlace::MixedPayload { mixed: local },
-                mode: mir::PayloadEnumUseMode::Borrow,
+                mode: payload_enum_use_mode(ty, transfer),
             })
         }
-        (source, target) if source == target => local_rvalue(local, target, false),
+        (source, target) if source == target => local_rvalue(local, target, transfer),
         _ => {
             return Err(vec![Diagnostic::new(
                 "I2801",
@@ -15281,7 +15357,11 @@ fn lower_property_place(
         _ => match context.expression_type(object)? {
             mir::Type::Class(class) => {
                 let value = lower_class_expression(object, class, false, context)?;
-                let owner = context.declare_borrowed_temp(mir::Type::Class(class), false);
+                let owner = if value.owned_temporary_class().is_some() {
+                    context.declare_owned_temp(mir::Type::Class(class))
+                } else {
+                    context.declare_borrowed_temp(mir::Type::Class(class), false)
+                };
                 context.push_statement(mir::Statement::AssignLocal {
                     target: owner,
                     value: mir::Rvalue::Class(value),
