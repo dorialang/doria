@@ -1672,15 +1672,15 @@ impl Checker<'_> {
                     &body_flow.backedges,
                     return_move_type,
                 );
-                let mut exits = body_flow.backedges;
-                exits.extend(body_flow.breaks);
-                if constant_bool(&statement.condition) != Some(true) {
-                    exits.push(before.clone());
+                let condition = constant_bool(&statement.condition);
+                let mut exits = body_flow.breaks;
+                if condition != Some(true) {
+                    exits.extend(body_flow.backedges);
                 }
                 if exits.is_empty() {
                     Flow::stops()
                 } else {
-                    merge_loop_exit(scopes, &before, &exits);
+                    merge_reachable_states(scopes, &exits);
                     Flow::fallthrough()
                 }
             }
@@ -4228,6 +4228,18 @@ fn merge_loop_exit(scopes: &mut Scopes, before: &Scopes, backedges: &[Scopes]) {
         repeated.merge_from(&left, state);
     }
     scopes.merge_from(before, &repeated);
+}
+
+fn merge_reachable_states(scopes: &mut Scopes, states: &[Scopes]) {
+    let Some((first, rest)) = states.split_first() else {
+        return;
+    };
+    let mut merged = first.clone();
+    for state in rest {
+        let left = merged.clone();
+        merged.merge_from(&left, state);
+    }
+    *scopes = merged;
 }
 
 fn pop_flow_scope(flow: &mut Flow) {

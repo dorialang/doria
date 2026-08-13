@@ -1,5 +1,7 @@
 use crate::ast::{Block, ElseBranch, FunctionDecl, Stmt};
-use crate::control_flow::{build_function_cfg, ControlFlowGraph, Node};
+use crate::control_flow::{
+    build_function_cfg, build_function_cfg_with_given, ControlFlowGraph, GivenSemanticInfoMap, Node,
+};
 use crate::dataflow::{solve_forward, ForwardAnalysis};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -12,8 +14,28 @@ pub fn analyze(function: &FunctionDecl) -> ReturnAnalysis {
     analyze_block(&function.body, function.span)
 }
 
+pub fn analyze_with_given(
+    function: &FunctionDecl,
+    given_preludes: &GivenSemanticInfoMap,
+) -> ReturnAnalysis {
+    analyze_block_with_given(&function.body, function.span, given_preludes)
+}
+
 pub fn analyze_block(block: &Block, owner_span: crate::source::Span) -> ReturnAnalysis {
     let graph = build_function_cfg(block, owner_span);
+    analyze_graph(graph)
+}
+
+pub fn analyze_block_with_given(
+    block: &Block,
+    owner_span: crate::source::Span,
+    given_preludes: &GivenSemanticInfoMap,
+) -> ReturnAnalysis {
+    let graph = build_function_cfg_with_given(block, owner_span, given_preludes);
+    analyze_graph(graph)
+}
+
+fn analyze_graph(graph: ControlFlowGraph) -> ReturnAnalysis {
     let result = solve_forward(&graph, &Reachability);
     let fallthrough_reachable = result.inputs[graph.fallthrough_exit.0];
     ReturnAnalysis {

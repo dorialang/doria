@@ -1,5 +1,14 @@
+use std::collections::HashMap;
+
 use crate::ast::{Block, ElseBranch, Expr, ForIncrement, ForInitializer, ForStmt, Stmt};
 use crate::source::Span;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GivenSemanticInfo {
+    pub predicate_statement_indices: Vec<usize>,
+}
+
+pub type GivenSemanticInfoMap = HashMap<(usize, usize), GivenSemanticInfo>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub usize);
@@ -133,14 +142,24 @@ struct LoopContext {
 struct Builder {
     graph: ControlFlowGraph,
     loops: Vec<LoopContext>,
+    given_preludes: GivenSemanticInfoMap,
 }
 
 pub fn build_function_cfg(body: &Block, function_span: Span) -> ControlFlowGraph {
+    build_function_cfg_with_given(body, function_span, &GivenSemanticInfoMap::new())
+}
+
+pub fn build_function_cfg_with_given(
+    body: &Block,
+    function_span: Span,
+    given_preludes: &GivenSemanticInfoMap,
+) -> ControlFlowGraph {
     let graph = ControlFlowGraph::new(function_span);
     let entry = graph.entry;
     let mut builder = Builder {
         graph,
         loops: Vec::new(),
+        given_preludes: given_preludes.clone(),
     };
     let outgoing = builder.build_statements(&body.statements, vec![entry]);
     let fallthrough = builder.graph.add_node(
@@ -152,6 +171,17 @@ pub fn build_function_cfg(body: &Block, function_span: Span) -> ControlFlowGraph
     builder.graph.connect_all(&outgoing, fallthrough);
     builder.graph.fallthrough_exit = fallthrough;
     builder.graph
+}
+
+struct GivenFlow {
+    setup_outgoing: Vec<NodeId>,
+    predicates: Vec<Expr>,
+}
+
+struct GateFlow {
+    entry: Option<NodeId>,
+    passed: Vec<NodeId>,
+    failed: Vec<NodeId>,
 }
 
 impl Builder {
@@ -184,25 +214,35 @@ impl Builder {
                 Vec::new()
             }
             Stmt::If(if_stmt) => {
-                let incoming = if_stmt.given.as_ref().map_or(incoming.clone(), |given| {
-                    self.build_statements(&given.block.statements, incoming)
-                });
-                self.build_if(if_stmt, incoming)
+                if let Some(given) = &if_stmt.given {
+                    let given = self.build_given(given, incoming);
+                    let gate = self.build_gate(given.predicates, given.setup_outgoing, false);
+                    self.build_if_with_gate(if_stmt, gate.passed, gate.failed)
+                } else {
+                    self.build_if(if_stmt, incoming)
+                }
             }
             Stmt::While(while_stmt) => {
-                let incoming = while_stmt.given.as_ref().map_or(incoming.clone(), |given| {
-                    self.build_statements(&given.block.statements, incoming)
-                });
+                let gate = if let Some(given) = &while_stmt.given {
+                    let given = self.build_given(given, incoming);
+                    self.build_gate(given.predicates, given.setup_outgoing, true)
+                } else {
+                    GateFlow {
+                        entry: None,
+                        passed: incoming,
+                        failed: Vec::new(),
+                    }
+                };
                 let header = self.graph.add_node(
                     NodeKind::LoopHeader,
                     while_stmt.condition.span(),
                     NodeAction::Expression(while_stmt.condition.clone()),
                     true,
                 );
-                self.graph.connect_all(&incoming, header);
+                self.graph.connect_all(&gate.passed, header);
                 let condition = constant_condition(&while_stmt.condition);
                 self.loops.push(LoopContext {
-                    continue_target: header,
+                    continue_target: gate.entry.unwrap_or(header),
                     breaks: Vec::new(),
                 });
                 let body_incoming = if condition == ConstantCondition::AlwaysFalse {
@@ -212,9 +252,11 @@ impl Builder {
                 };
                 let body_outgoing =
                     self.build_statements(&while_stmt.body.statements, body_incoming);
-                self.graph.connect_all(&body_outgoing, header);
+                self.graph
+                    .connect_all(&body_outgoing, gate.entry.unwrap_or(header));
                 let loop_context = self.loops.pop().expect("while loop context");
                 let mut outgoing = loop_context.breaks;
+                outgoing.extend(gate.failed);
                 if condition != ConstantCondition::AlwaysTrue {
                     outgoing.push(self.assumption(&while_stmt.condition, false, header));
                 }
@@ -294,7 +336,82 @@ impl Builder {
         }
     }
 
+    fn build_given(
+        &mut self,
+        given: &crate::ast::GivenPrelude,
+        incoming: Vec<NodeId>,
+    ) -> GivenFlow {
+        let predicate_indices = self
+            .given_preludes
+            .get(&(given.span.start, given.span.end))
+            .map(|info| info.predicate_statement_indices.as_slice())
+            .unwrap_or_default()
+            .to_vec();
+        let mut setup_outgoing = incoming;
+        let mut predicates = Vec::with_capacity(predicate_indices.len());
+        for (index, statement) in given.block.statements.iter().enumerate() {
+            if predicate_indices.contains(&index) {
+                let Stmt::Expr { expr, .. } = statement else {
+                    unreachable!("checked given predicate must be an expression statement")
+                };
+                predicates.push(expr.clone());
+            } else {
+                setup_outgoing = self.build_statement(statement, setup_outgoing);
+            }
+        }
+        GivenFlow {
+            setup_outgoing,
+            predicates,
+        }
+    }
+
+    fn build_gate(
+        &mut self,
+        predicates: Vec<Expr>,
+        incoming: Vec<NodeId>,
+        repeatable: bool,
+    ) -> GateFlow {
+        let mut passed = incoming;
+        let mut failed = Vec::new();
+        let mut entry = None;
+        for predicate in predicates {
+            let branch = self.graph.add_node(
+                NodeKind::Branch,
+                predicate.span(),
+                NodeAction::Expression(predicate.clone()),
+                repeatable,
+            );
+            self.graph.connect_all(&passed, branch);
+            entry.get_or_insert(branch);
+            let condition = constant_condition(&predicate);
+            passed = if condition == ConstantCondition::AlwaysFalse {
+                Vec::new()
+            } else {
+                vec![self.assumption_with_repeatability(&predicate, true, branch, repeatable)]
+            };
+            if condition != ConstantCondition::AlwaysTrue {
+                failed.push(
+                    self.assumption_with_repeatability(&predicate, false, branch, repeatable),
+                );
+            }
+        }
+        GateFlow {
+            entry,
+            passed,
+            failed,
+        }
+    }
+
     fn build_if(&mut self, if_stmt: &crate::ast::IfStmt, incoming: Vec<NodeId>) -> Vec<NodeId> {
+        self.build_if_with_gate(if_stmt, incoming, Vec::new())
+    }
+
+    fn build_if_with_gate(
+        &mut self,
+        if_stmt: &crate::ast::IfStmt,
+        incoming: Vec<NodeId>,
+        gate_failed: Vec<NodeId>,
+    ) -> Vec<NodeId> {
         let branch = self.normal(
             NodeKind::Branch,
             if_stmt.condition.span(),
@@ -316,12 +433,17 @@ impl Builder {
         };
         match &if_stmt.else_branch {
             Some(ElseBranch::If(nested)) => {
-                outgoing.extend(self.build_if(nested, else_incoming));
+                outgoing.extend(self.build_if_with_gate(nested, else_incoming, gate_failed));
             }
             Some(ElseBranch::Block(block)) => {
-                outgoing.extend(self.build_statements(&block.statements, else_incoming));
+                let mut fallback_incoming = else_incoming;
+                fallback_incoming.extend(gate_failed);
+                outgoing.extend(self.build_statements(&block.statements, fallback_incoming));
             }
-            None => outgoing.extend(else_incoming),
+            None => {
+                outgoing.extend(else_incoming);
+                outgoing.extend(gate_failed);
+            }
         }
         deduplicate(outgoing)
     }
@@ -413,15 +535,27 @@ impl Builder {
     }
 
     fn assumption(&mut self, condition: &Expr, truth: bool, incoming: NodeId) -> NodeId {
-        self.normal(
+        self.assumption_with_repeatability(condition, truth, incoming, !self.loops.is_empty())
+    }
+
+    fn assumption_with_repeatability(
+        &mut self,
+        condition: &Expr,
+        truth: bool,
+        incoming: NodeId,
+        repeatable: bool,
+    ) -> NodeId {
+        let node = self.graph.add_node(
             NodeKind::Branch,
             condition.span(),
             NodeAction::Assume {
                 condition: condition.clone(),
                 truth,
             },
-            vec![incoming],
-        )
+            repeatable,
+        );
+        self.graph.add_edge(incoming, node);
+        node
     }
 
     fn terminal(&mut self, kind: NodeKind, span: Span, action: NodeAction, incoming: Vec<NodeId>) {

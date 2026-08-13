@@ -3470,8 +3470,20 @@ fn emit_when_expression(
     let predicates = given
         .map(|given| emit_given_setup(given, &mut body, 1, &mut when_scopes))
         .unwrap_or_default();
-    let gate =
-        (!predicates.is_empty()).then(|| emit_bool_chain(predicates.iter().map(String::as_str)));
+    let gate = if predicates.is_empty() {
+        None
+    } else {
+        let gate = when_scopes.fresh_temp("__doria_given_gate");
+        writeln(
+            &mut body,
+            1,
+            &format!(
+                "${gate} = {};",
+                emit_bool_chain(predicates.iter().map(String::as_str))
+            ),
+        );
+        Some(format!("${gate}"))
+    };
 
     for (index, branch) in branches.iter().enumerate() {
         write_indent(&mut body, 1);

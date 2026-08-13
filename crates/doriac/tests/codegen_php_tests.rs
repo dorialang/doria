@@ -1171,6 +1171,12 @@ function skipped(): bool
     return true;
 }
 
+function whenGate(): bool
+{
+    echo "when gate\n";
+    return true;
+}
+
 function main(): void
 {
     string $label = given {
@@ -1184,6 +1190,17 @@ function main(): void
         return "fallback {$prepared}";
     };
     echo $label . "\n";
+
+    string $alternate = given {
+        whenGate();
+    } when (false): string {
+        return "wrong";
+    } else when (true) {
+        return "alternate";
+    } else {
+        return "fallback";
+    };
+    echo $alternate . "\n";
 
     given {
         let writable $running = true;
@@ -1226,7 +1243,7 @@ function main(): void
     );
     assert_eq!(
         run.stdout,
-        b"fallback ready\npredicate true\nbody\npredicate false\nonce\n"
+        b"fallback ready\nwhen gate\nalternate\npredicate true\nbody\npredicate false\nonce\n"
     );
 }
 

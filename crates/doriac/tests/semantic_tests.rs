@@ -4293,6 +4293,7 @@ function main(): void
         prepare();
     } while (false);
 }
+
 "#,
     )
     .expect("valid given phases and do-while should check");
@@ -4314,6 +4315,90 @@ function main(): void
         "function main(): void { given { let $inside = 1; } if (true) {} echo $inside; }",
         "E0101",
     );
+}
+
+#[test]
+fn stage28a_control_flow_analysis_honors_given_gates_and_enclosing_loops() {
+    let diagnostics = doriac::check_source(
+        "test.doria",
+        r#"
+function missing(): int
+{
+    given {
+        false;
+    } while (true) {
+    }
+}
+"#,
+    )
+    .expect_err("a false given gate leaves the function without a value");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0406"));
+
+    doriac::check_source(
+        "test.doria",
+        r#"
+function inspect(bool $running, bool $stop): void
+{
+    while ($running) {
+        int $value = when ($stop): int {
+            break;
+        } else {
+            continue;
+        };
+        echo $value;
+    }
+}
+"#,
+    )
+    .expect("when branches may transfer to their enclosing loop");
+
+    let diagnostics = doriac::check_source(
+        "test.doria",
+        r#"
+class Box
+{
+    int $value;
+
+    function __construct()
+    {
+        given {
+            false;
+        } while (true) {
+            $this->value = 1;
+        }
+    }
+}
+"#,
+    )
+    .expect_err("a false given gate cannot initialize a constructor property");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0504"));
+}
+
+#[test]
+fn do_while_ownership_exit_excludes_the_unexecuted_pre_body_state() {
+    doriac::check_source(
+        "test.doria",
+        r#"
+class Value {}
+function consume(take Value $value): void {}
+function main(): void
+{
+    let writable $value = new Value();
+    consume($value);
+
+    do {
+        $value = new Value();
+    } while (false);
+
+    consume($value);
+}
+"#,
+    )
+    .expect("the mandatory do-while iteration restores ownership on every exit");
 }
 
 #[test]

@@ -2,7 +2,9 @@ use crate::ast::{
     AssignOp, ClassDecl, ClassMember, Expr, ForIncrement, ForInitializer, InterpolatedStringPart,
     Item, Program, Stmt,
 };
-use crate::control_flow::{build_function_cfg, Node, NodeAction, NodeKind};
+use crate::control_flow::{
+    build_function_cfg_with_given, GivenSemanticInfoMap, Node, NodeAction, NodeKind,
+};
 use crate::dataflow::{solve_forward, ForwardAnalysis};
 use crate::diagnostics::Diagnostic;
 use crate::source::Span;
@@ -103,18 +105,25 @@ impl ForwardAnalysis for ConstructorAnalysis<'_> {
     }
 }
 
-pub(crate) fn check_program(program: &Program) -> Vec<Diagnostic> {
+pub(crate) fn check_program(
+    program: &Program,
+    given_preludes: &GivenSemanticInfoMap,
+) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for class in program.items.iter().filter_map(|item| match item {
         Item::Class(class) => Some(class),
         _ => None,
     }) {
-        check_class(class, &mut diagnostics);
+        check_class(class, given_preludes, &mut diagnostics);
     }
     diagnostics
 }
 
-fn check_class(class: &ClassDecl, diagnostics: &mut Vec<Diagnostic>) {
+fn check_class(
+    class: &ClassDecl,
+    given_preludes: &GivenSemanticInfoMap,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     let mut properties = class
         .members
         .iter()
@@ -169,7 +178,7 @@ fn check_class(class: &ClassDecl, diagnostics: &mut Vec<Diagnostic>) {
         return;
     };
 
-    let graph = build_function_cfg(&constructor.body, constructor.span);
+    let graph = build_function_cfg_with_given(&constructor.body, constructor.span, given_preludes);
     let result = solve_forward(
         &graph,
         &ConstructorAnalysis {

@@ -6,6 +6,7 @@ use crate::class_layout::{ClassId, PropertyId};
 use crate::collection_diagnostics::{
     self, ArgumentShape, CollectionMemberKind, CollectionReceiver, ImplementationStatus,
 };
+pub use crate::control_flow::GivenSemanticInfo;
 use crate::diagnostics::{
     Diagnostic, DiagnosticResult, DiagnosticSource, FixApplicability, FixEdit,
 };
@@ -176,11 +177,6 @@ pub struct WhenSemanticInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GivenSemanticInfo {
-    pub predicate_statement_indices: Vec<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchArmSemanticInfo {
     pub pattern: ResolvedMatchPattern,
     pub guard: MatchGuardSemanticInfo,
@@ -305,7 +301,10 @@ pub fn analyze_program_for_ide_with_source<'source>(
     if checker.diagnostics.is_empty() {
         checker
             .diagnostics
-            .extend(crate::constructor_init::check_program(program));
+            .extend(crate::constructor_init::check_program(
+                program,
+                &checker.given_preludes,
+            ));
     }
     if checker.diagnostics.is_empty() {
         let inferred_move_returns = checker
@@ -1019,6 +1018,7 @@ struct Checker<'program> {
     flow_facts: crate::narrowing::FactsByUse,
     contextual_expression_types: HashMap<(usize, usize), TypeId>,
     when_contexts: Vec<WhenCheckContext>,
+    active_loop_depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1506,6 +1506,7 @@ impl<'program> Checker<'program> {
             flow_facts: crate::narrowing::analyze_program(program),
             contextual_expression_types: HashMap::new(),
             when_contexts: Vec::new(),
+            active_loop_depth: 0,
         }
     }
 
@@ -4202,6 +4203,7 @@ impl<'program> Checker<'program> {
         return_context: Option<&ReturnContext>,
         loop_depth: usize,
     ) {
+        self.active_loop_depth = loop_depth;
         match statement {
             Stmt::Block(block) => {
                 let mut nested_constructor_init_context = constructor_init_context
@@ -5316,7 +5318,9 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        if crate::return_analysis::analyze(function).fallthrough_reachable {
+        if crate::return_analysis::analyze_with_given(function, &self.given_preludes)
+            .fallthrough_reachable
+        {
             self.report_missing_return_value(context, expected, function.span);
         }
     }
@@ -6198,6 +6202,7 @@ impl<'program> Checker<'program> {
         let branches = &when.branches;
         let finally = &when.finally;
         let span = when.span;
+        let enclosing_loop_depth = self.active_loop_depth;
 
         let mut when_scopes = scopes.clone();
         when_scopes.push();
@@ -6236,9 +6241,15 @@ impl<'program> Checker<'program> {
                 method_context,
                 None,
                 None,
-                0,
+                enclosing_loop_depth,
             );
-            if crate::return_analysis::block_falls_through(&branch.block) {
+            if crate::return_analysis::analyze_block_with_given(
+                &branch.block,
+                branch.block.span,
+                &self.given_preludes,
+            )
+            .fallthrough_reachable
+            {
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0610",
@@ -6250,6 +6261,8 @@ impl<'program> Checker<'program> {
                 );
             }
         }
+
+        self.active_loop_depth = enclosing_loop_depth;
 
         let context = self.when_contexts.pop().expect("when result context");
         let result = context
