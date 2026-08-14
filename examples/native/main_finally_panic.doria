@@ -1,0 +1,19 @@
+class Guard
+{
+    function __destruct()
+    {
+        echo "wrong destructor\n";
+    }
+}
+
+function main(): void
+{
+    let $guard = new Guard();
+    echo "before\n";
+
+    if (true) {
+        panic("stop before cleanup");
+    } finally {
+        echo "must not run\n";
+    }
+}

@@ -1,0 +1,13 @@
+function main(): void
+{
+    echo "before\n";
+
+    string $value = when (true): string {
+        panic("stop in when branch");
+        return "wrong";
+    } else {
+        return "wrong";
+    } finally {
+        echo "wrong cleanup\n";
+    };
+}

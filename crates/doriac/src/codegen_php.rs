@@ -2608,6 +2608,23 @@ fn emit_block(block: &Block, output: &mut String, indent: usize, scopes: &mut Ph
     writeln(output, indent, "}");
 }
 
+fn emit_with_finally(
+    finally: &ControlFlowFinally,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+    emit_body: impl FnOnce(&mut String, usize, &mut PhpNameScopes),
+) {
+    writeln(output, indent, "try");
+    writeln(output, indent, "{");
+    scopes.push();
+    emit_body(output, indent + 1, scopes);
+    writeln(output, indent, "}");
+    writeln(output, indent, "finally");
+    emit_block(&finally.block, output, indent, scopes);
+    scopes.pop();
+}
+
 fn emit_statement(
     statement: &Stmt,
     output: &mut String,
@@ -2706,40 +2723,37 @@ fn emit_statement(
             }
         }
         Stmt::If(if_stmt) => {
-            if if_stmt.given.is_some() {
+            if let Some(finally) = &if_stmt.finally {
+                emit_with_finally(finally, output, indent, scopes, |output, indent, scopes| {
+                    if if_stmt.given.is_some() {
+                        emit_given_if(if_stmt, output, indent, scopes);
+                    } else {
+                        emit_if(if_stmt, output, indent, "if", None, scopes);
+                    }
+                });
+            } else if if_stmt.given.is_some() {
                 emit_given_if(if_stmt, output, indent, scopes);
             } else {
                 emit_if(if_stmt, output, indent, "if", None, scopes);
             }
         }
         Stmt::While(while_stmt) => {
-            if let Some(given) = &while_stmt.given {
-                scopes.push();
-                let mut predicates = emit_given_setup(given, output, indent, scopes);
-                predicates.push(emit_expr(&while_stmt.condition, scopes));
-                write_indent(output, indent);
-                output.push_str("while (");
-                output.push_str(&emit_bool_chain(predicates.iter().map(String::as_str)));
-                output.push_str(")\n");
-                emit_block(&while_stmt.body, output, indent, scopes);
-                scopes.pop();
+            if let Some(finally) = &while_stmt.finally {
+                emit_with_finally(finally, output, indent, scopes, |output, indent, scopes| {
+                    emit_while(while_stmt, output, indent, scopes);
+                });
                 return;
             }
-            write_indent(output, indent);
-            output.push_str("while (");
-            output.push_str(&emit_expr(&while_stmt.condition, scopes));
-            output.push_str(")\n");
-            emit_block(&while_stmt.body, output, indent, scopes);
+            emit_while(while_stmt, output, indent, scopes);
         }
         Stmt::DoWhile(do_while) => {
-            write_indent(output, indent);
-            output.push_str("do\n");
-            emit_block(&do_while.body, output, indent, scopes);
-            writeln(
-                output,
-                indent,
-                &format!("while ({});", emit_expr(&do_while.condition, scopes)),
-            );
+            if let Some(finally) = &do_while.finally {
+                emit_with_finally(finally, output, indent, scopes, |output, indent, scopes| {
+                    emit_do_while(do_while, output, indent, scopes);
+                });
+                return;
+            }
+            emit_do_while(do_while, output, indent, scopes);
         }
         Stmt::For(for_stmt) => emit_for(for_stmt, output, indent, scopes),
         Stmt::Break { .. } => {
@@ -2766,6 +2780,47 @@ fn emit_statement(
             writeln(output, indent, &format!("{};", emit_expr(expr, scopes)));
         }
     }
+}
+
+fn emit_while(
+    while_stmt: &WhileStmt,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    if let Some(given) = &while_stmt.given {
+        scopes.push();
+        let mut predicates = emit_given_setup(given, output, indent, scopes);
+        predicates.push(emit_expr(&while_stmt.condition, scopes));
+        write_indent(output, indent);
+        output.push_str("while (");
+        output.push_str(&emit_bool_chain(predicates.iter().map(String::as_str)));
+        output.push_str(")\n");
+        emit_block(&while_stmt.body, output, indent, scopes);
+        scopes.pop();
+        return;
+    }
+    write_indent(output, indent);
+    output.push_str("while (");
+    output.push_str(&emit_expr(&while_stmt.condition, scopes));
+    output.push_str(")\n");
+    emit_block(&while_stmt.body, output, indent, scopes);
+}
+
+fn emit_do_while(
+    do_while: &DoWhileStmt,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    write_indent(output, indent);
+    output.push_str("do\n");
+    emit_block(&do_while.body, output, indent, scopes);
+    writeln(
+        output,
+        indent,
+        &format!("while ({});", emit_expr(&do_while.condition, scopes)),
+    );
 }
 
 fn emit_panic(
@@ -3435,15 +3490,20 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             span,
             ..
         } => emit_match_expression(scrutinee, arms, *span, scopes),
-        Expr::When(when) => {
-            emit_when_expression(when.given.as_ref(), &when.branches, when.span, scopes)
-        }
+        Expr::When(when) => emit_when_expression(
+            when.given.as_ref(),
+            &when.branches,
+            when.finally.as_ref(),
+            when.span,
+            scopes,
+        ),
     }
 }
 
 fn emit_when_expression(
     given: Option<&GivenPrelude>,
     branches: &[WhenBranch],
+    finally: Option<&ControlFlowFinally>,
     span: Span,
     scopes: &PhpNameScopes,
 ) -> String {
@@ -3467,8 +3527,13 @@ fn emit_when_expression(
     let mut when_scopes = scopes.clone();
     when_scopes.push();
     let mut body = String::new();
+    let body_indent = if finally.is_some() { 2 } else { 1 };
+    if finally.is_some() {
+        writeln(&mut body, 1, "try");
+        writeln(&mut body, 1, "{");
+    }
     let predicates = given
-        .map(|given| emit_given_setup(given, &mut body, 1, &mut when_scopes))
+        .map(|given| emit_given_setup(given, &mut body, body_indent, &mut when_scopes))
         .unwrap_or_default();
     let gate = if predicates.is_empty() {
         None
@@ -3476,7 +3541,7 @@ fn emit_when_expression(
         let gate = when_scopes.fresh_temp("__doria_given_gate");
         writeln(
             &mut body,
-            1,
+            body_indent,
             &format!(
                 "${gate} = {};",
                 emit_bool_chain(predicates.iter().map(String::as_str))
@@ -3486,7 +3551,7 @@ fn emit_when_expression(
     };
 
     for (index, branch) in branches.iter().enumerate() {
-        write_indent(&mut body, 1);
+        write_indent(&mut body, body_indent);
         if let Some(condition) = &branch.condition {
             body.push_str(if index == 0 { "if (" } else { "else if (" });
             if let Some(gate) = &gate {
@@ -3498,7 +3563,12 @@ fn emit_when_expression(
         } else {
             body.push_str("else\n");
         }
-        emit_block(&branch.block, &mut body, 1, &mut when_scopes);
+        emit_block(&branch.block, &mut body, body_indent, &mut when_scopes);
+    }
+    if let Some(finally) = finally {
+        writeln(&mut body, 1, "}");
+        writeln(&mut body, 1, "finally");
+        emit_block(&finally.block, &mut body, 1, &mut when_scopes);
     }
     when_scopes.pop();
     format!("(function(){capture_list} {{\n{body}}})()")

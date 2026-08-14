@@ -1,0 +1,16 @@
+function stop(): bool
+{
+    panic("stop in if condition");
+    return false;
+}
+
+function main(): void
+{
+    echo "before\n";
+
+    if (stop()) {
+        echo "wrong body\n";
+    } finally {
+        echo "wrong cleanup\n";
+    }
+}

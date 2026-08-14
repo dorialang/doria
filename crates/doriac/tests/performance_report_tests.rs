@@ -11,11 +11,17 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
     }
     let directory = fixture_directory("success");
     fs::create_dir_all(&directory).expect("fixture directory");
-    fs::write(
-        directory.join("main.doria"),
-        "function main(): int { return 42; }\n",
-    )
-    .expect("source");
+    let source = r#"function main(): void
+{
+    if (true) {
+    } finally {
+        if (true) {
+        } finally {
+        }
+    }
+}
+"#;
+    fs::write(directory.join("main.doria"), source).expect("source");
     let output = Command::new(doriac_bin())
         .current_dir(&directory)
         .args([
@@ -44,7 +50,7 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
     assert_eq!(report["schemaVersion"], 1);
     assert_eq!(report["success"], true);
     assert_eq!(report["backend"], "cranelift");
-    assert_eq!(report["source"]["bytes"], 36);
+    assert_eq!(report["source"]["bytes"], source.len());
     assert_eq!(
         report["command"],
         serde_json::json!([
@@ -94,7 +100,7 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
         .as_u64()
         .is_some_and(|value| value > 0));
     assert!(report["metrics"]["functionCount"].as_u64().is_some());
-    assert_eq!(report["metrics"]["sourceLineCount"], 1);
+    assert_eq!(report["metrics"]["sourceLineCount"], source.lines().count());
     assert_eq!(report["metrics"]["astItemCount"], 1);
     assert_eq!(
         report["metrics"]["mirFunctionCount"],
@@ -104,6 +110,12 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
         "mirBasicBlockCount",
         "mirStatementCount",
         "mirTerminatorCount",
+        "finalizerCount",
+        "structuredExitCount",
+        "finalizedReturnCount",
+        "finalizedBreakCount",
+        "finalizedContinueCount",
+        "maximumFinalizerNestingDepth",
     ] {
         assert!(report["metrics"][field].as_u64().is_some(), "{field}");
     }
@@ -111,6 +123,8 @@ fn opt_in_native_compile_writes_a_versioned_phase_report() {
         report["metrics"]["mirBasicBlockCount"],
         report["metrics"]["mirTerminatorCount"]
     );
+    assert_eq!(report["metrics"]["finalizerCount"], 2);
+    assert_eq!(report["metrics"]["maximumFinalizerNestingDepth"], 2);
     assert!(report["metrics"]["runtimeArtifactBytes"]
         .as_u64()
         .is_some_and(|value| value > 0));

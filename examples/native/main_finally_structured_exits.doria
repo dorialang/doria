@@ -1,0 +1,26 @@
+function choose(): int
+{
+    if (true) {
+        return 42;
+    } finally {
+        echo "return cleanup\n";
+    }
+    return 0;
+}
+
+function main(): void
+{
+    echo "value {choose()}\n";
+    let writable $index = 0;
+    while ($index < 3) {
+        $index++;
+        if ($index == 1) {
+            continue;
+        } finally {
+            echo "iteration {$index}\n";
+        }
+        break;
+    } finally {
+        echo "loop cleanup\n";
+    }
+}

@@ -1,0 +1,16 @@
+function main(): void
+{
+    let writable $index = 0;
+    while ($index < 4) {
+        $index++;
+        if ($index == 1) {
+            continue;
+        }
+        if ($index == 3) {
+            break;
+        }
+        echo "step {$index}\n";
+    } finally {
+        echo "cleanup {$index}\n";
+    }
+}

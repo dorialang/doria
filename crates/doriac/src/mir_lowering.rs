@@ -526,6 +526,12 @@ pub(crate) struct StructuralMetrics {
     pub(crate) given_prelude_count: usize,
     pub(crate) given_predicate_count: usize,
     pub(crate) do_while_count: usize,
+    pub(crate) finalizer_count: usize,
+    pub(crate) structured_exit_count: usize,
+    pub(crate) finalized_return_count: usize,
+    pub(crate) finalized_break_count: usize,
+    pub(crate) finalized_continue_count: usize,
+    pub(crate) maximum_finalizer_nesting_depth: usize,
     pub(crate) basic_block_count: usize,
     pub(crate) statement_count: usize,
     pub(crate) terminator_count: usize,
@@ -1970,8 +1976,10 @@ fn lower_function_body(
 ) -> DiagnosticResult<()> {
     lower_statement_sequence(&body.statements, return_type, context)?;
 
-    if context.current_block.is_some() {
-        if return_type == mir::ReturnType::Void {
+    if let Some(block) = context.current_block {
+        if !context.is_reachable(block) {
+            context.terminate_current(mir::Terminator::Unreachable);
+        } else if return_type == mir::ReturnType::Void {
             context.cleanup_scopes_from(0);
             context.terminate_current(mir::Terminator::ReturnVoid);
         } else {
@@ -2017,9 +2025,7 @@ fn lower_statement_sequence(
                     if let Some(target) = context.when_targets.last().copied() {
                         lower_when_yield(expr.as_ref(), *span, target, context)
                     } else {
-                        let terminator = lower_return(expr.as_ref(), *span, return_type, context)?;
-                        context.terminate_current(terminator);
-                        Ok(())
+                        lower_function_return(expr.as_ref(), *span, return_type, context)
                     }
                 })?;
             }
@@ -2199,12 +2205,48 @@ fn lower_if_statement(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if let Some(finally) = &if_stmt.finally {
+        context.push_scope();
+        let region = context.begin_finalizer_region(mir::FinalizerAttachment::If);
+        if let Some(given) = &if_stmt.given {
+            lower_if_statement_with_given(if_stmt, given, return_type, context)?;
+        } else {
+            lower_if_statement_without_finalizer(if_stmt, return_type, context)?;
+        }
+        let continuation = context.create_block();
+        if context.current_block.is_some() {
+            let scope_depth = context.finalizer_regions[region.0].scope_depth;
+            let source_scope_depth = context.local_scopes.len();
+            context.route_structured_exit(
+                RoutedExit {
+                    exit: StructuredExit::Normal {
+                        destination: continuation,
+                    },
+                    target_finalizer_depth: context.active_finalizers.len() - 1,
+                    cleanup_depth: scope_depth,
+                },
+                source_scope_depth,
+            );
+        }
+        finish_finalizer_region(region, finally, return_type, context)?;
+        context.pop_scope_without_cleanup();
+        context.current_block = context.is_reachable(continuation).then_some(continuation);
+        return Ok(());
+    }
     if let Some(given) = &if_stmt.given {
         context.push_scope();
         let result = lower_if_statement_with_given(if_stmt, given, return_type, context);
         context.pop_scope();
         return result;
     }
+    lower_if_statement_without_finalizer(if_stmt, return_type, context)
+}
+
+fn lower_if_statement_without_finalizer(
+    if_stmt: &hir::IfStmt,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
     let condition_block = context.current_block();
     let fallthrough_blocks = lower_if_tree(if_stmt, condition_block, return_type, context)?;
 
@@ -2332,26 +2374,68 @@ fn lower_while_statement(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if let Some(finally) = &while_stmt.finally {
+        context.push_scope();
+        let region = context.begin_finalizer_region(mir::FinalizerAttachment::While);
+        let continuation = context.create_block();
+        let finalized = Some((region, continuation));
+        if let Some(given) = &while_stmt.given {
+            lower_while_statement_with_given(while_stmt, given, return_type, finalized, context)?;
+        } else {
+            lower_while_statement_with_predicates(
+                while_stmt,
+                &[],
+                return_type,
+                finalized,
+                context,
+            )?;
+        }
+        if context.current_block.is_some() {
+            let scope_depth = context.finalizer_regions[region.0].scope_depth;
+            let source_scope_depth = context.local_scopes.len();
+            context.route_structured_exit(
+                RoutedExit {
+                    exit: StructuredExit::Normal {
+                        destination: continuation,
+                    },
+                    target_finalizer_depth: context.active_finalizers.len() - 1,
+                    cleanup_depth: scope_depth,
+                },
+                source_scope_depth,
+            );
+        }
+        finish_finalizer_region(region, finally, return_type, context)?;
+        context.pop_scope_without_cleanup();
+        context.current_block = context.is_reachable(continuation).then_some(continuation);
+        return Ok(());
+    }
     if let Some(given) = &while_stmt.given {
         context.push_scope();
-        let result = lower_while_statement_with_given(while_stmt, given, return_type, context);
+        let result =
+            lower_while_statement_with_given(while_stmt, given, return_type, None, context);
         context.pop_scope();
         return result;
     }
-    lower_while_statement_with_predicates(while_stmt, &[], return_type, context).map(|_| ())
+    lower_while_statement_with_predicates(while_stmt, &[], return_type, None, context).map(|_| ())
 }
 
 fn lower_while_statement_with_given(
     while_stmt: &hir::WhileStmt,
     given: &hir::GivenPrelude,
     return_type: mir::ReturnType,
+    finalized: Option<(mir::FinalizerRegionId, mir::BlockId)>,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     let setup_block = context.current_block();
     let predicates = lower_given_setup(given, return_type, context)?;
     let setup_exit = context.current_block();
-    let plan =
-        lower_while_statement_with_predicates(while_stmt, &predicates, return_type, context)?;
+    let plan = lower_while_statement_with_predicates(
+        while_stmt,
+        &predicates,
+        return_type,
+        finalized,
+        context,
+    )?;
     let gate_failed = (!plan.predicates.is_empty()).then_some(plan.exit);
     context.blocks[setup_block.0]
         .statements
@@ -2381,6 +2465,7 @@ fn lower_while_statement_with_predicates(
     while_stmt: &hir::WhileStmt,
     predicates: &[&hir::Expr],
     return_type: mir::ReturnType,
+    finalized: Option<(mir::FinalizerRegionId, mir::BlockId)>,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<LoweredWhilePlan> {
     let header_block = context.create_block();
@@ -2397,10 +2482,27 @@ fn lower_while_statement_with_predicates(
         context,
     )?;
 
+    let (break_block, break_cleanup_depth, break_finalizer_depth) = finalized.map_or(
+        (
+            exit_block,
+            context.local_scopes.len(),
+            context.active_finalizers.len(),
+        ),
+        |(region, destination)| {
+            (
+                destination,
+                context.finalizer_regions[region.0].scope_depth,
+                context.active_finalizers.len() - 1,
+            )
+        },
+    );
     context.push_loop_targets(LoopTargets {
         continue_block: header_block,
-        break_block: exit_block,
-        cleanup_depth: context.local_scopes.len(),
+        break_block,
+        continue_cleanup_depth: context.local_scopes.len(),
+        break_cleanup_depth,
+        continue_finalizer_depth: context.active_finalizers.len(),
+        break_finalizer_depth,
         continue_sources: Vec::new(),
     });
     let body_result = lower_scoped_block(&while_stmt.body, body_block, return_type, context);
@@ -2424,16 +2526,71 @@ fn lower_do_while_statement(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if let Some(finally) = &do_while.finally {
+        context.push_scope();
+        let region = context.begin_finalizer_region(mir::FinalizerAttachment::DoWhile);
+        let continuation = context.create_block();
+        lower_do_while_statement_body(
+            do_while,
+            return_type,
+            Some((region, continuation)),
+            context,
+        )?;
+        if context.current_block.is_some() {
+            let scope_depth = context.finalizer_regions[region.0].scope_depth;
+            let source_scope_depth = context.local_scopes.len();
+            context.route_structured_exit(
+                RoutedExit {
+                    exit: StructuredExit::Normal {
+                        destination: continuation,
+                    },
+                    target_finalizer_depth: context.active_finalizers.len() - 1,
+                    cleanup_depth: scope_depth,
+                },
+                source_scope_depth,
+            );
+        }
+        finish_finalizer_region(region, finally, return_type, context)?;
+        context.pop_scope_without_cleanup();
+        context.current_block = context.is_reachable(continuation).then_some(continuation);
+        return Ok(());
+    }
+    lower_do_while_statement_body(do_while, return_type, None, context)
+}
+
+fn lower_do_while_statement_body(
+    do_while: &hir::DoWhileStmt,
+    return_type: mir::ReturnType,
+    finalized: Option<(mir::FinalizerRegionId, mir::BlockId)>,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
     let entry_block = context.current_block();
     let body_block = context.create_block();
     let condition_block = context.create_block();
     let exit_block = context.create_block();
     context.terminate_current(mir::Terminator::Jump(body_block));
 
+    let (break_block, break_cleanup_depth, break_finalizer_depth) = finalized.map_or(
+        (
+            exit_block,
+            context.local_scopes.len(),
+            context.active_finalizers.len(),
+        ),
+        |(region, destination)| {
+            (
+                destination,
+                context.finalizer_regions[region.0].scope_depth,
+                context.active_finalizers.len() - 1,
+            )
+        },
+    );
     context.push_loop_targets(LoopTargets {
         continue_block: condition_block,
-        break_block: exit_block,
-        cleanup_depth: context.local_scopes.len(),
+        break_block,
+        continue_cleanup_depth: context.local_scopes.len(),
+        break_cleanup_depth,
+        continue_finalizer_depth: context.active_finalizers.len(),
+        break_finalizer_depth,
         continue_sources: Vec::new(),
     });
     let body_result = lower_scoped_block(&do_while.body, body_block, return_type, context);
@@ -2604,7 +2761,10 @@ fn lower_for_statement_in_scope(
     context.push_loop_targets(LoopTargets {
         continue_block: increment_block,
         break_block: exit_block,
-        cleanup_depth: context.local_scopes.len(),
+        continue_cleanup_depth: context.local_scopes.len(),
+        break_cleanup_depth: context.local_scopes.len(),
+        continue_finalizer_depth: context.active_finalizers.len(),
+        break_finalizer_depth: context.active_finalizers.len(),
         continue_sources: Vec::new(),
     });
     let body_result = lower_scoped_block(&for_stmt.body, body_block, return_type, context);
@@ -2853,7 +3013,10 @@ fn lower_collection_foreach_in_scope(
     context.push_loop_targets(LoopTargets {
         continue_block: update_block,
         break_block: exit_block,
-        cleanup_depth: context.local_scopes.len(),
+        continue_cleanup_depth: context.local_scopes.len(),
+        break_cleanup_depth: context.local_scopes.len(),
+        continue_finalizer_depth: context.active_finalizers.len(),
+        break_finalizer_depth: context.active_finalizers.len(),
         continue_sources: Vec::new(),
     });
     context.push_scope();
@@ -3251,7 +3414,10 @@ fn lower_range_foreach_in_scope(
     context.push_loop_targets(LoopTargets {
         continue_block: update_block,
         break_block: exit_block,
-        cleanup_depth: context.local_scopes.len(),
+        continue_cleanup_depth: context.local_scopes.len(),
+        break_cleanup_depth: context.local_scopes.len(),
+        continue_finalizer_depth: context.active_finalizers.len(),
+        break_finalizer_depth: context.active_finalizers.len(),
         continue_sources: Vec::new(),
     });
     context.push_scope();
@@ -3336,7 +3502,7 @@ fn lower_loop_control(
     control: LoopControl,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
-    let (target, cleanup_depth) = context.current_loop_targets().ok_or_else(|| {
+    let target = context.current_loop_targets().ok_or_else(|| {
         let keyword = match control {
             LoopControl::Break => "break",
             LoopControl::Continue => "continue",
@@ -3346,16 +3512,35 @@ fn lower_loop_control(
             format!("`{keyword}` requires an enclosing loop"),
         )]
     })?;
-    let target = match control {
-        LoopControl::Break => target.break_block,
-        LoopControl::Continue => target.continue_block,
+    let (exit, cleanup_depth, finalizer_depth) = match control {
+        LoopControl::Break => (
+            StructuredExit::Break {
+                destination: target.break_block,
+            },
+            target.break_cleanup_depth,
+            target.break_finalizer_depth,
+        ),
+        LoopControl::Continue => (
+            StructuredExit::Continue {
+                destination: target.continue_block,
+            },
+            target.continue_cleanup_depth,
+            target.continue_finalizer_depth,
+        ),
     };
-    context.cleanup_scopes_from(cleanup_depth);
     if matches!(control, LoopControl::Continue) {
         let source = context.current_block();
         context.record_continue_source(source);
     }
-    context.terminate_current(mir::Terminator::Jump(target));
+    let source_scope_depth = context.local_scopes.len();
+    context.route_structured_exit(
+        RoutedExit {
+            exit,
+            target_finalizer_depth: finalizer_depth,
+            cleanup_depth,
+        },
+        source_scope_depth,
+    );
     Ok(())
 }
 
@@ -3383,7 +3568,10 @@ struct BlockBuilder {
 struct LoopTargets {
     continue_block: mir::BlockId,
     break_block: mir::BlockId,
-    cleanup_depth: usize,
+    continue_cleanup_depth: usize,
+    break_cleanup_depth: usize,
+    continue_finalizer_depth: usize,
+    break_finalizer_depth: usize,
     continue_sources: Vec<mir::BlockId>,
 }
 
@@ -3394,6 +3582,70 @@ struct WhenTarget {
     merge_block: mir::BlockId,
     transfer: bool,
     cleanup_depth: usize,
+    finalizer_depth: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PendingReturnValue {
+    local: mir::LocalId,
+    ty: mir::Type,
+    transfer: bool,
+}
+
+#[derive(Clone, Copy)]
+enum StructuredExit {
+    Normal {
+        destination: mir::BlockId,
+    },
+    WhenYield {
+        result: mir::LocalId,
+        destination: mir::BlockId,
+    },
+    FunctionReturn {
+        value: Option<PendingReturnValue>,
+    },
+    Break {
+        destination: mir::BlockId,
+    },
+    Continue {
+        destination: mir::BlockId,
+    },
+}
+
+impl StructuredExit {
+    fn plan_kind(self) -> mir::StructuredExitKind {
+        match self {
+            Self::Normal { .. } => mir::StructuredExitKind::Normal,
+            Self::WhenYield { result, .. } => mir::StructuredExitKind::WhenYield { result },
+            Self::FunctionReturn { value } => mir::StructuredExitKind::FunctionReturn {
+                value: value.map(|value| value.local),
+            },
+            Self::Break { .. } => mir::StructuredExitKind::Break,
+            Self::Continue { .. } => mir::StructuredExitKind::Continue,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RoutedExit {
+    exit: StructuredExit,
+    target_finalizer_depth: usize,
+    cleanup_depth: usize,
+}
+
+struct FinalizerExitBuilder {
+    route: RoutedExit,
+    source: mir::BlockId,
+}
+
+struct FinalizerRegionBuilder {
+    parent: Option<mir::FinalizerRegionId>,
+    attachment: mir::FinalizerAttachment,
+    activation: mir::BlockId,
+    entry: mir::BlockId,
+    discriminator: mir::LocalId,
+    scope_depth: usize,
+    exits: Vec<FinalizerExitBuilder>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -3425,6 +3677,9 @@ struct LoweringContext<'semantic> {
     current_block: Option<mir::BlockId>,
     loop_targets: Vec<LoopTargets>,
     when_targets: Vec<WhenTarget>,
+    finalizer_regions: Vec<FinalizerRegionBuilder>,
+    active_finalizers: Vec<mir::FinalizerRegionId>,
+    lexical_finalizers: Vec<mir::FinalizerRegionId>,
     return_borrow: Option<mir::ReturnBorrow>,
 }
 
@@ -3540,6 +3795,9 @@ impl<'semantic> LoweringContext<'semantic> {
             current_block: Some(mir::BlockId(0)),
             loop_targets: Vec::new(),
             when_targets: Vec::new(),
+            finalizer_regions: Vec::new(),
+            active_finalizers: Vec::new(),
+            lexical_finalizers: Vec::new(),
             return_borrow: None,
         }
     }
@@ -3549,6 +3807,15 @@ impl<'semantic> LoweringContext<'semantic> {
         metrics: Option<&mut StructuralMetrics>,
     ) -> (Vec<mir::Local>, Vec<mir::BasicBlock>) {
         let mut metrics = metrics;
+        if let Some(metrics) = metrics.as_deref_mut() {
+            let mut depths = Vec::with_capacity(self.finalizer_regions.len());
+            for region in &self.finalizer_regions {
+                let depth = region.parent.map_or(1, |parent| depths[parent.0] + 1);
+                depths.push(depth);
+                metrics.maximum_finalizer_nesting_depth =
+                    metrics.maximum_finalizer_nesting_depth.max(depth);
+            }
+        }
         let blocks = self
             .blocks
             .into_iter()
@@ -3572,7 +3839,26 @@ impl<'semantic> LoweringContext<'semantic> {
                                 metrics.given_predicate_count += plan.predicates.len();
                             }
                             mir::ControlFlowPlan::DoWhile(_) => metrics.do_while_count += 1,
-                            mir::ControlFlowPlan::PendingFinally { .. } => {}
+                            mir::ControlFlowPlan::Finalizer(plan) => {
+                                metrics.finalizer_count += 1;
+                                metrics.structured_exit_count += plan.exits.len();
+                                for exit in &plan.exits {
+                                    match exit.kind {
+                                        mir::StructuredExitKind::FunctionReturn { .. } => {
+                                            metrics.finalized_return_count += 1;
+                                        }
+                                        mir::StructuredExitKind::Break => {
+                                            metrics.finalized_break_count += 1;
+                                        }
+                                        mir::StructuredExitKind::Continue => {
+                                            metrics.finalized_continue_count += 1;
+                                        }
+                                        mir::StructuredExitKind::Normal
+                                        | mir::StructuredExitKind::WhenYield { .. }
+                                        | mir::StructuredExitKind::CheckedError => {}
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3670,9 +3956,23 @@ impl<'semantic> LoweringContext<'semantic> {
         self.scope_owned_locals.pop();
     }
 
+    fn pop_scope_without_cleanup(&mut self) {
+        assert!(
+            self.local_scopes.len() > 1,
+            "MIR lowering cannot pop the root local scope"
+        );
+        self.local_scopes.pop();
+        self.scope_owned_locals.pop();
+    }
+
     fn cleanup_scopes_from(&mut self, depth: usize) {
+        self.cleanup_scope_range(depth, self.scope_owned_locals.len());
+    }
+
+    fn cleanup_scope_range(&mut self, start: usize, end: usize) {
+        assert!(start <= end && end <= self.scope_owned_locals.len());
         self.cleanup_active_statement_temporaries();
-        let cleanup = self.scope_owned_locals[depth..]
+        let cleanup = self.scope_owned_locals[start..end]
             .iter()
             .flat_map(|scope| scope.iter().copied())
             .collect::<Vec<_>>();
@@ -3768,10 +4068,8 @@ impl<'semantic> LoweringContext<'semantic> {
             .expect("MIR lowering cannot pop an empty loop-target stack")
     }
 
-    fn current_loop_targets(&self) -> Option<(&LoopTargets, usize)> {
-        self.loop_targets
-            .last()
-            .map(|targets| (targets, targets.cleanup_depth))
+    fn current_loop_targets(&self) -> Option<&LoopTargets> {
+        self.loop_targets.last()
     }
 
     fn record_continue_source(&mut self, source: mir::BlockId) {
@@ -3790,6 +4088,68 @@ impl<'semantic> LoweringContext<'semantic> {
         self.when_targets
             .pop()
             .expect("MIR lowering cannot pop an empty when-target stack");
+    }
+
+    fn begin_finalizer_region(
+        &mut self,
+        attachment: mir::FinalizerAttachment,
+    ) -> mir::FinalizerRegionId {
+        let id = mir::FinalizerRegionId(self.finalizer_regions.len());
+        let parent = self.lexical_finalizers.last().copied();
+        let activation = self.current_block();
+        let entry = self.create_block();
+        let discriminator = self.declare_temp(true, IntegerType::Int64);
+        let scope_depth = self.local_scopes.len() - 1;
+        self.finalizer_regions.push(FinalizerRegionBuilder {
+            parent,
+            attachment,
+            activation,
+            entry,
+            discriminator,
+            scope_depth,
+            exits: Vec::new(),
+        });
+        self.active_finalizers.push(id);
+        self.lexical_finalizers.push(id);
+        id
+    }
+
+    fn route_structured_exit(&mut self, route: RoutedExit, source_scope_depth: usize) {
+        if self.active_finalizers.len() > route.target_finalizer_depth {
+            let region_id = *self
+                .active_finalizers
+                .last()
+                .expect("crossed finalizer has an active region");
+            let (cleanup_start, discriminator, entry) = {
+                let region = &self.finalizer_regions[region_id.0];
+                (region.scope_depth + 1, region.discriminator, region.entry)
+            };
+            self.cleanup_scope_range(cleanup_start, source_scope_depth);
+            let source = self.current_block();
+            let discriminator_value = self.finalizer_regions[region_id.0].exits.len() as i128;
+            self.push_statement(mir::Statement::AssignLocal {
+                target: discriminator,
+                value: integer_constant_rvalue(discriminator_value),
+            });
+            self.finalizer_regions[region_id.0]
+                .exits
+                .push(FinalizerExitBuilder { route, source });
+            self.terminate_current(mir::Terminator::Jump(entry));
+            return;
+        }
+
+        self.cleanup_scope_range(route.cleanup_depth, source_scope_depth);
+        let terminator = match route.exit {
+            StructuredExit::Normal { destination }
+            | StructuredExit::WhenYield { destination, .. }
+            | StructuredExit::Break { destination }
+            | StructuredExit::Continue { destination } => mir::Terminator::Jump(destination),
+            StructuredExit::FunctionReturn { value: None } => mir::Terminator::ReturnVoid,
+            StructuredExit::FunctionReturn { value: Some(value) } => {
+                mir::Terminator::Return(local_rvalue(value.local, value.ty, value.transfer))
+            }
+        };
+        self.terminate_current(terminator);
     }
 
     fn declare_user_local(&mut self, name: &str, writable: bool, ty: mir::Type) -> mir::LocalId {
@@ -4473,6 +4833,135 @@ impl<'semantic> LoweringContext<'semantic> {
             _ => None,
         }
     }
+}
+
+fn integer_constant_rvalue(value: i128) -> mir::Rvalue {
+    mir::Rvalue::Value(mir::ValueExpression::Integer(
+        mir::IntegerExpression::constant(
+            IntegerValue::from_i128(IntegerType::Int64, value)
+                .expect("finalizer discriminator fits Doria int"),
+        ),
+    ))
+}
+
+fn finalizer_discriminator_condition(
+    discriminator: mir::LocalId,
+    value: i128,
+) -> mir::BoolExpression {
+    mir::BoolExpression::Compare {
+        op: mir::CompareOp::Equal,
+        left: Box::new(mir::ValueExpression::Integer(local_integer_expression(
+            discriminator,
+            IntegerType::Int64,
+        ))),
+        right: Box::new(mir::ValueExpression::Integer(
+            mir::IntegerExpression::constant(
+                IntegerValue::from_i128(IntegerType::Int64, value)
+                    .expect("finalizer discriminator fits Doria int"),
+            ),
+        )),
+    }
+}
+
+fn finish_finalizer_region(
+    region_id: mir::FinalizerRegionId,
+    finally: &hir::ControlFlowFinally,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let active = context
+        .active_finalizers
+        .pop()
+        .expect("finalizer completion requires an active region");
+    assert_eq!(active, region_id, "finalizers must complete inside-out");
+
+    let body_block_start = context.blocks.len();
+    let entry = context.finalizer_regions[region_id.0].entry;
+    let fallthrough = lower_scoped_block(&finally.block, entry, return_type, context)?;
+    let lexical = context
+        .lexical_finalizers
+        .pop()
+        .expect("finalizer completion requires a lexical region");
+    assert_eq!(lexical, region_id, "finalizers must complete inside-out");
+    let body_block_end = context.blocks.len();
+    let completion = context.create_block();
+    for block in fallthrough {
+        context.terminate_block(block, mir::Terminator::Jump(completion));
+    }
+
+    let (parent, attachment, activation, discriminator, scope_depth, exits) = {
+        let region = &mut context.finalizer_regions[region_id.0];
+        (
+            region.parent,
+            region.attachment,
+            region.activation,
+            region.discriminator,
+            region.scope_depth,
+            std::mem::take(&mut region.exits),
+        )
+    };
+
+    let mut body_blocks = Vec::with_capacity(body_block_end - body_block_start + 1);
+    body_blocks.push(entry);
+    body_blocks.extend((body_block_start..body_block_end).map(mir::BlockId));
+    body_blocks.sort_unstable_by_key(|block| block.0);
+    body_blocks.dedup();
+
+    context.current_block = Some(completion);
+    context.cleanup_scope_range(scope_depth, scope_depth + 1);
+
+    let continuations = exits
+        .iter()
+        .map(|_| context.create_block())
+        .collect::<Vec<_>>();
+    if exits.is_empty() {
+        context.terminate_current(mir::Terminator::Unreachable);
+    } else {
+        let mut dispatch = completion;
+        for (index, continuation) in continuations.iter().copied().enumerate() {
+            context.current_block = Some(dispatch);
+            if index + 1 == continuations.len() {
+                context.terminate_current(mir::Terminator::Jump(continuation));
+            } else {
+                let next = context.create_block();
+                context.terminate_current(mir::Terminator::Branch {
+                    condition: finalizer_discriminator_condition(discriminator, index as i128),
+                    then_block: continuation,
+                    else_block: next,
+                });
+                dispatch = next;
+            }
+        }
+    }
+
+    let mut exit_plans = Vec::with_capacity(exits.len());
+    for (exit, continuation) in exits.into_iter().zip(continuations) {
+        exit_plans.push(mir::FinalizerExitPlan {
+            kind: exit.route.exit.plan_kind(),
+            source: exit.source,
+            continuation,
+        });
+        context.current_block = Some(continuation);
+        context.route_structured_exit(exit.route, scope_depth);
+    }
+
+    context.blocks[activation.0]
+        .statements
+        .push(mir::Statement::ControlFlowPlan(
+            mir::ControlFlowPlan::Finalizer(mir::FinalizerRegionPlan {
+                id: region_id,
+                parent,
+                attachment,
+                activation,
+                entry,
+                completion,
+                discriminator,
+                body_blocks,
+                exits: exit_plans,
+            }),
+        ));
+    context.current_block = None;
+    Ok(())
 }
 
 fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
@@ -7839,19 +8328,32 @@ fn lower_static_method_call(
     Ok((signature, lowered))
 }
 
-fn lower_return(
+fn lower_function_return(
     expr: Option<&hir::Expr>,
     span: Span,
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
-) -> DiagnosticResult<mir::Terminator> {
+) -> DiagnosticResult<()> {
     if let Some(expr) = expr {
         materialize_nested_collection_places(expr, false, context)?;
     }
     match (return_type, expr) {
         (mir::ReturnType::Void, None) => {
-            context.cleanup_scopes_from(0);
-            Ok(mir::Terminator::ReturnVoid)
+            if context.active_finalizers.is_empty() {
+                context.cleanup_scopes_from(0);
+                context.terminate_current(mir::Terminator::ReturnVoid);
+            } else {
+                let source_scope_depth = context.local_scopes.len();
+                context.route_structured_exit(
+                    RoutedExit {
+                        exit: StructuredExit::FunctionReturn { value: None },
+                        target_finalizer_depth: 0,
+                        cleanup_depth: 0,
+                    },
+                    source_scope_depth,
+                );
+            }
+            Ok(())
         }
         (mir::ReturnType::Value(expected), Some(expr)) => {
             let borrowed_move = matches!(
@@ -7884,22 +8386,41 @@ fn lower_return(
                     expr.span(),
                 )]);
             }
-            if context.has_cleanup_obligations() {
+            if context.has_cleanup_obligations() || !context.active_finalizers.is_empty() {
                 let result_owns = expected.has_move_ownership() && !borrowed_move;
                 let result = context.declare_return_temp(expected, result_owns);
                 context.push_statement(mir::Statement::AssignLocal {
                     target: result,
                     value,
                 });
-                context.cleanup_scopes_from(0);
-                Ok(mir::Terminator::Return(local_rvalue(
-                    result,
-                    expected,
-                    !borrowed_move,
-                )))
+                if context.active_finalizers.is_empty() {
+                    context.cleanup_scopes_from(0);
+                    context.terminate_current(mir::Terminator::Return(local_rvalue(
+                        result,
+                        expected,
+                        !borrowed_move,
+                    )));
+                } else {
+                    let source_scope_depth = context.local_scopes.len();
+                    context.route_structured_exit(
+                        RoutedExit {
+                            exit: StructuredExit::FunctionReturn {
+                                value: Some(PendingReturnValue {
+                                    local: result,
+                                    ty: expected,
+                                    transfer: !borrowed_move,
+                                }),
+                            },
+                            target_finalizer_depth: 0,
+                            cleanup_depth: 0,
+                        },
+                        source_scope_depth,
+                    );
+                }
             } else {
-                Ok(mir::Terminator::Return(value))
+                context.terminate_current(mir::Terminator::Return(value));
             }
+            Ok(())
         }
         (mir::ReturnType::Value(_), None) => Err(vec![unsupported(
             span,
@@ -8085,8 +8606,18 @@ fn lower_when_yield(
         target: target.result_local,
         value,
     });
-    context.cleanup_scopes_from(target.cleanup_depth);
-    context.terminate_current(mir::Terminator::Jump(target.merge_block));
+    let source_scope_depth = context.local_scopes.len();
+    context.route_structured_exit(
+        RoutedExit {
+            exit: StructuredExit::WhenYield {
+                result: target.result_local,
+                destination: target.merge_block,
+            },
+            target_finalizer_depth: target.finalizer_depth,
+            cleanup_depth: target.cleanup_depth,
+        },
+        source_scope_depth,
+    );
     Ok(())
 }
 
@@ -8354,6 +8885,10 @@ fn lower_when_rvalue(
     };
     let merge_block = context.create_block();
     context.push_scope();
+    let finalizer_region = when
+        .finally
+        .as_ref()
+        .map(|_| context.begin_finalizer_region(mir::FinalizerAttachment::When));
     let plan_block = context.current_block();
     let predicates = if let Some(given) = given {
         lower_given_setup(given, mir::ReturnType::Void, context)?
@@ -8361,13 +8896,22 @@ fn lower_when_rvalue(
         Vec::new()
     };
     let setup_exit = context.current_block();
-    let cleanup_depth = context.local_scopes.len();
+    let (cleanup_depth, finalizer_depth) = finalizer_region.map_or(
+        (context.local_scopes.len(), context.active_finalizers.len()),
+        |region| {
+            (
+                context.finalizer_regions[region.0].scope_depth,
+                context.active_finalizers.len() - 1,
+            )
+        },
+    );
     let target = WhenTarget {
         result_local,
         result_type: expected,
         merge_block,
         transfer: result_transfer,
         cleanup_depth,
+        finalizer_depth,
     };
 
     let mut next_condition = context.current_block();
@@ -8448,8 +8992,16 @@ fn lower_when_rvalue(
                 }),
             ));
     }
+    if let (Some(region), Some(finally)) = (finalizer_region, &when.finally) {
+        finish_finalizer_region(region, finally, mir::ReturnType::Void, context)?;
+        context.pop_scope_without_cleanup();
+    } else {
+        context.pop_scope();
+    }
+    // Keep one insertion block even when every reachable branch diverges. The block remains
+    // unreachable, so enclosing expression lowering can finish structurally without inventing a
+    // fallthrough path or losing its current MIR block.
     context.current_block = Some(merge_block);
-    context.pop_scope();
     Ok(local_rvalue(result_local, expected, result_transfer))
 }
 

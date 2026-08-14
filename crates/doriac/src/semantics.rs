@@ -1019,6 +1019,7 @@ struct Checker<'program> {
     contextual_expression_types: HashMap<(usize, usize), TypeId>,
     when_contexts: Vec<WhenCheckContext>,
     active_loop_depth: usize,
+    finalizer_boundaries: Vec<FinalizerBoundary>,
 }
 
 #[derive(Debug, Clone)]
@@ -1026,6 +1027,12 @@ struct WhenCheckContext {
     expected: Option<TypeId>,
     inferred: Option<TypeId>,
     saw_value: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FinalizerBoundary {
+    loop_depth: usize,
+    when_depth: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -1507,6 +1514,7 @@ impl<'program> Checker<'program> {
             contextual_expression_types: HashMap::new(),
             when_contexts: Vec::new(),
             active_loop_depth: 0,
+            finalizer_boundaries: Vec::new(),
         }
     }
 
@@ -4266,6 +4274,13 @@ impl<'program> Checker<'program> {
                 _ => self.check_expr(expr, scopes, method_context),
             },
             Stmt::Return { expr, span } => {
+                if self.return_leaves_active_finalizer() {
+                    if let Some(expr) = expr {
+                        self.check_expr(expr, scopes, method_context);
+                    }
+                    self.report_finalizer_transfer("return", *span);
+                    return;
+                }
                 if self.when_contexts.is_empty() {
                     self.check_return_statement(
                         expr.as_ref(),
@@ -4307,7 +4322,14 @@ impl<'program> Checker<'program> {
                         loop_depth,
                     );
                 }
-                self.reject_executable_finally(if_stmt.finally.as_ref());
+                self.check_finally(
+                    if_stmt.finally.as_ref(),
+                    &construct_scopes,
+                    method_context,
+                    constructor_init_context.as_deref(),
+                    return_context,
+                    loop_depth,
+                );
             }
             Stmt::While(while_stmt) => {
                 let mut construct_scopes = scopes.clone();
@@ -4316,7 +4338,7 @@ impl<'program> Checker<'program> {
                     self.check_given_prelude(given, &mut construct_scopes, method_context);
                 }
                 self.check_condition(&while_stmt.condition, &construct_scopes, method_context);
-                let mut body_scopes = construct_scopes;
+                let mut body_scopes = construct_scopes.clone();
                 let mut loop_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::repeatable);
@@ -4328,10 +4350,19 @@ impl<'program> Checker<'program> {
                     return_context,
                     loop_depth + 1,
                 );
-                self.reject_executable_finally(while_stmt.finally.as_ref());
+                self.check_finally(
+                    while_stmt.finally.as_ref(),
+                    &construct_scopes,
+                    method_context,
+                    constructor_init_context.as_deref(),
+                    return_context,
+                    loop_depth,
+                );
             }
             Stmt::DoWhile(do_while) => {
-                let mut body_scopes = scopes.clone();
+                let mut construct_scopes = scopes.clone();
+                construct_scopes.push();
+                let mut body_scopes = construct_scopes.clone();
                 let mut loop_constructor_init_context = constructor_init_context
                     .as_deref()
                     .map(ConstructorInitContext::repeatable);
@@ -4343,8 +4374,15 @@ impl<'program> Checker<'program> {
                     return_context,
                     loop_depth + 1,
                 );
-                self.check_condition(&do_while.condition, scopes, method_context);
-                self.reject_executable_finally(do_while.finally.as_ref());
+                self.check_condition(&do_while.condition, &construct_scopes, method_context);
+                self.check_finally(
+                    do_while.finally.as_ref(),
+                    &construct_scopes,
+                    method_context,
+                    constructor_init_context.as_deref(),
+                    return_context,
+                    loop_depth,
+                );
             }
             Stmt::For(for_stmt) => {
                 let mut loop_scopes = scopes.clone();
@@ -4381,7 +4419,9 @@ impl<'program> Checker<'program> {
                 }
             }
             Stmt::Break { span } => {
-                if loop_depth == 0 {
+                if self.loop_transfer_leaves_active_finalizer(loop_depth) {
+                    self.report_finalizer_transfer("break", *span);
+                } else if loop_depth == 0 {
                     self.diagnostics.push(Diagnostic::new(
                         "E0421",
                         "`break` may only be used inside a loop",
@@ -4390,7 +4430,9 @@ impl<'program> Checker<'program> {
                 }
             }
             Stmt::Continue { span } => {
-                if loop_depth == 0 {
+                if self.loop_transfer_leaves_active_finalizer(loop_depth) {
+                    self.report_finalizer_transfer("continue", *span);
+                } else if loop_depth == 0 {
                     self.diagnostics.push(Diagnostic::new(
                         "E0422",
                         "`continue` may only be used inside a loop",
@@ -5009,8 +5051,13 @@ impl<'program> Checker<'program> {
     ) {
         match branch {
             ElseBranch::If(if_stmt) => {
-                self.check_condition(&if_stmt.condition, scopes, method_context);
-                let mut then_scopes = scopes.clone();
+                let mut construct_scopes = scopes.clone();
+                construct_scopes.push();
+                if let Some(given) = &if_stmt.given {
+                    self.check_given_prelude(given, &mut construct_scopes, method_context);
+                }
+                self.check_condition(&if_stmt.condition, &construct_scopes, method_context);
+                let mut then_scopes = construct_scopes.clone();
                 let mut then_constructor_init_context =
                     constructor_init_context.map(ConstructorInitContext::nested);
                 self.check_block(
@@ -5024,13 +5071,21 @@ impl<'program> Checker<'program> {
                 if let Some(else_branch) = &if_stmt.else_branch {
                     self.check_else_branch(
                         else_branch,
-                        scopes,
+                        &construct_scopes,
                         method_context,
                         constructor_init_context,
                         return_context,
                         loop_depth,
                     );
                 }
+                self.check_finally(
+                    if_stmt.finally.as_ref(),
+                    &construct_scopes,
+                    method_context,
+                    constructor_init_context,
+                    return_context,
+                    loop_depth,
+                );
             }
             ElseBranch::Block(block) => {
                 let mut block_scopes = scopes.clone();
@@ -5147,18 +5202,62 @@ impl<'program> Checker<'program> {
         );
     }
 
-    fn reject_executable_finally(&mut self, finally: Option<&ControlFlowFinally>) {
+    fn check_finally(
+        &mut self,
+        finally: Option<&ControlFlowFinally>,
+        construct_scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+        constructor_init_context: Option<&ConstructorInitContext>,
+        return_context: Option<&ReturnContext>,
+        loop_depth: usize,
+    ) {
         let Some(finally) = finally else {
             return;
         };
+        self.finalizer_boundaries.push(FinalizerBoundary {
+            loop_depth,
+            when_depth: self.when_contexts.len(),
+        });
+        let mut finally_scopes = construct_scopes.clone();
+        let mut finally_constructor_init_context =
+            constructor_init_context.map(ConstructorInitContext::nested);
+        self.check_block(
+            &finally.block,
+            &mut finally_scopes,
+            method_context,
+            finally_constructor_init_context.as_mut(),
+            return_context,
+            loop_depth,
+        );
+        self.finalizer_boundaries
+            .pop()
+            .expect("checked finalizer boundary");
+        self.active_loop_depth = loop_depth;
+    }
+
+    fn return_leaves_active_finalizer(&self) -> bool {
+        self.finalizer_boundaries
+            .last()
+            .is_some_and(|boundary| self.when_contexts.len() <= boundary.when_depth)
+    }
+
+    fn loop_transfer_leaves_active_finalizer(&self, loop_depth: usize) -> bool {
+        self.finalizer_boundaries
+            .last()
+            .is_some_and(|boundary| loop_depth <= boundary.loop_depth)
+    }
+
+    fn report_finalizer_transfer(&mut self, keyword: &str, span: Span) {
         self.diagnostics.push(
-            Diagnostic::unsupported_stage(
-                "E0611",
-                "control-flow `finally` is preserved by the compiler but does not execute until Stage 28a Slice 2",
-                finally.keyword_span,
+            Diagnostic::new(
+                "E0612",
+                format!("`{keyword}` cannot leave a `finally` block"),
+                span,
             )
-            .with_title("Control-Flow Finally Is Not Executable Yet")
-            .with_help("remove `finally` until Slice 2, or move required cleanup into explicit control flow"),
+            .with_title("Control Transfer Cannot Leave Finally")
+            .with_help(format!(
+                "move `{keyword}` outside `finally`, or target control flow declared inside the finalizer"
+            )),
         );
     }
 
@@ -6291,7 +6390,14 @@ impl<'program> Checker<'program> {
                 result_type: self.types.resolved(result),
             },
         );
-        self.reject_executable_finally(finally.as_ref());
+        self.check_finally(
+            finally.as_ref(),
+            &when_scopes,
+            method_context,
+            None,
+            None,
+            enclosing_loop_depth,
+        );
     }
 
     fn classify_match_guard(&self, guard: Option<&MatchGuard>) -> MatchGuardSemanticInfo {

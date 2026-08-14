@@ -1961,6 +1961,9 @@ impl Resolver {
                         ElseBranch::Block(block) => self.resolve_block(block),
                     }
                 }
+                if let Some(finally) = &statement.finally {
+                    self.resolve_block(&finally.block);
+                }
                 if has_given {
                     self.scopes.pop();
                 }
@@ -1973,6 +1976,9 @@ impl Resolver {
                 }
                 self.resolve_expr(&statement.condition);
                 self.resolve_block(&statement.body);
+                if let Some(finally) = &statement.finally {
+                    self.resolve_block(&finally.block);
+                }
                 if has_given {
                     self.scopes.pop();
                 }
@@ -1980,6 +1986,9 @@ impl Resolver {
             Stmt::DoWhile(statement) => {
                 self.resolve_block(&statement.body);
                 self.resolve_expr(&statement.condition);
+                if let Some(finally) = &statement.finally {
+                    self.resolve_block(&finally.block);
+                }
             }
             Stmt::For(statement) => {
                 self.scopes.push(HashMap::new());

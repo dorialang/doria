@@ -1,0 +1,10 @@
+function main(): void
+{
+    echo "before\n";
+
+    do {
+        panic("stop in do body");
+    } while (false) finally {
+        echo "wrong cleanup\n";
+    }
+}

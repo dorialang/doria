@@ -1,0 +1,16 @@
+function stop(): bool
+{
+    panic("stop in while condition");
+    return false;
+}
+
+function main(): void
+{
+    echo "before\n";
+
+    while (stop()) {
+        echo "wrong body\n";
+    } finally {
+        echo "wrong cleanup\n";
+    }
+}

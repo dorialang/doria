@@ -1,0 +1,18 @@
+class Note
+{
+    function __construct(string $text)
+    {
+    }
+}
+
+function main(): void
+{
+    given {
+        let $note = new Note("ready");
+        true;
+    } if (true) {
+        echo "body\n";
+    } finally {
+        echo "cleanup\n";
+    }
+}

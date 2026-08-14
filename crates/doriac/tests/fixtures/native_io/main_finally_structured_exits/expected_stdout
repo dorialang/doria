@@ -1,0 +1,5 @@
+return cleanup
+value 42
+iteration 1
+iteration 2
+loop cleanup

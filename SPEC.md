@@ -120,14 +120,14 @@ Implemented control-flow also includes:
 - `when` as a value-returning conditional form.
 - `match` as a pattern/value selection construct.
 
-Stage 28a Slice 1 also accepts and preserves `finally` grammar on `if`, `when`,
-`while`, and `do ... while`, including the corresponding `given` forms. Its
-execution is the next Slice 2 boundary. `finally` on `for`, `foreach`, `match`,
-or a bare block is not Doria syntax.
+Control-flow `finally` executes on `if`, `when`, `while`, and `do ... while`,
+including the corresponding `given` forms. It runs once on normal or structured
+exit, from inner to outer when nested. Same-loop `continue` does not run the
+loop finalizer, and fatal panic runs no finalizer. `finally` on `for`, `foreach`,
+`match`, or a bare block is not Doria syntax.
 
 Planned future control flow includes:
 
-- executable control-flow `finally`;
 - checked `throw` / `throws` error handling.
 
 See Decision 0116 for the current control-flow authority.
@@ -1193,9 +1193,10 @@ A failed gate skips every attached conditional condition and selects only the
 unconditional `else` when present.
 
 The scoped declarations remain visible through the complete attached construct
-and future finalizer, then leave scope. Ownership and borrow checking use the
-ordinary lexical rules. Decision 0116 settles lowering and cleanup order;
-executable `finally` remains Stage 28a Slice 2.
+and finalizer, then leave scope. Ownership and borrow checking use the ordinary
+lexical rules. Outgoing values are acquired before branch cleanup, the finalizer
+runs next, and scoped `given` declarations are released afterward. A transfer
+inside `finally` may target only control flow wholly contained in that finalizer.
 
 ### do while
 
@@ -1207,7 +1208,7 @@ do {
 
 The body executes before the first strict-`bool` condition. `continue` reaches
 the condition and `break` exits. The ordinary form requires its semicolon. In
-the accepted pending finalizer form, `while ($ready) finally { ... }` has no
+the finalizer form, `while ($ready) finally { ... }` has no
 intervening or trailing semicolon. `given` does not attach to `do`.
 
 ## 8. Class syntax
@@ -1571,9 +1572,8 @@ Future work includes:
 - Attribute syntax and metadata representation.
 - Richer instance property initializers.
 - Named arguments.
-- Executable Stage 28a Slice 2 control-flow finalizers and any future labeled or
-  numeric loop-control surface. Base `do ... while`, `given`, `when`, and
-  `match` are implemented.
+- Any future labeled or numeric loop-control surface. Base `do ... while`,
+  `given`, `when`, control-flow `finally`, and `match` are implemented.
 - Careful evaluation of `goto`, labeled loop control, and structured conditional compilation without adopting C/C++ textual macros.
 - Async/await and structured concurrency.
 - The decision-0110 hosted stream/file foundation and the later terminal APIs beyond the existing text and binary intrinsics.

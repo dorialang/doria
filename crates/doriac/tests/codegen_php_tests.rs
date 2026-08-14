@@ -1248,6 +1248,222 @@ function main(): void
 }
 
 #[test]
+fn php_backend_executes_stage28a_finalizers() {
+    let php = doriac::compile_source_to_php(
+        "stage28a-finalizers.doria",
+        r#"
+function returnThroughFinalizer(): int
+{
+    if (true) {
+        return 42;
+    } finally {
+        echo "return cleanup\n";
+    }
+
+    return 0;
+}
+
+function main(): void
+{
+    given {
+        let $prepared = "prepared";
+    } if (true) {
+        echo "if {$prepared}\n";
+    } finally {
+        echo "if cleanup {$prepared}\n";
+    }
+
+    string $selected = when (true): string {
+        return "selected";
+    } else {
+        return "wrong";
+    } finally {
+        echo "when cleanup\n";
+    };
+    echo "{$selected}\n";
+
+    let writable $count = 0;
+    while ($count < 3) {
+        if ($count == 0) {
+            $count = 1;
+            continue;
+        }
+        $count = 2;
+        break;
+    } finally {
+        echo "while cleanup {$count}\n";
+    }
+
+    do {
+        echo "do body\n";
+    } while (false) finally {
+        echo "do cleanup\n";
+    }
+
+    if (true) {
+        if (true) {
+            echo "nested body\n";
+        } finally {
+            echo "inner cleanup\n";
+        }
+    } finally {
+        echo "outer cleanup\n";
+    }
+
+    echo "return {returnThroughFinalizer()}\n";
+}
+"#,
+    )
+    .expect("Stage 28a finalizers should lower to PHP");
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated Stage 28a finalizer PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout,
+        b"if prepared\nif cleanup prepared\nwhen cleanup\nselected\nwhile cleanup 2\ndo body\ndo cleanup\nnested body\ninner cleanup\nouter cleanup\nreturn cleanup\nreturn 42\n"
+    );
+
+    let panic_php = doriac::compile_source_to_php(
+        "stage28a-panic-finalizers.doria",
+        r#"
+function main(): void
+{
+    if (true) {
+        if (true) {
+            panic("stop");
+        } finally {
+            echo "wrong inner\n";
+        }
+    } finally {
+        echo "wrong outer\n";
+    }
+}
+"#,
+    )
+    .expect("fatal panic inside finalizers should lower to PHP");
+    let panic_script = format!(
+        "{}\nmain();",
+        panic_php
+            .strip_prefix("<?php")
+            .expect("generated PHP header")
+    );
+    let panic_run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(panic_script)
+        .output()
+        .expect("generated panic finalizer PHP should execute");
+    assert_eq!(panic_run.status.code(), Some(101));
+    assert!(panic_run.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&panic_run.stderr).contains("stop"));
+}
+
+#[test]
+fn php_fatal_panic_bypasses_every_stage28a_finalizer_entry() {
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+
+    for (name, source, expected_stdout) in [
+        (
+            "if-condition",
+            include_str!("../../../examples/native/main_finally_panic_if_condition.doria"),
+            &b"before\n"[..],
+        ),
+        (
+            "given-setup",
+            include_str!("../../../examples/native/main_finally_panic_given_setup.doria"),
+            &b"before\n"[..],
+        ),
+        (
+            "given-predicate",
+            include_str!("../../../examples/native/main_finally_panic_given_predicate.doria"),
+            &b"before\n"[..],
+        ),
+        (
+            "when-branch",
+            include_str!("../../../examples/native/main_finally_panic_when_branch.doria"),
+            &b"before\n"[..],
+        ),
+        (
+            "when-condition",
+            include_str!("../../../examples/native/main_finally_panic_when_condition.doria"),
+            &b"before\n"[..],
+        ),
+        (
+            "while-body",
+            include_str!("../../../examples/native/main_finally_panic_while_body.doria"),
+            &b"before\n"[..],
+        ),
+        (
+            "while-condition",
+            include_str!("../../../examples/native/main_finally_panic_while_condition.doria"),
+            &b"before\n"[..],
+        ),
+        (
+            "do-body",
+            include_str!("../../../examples/native/main_finally_panic_do_body.doria"),
+            &b"before\n"[..],
+        ),
+        (
+            "do-condition",
+            include_str!("../../../examples/native/main_finally_panic_do_condition.doria"),
+            &b"before\n"[..],
+        ),
+        (
+            "inner-finalizer",
+            include_str!("../../../examples/native/main_finally_panic_inner_finalizer.doria"),
+            &b"before\ninner\n"[..],
+        ),
+    ] {
+        let php = doriac::compile_source_to_php(format!("{name}.doria"), source)
+            .unwrap_or_else(|diagnostics| panic!("{name} should lower to PHP: {diagnostics:#?}"));
+        let script = format!(
+            "{}\nmain();",
+            php.strip_prefix("<?php").expect("generated PHP header")
+        );
+        let run = Command::new("php")
+            .arg("-d")
+            .arg("display_errors=1")
+            .arg("-r")
+            .arg(script)
+            .output()
+            .unwrap_or_else(|error| panic!("{name} generated PHP should execute: {error}"));
+
+        assert_eq!(run.status.code(), Some(101), "{name}");
+        assert_eq!(run.stdout, expected_stdout, "{name}");
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("stop"),
+            "{name} should preserve its panic transport"
+        );
+    }
+}
+
+#[test]
 fn emits_php_for_loop_control() {
     let php = doriac::compile_source_to_php(
         "test.doria",

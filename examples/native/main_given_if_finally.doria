@@ -1,0 +1,11 @@
+function main(): void
+{
+    given {
+        string $label = "prepared";
+        true;
+    } if (true) {
+        echo "body {$label}\n";
+    } finally {
+        echo "cleanup {$label}\n";
+    }
+}

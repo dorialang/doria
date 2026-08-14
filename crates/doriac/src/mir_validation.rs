@@ -1752,9 +1752,51 @@ fn validate_statement(
                 }
                 Ok(())
             }
-            mir::ControlFlowPlan::PendingFinally { .. } => Err(malformed_mir(
-                "pending Stage 28a Slice 2 finalizer reached MIR",
-            )),
+            mir::ControlFlowPlan::Finalizer(plan) => {
+                block_in(function, plan.activation)?;
+                block_in(function, plan.entry)?;
+                block_in(function, plan.completion)?;
+                let discriminator = local_in(function, plan.discriminator)?;
+                if !discriminator.synthetic
+                    || !discriminator.writable
+                    || discriminator.ty
+                        != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
+                {
+                    return Err(malformed_mir(
+                        "finalizer discriminator must be a writable synthetic int local",
+                    ));
+                }
+                if plan.body_blocks.is_empty() || !plan.body_blocks.contains(&plan.entry) {
+                    return Err(malformed_mir(
+                        "finalizer body does not identify its entry block",
+                    ));
+                }
+                for body in &plan.body_blocks {
+                    block_in(function, *body)?;
+                }
+                for exit in &plan.exits {
+                    block_in(function, exit.source)?;
+                    block_in(function, exit.continuation)?;
+                    match exit.kind {
+                        mir::StructuredExitKind::WhenYield { result } => {
+                            local_in(function, result)?;
+                        }
+                        mir::StructuredExitKind::FunctionReturn { value: Some(value) } => {
+                            local_in(function, value)?;
+                        }
+                        mir::StructuredExitKind::CheckedError => {
+                            return Err(malformed_mir(
+                                "Stage 29 checked-error finalizer routing is not executable yet",
+                            ));
+                        }
+                        mir::StructuredExitKind::Normal
+                        | mir::StructuredExitKind::FunctionReturn { value: None }
+                        | mir::StructuredExitKind::Break
+                        | mir::StructuredExitKind::Continue => {}
+                    }
+                }
+                Ok(())
+            }
         },
     }
 }
@@ -7252,6 +7294,29 @@ fn validate_match_result_plans(function: &mir::Function) -> Result<(), BackendEr
 }
 
 fn validate_control_flow_plans(function: &mir::Function) -> Result<(), BackendError> {
+    let finalizer_plans = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement {
+            mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::Finalizer(plan)) => Some(plan),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let finalizer_ids = finalizer_plans
+        .iter()
+        .map(|plan| plan.id)
+        .collect::<HashSet<_>>();
+    if finalizer_ids.len() != finalizer_plans.len() {
+        return Err(malformed_mir(
+            "finalizer region identifiers are duplicated within the function",
+        ));
+    }
+    if finalizer_ids.iter().any(|id| id.0 >= finalizer_ids.len()) {
+        return Err(malformed_mir(
+            "finalizer region identifiers are not dense within the function",
+        ));
+    }
     for block in &function.blocks {
         for statement in &block.statements {
             let mir::Statement::ControlFlowPlan(plan) = statement else {
@@ -7387,15 +7452,212 @@ fn validate_control_flow_plans(function: &mir::Function) -> Result<(), BackendEr
                         }
                     }
                 }
-                mir::ControlFlowPlan::PendingFinally { .. } => {
-                    return Err(malformed_mir(
-                        "pending Stage 28a Slice 2 finalizer reached MIR",
-                    ));
+                mir::ControlFlowPlan::Finalizer(plan) => {
+                    if let Some(parent) = plan.parent {
+                        if parent.0 >= plan.id.0 || !finalizer_ids.contains(&parent) {
+                            return Err(malformed_mir(
+                                "finalizer region has an invalid lexical parent",
+                            ));
+                        }
+                    }
+                    validate_finalizer_plan(function, block.id, plan)?;
                 }
             }
         }
     }
     Ok(())
+}
+
+fn validate_finalizer_plan(
+    function: &mir::Function,
+    anchor: mir::BlockId,
+    plan: &mir::FinalizerRegionPlan,
+) -> Result<(), BackendError> {
+    if anchor != plan.activation {
+        return Err(malformed_mir(
+            "finalizer region is not anchored at its activation block",
+        ));
+    }
+    if plan.body_blocks.is_empty()
+        || !plan.body_blocks.contains(&plan.entry)
+        || plan.body_blocks.contains(&plan.completion)
+    {
+        return Err(malformed_mir(
+            "finalizer region has an invalid body boundary",
+        ));
+    }
+    let mut planned_sources = HashSet::new();
+    let mut planned_continuations = HashSet::new();
+    for exit in &plan.exits {
+        if !planned_sources.insert(exit.source) {
+            return Err(malformed_mir(
+                "finalizer region repeats a structured-exit source",
+            ));
+        }
+        if !planned_continuations.insert(exit.continuation) {
+            return Err(malformed_mir(
+                "finalizer region repeats a continuation block",
+            ));
+        }
+    }
+    let entry_predecessors = function
+        .blocks
+        .iter()
+        .filter(|block| terminator_targets(&block.terminator).contains(&plan.entry))
+        .map(|block| block.id)
+        .collect::<HashSet<_>>();
+    if entry_predecessors != planned_sources {
+        return Err(malformed_mir(
+            "finalizer entry edges disagree with its structured-exit table",
+        ));
+    }
+    for (index, exit) in plan.exits.iter().enumerate() {
+        let source = block_in(function, exit.source)?;
+        if !matches!(source.terminator, mir::Terminator::Jump(target) if target == plan.entry) {
+            return Err(malformed_mir(
+                "structured exit does not enter its finalizer region",
+            ));
+        }
+        let selected_exits = source
+            .statements
+            .iter()
+            .filter_map(|statement| {
+                let mir::Statement::AssignLocal { target, value } = statement else {
+                    return None;
+                };
+                (*target == plan.discriminator).then_some(value)
+            })
+            .collect::<Vec<_>>();
+        if selected_exits.len() != 1
+            || !matches!(
+                selected_exits[0],
+                mir::Rvalue::Value(mir::ValueExpression::Integer(
+                    mir::IntegerExpression::Use {
+                        ty: IntegerType::Int64,
+                        operand: mir::Operand::Scalar(mir::ScalarValue::Integer(value)),
+                    }
+                )) if value.mathematical_value() == index as i128
+            )
+        {
+            return Err(malformed_mir(
+                "structured exit does not select its finalizer continuation",
+            ));
+        }
+        match exit.kind {
+            mir::StructuredExitKind::WhenYield { result }
+            | mir::StructuredExitKind::FunctionReturn {
+                value: Some(result),
+            } => {
+                if !source
+                    .statements
+                    .iter()
+                    .any(|statement| matches!(statement, mir::Statement::AssignLocal { target, .. } if *target == result))
+                {
+                    return Err(malformed_mir(
+                        "structured value exit enters a finalizer before acquiring its value",
+                    ));
+                }
+            }
+            mir::StructuredExitKind::Continue
+                if matches!(
+                    plan.attachment,
+                    mir::FinalizerAttachment::While | mir::FinalizerAttachment::DoWhile
+                ) =>
+            {
+                return Err(malformed_mir(
+                    "same-loop continue incorrectly routes through its loop finalizer",
+                ));
+            }
+            mir::StructuredExitKind::CheckedError => {
+                return Err(malformed_mir(
+                    "Stage 29 checked-error finalizer routing is not executable yet",
+                ));
+            }
+            mir::StructuredExitKind::Normal
+            | mir::StructuredExitKind::FunctionReturn { value: None }
+            | mir::StructuredExitKind::Break
+            | mir::StructuredExitKind::Continue => {}
+        }
+    }
+    validate_finalizer_dispatch(function, plan)?;
+    Ok(())
+}
+
+fn validate_finalizer_dispatch(
+    function: &mir::Function,
+    plan: &mir::FinalizerRegionPlan,
+) -> Result<(), BackendError> {
+    if plan.exits.is_empty() {
+        if !matches!(
+            block_in(function, plan.completion)?.terminator,
+            mir::Terminator::Unreachable
+        ) {
+            return Err(malformed_mir(
+                "finalizer without exits has an executable completion",
+            ));
+        }
+        return Ok(());
+    }
+
+    let mut dispatch = plan.completion;
+    for (index, exit) in plan.exits.iter().enumerate() {
+        let terminator = &block_in(function, dispatch)?.terminator;
+        if index + 1 == plan.exits.len() {
+            if !matches!(terminator, mir::Terminator::Jump(target) if *target == exit.continuation)
+            {
+                return Err(malformed_mir(
+                    "finalizer completion does not select its final continuation",
+                ));
+            }
+            continue;
+        }
+        let mir::Terminator::Branch {
+            condition,
+            then_block,
+            else_block,
+        } = terminator
+        else {
+            return Err(malformed_mir(
+                "finalizer completion has a malformed continuation dispatch",
+            ));
+        };
+        if *then_block != exit.continuation
+            || !is_finalizer_discriminator_condition(condition, plan.discriminator, index as i128)
+        {
+            return Err(malformed_mir(
+                "finalizer completion dispatch disagrees with its exit table",
+            ));
+        }
+        dispatch = *else_block;
+    }
+    Ok(())
+}
+
+fn is_finalizer_discriminator_condition(
+    condition: &mir::BoolExpression,
+    discriminator: mir::LocalId,
+    expected: i128,
+) -> bool {
+    matches!(
+        condition,
+        mir::BoolExpression::Compare {
+            op: mir::CompareOp::Equal,
+            left,
+            right,
+        } if matches!(
+            left.as_ref(),
+            mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                ty: IntegerType::Int64,
+                operand: mir::Operand::Local(local),
+            }) if *local == discriminator
+        ) && matches!(
+            right.as_ref(),
+            mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                ty: IntegerType::Int64,
+                operand: mir::Operand::Scalar(mir::ScalarValue::Integer(value)),
+            }) if value.mathematical_value() == expected
+        )
+    )
 }
 
 fn cfg_reaches(
@@ -7538,6 +7800,7 @@ fn validate_result_path(
     let mut pending = VecDeque::from([(arm, 0_u8)]);
     let mut visited = HashSet::new();
     let mut reached_merge = false;
+    let mut reached_fatal_panic = false;
     while let Some((block_id, assignments)) = pending.pop_front() {
         if block_id == merge {
             reached_merge = true;
@@ -7576,9 +7839,10 @@ fn validate_result_path(
                 pending.push_back((*then_block, assignments));
                 pending.push_back((*else_block, assignments));
             }
-            mir::Terminator::Return(_)
-            | mir::Terminator::ReturnVoid
-            | mir::Terminator::Panic { .. } => {
+            mir::Terminator::Panic { .. } => {
+                reached_fatal_panic = true;
+            }
+            mir::Terminator::Return(_) | mir::Terminator::ReturnVoid => {
                 return Err(malformed_mir(format!(
                     "{path_name} terminates before assigning and merging its result"
                 )));
@@ -7586,7 +7850,7 @@ fn validate_result_path(
             mir::Terminator::Unreachable => {}
         }
     }
-    if !reached_merge {
+    if !reached_merge && !reached_fatal_panic {
         return Err(malformed_mir(format!(
             "{path_name} cannot reach its result merge"
         )));

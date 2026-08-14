@@ -1099,7 +1099,7 @@ class Parser
 }
 
 #[test]
-fn parses_given_when_and_preserves_the_pending_finalizer() {
+fn parses_given_when_and_preserves_its_finalizer() {
     let program = doriac::parse_source(
         "test.doria",
         r#"

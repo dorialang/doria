@@ -1,0 +1,12 @@
+function main(): void
+{
+    if (true) {
+        if (true) {
+            echo "body\n";
+        } finally {
+            echo "inner\n";
+        }
+    } finally {
+        echo "outer\n";
+    }
+}

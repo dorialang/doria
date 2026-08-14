@@ -256,7 +256,33 @@ function repeat(): void
         if ($count < 2) { continue; }
     } while ($count < 3);
 }
-function main(): void { echo "{select(true)}"; gated(true); repeat(); }
+function finalized(bool $ready): int
+{
+    if ($ready) {
+        return 42;
+    } finally {
+        echo "cleanup";
+    }
+    return 0;
+}
+function loopFinalizer(): void
+{
+    let writable $count = 0;
+    while ($count < 2) {
+        $count++;
+        if ($count == 1) { continue; }
+        break;
+    } finally {
+        echo "loop cleanup";
+    }
+}
+function main(): void
+{
+    echo "{select(true)}:{finalized(true)}";
+    gated(true);
+    repeat();
+    loopFinalizer();
+}
 "#;
     let program = doriac::lower_source_to_mir("llvm-stage28a.doria", source)
         .expect("Stage 28a source should lower to validated MIR");
@@ -357,19 +383,59 @@ function main(): void { echo "{select(true)}"; gated(true); repeat(); }
         ));
     }
 
-    assert!(program
+    let finalized = program
         .functions
         .iter()
-        .all(|function| function.blocks.iter().all(|block| {
-            block.statements.iter().all(|statement| {
-                !matches!(
-                    statement,
-                    doriac::mir::Statement::ControlFlowPlan(
-                        doriac::mir::ControlFlowPlan::PendingFinally { .. }
-                    )
-                )
-            })
-        })));
+        .find(|function| function.name == "finalized")
+        .expect("finalized should exist");
+    let finalized_plan = finalized
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            doriac::mir::Statement::ControlFlowPlan(doriac::mir::ControlFlowPlan::Finalizer(
+                plan,
+            )) => Some(plan),
+            _ => None,
+        })
+        .expect("returning if-finalizer plan should exist");
+    assert_eq!(
+        finalized_plan.attachment,
+        doriac::mir::FinalizerAttachment::If
+    );
+    assert!(finalized_plan.exits.iter().any(|exit| matches!(
+        exit.kind,
+        doriac::mir::StructuredExitKind::FunctionReturn { value: Some(_) }
+    )));
+
+    let looped = program
+        .functions
+        .iter()
+        .find(|function| function.name == "loopFinalizer")
+        .expect("loopFinalizer should exist");
+    let loop_plan = looped
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            doriac::mir::Statement::ControlFlowPlan(doriac::mir::ControlFlowPlan::Finalizer(
+                plan,
+            )) => Some(plan),
+            _ => None,
+        })
+        .expect("while-finalizer plan should exist");
+    assert_eq!(
+        loop_plan.attachment,
+        doriac::mir::FinalizerAttachment::While
+    );
+    assert!(loop_plan
+        .exits
+        .iter()
+        .any(|exit| matches!(exit.kind, doriac::mir::StructuredExitKind::Break)));
+    assert!(!loop_plan
+        .exits
+        .iter()
+        .any(|exit| matches!(exit.kind, doriac::mir::StructuredExitKind::Continue)));
 
     let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
         .expect("validated Stage 28a MIR should lower to LLVM IR");
@@ -380,9 +446,15 @@ function main(): void { echo "{select(true)}"; gated(true); repeat(); }
         placement.escaped.join("\n")
     );
     assert!(
-        !["dr_v1_when", "dr_v1_given", "dr_v1_do_while"]
-            .iter()
-            .any(|name| ir.contains(name)),
+        ![
+            "dr_v1_when",
+            "dr_v1_given",
+            "dr_v1_do_while",
+            "dr_v1_finalizer",
+            "dr_v1_cleanup_stack",
+        ]
+        .iter()
+        .any(|name| ir.contains(name)),
         "Stage 28a control flow introduced runtime control-flow objects:\n{ir}"
     );
 }

@@ -1,0 +1,18 @@
+function stop(): void
+{
+    panic("stop in given setup");
+}
+
+function main(): void
+{
+    echo "before\n";
+
+    given {
+        stop();
+        true;
+    } if (true) {
+        echo "wrong body\n";
+    } finally {
+        echo "wrong cleanup\n";
+    }
+}
