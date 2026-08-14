@@ -4,6 +4,14 @@ Status: Accepted
 
 Implementation note: `docs/decisions/0031-stage-7b-break-continue.md` implements the first compiler and native smoke slice for `break;` and `continue;`. Namespace, `use`, `include`, and `declare` compiler support still remain future work.
 
+Phase F amendment: Decision 0117 is the complete accepted authority for
+compile-time `autoload`, hybrid strict source layout, package compilation
+graphs, same-package include containment, package-wide `internal`, and the
+versioned Baton-to-compiler build plan. Decision 0118 owns Baton's manifest,
+dependency, lockfile, workspace, processor, cache, and offline model. This
+record's distinction among `namespace`, `use`, `include`, and `declare` remains
+unchanged.
+
 ## Decision
 
 Doria accepts the following language directions:
@@ -109,6 +117,9 @@ Accepted intended semantics:
 - Included source participates in the same compiler pipeline as normal Doria source.
 
 Only string-literal local source paths are accepted in the intended direction.
+The path resolves relative to the including file, and its canonical target must
+remain inside the current package. A canonical file reached through both
+autoload and include enters the compilation once.
 
 Rejected direction:
 

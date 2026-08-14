@@ -134,7 +134,7 @@ See Decision 0116 for the current control-flow authority.
 
 ### Source organization and compiler directives
 
-The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Current compiler support may lag this accepted direction until lexer, parser, semantic name resolution, source management, Doria IR, backends, and LSP support are updated.
+The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Current compiler support may lag this accepted direction until the scheduled compiler and Baton stages implement it.
 
 Namespaces define logical symbol ownership and declaration scope. They are part of semantic name resolution, not source inclusion, package resolution, build orchestration, or runtime loading.
 
@@ -148,7 +148,7 @@ class UserService
 }
 ```
 
-Nested namespace paths such as `namespace App\Domain\Users;` are accepted as the likely/default direction. The backslash separator matches Doria's PHP-shaped readability, but exact grammar details remain future implementation work.
+Nested namespace paths such as `namespace App\Domain\Users;` use the backslash separator. Any name containing `\` is absolute; unqualified names resolve through imports, the current namespace, and the edition prelude.
 
 `use` statements import names from namespaces at namespace/file-scope only. `use` is semantic name resolution and aliasing. It is not textual inclusion, PHP runtime include, package dependency resolution, trait composition, or code execution. `use` is not valid inside class, trait, interface, function, or method bodies.
 
@@ -160,7 +160,7 @@ use App\Security\Permission;
 use App\Repositories\PostRepository as Posts;
 ```
 
-`use` may import fully qualified symbols and may alias symbols. Duplicate or conflicting imports should be diagnosed. Unused import warnings may be added later. `use` does not load packages by itself; package resolution belongs to Baton later.
+`use` may import fully qualified symbols and may alias symbols. Duplicate or conflicting imports are diagnosed. `use` does not load files or packages; Baton resolves packages and discovers source through compile-time `autoload` mappings.
 
 Class-body and trait-body trait composition uses `uses`, not namespace import `use`.
 
@@ -172,7 +172,7 @@ Accepted conceptual syntax:
 include "src/generated/routes.doria";
 ```
 
-Only string-literal local source paths are accepted in the intended direction. Computed paths and remote includes are rejected:
+Only string-literal same-package source paths are accepted. Paths resolve relative to the including file, use include-once semantics, and cannot escape the package root. A file discovered by both autoload and include enters the compilation once. Computed paths, remote includes, and cross-package traversal are rejected:
 
 ```doria
 include $path;                         // rejected direction
@@ -181,6 +181,32 @@ include "https://example.com/file.doria"; // rejected direction
 ```
 
 Doria does not add separate PHP-style `require`, `require_once`, or `include_once` forms. Doria `include` already means required include-once source inclusion.
+
+### Package source organization
+
+The public manifest term `autoload` maps namespace prefixes to package-relative
+source directories. Baton discovers matching `.doria` files during the build
+and gives a deterministic source inventory to `doriac`; a Doria executable does
+not load source files at runtime. Every active main, development, generated,
+dependency, and explicitly included file is checked.
+
+Source layout uses hybrid strictness: namespace directory segments match
+exactly, an externally accessible type matches its filename, and a file has one
+primary externally accessible type. Related `internal` helpers may share that
+file, while free functions and constants may use descriptive bundle files.
+Generated bundles and selected binary entry files have the bounded exceptions
+defined by Decision 0117.
+
+Publishable package identities use lowercase `vendor/package` and remain
+independent of Doria namespace identity. `internal` is accessible throughout
+one package, including package-owned development sources, but not from another
+package or merely another member of the same workspace. Only direct declared
+dependencies are source-visible.
+
+In package mode, only a selected binary entry file may contain top-level
+executable statements. Library, autoloaded non-entry, development, generated,
+dependency, and included files are declaration-only. Source discovery order has
+no runtime initialization meaning.
 
 `break` exits the nearest enclosing loop. PHP-style numeric break levels such as `break 2;` are not accepted by the namespace/directive decision. Labeled break may be evaluated later if needed.
 
