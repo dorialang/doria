@@ -75,6 +75,26 @@ Doria source -> doriac check -> doriac compile -> Executable
 Check your source, compile it, then run it.
 ```
 
+## Package And Autoload Positioning
+
+Public package documentation uses `autoload` for Baton-managed source discovery.
+Baton finds matching `.doria` files while building and gives a deterministic
+source inventory to `doriac`; compiled programs do not search for or load Doria source files at runtime.
+
+Keep the package concepts separate:
+
+- `autoload` finds a package's source files automatically during the build.
+- `use` gives a shorter name to a declaration in source.
+- `include` explicitly adds one same-package source file at compile time.
+- dependencies add other packages to the resolved build graph.
+
+Target-state project guides may teach the accepted manifest schema, hybrid
+source layout, dependency workflow, lockfile, workspace, cache, and offline
+behavior before those facilities execute in the bootstrap toolchain. Do not add stage numbers,
+temporary implementation caveats, compiler backend details, or
+runtime-autoloader language to public package guidance. Do not rename the public
+manifest action to `sources`, `discover`, or another implementation term.
+
 ## API Naming
 
 Website examples must follow the naming charter:

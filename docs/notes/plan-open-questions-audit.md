@@ -16,7 +16,9 @@
 - **F4 — integer literals:** RESOLVED direction → add `0x`/`0o`/`0b` literals and `_` digit separators (`1_000_000`); **no** typed suffixes. SPEC records this as future direction, not current syntax. A dedicated numeric-literals slice must settle separator placement and malformed-form diagnostics before promoting the forms into the accepted grammar.
 - **F5 — `uint8[]`↔`Bytes`:** RESOLVED → **explicit, non-implicit** conversion, copy in v1.0; method surface finalized with the collections decision (Stage 23).
 - **F6 — property-hook I/O policy:** RESOLVED → a hook **may `throws`**, **may not block/async** in v1.0, and is **not guaranteed side-effect-free** ("looks like data" is a readability convention, not a purity guarantee). Recorded on the §12 property-hooks subject for the future record.
-- **F7 — `Baton.lock` encoding:** RESOLVED → **JSON**.
+- **F7 — `Baton.lock` encoding:** RESOLVED → **deterministic JSON**, now
+  formalized by Decision 0118 together with the complete source-neutral lock,
+  resolver, workspace, cache, and offline contract.
 - **F8 — `Console` vs `ScreenBuffer`:** RESOLVED → **stateless `Console`, no `ScreenBuffer` std type** (back-buffer renderers are userland).
 
 ## Read (sources consulted)
@@ -30,7 +32,7 @@
 
 ## Already settled / correctly scheduled (not open — do not re-decide)
 
-Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: checked errors (29), closures (30), namespaces (31), inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Enums and complete core match are no longer in that list: decisions 0114 and 0115 own their semantics, including `if` pattern guards and explicit whole-scrutinee consumption. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
+Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: checked errors (29), closures (30), inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Namespace/package-graph authority and Baton's manifest/resolver authority are no longer in that list: decisions 0117 and 0118 own them. Enums and complete core match are likewise settled by decisions 0114 and 0115. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
 
 ## Open questions (answerable now)
 
@@ -44,7 +46,7 @@ above; their accepted decisions and scheduled work are the authority.
 ## Recommended deferrals (reason · reopen trigger)
 - **F5** (`uint8[]`↔`Bytes`) → decide with the **collections decision (Stage 23)**; the recommendation above is the direction.
 - **F6** (hook I/O policy) → decide with the **property-hooks decision (Stage 36)**; needs a real ruling, not a default.
-- **F7** (lock encoding) → decide with the **Baton decision (Stage 33)**.
+- **F7** (lock encoding) → resolved by **Decision 0118**; no longer deferred.
 - **F8** (ScreenBuffer) → decide with the **terminal decision (Stage 46)**.
 - Genuinely blocked / correctly parked (not audited): async/concurrency (Phase H), FFI zero-copy (Stage 40), generics value-parameters (kept-room extension point), `sscanf` (post-1.0), registry server (post-1.0), labeled break/continue, `goto`, `declare` keys.
 
@@ -56,14 +58,13 @@ above; their accepted decisions and scheduled work are the authority.
 
 ## Stage 31 Authority Prerequisite
 
-Decision 0115 closes the unauthored core-match subject. It does not begin Stage
-31. Before namespace or multi-file implementation starts, authority must still
-settle the public `autoload` vocabulary, namespace-prefix-to-path mappings,
-main/test/generated autoload scopes, dependency source discovery, deterministic
-package graphs, incremental source indexing, and top-level execution rules
-across autoloaded files. Internal compiler/build-plan types may use
-`SourceRoot`, `SourceMapping`, or `PackageSourceGraph`; the public manifest term
-is `autoload`.
+Resolved. Decision 0117 accepts the public `autoload` vocabulary, compile-time
+discovery, namespace-prefix mappings, main/development/generated scopes, hybrid
+strict layout, deterministic package compilation graphs, incremental ownership,
+and top-level entry rules. Decision 0118 accepts schema 2 and the dependency,
+lockfile, workspace, cache, and offline model. This authority does not begin
+implementation: Stage 31 remains scheduled in two slices, Stage 33 remains
+scheduled in three slices, and Stage 29 remains next.
 
 ## Proposed deliverable path
 `docs/notes/plan-open-questions-audit.md` (this file), under "supporting context" per `docs/information-architecture.md`. Not a decision record — every item is a stop-and-ask for Andrew.
