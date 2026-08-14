@@ -1147,6 +1147,49 @@ function main(): void { echo "{choose()}"; }
 }
 
 #[test]
+fn nested_finalizers_inside_finalizer_bodies_preserve_lexical_parentage() {
+    let program = doriac::lower_source_to_mir(
+        "nested-finalizer-parent.doria",
+        r#"
+function main(): void
+{
+    if (true) {
+        echo "outer body";
+    } finally {
+        if (true) {
+            echo "inner body";
+        } finally {
+            echo "inner cleanup";
+        }
+    }
+}
+"#,
+    )
+    .expect("nested finalizers should lower");
+
+    let plans = program.functions[0]
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::Finalizer(plan)) => Some(plan),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(plans.len(), 2);
+    let outer = plans
+        .iter()
+        .find(|plan| plan.parent.is_none())
+        .expect("outer finalizer should have no lexical parent");
+    let inner = plans
+        .iter()
+        .find(|plan| plan.parent.is_some())
+        .expect("inner finalizer should retain its lexical parent");
+    assert_eq!(inner.parent, Some(outer.id));
+}
+
+#[test]
 fn shared_validator_rejects_malformed_collection_clear_shapes() {
     let source = r#"
 function main(): void

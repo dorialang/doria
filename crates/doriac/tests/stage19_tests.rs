@@ -906,6 +906,57 @@ function route(): void
 }
 
 #[test]
+fn given_ownership_state_reaches_attached_finalizers() {
+    for (name, source) in [
+        (
+            "given-if-finalizer-owner.doria",
+            r#"
+class Guard {}
+function consume(take Guard $guard): void {}
+function route(): void
+{
+    given {
+        let $guard = new Guard();
+    } if (true) {
+        consume($guard);
+    } finally {
+        consume($guard);
+    }
+}
+"#,
+        ),
+        (
+            "given-while-finalizer-owner.doria",
+            r#"
+class Guard {}
+function consume(take Guard $guard): void {}
+function route(): void
+{
+    given {
+        let $guard = new Guard();
+        let writable $running = true;
+    } while ($running) {
+        consume($guard);
+        break;
+    } finally {
+        consume($guard);
+    }
+}
+"#,
+        ),
+    ] {
+        let diagnostics = doriac::check_source(name, source)
+            .expect_err("a finalizer cannot consume an already-moved given owner");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0470"),
+            "expected use-after-move ownership diagnostic for {name}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
 fn fatal_panic_bypasses_finalizer_ownership_flow() {
     doriac::check_source(
         "finalizer-panic-owner.doria",

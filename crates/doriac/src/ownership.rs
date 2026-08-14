@@ -1600,17 +1600,6 @@ impl Checker<'_> {
                 Flow::returns(scopes)
             }
             Stmt::If(statement) => {
-                if let Some(finally) = &statement.finally {
-                    let mut attached = statement.clone();
-                    attached.finally = None;
-                    let flow = self.check_statement(&Stmt::If(attached), scopes, return_move_type);
-                    return self.apply_finally_to_flow(
-                        &finally.block,
-                        scopes,
-                        flow,
-                        return_move_type,
-                    );
-                }
                 if let Some(given) = &statement.given {
                     scopes.push();
                     self.check_given_setup(given, scopes, return_move_type);
@@ -1621,6 +1610,17 @@ impl Checker<'_> {
                     scopes.pop();
                     pop_flow_scope(&mut flow);
                     return flow;
+                }
+                if let Some(finally) = &statement.finally {
+                    let mut attached = statement.clone();
+                    attached.finally = None;
+                    let flow = self.check_statement(&Stmt::If(attached), scopes, return_move_type);
+                    return self.apply_finally_to_flow(
+                        &finally.block,
+                        scopes,
+                        flow,
+                        return_move_type,
+                    );
                 }
                 self.use_expr(&statement.condition, scopes, UseMode::Read);
                 if let Some(condition) = constant_bool(&statement.condition) {
@@ -1689,24 +1689,12 @@ impl Checker<'_> {
                 }
             }
             Stmt::While(statement) => {
-                if let Some(finally) = &statement.finally {
-                    let mut attached = statement.clone();
-                    attached.finally = None;
-                    let flow =
-                        self.check_statement(&Stmt::While(attached), scopes, return_move_type);
-                    return self.apply_finally_to_flow(
-                        &finally.block,
-                        scopes,
-                        flow,
-                        return_move_type,
-                    );
-                }
                 if let Some(given) = &statement.given {
                     scopes.push();
                     let predicates = self.check_given_setup(given, scopes, return_move_type);
                     let mut attached = statement.clone();
                     attached.given = None;
-                    let mut flow = self.check_while_statement(
+                    let mut flow = self.check_while_with_finally(
                         &attached,
                         &predicates,
                         scopes,
@@ -1716,7 +1704,7 @@ impl Checker<'_> {
                     pop_flow_scope(&mut flow);
                     flow
                 } else {
-                    self.check_while_statement(statement, &[], scopes, return_move_type)
+                    self.check_while_with_finally(statement, &[], scopes, return_move_type)
                 }
             }
             Stmt::DoWhile(statement) => {
@@ -1951,6 +1939,22 @@ impl Checker<'_> {
             returns,
             ..Flow::fallthrough()
         }
+    }
+
+    fn check_while_with_finally(
+        &mut self,
+        statement: &ast::WhileStmt,
+        predicates: &[&Expr],
+        scopes: &mut Scopes,
+        return_move_type: bool,
+    ) -> Flow {
+        let Some(finally) = &statement.finally else {
+            return self.check_while_statement(statement, predicates, scopes, return_move_type);
+        };
+        let mut attached = statement.clone();
+        attached.finally = None;
+        let flow = self.check_while_statement(&attached, predicates, scopes, return_move_type);
+        self.apply_finally_to_flow(&finally.block, scopes, flow, return_move_type)
     }
 
     fn check_foreach_iteration(

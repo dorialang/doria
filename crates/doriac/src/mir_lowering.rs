@@ -3679,6 +3679,7 @@ struct LoweringContext<'semantic> {
     when_targets: Vec<WhenTarget>,
     finalizer_regions: Vec<FinalizerRegionBuilder>,
     active_finalizers: Vec<mir::FinalizerRegionId>,
+    lexical_finalizers: Vec<mir::FinalizerRegionId>,
     return_borrow: Option<mir::ReturnBorrow>,
 }
 
@@ -3796,6 +3797,7 @@ impl<'semantic> LoweringContext<'semantic> {
             when_targets: Vec::new(),
             finalizer_regions: Vec::new(),
             active_finalizers: Vec::new(),
+            lexical_finalizers: Vec::new(),
             return_borrow: None,
         }
     }
@@ -4093,7 +4095,7 @@ impl<'semantic> LoweringContext<'semantic> {
         attachment: mir::FinalizerAttachment,
     ) -> mir::FinalizerRegionId {
         let id = mir::FinalizerRegionId(self.finalizer_regions.len());
-        let parent = self.active_finalizers.last().copied();
+        let parent = self.lexical_finalizers.last().copied();
         let activation = self.current_block();
         let entry = self.create_block();
         let discriminator = self.declare_temp(true, IntegerType::Int64);
@@ -4108,6 +4110,7 @@ impl<'semantic> LoweringContext<'semantic> {
             exits: Vec::new(),
         });
         self.active_finalizers.push(id);
+        self.lexical_finalizers.push(id);
         id
     }
 
@@ -4875,6 +4878,11 @@ fn finish_finalizer_region(
     let body_block_start = context.blocks.len();
     let entry = context.finalizer_regions[region_id.0].entry;
     let fallthrough = lower_scoped_block(&finally.block, entry, return_type, context)?;
+    let lexical = context
+        .lexical_finalizers
+        .pop()
+        .expect("finalizer completion requires a lexical region");
+    assert_eq!(lexical, region_id, "finalizers must complete inside-out");
     let body_block_end = context.blocks.len();
     let completion = context.create_block();
     for block in fallthrough {
