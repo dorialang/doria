@@ -23,6 +23,14 @@ $require = static function (string $path, string $contents, array $needles) use 
     }
 };
 
+$forbid = static function (string $path, string $contents, array $needles) use (&$failures): void {
+    foreach ($needles as $needle) {
+        if (str_contains($contents, $needle)) {
+            $failures[] = "{$path}: contains stale or duplicate Phase F authority `{$needle}`";
+        }
+    }
+};
+
 $namespacePath = 'docs/decisions/0117-namespaces-compile-time-autoloading-hybrid-source-layout-and-package-compilation-graphs.md';
 $batonPath = 'docs/decisions/0118-baton-manifests-package-dependencies-resolution-lockfiles-workspaces-and-caches.md';
 $planPath = 'docs/doria-end-to-end-plan.md';
@@ -31,6 +39,7 @@ $auditPath = 'docs/notes/plan-open-questions-audit.md';
 $specPath = 'SPEC.md';
 $readmePath = 'README.md';
 $decision0028Path = 'docs/decisions/0028-namespaces-use-include-and-directives.md';
+$decision0115Path = 'docs/decisions/0115-match-expressions-patterns-exhaustiveness-narrowing-and-ownership.md';
 $websiteGuidelinesPath = 'docs/website-content-guidelines.md';
 
 $namespace = $read($namespacePath);
@@ -41,6 +50,7 @@ $audit = $read($auditPath);
 $spec = $read($specPath);
 $readme = $read($readmePath);
 $decision0028 = $read($decision0028Path);
+$decision0115 = $read($decision0115Path);
 $websiteGuidelines = $read($websiteGuidelinesPath);
 
 $require($namespacePath, $namespace, [
@@ -72,6 +82,15 @@ $require($namespacePath, $namespace, [
     'versioned JSON build plan',
     'make `doriac` parse `Baton.toml`',
     'parse Doria declarations',
+    '## Namespace Syntax And Resolution',
+    'Any name containing `\` is absolute',
+    'explicit imports -> current namespace -> edition prelude',
+    'Wildcard imports such as `use Doria\Std\Math\*;` are rejected',
+    'standard-library root is `Doria\Std`',
+    'compiler injects a small documented prelude',
+    'Prelude additions are edition-scoped',
+    'Language intrinsics are resolved before namespace lookup',
+    'cannot be redeclared',
     'Stage 31 Slice 1',
     'Stage 31 Slice 2',
     'Stage 29 remains the next compiler stage',
@@ -118,6 +137,7 @@ $require($planPath, $plan, [
     'Stage 31 — Namespaces and package compilation graph',
     'Stage 33 — Baton package and dependency workflow',
     'Stage 29 is next',
+    'Decision 0117 owns the complete namespace syntax and resolution contract',
 ]);
 $require($pipelinePath, $pipeline, [
     'Phase F Namespace, Autoload, Package, And Dependency Authority — Accepted',
@@ -133,14 +153,21 @@ $require($decision0028Path, $decision0028, [
     'Phase F amendment: Decision 0117',
     "record's distinction among",
 ]);
+$require($decision0115Path, $decision0115, [
+    'Decision 0117 satisfies the former Stage 31 authority prerequisite',
+    'Decision 0118 owns dependency discovery and resolution',
+]);
 $require($specPath, $spec, [
     'Decision 0117 defines compile-time autoloading',
     'The public manifest term `autoload`',
     '`internal` is accessible throughout',
 ]);
 $require($readmePath, $readme, [
-    'Baton is Doria\'s project and package tool',
-    'never search for or load',
+    'Baton is the accepted project and package tool for Doria',
+    'bootstrap reads manifest schema 1 only',
+    'accepted target adds schema 2',
+    'executables will never',
+    'search for or load source files at runtime',
 ]);
 $require($websiteGuidelinesPath, $websiteGuidelines, [
     '## Package And Autoload Positioning',
@@ -150,6 +177,22 @@ $require($websiteGuidelinesPath, $websiteGuidelines, [
     '`include` explicitly adds one same-package source file at compile time',
     'dependencies add other packages',
     'Do not add stage numbers',
+]);
+
+$forbid($decision0115Path, $decision0115, [
+    'Stage 31 still requires a pre-implementation authority amendment',
+]);
+$forbid($planPath, $plan, [
+    '### Decision 0117 detail',
+    '**Any name containing `\` is absolute.',
+    '**Group `use`, no wildcards.**',
+    '**The prelude is a small documented list',
+    '**Intrinsics are language, not library',
+]);
+$forbid($readmePath, $readme, [
+    'Baton resolves that project',
+    'dependency resolution is recorded in JSON `Baton.lock`',
+    'workspaces share one lockfile',
 ]);
 
 foreach (['Andrew', 'Lucy', 'Masiye'] as $privateName) {

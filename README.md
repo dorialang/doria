@@ -137,13 +137,17 @@ cleanup.
 
 Official language-server and editor integrations are developed separately in [`dorialang/doria-language-server`](https://github.com/dorialang/doria-language-server), which consumes reusable `doriac` frontend services without duplicating compiler semantics.
 
-Baton is Doria's project and package tool. A `Baton.toml` describes package
-identity, targets, compile-time `autoload` mappings, dependencies, development
-dependencies, and explicit processors. Baton resolves that project into a
-versioned build plan for `doriac`; Doria executables never search for or load
-source files at runtime. Package versions use SemVer, deterministic dependency
-resolution is recorded in JSON `Baton.lock`, and workspaces share one lockfile
-without merging package `internal` boundaries.
+Baton is the accepted project and package tool for Doria. Its current PHP
+bootstrap reads manifest schema 1 only: one binary target with an explicit
+entry file and no autoload, dependencies, lockfile, or workspace. Decision
+0118's accepted target adds schema 2, where `Baton.toml` will describe
+package identity, targets, compile-time `autoload` mappings, dependencies,
+development dependencies, and explicit processors. Baton will resolve that
+project into a versioned build plan for `doriac`; Doria executables will never
+search for or load source files at runtime. Package versions will use SemVer,
+deterministic dependency resolution will be recorded in JSON `Baton.lock`, and
+workspaces will share one lockfile without merging package `internal`
+boundaries.
 
 The CLI supports human, concise, and versioned JSON diagnostics. Human and
 concise output go to stderr; JSON goes to stdout for tools:

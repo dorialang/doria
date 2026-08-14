@@ -36,6 +36,51 @@ Doria autoloading happens during compilation. There is no runtime Doria source
 autoloader. A finished program never searches for, parses, or loads `.doria`
 files.
 
+## Namespace Syntax And Resolution
+
+The namespace separator is `\`. `::` remains static member access, `.` remains
+concatenation, and `/` remains division. Any name containing `\` is absolute;
+Doria has no leading-`\` form and no relative qualified-name form. An
+unqualified name follows one resolution chain for every symbol kind and every
+type or value position:
+
+```text
+explicit imports -> current namespace -> edition prelude
+```
+
+File-scope `use` supports individual imports, aliases, and grouped imports:
+
+```doria
+use Doria\Std\Math\{Vector2, Vector3, Quaternion};
+use Acme\Http\Client as HttpClient;
+```
+
+Wildcard imports such as `use Doria\Std\Math\*;` are rejected. They make name
+resolution depend on later library additions and can silently collide with
+local declarations.
+
+The standard-library root is `Doria\Std`, with PascalCase namespace segments
+and folded acronyms such as `Doria\Std\Io`, `Doria\Std\Http`, and
+`Doria\Std\Json`. First-party modules outside the standard library use
+`Doria\<Module>`.
+
+The compiler injects a small documented prelude rather than a wildcard import.
+It contains compiler-known core interfaces, beginning with `Displayable` and
+later including `Comparable`, `Equatable`, and `Cloneable`; primitive
+companions from `Int` and the fixed-width integer companions through `Float`
+and `Bool`; and the core collections `List`, `Dictionary`, and `Set`. Domain
+modules such as `Console` and `Vector3` require explicit imports.
+
+Prelude additions are edition-scoped because a new prelude name can collide
+with user source. User declarations may shadow ordinary prelude conveniences,
+but compiler-known names remain reserved under their owning decisions.
+
+Language intrinsics are resolved before namespace lookup, have no namespace or
+prelude entry, and cannot be redeclared. This includes the accepted I/O and
+formatting intrinsic family, byte I/O intrinsics, and `panic`. Library objects
+such as the future `Doria\Std\Io` stream types remain ordinary namespaced
+declarations rather than intrinsics.
+
 ## Manifest Source Mappings
 
 The canonical main-source table is:

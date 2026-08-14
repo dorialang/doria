@@ -383,9 +383,9 @@ the end-to-end plan rather than frozen in this Stage 28 record.
 - The open-questions audit no longer lists match as an unauthored subject.
 - The former PHP B1301 boundary for valid exact numeric tests after `mixed` is
   removed; faithful backend-private tags preserve Doria identity instead.
-- Stage 31 still requires a pre-implementation authority amendment for public
-  `autoload` vocabulary, namespace-prefix-to-path mappings, main/test/generated
-  autoload scopes, dependency source discovery, deterministic package graphs,
-  incremental source indexing, and top-level execution across autoloaded files.
-  Internal plans may use `SourceRoot`, `SourceMapping`, and
-  `PackageSourceGraph`; the public manifest term remains `autoload`.
+- Decision 0117 satisfies the former Stage 31 authority prerequisite for public
+  `autoload` vocabulary, namespace-prefix mappings, source scopes,
+  deterministic package graphs, incremental source ownership, and top-level
+  execution. Decision 0118 owns dependency discovery and resolution. Stage 31
+  remains scheduled and must implement those accepted records rather than
+  reopening this prerequisite.
