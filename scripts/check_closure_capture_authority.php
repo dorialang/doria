@@ -1,0 +1,179 @@
+<?php
+
+declare(strict_types=1);
+
+/**
+ * @return list<string>
+ */
+function check_closure_capture_authority(string $root): array
+{
+    $failures = [];
+
+    $read = static function (string $path) use ($root, &$failures): string {
+        $contents = @file_get_contents($root . '/' . $path);
+        if (!is_string($contents)) {
+            $failures[] = "{$path}: required file is missing or unreadable";
+            return '';
+        }
+
+        return $contents;
+    };
+
+    $require = static function (string $path, string $contents, array $needles) use (&$failures): void {
+        foreach ($needles as $needle) {
+            if (!str_contains($contents, $needle)) {
+                $failures[] = "{$path}: missing closure-capture authority `{$needle}`";
+            }
+        }
+    };
+
+    $forbid = static function (string $path, string $contents, array $needles) use (&$failures): void {
+        foreach ($needles as $needle) {
+            if (str_contains($contents, $needle)) {
+                $failures[] = "{$path}: forbidden stale closure-capture authority `{$needle}`";
+            }
+        }
+    };
+
+    $decisionPath = 'docs/decisions/0120-explicit-closure-capture-lists.md';
+    $planPath = 'docs/doria-end-to-end-plan.md';
+    $specPath = 'SPEC.md';
+    $pipelinePath = 'docs/notes/current-pipeline.md';
+    $auditPath = 'docs/notes/plan-open-questions-audit.md';
+    $examplesPath = 'examples/future/stage30/README.md';
+
+    $decision = $read($decisionPath);
+    $plan = $read($planPath);
+    $spec = $read($specPath);
+    $pipeline = $read($pipelinePath);
+    $audit = $read($auditPath);
+    $examples = $read($examplesPath);
+
+    $require($decisionPath, $decision, [
+        '# Decision 0120: Explicit Closure Capture Lists',
+        '**Status:** Accepted',
+        'All captures of surrounding local bindings are explicit.',
+        'anonymous block functions use the same `with` capture list',
+        'Copy values still require an explicit capture',
+        'Move values still require an explicit capture',
+        'There is no automatic capture for arrows, anonymous functions, Copy locals,',
+        'A closure that uses no surrounding local omits `with`',
+        '`with ($value)` borrows the binding readonly',
+        '`with (writable $value)` takes an exclusive writable borrow',
+        '`with (take $value)` transfers ownership',
+        'namespace-import keyword and is not a closure alias',
+        'Changing an arrow closure into an anonymous block closure must not change its',
+        'Closure Must Capture `$minimum`',
+        '## Pre-Stage-30 Grammar Slice',
+        'two-clocks rule requires accepted syntax to parse',
+        'owns `fn` and anonymous-function expression tokens and',
+        'source-preserving AST nodes',
+        'accepted-syntax regression tests',
+        'Parsed closures stop at one stage-named Stage',
+        'This grammar slice does not perform free-variable discovery',
+        'Stage 30 consumes the source-preserving closure AST',
+        'Decision 0119 owns source-ordered checked-effect sets',
+        'effect inference. Stage 30 must integrate closure bodies',
+        'Stage 30 must settle `$this` independently',
+        'The later structured-concurrency stage owns async closures',
+        'The audit found no accepted grant of',
+        'runtime reflection occurs',
+        'not PHP arrow-function',
+        'Rust bootstrap representation does not define the language model',
+    ]);
+
+    $require($planPath, $plan, [
+        'Both forms require a `with` list when they reference enclosing local bindings',
+        'Copy, readonly, writable, and Move bindings have no implicit-capture exception',
+        'A closure with no surrounding-local dependency omits `with`',
+        'Changing an arrow into a block closure preserves its capture list and ownership modes',
+        'Decision 0120: explicit closure capture lists',
+        '**Pre-Stage-30 Grammar Slice — Closure accepted syntax.**',
+        'Scheduled immediately after Stage 29 and before Stage 30',
+        'Successfully parsed closures stop at one stage-named Stage 30 unsupported-feature boundary',
+        'This slice does not perform free-variable discovery',
+        'Stage 30 remains blocked until Stage 29 and the pre-Stage-30 grammar slice complete',
+        'A missing capture receives a capture-specific diagnostic',
+        'Closure callable types preserve Stage 29',
+        '`List<T>` `map`, `filter`, and `reduce` use this same closure model',
+        'No automatic-capture exception exists for Copy values',
+    ]);
+    $forbid($planPath, $plan, [
+        'auto-capturing arrow functions',
+        'arrow-function auto-capture',
+        'arrow functions automatically capture',
+    ]);
+
+    $require($specPath, $spec, [
+        'Closure captures are explicit for both arrow functions and anonymous block',
+        'There is no automatic arrow capture',
+        '`with ($value)` is a readonly borrow',
+        '`with (writable $value)` is an exclusive',
+        '`with (take $value)` transfers ownership',
+        '`use` is not a closure-capture alias',
+        'A closure that uses no enclosing local',
+        '`$this` capture remains a bounded Stage 30',
+    ]);
+
+    $require($pipelinePath, $pipeline, [
+        'Decision 0120 accepts one explicit closure-capture model',
+        'Stage 29 — In Progress',
+        'Stage 29 Slice 1 — Complete',
+        'Stage 29 Slice 2 — Next',
+        'Stage 29 Slice 3 — Pending',
+        'Stage 30 — Blocked Until Stage 29 Completes',
+        'Decision 0120 — Accepted; Stage 30 Authority Only',
+        'Pre-Stage-30 Grammar Slice — Scheduled After Stage 29',
+    ]);
+
+    $require($auditPath, $audit, [
+        'decision 0120 requires explicit `with` capture lists',
+        'pre-Stage-30 grammar slice owns accepted lexer/parser/AST syntax',
+        'No accepted authority grants those',
+        'decision 0120 deliberately adds no public method',
+    ]);
+
+    $require($examplesPath, $examples, [
+        'These snippets are accepted Stage 30 target-state documentation. They are not',
+        'registered as `.doria` examples or native parity fixtures',
+        'Repository `.doria`',
+        'examples are required to parse under the two-clocks rule',
+        'let $double = fn(int $value) => $value * 2;',
+        'fn(int $score) with ($minimum) =>',
+        'function (int $score): bool with ($minimum) {',
+        'with (writable $count)',
+        'with (take $payload)',
+        'function(): string',
+        'with ($bonus)',
+        'fn(string $label) =>',
+        'Doria\Std\Io\IoError',
+        'Closure Must Capture',
+        'between an arrow\'s',
+        'ordinary moved-value diagnostic',
+        'readonly capture is borrow-bound',
+    ]);
+
+    foreach (['Andrew', 'Lucy', 'Maya', 'Masiye'] as $personalName) {
+        if (stripos($examples, $personalName) !== false) {
+            $failures[] = "examples/future/stage30: personal or family name `{$personalName}` is forbidden";
+        }
+    }
+
+    $grammarPosition = strpos($plan, '**Pre-Stage-30 Grammar Slice — Closure accepted syntax.**');
+    $stage30Position = strpos($plan, '**Stage 30 — Closures.**');
+    if ($grammarPosition === false || $stage30Position === false || $grammarPosition >= $stage30Position) {
+        $failures[] = "{$planPath}: the accepted-syntax grammar slice must precede Stage 30";
+    }
+
+    return $failures;
+}
+
+if (realpath($_SERVER['SCRIPT_FILENAME'] ?? '') === __FILE__) {
+    $failures = check_closure_capture_authority(dirname(__DIR__));
+    if ($failures !== []) {
+        fwrite(STDERR, "closure capture authority check failed:\n- " . implode("\n- ", $failures) . "\n");
+        exit(1);
+    }
+
+    fwrite(STDOUT, "closure capture authority check passed\n");
+}
