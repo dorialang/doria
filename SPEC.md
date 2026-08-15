@@ -388,9 +388,11 @@ between arrow and block bodies preserves the capture list and its ownership
 modes. Own parameters and locals, top-level functions, constants, statics, type
 names, and enum cases do not require capture.
 
-This accepted surface is scheduled for Stage 30 and is not implemented yet.
-Stage 30 also owns capture-specific diagnostics, callable-effect integration,
-and borrow-bound escape checking. `$this` capture remains a bounded Stage 30
+This accepted surface is not implemented yet. Under the two-clocks rule, a
+pre-Stage-30 grammar slice will first accept and preserve the syntax in AST while
+emitting one Stage 30 unsupported-feature boundary. Stage 30 then owns semantic
+capture diagnostics, callable-effect integration, borrow-bound escape checking,
+HIR/MIR lowering, and execution. `$this` capture remains a bounded Stage 30
 design question; this specification does not invent `with ($this)` or assign it
 automatic behavior.
 

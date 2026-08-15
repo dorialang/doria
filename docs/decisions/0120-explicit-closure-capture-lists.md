@@ -3,8 +3,8 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-15
 - **Date:** 2026-08-15
-- **Implementation status:** Authority accepted; Stage 30 remains blocked until
-  Stage 29 completes
+- **Implementation status:** Authority accepted; the pre-Stage-30 grammar slice
+  is scheduled after Stage 29; Stage 30 remains blocked until both complete
 - **Scope:** Closure capture spelling, ownership modes, diagnostics, Stage 30
   boundaries, and backend-independent behavior
 - **Amends:** D10 and the Stage 30 plan; preserves Decision 0119's callable-effect
@@ -195,13 +195,30 @@ none. Result shapes, traversal contracts, callback ownership, dictionary entry
 shapes, and any wider shared algorithm surface remain unresolved until accepted
 separately.
 
+## Pre-Stage-30 Grammar Slice
+
+The repository's two-clocks rule requires accepted syntax to parse before its
+semantic execution stage. A bounded grammar slice therefore runs after Stage 29
+and before Stage 30. It owns `fn` and anonymous-function expression tokens and
+productions, explicit parameter and return syntax, `with` capture-list syntax,
+capture-mode syntax, source-preserving AST nodes, parser recovery, and
+accepted-syntax regression tests. Parsed closures stop at one stage-named Stage
+30 unsupported-feature boundary until semantic implementation lands.
+
+This grammar slice does not perform free-variable discovery, capture validation,
+mode checking, HIR/MIR lowering, ownership analysis, closure calls, environment
+construction, collection algorithms, or backend execution. Documentation-only
+snippets remain outside the checked `.doria` example inventory until the grammar
+slice lands; afterward they become parser fixtures without claiming execution.
+
 ## Stage 30 Ownership
 
-Stage 30 owns closure grammar, explicit capture lists, capture validation,
-environment ownership and representation, function types, closure calls,
-checked-effect integration, borrow-bound escape checking, accepted closure-based
-collection algorithms, interpreter/Cranelift/LLVM execution, PHP compatibility,
-language-server integration, and website/playground activation.
+Stage 30 consumes the source-preserving closure AST and owns explicit capture
+validation, environment ownership and representation, function types, closure
+calls, checked-effect integration, borrow-bound escape checking, accepted
+closure-based collection algorithms, interpreter/Cranelift/LLVM execution, PHP
+compatibility, language-server semantic integration, and website/playground
+activation.
 
 The later structured-concurrency stage owns async closures, spawned closures,
 task-group closures, cross-task captures, `Sendable`, `Shareable`, and concurrent
@@ -259,11 +276,12 @@ Rust bootstrap representation does not define the language model.
 
 ## Affected Components
 
-Stage 30 lexer/parser/AST/HIR/MIR work; semantic name and capture checking;
-ownership and borrow analysis; diagnostics and structured fixes; function types
-and checked effects; `List` closure algorithms; interpreter, Cranelift, LLVM, and
-PHP lowering; language-server and editor tooling; future examples, website and
-playground activation; self-hosting compiler code; performance and escape work.
+The pre-Stage-30 lexer/parser/AST grammar slice; Stage 30 HIR/MIR work, semantic
+name and capture checking, ownership and borrow analysis, diagnostics and
+structured fixes, function types and checked effects, `List` closure algorithms,
+interpreter, Cranelift, LLVM, and PHP lowering; language-server and editor
+tooling; future examples, website and playground activation; self-hosting compiler
+code; performance and escape work.
 
 ## Invalidated Elsewhere
 
@@ -271,6 +289,8 @@ playground activation; self-hosting compiler code; performance and escape work.
 - The master plan closure section must use explicit capture for both forms.
 - Stage 30 must implement capture-specific diagnostics and preserve Decision
   0119's effect-set law.
+- Accepted closure syntax must land in the pre-Stage-30 grammar slice rather than
+  waiting for semantic/runtime implementation.
 - Existing or future arrow examples that reference enclosing locals without
   `with` must be corrected; no-capture arrows remain unchanged.
 - LSP, VS Code, IntelliJ, all execution backends, async work, self-hosting, and

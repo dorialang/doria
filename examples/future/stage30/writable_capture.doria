@@ -1,9 +1,0 @@
-function main(): void
-{
-    let writable $count = 0;
-
-    let $next = function (): int with (writable $count) {
-        $count += 1;
-        return $count;
-    };
-}

@@ -64,7 +64,14 @@ function check_closure_capture_authority(string $root): array
         'namespace-import keyword and is not a closure alias',
         'Changing an arrow closure into an anonymous block closure must not change its',
         'Closure Must Capture `$minimum`',
-        'Stage 30 owns closure grammar, explicit capture lists, capture validation',
+        '## Pre-Stage-30 Grammar Slice',
+        'two-clocks rule requires accepted syntax to parse',
+        'owns `fn` and anonymous-function expression tokens and',
+        'source-preserving AST nodes',
+        'accepted-syntax regression tests',
+        'Parsed closures stop at one stage-named Stage',
+        'This grammar slice does not perform free-variable discovery',
+        'Stage 30 consumes the source-preserving closure AST',
         'Decision 0119 owns source-ordered checked-effect sets',
         'effect inference. Stage 30 must integrate closure bodies',
         'Stage 30 must settle `$this` independently',
@@ -81,7 +88,11 @@ function check_closure_capture_authority(string $root): array
         'A closure with no surrounding-local dependency omits `with`',
         'Changing an arrow into a block closure preserves its capture list and ownership modes',
         'Decision 0120: explicit closure capture lists',
-        'Stage 30 remains blocked until Stage 29 completes and is not implemented',
+        '**Pre-Stage-30 Grammar Slice — Closure accepted syntax.**',
+        'Scheduled immediately after Stage 29 and before Stage 30',
+        'Successfully parsed closures stop at one stage-named Stage 30 unsupported-feature boundary',
+        'This slice does not perform free-variable discovery',
+        'Stage 30 remains blocked until Stage 29 and the pre-Stage-30 grammar slice complete',
         'A missing capture receives a capture-specific diagnostic',
         'Closure callable types preserve Stage 29',
         '`List<T>` `map`, `filter`, and `reduce` use this same closure model',
@@ -112,68 +123,46 @@ function check_closure_capture_authority(string $root): array
         'Stage 29 Slice 3 — Pending',
         'Stage 30 — Blocked Until Stage 29 Completes',
         'Decision 0120 — Accepted; Stage 30 Authority Only',
+        'Pre-Stage-30 Grammar Slice — Scheduled After Stage 29',
     ]);
 
     $require($auditPath, $audit, [
         'decision 0120 requires explicit `with` capture lists',
+        'pre-Stage-30 grammar slice owns accepted lexer/parser/AST syntax',
         'No accepted authority grants those',
         'decision 0120 deliberately adds no public method',
     ]);
 
     $require($examplesPath, $examples, [
-        'registered as native parity fixtures',
+        'These snippets are accepted Stage 30 target-state documentation. They are not',
+        'registered as `.doria` examples or native parity fixtures',
+        'Repository `.doria`',
+        'examples are required to parse under the two-clocks rule',
+        'let $double = fn(int $value) => $value * 2;',
+        'fn(int $score) with ($minimum) =>',
+        'function (int $score): bool with ($minimum) {',
+        'with (writable $count)',
+        'with (take $payload)',
+        'function(): string',
+        'with ($bonus)',
+        'fn(string $label) =>',
+        'Doria\Std\Io\IoError',
         'Closure Must Capture',
         'between an arrow\'s',
         'ordinary moved-value diagnostic',
         'readonly capture is borrow-bound',
     ]);
 
-    $exampleFiles = [
-        'examples/future/stage30/no_capture.doria',
-        'examples/future/stage30/readonly_arrow_capture.doria',
-        'examples/future/stage30/readonly_block_capture.doria',
-        'examples/future/stage30/writable_capture.doria',
-        'examples/future/stage30/taking_capture.doria',
-        'examples/future/stage30/collection_pipeline.doria',
-    ];
-
-    $allExamples = $examples;
-    foreach ($exampleFiles as $path) {
-        $contents = $read($path);
-        $allExamples .= "\n" . $contents;
-        if (str_contains($contents, 'with ()')) {
-            $failures[] = "{$path}: no-capture closures must omit `with`; empty capture lists are forbidden";
+    foreach (['Andrew', 'Lucy', 'Maya', 'Masiye'] as $personalName) {
+        if (stripos($examples, $personalName) !== false) {
+            $failures[] = "examples/future/stage30: personal or family name `{$personalName}` is forbidden";
         }
     }
 
-    $require('examples/future/stage30/no_capture.doria', $read($exampleFiles[0]), [
-        'fn(int $value) =>',
-        'function (int $value): bool {',
-    ]);
-    $require('examples/future/stage30/readonly_arrow_capture.doria', $read($exampleFiles[1]), [
-        'fn(int $score) with ($minimum) =>',
-    ]);
-    $require('examples/future/stage30/readonly_block_capture.doria', $read($exampleFiles[2]), [
-        'function (int $score): bool with ($minimum) {',
-    ]);
-    $require('examples/future/stage30/writable_capture.doria', $read($exampleFiles[3]), [
-        'with (writable $count)',
-    ]);
-    $require('examples/future/stage30/taking_capture.doria', $read($exampleFiles[4]), [
-        'with (take $payload)',
-        'function(): string',
-    ]);
-    $require('examples/future/stage30/collection_pipeline.doria', $read($exampleFiles[5]), [
-        'with ($minimum)',
-        'with ($bonus)',
-        'fn(string $label) =>',
-        'Doria\Std\Io\IoError',
-    ]);
-
-    foreach (['Andrew', 'Lucy', 'Maya', 'Masiye'] as $personalName) {
-        if (stripos($allExamples, $personalName) !== false) {
-            $failures[] = "examples/future/stage30: personal or family name `{$personalName}` is forbidden";
-        }
+    $grammarPosition = strpos($plan, '**Pre-Stage-30 Grammar Slice — Closure accepted syntax.**');
+    $stage30Position = strpos($plan, '**Stage 30 — Closures.**');
+    if ($grammarPosition === false || $stage30Position === false || $grammarPosition >= $stage30Position) {
+        $failures[] = "{$planPath}: the accepted-syntax grammar slice must precede Stage 30";
     }
 
     return $failures;
