@@ -90,6 +90,8 @@ pub struct SemanticInfo {
     pub(crate) flow_facts: crate::narrowing::FactsByUse,
     /// Declared, source-ordered checked effects for each callable declaration.
     pub callable_checked_effects: HashMap<usize, Vec<ResolvedType>>,
+    /// Exact checked effects produced at each source operation.
+    pub(crate) checked_effect_sites: crate::checked_effects::EffectSiteMap,
     /// Resolved owned Error type transferred by each `throw` statement.
     pub throw_error_types: HashMap<(usize, usize), ResolvedType>,
     /// Protected effects left after catch coverage for each `try` statement.
@@ -322,6 +324,8 @@ pub fn analyze_program_for_ide_with_source<'source>(
             .extend(crate::constructor_init::check_program(
                 program,
                 &checker.given_preludes,
+                &checker.checked_effect_sites,
+                &checker.catch_error_types,
             ));
     }
     if checker.diagnostics.is_empty() {
@@ -347,12 +351,16 @@ pub fn analyze_program_for_ide_with_source<'source>(
             .collect();
         let ownership_diagnostics = crate::ownership::check_program_with_inferred_move_returns(
             program,
-            &inferred_move_returns,
-            &return_borrows,
-            &checker.expression_types,
-            &checker.flow_facts,
-            &move_enum_names,
-            &checker.given_preludes,
+            &crate::ownership::OwnershipAnalysisContext {
+                inferred_move_returns: &inferred_move_returns,
+                return_borrows: &return_borrows,
+                resolved_types: &checker.expression_types,
+                flow_facts: &checker.flow_facts,
+                move_enum_names: &move_enum_names,
+                given_preludes: &checker.given_preludes,
+                checked_effect_sites: &checker.checked_effect_sites,
+                catch_error_types: &checker.catch_error_types,
+            },
         );
         checker.diagnostics.extend(ownership_diagnostics);
     }
@@ -385,6 +393,7 @@ pub fn analyze_program_for_ide_with_source<'source>(
             return_borrows,
             flow_facts: checker.flow_facts,
             callable_checked_effects: checker.callable_checked_effects,
+            checked_effect_sites: checker.checked_effect_sites,
             throw_error_types: checker.throw_error_types,
             try_uncovered_effects: checker.try_uncovered_effects,
             catch_error_types: checker.catch_error_types,
@@ -1052,6 +1061,7 @@ struct Checker<'program> {
     effect_scopes: Vec<CheckedEffectSet>,
     class_initializer_effects: HashMap<String, CheckedEffectSet>,
     callable_checked_effects: HashMap<usize, Vec<ResolvedType>>,
+    checked_effect_sites: crate::checked_effects::EffectSiteMap,
     throw_error_types: HashMap<(usize, usize), ResolvedType>,
     try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
     catch_error_types: HashMap<(usize, usize), ResolvedType>,
@@ -1580,6 +1590,7 @@ impl<'program> Checker<'program> {
             effect_scopes: Vec::new(),
             class_initializer_effects: HashMap::new(),
             callable_checked_effects: HashMap::new(),
+            checked_effect_sites: HashMap::new(),
             throw_error_types: HashMap::new(),
             try_uncovered_effects: HashMap::new(),
             catch_error_types: HashMap::new(),
@@ -4459,6 +4470,11 @@ impl<'program> Checker<'program> {
 
     fn record_checked_effects(&mut self, effects: impl IntoIterator<Item = TypeId>, span: Span) {
         let effects = effects.into_iter().collect::<Vec<_>>();
+        crate::checked_effects::record_effect_site(
+            &mut self.checked_effect_sites,
+            span,
+            effects.iter().map(|effect| self.types.resolved(*effect)),
+        );
         if let Some(scope) = self.effect_scopes.last_mut() {
             scope.extend(effects);
             return;

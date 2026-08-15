@@ -2,6 +2,7 @@ pub mod arg_binding;
 pub mod ast;
 pub mod backend;
 pub mod builtins;
+mod checked_effects;
 pub mod class_layout;
 pub mod codegen_cranelift;
 #[cfg(feature = "llvm-backend")]

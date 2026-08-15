@@ -611,6 +611,109 @@ function create(): Box throws Failure {{ return new Box(); }}
 }
 
 #[test]
+fn ownership_catches_join_the_state_at_each_matching_throw_site() {
+    let source = format!(
+        r#"
+{}
+class Payload {{}}
+function consume(take Payload $payload): void {{}}
+function fail(): void throws Failure {{ throw new Failure("failure"); }}
+function inspect(Payload $payload): void {{}}
+function invalid(): void
+{{
+    let writable $payload = new Payload();
+    try {{
+        consume($payload);
+        fail();
+        $payload = new Payload();
+    }} catch (Failure) {{}}
+    inspect($payload);
+}}
+"#,
+        error_class("Failure")
+    );
+    assert_code(&source, "E0470");
+}
+
+#[test]
+fn constructor_catches_observe_completed_writes_before_throw() {
+    let source = format!(
+        r#"
+{}
+function fail(): void throws Failure {{ throw new Failure("failure"); }}
+class Ready
+{{
+    string $value;
+    function __construct()
+    {{
+        try {{
+            $this->value = "ready";
+            fail();
+        }} catch (Failure) {{}}
+    }}
+}}
+"#,
+        error_class("Failure")
+    );
+    doriac::check_source("checked_error.doria", source)
+        .expect("a caught throw must preserve constructor writes completed before it");
+}
+
+#[test]
+fn constructor_catches_do_not_observe_writes_after_a_throwing_rhs() {
+    let source = format!(
+        r#"
+{}
+function load(): string throws Failure {{ throw new Failure("failure"); }}
+class NotReady
+{{
+    string $value;
+    function __construct()
+    {{
+        try {{
+            $this->value = load();
+        }} catch (Failure) {{}}
+    }}
+}}
+"#,
+        error_class("Failure")
+    );
+    assert_code(&source, "E0500");
+}
+
+#[test]
+fn concrete_catches_receive_only_matching_exceptional_states() {
+    let source = format!(
+        r#"
+{}
+{}
+class Payload {{}}
+function failFirst(): void throws FirstError {{ throw new FirstError("first"); }}
+function failSecond(): void throws SecondError {{ throw new SecondError("second"); }}
+function consume(take Payload $payload): void {{}}
+function inspect(Payload $payload): void {{}}
+function valid(bool $first): void throws SecondError
+{{
+    let writable $payload = new Payload();
+    try {{
+        if ($first) {{
+            failFirst();
+        }}
+        consume($payload);
+        failSecond();
+    }} catch (FirstError) {{
+        inspect($payload);
+    }}
+}}
+"#,
+        error_class("FirstError"),
+        error_class("SecondError")
+    );
+    doriac::check_source("checked_error.doria", source)
+        .expect("a concrete catch must not receive a different error type's ownership state");
+}
+
+#[test]
 fn stage29_slice1_stops_once_before_mir_and_backends() {
     let source = format!(
         "{} function fail(): void throws Failure {{ throw new Failure(\"x\"); }}",
