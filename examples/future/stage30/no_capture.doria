@@ -1,0 +1,8 @@
+function main(): void
+{
+    let $double = fn(int $value) => $value * 2;
+
+    let $positive = function (int $value): bool {
+        return $value > 0;
+    };
+}

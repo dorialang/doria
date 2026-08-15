@@ -363,6 +363,37 @@ let $format = function (int $score): string {
 
 Omitting a parameter type is a syntax or semantic error even when the surrounding expression makes the intended type obvious.
 
+Closure captures are explicit for both arrow functions and anonymous block
+functions. When a closure references a local binding from an enclosing lexical
+scope, the binding must appear in a `with` clause. This applies to Copy and Move
+bindings, readonly and writable bindings, outer parameters, and enclosing
+pattern, catch, and `given` bindings. There is no automatic arrow capture.
+
+```doria
+let $minimum = 70;
+
+let $arrow = fn(int $score) with ($minimum) =>
+    $score >= $minimum;
+
+let $block = function (int $score): bool with ($minimum) {
+    return $score >= $minimum;
+};
+```
+
+`with ($value)` is a readonly borrow, `with (writable $value)` is an exclusive
+writable borrow, and `with (take $value)` transfers ownership into the closure.
+`use` is not a closure-capture alias. A closure that uses no enclosing local
+omits `with`; an empty `with ()` is neither required nor recommended. Changing
+between arrow and block bodies preserves the capture list and its ownership
+modes. Own parameters and locals, top-level functions, constants, statics, type
+names, and enum cases do not require capture.
+
+This accepted surface is scheduled for Stage 30 and is not implemented yet.
+Stage 30 also owns capture-specific diagnostics, callable-effect integration,
+and borrow-bound escape checking. `$this` capture remains a bounded Stage 30
+design question; this specification does not invent `with ($this)` or assign it
+automatic behavior.
+
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.
 
 ## 6. Member access

@@ -1,0 +1,14 @@
+class Payload
+{
+    function __construct(string $value)
+    {
+    }
+}
+function makeReader(
+    take Payload $payload,
+): function(): string
+{
+    return function (): string with (take $payload) {
+        return $payload->value;
+    };
+}

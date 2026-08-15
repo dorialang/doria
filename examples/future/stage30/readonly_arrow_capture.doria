@@ -1,0 +1,7 @@
+function main(): void
+{
+    let $minimum = 70;
+
+    let $passes = fn(int $score) with ($minimum) =>
+        $score >= $minimum;
+}

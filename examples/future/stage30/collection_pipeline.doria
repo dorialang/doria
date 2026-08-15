@@ -1,0 +1,31 @@
+function main(): void throws Doria\Std\Io\IoError
+{
+    List<int> $scores = [65, 72, 88];
+
+    let $minimum = 70;
+    let $bonus = 5;
+
+    let $passing = $scores->filter(
+        fn(int $score) with ($minimum) =>
+            $score >= $minimum
+    );
+
+    let $adjusted = $passing->map(
+        fn(int $score) with ($bonus) =>
+            $score + $bonus
+    );
+
+    foreach ($adjusted as int $score) {
+        echo "{$score}\n";
+    }
+
+    List<string> $labels = ["atlas", "birch", "cedar"];
+
+    let $filteredLabels = $labels->filter(
+        fn(string $label) => $label != "birch"
+    );
+
+    foreach ($filteredLabels as string $label) {
+        echo "{$label}\n";
+    }
+}

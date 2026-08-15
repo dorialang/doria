@@ -32,7 +32,7 @@
 
 ## Already settled / correctly scheduled (not open — do not re-decide)
 
-Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: closures (30), inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Checked errors are no longer in that list: decision 0119 owns the complete Stage 29 contract and Slice 1 is implemented. Namespace/package-graph authority and Baton's manifest/resolver authority are likewise settled by decisions 0117 and 0118. Enums and complete core match are settled by decisions 0114 and 0115. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
+Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Closures are no longer in that list: decision 0120 requires explicit `with` capture lists for arrows and anonymous block functions, while the full Stage 30 decision still owns `$this`, mode validation, callable-effect inference, environment ABI, and implementation slicing. Checked errors are likewise settled by decision 0119, which owns the complete Stage 29 contract and whose Slice 1 is implemented. Namespace/package-graph authority and Baton's manifest/resolver authority are settled by decisions 0117 and 0118. Enums and complete core match are settled by decisions 0114 and 0115. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
 
 ## Open questions (answerable now)
 
@@ -42,6 +42,12 @@ above; their accepted decisions and scheduled work are the authority.
 ## Minor / spec-tightening (lower priority)
 - **`given` + chained `if`: RESOLVED.** Decision 0116 defines one gate for the complete chain. A failed predicate skips every `if`/`else if` condition and selects only the unconditional `else`, when present. Decision 0020 and SPEC now use the same rule.
 - **Collection method surface.** Line 632 sketches List/Dictionary/Set methods but says the surface "gets its own decision record." The names look settled (inventory is 0092); this is closer to an authoring task than an open fork — noted for completeness.
+- **Closure-based collection algorithms.** Decision 0100 grants `map`, `filter`,
+  and `reduce` to `List<T>` at Stage 30. No accepted authority grants those
+  methods to `Dictionary`, `SortedDictionary`, `Set`, `SortedSet`, `Deque`,
+  `T[]`, `Iterable`, or a shared algorithm interface. Their result shapes,
+  traversal contracts, callback ownership, and any dictionary-entry shape remain
+  unresolved; decision 0120 deliberately adds no public method to those types.
 
 ## Recommended deferrals (reason · reopen trigger)
 - **F5** (`uint8[]`↔`Bytes`) → decide with the **collections decision (Stage 23)**; the recommendation above is the direction.

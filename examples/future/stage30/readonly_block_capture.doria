@@ -1,0 +1,8 @@
+function main(): void
+{
+    let $minimum = 70;
+
+    let $passes = function (int $score): bool with ($minimum) {
+        return $score >= $minimum;
+    };
+}
