@@ -61,7 +61,7 @@ is now stale.
 | Flush | The standard-output flush is presently an intentional successful no-op over unbuffered writes, not durable filesystem synchronization. |
 | TTY | Runtime interactivity detection uses `isatty` on Unix and console-handle detection on Windows. |
 | Broken pipe | Unix ignores `SIGPIPE`; Unix `EPIPE` and Windows broken-pipe conditions cleanly exit status 0 for ordinary standard output. |
-| Failures | Runtime panics use decision 0109's unified structured outcomes; Stage 29 migrates ordinary I/O failures to checked errors. |
+| Failures | Runtime panics use decision 0109's unified structured outcomes; Stage 29 Slice 3 migrates ordinary I/O failures to the canonical decision-0119 checked errors. |
 
 ## Architectural constraints carried into review
 
@@ -542,7 +542,7 @@ the capability-specific detail is normalized in the machine-readable manifest.
 - **`write_file` truncates** ("creates or truncates and writes exact bytes") — 0074 §Text files; SPEC "Stage 17" (`write_file creates or truncates`). *At audit time truncate was defined and shipped while append was open (Q3); Decision 0091 has since settled the additive `append_file` spelling for Stage 23.*
 - **Text tier does no newline normalization; byte-exact read & write** — 0074 ("preserves its bytes without newline normalization"; "writes exact bytes"). `read_line` strips exactly one LF or one CRLF at the line boundary — 0074 §Line input; SPEC.
 - **Invalid UTF-8 on read → panic, no lossy/replacement path** ("file contained invalid UTF-8" / "stdin contained invalid UTF-8") — 0074. Raw/undecoded bytes are the `Bytes` tier's job (Stage 23), not a lossy string path.
-- **Text-tier failure model:** panic + status 101 until Stage 29, then declared `throws`; `read_line` `null` = EOF only, never error — 0074, 0075.
+- **Text-tier failure model:** panic + status 101 until Stage 29 Slice 3, then declared `throws`; `read_line` `null` = EOF only, never error — 0074, 0075, 0119.
 - **Terminal layer deferred and bounded:** capability-based `Console` static facade, no escape sequences/handles/ANSI in any public value, Stage 46 build-out, decision number assigned when authored — 0074 §Future terminal boundary; plan §9; 0006.
 - **RAII flush/close on normal exit and on `throws` propagation** (drop elaboration runs `__destruct` at every scope boundary) — plan §3.1, §5. **Abort-only panic runs no cleanup** — 0081 (this is the root of D6).
 - **SIGPIPE is ignored at the runtime** so a closed-pipe write reports EPIPE instead of killing by signal — `doria-rt/src/lib.rs:940` (impl). *The language-level contract was the audit's D1 gap and is now settled by Decision 0091.*

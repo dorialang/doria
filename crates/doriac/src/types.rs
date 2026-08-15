@@ -115,7 +115,9 @@ impl TypeRef {
         }
         match self.name.as_str() {
             "void" | "float" | "float32" | "float64" | "string" | "bool" | "mixed" | "null"
-            | "resource" | "Bytes" | "List" | "Dictionary" | "Set" | "[]" | "Unknown" => None,
+            | "resource" | "Error" | "Bytes" | "List" | "Dictionary" | "Set" | "[]" | "Unknown" => {
+                None
+            }
             _ => Some(&self.name),
         }
     }
@@ -276,6 +278,7 @@ pub enum TypeKind {
     Bool,
     Null,
     Mixed,
+    Error,
     TypedArray(TypeId),
     Unknown,
     Heterogeneous,
@@ -303,6 +306,7 @@ pub enum ResolvedType {
     Bool,
     Null,
     Mixed,
+    Error,
     TypeParameter(String),
     Enum(EnumType),
     Nullable(Box<ResolvedType>),
@@ -345,6 +349,7 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
         | ResolvedType::String
         | ResolvedType::Bytes
         | ResolvedType::Mixed
+        | ResolvedType::Error
         | ResolvedType::Void
         | ResolvedType::Null
         | ResolvedType::TypeParameter(_)
@@ -401,6 +406,7 @@ impl TypeRegistry {
             TypeKind::Bool => "bool".to_string(),
             TypeKind::Null => "null".to_string(),
             TypeKind::Mixed => "mixed".to_string(),
+            TypeKind::Error => "Error".to_string(),
             TypeKind::TypedArray(element) => format!("{}[]", self.display(*element)),
             TypeKind::Unknown => "Unknown".to_string(),
             TypeKind::Heterogeneous => "heterogeneous".to_string(),
@@ -460,6 +466,7 @@ impl TypeRegistry {
             TypeKind::Bool => ResolvedType::Bool,
             TypeKind::Null => ResolvedType::Null,
             TypeKind::Mixed => ResolvedType::Mixed,
+            TypeKind::Error => ResolvedType::Error,
             TypeKind::TypeParameter(name) => ResolvedType::TypeParameter(name.clone()),
             TypeKind::Enum(enum_type) => ResolvedType::Enum(enum_type.clone()),
             TypeKind::Nullable(inner) => ResolvedType::Nullable(Box::new(self.resolved(*inner))),
@@ -510,6 +517,7 @@ impl TypeRegistry {
             ResolvedType::Bool => TypeKind::Bool,
             ResolvedType::Null => TypeKind::Null,
             ResolvedType::Mixed => TypeKind::Mixed,
+            ResolvedType::Error => TypeKind::Error,
             ResolvedType::TypeParameter(name) => TypeKind::TypeParameter(name.clone()),
             ResolvedType::Enum(ty) => TypeKind::Enum(ty.clone()),
             ResolvedType::Nullable(inner) => {

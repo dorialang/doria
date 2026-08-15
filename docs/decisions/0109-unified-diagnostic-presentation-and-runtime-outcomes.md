@@ -87,8 +87,9 @@ runs no cleanup or destructors, and exits with status 101.
 
 ## Checked-error compatibility
 
-Checked errors remain unimplemented. Their future implementation is bound to
-this architecture:
+Decision 0119 implements checked-error grammar and static checking in Stage 29
+Slice 1. Slice 2 execution and Slice 3 runtime reporting remain bound to this
+architecture:
 
 - compile-time checked-error violations are ordinary language diagnostics;
 - a caught checked error is ordinary program control flow and emits no
@@ -102,10 +103,11 @@ this architecture:
   are reused.
 
 The old conceptual lowercase `error: <Class>: <message>` line is not a separate
-permanent rendering contract. Its error identity, message, cleanup semantics,
-and status remain accepted. The exact header, message placement, origin,
-propagation path, cause-chain, help, and sensitive-message policy require
-designer review when checked errors are implemented.
+permanent rendering contract. Decision 0119 settles the shared presentation as
+`Error[R1000]: Unhandled <ConcreteType>` with status 70, first-throw origin, no
+default propagation path or automatic cause chain, and safe human rendering of
+untrusted message text. Slice 3 implements that target through this decision's
+existing diagnostic and runtime-outcome model.
 
 ## Consequences
 
@@ -120,8 +122,9 @@ designer review when checked errors are implemented.
   fallback.
 - The previous function-only `DrStackFrameV1` and message-based built-in panic
   path are retired from production use rather than silently reinterpreted.
-- Checked `throw`/`throws`, `try`, `catch`, propagation, and error objects remain
-  deferred.
+- Checked `throw`/`throws`, `try`, `catch`, Error conformance, and effect checking
+  are implemented in Stage 29 Slice 1. Propagation, runtime Error representation,
+  and R1000 execution remain deferred to Slices 2 and 3 under Decision 0119.
 
 ## Invalidated elsewhere
 

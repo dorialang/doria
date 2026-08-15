@@ -5,6 +5,106 @@ use doriac::ast::{
 use doriac::types::TypeArgumentRef;
 
 #[test]
+fn parses_stage29_checked_error_declarations_and_control_flow() {
+    let program = doriac::parse_source(
+        "test.doria",
+        r#"
+class LoadError implements Error
+{
+    function __construct(string $message)
+        throws LoadError
+    {
+        throw new LoadError($message);
+    }
+
+    static function create(): LoadError throws LoadError
+    {
+        return new LoadError("create");
+    }
+}
+
+function load(): string throws LoadError, Error
+{
+    try {
+        throw new LoadError("load");
+    } catch (LoadError $error) {
+        throw $error;
+    } catch (Error) {
+        throw new LoadError("other");
+    } finally {
+        try {
+            echo "cleanup";
+        } finally {
+            echo "done";
+        }
+    }
+}
+
+function main(): void throws Error
+{
+    load();
+}
+"#,
+    )
+    .expect("Stage 29 checked-error syntax should parse");
+
+    let Item::Class(class) = &program.items[0] else {
+        panic!("expected class declaration");
+    };
+    let ClassMember::Method(constructor) = &class.members[0] else {
+        panic!("expected constructor");
+    };
+    assert_eq!(constructor.throws.as_ref().unwrap().entries.len(), 1);
+    let ClassMember::Method(static_method) = &class.members[1] else {
+        panic!("expected static method");
+    };
+    assert!(static_method.is_static);
+    assert!(static_method.throws.is_some());
+
+    let Item::Function(load) = &program.items[1] else {
+        panic!("expected load function");
+    };
+    assert_eq!(load.throws.as_ref().unwrap().entries.len(), 2);
+    let Stmt::Try(try_statement) = &load.body.statements[0] else {
+        panic!("expected try statement");
+    };
+    assert_eq!(try_statement.catches.len(), 2);
+    assert!(try_statement.catches[0].binding.is_some());
+    assert!(try_statement.catches[1].binding.is_none());
+    assert!(try_statement.finally.is_some());
+
+    let Item::Function(main) = &program.items[2] else {
+        panic!("expected main function");
+    };
+    assert!(main.throws.is_some());
+}
+
+#[test]
+fn rejects_malformed_stage29_checked_error_syntax() {
+    for (source, code) in [
+        ("function f(): void { throw; }", "E0624"),
+        ("function f(): void { try {} }", "E0625"),
+        ("function f(): void { return throw value; }", "E0636"),
+        (
+            "function f(): void { try {} finally {} catch (Error) {} }",
+            "E0637",
+        ),
+    ] {
+        let diagnostics =
+            doriac::parse_source("test.doria", source).expect_err("source should be rejected");
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code == code),
+            "expected {code}, got {diagnostics:?}"
+        );
+    }
+
+    doriac::parse_source("test.doria", "function f(): void throws { }")
+        .expect_err("an empty throws clause should be rejected");
+    doriac::parse_source("test.doria", "function f(): void { try {} catch () {} }")
+        .expect_err("a catch without a type should be rejected");
+}
+
+#[test]
 fn parses_standalone_lexical_blocks_as_statements() {
     let program = doriac::parse_source(
         "test.doria",

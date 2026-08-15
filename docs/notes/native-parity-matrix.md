@@ -198,6 +198,9 @@ front-to-back iteration across the interpreter, Cranelift, and LLVM. The Stage
 independent writable bindings, shared immutable strings, and nullable empty
 move bindings across the same three execution paths.
 
-Status: Passed through Stage 28a Slice 2. Stage 28a is complete; Stage 29 checked errors are next.
+Status: Passed through Stage 28a Slice 2. Stage 28a is complete. Stage 29 Slice 1
+semantic checking is complete; checked-error execution has not entered this
+matrix and stops at B2901 before MIR. Slice 2 is next. Existing nonthrowing
+parity remains unchanged.
 
 All accepted native scalar, string, interpolation, checked-format, text-I/O, ownership, native-class, method, static, constant, concrete-display, nullable, collection, `Bytes`, boxed-`mixed`, monomorphized generic, and Stage 25a shared-ownership lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; Linux CI memory-checks the ownership-bearing native fixtures, including readonly collision projection, writable shared class, all writable payload domains, weak-cycle breaking, bounded stress, access lifetime, and stored-access paths; and the Stage 7-10 native smoke module remains retired and deleted. Stage 21 ordinary borrowing and constructor definite initialization and Stage 22 narrowing use the same backend-independent control-flow/dataflow foundation. Stage 24 specializes reachable free functions and instance/static methods once per concrete generic-argument set before any backend consumes the program. Stage 25 specializes generic classes. Stage 25a Slices 1 through 4 provide the two distinct non-atomic control models, per-allocation writable access state, owned access objects, collision projection, exact conflict reasons, and complete parity/tooling closure.

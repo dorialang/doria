@@ -1087,6 +1087,17 @@ fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<
         }
         Stmt::Increment(increment) => Err(unsupported_increment(increment)),
         Stmt::Expr { expr, .. } => validate_expr(expr, semantic_info),
+        Stmt::Throw(statement) => validate_expr(&statement.expr, semantic_info),
+        Stmt::Try(statement) => {
+            validate_block(&statement.body, semantic_info)?;
+            for catch in &statement.catches {
+                validate_block(&catch.body, semantic_info)?;
+            }
+            if let Some(finally) = &statement.finally {
+                validate_block(&finally.body, semantic_info)?;
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2779,6 +2790,7 @@ fn emit_statement(
             }
             writeln(output, indent, &format!("{};", emit_expr(expr, scopes)));
         }
+        Stmt::Throw(_) | Stmt::Try(_) => {}
     }
 }
 

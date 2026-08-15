@@ -270,14 +270,25 @@ These are identity, not scope deferral. They do not become available later, and 
 - Do not allow `return <expr>;` in `main(): void`; it is a void-return semantic error.
 - Treat panic as fatal, non-catchable, and non-unwinding. Explicit `panic("message")`, checked-integer failures, invalid float-to-int conversion, and an invalid `main(): int` process status use the abort-only status-101 path.
 - An abort-only panic runs no cleanup. RAII guards therefore do not restore state on the panic path; say so honestly wherever a guard's guarantee is described, rather than implying panics are covered.
-- Treat `throw` / `throws` as the accepted checked-error spelling direction. `throw` raises checked errors, `throws` declares checked thrown error types, and callers must catch or declare thrown errors once implemented. Do not implement checked-error compiler behavior, `try` / `catch`, runtime exception machinery, or `Result<T, E>` as the default Doria error model without a dedicated accepted implementation decision.
+- Decision 0119 owns checked errors. `Error` is a compiler-known Move interface
+  requiring explicit `implements Error` and an external readonly stored
+  `string $message`; promoted readonly `message` satisfies it. `throw` is a
+  statement that transfers owned Error values, `throws` follows an explicit
+  callable return type, concrete catches are exact, `catch (Error)` is the
+  catch-all, and callers catch or declare every effect. Catch bindings are
+  optional, checked cleanup does not roll back side effects, and failed
+  construction runs no class destructor. Stage 29 Slice 1 checking and AST/HIR
+  are complete; keep descriptors, carrier/ABI, executable MIR, propagation,
+  backend transport, I/O migration, and R1000 in their bound Slices 2 and 3.
+  Never use panic, `Result<T, E>`, host exceptions, or a second cleanup model as
+  an implementation shortcut.
 - Errors escaping `main` are an orderly declared failure: destructors run on the propagation path and the process exits 70, distinct from a panic's 101. The split is machine-readable triage for a supervisor or host.
 
 ### Standard library and I/O
 
 - The stdin spelling is `read_line`, never `readline`. The PHP spelling may appear only as migration input or in a fixit test that directs users to `read_line`.
 - Treat `read_file` and `write_file` as UTF-8 text-file functions. `read_file` must validate before constructing a `string`; invalid bytes never enter a Doria string. `null` from `read_line` means EOF, never failure.
-- File I/O is a three-tier family: UTF-8 text free functions, a binary `Bytes` tier, and a streaming `File`/stream-object tier. The text free functions panic on failure until checked errors exist, then migrate to declared `throws` signatures — a planned, recorded, announced signature change.
+- File I/O is a three-tier family: UTF-8 text free functions, a binary `Bytes` tier, and a streaming `File`/stream-object tier. The free functions retain their current panic behavior until Stage 29 Slice 3 migrates failures to the exact canonical `Doria\Std\Io` Error identities. Slice 1 semantic availability alone does not change runtime I/O signatures.
 - Compiler-known intrinsics are language, not library: `read_line`, `sprintf`, `printf`, `write_stderr`, `read_file`, `write_file`, `panic`, and the byte-I/O family are recognized before name resolution. They have no namespace, no prelude entry, and cannot be redeclared. Their names are reserved globally and permanently.
 - Format strings for `sprintf` / `printf` must be literal and are checked at compile time. Keep the literal-format analysis structured for reuse; it has more than one planned consumer.
 - Root the standard library at the reserved `Doria\Std` namespace (`Doria\Std\Term`, `Doria\Std\Math`, `Doria\Std\Io`, `Doria\Std\Json`, `Doria\Std\Net`, `Doria\Std\Data`). First-party modules that are not standard library sit at `Doria\<Module>`. Never use Rust-shaped `std::term` spellings; `scripts/check_docs_authority.php` guards this.

@@ -235,6 +235,7 @@ jobs:
         run: |
           php scripts/check_docs_authority.php
           php scripts/check_stage25a_completion.php
+          php scripts/check_checked_error_foundation.php
 
       # Reachability needs the network and, for private repositories, an
       # explicitly scoped credential. Structural checks always run. A configured

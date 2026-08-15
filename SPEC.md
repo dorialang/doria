@@ -1159,11 +1159,87 @@ Stage 28a model.
 
 ### Checked errors
 
-The accepted checked error direction is recorded in `docs/decisions/0035-checked-throw-throws-direction.md`.
+Decision 0119 defines Doria's checked-error model. `Error` is a compiler-known
+core interface. A class conforms only by explicitly declaring `implements Error`
+and providing an externally accessible readonly stored `string $message`
+property. A promoted readonly constructor parameter named `message` satisfies
+the contract. Error classes are ordinary Move classes; there is no mandatory
+base class, synthesized property, automatic cause chain, hashing, or ordering.
 
-`throw` raises an error. `throws` declares possible thrown error types in function and method signatures. Thrown errors are checked by the compiler: callers must catch thrown errors or declare them in their own `throws` clause.
+`throws` follows the explicit return type and preserves source order:
 
-`Result<T, E>` is not Doria's default surface error model unless a later accepted decision explicitly adopts it. Runtime panic or fatal-error behavior is separate from checked `throw` / `throws`.
+```doria
+class StorageError implements Error
+{
+    function __construct(string $message, string $operation)
+    {
+    }
+}
+
+function loadRecord(string $id): Record throws StorageError
+{
+    throw new StorageError("record unavailable", "load");
+}
+```
+
+Named functions and methods still require explicit return types. Constructors
+may omit a return annotation and declare `throws`; destructors cannot declare or
+allow checked errors to escape. Each throws entry is `Error` or a concrete
+Error-conforming class. Duplicate entries and concrete entries after the
+catch-all `Error` are rejected. Nullable, primitive, collection, `mixed`,
+unknown, and non-Error entries are invalid.
+
+`throw expression;` is a statement. Its operand evaluates exactly once, must be
+an owned Error value, and transfers ownership. Rethrow uses `throw $error;`.
+Bare throw and expression-position throw are not Doria syntax. Ordinary move
+checking rejects use of a named Error after it is thrown.
+
+```doria
+function renderRecord(string $id): string
+{
+    try {
+        let $record = loadRecord($id);
+        return $record->title;
+    } catch (StorageError $error) {
+        return $error->message;
+    } finally {
+        recordAttempt();
+    }
+}
+```
+
+A `try` statement requires at least one `catch` or `finally`; catches precede
+the optional finalizer. Catch bindings are optional. A present binding is owned,
+readonly, and catch-scoped. Concrete catches match exact concrete Error identity
+in Stage 29; `catch (Error)` catches every checked error. Duplicate catches,
+catches after `Error`, and catches proven unable to match a protected effect are
+unreachable. Catch bodies are independent: sibling catches do not handle an
+error raised by another catch. An error may not escape `finally`.
+
+Every callable carries a semantic checked-effect set. Direct throws and resolved
+function, method, static, constructor, and property-initializer calls contribute
+effects. Catches remove only effects they cover; every remaining error must be
+declared by the enclosing callable. Nonthrowing and narrower effect sets may be
+used where a wider set is accepted, never the reverse. Stage 30 callable types
+must preserve this law while owning closure effect syntax.
+
+Checked propagation performs deterministic cleanup through the existing
+structured finalizer regions, but never rolls back completed side effects. A
+failed construction runs no class `__destruct`; initialized owned fields drop in
+reverse order, uninitialized fields are ignored, allocation is freed, and the
+error continues. Fatal panic remains separate, non-catchable, cleanup-free, and
+status 101.
+
+Stage 29 Slice 1 implements grammar, semantic checking, AST/HIR, and ownership.
+Valid checked-error source succeeds through `check`, `ast`, and `hir`; MIR and
+all execution/emission backends stop once with the Stage 29 Slice 2 boundary.
+Slice 2 owns the erased carrier, checked MIR, status/out-slot ABI, propagation,
+cleanup, and backend transport. Slice 3 owns the canonical `Doria\Std\Io` error
+types, I/O signature migration, and shared `Error[R1000]` status-70 unhandled
+outcome. Nonthrowing programs remain executable throughout.
+
+`Result<T, E>` is not Doria's default error model. Runtime panic is separate
+from checked `throw` / `throws`.
 
 ### Panic
 

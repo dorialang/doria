@@ -24,7 +24,13 @@ Details: decision 0096 (primitive conformance), the interfaces/traits decision (
 - **`Hashable`** — a canonical hash for `Dictionary`/`Set` keys.
 - **`Displayable`** — `toString(): string`; Doria's answer to `__toString`, drives interpolation / `.` / `echo` (§4.6, 0079).
 - **`Cloneable`** — the explicit-duplication contract (`->clone()`), public from Stage 35.
-- **`Error`** — the built-in error interface all thrown errors implement (checked-errors decision, Stage 29).
+- **`Error`** — the compiler-known Move interface for checked errors. Conformance
+  is explicit through `implements Error` and requires an externally accessible
+  readonly stored `string $message`; a promoted constructor property satisfies
+  the contract. The erased value exposes readonly `message` and uses identity
+  equality. General interface execution and `SharedReference<Error>` remain
+  Stage 35 work. Decision 0119; Stage 29 Slice 1 semantic surface complete,
+  execution in Slice 2.
 
 Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096).
 
@@ -106,6 +112,11 @@ The four no-literal forms use positional-only `Type::from(source)`. Direct brack
 Hosted modules under the reserved `Doria\Std` namespace. Most are direction-only in the plan today; each links to its owning section/record and is marked *(surface TBD)* where its decision is unauthored.
 
 - **`Doria\Std\Io`** — the decision-0110 Stage 36a byte-stream and standard-I/O foundation: small readable/writable/duplex/seekable/flushable/blocking/readiness capabilities rather than one god object; owned move handles with consuming checked close/finish and nonthrowing best-effort destruction; data/would-block/EOF/timed-out reads; partial-progress writes; first-class non-owning standard streams over the existing intrinsic substrate; one portable readiness, duration/deadline, cancellation, and backpressure model; typed file requests; per-value buffering, UTF-8 text/line adapters, bounded streaming copy, and process-pipe integration. Its accepted performance contract requires reusable caller/adapter buffers, safe byte regions, allocation-free common outcomes and standard-stream views, no mandatory allocation or whole-chunk copy per steady-state operation, reusable readiness storage, static specialization for concrete adapters, and zero async scheduler cost in synchronous programs. Stage 29 supplies checked errors but does not implement this layer. Exact interface, member, result-case, mode, byte-region, reusable-buffer, adapter, file, readiness, process, and standard-stream spellings remain deferred to the bounded decision-0110 appendix before Stage 36a implementation. The current text/binary free functions are *language intrinsics*, not proof that this module exists. *(Capability inventory: `docs/notes/io-surface-audit.md`; Stage 36a scheduled and not implemented; semantics and performance contract accepted, public spellings deferred.)*
+  Stage 29 Slice 3 supplies the canonical failure identities
+  `Doria\Std\Io\IoError`, `InvalidUtf8Error`, `IoOperation`, `IoTarget`,
+  `IoErrorReason`, and `Utf8InputSource` and migrates the free-function I/O
+  failures. These target identities have no temporary unqualified aliases and
+  are not runtime types in Slice 1.
 - **`Doria\Std\Fs`** — filesystem/namespace operations without an open handle: existence, size/metadata, permissions, timestamps, rename, delete, `mkdir`, directory listing, and path manipulation. Decision 0110 fixes the `Io`/`Fs` boundary while deferring the exact `Path` representation to the filesystem design; Stage 36a must preserve typed-path evolution. *(Surface TBD.)*
 - **`Doria\Std\Env`** — environment variables. *(Surface TBD.)*
 - **`Doria\Std\Process`** — process facts (exit code, process id, executable path) and decision-0110 owned child processes with typed stdin/stdout/stderr pipes, stdin half-close, explicit wait/detach/terminate lifetime resolution, concurrent bounded output drainage, and shared timeout/readiness/cancellation integration. Destruction does not silently wait, detach, or terminate. Exact process and type-state spellings remain deferred to the process owner. The pipe capability depends on Stage 36a and is not currently executable. Command-line arguments arrive through `main(List<string> $args)` (decision 0099), not here.

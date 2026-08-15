@@ -237,8 +237,9 @@ must preserve that Doria rule instead of inheriting PHP exception unwinding.
 ## Future Checked Errors
 
 Stage 29 checked errors reuse the same structured-exit and finalizer regions.
-They must not invent a second cleanup model. This decision does not implement
-`try`, `catch`, `throw`, or `throws`.
+They must not invent a second cleanup model. Decision 0119 now implements the
+Slice 1 grammar and semantic obligations while keeping executable checked-error
+routing in Slice 2.
 
 A future checked-error exit will identify crossed regions exactly as return and
 loop exits do. Its pending payload belongs in a typed synthetic local acquired

@@ -133,6 +133,12 @@ to `if`, `when`, `while`, and `do ... while`, runs once for each normal or
 structured exit, and preserves Doria's abort-only rule that fatal panic runs no
 cleanup.
 
+Doria currently parses and checks explicit `Error` conformance, `throw`,
+source-ordered `throws`, and `try`/`catch`/`finally`, and exposes their resolved
+effects in AST and HIR. Execution support is not available yet: programs that
+require checked-error execution stop before MIR with one structured diagnostic,
+while existing nonthrowing programs continue to compile and run unchanged.
+
 ## Tooling
 
 Official language-server and editor integrations are developed separately in [`dorialang/doria-language-server`](https://github.com/dorialang/doria-language-server), which consumes reusable `doriac` frontend services without duplicating compiler semantics.

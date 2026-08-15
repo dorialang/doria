@@ -147,6 +147,14 @@ impl Scopes {
         self.0.pop();
     }
 
+    fn lexical_depth(&self) -> usize {
+        self.0.len()
+    }
+
+    fn truncate_to(&mut self, lexical_depth: usize) {
+        self.0.truncate(lexical_depth);
+    }
+
     fn declare(&mut self, name: String, binding: Binding) {
         self.0
             .last_mut()
@@ -263,26 +271,53 @@ fn join_state(left: &State, right: &State) -> State {
 
 pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
     let flow_facts = crate::narrowing::analyze_program(program);
+    let inferred_move_returns = HashSet::new();
+    let return_borrows = HashMap::new();
+    let resolved_types = HashMap::new();
+    let move_enum_names = HashSet::new();
+    let given_preludes = HashMap::new();
+    let checked_effect_sites = HashMap::new();
+    let catch_error_types = HashMap::new();
     check_program_with_inferred_move_returns(
         program,
-        &HashSet::new(),
-        &HashMap::new(),
-        &HashMap::new(),
-        &flow_facts,
-        &HashSet::new(),
-        &HashMap::new(),
+        &OwnershipAnalysisContext {
+            inferred_move_returns: &inferred_move_returns,
+            return_borrows: &return_borrows,
+            resolved_types: &resolved_types,
+            flow_facts: &flow_facts,
+            move_enum_names: &move_enum_names,
+            given_preludes: &given_preludes,
+            checked_effect_sites: &checked_effect_sites,
+            catch_error_types: &catch_error_types,
+        },
     )
+}
+
+pub(crate) struct OwnershipAnalysisContext<'a> {
+    pub(crate) inferred_move_returns: &'a HashSet<usize>,
+    pub(crate) return_borrows: &'a HashMap<usize, ReturnBorrow>,
+    pub(crate) resolved_types: &'a HashMap<(usize, usize), crate::types::ResolvedType>,
+    pub(crate) flow_facts: &'a FactsByUse,
+    pub(crate) move_enum_names: &'a HashSet<String>,
+    pub(crate) given_preludes: &'a HashMap<(usize, usize), crate::semantics::GivenSemanticInfo>,
+    pub(crate) checked_effect_sites: &'a crate::checked_effects::EffectSiteMap,
+    pub(crate) catch_error_types: &'a crate::checked_effects::CatchTypeMap,
 }
 
 pub(crate) fn check_program_with_inferred_move_returns(
     program: &ast::Program,
-    inferred_move_returns: &HashSet<usize>,
-    return_borrows: &HashMap<usize, ReturnBorrow>,
-    resolved_types: &HashMap<(usize, usize), crate::types::ResolvedType>,
-    flow_facts: &FactsByUse,
-    move_enum_names: &HashSet<String>,
-    given_preludes: &HashMap<(usize, usize), crate::semantics::GivenSemanticInfo>,
+    context: &OwnershipAnalysisContext<'_>,
 ) -> Vec<Diagnostic> {
+    let OwnershipAnalysisContext {
+        inferred_move_returns,
+        return_borrows,
+        resolved_types,
+        flow_facts,
+        move_enum_names,
+        given_preludes,
+        checked_effect_sites,
+        catch_error_types,
+    } = *context;
     let classes = program
         .items
         .iter()
@@ -469,6 +504,9 @@ pub(crate) fn check_program_with_inferred_move_returns(
         return_borrows: return_borrows.clone(),
         resolved_types,
         given_preludes,
+        checked_effect_sites,
+        catch_error_types,
+        exception_scopes: Vec::new(),
         move_enum_names: move_enum_names.clone(),
         receiver_class: None,
         receiver_writable: false,
@@ -615,6 +653,8 @@ fn statement_return_borrow(
             }
         }
         Stmt::Return { expr: None, .. } => None,
+        Stmt::Throw(_) => Some(false),
+        Stmt::Try(_) => None,
         Stmt::If(statement) => match constant_bool(&statement.condition) {
             Some(true) => block_return_borrow(
                 &statement.then_block,
@@ -1024,6 +1064,18 @@ struct Flow {
     yields: Vec<Scopes>,
 }
 
+#[derive(Debug, Clone)]
+struct ExceptionalExit {
+    effect: crate::types::ResolvedType,
+    scopes: Scopes,
+}
+
+#[derive(Debug)]
+struct ExceptionScope {
+    lexical_depth: usize,
+    exits: Vec<ExceptionalExit>,
+}
+
 impl Flow {
     fn fallthrough() -> Self {
         Self {
@@ -1089,6 +1141,9 @@ struct Checker<'a> {
     return_borrows: HashMap<usize, ReturnBorrow>,
     resolved_types: &'a HashMap<(usize, usize), crate::types::ResolvedType>,
     given_preludes: &'a HashMap<(usize, usize), crate::semantics::GivenSemanticInfo>,
+    checked_effect_sites: &'a crate::checked_effects::EffectSiteMap,
+    catch_error_types: &'a crate::checked_effects::CatchTypeMap,
+    exception_scopes: Vec<ExceptionScope>,
     move_enum_names: HashSet<String>,
     receiver_class: Option<String>,
     receiver_writable: bool,
@@ -1108,6 +1163,59 @@ impl Checker<'_> {
         let id = BindingId(self.next_binding_id);
         self.next_binding_id += 1;
         id
+    }
+
+    fn push_exception_scope(&mut self, scopes: &Scopes) {
+        self.exception_scopes.push(ExceptionScope {
+            lexical_depth: scopes.lexical_depth(),
+            exits: Vec::new(),
+        });
+    }
+
+    fn pop_exception_scope(&mut self) -> Vec<ExceptionalExit> {
+        self.exception_scopes
+            .pop()
+            .expect("checked-error ownership scope")
+            .exits
+    }
+
+    fn record_exceptional_exits(&mut self, span: Span, scopes: &Scopes) {
+        let Some(exception_scope) = self.exception_scopes.last_mut() else {
+            return;
+        };
+        let effects = crate::checked_effects::effects_at(self.checked_effect_sites, span);
+        for effect in effects {
+            let mut exit_scopes = scopes.clone();
+            exit_scopes.truncate_to(exception_scope.lexical_depth);
+            exception_scope.exits.push(ExceptionalExit {
+                effect: effect.clone(),
+                scopes: exit_scopes,
+            });
+        }
+    }
+
+    fn propagate_exceptional_exits(&mut self, exits: impl IntoIterator<Item = ExceptionalExit>) {
+        let Some(parent) = self.exception_scopes.last_mut() else {
+            return;
+        };
+        for mut exit in exits {
+            exit.scopes.truncate_to(parent.lexical_depth);
+            parent.exits.push(exit);
+        }
+    }
+
+    fn apply_finally_to_exceptional_exits(
+        &mut self,
+        finally: &ast::Block,
+        exits: &mut Vec<ExceptionalExit>,
+        return_move_type: bool,
+    ) {
+        let diagnostics_before = self.diagnostics.len();
+        exits.retain_mut(|exit| {
+            self.check_block(finally, &mut exit.scopes, return_move_type, true)
+                .falls_through
+        });
+        self.deduplicate_diagnostics_from(diagnostics_before);
     }
 
     fn check_function(&mut self, function: &ast::FunctionDecl, receiver_class: Option<&str>) {
@@ -1832,6 +1940,120 @@ impl Checker<'_> {
                 self.use_expr(&increment.target, scopes, UseMode::Read);
                 Flow::fallthrough()
             }
+            Stmt::Throw(statement) => {
+                let diagnostics_before = self.diagnostics.len();
+                self.use_expr(&statement.expr, scopes, UseMode::Give);
+                for diagnostic in &mut self.diagnostics[diagnostics_before..] {
+                    if diagnostic.code == "E0474" {
+                        let help = "throw transfers ownership; use an owned Error value or accept the parameter with `take`".to_string();
+                        diagnostic.title = "Throw Requires Ownership".to_string();
+                        diagnostic.helps.clear();
+                        diagnostic.helps.push(help.clone());
+                        diagnostic.help = Some(help);
+                    }
+                }
+                self.record_exceptional_exits(statement.span, scopes);
+                Flow::stops()
+            }
+            Stmt::Try(statement) => {
+                let before = scopes.clone();
+                let mut protected_scopes = before.clone();
+                self.push_exception_scope(&before);
+                let mut protected_flow = self.check_block(
+                    &statement.body,
+                    &mut protected_scopes,
+                    return_move_type,
+                    true,
+                );
+                let mut unmatched_exits = self.pop_exception_scope();
+
+                let mut fallthrough_states = Vec::new();
+                if protected_flow.falls_through {
+                    fallthrough_states.push(protected_scopes.clone());
+                }
+                self.push_exception_scope(&before);
+                for catch in &statement.catches {
+                    let catch_type = self
+                        .catch_error_types
+                        .get(&(catch.span.start, catch.span.end))
+                        .expect("checked catch type");
+                    let mut caught_states = Vec::new();
+                    let mut remaining = Vec::new();
+                    for exit in unmatched_exits {
+                        if crate::checked_effects::effect_is_caught(&exit.effect, catch_type) {
+                            caught_states.push(exit.scopes);
+                        } else {
+                            remaining.push(exit);
+                        }
+                    }
+                    unmatched_exits = remaining;
+                    if caught_states.is_empty() {
+                        continue;
+                    }
+
+                    let mut catch_scopes = caught_states[0].clone();
+                    merge_reachable_states(&mut catch_scopes, &caught_states);
+                    catch_scopes.push();
+                    if let Some(binding) = &catch.binding {
+                        catch_scopes.declare(
+                            binding.name.clone(),
+                            Binding {
+                                id: self.next_binding_id(),
+                                class: type_ref_class_name(
+                                    &catch.ty,
+                                    &self.classes,
+                                    self.receiver_class.as_deref(),
+                                ),
+                                collection: None,
+                                mixed: false,
+                                borrowed_place: false,
+                                borrow_root: None,
+                                writable: false,
+                                state: State::Owned,
+                            },
+                        );
+                    }
+                    let mut catch_flow =
+                        self.check_block(&catch.body, &mut catch_scopes, return_move_type, false);
+                    catch_scopes.pop();
+                    pop_flow_scope(&mut catch_flow);
+                    if catch_flow.falls_through {
+                        fallthrough_states.push(catch_scopes);
+                    }
+                    protected_flow.backedges.append(&mut catch_flow.backedges);
+                    protected_flow.breaks.append(&mut catch_flow.breaks);
+                    protected_flow.returns.append(&mut catch_flow.returns);
+                    protected_flow.yields.append(&mut catch_flow.yields);
+                }
+                let mut propagating_exits = unmatched_exits;
+                propagating_exits.extend(self.pop_exception_scope());
+
+                if fallthrough_states.is_empty() {
+                    *scopes = before;
+                    protected_flow.falls_through = false;
+                } else {
+                    merge_reachable_states(scopes, &fallthrough_states);
+                    protected_flow.falls_through = true;
+                }
+
+                if let Some(finally) = &statement.finally {
+                    self.apply_finally_to_exceptional_exits(
+                        &finally.body,
+                        &mut propagating_exits,
+                        return_move_type,
+                    );
+                    self.propagate_exceptional_exits(propagating_exits);
+                    self.apply_finally_to_flow(
+                        &finally.body,
+                        scopes,
+                        protected_flow,
+                        return_move_type,
+                    )
+                } else {
+                    self.propagate_exceptional_exits(propagating_exits);
+                    protected_flow
+                }
+            }
             Stmt::Break { .. } => Flow::breaks(scopes),
             Stmt::Continue { .. } => Flow {
                 falls_through: false,
@@ -2297,12 +2519,16 @@ impl Checker<'_> {
                         .insert(assignment_root.expect("suspended assignment root"));
                 }
             }
-            Expr::FunctionCall { name, args, .. } => {
+            Expr::FunctionCall { name, args, span } => {
                 let signature = self.signatures.get(name).cloned().unwrap_or_default();
                 self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
+                self.record_exceptional_exits(*span, scopes);
             }
             Expr::New {
-                class_type, args, ..
+                class_type,
+                args,
+                span,
+                ..
             } => {
                 let signature = if class_type.name == "WritableSharedReference" {
                     writable_shared_constructor_signature()
@@ -2313,16 +2539,19 @@ impl Checker<'_> {
                         .unwrap_or_default()
                 };
                 self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
+                self.record_exceptional_exits(*span, scopes);
             }
             Expr::MethodCall {
                 object,
                 method,
                 args,
+                span,
                 null_safe,
                 ..
             } => {
                 if let Some(collection) = self.expr_collection_info(object, scopes) {
                     self.use_collection_call(collection.family, object, method, args, scopes);
+                    self.record_exceptional_exits(*span, scopes);
                     return;
                 }
                 let signature = self
@@ -2331,11 +2560,13 @@ impl Checker<'_> {
                     .unwrap_or_default();
                 let execution = self.method_call_execution(*null_safe, object);
                 self.use_call_args(Some(object), args, &signature, execution, scopes);
+                self.record_exceptional_exits(*span, scopes);
             }
             Expr::StaticCall {
                 qualifier,
                 method,
                 args,
+                span,
                 ..
             } => {
                 if matches!(
@@ -2347,12 +2578,14 @@ impl Checker<'_> {
                     for arg in args {
                         self.use_expr(&arg.value, scopes, UseMode::Read);
                     }
+                    self.record_exceptional_exits(*span, scopes);
                     return;
                 }
                 let signature = self
                     .static_call_signature(qualifier, method)
                     .unwrap_or_default();
                 self.use_call_args(None, args, &signature, CallExecution::Always, scopes);
+                self.record_exceptional_exits(*span, scopes);
             }
             Expr::InterpolatedString { parts, .. } => {
                 let borrow_depth = self.active_borrows.len();
@@ -3936,6 +4169,21 @@ fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
                     && statements_use_variable(&statement.body.statements, name))
         }
         Stmt::Increment(statement) => expr_uses_variable(&statement.target, name),
+        Stmt::Throw(statement) => expr_uses_variable(&statement.expr, name),
+        Stmt::Try(statement) => {
+            statements_use_variable(&statement.body.statements, name)
+                || statement.catches.iter().any(|catch| {
+                    catch
+                        .binding
+                        .as_ref()
+                        .is_none_or(|binding| binding.name != name)
+                        && statements_use_variable(&catch.body.statements, name)
+                })
+                || statement
+                    .finally
+                    .as_ref()
+                    .is_some_and(|finally| statements_use_variable(&finally.body.statements, name))
+        }
     }
 }
 
@@ -4305,6 +4553,7 @@ fn type_ref_is_move_type_with_enums(
         || matches!(
             ty.name.as_str(),
             "mixed"
+                | "Error"
                 | "Bytes"
                 | "[]"
                 | "List"

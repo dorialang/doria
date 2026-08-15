@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::MemberAccess;
 use crate::numeric::IntegerValue;
@@ -17,12 +17,24 @@ pub struct Binding {
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
     pub type_params: Vec<TypeParamInfo>,
-    pub implements_displayable: bool,
+    pub builtin_interfaces: HashSet<BuiltinInterface>,
     pub properties: HashMap<String, PropertyInfo>,
     pub static_properties: HashMap<String, StaticPropertyInfo>,
     pub constants: HashMap<String, ConstantInfo>,
     pub methods: HashMap<String, MethodInfo>,
     pub members: HashMap<String, MemberDeclaration>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BuiltinInterface {
+    Displayable,
+    Error,
+}
+
+impl ClassInfo {
+    pub fn implements(&self, interface: BuiltinInterface) -> bool {
+        self.builtin_interfaces.contains(&interface)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +117,7 @@ pub struct FunctionInfo {
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
     pub return_borrow: Option<ReturnBorrow>,
+    pub checked_effects: Vec<TypeId>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +131,7 @@ pub struct MethodInfo {
     pub type_params: Vec<TypeParamInfo>,
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
+    pub checked_effects: Vec<TypeId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

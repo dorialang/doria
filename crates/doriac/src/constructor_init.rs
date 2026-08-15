@@ -3,7 +3,7 @@ use crate::ast::{
     Item, Program, Stmt,
 };
 use crate::control_flow::{
-    build_function_cfg_with_given, GivenSemanticInfoMap, Node, NodeAction, NodeKind,
+    build_function_cfg_with_checked_effects, GivenSemanticInfoMap, Node, NodeAction, NodeKind,
 };
 use crate::dataflow::{solve_forward, ForwardAnalysis};
 use crate::diagnostics::Diagnostic;
@@ -108,13 +108,21 @@ impl ForwardAnalysis for ConstructorAnalysis<'_> {
 pub(crate) fn check_program(
     program: &Program,
     given_preludes: &GivenSemanticInfoMap,
+    checked_effect_sites: &crate::checked_effects::EffectSiteMap,
+    catch_error_types: &crate::checked_effects::CatchTypeMap,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
     for class in program.items.iter().filter_map(|item| match item {
         Item::Class(class) => Some(class),
         _ => None,
     }) {
-        check_class(class, given_preludes, &mut diagnostics);
+        check_class(
+            class,
+            given_preludes,
+            checked_effect_sites,
+            catch_error_types,
+            &mut diagnostics,
+        );
     }
     diagnostics
 }
@@ -122,6 +130,8 @@ pub(crate) fn check_program(
 fn check_class(
     class: &ClassDecl,
     given_preludes: &GivenSemanticInfoMap,
+    checked_effect_sites: &crate::checked_effects::EffectSiteMap,
+    catch_error_types: &crate::checked_effects::CatchTypeMap,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let mut properties = class
@@ -178,7 +188,13 @@ fn check_class(
         return;
     };
 
-    let graph = build_function_cfg_with_given(&constructor.body, constructor.span, given_preludes);
+    let graph = build_function_cfg_with_checked_effects(
+        &constructor.body,
+        constructor.span,
+        given_preludes,
+        checked_effect_sites,
+        catch_error_types,
+    );
     let result = solve_forward(
         &graph,
         &ConstructorAnalysis {
@@ -344,6 +360,9 @@ fn inspect_statement(
                 inspect_expr(class, properties, state, expr, diagnostics);
             }
         }
+        Stmt::Throw(statement) => {
+            inspect_expr(class, properties, state, &statement.expr, diagnostics)
+        }
         Stmt::Increment(increment) => inspect_increment(
             class,
             properties,
@@ -354,6 +373,7 @@ fn inspect_statement(
             diagnostics,
         ),
         Stmt::If(_)
+        | Stmt::Try(_)
         | Stmt::While(_)
         | Stmt::DoWhile(_)
         | Stmt::For(_)

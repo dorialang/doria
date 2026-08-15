@@ -32,7 +32,7 @@
 
 ## Already settled / correctly scheduled (not open — do not re-decide)
 
-Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: checked errors (29), closures (30), inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Namespace/package-graph authority and Baton's manifest/resolver authority are no longer in that list: decisions 0117 and 0118 own them. Enums and complete core match are likewise settled by decisions 0114 and 0115. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
+Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: closures (30), inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Checked errors are no longer in that list: decision 0119 owns the complete Stage 29 contract and Slice 1 is implemented. Namespace/package-graph authority and Baton's manifest/resolver authority are likewise settled by decisions 0117 and 0118. Enums and complete core match are settled by decisions 0114 and 0115. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
 
 ## Open questions (answerable now)
 
@@ -64,7 +64,8 @@ strict layout, deterministic package compilation graphs, incremental ownership,
 and top-level entry rules. Decision 0118 accepts schema 2 and the dependency,
 lockfile, workspace, cache, and offline model. This authority does not begin
 implementation: Stage 31 remains scheduled in two slices, Stage 33 remains
-scheduled in three slices, and Stage 29 remains next.
+scheduled in three slices. Stage 29 is in progress under decision 0119; Slice 2
+is next.
 
 ## Proposed deliverable path
 `docs/notes/plan-open-questions-audit.md` (this file), under "supporting context" per `docs/information-architecture.md`. Not a decision record — every item is a stop-and-ask for Andrew.

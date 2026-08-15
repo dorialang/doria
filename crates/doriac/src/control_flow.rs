@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use crate::ast::{Block, ElseBranch, Expr, ForIncrement, ForInitializer, ForStmt, Stmt};
+use crate::checked_effects::{CatchTypeMap, EffectSiteMap};
 use crate::source::Span;
+use crate::types::ResolvedType;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GivenSemanticInfo {
@@ -140,11 +142,19 @@ struct LoopContext {
     breaks: Vec<NodeId>,
 }
 
-struct Builder {
+struct ExceptionHandler {
+    catches: Vec<(ResolvedType, NodeId)>,
+    catch_finalizer_depth: usize,
+}
+
+struct Builder<'a> {
     graph: ControlFlowGraph,
     loops: Vec<LoopContext>,
     finalizers: Vec<Block>,
     given_preludes: GivenSemanticInfoMap,
+    checked_effect_sites: &'a EffectSiteMap,
+    catch_error_types: &'a CatchTypeMap,
+    exception_handlers: Vec<ExceptionHandler>,
 }
 
 pub fn build_function_cfg(body: &Block, function_span: Span) -> ControlFlowGraph {
@@ -156,6 +166,24 @@ pub fn build_function_cfg_with_given(
     function_span: Span,
     given_preludes: &GivenSemanticInfoMap,
 ) -> ControlFlowGraph {
+    let checked_effect_sites = EffectSiteMap::new();
+    let catch_error_types = CatchTypeMap::new();
+    build_function_cfg_with_checked_effects(
+        body,
+        function_span,
+        given_preludes,
+        &checked_effect_sites,
+        &catch_error_types,
+    )
+}
+
+pub(crate) fn build_function_cfg_with_checked_effects(
+    body: &Block,
+    function_span: Span,
+    given_preludes: &GivenSemanticInfoMap,
+    checked_effect_sites: &EffectSiteMap,
+    catch_error_types: &CatchTypeMap,
+) -> ControlFlowGraph {
     let graph = ControlFlowGraph::new(function_span);
     let entry = graph.entry;
     let mut builder = Builder {
@@ -163,6 +191,9 @@ pub fn build_function_cfg_with_given(
         loops: Vec::new(),
         finalizers: Vec::new(),
         given_preludes: given_preludes.clone(),
+        checked_effect_sites,
+        catch_error_types,
+        exception_handlers: Vec::new(),
     };
     let outgoing = builder.build_statements(&body.statements, vec![entry]);
     let fallthrough = builder.graph.add_node(
@@ -187,7 +218,7 @@ struct GateFlow {
     failed: Vec<NodeId>,
 }
 
-impl Builder {
+impl Builder<'_> {
     fn build_statements(&mut self, statements: &[Stmt], mut incoming: Vec<NodeId>) -> Vec<NodeId> {
         for statement in statements {
             incoming = self.build_statement(statement, incoming);
@@ -208,6 +239,98 @@ impl Builder {
                 let routed = self.route_finalizers(vec![value], 0);
                 self.terminal(NodeKind::ReturnExit, *span, NodeAction::None, routed);
                 Vec::new()
+            }
+            Stmt::Throw(statement) => {
+                let value = self.normal_without_checked_effects(
+                    NodeKind::Statement,
+                    statement.span,
+                    NodeAction::Statement(Stmt::Throw(statement.clone())),
+                    &incoming,
+                );
+                let has_checked_effect =
+                    self.checked_effect_sites
+                        .iter()
+                        .any(|((start, end), effects)| {
+                            statement.span.start <= *start
+                                && *end <= statement.span.end
+                                && !effects.is_empty()
+                        });
+                if has_checked_effect {
+                    self.connect_checked_effects(statement.span, &incoming, Some(value));
+                } else {
+                    let routed = self.route_finalizers(vec![value], 0);
+                    self.terminal(
+                        NodeKind::DivergeExit,
+                        statement.span,
+                        NodeAction::None,
+                        routed,
+                    );
+                }
+                Vec::new()
+            }
+            Stmt::Try(statement) => {
+                let precise_catches = statement.catches.iter().all(|catch| {
+                    self.catch_error_types
+                        .contains_key(&(catch.span.start, catch.span.end))
+                });
+                let catch_entries = if precise_catches {
+                    statement
+                        .catches
+                        .iter()
+                        .map(|catch| {
+                            self.graph.add_node(
+                                NodeKind::Statement,
+                                catch.span,
+                                NodeAction::None,
+                                !self.loops.is_empty(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                if let Some(finally) = &statement.finally {
+                    self.finalizers.push(finally.body.clone());
+                }
+                let before = incoming.clone();
+                if precise_catches {
+                    self.exception_handlers.push(ExceptionHandler {
+                        catches: statement
+                            .catches
+                            .iter()
+                            .zip(&catch_entries)
+                            .map(|(catch, entry)| {
+                                (
+                                    self.catch_error_types[&(catch.span.start, catch.span.end)]
+                                        .clone(),
+                                    *entry,
+                                )
+                            })
+                            .collect(),
+                        catch_finalizer_depth: self.finalizers.len(),
+                    });
+                }
+                let mut outgoing = self.build_statements(&statement.body.statements, incoming);
+                if precise_catches {
+                    self.exception_handlers
+                        .pop()
+                        .expect("checked try exception handler");
+                }
+                for (index, catch) in statement.catches.iter().enumerate() {
+                    let catch_incoming = if precise_catches {
+                        vec![catch_entries[index]]
+                    } else {
+                        before.clone()
+                    };
+                    outgoing.extend(self.build_statements(&catch.body.statements, catch_incoming));
+                }
+                let outgoing = deduplicate(outgoing);
+                if let Some(finally) = &statement.finally {
+                    self.finalizers.pop().expect("try finalizer context");
+                    self.build_statements(&finally.body.statements, outgoing)
+                } else {
+                    outgoing
+                }
             }
             Stmt::Expr { expr, span } if is_panic_call(expr) => {
                 self.terminal(
@@ -257,6 +380,7 @@ impl Builder {
                     true,
                 );
                 self.graph.connect_all(&gate.passed, header);
+                self.connect_checked_effects(while_stmt.condition.span(), &[header], None);
                 let condition = constant_condition(&while_stmt.condition);
                 self.loops.push(LoopContext {
                     continue_target: gate.entry.unwrap_or(header),
@@ -311,6 +435,7 @@ impl Builder {
                 let body_outgoing =
                     self.build_statements(&do_while.body.statements, vec![body_entry]);
                 self.graph.connect_all(&body_outgoing, condition_node);
+                self.connect_checked_effects(do_while.condition.span(), &[condition_node], None);
                 let condition = constant_condition(&do_while.condition);
                 if condition != ConstantCondition::AlwaysFalse {
                     let repeat = self.assumption(&do_while.condition, true, condition_node);
@@ -337,6 +462,7 @@ impl Builder {
                     true,
                 );
                 self.graph.connect_all(&incoming, header);
+                self.connect_checked_effects(foreach.iterable.span(), &incoming, None);
                 self.loops.push(LoopContext {
                     continue_target: header,
                     finalizer_depth: self.finalizers.len(),
@@ -429,6 +555,7 @@ impl Builder {
                 repeatable,
             );
             self.graph.connect_all(&passed, branch);
+            self.connect_checked_effects(predicate.span(), &[branch], None);
             entry.get_or_insert(branch);
             let condition = constant_condition(&predicate);
             passed = if condition == ConstantCondition::AlwaysFalse {
@@ -522,6 +649,9 @@ impl Builder {
             true,
         );
         self.graph.connect_all(&incoming, header);
+        if let Some(condition) = &for_stmt.condition {
+            self.connect_checked_effects(condition.span(), &[header], None);
+        }
         let increment = for_stmt.increment.as_ref().map(|increment| {
             self.graph.add_node(
                 NodeKind::Statement,
@@ -554,6 +684,9 @@ impl Builder {
             }
         };
         let body_outgoing = self.build_statements(&for_stmt.body.statements, body_incoming);
+        if let Some(increment) = &for_stmt.increment {
+            self.connect_checked_effects(for_increment_span(increment), &body_outgoing, None);
+        }
         self.graph
             .connect_all(&body_outgoing, increment.unwrap_or(header));
 
@@ -585,11 +718,68 @@ impl Builder {
         action: NodeAction,
         incoming: Vec<NodeId>,
     ) -> NodeId {
+        let node = self.normal_without_checked_effects(kind, span, action, &incoming);
+        self.connect_checked_effects(span, &incoming, None);
+        node
+    }
+
+    fn normal_without_checked_effects(
+        &mut self,
+        kind: NodeKind,
+        span: Span,
+        action: NodeAction,
+        incoming: &[NodeId],
+    ) -> NodeId {
         let node = self
             .graph
             .add_node(kind, span, action, !self.loops.is_empty());
-        self.graph.connect_all(&incoming, node);
+        self.graph.connect_all(incoming, node);
         node
+    }
+
+    fn connect_checked_effects(
+        &mut self,
+        action_span: Span,
+        before_action: &[NodeId],
+        completed_action: Option<NodeId>,
+    ) {
+        let sites = self
+            .checked_effect_sites
+            .iter()
+            .filter(|((start, end), _)| action_span.start <= *start && *end <= action_span.end)
+            .map(|((start, end), effects)| (Span::new(*start, *end), effects.clone()))
+            .collect::<Vec<_>>();
+        for (site_span, effects) in sites {
+            let completed = completed_action.filter(|_| {
+                site_span.start == action_span.start && site_span.end == action_span.end
+            });
+            let sources = completed
+                .map(|node| vec![node])
+                .unwrap_or_else(|| before_action.to_vec());
+            for effect in effects {
+                self.connect_checked_effect(&effect, site_span, &sources);
+            }
+        }
+    }
+
+    fn connect_checked_effect(&mut self, effect: &ResolvedType, span: Span, sources: &[NodeId]) {
+        let handler = self.exception_handlers.iter().rev().find_map(|handler| {
+            handler
+                .catches
+                .iter()
+                .find(|(catch, _)| crate::checked_effects::effect_is_caught(effect, catch))
+                .map(|(_, target)| (*target, handler.catch_finalizer_depth))
+        });
+        match handler {
+            Some((target, finalizer_depth)) => {
+                let routed = self.route_finalizers(sources.to_vec(), finalizer_depth);
+                self.graph.connect_all(&routed, target);
+            }
+            None => {
+                let routed = self.route_finalizers(sources.to_vec(), 0);
+                self.terminal(NodeKind::DivergeExit, span, NodeAction::None, routed);
+            }
+        }
     }
 
     fn assumption(&mut self, condition: &Expr, truth: bool, incoming: NodeId) -> NodeId {
@@ -617,7 +807,7 @@ impl Builder {
     }
 
     fn terminal(&mut self, kind: NodeKind, span: Span, action: NodeAction, incoming: Vec<NodeId>) {
-        self.normal(kind, span, action, incoming);
+        self.normal_without_checked_effects(kind, span, action, &incoming);
     }
 }
 
@@ -647,6 +837,8 @@ fn statement_span(statement: &Stmt) -> Span {
         Stmt::Break { span } | Stmt::Continue { span } => *span,
         Stmt::Foreach(foreach) => foreach.span,
         Stmt::Increment(increment) => increment.span,
+        Stmt::Throw(statement) => statement.span,
+        Stmt::Try(statement) => statement.span,
     }
 }
 

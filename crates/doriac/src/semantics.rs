@@ -18,9 +18,9 @@ use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
 use crate::symbols::{
-    Binding, BorrowSource, ClassInfo, ConstantInfo, FunctionInfo, MemberDeclaration, MemberKind,
-    MethodInfo, ParamInfo, PropertyInfo, PropertyInitState, ReceiverMode, ReturnBorrow, ScopeStack,
-    StaticPropertyInfo, TypeParamInfo,
+    Binding, BorrowSource, BuiltinInterface, ClassInfo, ConstantInfo, FunctionInfo,
+    MemberDeclaration, MemberKind, MethodInfo, ParamInfo, PropertyInfo, PropertyInitState,
+    ReceiverMode, ReturnBorrow, ScopeStack, StaticPropertyInfo, TypeParamInfo,
 };
 use crate::types::{
     resolved_type_complexity, ClassType, ResolvedType, SharedHandleKind, TypeId, TypeKind, TypeRef,
@@ -88,6 +88,18 @@ pub struct SemanticInfo {
     /// Flow facts at checked source uses, consumed by MIR lowering so
     /// statically selected nullable paths stay selected after lowering.
     pub(crate) flow_facts: crate::narrowing::FactsByUse,
+    /// Declared, source-ordered checked effects for each callable declaration.
+    pub callable_checked_effects: HashMap<usize, Vec<ResolvedType>>,
+    /// Exact checked effects produced at each source operation.
+    pub(crate) checked_effect_sites: crate::checked_effects::EffectSiteMap,
+    /// Resolved owned Error type transferred by each `throw` statement.
+    pub throw_error_types: HashMap<(usize, usize), ResolvedType>,
+    /// Protected effects left after catch coverage for each `try` statement.
+    pub try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
+    /// Resolved catch type for each catch clause.
+    pub catch_error_types: HashMap<(usize, usize), ResolvedType>,
+    /// First checked-error syntax that requires Slice 2 execution support.
+    pub checked_error_boundary: Option<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -123,8 +135,14 @@ pub struct ClassSemanticInfo {
     pub declaration_name: String,
     pub name: String,
     pub arguments: Vec<ResolvedType>,
-    pub implements_displayable: bool,
+    pub builtin_interfaces: Vec<BuiltinInterface>,
     pub properties: Vec<PropertySemanticInfo>,
+}
+
+impl ClassSemanticInfo {
+    pub fn implements(&self, interface: BuiltinInterface) -> bool {
+        self.builtin_interfaces.contains(&interface)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -204,6 +222,8 @@ fn statement_span(statement: &Stmt) -> Span {
         Stmt::Assignment(assignment) => assignment.span,
         Stmt::Echo { span, .. }
         | Stmt::Return { span, .. }
+        | Stmt::Throw(ThrowStmt { span, .. })
+        | Stmt::Try(TryStmt { span, .. })
         | Stmt::Break { span }
         | Stmt::Continue { span }
         | Stmt::Expr { span, .. } => *span,
@@ -304,6 +324,8 @@ pub fn analyze_program_for_ide_with_source<'source>(
             .extend(crate::constructor_init::check_program(
                 program,
                 &checker.given_preludes,
+                &checker.checked_effect_sites,
+                &checker.catch_error_types,
             ));
     }
     if checker.diagnostics.is_empty() {
@@ -329,12 +351,16 @@ pub fn analyze_program_for_ide_with_source<'source>(
             .collect();
         let ownership_diagnostics = crate::ownership::check_program_with_inferred_move_returns(
             program,
-            &inferred_move_returns,
-            &return_borrows,
-            &checker.expression_types,
-            &checker.flow_facts,
-            &move_enum_names,
-            &checker.given_preludes,
+            &crate::ownership::OwnershipAnalysisContext {
+                inferred_move_returns: &inferred_move_returns,
+                return_borrows: &return_borrows,
+                resolved_types: &checker.expression_types,
+                flow_facts: &checker.flow_facts,
+                move_enum_names: &move_enum_names,
+                given_preludes: &checker.given_preludes,
+                checked_effect_sites: &checker.checked_effect_sites,
+                catch_error_types: &checker.catch_error_types,
+            },
         );
         checker.diagnostics.extend(ownership_diagnostics);
     }
@@ -366,6 +392,12 @@ pub fn analyze_program_for_ide_with_source<'source>(
             parameter_defaults: checker.parameter_defaults,
             return_borrows,
             flow_facts: checker.flow_facts,
+            callable_checked_effects: checker.callable_checked_effects,
+            checked_effect_sites: checker.checked_effect_sites,
+            throw_error_types: checker.throw_error_types,
+            try_uncovered_effects: checker.try_uncovered_effects,
+            catch_error_types: checker.catch_error_types,
+            checked_error_boundary: checker.checked_error_boundary,
         },
         diagnostics: checker.diagnostics,
     }
@@ -505,6 +537,12 @@ fn collect_ordered_class_semantics(
                 properties.extend(promoted);
             }
             let class_type_id = checker.types.intern(TypeKind::Class(instance.clone()));
+            let mut builtin_interfaces = class_info
+                .builtin_interfaces
+                .iter()
+                .copied()
+                .collect::<Vec<_>>();
+            builtin_interfaces.sort();
             classes.push(ClassSemanticInfo {
                 id,
                 declaration_name: declaration.name.clone(),
@@ -514,10 +552,7 @@ fn collect_ordered_class_semantics(
                     .iter()
                     .map(|argument| checker.types.resolved(*argument))
                     .collect(),
-                implements_displayable: declaration
-                    .implements
-                    .iter()
-                    .any(|interface| interface == "Displayable"),
+                builtin_interfaces,
                 properties: properties
                     .into_iter()
                     .enumerate()
@@ -953,10 +988,13 @@ pub fn check_program(program: &Program) -> DiagnosticResult<()> {
 }
 
 pub(crate) fn interface_declaration_diagnostic(interface_decl: &InterfaceDecl) -> Diagnostic {
-    let (code, message) = if interface_decl.name == "Displayable" {
+    let (code, message) = if matches!(interface_decl.name.as_str(), "Displayable" | "Error") {
         (
             "E0309",
-            "`Displayable` is a compiler-known interface and cannot be redeclared".to_string(),
+            format!(
+                "`{}` is a compiler-known interface and cannot be redeclared",
+                interface_decl.name
+            ),
         )
     } else {
         (
@@ -1020,6 +1058,33 @@ struct Checker<'program> {
     when_contexts: Vec<WhenCheckContext>,
     active_loop_depth: usize,
     finalizer_boundaries: Vec<FinalizerBoundary>,
+    effect_scopes: Vec<CheckedEffectSet>,
+    class_initializer_effects: HashMap<String, CheckedEffectSet>,
+    callable_checked_effects: HashMap<usize, Vec<ResolvedType>>,
+    checked_effect_sites: crate::checked_effects::EffectSiteMap,
+    throw_error_types: HashMap<(usize, usize), ResolvedType>,
+    try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
+    catch_error_types: HashMap<(usize, usize), ResolvedType>,
+    checked_error_boundary: Option<Span>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CheckedEffectSet {
+    ordered: Vec<TypeId>,
+}
+
+impl CheckedEffectSet {
+    fn insert(&mut self, ty: TypeId) {
+        if !self.ordered.contains(&ty) {
+            self.ordered.push(ty);
+        }
+    }
+
+    fn extend(&mut self, effects: impl IntoIterator<Item = TypeId>) {
+        for effect in effects {
+            self.insert(effect);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1195,6 +1260,12 @@ fn semantic_type_capabilities(
             needs_drop: true,
             equality: true,
         },
+        TypeKind::Error => EnumCapabilities {
+            copy: false,
+            trivial_copy: false,
+            needs_drop: true,
+            equality: true,
+        },
         TypeKind::Bytes => EnumCapabilities {
             copy: false,
             trivial_copy: false,
@@ -1282,6 +1353,7 @@ fn semantic_layout_shape(
         }
         TypeKind::Null => Some(LayoutShape { size: 0, align: 1 }),
         TypeKind::Void
+        | TypeKind::Error
         | TypeKind::Unknown
         | TypeKind::Heterogeneous
         | TypeKind::EmptyCollection
@@ -1515,6 +1587,14 @@ impl<'program> Checker<'program> {
             when_contexts: Vec::new(),
             active_loop_depth: 0,
             finalizer_boundaries: Vec::new(),
+            effect_scopes: Vec::new(),
+            class_initializer_effects: HashMap::new(),
+            callable_checked_effects: HashMap::new(),
+            checked_effect_sites: HashMap::new(),
+            throw_error_types: HashMap::new(),
+            try_uncovered_effects: HashMap::new(),
+            catch_error_types: HashMap::new(),
+            checked_error_boundary: None,
         }
     }
 
@@ -1591,7 +1671,7 @@ impl<'program> Checker<'program> {
                             constraints: param.constraints.clone(),
                         })
                         .collect(),
-                    implements_displayable: false,
+                    builtin_interfaces: HashSet::new(),
                     properties: HashMap::new(),
                     static_properties: HashMap::new(),
                     constants: HashMap::new(),
@@ -1632,10 +1712,15 @@ impl<'program> Checker<'program> {
                         constraints: param.constraints.clone(),
                     })
                     .collect(),
-                implements_displayable: class_decl
+                builtin_interfaces: class_decl
                     .implements
                     .iter()
-                    .any(|name| name == "Displayable"),
+                    .filter_map(|name| match name.as_str() {
+                        "Displayable" => Some(BuiltinInterface::Displayable),
+                        "Error" => Some(BuiltinInterface::Error),
+                        _ => None,
+                    })
+                    .collect(),
                 properties: HashMap::new(),
                 static_properties: HashMap::new(),
                 constants: HashMap::new(),
@@ -1721,6 +1806,7 @@ impl<'program> Checker<'program> {
                                     type_params: signature.type_params,
                                     params: signature.params,
                                     return_ty: signature.return_ty,
+                                    checked_effects: signature.checked_effects,
                                 },
                             );
                         }
@@ -2233,7 +2319,7 @@ impl<'program> Checker<'program> {
                 ));
                 continue;
             }
-            if interface != "Displayable" {
+            if !matches!(interface.as_str(), "Displayable" | "Error") {
                 self.diagnostics.push(Diagnostic::new(
                     "E0464",
                     format!(
@@ -2244,7 +2330,11 @@ impl<'program> Checker<'program> {
             }
         }
 
-        if !info.implements_displayable {
+        if info.implements(BuiltinInterface::Error) {
+            self.check_error_interface(class_decl, info);
+        }
+
+        if !info.implements(BuiltinInterface::Displayable) {
             return;
         }
 
@@ -2289,6 +2379,57 @@ impl<'program> Checker<'program> {
                 .with_help(
                     "declare exactly `function toString(): string` as an externally accessible readonly instance method",
                 ),
+            );
+        }
+    }
+
+    fn check_error_interface(&mut self, class_decl: &ClassDecl, info: &ClassInfo) {
+        let Some(message) = info.properties.get("message") else {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0613",
+                    format!(
+                        "class `{}` implements `Error` but has no `message` property",
+                        class_decl.name
+                    ),
+                    class_decl.span,
+                )
+                .with_title("Error Message Property Is Missing")
+                .with_help("declare an externally accessible readonly `string $message` property"),
+            );
+            return;
+        };
+
+        if !matches!(self.types.kind(message.ty), TypeKind::String) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0614",
+                    "Error `message` must have type `string`",
+                    message.declaration_span,
+                )
+                .with_title("Error Message Property Must Be String"),
+            );
+        }
+        if message.writable {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0615",
+                    "Error `message` must be readonly",
+                    message.declaration_span,
+                )
+                .with_title("Error Message Property Must Be Readonly")
+                .with_help("remove `writable` from the message property"),
+            );
+        }
+        if message.access != MemberAccess::External {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0616",
+                    "Error `message` must be externally accessible",
+                    message.declaration_span,
+                )
+                .with_title("Error Message Property Must Be Externally Accessible")
+                .with_help("remove `internal` from the message property"),
             );
         }
     }
@@ -2367,6 +2508,9 @@ impl<'program> Checker<'program> {
             "Displayable" => Some(
                 "`Displayable` is a compiler-known interface and cannot be redeclared"
                     .to_string(),
+            ),
+            "Error" => Some(
+                "`Error` is a compiler-known interface and cannot be redeclared".to_string(),
             ),
             "Bytes" => Some(
                 "`Bytes` is the compiler-known byte-buffer type and cannot be redeclared"
@@ -2508,6 +2652,14 @@ impl<'program> Checker<'program> {
             .push(type_parameter_scope(&function.type_params));
         let params = self.resolve_param_infos(function, declaring_class);
         let return_ty = self.resolve_function_return_type(function, declaring_class);
+        let checked_effects = self.resolve_throws_clause(function, declaring_class);
+        self.callable_checked_effects.insert(
+            function.span.start,
+            checked_effects
+                .iter()
+                .map(|effect| self.types.resolved(*effect))
+                .collect(),
+        );
         self.type_parameter_scopes.pop();
         self.current_callable = previous_callable;
         let return_borrow = matches!(
@@ -2545,6 +2697,156 @@ impl<'program> Checker<'program> {
             params,
             return_ty,
             return_borrow,
+            checked_effects,
+        }
+    }
+
+    fn resolve_throws_clause(
+        &mut self,
+        function: &FunctionDecl,
+        declaring_class: Option<&str>,
+    ) -> Vec<TypeId> {
+        let Some(clause) = &function.throws else {
+            return Vec::new();
+        };
+        self.checked_error_boundary
+            .get_or_insert(clause.keyword_span);
+        if function.name == "__destruct" {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0622",
+                    "destructors cannot declare checked errors",
+                    clause.span,
+                )
+                .with_title("Destructors Cannot Throw Checked Errors")
+                .with_help("catch every checked error inside `__destruct`"),
+            );
+        }
+
+        let mut effects = Vec::new();
+        let mut saw_error = false;
+        for (entry_index, entry) in clause.entries.iter().enumerate() {
+            if entry.ty.nullable {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0619",
+                        format!("throws type `{}` cannot be nullable", entry.ty),
+                        entry.span,
+                    )
+                    .with_title("Throws Type Cannot Be Nullable"),
+                );
+                continue;
+            }
+            let ty = self.resolve_type_ref_with_class(&entry.ty, entry.span, declaring_class);
+            if self.is_unknown_type(ty) {
+                continue;
+            }
+            if !self.type_implements_error(ty) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0618",
+                        format!(
+                            "throws type `{}` does not implement `Error`",
+                            self.types.display(ty)
+                        ),
+                        entry.span,
+                    )
+                    .with_title("Throws Type Must Implement Error"),
+                );
+                continue;
+            }
+            if effects.contains(&ty) {
+                let (fix_span, applicability) =
+                    self.trailing_throws_entry_removal(clause, entry_index);
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0620",
+                        format!("duplicate throws entry `{}`", self.types.display(ty)),
+                        entry.span,
+                    )
+                    .with_title("Duplicate Throws Entry")
+                    .with_help("remove the duplicate entry")
+                    .with_structured_fix(
+                        "Remove Duplicate Throws Entry",
+                        applicability,
+                        vec![FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: fix_span,
+                            replacement: String::new(),
+                        }],
+                    ),
+                );
+                continue;
+            }
+            if saw_error || (matches!(self.types.kind(ty), TypeKind::Error) && !effects.is_empty())
+            {
+                let (fix_span, applicability) =
+                    self.trailing_throws_entry_removal(clause, entry_index);
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0621",
+                        "`Error` already covers every concrete checked error in this throws list",
+                        entry.span,
+                    )
+                    .with_title("Error Already Covers This Throws Entry")
+                    .with_help("remove the redundant entry")
+                    .with_structured_fix(
+                        "Remove Redundant Throws Entry",
+                        applicability,
+                        vec![FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: fix_span,
+                            replacement: String::new(),
+                        }],
+                    ),
+                );
+                continue;
+            }
+            saw_error = matches!(self.types.kind(ty), TypeKind::Error);
+            effects.push(ty);
+        }
+        effects
+    }
+
+    fn trailing_throws_entry_removal(
+        &self,
+        clause: &ThrowsClause,
+        entry_index: usize,
+    ) -> (Span, FixApplicability) {
+        let entry = &clause.entries[entry_index];
+        let Some(previous) = entry_index
+            .checked_sub(1)
+            .and_then(|index| clause.entries.get(index))
+        else {
+            return (entry.span, FixApplicability::RequiresReview);
+        };
+        let separator = Span::new(previous.span.end, entry.span.start);
+        let applicability = if self.source_slice(separator).is_some_and(|source| {
+            source
+                .chars()
+                .all(|character| character == ',' || character.is_ascii_whitespace())
+        }) {
+            FixApplicability::MachineApplicable
+        } else {
+            FixApplicability::RequiresReview
+        };
+        (Span::new(previous.span.end, entry.span.end), applicability)
+    }
+
+    fn type_implements_error(&self, ty: TypeId) -> bool {
+        match self.types.kind(ty) {
+            TypeKind::Error => true,
+            TypeKind::Class(class) => {
+                self.classes
+                    .get(&class.name)
+                    .is_some_and(|info| info.implements(BuiltinInterface::Error))
+                    || self.program.items.iter().any(|item| {
+                        matches!(item, Item::Class(declaration)
+                        if declaration.name == class.name
+                            && declaration.implements.iter().any(|name| name == "Error"))
+                    })
+            }
+            _ => false,
         }
     }
 
@@ -3540,6 +3842,7 @@ impl<'program> Checker<'program> {
             "string" if ty.arguments.is_empty() => self.types.intern(TypeKind::String),
             "bool" if ty.arguments.is_empty() => self.types.intern(TypeKind::Bool),
             "mixed" if ty.arguments.is_empty() => self.types.intern(TypeKind::Mixed),
+            "Error" if ty.arguments.is_empty() => self.types.intern(TypeKind::Error),
             "[]" if ty.type_argument_count() == 1 && !ty.has_value_arguments() => {
                 let element =
                     self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
@@ -3588,45 +3891,110 @@ impl<'program> Checker<'program> {
                 ClassMember::Property(property) => {
                     if property.is_static {
                         if let Some(initializer) = &property.initializer {
-                            self.check_constant_initializer(initializer, Some(&class_decl.name));
+                            self.check_nonthrowing_initializer(
+                                initializer,
+                                Some(&class_decl.name),
+                                "E0634",
+                                "Static Initializer Cannot Throw",
+                            );
                         }
                     } else {
                         self.check_property_initializer(&class_decl.name, property);
                     }
                 }
                 ClassMember::Constant(constant) => {
-                    self.check_constant_initializer(&constant.initializer, Some(&class_decl.name))
+                    self.check_nonthrowing_initializer(
+                        &constant.initializer,
+                        Some(&class_decl.name),
+                        "E0633",
+                        "Constant Initializer Cannot Throw",
+                    );
                 }
-                ClassMember::Method(method) => {
-                    let lifecycle = LifecycleMethod::from_method_name(&method.name);
-                    self.check_function(
-                        method,
-                        Some(MethodContext {
-                            class_name: class_decl.name.clone(),
-                            receiver_mode: (!method.is_static).then_some(
-                                if method.writable_this && lifecycle.is_none() {
-                                    ReceiverMode::Writable
-                                } else {
-                                    ReceiverMode::Readonly
-                                },
+                ClassMember::Method(_) => {}
+            }
+        }
+        let has_constructor = class_decl.members.iter().any(
+            |member| matches!(member, ClassMember::Method(method) if method.name == "__construct"),
+        );
+        if !has_constructor {
+            if let Some(effects) = self.class_initializer_effects.get(&class_decl.name) {
+                if !effects.ordered.is_empty() {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0635",
+                            format!(
+                                "implicit constructor for `{}` cannot hide a throwing property initializer",
+                                class_decl.name
                             ),
-                            this_available: !method.is_static,
-                        }),
+                            class_decl.span,
+                        )
+                        .with_title("Implicit Constructor Cannot Hide A Throwing Initializer")
+                        .with_help("declare `__construct` explicitly and list the initializer errors in its `throws` clause"),
                     );
                 }
             }
+        }
+        for member in &class_decl.members {
+            let ClassMember::Method(method) = member else {
+                continue;
+            };
+            let lifecycle = LifecycleMethod::from_method_name(&method.name);
+            self.check_function(
+                method,
+                Some(MethodContext {
+                    class_name: class_decl.name.clone(),
+                    receiver_mode: (!method.is_static).then_some(
+                        if method.writable_this && lifecycle.is_none() {
+                            ReceiverMode::Writable
+                        } else {
+                            ReceiverMode::Readonly
+                        },
+                    ),
+                    this_available: !method.is_static,
+                }),
+            );
         }
         self.type_parameter_scopes.pop();
     }
 
     fn check_constant_initializer(&mut self, initializer: &Expr, class_name: Option<&str>) {
+        self.check_nonthrowing_initializer(
+            initializer,
+            class_name,
+            "E0633",
+            "Constant Initializer Cannot Throw",
+        );
+    }
+
+    fn check_nonthrowing_initializer(
+        &mut self,
+        initializer: &Expr,
+        class_name: Option<&str>,
+        code: &'static str,
+        title: &'static str,
+    ) {
         let scopes = ScopeStack::new();
         let context = class_name.map(|class_name| MethodContext {
             class_name: class_name.to_string(),
             receiver_mode: None,
             this_available: false,
         });
+        self.effect_scopes.push(CheckedEffectSet::default());
         self.check_expr(initializer, &scopes, context.as_ref());
+        let effects = self.effect_scopes.pop().expect("initializer effect scope");
+        if !effects.ordered.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    code,
+                    "compile-time and static initialization cannot propagate checked errors",
+                    initializer.span(),
+                )
+                .with_title(title)
+                .with_help(
+                    "move the throwing operation into an explicitly declared runtime callable",
+                ),
+            );
+        }
     }
 
     fn check_property_initializer(&mut self, class_name: &str, property: &PropertyDecl) {
@@ -3649,7 +4017,16 @@ impl<'program> Checker<'program> {
                 self.resolve_type_ref_with_class(&property.ty, property.span, Some(class_name))
             });
         self.record_expected_expression_type(initializer, target_ty);
+        self.effect_scopes.push(CheckedEffectSet::default());
         self.check_expr(initializer, &scopes, Some(&initializer_context));
+        let effects = self
+            .effect_scopes
+            .pop()
+            .expect("property initializer effect scope");
+        self.class_initializer_effects
+            .entry(class_name.to_string())
+            .or_default()
+            .extend(effects.ordered);
         self.check_expr_assignable(
             target_ty,
             initializer,
@@ -3912,6 +4289,31 @@ impl<'program> Checker<'program> {
             .push(type_parameter_scope(&function.type_params));
         let mut scopes = ScopeStack::new();
         let signature = self.current_function_signature(function);
+        if function.return_type.is_none()
+            && LifecycleMethod::from_method_name(&function.name).is_none()
+            && function.throws.is_some()
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0617",
+                    format!("function `{}` must declare its return type", function.name),
+                    function.span,
+                )
+                .with_title("Function Return Type Is Required")
+                .with_help(
+                    "write an explicit return type, including `: void` when no value is returned",
+                ),
+            );
+        }
+        let mut body_effects = CheckedEffectSet::default();
+        if function.name == "__construct" {
+            if let Some(class_name) = method_context.as_ref().map(|context| &context.class_name) {
+                if let Some(initializer_effects) = self.class_initializer_effects.get(class_name) {
+                    body_effects.extend(initializer_effects.ordered.iter().copied());
+                }
+            }
+        }
+        self.effect_scopes.push(body_effects);
         if method_context.is_none()
             && function.name == "main"
             && !matches!(
@@ -3999,8 +4401,108 @@ impl<'program> Checker<'program> {
             0,
         );
         self.check_missing_final_return(function, &return_context);
+        let body_effects = self.effect_scopes.pop().expect("callable effect scope");
+        self.check_callable_effect_contract(function, &signature.checked_effects, &body_effects);
         self.type_parameter_scopes.pop();
         self.current_callable = previous_callable;
+    }
+
+    fn check_callable_effect_contract(
+        &mut self,
+        function: &FunctionDecl,
+        declared: &[TypeId],
+        observed: &CheckedEffectSet,
+    ) {
+        let uncovered = observed
+            .ordered
+            .iter()
+            .copied()
+            .filter(|effect| !Self::checked_error_type_covers(&self.types, declared, *effect))
+            .collect::<Vec<_>>();
+        if uncovered.is_empty() {
+            return;
+        }
+
+        let displays = uncovered
+            .iter()
+            .map(|effect| self.types.display(*effect))
+            .collect::<Vec<_>>();
+        let listed = displays
+            .iter()
+            .map(|display| format!("`{display}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (message, title, help) = if function.name == "__destruct" {
+            (
+                format!("destructor `__destruct` allows checked errors {listed} to escape"),
+                "Destructors Cannot Throw Checked Errors",
+                "catch every checked error completely inside `__destruct`".to_string(),
+            )
+        } else {
+            (
+                format!(
+                    "checked errors {listed} are not declared by `{}`",
+                    function.name
+                ),
+                "Checked Errors Are Not Declared",
+                format!(
+                    "catch each error or add these exact types to the callable's `throws` clause: {}",
+                    displays.join(", ")
+                ),
+            )
+        };
+        self.diagnostics.push(
+            Diagnostic::new("E0631", message, function.span)
+                .with_title(title)
+                .with_help(help),
+        );
+    }
+
+    fn checked_error_type_covers(
+        types: &TypeRegistry,
+        covering: &[TypeId],
+        effect: TypeId,
+    ) -> bool {
+        covering.iter().any(|candidate| {
+            *candidate == effect || matches!(types.kind(*candidate), TypeKind::Error)
+        })
+    }
+
+    fn record_checked_effects(&mut self, effects: impl IntoIterator<Item = TypeId>, span: Span) {
+        let effects = effects.into_iter().collect::<Vec<_>>();
+        crate::checked_effects::record_effect_site(
+            &mut self.checked_effect_sites,
+            span,
+            effects.iter().map(|effect| self.types.resolved(*effect)),
+        );
+        if let Some(scope) = self.effect_scopes.last_mut() {
+            scope.extend(effects);
+            return;
+        }
+        if effects.is_empty() {
+            return;
+        }
+        let displays = effects
+            .iter()
+            .map(|effect| self.types.display(*effect))
+            .collect::<Vec<_>>();
+        let listed = displays
+            .iter()
+            .map(|display| format!("`{display}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0630",
+                format!("checked errors {listed} are not handled"),
+                span,
+            )
+            .with_title("Checked Errors Are Not Handled")
+            .with_help(format!(
+                "catch each error or move this operation into a callable declaring these exact types: {}",
+                displays.join(", ")
+            )),
+        );
     }
 
     fn check_parameter_default_support(
@@ -4292,6 +4794,19 @@ impl<'program> Checker<'program> {
                 } else {
                     self.check_when_yield(expr.as_ref(), *span, scopes, method_context);
                 }
+            }
+            Stmt::Throw(statement) => {
+                self.check_throw_statement(statement, scopes, method_context);
+            }
+            Stmt::Try(statement) => {
+                self.check_try_statement(
+                    statement,
+                    scopes,
+                    method_context,
+                    constructor_init_context.as_deref(),
+                    return_context,
+                    loop_depth,
+                );
             }
             Stmt::If(if_stmt) => {
                 let mut construct_scopes = scopes.clone();
@@ -4658,6 +5173,235 @@ impl<'program> Checker<'program> {
                 );
             }
         }
+    }
+
+    fn check_throw_statement(
+        &mut self,
+        statement: &ThrowStmt,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        self.checked_error_boundary
+            .get_or_insert(statement.keyword_span);
+        self.check_expr(&statement.expr, scopes, method_context);
+        let error_type = self.infer_expr_type(&statement.expr, scopes, method_context);
+        if self.is_unknown_type(error_type) {
+            return;
+        }
+        if !self.type_implements_error(error_type) {
+            let (title, help) = match self.types.kind(error_type) {
+                TypeKind::Class(class) => (
+                    "Class Must Explicitly Implement Error",
+                    format!("declare `class {} implements Error` and provide its required readonly `string $message` property", class.name),
+                ),
+                _ => (
+                    "Throw Requires An Error Value",
+                    "throw an owned instance of a class that explicitly implements `Error`".to_string(),
+                ),
+            };
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0623",
+                    format!(
+                        "cannot throw value of type `{}` because it does not implement `Error`",
+                        self.types.display(error_type)
+                    ),
+                    statement.expr.span(),
+                )
+                .with_title(title)
+                .with_help(help),
+            );
+            return;
+        }
+        self.throw_error_types.insert(
+            (statement.span.start, statement.span.end),
+            self.types.resolved(error_type),
+        );
+        self.record_checked_effects([error_type], statement.span);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_try_statement(
+        &mut self,
+        statement: &TryStmt,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+        constructor_init_context: Option<&ConstructorInitContext>,
+        return_context: Option<&ReturnContext>,
+        loop_depth: usize,
+    ) {
+        self.checked_error_boundary
+            .get_or_insert(statement.keyword_span);
+        self.effect_scopes.push(CheckedEffectSet::default());
+        let mut protected_scopes = scopes.clone();
+        let mut protected_constructor =
+            constructor_init_context.map(ConstructorInitContext::nested);
+        self.check_block(
+            &statement.body,
+            &mut protected_scopes,
+            method_context,
+            protected_constructor.as_mut(),
+            return_context,
+            loop_depth,
+        );
+        let protected = self.effect_scopes.pop().expect("try effect scope");
+        let mut uncovered = protected.clone();
+        let mut seen_catches = Vec::new();
+        let mut saw_error_catch = false;
+
+        for catch in &statement.catches {
+            let catch_type = self.resolve_type_ref_with_class(
+                &catch.ty,
+                catch.ty_span,
+                method_context.map(|context| context.class_name.as_str()),
+            );
+            if self.is_unknown_type(catch_type) {
+                continue;
+            }
+            if !self.type_implements_error(catch_type) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0626",
+                        format!(
+                            "catch type `{}` does not implement `Error`",
+                            self.types.display(catch_type)
+                        ),
+                        catch.ty_span,
+                    )
+                    .with_title("Catch Must Name An Error Type"),
+                );
+                continue;
+            }
+            self.catch_error_types.insert(
+                (catch.span.start, catch.span.end),
+                self.types.resolved(catch_type),
+            );
+            if seen_catches.contains(&catch_type) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0627",
+                        format!("duplicate catch for `{}`", self.types.display(catch_type)),
+                        catch.ty_span,
+                    )
+                    .with_title("Duplicate Catch"),
+                );
+                continue;
+            }
+            if saw_error_catch {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0628",
+                        "no catch can follow the catch-all `Error` clause",
+                        catch.ty_span,
+                    )
+                    .with_title("Catch After Error Is Unreachable"),
+                );
+                continue;
+            }
+            let catches_all = matches!(self.types.kind(catch_type), TypeKind::Error);
+            let catch_set = [catch_type];
+            let reachable = protected.ordered.iter().any(|effect| {
+                matches!(self.types.kind(*effect), TypeKind::Error)
+                    || Self::checked_error_type_covers(&self.types, &catch_set, *effect)
+            });
+            if !reachable {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0629",
+                        format!(
+                            "this try cannot produce `{}`",
+                            self.types.display(catch_type)
+                        ),
+                        catch.ty_span,
+                    )
+                    .with_title("Catch Cannot Match An Error From This Try"),
+                );
+            }
+            if catches_all {
+                uncovered.ordered.clear();
+                saw_error_catch = true;
+            } else {
+                uncovered.ordered.retain(|effect| {
+                    !Self::checked_error_type_covers(&self.types, &catch_set, *effect)
+                });
+            }
+            seen_catches.push(catch_type);
+
+            let mut catch_scopes = scopes.clone();
+            catch_scopes.push();
+            if let Some(binding) = &catch.binding {
+                self.declare_binding(
+                    &mut catch_scopes,
+                    binding.name.clone(),
+                    Binding {
+                        writable: false,
+                        ty: catch_type,
+                        declared_ty: catch_type,
+                        int_constant: None,
+                        string_constant: None,
+                    },
+                    binding.span,
+                );
+            }
+            let mut catch_constructor =
+                constructor_init_context.map(ConstructorInitContext::nested);
+            self.check_block(
+                &catch.body,
+                &mut catch_scopes,
+                method_context,
+                catch_constructor.as_mut(),
+                return_context,
+                loop_depth,
+            );
+            catch_scopes.pop();
+        }
+
+        if let Some(finally) = &statement.finally {
+            self.effect_scopes.push(CheckedEffectSet::default());
+            self.finalizer_boundaries.push(FinalizerBoundary {
+                loop_depth,
+                when_depth: self.when_contexts.len(),
+            });
+            let mut finally_scopes = scopes.clone();
+            let mut finally_constructor =
+                constructor_init_context.map(ConstructorInitContext::nested);
+            self.check_block(
+                &finally.body,
+                &mut finally_scopes,
+                method_context,
+                finally_constructor.as_mut(),
+                return_context,
+                loop_depth,
+            );
+            self.finalizer_boundaries
+                .pop()
+                .expect("checked try finalizer boundary");
+            let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
+            for effect in finalizer_effects.ordered {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0632",
+                        format!(
+                            "checked error `{}` cannot escape `finally`",
+                            self.types.display(effect)
+                        ),
+                        finally.span,
+                    )
+                    .with_title("Checked Error Cannot Escape Finally")
+                    .with_help("catch the checked error inside `finally`"),
+                );
+            }
+        }
+
+        self.try_uncovered_effects.insert(
+            (statement.span.start, statement.span.end),
+            uncovered
+                .ordered
+                .iter()
+                .map(|effect| self.types.resolved(*effect))
+                .collect(),
+        );
+        self.record_checked_effects(uncovered.ordered, statement.span);
     }
 
     fn check_local_declaration(
@@ -7779,7 +8523,7 @@ impl<'program> Checker<'program> {
                 if self
                     .classes
                     .get(&class.name)
-                    .is_some_and(|class| class.implements_displayable)
+                    .is_some_and(|class| class.implements(BuiltinInterface::Displayable))
                 {
                     DisplayConversionKind::DisplayableClass
                 } else {
@@ -8016,6 +8760,7 @@ impl<'program> Checker<'program> {
                 .find(|definition| definition.id == enum_type.id)
                 .is_some_and(|definition| !definition.capabilities.copy),
             TypeKind::Class(_)
+            | TypeKind::Error
             | TypeKind::SharedHandle(_, _)
             | TypeKind::TypeParameter(_)
             | TypeKind::Bytes
@@ -8159,6 +8904,11 @@ impl<'program> Checker<'program> {
             param.ty = self.substitute_type_id(param.ty, &substitutions);
         }
         specialized.return_ty = self.substitute_type_id(method.return_ty, &substitutions);
+        specialized.checked_effects = method
+            .checked_effects
+            .iter()
+            .map(|effect| self.substitute_type_id(*effect, &substitutions))
+            .collect();
         specialized
     }
 
@@ -8744,6 +9494,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        let diagnostics_before = self.diagnostics.len();
         self.check_call_arguments(
             &format!("function `{name}`"),
             &function_info.params,
@@ -8752,6 +9503,9 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        if self.diagnostics.len() == diagnostics_before {
+            self.record_checked_effects(function_info.checked_effects, span);
+        }
     }
 
     fn check_builtin_call(
@@ -9129,6 +9883,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        let diagnostics_before = self.diagnostics.len();
         self.check_call_arguments(
             &format!("method `{class_name}::{method}`"),
             &method_info.params,
@@ -9137,6 +9892,9 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        if self.diagnostics.len() == diagnostics_before {
+            self.record_checked_effects(method_info.checked_effects, span);
+        }
     }
 
     fn string_companion_signature(&mut self, method: &str) -> Option<(Vec<ParamInfo>, TypeId)> {
@@ -9652,6 +10410,7 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        let diagnostics_before = self.diagnostics.len();
         self.check_call_arguments(
             &format!("method `{class_name}::{}`", access.member),
             &method_info.params,
@@ -9660,6 +10419,9 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        if self.diagnostics.len() == diagnostics_before {
+            self.record_checked_effects(method_info.checked_effects, access.span);
+        }
     }
 
     fn report_withdrawn_collection_from(
@@ -10242,6 +11004,7 @@ impl<'program> Checker<'program> {
         }
 
         let constructor = self.specialize_method_for_class(&constructor, class_type);
+        let diagnostics_before = self.diagnostics.len();
         self.check_call_arguments(
             &format!("constructor `{class_name}::__construct`"),
             &constructor.params,
@@ -10250,6 +11013,9 @@ impl<'program> Checker<'program> {
             scopes,
             method_context,
         );
+        if self.diagnostics.len() == diagnostics_before {
+            self.record_checked_effects(constructor.checked_effects, span);
+        }
     }
 
     fn check_call_arguments(
@@ -10431,6 +11197,11 @@ impl<'program> Checker<'program> {
                 .collect(),
             return_ty: self.substitute_type(function.return_ty, &bindings),
             return_borrow: function.return_borrow,
+            checked_effects: function
+                .checked_effects
+                .iter()
+                .map(|effect| self.substitute_type(*effect, &bindings))
+                .collect(),
         };
         for param in &specialized.params {
             self.check_specialized_shared_payloads(param.ty, span);
@@ -10477,6 +11248,11 @@ impl<'program> Checker<'program> {
                 .map(|param| self.substitute_param_info(param, &bindings))
                 .collect(),
             return_ty: self.substitute_type(method.return_ty, &bindings),
+            checked_effects: method
+                .checked_effects
+                .iter()
+                .map(|effect| self.substitute_type(*effect, &bindings))
+                .collect(),
         };
         for param in &specialized.params {
             self.check_specialized_shared_payloads(param.ty, span);
@@ -11498,6 +12274,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::String
                 | TypeKind::Bool
                 | TypeKind::Mixed
+                | TypeKind::Error
                 | TypeKind::Enum(_)
                 | TypeKind::TypeParameter(_)
                 | TypeKind::Class(_)
@@ -11569,6 +12346,10 @@ impl<'program> Checker<'program> {
                 "write `?T` with a concrete type, such as `?string` or `?Person`",
             ),
             "mixed" => self.resolve_zero_arg_type(ty, span, TypeKind::Mixed),
+            "Error" => {
+                self.checked_error_boundary.get_or_insert(span);
+                self.resolve_zero_arg_type(ty, span, TypeKind::Error)
+            }
             "object" => self.reject_type_ref_with_help(
                 ty,
                 span,
@@ -12314,7 +13095,7 @@ impl<'program> Checker<'program> {
                 TypeKind::Class(class) => self
                     .classes
                     .get(&class.name)
-                    .is_some_and(|info| info.implements_displayable),
+                    .is_some_and(|info| info.implements(BuiltinInterface::Displayable)),
                 _ => false,
             },
             _ => false,
@@ -12812,6 +13593,10 @@ impl<'program> Checker<'program> {
                 | TypeKind::Deque(_),
             ) => true,
             (TypeKind::Class(target), TypeKind::Class(value)) => target == value,
+            (TypeKind::Error, TypeKind::Class(value)) => self
+                .classes
+                .get(&value.name)
+                .is_some_and(|class| class.implements(BuiltinInterface::Error)),
             (TypeKind::TypedArray(target), TypeKind::TypedArray(value)) => {
                 self.is_assignable(target, value)
             }
@@ -13468,6 +14253,7 @@ impl<'program> Checker<'program> {
                     EnumBackingType::String => self.types.intern(TypeKind::String),
                 })
             }
+            (TypeKind::Error, "message") => Some(self.types.intern(TypeKind::String)),
             (TypeKind::String, "length" | "byteLength") => Some(int),
             (TypeKind::String, "isEmpty") => Some(bool_ty),
             (TypeKind::String, "bytes") => Some(self.types.intern(TypeKind::Bytes)),
@@ -13507,6 +14293,7 @@ impl<'program> Checker<'program> {
             }
             (
                 TypeKind::String
+                | TypeKind::Error
                 | TypeKind::Bytes
                 | TypeKind::TypedArray(_)
                 | TypeKind::List(_)
@@ -14299,6 +15086,16 @@ impl<'program> Checker<'program> {
                         "String intrinsic properties are `length`, `byteLength`, `isEmpty`, and `bytes`",
                     ),
                 ),
+            }
+            return;
+        }
+        if matches!(self.types.kind(ty), TypeKind::Error) {
+            if property != "message" {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0306",
+                    format!("unknown Error property `{property}`"),
+                    member_span,
+                ));
             }
             return;
         }

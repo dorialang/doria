@@ -81,6 +81,11 @@ formatting intrinsic family, byte I/O intrinsics, and `panic`. Library objects
 such as the future `Doria\Std\Io` stream types remain ordinary namespaced
 declarations rather than intrinsics.
 
+Decision 0119 permits the compiler to recognize only the exact canonical
+`Doria\Std\Io` checked-error identities before general namespaces execute. This
+is a bounded bootstrap exception for Stage 29 Slice 3, not a temporary short
+alias or a second namespace mechanism.
+
 ## Manifest Source Mappings
 
 The canonical main-source table is:

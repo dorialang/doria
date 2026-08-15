@@ -1,0 +1,16 @@
+class StorageError implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function load(): void throws StorageError
+{
+    throw new StorageError("storage unavailable");
+}
+
+function main(): void
+{
+    load();
+}
