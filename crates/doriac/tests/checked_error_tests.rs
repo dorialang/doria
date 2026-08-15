@@ -134,13 +134,51 @@ function load(bool $first): void throws FirstError, SecondError
     ));
 
     let first = error_class("FirstError");
-    assert_code(
-        &format!("{first} function f(): void throws FirstError, FirstError {{}}"),
-        "E0620",
-    );
-    assert_code(
-        &format!("{first} function f(): void throws Error, FirstError {{}}"),
-        "E0621",
+    for (source, code, title) in [
+        (
+            format!("{first} function f(): void throws FirstError, FirstError {{}}"),
+            "E0620",
+            "Remove Duplicate Throws Entry",
+        ),
+        (
+            format!("{first} function f(): void throws Error, FirstError {{}}"),
+            "E0621",
+            "Remove Redundant Throws Entry",
+        ),
+    ] {
+        let diagnostics = diagnostics(&source);
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == code)
+            .unwrap_or_else(|| panic!("expected {code}, got {diagnostics:?}"));
+        let fix = diagnostic
+            .fixes
+            .first()
+            .unwrap_or_else(|| panic!("{code} should carry a structured fix"));
+        assert_eq!(fix.title, title);
+        assert_eq!(
+            fix.applicability,
+            doriac::diagnostics::FixApplicability::MachineApplicable
+        );
+        let mut fixed = source.clone();
+        fixed.replace_range(fix.edits[0].span.start..fix.edits[0].span.end, "");
+        doriac::check_source("checked_error.doria", fixed).unwrap_or_else(|diagnostics| {
+            panic!("{code} fix must produce valid source: {diagnostics:?}")
+        });
+    }
+
+    let commented =
+        format!("{first} function f(): void throws FirstError, /* keep context */ FirstError {{}}");
+    let commented_diagnostics = diagnostics(&commented);
+    let commented_fix = &commented_diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0620")
+        .expect("commented duplicate")
+        .fixes[0];
+    assert_eq!(
+        commented_fix.applicability,
+        doriac::diagnostics::FixApplicability::RequiresReview,
+        "automatic cleanup must not silently discard comments"
     );
     assert_code("function f(): void throws int {}", "E0618");
     assert_code("function f(): void throws ?Error {}", "E0619");

@@ -2714,7 +2714,7 @@ impl<'program> Checker<'program> {
 
         let mut effects = Vec::new();
         let mut saw_error = false;
-        for entry in &clause.entries {
+        for (entry_index, entry) in clause.entries.iter().enumerate() {
             if entry.ty.nullable {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -2745,25 +2745,49 @@ impl<'program> Checker<'program> {
                 continue;
             }
             if effects.contains(&ty) {
+                let (fix_span, applicability) =
+                    self.trailing_throws_entry_removal(clause, entry_index);
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0620",
                         format!("duplicate throws entry `{}`", self.types.display(ty)),
                         entry.span,
                     )
-                    .with_title("Duplicate Throws Entry"),
+                    .with_title("Duplicate Throws Entry")
+                    .with_help("remove the duplicate entry")
+                    .with_structured_fix(
+                        "Remove Duplicate Throws Entry",
+                        applicability,
+                        vec![FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: fix_span,
+                            replacement: String::new(),
+                        }],
+                    ),
                 );
                 continue;
             }
             if saw_error || (matches!(self.types.kind(ty), TypeKind::Error) && !effects.is_empty())
             {
+                let (fix_span, applicability) =
+                    self.trailing_throws_entry_removal(clause, entry_index);
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0621",
                         "`Error` already covers every concrete checked error in this throws list",
                         entry.span,
                     )
-                    .with_title("Error Already Covers This Throws Entry"),
+                    .with_title("Error Already Covers This Throws Entry")
+                    .with_help("remove the redundant entry")
+                    .with_structured_fix(
+                        "Remove Redundant Throws Entry",
+                        applicability,
+                        vec![FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: fix_span,
+                            replacement: String::new(),
+                        }],
+                    ),
                 );
                 continue;
             }
@@ -2771,6 +2795,31 @@ impl<'program> Checker<'program> {
             effects.push(ty);
         }
         effects
+    }
+
+    fn trailing_throws_entry_removal(
+        &self,
+        clause: &ThrowsClause,
+        entry_index: usize,
+    ) -> (Span, FixApplicability) {
+        let entry = &clause.entries[entry_index];
+        let Some(previous) = entry_index
+            .checked_sub(1)
+            .and_then(|index| clause.entries.get(index))
+        else {
+            return (entry.span, FixApplicability::RequiresReview);
+        };
+        let separator = Span::new(previous.span.end, entry.span.start);
+        let applicability = if self.source_slice(separator).is_some_and(|source| {
+            source
+                .chars()
+                .all(|character| character == ',' || character.is_ascii_whitespace())
+        }) {
+            FixApplicability::MachineApplicable
+        } else {
+            FixApplicability::RequiresReview
+        };
+        (Span::new(previous.span.end, entry.span.end), applicability)
     }
 
     fn type_implements_error(&self, ty: TypeId) -> bool {
