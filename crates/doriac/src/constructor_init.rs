@@ -344,6 +344,9 @@ fn inspect_statement(
                 inspect_expr(class, properties, state, expr, diagnostics);
             }
         }
+        Stmt::Throw(statement) => {
+            inspect_expr(class, properties, state, &statement.expr, diagnostics)
+        }
         Stmt::Increment(increment) => inspect_increment(
             class,
             properties,
@@ -354,6 +357,7 @@ fn inspect_statement(
             diagnostics,
         ),
         Stmt::If(_)
+        | Stmt::Try(_)
         | Stmt::While(_)
         | Stmt::DoWhile(_)
         | Stmt::For(_)

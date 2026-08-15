@@ -113,6 +113,7 @@ pub fn lower_source_to_mir(
     text: impl Into<String>,
 ) -> DiagnosticResult<mir::Program> {
     let hir = lower_source(path, text)?;
+    reject_checked_error_execution(&hir)?;
     mir_lowering::lower_program(&hir)
 }
 
@@ -130,6 +131,7 @@ pub fn compile_source_with_options(
     options: CompileOptions,
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
     let hir = lower_source(path, text)?;
+    reject_checked_error_execution(&hir)?;
     backend::emit_with_options(&hir, options).map_err(|error| {
         error.diagnostics.unwrap_or_else(|| {
             let summary = error
@@ -147,6 +149,26 @@ pub fn compile_source_with_options(
             ]
         })
     })
+}
+
+pub(crate) fn reject_checked_error_execution(program: &hir::Program) -> DiagnosticResult<()> {
+    if let Some(span) = program.semantic_info.checked_error_boundary {
+        return Err(vec![checked_error_execution_boundary(span)]);
+    }
+    Ok(())
+}
+
+pub(crate) fn checked_error_execution_boundary(span: Span) -> Diagnostic {
+    Diagnostic::unsupported_stage(
+        "B2901",
+        "checked-error execution lands in Stage 29 Slice 2",
+        span,
+    )
+    .with_title("Checked Error Execution Lands In Stage 29 Slice 2")
+    .with_explanation(
+        "Stage 29 Slice 1 checks checked-error syntax, types, ownership, and effects before executable lowering begins.",
+    )
+    .with_help("use `doriac check`, `doriac ast`, or `doriac hir` to inspect this program")
 }
 
 pub fn parse_source_file(source: &SourceFile) -> DiagnosticResult<Program> {

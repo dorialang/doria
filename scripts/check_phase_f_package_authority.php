@@ -136,12 +136,13 @@ $require($planPath, $plan, [
     'Decision 0118:',
     'Stage 31 — Namespaces and package compilation graph',
     'Stage 33 — Baton package and dependency workflow',
-    'Stage 29 is next',
+    'Stage 29 is in progress',
     'Decision 0117 owns the complete namespace syntax and resolution contract',
 ]);
 $require($pipelinePath, $pipeline, [
     'Phase F Namespace, Autoload, Package, And Dependency Authority — Accepted',
-    'Stage 29 — Next',
+    'Stage 29 — In Progress',
+    'Stage 29 Slice 2 — Next',
     'Stage 31 — Scheduled, Not Implemented',
     'Stage 33 — Scheduled, Not Implemented',
 ]);

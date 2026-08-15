@@ -46,6 +46,8 @@ pub enum TokenKind {
     Default,
     When,
     Given,
+    Try,
+    Catch,
     Finally,
     While,
     Do,
@@ -467,6 +469,8 @@ impl<'source> Lexer<'source> {
             "default" => TokenKind::Default,
             "when" => TokenKind::When,
             "given" => TokenKind::Given,
+            "try" => TokenKind::Try,
+            "catch" => TokenKind::Catch,
             "finally" => TokenKind::Finally,
             "while" => TokenKind::While,
             "do" => TokenKind::Do,
@@ -500,9 +504,7 @@ impl<'source> Lexer<'source> {
             "and" => TokenKind::And,
             "or" => TokenKind::Or,
             "xor" => TokenKind::Xor,
-            "async" | "await" | "spawn" | "scope" | "try" | "catch" => {
-                TokenKind::Reserved(text.to_string())
-            }
+            "async" | "await" | "spawn" | "scope" => TokenKind::Reserved(text.to_string()),
             _ => TokenKind::Identifier(text.to_string()),
         };
 

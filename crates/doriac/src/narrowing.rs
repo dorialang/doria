@@ -565,6 +565,8 @@ fn statement_span(statement: &Stmt) -> Span {
         Stmt::For(statement) => statement.span,
         Stmt::Foreach(statement) => statement.span,
         Stmt::Increment(statement) => statement.span,
+        Stmt::Throw(statement) => statement.span,
+        Stmt::Try(statement) => statement.span,
     }
 }
 
@@ -806,11 +808,15 @@ fn transfer_statement(
                 kill_mutated_call_arguments(expr, state, resolution, mutations);
             }
         }
+        Stmt::Throw(statement) => {
+            kill_mutated_call_arguments(&statement.expr, state, resolution, mutations);
+        }
         Stmt::If(_)
         | Stmt::While(_)
         | Stmt::DoWhile(_)
         | Stmt::For(_)
         | Stmt::Foreach(_)
+        | Stmt::Try(_)
         | Stmt::Break { .. }
         | Stmt::Continue { .. } => {}
     }
@@ -1142,11 +1148,15 @@ fn kill_mutated_calls_in_statement(
                 kill_mutated_call_arguments(expr, state, resolution, mutations);
             }
         }
+        Stmt::Throw(statement) => {
+            kill_mutated_call_arguments(&statement.expr, state, resolution, mutations)
+        }
         Stmt::If(_)
         | Stmt::While(_)
         | Stmt::DoWhile(_)
         | Stmt::For(_)
         | Stmt::Foreach(_)
+        | Stmt::Try(_)
         | Stmt::Break { .. }
         | Stmt::Continue { .. } => {}
         Stmt::Increment(increment) => {
@@ -1472,6 +1482,9 @@ fn collect_statement(
                 collect_expr(expr, state, resolution, mutations, facts);
             }
         }
+        Stmt::Throw(statement) => {
+            collect_expr(&statement.expr, state, resolution, mutations, facts);
+        }
         Stmt::Increment(increment) => {
             collect_expr(&increment.target, state, resolution, mutations, facts);
         }
@@ -1480,6 +1493,7 @@ fn collect_statement(
         | Stmt::DoWhile(_)
         | Stmt::For(_)
         | Stmt::Foreach(_)
+        | Stmt::Try(_)
         | Stmt::Break { .. }
         | Stmt::Continue { .. } => {}
     }
@@ -1943,6 +1957,21 @@ impl Resolver {
             Stmt::Return { expr, .. } => {
                 if let Some(expr) = expr {
                     self.resolve_expr(expr);
+                }
+            }
+            Stmt::Throw(statement) => self.resolve_expr(&statement.expr),
+            Stmt::Try(statement) => {
+                self.resolve_block(&statement.body);
+                for catch in &statement.catches {
+                    self.scopes.push(HashMap::new());
+                    if let Some(binding) = &catch.binding {
+                        self.declare(&binding.name, binding.span.start, Some(catch.ty.clone()));
+                    }
+                    self.resolve_statements(&catch.body.statements);
+                    self.scopes.pop();
+                }
+                if let Some(finally) = &statement.finally {
+                    self.resolve_block(&finally.body);
                 }
             }
             Stmt::If(statement) => {

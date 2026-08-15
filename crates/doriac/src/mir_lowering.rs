@@ -1113,6 +1113,7 @@ fn intern_resolved_collection_types(
         ResolvedType::String => mir::Type::String,
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::Mixed => mir::Type::Mixed,
+        ResolvedType::Error => return None,
         ResolvedType::Enum(enum_type) => class_ids.mir_enum_type(enum_type.id),
         ResolvedType::Class(class) => mir::Type::Class(*class_ids.get(class)?),
         ResolvedType::SharedHandle(kind, payload) => match kind {
@@ -1335,6 +1336,8 @@ fn intern_block_collection_types(
             | hir::Stmt::Break { .. }
             | hir::Stmt::Continue { .. }
             | hir::Stmt::Increment(_)
+            | hir::Stmt::Throw(_)
+            | hir::Stmt::Try(_)
             | hir::Stmt::Expr { .. } => {}
         }
     }
@@ -2058,6 +2061,16 @@ fn lower_statement_sequence(
             hir::Stmt::Break { span } => lower_loop_control(*span, LoopControl::Break, context)?,
             hir::Stmt::Continue { span } => {
                 lower_loop_control(*span, LoopControl::Continue, context)?;
+            }
+            hir::Stmt::Throw(statement) => {
+                return Err(vec![crate::checked_error_execution_boundary(
+                    statement.span,
+                )]);
+            }
+            hir::Stmt::Try(statement) => {
+                return Err(vec![crate::checked_error_execution_boundary(
+                    statement.span,
+                )]);
             }
             hir::Stmt::Expr { expr, span } => {
                 lower_with_statement_temporaries(context, |context| {
@@ -4818,6 +4831,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullablePayloadEnum(_)) => Some(already),
             },
             ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
+            ResolvedType::Error => None,
         }
     }
 
@@ -7196,7 +7210,7 @@ fn lower_display_string_expression(
                 format!("unknown native class#{}", class.0),
             )]
         })?;
-        if !class_info.implements_displayable {
+        if !class_info.implements(crate::symbols::BuiltinInterface::Displayable) {
             return Err(vec![unsupported(
                 expr.span(),
                 format!(
@@ -17425,6 +17439,8 @@ fn stmt_span(statement: &hir::Stmt) -> Span {
         hir::Stmt::Foreach(foreach) => foreach.span,
         hir::Stmt::Increment(increment) => increment.span,
         hir::Stmt::Expr { span, .. } => *span,
+        hir::Stmt::Throw(statement) => statement.span,
+        hir::Stmt::Try(statement) => statement.span,
     }
 }
 

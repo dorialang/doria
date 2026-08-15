@@ -171,9 +171,12 @@ foreach (0..<10 as $i) {
 
 #[test]
 fn lexes_checked_error_direction_keywords() {
-    let kinds = token_kinds("throw throws");
-    assert!(matches!(kinds[0], TokenKind::Throw));
-    assert!(matches!(kinds[1], TokenKind::Throws));
+    let kinds = token_kinds("try catch throw throws finally");
+    assert!(matches!(kinds[0], TokenKind::Try));
+    assert!(matches!(kinds[1], TokenKind::Catch));
+    assert!(matches!(kinds[2], TokenKind::Throw));
+    assert!(matches!(kinds[3], TokenKind::Throws));
+    assert!(matches!(kinds[4], TokenKind::Finally));
 }
 
 #[test]

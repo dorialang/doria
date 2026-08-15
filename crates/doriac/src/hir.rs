@@ -1,5 +1,5 @@
 use crate::source::Span;
-use crate::types::TypeRef;
+use crate::types::{ResolvedType, TypeRef};
 
 pub use crate::ast::{
     ArgumentName, AssignOp, BinaryOp, IncrementOp, IncrementPosition, MatchMode, MatchOrigin,
@@ -106,7 +106,22 @@ pub struct FunctionDecl {
     pub type_params: Vec<TypeParamDecl>,
     pub params: Vec<Param>,
     pub return_type: Option<TypeRef>,
+    pub throws: Option<ThrowsClause>,
     pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrowsClause {
+    pub keyword_span: Span,
+    pub entries: Vec<ThrowsEntry>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrowsEntry {
+    pub source: TypeRef,
+    pub resolved: ResolvedType,
     pub span: Span,
 }
 
@@ -142,6 +157,8 @@ pub enum Stmt {
     Assignment(Assignment),
     Echo { expr: Expr, span: Span },
     Return { expr: Option<Expr>, span: Span },
+    Throw(ThrowStmt),
+    Try(TryStmt),
     If(IfStmt),
     While(WhileStmt),
     DoWhile(DoWhileStmt),
@@ -151,6 +168,49 @@ pub enum Stmt {
     Foreach(ForeachStmt),
     Increment(IncrementStmt),
     Expr { expr: Expr, span: Span },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrowStmt {
+    pub keyword_span: Span,
+    pub expr: Expr,
+    pub error_type: ResolvedType,
+    pub transfers_ownership: bool,
+    pub semicolon_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TryStmt {
+    pub keyword_span: Span,
+    pub body: Block,
+    pub catches: Vec<CatchClause>,
+    pub finally: Option<TryFinally>,
+    pub uncovered_effects: Vec<ResolvedType>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchClause {
+    pub keyword_span: Span,
+    pub source_type: TypeRef,
+    pub error_type: ResolvedType,
+    pub binding: Option<CatchBinding>,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchBinding {
+    pub name: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TryFinally {
+    pub keyword_span: Span,
+    pub body: Block,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

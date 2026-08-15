@@ -38,6 +38,7 @@ pub fn lower_program_with_semantics(
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }
+    apply_checked_error_semantics(&mut items, &semantic_info);
 
     Ok(hir::Program {
         source_path: String::new(),
@@ -52,6 +53,138 @@ pub fn lower_program_with_semantics(
         items,
         semantic_info,
     })
+}
+
+fn apply_checked_error_semantics(
+    items: &mut [hir::Item],
+    semantic_info: &crate::semantics::SemanticInfo,
+) {
+    for item in items {
+        match item {
+            hir::Item::Function(function) => {
+                apply_function_checked_error_semantics(function, semantic_info)
+            }
+            hir::Item::Class(class) => {
+                for member in &mut class.members {
+                    if let hir::ClassMember::Method(method) = member {
+                        apply_function_checked_error_semantics(method, semantic_info);
+                    }
+                }
+            }
+            hir::Item::Statement(statement) => {
+                apply_statement_checked_error_semantics(statement, semantic_info)
+            }
+            hir::Item::Enum(_) | hir::Item::Constant(_) => {}
+        }
+    }
+}
+
+fn apply_function_checked_error_semantics(
+    function: &mut hir::FunctionDecl,
+    semantic_info: &crate::semantics::SemanticInfo,
+) {
+    if let Some(throws) = &mut function.throws {
+        if let Some(effects) = semantic_info
+            .callable_checked_effects
+            .get(&function.span.start)
+        {
+            for (entry, effect) in throws.entries.iter_mut().zip(effects) {
+                entry.resolved = effect.clone();
+            }
+        }
+    }
+    apply_block_checked_error_semantics(&mut function.body, semantic_info);
+}
+
+fn apply_block_checked_error_semantics(
+    block: &mut hir::Block,
+    semantic_info: &crate::semantics::SemanticInfo,
+) {
+    for statement in &mut block.statements {
+        apply_statement_checked_error_semantics(statement, semantic_info);
+    }
+}
+
+fn apply_statement_checked_error_semantics(
+    statement: &mut hir::Stmt,
+    semantic_info: &crate::semantics::SemanticInfo,
+) {
+    match statement {
+        hir::Stmt::Block(block) => apply_block_checked_error_semantics(block, semantic_info),
+        hir::Stmt::Throw(statement) => {
+            if let Some(error_type) = semantic_info
+                .throw_error_types
+                .get(&(statement.span.start, statement.span.end))
+            {
+                statement.error_type = error_type.clone();
+            }
+        }
+        hir::Stmt::Try(statement) => {
+            apply_block_checked_error_semantics(&mut statement.body, semantic_info);
+            for catch in &mut statement.catches {
+                if let Some(error_type) = semantic_info
+                    .catch_error_types
+                    .get(&(catch.span.start, catch.span.end))
+                {
+                    catch.error_type = error_type.clone();
+                }
+                apply_block_checked_error_semantics(&mut catch.body, semantic_info);
+            }
+            if let Some(finally) = &mut statement.finally {
+                apply_block_checked_error_semantics(&mut finally.body, semantic_info);
+            }
+            statement.uncovered_effects = semantic_info
+                .try_uncovered_effects
+                .get(&(statement.span.start, statement.span.end))
+                .cloned()
+                .unwrap_or_default();
+        }
+        hir::Stmt::If(statement) => apply_if_checked_error_semantics(statement, semantic_info),
+        hir::Stmt::While(statement) => {
+            apply_block_checked_error_semantics(&mut statement.body, semantic_info);
+            if let Some(finally) = &mut statement.finally {
+                apply_block_checked_error_semantics(&mut finally.block, semantic_info);
+            }
+        }
+        hir::Stmt::DoWhile(statement) => {
+            apply_block_checked_error_semantics(&mut statement.body, semantic_info);
+            if let Some(finally) = &mut statement.finally {
+                apply_block_checked_error_semantics(&mut finally.block, semantic_info);
+            }
+        }
+        hir::Stmt::For(statement) => {
+            apply_block_checked_error_semantics(&mut statement.body, semantic_info)
+        }
+        hir::Stmt::Foreach(statement) => {
+            apply_block_checked_error_semantics(&mut statement.body, semantic_info)
+        }
+        hir::Stmt::VarDecl(_)
+        | hir::Stmt::Assignment(_)
+        | hir::Stmt::Echo { .. }
+        | hir::Stmt::Return { .. }
+        | hir::Stmt::Break { .. }
+        | hir::Stmt::Continue { .. }
+        | hir::Stmt::Increment(_)
+        | hir::Stmt::Expr { .. } => {}
+    }
+}
+
+fn apply_if_checked_error_semantics(
+    statement: &mut hir::IfStmt,
+    semantic_info: &crate::semantics::SemanticInfo,
+) {
+    apply_block_checked_error_semantics(&mut statement.then_block, semantic_info);
+    if let Some(branch) = &mut statement.else_branch {
+        match branch {
+            hir::ElseBranch::If(nested) => apply_if_checked_error_semantics(nested, semantic_info),
+            hir::ElseBranch::Block(block) => {
+                apply_block_checked_error_semantics(block, semantic_info)
+            }
+        }
+    }
+    if let Some(finally) = &mut statement.finally {
+        apply_block_checked_error_semantics(&mut finally.block, semantic_info);
+    }
 }
 
 fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
@@ -202,6 +335,19 @@ fn lower_function(
             .return_type
             .as_ref()
             .map(|ty| lower_type_ref(ty, class_name)),
+        throws: function.throws.as_ref().map(|throws| hir::ThrowsClause {
+            keyword_span: throws.keyword_span,
+            entries: throws
+                .entries
+                .iter()
+                .map(|entry| hir::ThrowsEntry {
+                    source: lower_type_ref(&entry.ty, class_name),
+                    resolved: crate::types::ResolvedType::Unsupported,
+                    span: entry.span,
+                })
+                .collect(),
+            span: throws.span,
+        }),
         body: lower_block(&function.body, class_name),
         span: function.span,
     }
@@ -283,6 +429,40 @@ fn lower_stmt(statement: &ast::Stmt, class_name: Option<ClassContext<'_>>) -> hi
             expr: expr.as_ref().map(|expr| lower_expr(expr, class_name)),
             span: *span,
         },
+        ast::Stmt::Throw(throw) => hir::Stmt::Throw(hir::ThrowStmt {
+            keyword_span: throw.keyword_span,
+            expr: lower_expr(&throw.expr, class_name),
+            error_type: crate::types::ResolvedType::Unsupported,
+            transfers_ownership: true,
+            semicolon_span: throw.semicolon_span,
+            span: throw.span,
+        }),
+        ast::Stmt::Try(try_stmt) => hir::Stmt::Try(hir::TryStmt {
+            keyword_span: try_stmt.keyword_span,
+            body: lower_block(&try_stmt.body, class_name),
+            catches: try_stmt
+                .catches
+                .iter()
+                .map(|catch| hir::CatchClause {
+                    keyword_span: catch.keyword_span,
+                    source_type: lower_type_ref(&catch.ty, class_name),
+                    error_type: crate::types::ResolvedType::Unsupported,
+                    binding: catch.binding.as_ref().map(|binding| hir::CatchBinding {
+                        name: binding.name.clone(),
+                        span: binding.span,
+                    }),
+                    body: lower_block(&catch.body, class_name),
+                    span: catch.span,
+                })
+                .collect(),
+            finally: try_stmt.finally.as_ref().map(|finally| hir::TryFinally {
+                keyword_span: finally.keyword_span,
+                body: lower_block(&finally.body, class_name),
+                span: finally.span,
+            }),
+            uncovered_effects: Vec::new(),
+            span: try_stmt.span,
+        }),
         ast::Stmt::If(if_stmt) => hir::Stmt::If(lower_if_stmt(if_stmt, class_name)),
         ast::Stmt::While(while_stmt) => hir::Stmt::While(hir::WhileStmt {
             given: while_stmt

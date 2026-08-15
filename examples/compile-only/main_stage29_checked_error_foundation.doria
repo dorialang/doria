@@ -1,0 +1,52 @@
+class RecordUnavailableError implements Error
+{
+    function __construct(string $message, string $recordId)
+    {
+    }
+}
+
+class StorageError implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function loadRecord(string $recordId): string
+    throws RecordUnavailableError, StorageError
+{
+    if ($recordId == "missing") {
+        throw new RecordUnavailableError("record unavailable", $recordId);
+    }
+
+    throw new StorageError("storage unavailable");
+}
+
+function relay(take StorageError $error): void throws StorageError
+{
+    throw $error;
+}
+
+class Repository
+{
+    string $status = loadRecord("ready");
+
+    function __construct() throws RecordUnavailableError, StorageError
+    {
+    }
+}
+
+function main(): void throws StorageError
+{
+    try {
+        echo loadRecord("missing");
+    } catch (RecordUnavailableError $error) {
+        echo $error->message;
+    } catch (StorageError) {
+        echo "storage failure";
+    } finally {
+        echo "checked\n";
+    }
+
+    relay(new StorageError("relay"));
+}

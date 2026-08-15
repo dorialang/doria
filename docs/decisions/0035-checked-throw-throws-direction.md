@@ -61,7 +61,10 @@ function renderProfile(int $id): string
 
 ## Implementation status
 
-This decision records the language direction only. It does not implement compiler behavior for `throw`, `throws`, `try`, or `catch`.
+Decision 0119 supplies the complete grammar, semantic, representation, and
+three-slice implementation contract. Stage 29 Slice 1 implements checking,
+AST/HIR, and the shared pre-MIR execution boundary. Checked-error execution,
+runtime transport, and I/O migration remain in Slices 2 and 3.
 
 ## Unified diagnostic amendment
 
@@ -83,13 +86,12 @@ review.
 
 This decision does not add:
 
-- parser support for `throws` clauses
-- semantic checking for thrown error declarations
-- `throw` statement lowering
-- `try`/`catch` compiler behavior
 - runtime error objects
 - exception unwinding
 - panic/fatal-error taxonomy
 - interaction with `finally`
 - standard-library error hierarchies
 - native runtime exception machinery
+
+These historical non-goals described this direction-only record before Decision
+0119. They do not override the implemented Slice 1 grammar and semantic model.

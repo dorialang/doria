@@ -615,6 +615,8 @@ fn statement_return_borrow(
             }
         }
         Stmt::Return { expr: None, .. } => None,
+        Stmt::Throw(_) => Some(false),
+        Stmt::Try(_) => None,
         Stmt::If(statement) => match constant_bool(&statement.condition) {
             Some(true) => block_return_borrow(
                 &statement.then_block,
@@ -1831,6 +1833,90 @@ impl Checker<'_> {
             Stmt::Increment(increment) => {
                 self.use_expr(&increment.target, scopes, UseMode::Read);
                 Flow::fallthrough()
+            }
+            Stmt::Throw(statement) => {
+                let diagnostics_before = self.diagnostics.len();
+                self.use_expr(&statement.expr, scopes, UseMode::Give);
+                for diagnostic in &mut self.diagnostics[diagnostics_before..] {
+                    if diagnostic.code == "E0474" {
+                        let help = "throw transfers ownership; use an owned Error value or accept the parameter with `take`".to_string();
+                        diagnostic.title = "Throw Requires Ownership".to_string();
+                        diagnostic.helps.clear();
+                        diagnostic.helps.push(help.clone());
+                        diagnostic.help = Some(help);
+                    }
+                }
+                Flow::stops()
+            }
+            Stmt::Try(statement) => {
+                let before = scopes.clone();
+                let mut protected_scopes = before.clone();
+                let mut protected_flow = self.check_block(
+                    &statement.body,
+                    &mut protected_scopes,
+                    return_move_type,
+                    true,
+                );
+
+                let mut fallthrough_states = Vec::new();
+                if protected_flow.falls_through {
+                    fallthrough_states.push(protected_scopes.clone());
+                }
+                let mut exceptional_base = before.clone();
+                exceptional_base.merge_from(&before, &protected_scopes);
+                for catch in &statement.catches {
+                    let mut catch_scopes = exceptional_base.clone();
+                    catch_scopes.push();
+                    if let Some(binding) = &catch.binding {
+                        catch_scopes.declare(
+                            binding.name.clone(),
+                            Binding {
+                                id: self.next_binding_id(),
+                                class: type_ref_class_name(
+                                    &catch.ty,
+                                    &self.classes,
+                                    self.receiver_class.as_deref(),
+                                ),
+                                collection: None,
+                                mixed: false,
+                                borrowed_place: false,
+                                borrow_root: None,
+                                writable: false,
+                                state: State::Owned,
+                            },
+                        );
+                    }
+                    let mut catch_flow =
+                        self.check_block(&catch.body, &mut catch_scopes, return_move_type, false);
+                    catch_scopes.pop();
+                    pop_flow_scope(&mut catch_flow);
+                    if catch_flow.falls_through {
+                        fallthrough_states.push(catch_scopes);
+                    }
+                    protected_flow.backedges.append(&mut catch_flow.backedges);
+                    protected_flow.breaks.append(&mut catch_flow.breaks);
+                    protected_flow.returns.append(&mut catch_flow.returns);
+                    protected_flow.yields.append(&mut catch_flow.yields);
+                }
+
+                if fallthrough_states.is_empty() {
+                    *scopes = before;
+                    protected_flow.falls_through = false;
+                } else {
+                    merge_reachable_states(scopes, &fallthrough_states);
+                    protected_flow.falls_through = true;
+                }
+
+                if let Some(finally) = &statement.finally {
+                    self.apply_finally_to_flow(
+                        &finally.body,
+                        scopes,
+                        protected_flow,
+                        return_move_type,
+                    )
+                } else {
+                    protected_flow
+                }
             }
             Stmt::Break { .. } => Flow::breaks(scopes),
             Stmt::Continue { .. } => Flow {
@@ -3936,6 +4022,21 @@ fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
                     && statements_use_variable(&statement.body.statements, name))
         }
         Stmt::Increment(statement) => expr_uses_variable(&statement.target, name),
+        Stmt::Throw(statement) => expr_uses_variable(&statement.expr, name),
+        Stmt::Try(statement) => {
+            statements_use_variable(&statement.body.statements, name)
+                || statement.catches.iter().any(|catch| {
+                    catch
+                        .binding
+                        .as_ref()
+                        .is_none_or(|binding| binding.name != name)
+                        && statements_use_variable(&catch.body.statements, name)
+                })
+                || statement
+                    .finally
+                    .as_ref()
+                    .is_some_and(|finally| statements_use_variable(&finally.body.statements, name))
+        }
     }
 }
 
@@ -4305,6 +4406,7 @@ fn type_ref_is_move_type_with_enums(
         || matches!(
             ty.name.as_str(),
             "mixed"
+                | "Error"
                 | "Bytes"
                 | "[]"
                 | "List"

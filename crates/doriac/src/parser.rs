@@ -347,6 +347,12 @@ impl Parser {
             None
         };
 
+        let throws = if self.match_kind(&TokenKind::Throws) {
+            Some(self.parse_throws_clause()?)
+        } else {
+            None
+        };
+
         let body = self.parse_block()?;
         let span = Span::new(start, body.span.end);
         Some(FunctionDecl {
@@ -359,8 +365,29 @@ impl Parser {
             type_params,
             params,
             return_type,
+            throws,
             body,
             span,
+        })
+    }
+
+    fn parse_throws_clause(&mut self) -> Option<ThrowsClause> {
+        let keyword_span = self.previous().span;
+        let mut entries = Vec::new();
+        loop {
+            let start = self.peek().span.start;
+            let ty = self.parse_type_ref()?;
+            let span = Span::new(start, self.previous().span.end);
+            entries.push(ThrowsEntry { ty, span });
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = entries.last()?.span.end;
+        Some(ThrowsClause {
+            keyword_span,
+            entries,
+            span: Span::new(keyword_span.start, end),
         })
     }
 
@@ -587,6 +614,33 @@ impl Parser {
             });
         }
 
+        if self.match_kind(&TokenKind::Throw) {
+            let keyword_span = self.previous().span;
+            if self.check(&TokenKind::Semicolon) {
+                self.advance();
+                self.diagnostics.push(
+                    Diagnostic::new("E0624", "bare `throw` is not supported", keyword_span)
+                        .with_title("Throw Requires An Error Value")
+                        .with_help("rethrow a caught Error with `throw $error;`"),
+                );
+                return None;
+            }
+            let expr = self.parse_expression()?;
+            let semicolon_span = self
+                .expect(TokenKind::Semicolon, "expected `;` after throw statement")?
+                .span;
+            return Some(Stmt::Throw(ThrowStmt {
+                keyword_span,
+                span: Span::new(keyword_span.start, semicolon_span.end),
+                expr,
+                semicolon_span,
+            }));
+        }
+
+        if self.match_kind(&TokenKind::Try) {
+            return self.parse_try_statement().map(Stmt::Try);
+        }
+
         if self.match_kind(&TokenKind::Break) {
             return self.parse_loop_control_statement(
                 TokenKind::Break,
@@ -704,6 +758,80 @@ impl Parser {
         Some(Stmt::Expr {
             span: Span::new(expr.span().start, end),
             expr,
+        })
+    }
+
+    fn parse_try_statement(&mut self) -> Option<TryStmt> {
+        let keyword_span = self.previous().span;
+        let body = self.parse_block()?;
+        let mut catches = Vec::new();
+        while self.match_kind(&TokenKind::Catch) {
+            let catch_keyword = self.previous().span;
+            self.expect(TokenKind::LeftParen, "expected `(` after `catch`")?;
+            let type_start = self.peek().span.start;
+            let ty = self.parse_type_ref()?;
+            let ty_span = Span::new(type_start, self.previous().span.end);
+            let binding = if let Some((name, span)) = self.consume_variable() {
+                Some(CatchBinding { name, span })
+            } else {
+                None
+            };
+            self.expect(TokenKind::RightParen, "expected `)` after catch type")?;
+            let catch_body = self.parse_block()?;
+            let span = Span::new(catch_keyword.start, catch_body.span.end);
+            catches.push(CatchClause {
+                keyword_span: catch_keyword,
+                ty,
+                ty_span,
+                binding,
+                body: catch_body,
+                span,
+            });
+        }
+        let finally = if self.match_kind(&TokenKind::Finally) {
+            let finally_keyword = self.previous().span;
+            let finally_body = self.parse_block()?;
+            Some(TryFinally {
+                keyword_span: finally_keyword,
+                span: Span::new(finally_keyword.start, finally_body.span.end),
+                body: finally_body,
+            })
+        } else {
+            None
+        };
+        if finally.is_some() && self.check(&TokenKind::Catch) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0637",
+                    "a `catch` clause cannot follow `finally`",
+                    self.peek().span,
+                )
+                .with_title("Catch Cannot Follow Finally")
+                .with_help("place every `catch` before the single final `finally` clause"),
+            );
+            return None;
+        }
+        if catches.is_empty() && finally.is_none() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0625",
+                    "`try` requires at least one `catch` or `finally`",
+                    body.span,
+                )
+                .with_title("Try Requires Catch Or Finally"),
+            );
+            return None;
+        }
+        let end = finally.as_ref().map_or_else(
+            || catches.last().map_or(body.span.end, |catch| catch.span.end),
+            |clause| clause.span.end,
+        );
+        Some(TryStmt {
+            keyword_span,
+            body,
+            catches,
+            finally,
+            span: Span::new(keyword_span.start, end),
         })
     }
 
@@ -1573,6 +1701,18 @@ impl Parser {
         }
         let token = self.advance().clone();
         match token.kind {
+            TokenKind::Throw => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0636",
+                        "`throw` is a statement and cannot be used as a value",
+                        token.span,
+                    )
+                    .with_title("Throw Is A Statement")
+                    .with_help("write `throw $error;` as its own statement"),
+                );
+                None
+            }
             TokenKind::Variable(name) => {
                 if name == "this" {
                     Some(Expr::This { span: token.span })
@@ -2726,6 +2866,8 @@ impl Parser {
                 | TokenKind::Let
                 | TokenKind::Echo
                 | TokenKind::Return
+                | TokenKind::Throw
+                | TokenKind::Try
                 | TokenKind::Break
                 | TokenKind::Continue
                 | TokenKind::If
@@ -2775,6 +2917,8 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Default => "default",
         TokenKind::When => "when",
         TokenKind::Given => "given",
+        TokenKind::Try => "try",
+        TokenKind::Catch => "catch",
         TokenKind::Finally => "finally",
         TokenKind::While => "while",
         TokenKind::Do => "do",

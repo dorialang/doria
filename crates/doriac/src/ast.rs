@@ -118,7 +118,21 @@ pub struct FunctionDecl {
     pub type_params: Vec<TypeParamDecl>,
     pub params: Vec<Param>,
     pub return_type: Option<TypeRef>,
+    pub throws: Option<ThrowsClause>,
     pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrowsClause {
+    pub keyword_span: Span,
+    pub entries: Vec<ThrowsEntry>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrowsEntry {
+    pub ty: TypeRef,
     pub span: Span,
 }
 
@@ -176,6 +190,8 @@ pub enum Stmt {
     Assignment(Assignment),
     Echo { expr: Expr, span: Span },
     Return { expr: Option<Expr>, span: Span },
+    Throw(ThrowStmt),
+    Try(TryStmt),
     If(IfStmt),
     While(WhileStmt),
     DoWhile(DoWhileStmt),
@@ -185,6 +201,46 @@ pub enum Stmt {
     Foreach(ForeachStmt),
     Increment(IncrementStmt),
     Expr { expr: Expr, span: Span },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrowStmt {
+    pub keyword_span: Span,
+    pub expr: Expr,
+    pub semicolon_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TryStmt {
+    pub keyword_span: Span,
+    pub body: Block,
+    pub catches: Vec<CatchClause>,
+    pub finally: Option<TryFinally>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchClause {
+    pub keyword_span: Span,
+    pub ty: TypeRef,
+    pub ty_span: Span,
+    pub binding: Option<CatchBinding>,
+    pub body: Block,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatchBinding {
+    pub name: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TryFinally {
+    pub keyword_span: Span,
+    pub body: Block,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

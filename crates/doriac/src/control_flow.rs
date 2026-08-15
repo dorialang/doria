@@ -209,6 +209,39 @@ impl Builder {
                 self.terminal(NodeKind::ReturnExit, *span, NodeAction::None, routed);
                 Vec::new()
             }
+            Stmt::Throw(statement) => {
+                let value = self.normal(
+                    NodeKind::Statement,
+                    statement.span,
+                    NodeAction::Statement(Stmt::Throw(statement.clone())),
+                    incoming,
+                );
+                let routed = self.route_finalizers(vec![value], 0);
+                self.terminal(
+                    NodeKind::DivergeExit,
+                    statement.span,
+                    NodeAction::None,
+                    routed,
+                );
+                Vec::new()
+            }
+            Stmt::Try(statement) => {
+                if let Some(finally) = &statement.finally {
+                    self.finalizers.push(finally.body.clone());
+                }
+                let before = incoming.clone();
+                let mut outgoing = self.build_statements(&statement.body.statements, incoming);
+                for catch in &statement.catches {
+                    outgoing.extend(self.build_statements(&catch.body.statements, before.clone()));
+                }
+                let outgoing = deduplicate(outgoing);
+                if let Some(finally) = &statement.finally {
+                    self.finalizers.pop().expect("try finalizer context");
+                    self.build_statements(&finally.body.statements, outgoing)
+                } else {
+                    outgoing
+                }
+            }
             Stmt::Expr { expr, span } if is_panic_call(expr) => {
                 self.terminal(
                     NodeKind::DivergeExit,
@@ -647,6 +680,8 @@ fn statement_span(statement: &Stmt) -> Span {
         Stmt::Break { span } | Stmt::Continue { span } => *span,
         Stmt::Foreach(foreach) => foreach.span,
         Stmt::Increment(increment) => increment.span,
+        Stmt::Throw(statement) => statement.span,
+        Stmt::Try(statement) => statement.span,
     }
 }
 

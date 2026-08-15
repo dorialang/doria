@@ -80,6 +80,8 @@ fn statement_span(statement: &Stmt) -> crate::source::Span {
         Stmt::Break { span } | Stmt::Continue { span } => *span,
         Stmt::Foreach(foreach) => foreach.span,
         Stmt::Increment(increment) => increment.span,
+        Stmt::Throw(statement) => statement.span,
+        Stmt::Try(statement) => statement.span,
     }
 }
 
