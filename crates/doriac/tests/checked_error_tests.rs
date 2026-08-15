@@ -339,6 +339,23 @@ function caller(): void
     assert_eq!(uncovered.len(), 1);
     assert!(uncovered[0].message.contains("FirstError"));
     assert!(uncovered[0].message.contains("SecondError"));
+
+    let broad_contract = format!(
+        r#"
+{}
+function concrete(): void throws FirstError
+{{
+    throw new FirstError("first");
+}}
+function broad(): void throws Error
+{{
+    concrete();
+}}
+"#,
+        error_class("FirstError")
+    );
+    doriac::check_source("checked_error.doria", broad_contract)
+        .expect("the broad Error effect must cover each concrete checked error");
 }
 
 #[test]
