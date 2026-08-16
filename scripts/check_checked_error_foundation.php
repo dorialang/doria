@@ -77,7 +77,10 @@ $fixture = $read($fixturePath);
 
 $require($decisionPath, $decision, [
     '**Status:** Accepted',
-    'Stage 29 Slices 1 and 2 complete; Slice 3 next',
+    'Stage 29 Slices 1 and 2 complete',
+    'native collection',
+    'property initializer corrective beat complete',
+    'Slice 3 next',
     '`Error` is a compiler-known core interface',
     'explicitly declares `implements Error`',
     'externally accessible, readonly, stored `string $message`',
