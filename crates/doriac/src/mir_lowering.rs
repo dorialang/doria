@@ -779,6 +779,7 @@ fn lower_program_impl(
             });
         }
     }
+    intern_aggregate_storage_types(&program.semantic_info, &class_ids, &mut collection_registry);
     let property_initializers = program
         .semantic_info
         .classes
@@ -1326,6 +1327,29 @@ fn intern_resolved_collection_types(
         | ResolvedType::Unsupported => return None,
     };
     Some(ty)
+}
+
+fn intern_aggregate_storage_types(
+    semantic_info: &crate::semantics::SemanticInfo,
+    class_ids: &ClassIds,
+    collections: &mut CollectionRegistry,
+) {
+    for property in semantic_info
+        .classes
+        .iter()
+        .flat_map(|class| &class.properties)
+    {
+        let _ = intern_resolved_collection_types(&property.ty, class_ids, collections);
+    }
+
+    for field in semantic_info
+        .enums
+        .iter()
+        .flat_map(|definition| &definition.cases)
+        .flat_map(|case| &case.payload)
+    {
+        let _ = intern_resolved_collection_types(&field.ty, class_ids, collections);
+    }
 }
 
 fn intern_block_collection_types(

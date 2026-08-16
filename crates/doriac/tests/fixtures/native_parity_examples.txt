@@ -1,5 +1,5 @@
 # Durable executable source of truth for accepted native behavior.
-# Highest covered stage: Stage 27 Slice 2 closure
+# Highest covered stage: Stage 29 Slice 2 plus the native collection property initializer corrective beat
 examples/native/main_add_overflow_panic.doria
 examples/native/main_arithmetic_42.doria
 examples/native/main_bitwise_42.doria
@@ -251,3 +251,4 @@ examples/native/main_checked_error_origin.doria
 examples/native/main_checked_error_rethrow.doria
 examples/native/main_checked_error_values.doria
 examples/native/main_checked_error_success_values.doria
+examples/native/main_native_collection_property_initializers.doria

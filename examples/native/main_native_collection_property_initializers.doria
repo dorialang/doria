@@ -1,0 +1,84 @@
+class Scene
+{
+    function __construct(string $name)
+    {
+    }
+}
+
+class Box<T>
+{
+    function __construct(take T $value)
+    {
+    }
+}
+
+class ImplicitCollections
+{
+    List<Scene> $emptyList = [];
+    List<Scene> $filledList = [new Scene("list")];
+    List<Box<int>> $genericList = [];
+    List<List<Scene>> $nestedList = [];
+    Scene[] $typedArray = [];
+    Dictionary<string, Scene> $dictionary = [];
+    Set<int> $set = Set::from([]);
+    SortedDictionary<string, Scene> $sortedDictionary = SortedDictionary::from([]);
+    SortedSet<int> $sortedSet = SortedSet::from([]);
+    Deque<Scene> $deque = Deque::from([]);
+}
+
+class ExplicitCollections
+{
+    internal writable List<Scene> $scenes = [];
+
+    function __construct(string $name)
+    {
+    }
+}
+
+class Independent
+{
+    internal writable List<int> $values = [];
+
+    writable function add(int $value): void
+    {
+        $this->values->add($value);
+    }
+
+    function count(): int
+    {
+        return $this->values->count;
+    }
+}
+
+class DropToken
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        echo "drop {$this->name}\n";
+    }
+}
+
+class DropHolder
+{
+    List<DropToken> $values = [new DropToken("first"), new DropToken("second")];
+}
+
+function main(): void
+{
+    let $implicit = new ImplicitCollections();
+    let $explicit = new ExplicitCollections("explicit");
+
+    let writable $left = new Independent();
+    let writable $right = new Independent();
+    $left->add(1);
+    echo "counts {$left->count()}:{$right->count()}\n";
+
+    {
+        let $drops = new DropHolder();
+        echo "drop scope\n";
+    }
+}
