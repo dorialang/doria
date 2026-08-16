@@ -2997,6 +2997,91 @@ function main(): void
 }
 
 #[test]
+fn php_backend_executes_checked_errors_with_doria_descriptor_dispatch() {
+    let fixtures = [
+        (
+            "checked-error-catch.doria",
+            include_str!("../../../examples/native/main_checked_error_catch.doria"),
+            "caught exact\n",
+        ),
+        (
+            "checked-error-catch-all.doria",
+            include_str!("../../../examples/native/main_checked_error_catch_all.doria"),
+            "catch all\n",
+        ),
+        (
+            "checked-error-optional-binding.doria",
+            include_str!("../../../examples/native/main_checked_error_optional_binding.doria"),
+            "handled without binding\n",
+        ),
+        (
+            "checked-error-rethrow.doria",
+            include_str!("../../../examples/native/main_checked_error_rethrow.doria"),
+            "relay\noriginal\n",
+        ),
+        (
+            "checked-error-finally.doria",
+            include_str!("../../../examples/native/main_checked_error_finally.doria"),
+            "caught\nfinally\n",
+        ),
+        (
+            "checked-error-constructor.doria",
+            include_str!("../../../examples/native/main_checked_error_constructor.doria"),
+            "caught constructor\n",
+        ),
+    ];
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+
+    for (path, source, expected_stdout) in fixtures {
+        let php = doriac::compile_source_to_php(path, source)
+            .unwrap_or_else(|error| panic!("{path} should compile for PHP: {error:?}"));
+        assert!(php.contains("catch (__DoriaCheckedError"));
+        assert!(php.contains("::__doriaErrorType()"));
+        if path == "checked-error-catch-all.doria" {
+            assert!(!php.contains("->descriptor ==="));
+        } else {
+            assert!(php.contains("->descriptor ==="));
+        }
+        assert!(!php.contains("instanceof Failure"));
+        assert!(!php.contains("instanceof BuildError"));
+
+        let script = format!(
+            "{}\nmain();",
+            php.strip_prefix("<?php").expect("generated PHP header")
+        );
+        let run = Command::new("php")
+            .arg("-d")
+            .arg("display_errors=1")
+            .arg("-r")
+            .arg(script)
+            .output()
+            .unwrap_or_else(|error| panic!("{path} generated PHP should execute: {error}"));
+
+        assert!(
+            run.status.success(),
+            "{path}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            expected_stdout,
+            "{path}"
+        );
+        assert!(
+            run.stderr.is_empty(),
+            "{path}: {}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+    }
+}
+
+#[test]
 fn php_collection_clear_releases_owned_deque_values_in_doria_order() {
     let php = doriac::compile_source_to_php(
         "stage26-clear-order.doria",
@@ -3080,6 +3165,7 @@ function main(): void
     echo " ";
     echo $empty->last ?? -1;
 }
+
 "#,
     )
     .expect("ordered Slice 3 members should lower to PHP compatibility helpers");

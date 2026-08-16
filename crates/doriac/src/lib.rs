@@ -114,7 +114,6 @@ pub fn lower_source_to_mir(
     text: impl Into<String>,
 ) -> DiagnosticResult<mir::Program> {
     let hir = lower_source(path, text)?;
-    reject_checked_error_execution(&hir)?;
     mir_lowering::lower_program(&hir)
 }
 
@@ -132,7 +131,6 @@ pub fn compile_source_with_options(
     options: CompileOptions,
 ) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
     let hir = lower_source(path, text)?;
-    reject_checked_error_execution(&hir)?;
     backend::emit_with_options(&hir, options).map_err(|error| {
         error.diagnostics.unwrap_or_else(|| {
             let summary = error
@@ -152,24 +150,34 @@ pub fn compile_source_with_options(
     })
 }
 
-pub(crate) fn reject_checked_error_execution(program: &hir::Program) -> DiagnosticResult<()> {
-    if let Some(span) = program.semantic_info.checked_error_boundary {
-        return Err(vec![checked_error_execution_boundary(span)]);
+pub(crate) fn reject_escaping_main_error(program: &hir::Program) -> DiagnosticResult<()> {
+    let Some(main) = program.items.iter().find_map(|item| match item {
+        hir::Item::Function(function) if function.name == "main" => Some(function),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    let effects = program
+        .semantic_info
+        .callable_checked_effects
+        .get(&main.span.start);
+    if effects.is_some_and(|effects| !effects.is_empty()) {
+        return Err(vec![escaping_main_error_boundary(main.span)]);
     }
     Ok(())
 }
 
-pub(crate) fn checked_error_execution_boundary(span: Span) -> Diagnostic {
+pub(crate) fn escaping_main_error_boundary(span: Span) -> Diagnostic {
     Diagnostic::unsupported_stage(
-        "B2901",
-        "checked-error execution lands in Stage 29 Slice 2",
+        "B2902",
+        "process-level reporting for an Error escaping `main` lands in Stage 29 Slice 3",
         span,
     )
-    .with_title("Checked Error Execution Lands In Stage 29 Slice 2")
+    .with_title("Unhandled Main Error Reporting Lands In Stage 29 Slice 3")
     .with_explanation(
-        "Stage 29 Slice 1 checks checked-error syntax, types, ownership, and effects before executable lowering begins.",
+        "Checked-error execution is available. Stage 29 Slice 3 will define process-level reporting for an Error that escapes `main`.",
     )
-    .with_help("use `doriac check`, `doriac ast`, or `doriac hir` to inspect this program")
+    .with_help("handle every checked Error before `main` returns")
 }
 
 pub fn parse_source_file(source: &SourceFile) -> DiagnosticResult<Program> {

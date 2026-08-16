@@ -342,6 +342,7 @@ fn rejects_mixed_width_float_binary_operands() {
         receiver_mode: None,
         params: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
+        checked_effects: Vec::new(),
         locals: Vec::new(),
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -384,6 +385,8 @@ fn void_program() -> Program {
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
+        error_descriptors: Vec::new(),
+        error_origins: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -392,6 +395,7 @@ fn void_program() -> Program {
             receiver_mode: None,
             params: Vec::new(),
             return_type: ReturnType::Void,
+            checked_effects: Vec::new(),
             locals: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),

@@ -1,0 +1,11 @@
+scalars true -8 64 1.5 2.5
+string text
+class item true
+errors error optional
+mixed
+collection 42
+payload 42
+nullable payload
+borrow item
+generic 42
+methods 42 42

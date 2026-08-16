@@ -1,0 +1,29 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function firstThrow(take Failure $error): void throws Failure
+{
+    throw $error;
+}
+
+function rethrow(): void throws Failure
+{
+    try {
+        firstThrow(new Failure("origin preserved"));
+    } catch (Failure $error) {
+        throw $error;
+    }
+}
+
+function main(): void
+{
+    try {
+        rethrow();
+    } catch (Failure $error) {
+        echo "{$error->message}\n";
+    }
+}

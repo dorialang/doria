@@ -1,0 +1,14 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function main(): void
+{
+    mixed $value = new Failure("mixed");
+    if ($value is Failure) {
+        echo "{$value->message}\n";
+    }
+}

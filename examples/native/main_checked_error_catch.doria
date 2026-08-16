@@ -1,0 +1,20 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function fail(): void throws Failure
+{
+    throw new Failure("exact");
+}
+
+function main(): void
+{
+    try {
+        fail();
+    } catch (Failure $error) {
+        echo "caught {$error->message}\n";
+    }
+}

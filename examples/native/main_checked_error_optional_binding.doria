@@ -1,0 +1,20 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function fail(): void throws Failure
+{
+    throw new Failure("unused");
+}
+
+function main(): void
+{
+    try {
+        fail();
+    } catch (Failure) {
+        echo "handled without binding\n";
+    }
+}

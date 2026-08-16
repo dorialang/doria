@@ -1,0 +1,30 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function fail(): void throws Failure
+{
+    throw new Failure("nested");
+}
+
+function inner(): void throws Failure
+{
+    try {
+        fail();
+    } catch (Failure $error) {
+        echo "inner\n";
+        throw $error;
+    }
+}
+
+function main(): void
+{
+    try {
+        inner();
+    } catch (Error $error) {
+        echo "outer {$error->message}\n";
+    }
+}

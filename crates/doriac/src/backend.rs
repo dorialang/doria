@@ -207,6 +207,8 @@ pub fn emit_with_options(
         ));
     }
 
+    crate::reject_escaping_main_error(program).map_err(BackendError::from_diagnostics)?;
+
     match options.target {
         BackendTarget::Native => emit_native(program, options.native_profile),
         BackendTarget::Php => PhpBackend.emit(program),

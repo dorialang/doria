@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-15
 - **Date:** 2026-08-15
-- **Implementation status:** Stage 29 Slice 1 complete; Slice 2 next; Slice 3 pending
+- **Implementation status:** Stage 29 Slices 1 and 2 complete; Slice 3 next
 - **Scope:** Checked-error syntax, static effects, ownership, future execution,
   runtime outcomes, and I/O failure migration
 - **Amends:** Decisions 0035, 0109, 0116, and 0117
@@ -55,7 +55,7 @@ and structural field comparison are not implied.
 Concrete Error classes may use existing class sharing. `SharedReference<Error>`
 is deferred until Stage 35 general erased-interface payload support.
 
-## Runtime Representation Reserved For Slice 2
+## Runtime Representation
 
 The erased Error carrier is two machine words: the concrete object pointer and
 a static Error descriptor pointer. Each conforming object gains one private,
@@ -63,10 +63,10 @@ optional first-throw origin slot. Construction leaves it empty, the first throw
 sets it, and rethrowing the same object preserves it. This slot is not a source
 property, public object header, reflection facility, or second allocation.
 
-Slice 1 records semantic metadata for explicit conformance, the resolved
-message property, concrete identity, future descriptor identity, and the future
-origin requirement. It does not change executable class layout or create
-runtime descriptors.
+Slice 2 implements this representation. One immutable descriptor per concrete
+Error specialization carries concrete identity, type name, the validated
+`message` projection, and concrete drop glue. Only Error-conforming objects gain
+the hidden origin slot; ordinary class layouts remain unchanged.
 
 ## `throws` Grammar And Effects
 
@@ -177,7 +177,7 @@ drop once in reverse initialization order; uninitialized properties are
 ignored; constructor parameters and temporaries clean normally; allocation is
 freed; then the checked error propagates.
 
-## Native ABI And MIR Reserved For Slice 2
+## Native ABI And MIR
 
 Nonthrowing callables preserve their ABI. A throwing non-void callable uses its
 ordinary arguments plus caller-owned success and Error out slots and returns a
@@ -186,15 +186,12 @@ the success slot. Storage is function-entry or backend-equivalent fixed frame
 storage; successful calls allocate no heap memory; propagation moves the same
 Error carrier without cloning or reallocating its object.
 
-Slice 2 introduces the carrier, descriptors, hidden origin, checked-error MIR,
-status/out-slot ABI, propagation, catch dispatch, rethrow, failed-construction
-cleanup, and interpreter/Cranelift/LLVM/PHP transport parity. Slice 1 does not
-activate `StructuredExitKind::CheckedError` or emit partial backend artifacts.
-
-For valid source requiring checked-error execution, `check`, `ast`, and `hir`
-succeed. MIR generation and every execution or emission path stop once with the
-structured Stage 29 Slice 2 boundary diagnostic. Semantic errors take priority.
-Nonthrowing programs and unused conforming declarations remain executable.
+Slice 2 implements the carrier, descriptors, hidden origin, explicit checked
+calls, `StructuredExitKind::CheckedError`, propagation, exact/catch-all dispatch,
+rethrow, failed-construction cleanup, and interpreter/Cranelift/LLVM/PHP
+transport parity. B2901 remains a historical catalogue identity with no valid
+Slice 2 source route. A nonempty checked-effect set on `main` remains gated by
+B2902 before artifact emission because Slice 3 owns process-level reporting.
 
 ## I/O Migration Reserved For Slice 3
 
@@ -243,12 +240,23 @@ than terminating the host process.
 
 ## Performance And Memory
 
-Slice 1 adds semantic facts during existing declaration, resolution, ownership,
-and control-flow traversal. It adds no runtime object, allocation, class-layout
-change, ABI change, or separate whole-program error pass. Effect sets use
-resolved semantic identities, not source strings. Controlled timing is
-**Pending Available Runner** and non-blocking; the accepted performance standard
-is unchanged.
+Effect sets use resolved semantic identities, not source strings. An erased
+Error is exactly two machine words. Checked calls use fixed function-entry
+success/Error scratch, one status test, and no heap allocation on success.
+Propagation moves the carrier without cloning or reallocating the concrete
+object, path capture, native unwinding, or a runtime cleanup stack. Nonthrowing
+callables retain their existing ABI. Controlled timing is **Pending Available
+Runner** and non-blocking; the accepted performance standard is unchanged.
+
+## PR #137 Closure Audit
+
+| Finding | Current Fix | Regression Test | Slice 2 Dependency | Risk | Disposition |
+| --- | --- | --- | --- | --- | --- |
+| Effect sites must remain operation-precise | The semantic effect-site map records the actual throwing expression, including calls nested in conditions and loop clauses. | `checked_effects_propagate_through_every_callable_form` plus the checked-error control-flow parity fixtures | Checked calls branch at the operation that can fail. | Later lowering could collapse an effect to a statement or function. | Preserved |
+| Checked edges must select the semantic catch | One centralized exact/Error coverage model drives semantic CFG routing and MIR `ErrorSwitch` descriptor dispatch. | `catches_subtract_only_protected_effects_and_catch_bodies_are_independent`, exact/catch-all/nested parity fixtures | Runtime dispatch must agree with checked reachability. | Backend host-type matching could diverge. | Preserved |
+| Checked edges must cross the right finalizers | Checked exits reuse Decision 0116 finalizer regions; the try-attached finalizer runs after its selected catch and before unmatched propagation. | `main_checked_error_finally.doria`, `main_checked_error_control_finalizers.doria`, malformed finalizer-plan validation | Slice 2 cleanup depends on the existing structured region graph. | A parallel cleanup path could reorder finalizers. | Preserved |
+| Loop and condition sites must not disappear | Effect collection and lowering retain calls in branch, loop, `given`, and iteration positions. | semantic callable-form matrix and durable control-flow fixtures | Checked execution needs an edge at every resolved effect site. | Expression-only lowering could miss an exceptional edge. | Preserved |
+| Structured fixes must preserve source | Duplicate/redundant `throws` fixes remain compiler-owned edits over precise spans and do not consume adjacent comments. | `throws_entries_are_error_types_unique_and_source_ordered` and diagnostic fix snapshots | Slice 2 consumes normalized effects after diagnostics. | Runtime work could bypass or duplicate semantic normalization. | Preserved |
 
 ## Implementation Slices
 
@@ -256,25 +264,25 @@ is unchanged.
   conformance; semantic effect sets; catch coverage/reachability;
   catch-or-declare; ownership; constructor/static/constant/finally checks;
   diagnostics; tooling; and one execution boundary.
-- **Slice 2 - Next:** runtime representation, checked MIR, ABI, propagation,
+- **Slice 2 - Complete:** runtime representation, checked MIR, ABI, propagation,
   cleanup, catch dispatch, rethrow, and backend execution parity.
-- **Slice 3 - Pending:** canonical I/O errors and signature migration, R1000,
+- **Slice 3 - Next:** canonical I/O errors and signature migration, R1000,
   status-70 entry handling, installed-tooling, and website closure.
 
 Stage 29 is in progress. Stage 30 is blocked until Stage 29 completes.
 
 ## Explicit Exclusions
 
-This slice does not implement checked-error MIR, runtime descriptors, origin
-storage, ABI changes, backend transport, runtime reporting, I/O migration,
-expression-position throw, bare rethrow, union catches, inheritance/interface
+Slice 3 does not implement expression-position throw, bare rethrow, union
+catches, inheritance/interface
 catch matching, closure effects, namespaces, streams, PHP export conversion,
-native unwinding, reflection, or a second diagnostic/cleanup model.
+native unwinding, reflection, or a second diagnostic/cleanup model. It also
+retains ownership of runtime reporting and I/O migration.
 
 ## Consequences
 
-- The compiler can validate checked-error programs and expose their exact
-  source-ordered contracts before execution exists.
+- The compiler validates and executes handled checked-error programs while
+  preserving their exact source-ordered contracts.
 - Backends cannot silently define or approximate checked-error semantics.
 - Ownership, cleanup, and diagnostics remain one language-wide model.
 - Stage 30 and Stage 35 must preserve effect-set substitution and extend the
@@ -285,10 +293,10 @@ native unwinding, reflection, or a second diagnostic/cleanup model.
 ## Affected Components
 
 Compiler lexing, parsing, AST, HIR, symbols, type resolution, semantic analysis,
-ownership, constructor initialization, diagnostics, backend boundary, language
-server, editors, website documentation, playground metadata, and future runtime
-work are affected. `doria-rt`, executable MIR, and existing class ABI are not
-changed by Slice 1.
+ownership, constructor initialization, diagnostics, class layout, executable
+MIR, native/PHP backends, language server, editors, website documentation, and
+playground metadata are affected. Ordinary nonthrowing function and class ABI
+remain unchanged.
 
 ## Invalidated Elsewhere
 
@@ -296,8 +304,8 @@ changed by Slice 1.
   grammar/semantic contract are superseded by this record.
 - Decision 0109's unresolved checked-error presentation is settled as R1000 in
   the shared diagnostic model.
-- Decision 0116's reserved checked-error exit now has a bound payload, cleanup,
-  and staged implementation contract; executable routing remains Slice 2.
+- Decision 0116's reserved checked-error exit now has an executable owned Error
+  payload and reuses its finalizer-region routing.
 - Decision 0117's ordinary namespace dependency is relaxed only for the exact
   compiler-known `Doria\Std\Io` identities before Stage 31. No short alias exists.
 - Stage 30 closure work must carry checked-effect sets and the subset law.

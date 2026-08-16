@@ -132,6 +132,13 @@ impl std::error::Error for InterpreterError {}
 enum FunctionOutcome {
     Value(LocalValue),
     Void,
+    CheckedError(ErrorValue),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ErrorValue {
+    object: usize,
+    descriptor: mir::ErrorDescriptorId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +152,8 @@ enum LocalValue {
     },
     NullableString(Option<SharedString>),
     NullableMixed(Option<MixedValue>),
+    Error(ErrorValue),
+    NullableError(Option<ErrorValue>),
     Class {
         object: usize,
         class: crate::class_layout::ClassId,
@@ -225,6 +234,7 @@ enum OwnedDrop {
         control: WritableSharedControl,
         writable: bool,
     },
+    Error(ErrorValue),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -245,6 +255,8 @@ enum EvaluationValue {
     },
     NullableString(Option<SharedString>),
     NullableMixed(Option<MixedValue>),
+    Error(ErrorValue),
+    NullableError(Option<ErrorValue>),
     Class {
         object: usize,
         class: crate::class_layout::ClassId,
@@ -318,6 +330,11 @@ enum MixedValue {
         owner: Rc<Cell<usize>>,
         payload_owned: bool,
     },
+    Error {
+        value: ErrorValue,
+        owner: Rc<Cell<usize>>,
+        payload_owned: bool,
+    },
 }
 
 impl MixedValue {
@@ -330,6 +347,7 @@ impl MixedValue {
             Self::String(_) => mir::MixedTag::String,
             Self::Class { class, .. } => mir::MixedTag::Class(*class),
             Self::PayloadEnum { value, .. } => mir::MixedTag::PayloadEnum(value.ty),
+            Self::Error { .. } => mir::MixedTag::Error,
         }
     }
 }
@@ -394,6 +412,7 @@ impl CollectionValue {
 struct ObjectValue {
     class: crate::class_layout::ClassId,
     properties: Vec<Option<LocalValue>>,
+    error_origin: Option<mir::ErrorOriginId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,6 +420,33 @@ enum ReturnExpectation {
     Value(mir::Type),
     Discard(mir::Type),
     Void,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckedContinuation {
+    Call {
+        result: Option<mir::LocalId>,
+        error: mir::LocalId,
+        success: mir::BlockId,
+        failure: mir::BlockId,
+    },
+    Construct {
+        result: mir::LocalId,
+        error: mir::LocalId,
+        success: mir::BlockId,
+        failure: mir::BlockId,
+        object: usize,
+        class: crate::class_layout::ClassId,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CheckedConstruction {
+    result: mir::LocalId,
+    error: mir::LocalId,
+    success: mir::BlockId,
+    failure: mir::BlockId,
+    call_site: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -414,6 +460,8 @@ enum EvaluationTask {
     NullableScalar(mir::NullableScalarExpression),
     NullableString(mir::NullableStringExpression),
     NullableMixed(mir::NullableMixedExpression),
+    Error(mir::ErrorExpression),
+    NullableError(mir::NullableErrorExpression),
     Class(mir::ClassExpression),
     NullableClass(mir::NullableClassExpression),
     SharedReference(mir::SharedReferenceExpression),
@@ -558,6 +606,7 @@ enum EvaluationTask {
         argument_count: usize,
         property_expression_count: usize,
         temporary_arg_drops: Vec<usize>,
+        checked: Option<CheckedConstruction>,
     },
     FinishClassNew {
         object: usize,
@@ -566,10 +615,14 @@ enum EvaluationTask {
     BuildNullableSome,
     BuildNullableScalarSome(mir::ScalarType),
     BuildNullableClassSome(crate::class_layout::ClassId),
+    BuildError(mir::ErrorDescriptorId),
+    ErrorMessage,
+    BuildNullableErrorSome,
     BuildMixedValue,
     BuildMixedString,
     BuildMixedClass(bool),
     BuildMixedPayloadEnum,
+    BuildMixedError,
     BuildNullableMixedPayloadEnum,
     OwnMixed,
     BuildNullableMixedSome,
@@ -591,6 +644,7 @@ enum EvaluationTask {
         writable: bool,
     },
     NullableMixedIsPresent(mir::MixedOwnership),
+    NullableErrorIsPresent,
     MixedIs {
         tag: mir::MixedTag,
         ownership: mir::MixedOwnership,
@@ -751,6 +805,13 @@ enum EvaluationTask {
         temporary_arg_drops: Vec<usize>,
         call_site: Option<Span>,
     },
+    InvokeChecked {
+        function: mir::FunctionId,
+        argument_count: usize,
+        continuation: CheckedContinuation,
+        temporary_arg_drops: Vec<usize>,
+        call_site: Span,
+    },
     FinishStatement,
     DropTemporaryValues(Vec<OwnedDrop>),
     Assign(mir::LocalId),
@@ -806,6 +867,7 @@ struct CallFrame {
     values: Vec<EvaluationValue>,
     statement_temporary_drops: Vec<OwnedDrop>,
     caller_expectation: Option<ReturnExpectation>,
+    checked_continuation: Option<CheckedContinuation>,
     entered_from: Option<Span>,
 }
 
@@ -1266,6 +1328,28 @@ impl Interpreter<'_> {
                             target.0
                         )));
                     }
+                    (mir::Type::Error, mir::Rvalue::Error(expression)) => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::Error(expression));
+                    }
+                    (mir::Type::Error, _) => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR Error local local{} received another value type",
+                            target.0
+                        )));
+                    }
+                    (mir::Type::NullableError, mir::Rvalue::NullableError(expression)) => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::NullableError(expression));
+                    }
+                    (mir::Type::NullableError, _) => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR nullable Error local local{} received another value type",
+                            target.0
+                        )));
+                    }
                     (
                         mir::Type::NullableScalar(expected),
                         mir::Rvalue::NullableScalar(expression),
@@ -1663,6 +1747,44 @@ impl Interpreter<'_> {
             mir::Statement::DropMixed { local } => {
                 self.drop_mixed_local(local)?;
             }
+            mir::Statement::EnsureErrorOrigin { error, origin } => {
+                let value = self.error_local(error)?;
+                let object = self.heap.get_mut(&value.object).ok_or_else(|| {
+                    InterpreterError::new("MIR Error carrier references a freed object")
+                })?;
+                object.error_origin.get_or_insert(origin);
+            }
+            mir::Statement::ExtractErrorObject {
+                target,
+                error,
+                descriptor,
+            } => {
+                let value = self.take_error_local(error)?;
+                if value.descriptor != descriptor {
+                    return Err(InterpreterError::new(
+                        "MIR exact catch extracted an Error with another descriptor",
+                    ));
+                }
+                let class = self.error_descriptor(descriptor)?.class;
+                let function = function_in(self.program, self.current_frame()?.function)?;
+                let old = assign_local(
+                    &function.locals,
+                    &mut self.current_frame_mut()?.locals,
+                    target,
+                    LocalValue::Class {
+                        object: value.object,
+                        class,
+                    },
+                )?;
+                if old.is_some() {
+                    return Err(InterpreterError::new(
+                        "MIR exact catch initialized an occupied binding",
+                    ));
+                }
+            }
+            mir::Statement::DropError { local } => {
+                self.drop_error_local(local)?;
+            }
             mir::Statement::CollectionAdd {
                 collection,
                 value,
@@ -1789,6 +1911,111 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Bool(condition));
                 Ok(StepOutcome::Continue)
             }
+            mir::Terminator::CheckedCall {
+                function,
+                args,
+                result,
+                error,
+                success,
+                failure,
+                span,
+            } => {
+                let callee = function_in(self.program, function)?;
+                let temporary_arg_drops =
+                    temporary_argument_drop_order(&args, callee, 0, |_| false)?;
+                let continuation = CheckedContinuation::Call {
+                    result,
+                    error,
+                    success,
+                    failure,
+                };
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::InvokeChecked {
+                    function,
+                    argument_count: args.len(),
+                    continuation,
+                    temporary_arg_drops,
+                    call_site: span,
+                });
+                for argument in args.into_iter().rev() {
+                    frame.tasks.push(EvaluationTask::Rvalue(argument));
+                }
+                Ok(StepOutcome::Continue)
+            }
+            mir::Terminator::CheckedConstruct {
+                class,
+                properties,
+                constructor,
+                args,
+                result,
+                error,
+                success,
+                failure,
+                span,
+            } => {
+                let definition = function_in(self.program, constructor)?;
+                let temporary_arg_drops =
+                    temporary_argument_drop_order(&args, definition, 1, |index| {
+                        properties.iter().any(|property| {
+                            matches!(
+                                property.source,
+                                mir::PropertyValueSource::ConstructorArgument(argument)
+                                    if argument == index
+                            )
+                        })
+                    })?;
+                let property_expression_count = properties
+                    .iter()
+                    .filter(|property| {
+                        matches!(property.source, mir::PropertyValueSource::Expression(_))
+                    })
+                    .count();
+                let checked = CheckedConstruction {
+                    result,
+                    error,
+                    success,
+                    failure,
+                    call_site: span,
+                };
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::BuildClassNew {
+                    class,
+                    properties: properties.clone(),
+                    constructor: Some(constructor),
+                    argument_count: args.len(),
+                    property_expression_count,
+                    temporary_arg_drops,
+                    checked: Some(checked),
+                });
+                for argument in args.into_iter().rev() {
+                    frame.tasks.push(EvaluationTask::Rvalue(argument));
+                }
+                for property in properties.into_iter().rev() {
+                    if let mir::PropertyValueSource::Expression(value) = property.source {
+                        frame.tasks.push(EvaluationTask::Rvalue(value));
+                    }
+                }
+                Ok(StepOutcome::Continue)
+            }
+            mir::Terminator::ErrorSwitch {
+                error,
+                cases,
+                catch_all,
+                fallback,
+            } => {
+                let descriptor = self.error_local(error)?.descriptor;
+                let target = cases
+                    .into_iter()
+                    .find_map(|(candidate, target)| (candidate == descriptor).then_some(target))
+                    .or(catch_all)
+                    .unwrap_or(fallback);
+                self.move_to_block(function, target)?;
+                Ok(StepOutcome::Continue)
+            }
+            mir::Terminator::PropagateError { error } => {
+                let value = self.take_error_local(error)?;
+                self.complete_frame(FunctionOutcome::CheckedError(value))
+            }
         }
     }
 
@@ -1819,6 +2046,14 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableMixed(value)),
+                mir::Rvalue::Error(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::Error(value)),
+                mir::Rvalue::NullableError(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::NullableError(value)),
                 mir::Rvalue::Class(value) => self
                     .current_frame_mut()?
                     .tasks
@@ -1917,6 +2152,10 @@ impl Interpreter<'_> {
             }
             EvaluationTask::NullableMixed(expression) => {
                 self.expand_nullable_mixed_expression(expression)?
+            }
+            EvaluationTask::Error(expression) => self.expand_error_expression(expression)?,
+            EvaluationTask::NullableError(expression) => {
+                self.expand_nullable_error_expression(expression)?
             }
             EvaluationTask::Class(expression) => self.expand_class_expression(expression)?,
             EvaluationTask::NullableClass(expression) => {
@@ -3366,6 +3605,13 @@ impl Interpreter<'_> {
                         .current_frame_mut()?
                         .values
                         .push(EvaluationValue::NullablePayloadEnum { ty, value }),
+                    (mir::Type::Error, Some(LocalValue::Error(value))) => {
+                        self.push_nullable_error(Some(value))?;
+                    }
+                    (mir::Type::Error, None) => self.push_nullable_error(None)?,
+                    (mir::Type::Error, Some(LocalValue::NullableError(value))) => {
+                        self.push_nullable_error(value)?;
+                    }
                     (expected, value) if expected.shared_access().is_some() => {
                         let access = expected
                             .shared_access()
@@ -3622,6 +3868,7 @@ impl Interpreter<'_> {
                 argument_count,
                 property_expression_count,
                 temporary_arg_drops,
+                checked,
             } => {
                 let arguments = self.take_call_arguments(argument_count)?;
                 let property_expressions = self.take_call_arguments(property_expression_count)?;
@@ -3663,6 +3910,7 @@ impl Interpreter<'_> {
                     ObjectValue {
                         class,
                         properties: slots,
+                        error_origin: None,
                     },
                 );
                 if let Some(constructor) = constructor {
@@ -3679,24 +3927,45 @@ impl Interpreter<'_> {
                         class,
                     });
                     constructor_arguments.extend(arguments);
-                    self.current_frame_mut()?
-                        .tasks
-                        .push(EvaluationTask::FinishClassNew {
-                            object: object_id,
-                            class,
-                        });
                     if !temporary_drops.is_empty() {
                         self.current_frame_mut()?
                             .statement_temporary_drops
                             .extend(temporary_drops);
                     }
-                    self.push_frame(
-                        constructor,
-                        &constructor_arguments,
-                        Some(ReturnExpectation::Void),
-                        None,
-                    )?;
+                    if let Some(checked) = checked {
+                        self.push_checked_frame(
+                            constructor,
+                            &constructor_arguments,
+                            CheckedContinuation::Construct {
+                                result: checked.result,
+                                error: checked.error,
+                                success: checked.success,
+                                failure: checked.failure,
+                                object: object_id,
+                                class,
+                            },
+                            checked.call_site,
+                        )?;
+                    } else {
+                        self.current_frame_mut()?
+                            .tasks
+                            .push(EvaluationTask::FinishClassNew {
+                                object: object_id,
+                                class,
+                            });
+                        self.push_frame(
+                            constructor,
+                            &constructor_arguments,
+                            Some(ReturnExpectation::Void),
+                            None,
+                        )?;
+                    }
                 } else {
+                    if checked.is_some() {
+                        return Err(InterpreterError::new(
+                            "checked construction has no constructor",
+                        ));
+                    }
                     self.current_frame_mut()?
                         .values
                         .push(EvaluationValue::Class {
@@ -3763,6 +4032,55 @@ impl Interpreter<'_> {
                 }
                 self.push_nullable_class(class, Some(object))?;
             }
+            EvaluationTask::BuildError(descriptor) => {
+                let value = self.pop_local_value()?;
+                let (object, class) = match value {
+                    LocalValue::Class { object, class }
+                    | LocalValue::NullableClass {
+                        object: Some(object),
+                        class,
+                    } => (object, class),
+                    LocalValue::NullableClass { object: None, .. } => {
+                        return Err(InterpreterError::new(
+                            "MIR erased an absent nullable Error object",
+                        ));
+                    }
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR Error erasure operand is not a class",
+                        ));
+                    }
+                };
+                if self.error_descriptor(descriptor)?.class != class {
+                    return Err(InterpreterError::new(
+                        "MIR Error descriptor does not match its concrete object",
+                    ));
+                }
+                self.push_error(ErrorValue { object, descriptor })?;
+            }
+            EvaluationTask::ErrorMessage => {
+                let error = self.pop_error()?;
+                let property = self.error_descriptor(error.descriptor)?.message_property;
+                let value = self
+                    .heap
+                    .get(&error.object)
+                    .and_then(|object| object.properties.get(property.index))
+                    .and_then(Option::as_ref)
+                    .and_then(|value| match value {
+                        LocalValue::String(value) => Some(value.clone()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        InterpreterError::new(
+                            "MIR Error message descriptor does not project a live string",
+                        )
+                    })?;
+                self.push_string(value)?;
+            }
+            EvaluationTask::BuildNullableErrorSome => {
+                let value = self.pop_error()?;
+                self.push_nullable_error(Some(value))?;
+            }
             EvaluationTask::BuildMixedValue => {
                 let value = self.pop_scalar()?;
                 self.push_mixed(MixedValue::Scalar(value))?;
@@ -3786,6 +4104,14 @@ impl Interpreter<'_> {
                 let value = self.pop_payload_enum()?;
                 self.push_mixed(MixedValue::PayloadEnum {
                     value: Box::new(value),
+                    owner: Rc::new(Cell::new(1)),
+                    payload_owned: true,
+                })?;
+            }
+            EvaluationTask::BuildMixedError => {
+                let value = self.pop_error()?;
+                self.push_mixed(MixedValue::Error {
+                    value,
                     owner: Rc::new(Cell::new(1)),
                     payload_owned: true,
                 })?;
@@ -3934,6 +4260,10 @@ impl Interpreter<'_> {
                     self.queue_value_drops(LocalValue::NullableMixed(value))?;
                 }
                 self.push_scalar(mir::ScalarValue::Bool(present))?;
+            }
+            EvaluationTask::NullableErrorIsPresent => {
+                let value = self.pop_nullable_error()?;
+                self.push_scalar(mir::ScalarValue::Bool(value.is_some()))?;
             }
             EvaluationTask::MixedIs { tag, ownership } => {
                 let LocalValue::Mixed(value) = self.pop_local_value()? else {
@@ -4964,6 +5294,25 @@ impl Interpreter<'_> {
                 }
                 self.push_frame(function, &args, Some(expectation), call_site)?;
             }
+            EvaluationTask::InvokeChecked {
+                function,
+                argument_count,
+                continuation,
+                temporary_arg_drops,
+                call_site,
+            } => {
+                let args = self.take_call_arguments(argument_count)?;
+                let mut drops = Vec::new();
+                for index in temporary_arg_drops {
+                    collect_owned_objects_from_value(args[index].clone(), &mut drops);
+                }
+                if !drops.is_empty() {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .extend(drops);
+                }
+                self.push_checked_frame(function, &args, continuation, call_site)?;
+            }
             EvaluationTask::FinishStatement => {
                 let drops =
                     std::mem::take(&mut self.current_frame_mut()?.statement_temporary_drops);
@@ -5548,6 +5897,11 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableMixedIsPresent(ownership));
                 frame.tasks.push(EvaluationTask::NullableMixed(*value));
             }
+            mir::BoolExpression::NullableErrorIsPresent(value) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::NullableErrorIsPresent);
+                frame.tasks.push(EvaluationTask::NullableError(*value));
+            }
             mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
                 let frame = self.current_frame_mut()?;
                 frame
@@ -5674,6 +6028,12 @@ impl Interpreter<'_> {
                             id.0
                         )))
                     }
+                    LocalValue::Error(_) | LocalValue::NullableError(_) => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR Error local local{} was used as a string value",
+                            id.0
+                        )))
+                    }
                     LocalValue::Class { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR class local local{} was used as a string value",
@@ -5764,6 +6124,11 @@ impl Interpreter<'_> {
                         )))
                     }
                 }
+            }
+            mir::StringExpression::ErrorMessage(error) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ErrorMessage);
+                frame.tasks.push(EvaluationTask::Error(*error));
             }
             mir::StringExpression::Concat(parts) => {
                 let count = parts.len();
@@ -6025,6 +6390,11 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::BuildMixedPayloadEnum);
                 frame.tasks.push(EvaluationTask::PayloadEnum(*value));
             }
+            mir::MixedExpression::BoxError { value } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::BuildMixedError);
+                frame.tasks.push(EvaluationTask::Error(*value));
+            }
             mir::MixedExpression::CollectionIndex {
                 positional,
                 collection,
@@ -6044,6 +6414,233 @@ impl Interpreter<'_> {
                     collection,
                     index_span: Span::default(),
                     transfer: remove,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_error_expression(
+        &mut self,
+        expression: mir::ErrorExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::ErrorExpression::Local { local, transfer } => {
+                let value = if transfer {
+                    self.current_frame_mut()?
+                        .locals
+                        .get_mut(local.0)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            InterpreterError::new(format!(
+                                "MIR error local local{} was moved before use",
+                                local.0
+                            ))
+                        })?
+                } else {
+                    read_local(&self.current_frame()?.locals, local)?.clone()
+                };
+                let LocalValue::Error(value) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR error expression used another local type",
+                    ));
+                };
+                self.push_error(value)?;
+            }
+            mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer } => {
+                let value = if transfer {
+                    self.current_frame_mut()?
+                        .locals
+                        .get_mut(local.0)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            InterpreterError::new(format!(
+                                "MIR nullable error local local{} was moved before use",
+                                local.0
+                            ))
+                        })?
+                } else {
+                    read_local(&self.current_frame()?.locals, local)?.clone()
+                };
+                let LocalValue::NullableError(Some(value)) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR nonnull Error expression used an absent or incompatible local",
+                    ));
+                };
+                self.push_error(value)?;
+            }
+            mir::ErrorExpression::FromClass { object, descriptor } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::BuildError(descriptor));
+                frame.tasks.push(EvaluationTask::Class(*object));
+            }
+            mir::ErrorExpression::FromNullableClass { object, descriptor } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::BuildError(descriptor));
+                frame.tasks.push(EvaluationTask::NullableClass(*object));
+            }
+            mir::ErrorExpression::Property {
+                object,
+                property,
+                transfer,
+            } => {
+                let value = if transfer {
+                    self.take_property(object, property)?
+                } else {
+                    self.read_property(object, property)?
+                };
+                let LocalValue::Error(value) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR error property contains another value type",
+                    ));
+                };
+                self.push_error(value)?;
+            }
+            mir::ErrorExpression::Call { function, args, .. } => {
+                self.queue_call(function, args, ReturnExpectation::Value(mir::Type::Error))?;
+            }
+            mir::ErrorExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    collection,
+                    index_span: Span::default(),
+                    transfer: remove,
+                    positional,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+            mir::ErrorExpression::MixedPayload { mixed, transfer } => {
+                let value = if transfer {
+                    self.current_frame_mut()?
+                        .locals
+                        .get_mut(mixed.0)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            InterpreterError::new("mixed error local was moved before use")
+                        })?
+                } else {
+                    read_local(&self.current_frame()?.locals, mixed)?.clone()
+                };
+                let mixed = match value {
+                    LocalValue::Mixed(value) | LocalValue::NullableMixed(Some(value)) => value,
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR mixed error payload references another local type",
+                        ));
+                    }
+                };
+                let MixedValue::Error {
+                    value,
+                    owner,
+                    payload_owned,
+                } = mixed
+                else {
+                    return Err(InterpreterError::new(
+                        "MIR mixed error payload observed another tag",
+                    ));
+                };
+                if transfer {
+                    if owner.get() != 1 || !payload_owned {
+                        return Err(InterpreterError::new(
+                            "mixed error payload cannot transfer a shared ownership claim",
+                        ));
+                    }
+                    owner.set(0);
+                }
+                self.push_error(value)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_nullable_error_expression(
+        &mut self,
+        expression: mir::NullableErrorExpression,
+    ) -> Result<(), InterpreterError> {
+        match expression {
+            mir::NullableErrorExpression::Null => self.push_nullable_error(None)?,
+            mir::NullableErrorExpression::Error(value) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::BuildNullableErrorSome);
+                frame.tasks.push(EvaluationTask::Error(value));
+            }
+            mir::NullableErrorExpression::Local { local, transfer } => {
+                let value = if transfer {
+                    self.current_frame_mut()?
+                        .locals
+                        .get_mut(local.0)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            InterpreterError::new(format!(
+                                "MIR nullable error local local{} was moved before use",
+                                local.0
+                            ))
+                        })?
+                } else {
+                    read_local(&self.current_frame()?.locals, local)?.clone()
+                };
+                let LocalValue::NullableError(value) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR nullable error expression used another local type",
+                    ));
+                };
+                self.push_nullable_error(value)?;
+            }
+            mir::NullableErrorExpression::Property {
+                object,
+                property,
+                transfer,
+            } => {
+                let value = if transfer {
+                    self.take_property(object, property)?
+                } else {
+                    self.read_property(object, property)?
+                };
+                let LocalValue::NullableError(value) = value else {
+                    return Err(InterpreterError::new(
+                        "MIR nullable error property contains another value type",
+                    ));
+                };
+                self.push_nullable_error(value)?;
+            }
+            mir::NullableErrorExpression::Call { function, args, .. } => {
+                self.queue_call(
+                    function,
+                    args,
+                    ReturnExpectation::Value(mir::Type::NullableError),
+                )?;
+            }
+            mir::NullableErrorExpression::DictionaryGet {
+                collection,
+                key,
+                access,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection,
+                    expected: mir::Type::Error,
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
+            }
+            mir::NullableErrorExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    collection,
+                    index_span: Span::default(),
+                    transfer: remove,
+                    positional,
                 });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
@@ -6368,6 +6965,7 @@ impl Interpreter<'_> {
                     argument_count: args.len(),
                     property_expression_count,
                     temporary_arg_drops,
+                    checked: None,
                 });
                 for argument in args.into_iter().rev() {
                     frame.tasks.push(EvaluationTask::Rvalue(argument));
@@ -8953,8 +9551,24 @@ impl Interpreter<'_> {
             values: Vec::new(),
             statement_temporary_drops: Vec::new(),
             caller_expectation,
+            checked_continuation: None,
             entered_from,
         });
+        Ok(())
+    }
+
+    fn push_checked_frame(
+        &mut self,
+        function_id: mir::FunctionId,
+        args: &[LocalValue],
+        continuation: CheckedContinuation,
+        entered_from: Span,
+    ) -> Result<(), InterpreterError> {
+        self.push_frame(function_id, args, None, Some(entered_from))?;
+        self.frames
+            .last_mut()
+            .expect("checked frame was just pushed")
+            .checked_continuation = Some(continuation);
         Ok(())
     }
 
@@ -8966,6 +9580,113 @@ impl Interpreter<'_> {
             .frames
             .pop()
             .ok_or_else(|| InterpreterError::new("MIR interpreter has no call frame to return"))?;
+        if let Some(continuation) = frame.checked_continuation {
+            let (target, assignment, failed_construction) = match (continuation, outcome) {
+                (
+                    CheckedContinuation::Call {
+                        result: Some(result),
+                        success,
+                        ..
+                    },
+                    FunctionOutcome::Value(value),
+                ) => (success, Some((result, value)), None),
+                (
+                    CheckedContinuation::Call {
+                        result: None,
+                        success,
+                        ..
+                    },
+                    FunctionOutcome::Void,
+                ) => (success, None, None),
+                (
+                    CheckedContinuation::Call { error, failure, .. },
+                    FunctionOutcome::CheckedError(value),
+                ) => (failure, Some((error, LocalValue::Error(value))), None),
+                (
+                    CheckedContinuation::Construct {
+                        result,
+                        success,
+                        object,
+                        class,
+                        ..
+                    },
+                    FunctionOutcome::Void,
+                ) => (
+                    success,
+                    Some((result, LocalValue::Class { object, class })),
+                    None,
+                ),
+                (
+                    CheckedContinuation::Construct {
+                        error,
+                        failure,
+                        object,
+                        class,
+                        ..
+                    },
+                    FunctionOutcome::CheckedError(value),
+                ) => (
+                    failure,
+                    Some((error, LocalValue::Error(value))),
+                    Some((object, class)),
+                ),
+                (CheckedContinuation::Call { result: None, .. }, FunctionOutcome::Value(_)) => {
+                    return Err(InterpreterError::new("checked void call returned a value"));
+                }
+                (
+                    CheckedContinuation::Call {
+                        result: Some(_), ..
+                    },
+                    FunctionOutcome::Void,
+                ) => {
+                    return Err(InterpreterError::new("checked value call returned void"));
+                }
+                (CheckedContinuation::Construct { .. }, FunctionOutcome::Value(_)) => {
+                    return Err(InterpreterError::new(
+                        "checked constructor returned a value",
+                    ));
+                }
+            };
+            let caller_id = self.current_frame()?.function;
+            let caller = function_in(self.program, caller_id)?;
+            block_in(caller, target)?;
+            if let Some((local, value)) = assignment {
+                let expected = local_in(caller, local)?.ty;
+                if local_value_type(&value) != expected {
+                    return Err(InterpreterError::new(format!(
+                        "checked call local{} expects {}, got {}",
+                        local.0,
+                        expected,
+                        local_value_type(&value)
+                    )));
+                }
+                let slot = self
+                    .current_frame_mut()?
+                    .locals
+                    .get_mut(local.0)
+                    .ok_or_else(|| InterpreterError::new("checked call local does not exist"))?;
+                if slot.replace(value).is_some() {
+                    return Err(InterpreterError::new(
+                        "checked call initialized an occupied result local",
+                    ));
+                }
+            }
+            let caller = self.current_frame_mut()?;
+            caller.block = target;
+            caller.statement_index = 0;
+            caller.entered_block = false;
+            if let Some((object, class)) = failed_construction {
+                // Failed construction drops initialized fields and frees storage,
+                // but never invokes the class destructor.
+                caller
+                    .tasks
+                    .push(EvaluationTask::FreeObject { object, class });
+                caller
+                    .tasks
+                    .push(EvaluationTask::DropObjectProperties { object, class });
+            }
+            return Ok(StepOutcome::Continue);
+        }
         let Some(expectation) = frame.caller_expectation else {
             return Ok(StepOutcome::EntryReturned(outcome));
         };
@@ -8999,6 +9720,11 @@ impl Interpreter<'_> {
             (ReturnExpectation::Void, FunctionOutcome::Value(_)) => {
                 return Err(InterpreterError::new(
                     "MIR void call returned a scalar value",
+                ));
+            }
+            (_, FunctionOutcome::CheckedError(_)) => {
+                return Err(InterpreterError::new(
+                    "checked error escaped through an ordinary MIR call",
                 ));
             }
         }
@@ -9038,6 +9764,8 @@ impl Interpreter<'_> {
                 }
                 EvaluationValue::NullableString(value) => Ok(LocalValue::NullableString(value)),
                 EvaluationValue::NullableMixed(value) => Ok(LocalValue::NullableMixed(value)),
+                EvaluationValue::Error(value) => Ok(LocalValue::Error(value)),
+                EvaluationValue::NullableError(value) => Ok(LocalValue::NullableError(value)),
                 EvaluationValue::Class { object, class } => Ok(LocalValue::Class { object, class }),
                 EvaluationValue::NullableClass { object, class } => {
                     Ok(LocalValue::NullableClass { object, class })
@@ -9109,6 +9837,9 @@ impl Interpreter<'_> {
             Some(EvaluationValue::Mixed(_)) | Some(EvaluationValue::NullableMixed(_)) => Err(
                 InterpreterError::new("MIR scalar evaluation produced a mixed value"),
             ),
+            Some(EvaluationValue::Error(_)) | Some(EvaluationValue::NullableError(_)) => Err(
+                InterpreterError::new("MIR scalar evaluation produced an Error value"),
+            ),
             Some(EvaluationValue::NullableString(_)) => Err(InterpreterError::new(
                 "MIR scalar evaluation produced a nullable string",
             )),
@@ -9161,6 +9892,9 @@ impl Interpreter<'_> {
             Some(EvaluationValue::Mixed(_)) | Some(EvaluationValue::NullableMixed(_)) => Err(
                 InterpreterError::new("MIR string evaluation produced a mixed value"),
             ),
+            Some(EvaluationValue::Error(_)) | Some(EvaluationValue::NullableError(_)) => Err(
+                InterpreterError::new("MIR string evaluation produced an Error value"),
+            ),
             Some(EvaluationValue::NullableString(_)) => Err(InterpreterError::new(
                 "MIR string evaluation produced a nullable string",
             )),
@@ -9205,6 +9939,44 @@ impl Interpreter<'_> {
             .values
             .push(EvaluationValue::NullableString(value));
         Ok(())
+    }
+
+    fn push_error(&mut self, value: ErrorValue) -> Result<(), InterpreterError> {
+        self.current_frame_mut()?
+            .values
+            .push(EvaluationValue::Error(value));
+        Ok(())
+    }
+
+    fn pop_error(&mut self) -> Result<ErrorValue, InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::Error(value)) => Ok(value),
+            Some(_) => Err(InterpreterError::new(
+                "MIR Error evaluation produced another value type",
+            )),
+            None => Err(InterpreterError::new(
+                "MIR Error evaluation produced no value",
+            )),
+        }
+    }
+
+    fn push_nullable_error(&mut self, value: Option<ErrorValue>) -> Result<(), InterpreterError> {
+        self.current_frame_mut()?
+            .values
+            .push(EvaluationValue::NullableError(value));
+        Ok(())
+    }
+
+    fn pop_nullable_error(&mut self) -> Result<Option<ErrorValue>, InterpreterError> {
+        match self.current_frame_mut()?.values.pop() {
+            Some(EvaluationValue::NullableError(value)) => Ok(value),
+            Some(_) => Err(InterpreterError::new(
+                "MIR nullable Error evaluation produced another value type",
+            )),
+            None => Err(InterpreterError::new(
+                "MIR nullable Error evaluation produced no value",
+            )),
+        }
     }
 
     fn push_mixed(&mut self, value: MixedValue) -> Result<(), InterpreterError> {
@@ -9395,6 +10167,7 @@ impl Interpreter<'_> {
             mir::Type::NullableScalar(ty) => self.push_nullable_scalar(ty, None),
             mir::Type::NullableString => self.push_nullable_string(None),
             mir::Type::NullableMixed => self.push_nullable_mixed(None),
+            mir::Type::NullableError => self.push_nullable_error(None),
             mir::Type::NullableClass(class) => self.push_nullable_class(class, None),
             mir::Type::NullableSharedReference(class) => {
                 self.current_frame_mut()?
@@ -9474,6 +10247,12 @@ impl Interpreter<'_> {
             }
             (mir::Type::NullableMixed, LocalValue::NullableMixed(value)) => {
                 self.push_nullable_mixed(value)
+            }
+            (mir::Type::NullableError, LocalValue::Error(value)) => {
+                self.push_nullable_error(Some(value))
+            }
+            (mir::Type::NullableError, LocalValue::NullableError(value)) => {
+                self.push_nullable_error(value)
             }
             (mir::Type::NullableClass(expected), LocalValue::Class { object, class })
                 if expected == class =>
@@ -9590,6 +10369,8 @@ impl Interpreter<'_> {
             }
             Some(EvaluationValue::NullableString(value)) => Ok(LocalValue::NullableString(value)),
             Some(EvaluationValue::NullableMixed(value)) => Ok(LocalValue::NullableMixed(value)),
+            Some(EvaluationValue::Error(value)) => Ok(LocalValue::Error(value)),
+            Some(EvaluationValue::NullableError(value)) => Ok(LocalValue::NullableError(value)),
             Some(EvaluationValue::Class { object, class }) => {
                 Ok(LocalValue::Class { object, class })
             }
@@ -9695,6 +10476,8 @@ impl Interpreter<'_> {
             }
             LocalValue::NullableString(value) => EvaluationValue::NullableString(value),
             LocalValue::NullableMixed(value) => EvaluationValue::NullableMixed(value),
+            LocalValue::Error(value) => EvaluationValue::Error(value),
+            LocalValue::NullableError(value) => EvaluationValue::NullableError(value),
             LocalValue::Class { object, class } => EvaluationValue::Class { object, class },
             LocalValue::NullableClass { object, class } => {
                 EvaluationValue::NullableClass { object, class }
@@ -10235,6 +11018,9 @@ impl Interpreter<'_> {
                 LocalValue::Mixed(_) | LocalValue::NullableMixed(_) => Err(InterpreterError::new(
                     format!("MIR mixed local local{} was used as a scalar value", id.0),
                 )),
+                LocalValue::Error(_) | LocalValue::NullableError(_) => Err(InterpreterError::new(
+                    format!("MIR Error local local{} was used as a scalar value", id.0),
+                )),
                 LocalValue::NullableString(_) => Err(InterpreterError::new(format!(
                     "MIR nullable-string local local{} was used as a scalar value",
                     id.0
@@ -10690,20 +11476,8 @@ impl Interpreter<'_> {
                 collect_owned_objects_from_value(value, &mut drops);
             }
         }
-        let frame = self.current_frame_mut()?;
         for drop in drops.into_iter().rev() {
-            frame.tasks.push(match drop {
-                OwnedDrop::Class { object, class } => EvaluationTask::DropObject { object, class },
-                OwnedDrop::Shared(control) => EvaluationTask::ReleaseShared(control),
-                OwnedDrop::Weak(control) => EvaluationTask::ReleaseWeak(control),
-                OwnedDrop::WritableShared(control) => {
-                    EvaluationTask::ReleaseWritableShared(control)
-                }
-                OwnedDrop::WritableWeak(control) => EvaluationTask::ReleaseWritableWeak(control),
-                OwnedDrop::SharedAccess { control, writable } => {
-                    EvaluationTask::ReleaseSharedAccess { control, writable }
-                }
-            });
+            self.push_owned_drop_task(drop)?;
         }
         Ok(())
     }
@@ -10995,6 +11769,67 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn error_descriptor(
+        &self,
+        descriptor: mir::ErrorDescriptorId,
+    ) -> Result<&mir::ErrorDescriptor, InterpreterError> {
+        self.program
+            .error_descriptors
+            .get(descriptor.0)
+            .filter(|value| value.id == descriptor)
+            .ok_or_else(|| InterpreterError::new("MIR Error descriptor does not exist"))
+    }
+
+    fn error_local(&self, local: mir::LocalId) -> Result<ErrorValue, InterpreterError> {
+        match read_local(&self.current_frame()?.locals, local)? {
+            LocalValue::Error(value) => Ok(*value),
+            _ => Err(InterpreterError::new(
+                "MIR Error operation references another local type",
+            )),
+        }
+    }
+
+    fn take_error_local(&mut self, local: mir::LocalId) -> Result<ErrorValue, InterpreterError> {
+        let slot = self
+            .current_frame_mut()?
+            .locals
+            .get_mut(local.0)
+            .ok_or_else(|| InterpreterError::new("MIR Error local does not exist"))?;
+        match slot.take() {
+            Some(LocalValue::Error(value)) => Ok(value),
+            Some(value) => {
+                *slot = Some(value);
+                Err(InterpreterError::new(
+                    "MIR Error operation references another local type",
+                ))
+            }
+            None => Err(InterpreterError::new(
+                "MIR Error local was moved before use",
+            )),
+        }
+    }
+
+    fn drop_error_local(&mut self, local: mir::LocalId) -> Result<(), InterpreterError> {
+        let value = self
+            .current_frame_mut()?
+            .locals
+            .get_mut(local.0)
+            .ok_or_else(|| InterpreterError::new("MIR Error local does not exist"))?
+            .take();
+        match value {
+            Some(LocalValue::Error(value)) | Some(LocalValue::NullableError(Some(value))) => {
+                self.push_owned_drop_task(OwnedDrop::Error(value))
+            }
+            Some(LocalValue::NullableError(None)) | None => Ok(()),
+            Some(value) => {
+                self.current_frame_mut()?.locals[local.0] = Some(value);
+                Err(InterpreterError::new(
+                    "MIR Error drop references another local type",
+                ))
+            }
+        }
+    }
+
     fn queue_value_drops(&mut self, value: LocalValue) -> Result<(), InterpreterError> {
         let mut drops = Vec::new();
         collect_owned_objects_from_value(value, &mut drops);
@@ -11005,7 +11840,7 @@ impl Interpreter<'_> {
     }
 
     fn push_owned_drop_task(&mut self, drop: OwnedDrop) -> Result<(), InterpreterError> {
-        self.current_frame_mut()?.tasks.push(match drop {
+        let task = match drop {
             OwnedDrop::Class { object, class } => EvaluationTask::DropObject { object, class },
             OwnedDrop::Shared(control) => EvaluationTask::ReleaseShared(control),
             OwnedDrop::Weak(control) => EvaluationTask::ReleaseWeak(control),
@@ -11014,7 +11849,12 @@ impl Interpreter<'_> {
             OwnedDrop::SharedAccess { control, writable } => {
                 EvaluationTask::ReleaseSharedAccess { control, writable }
             }
-        });
+            OwnedDrop::Error(value) => EvaluationTask::DropObject {
+                object: value.object,
+                class: self.error_descriptor(value.descriptor)?.class,
+            },
+        };
+        self.current_frame_mut()?.tasks.push(task);
         Ok(())
     }
 
@@ -11072,6 +11912,9 @@ impl Interpreter<'_> {
                     local_value_type(&value)
                 )))
             }
+            (_, FunctionOutcome::CheckedError(_)) => Err(InterpreterError::new(
+                "checked Error escaped from main before the Stage 29 Slice 3 entry boundary",
+            )),
         }
     }
 
@@ -11608,6 +12451,8 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
         LocalValue::NullableScalar { ty, .. } => mir::Type::NullableScalar(*ty),
         LocalValue::NullableString(_) => mir::Type::NullableString,
         LocalValue::NullableMixed(_) => mir::Type::NullableMixed,
+        LocalValue::Error(_) => mir::Type::Error,
+        LocalValue::NullableError(_) => mir::Type::NullableError,
         LocalValue::Class { class, .. } => mir::Type::Class(*class),
         LocalValue::NullableClass { class, .. } => mir::Type::NullableClass(*class),
         LocalValue::SharedReference { class, .. } => mir::Type::SharedReference(*class),
@@ -11670,6 +12515,7 @@ fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
         mir::Type::NullableScalar(ty) => Some(mir::Type::Scalar(ty)),
         mir::Type::NullableString => Some(mir::Type::String),
         mir::Type::NullableMixed => Some(mir::Type::Mixed),
+        mir::Type::NullableError => Some(mir::Type::Error),
         mir::Type::NullableClass(class) => Some(mir::Type::Class(class)),
         mir::Type::NullableSharedReference(class) => Some(mir::Type::SharedReference(class)),
         mir::Type::NullableWeakReference(class) => Some(mir::Type::WeakReference(class)),
@@ -11722,7 +12568,9 @@ fn retain_mixed_claim(value: &mut MixedValue, ownership: mir::MixedOwnership) {
         return;
     }
     match value {
-        MixedValue::Class { owner, .. } | MixedValue::PayloadEnum { owner, .. } => {
+        MixedValue::Class { owner, .. }
+        | MixedValue::PayloadEnum { owner, .. }
+        | MixedValue::Error { owner, .. } => {
             owner.set(owner.get().saturating_add(1));
         }
         MixedValue::Scalar(_) | MixedValue::String(_) => {}
@@ -11747,6 +12595,10 @@ fn collect_owned_objects_from_entries(
 
 fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop>) {
     match value {
+        LocalValue::Error(value) | LocalValue::NullableError(Some(value)) => {
+            drops.push(OwnedDrop::Error(value))
+        }
+        LocalValue::NullableError(None) => {}
         LocalValue::SharedReference { control, .. } => drops.push(OwnedDrop::Shared(control)),
         LocalValue::WeakReference { control, .. } => drops.push(OwnedDrop::Weak(control)),
         LocalValue::NullableSharedReference {
@@ -11835,6 +12687,24 @@ fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop
                             collect_owned_objects_from_value(field, drops);
                         }
                     }
+                }
+            }
+        }
+        LocalValue::Mixed(MixedValue::Error {
+            value,
+            owner,
+            payload_owned,
+        })
+        | LocalValue::NullableMixed(Some(MixedValue::Error {
+            value,
+            owner,
+            payload_owned,
+        })) => {
+            let claims = owner.get();
+            if claims != 0 {
+                owner.set(claims - 1);
+                if claims == 1 && payload_owned {
+                    drops.push(OwnedDrop::Error(value));
                 }
             }
         }
@@ -12194,6 +13064,10 @@ fn assign_local(
         (definition.ty, &value),
         (mir::Type::NullablePayloadEnum(expected), LocalValue::NullablePayloadEnum { ty, .. })
             if expected == *ty
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::Error, LocalValue::Error(_))
+            | (mir::Type::NullableError, LocalValue::NullableError(_))
     );
     if !compatible {
         let actual = match &value {
@@ -12208,6 +13082,8 @@ fn assign_local(
             LocalValue::NullableScalar { .. } => "nullable scalar",
             LocalValue::NullableString(_) => "?string",
             LocalValue::NullableMixed(_) => "?mixed",
+            LocalValue::Error(_) => "Error",
+            LocalValue::NullableError(_) => "?Error",
             LocalValue::Class { .. } => "class",
             LocalValue::NullableClass { .. } => "nullable class",
             LocalValue::SharedReference { .. } => "shared reference",

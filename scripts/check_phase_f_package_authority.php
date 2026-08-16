@@ -93,7 +93,7 @@ $require($namespacePath, $namespace, [
     'cannot be redeclared',
     'Stage 31 Slice 1',
     'Stage 31 Slice 2',
-    'Stage 29 remains the next compiler stage',
+    'Stage 29 is in progress: Slices 1 and 2 are complete, and Slice 3 is next',
     'Stage 31 is scheduled',
 ]);
 
@@ -142,7 +142,8 @@ $require($planPath, $plan, [
 $require($pipelinePath, $pipeline, [
     'Phase F Namespace, Autoload, Package, And Dependency Authority — Accepted',
     'Stage 29 — In Progress',
-    'Stage 29 Slice 2 — Next',
+    'Stage 29 Slice 2 — Complete',
+    'Stage 29 Slice 3 — Next',
     'Stage 31 — Scheduled, Not Implemented',
     'Stage 33 — Scheduled, Not Implemented',
 ]);

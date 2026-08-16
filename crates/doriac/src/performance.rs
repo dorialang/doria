@@ -46,7 +46,7 @@ pub fn compile_native(
     hir.source_path = source.path.clone();
     hir.source_text = source.text.clone();
     let hir_lowering = started.elapsed();
-    crate::reject_checked_error_execution(&hir)?;
+    crate::reject_escaping_main_error(&hir)?;
 
     let started = Instant::now();
     let (mir, structure) = mir_lowering::lower_program_with_metrics(&hir)?;

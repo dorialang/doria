@@ -109,7 +109,8 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 28a Slice 2 — Complete',
         'Stage 29 — In Progress',
         'Stage 29 Slice 1 — Complete',
-        'Stage 29 Slice 2 — Next',
+        'Stage 29 Slice 2 — Complete',
+        'Stage 29 Slice 3 — Next',
     ]);
 }
 
@@ -179,7 +180,7 @@ $require($validationPath, $validation, [
     'finalizer completion does not select its final continuation',
     'same-loop continue incorrectly routes through its loop finalizer',
     'finalizer entry edges disagree with its structured-exit table',
-    'Stage 29 checked-error finalizer routing is not executable yet',
+    'checked-error finalizer exit does not own an Error carrier',
 ]);
 $require($phpPath, $php, [
     'fn emit_with_finally(',

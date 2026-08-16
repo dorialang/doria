@@ -133,11 +133,12 @@ to `if`, `when`, `while`, and `do ... while`, runs once for each normal or
 structured exit, and preserves Doria's abort-only rule that fatal panic runs no
 cleanup.
 
-Doria currently parses and checks explicit `Error` conformance, `throw`,
-source-ordered `throws`, and `try`/`catch`/`finally`, and exposes their resolved
-effects in AST and HIR. Execution support is not available yet: programs that
-require checked-error execution stop before MIR with one structured diagnostic,
-while existing nonthrowing programs continue to compile and run unchanged.
+Doria parses, checks, and executes explicit `Error` conformance, `throw`,
+source-ordered `throws`, and `try`/`catch`/`finally`. Handled errors use one
+backend-independent MIR and deterministic cleanup model across the interpreter,
+Cranelift, LLVM, and the PHP compatibility backend. Process-level reporting for
+an Error escaping `main`, the canonical checked-I/O migration, and its runtime
+outcome remain under development.
 
 ## Tooling
 

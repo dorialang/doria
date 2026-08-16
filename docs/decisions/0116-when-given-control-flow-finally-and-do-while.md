@@ -234,15 +234,15 @@ not a backend optimization.
 Fatal panic does not unwind and runs no finalizer or destructor. PHP compatibility
 must preserve that Doria rule instead of inheriting PHP exception unwinding.
 
-## Future Checked Errors
+## Checked Errors
 
 Stage 29 checked errors reuse the same structured-exit and finalizer regions.
-They must not invent a second cleanup model. Decision 0119 now implements the
-Slice 1 grammar and semantic obligations while keeping executable checked-error
-routing in Slice 2.
+They do not invent a second cleanup model. Decision 0119 Slices 1 and 2 now
+implement the grammar, semantic obligations, and executable checked-error
+routing through those regions.
 
-A future checked-error exit will identify crossed regions exactly as return and
-loop exits do. Its pending payload belongs in a typed synthetic local acquired
+A checked-error exit identifies crossed regions exactly as return and loop
+exits do. Its pending payload belongs in a typed synthetic local acquired
 before ordinary cleanup; crossed regions run before propagation continues. A
 matching catch consumes that pending route and stops propagation. A finalizer
 cannot replace or cancel the pending error. Fatal panic remains a separate
@@ -262,8 +262,8 @@ Validation plans preserve source control-flow identity and prove entry,
 discriminator selection, value acquisition, continuation routing, and lexical
 nesting. Backends execute ordinary blocks and branches; there is no runtime
 finalizer object, heap cleanup stack, per-iteration registration, or unwind path.
-`StructuredExitKind::CheckedError` reserves Stage 29's extension point and is
-rejected if it appears in executable MIR before checked errors are implemented.
+`StructuredExitKind::CheckedError` is Stage 29's implemented extension point for
+executable checked-error MIR.
 
 ## PHP Compatibility
 
@@ -295,8 +295,8 @@ preservation, backend parity, and tooling synchronization.
 
 Slice 2 implements shared finalizer regions and routes normal completion,
 `return`, `break`, `continue`, and `when` yields through them. The same region
-model reserves, but does not execute, future checked-error crossings. Stage 28a
-is complete and Stage 29 is next.
+model now also executes checked-error crossings under Decision 0119 Slice 2.
+Stage 28a and Stage 29 Slices 1 and 2 are complete; Stage 29 Slice 3 is next.
 
 ## PR #134 Closure Audit
 
@@ -336,6 +336,6 @@ grammars, website examples, and authority guards are affected.
 - Decision 0097's result inference is amended: a surrounding expected type may
   type an unannotated `when` before head-branch inference.
 - Stage 28a Slice 2 implements this exact finalizer model.
-- Stage 29 must reuse the same structured finalizer regions.
+- Stage 29 Slice 2 reuses the same structured finalizer regions.
 - Stage 31 namespace and compile-time autoload authority, Stage 33 Baton work,
   self-hosting, and the performance workstream gain no new semantics here.
