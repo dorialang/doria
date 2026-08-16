@@ -91,7 +91,7 @@ $require($decisionPath, $decision, [
     'Branch locals',
     'drop next',
     'Given locals drop afterward',
-    'checked-error exit will identify crossed regions',
+    'A checked-error exit identifies crossed regions',
     'Fatal panic remains a separate',
     'abort-only edge and bypasses every region',
     'Controlled',
