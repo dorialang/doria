@@ -15,6 +15,55 @@ fn assert_object(source: &str) {
 }
 
 #[test]
+fn checked_error_ir_uses_status_out_slots_static_metadata_and_entry_scratch() {
+    let source = include_str!("../../../examples/native/main_checked_error_catch.doria");
+    let program = doriac::lower_source_to_mir("llvm-checked-errors.doria", source)
+        .expect("checked-error source should lower to validated MIR");
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
+        .expect("checked-error MIR should lower to LLVM IR");
+
+    assert!(ir.contains("@__doria_error_descriptor_0"), "{ir}");
+    assert!(ir.contains("@__doria_error_origin_0"), "{ir}");
+    assert!(
+        ir.contains("define internal i8"),
+        "throwing ABI must return i8:\n{ir}"
+    );
+    assert!(
+        ir.contains("checked.call"),
+        "checked call is missing:\n{ir}"
+    );
+    assert!(
+        ir.contains("checked.call.succeeded") && ir.contains("checked.call.failed"),
+        "checked status does not have distinct success and error tests:\n{ir}"
+    );
+    assert!(
+        ir.contains("checked.call.invalid-status"),
+        "an impossible checked status is not trapped structurally:\n{ir}"
+    );
+    assert!(
+        ir.contains("error.origin.empty") && ir.contains("error.origin.write"),
+        "first-throw origin is not set conditionally:\n{ir}"
+    );
+    assert!(
+        ir.contains("error.descriptor") && ir.contains("icmp eq ptr"),
+        "exact catch does not compare descriptor identity:\n{ir}"
+    );
+    for forbidden in [" invoke ", "landingpad", "personality", "resume "] {
+        assert!(
+            !ir.contains(forbidden),
+            "LLVM unwinding leaked into Doria MIR:\n{ir}"
+        );
+    }
+
+    let placement = scan_alloca_placement(&ir);
+    assert!(
+        placement.escaped.is_empty(),
+        "checked-call scratch escaped the function entry block:\n{}",
+        placement.escaped.join("\n")
+    );
+}
+
+#[test]
 fn lowers_complete_stage_14_mir_shapes_to_verified_objects() {
     for source in [
         include_str!("../../../examples/native/main_return_42.doria"),
@@ -467,6 +516,8 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
+        error_descriptors: vec![],
+        error_origins: vec![],
         functions: vec![
             Function {
                 id: FunctionId(0),
@@ -476,6 +527,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 receiver_mode: None,
                 params: Vec::new(),
                 return_type: ReturnType::Void,
+                checked_effects: Vec::new(),
                 locals: Vec::new(),
                 blocks: vec![BasicBlock {
                     id: BlockId(0),
@@ -492,6 +544,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 receiver_mode: None,
                 params: Vec::new(),
                 return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
+                checked_effects: Vec::new(),
                 locals: Vec::new(),
                 blocks: vec![BasicBlock {
                     id: BlockId(0),

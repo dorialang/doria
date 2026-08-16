@@ -1,0 +1,26 @@
+class BuildError implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+class Service
+{
+    string $state = "ready";
+
+    function __construct() throws BuildError
+    {
+        throw new BuildError("constructor");
+    }
+}
+
+function main(): void
+{
+    try {
+        let $service = new Service();
+        echo $service->state;
+    } catch (BuildError $error) {
+        echo "caught {$error->message}\n";
+    }
+}

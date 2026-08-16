@@ -32,6 +32,12 @@ pub struct CollectionTypeId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FinalizerRegionId(pub usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ErrorDescriptorId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ErrorOriginId(pub usize);
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub source: SourceFile,
@@ -39,6 +45,8 @@ pub struct Program {
     pub enums: Vec<EnumDefinition>,
     pub collection_types: Vec<CollectionType>,
     pub statics: Vec<StaticProperty>,
+    pub error_descriptors: Vec<ErrorDescriptor>,
+    pub error_origins: Vec<ErrorOrigin>,
     pub functions: Vec<Function>,
     pub entry: FunctionId,
 }
@@ -49,6 +57,8 @@ impl PartialEq for Program {
             && self.enums == other.enums
             && self.collection_types == other.collection_types
             && self.statics == other.statics
+            && self.error_descriptors == other.error_descriptors
+            && self.error_origins == other.error_origins
             && self.functions == other.functions
             && self.entry == other.entry
     }
@@ -195,6 +205,29 @@ pub struct Class {
     pub layout: ClassLayout,
     pub constructor: Option<FunctionId>,
     pub destructor: Option<FunctionId>,
+    pub error_descriptor: Option<ErrorDescriptorId>,
+    pub error_origin_offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ErrorDescriptor {
+    pub id: ErrorDescriptorId,
+    pub class: ClassId,
+    pub type_name: String,
+    pub message_property: PropertyId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ErrorOrigin {
+    pub id: ErrorOriginId,
+    pub span: Span,
+    pub function: FunctionId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CheckedEffect {
+    Concrete(ErrorDescriptorId),
+    Any,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,6 +248,7 @@ pub struct Function {
     pub receiver_mode: Option<ReceiverMode>,
     pub params: Vec<LocalId>,
     pub return_type: ReturnType,
+    pub checked_effects: Vec<CheckedEffect>,
     pub locals: Vec<Local>,
     pub blocks: Vec<BasicBlock>,
     pub entry_block: BlockId,
@@ -228,6 +262,7 @@ impl PartialEq for Function {
             && self.receiver_mode == other.receiver_mode
             && self.params == other.params
             && self.return_type == other.return_type
+            && self.checked_effects == other.checked_effects
             && self.locals == other.locals
             && self.blocks == other.blocks
             && self.entry_block == other.entry_block
@@ -314,6 +349,8 @@ pub enum Type {
     NullableScalar(ScalarType),
     NullableString,
     NullableMixed,
+    Error,
+    NullableError,
     Class(ClassId),
     NullableClass(ClassId),
     SharedReference(ClassId),
@@ -384,6 +421,8 @@ impl Type {
             self,
             Self::Mixed
                 | Self::NullableMixed
+                | Self::Error
+                | Self::NullableError
                 | Self::Class(_)
                 | Self::NullableClass(_)
                 | Self::SharedReference(_)
@@ -532,6 +571,8 @@ pub enum Rvalue {
     NullableScalar(NullableScalarExpression),
     NullableString(NullableStringExpression),
     NullableMixed(NullableMixedExpression),
+    Error(ErrorExpression),
+    NullableError(NullableErrorExpression),
     Class(ClassExpression),
     NullableClass(NullableClassExpression),
     SharedReference(SharedReferenceExpression),
@@ -569,6 +610,8 @@ impl Rvalue {
             Self::NullableScalar(value) => Type::NullableScalar(value.ty()),
             Self::NullableString(_) => Type::NullableString,
             Self::NullableMixed(_) => Type::NullableMixed,
+            Self::Error(_) => Type::Error,
+            Self::NullableError(_) => Type::NullableError,
             Self::Class(value) => Type::Class(value.class()),
             Self::NullableClass(value) => Type::NullableClass(value.class()),
             Self::SharedReference(value) => Type::SharedReference(value.class()),
@@ -602,6 +645,8 @@ impl Rvalue {
             | Self::Mixed(_)
             | Self::NullableScalar(_)
             | Self::NullableMixed(_)
+            | Self::Error(_)
+            | Self::NullableError(_)
             | Self::NullableString(_)
             | Self::SharedReference(_)
             | Self::WeakReference(_)
@@ -628,6 +673,8 @@ impl Rvalue {
             | Self::NullableScalar(_)
             | Self::NullableString(_)
             | Self::NullableMixed(_)
+            | Self::Error(_)
+            | Self::NullableError(_)
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::SharedReference(_)
@@ -691,6 +738,8 @@ impl Rvalue {
             | Self::NullableScalar(_)
             | Self::NullableString(_)
             | Self::NullableMixed(_)
+            | Self::Error(_)
+            | Self::NullableError(_)
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::Collection(_)
@@ -718,6 +767,8 @@ impl Rvalue {
             | Self::NullableScalar(_)
             | Self::NullableString(_)
             | Self::NullableMixed(_)
+            | Self::Error(_)
+            | Self::NullableError(_)
             | Self::Collection(_)
             | Self::NullableCollection(_)
             | Self::SharedReference(_)
@@ -764,6 +815,18 @@ impl Rvalue {
                 local,
                 transfer: true,
                 ..
+            })
+            | Self::Error(ErrorExpression::Local {
+                local,
+                transfer: true,
+            })
+            | Self::Error(ErrorExpression::NullableLocalAssumeNonNull {
+                local,
+                transfer: true,
+            })
+            | Self::NullableError(NullableErrorExpression::Local {
+                local,
+                transfer: true,
             }) => Some(*local),
             Self::SharedReference(SharedReferenceExpression::Local {
                 local,
@@ -851,6 +914,8 @@ impl Rvalue {
             | Self::NullableScalar(_)
             | Self::NullableString(_)
             | Self::NullableMixed(_)
+            | Self::Error(_)
+            | Self::NullableError(_)
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::Collection(_)
@@ -878,6 +943,8 @@ impl Rvalue {
             | Self::String(_)
             | Self::NullableScalar(_)
             | Self::NullableString(_)
+            | Self::Error(_)
+            | Self::NullableError(_)
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::Collection(_)
@@ -896,6 +963,77 @@ impl Rvalue {
             | Self::NullablePayloadEnum(_) => MixedOwnership::None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ErrorExpression {
+    Local {
+        local: LocalId,
+        transfer: bool,
+    },
+    NullableLocalAssumeNonNull {
+        local: LocalId,
+        transfer: bool,
+    },
+    FromClass {
+        object: Box<ClassExpression>,
+        descriptor: ErrorDescriptorId,
+    },
+    FromNullableClass {
+        object: Box<NullableClassExpression>,
+        descriptor: ErrorDescriptorId,
+    },
+    Property {
+        object: LocalId,
+        property: PropertyId,
+        transfer: bool,
+    },
+    Call {
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    CollectionIndex {
+        collection: LocalId,
+        index: Box<Rvalue>,
+        positional: bool,
+        remove: bool,
+    },
+    MixedPayload {
+        mixed: LocalId,
+        transfer: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableErrorExpression {
+    Null,
+    Error(ErrorExpression),
+    Local {
+        local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        object: LocalId,
+        property: PropertyId,
+        transfer: bool,
+    },
+    Call {
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        return_borrow: Option<ReturnBorrow>,
+    },
+    DictionaryGet {
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+    },
+    CollectionIndex {
+        collection: LocalId,
+        index: Box<Rvalue>,
+        positional: bool,
+        remove: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2179,6 +2317,7 @@ pub enum MixedTag {
     Float(FloatType),
     String,
     Class(ClassId),
+    Error,
     Enum(EnumId),
     PayloadEnum(PayloadEnumType),
 }
@@ -2191,6 +2330,7 @@ impl MixedTag {
             Self::Float(ty) => Type::Scalar(ScalarType::Float(ty)),
             Self::String => Type::String,
             Self::Class(class) => Type::Class(class),
+            Self::Error => Type::Error,
             Self::Enum(enum_id) => Type::Scalar(ScalarType::Enum(enum_id)),
             Self::PayloadEnum(ty) => Type::PayloadEnum(ty),
         }
@@ -2234,6 +2374,9 @@ pub enum MixedExpression {
         value: ClassExpression,
         payload_owned: bool,
     },
+    BoxError {
+        value: Box<ErrorExpression>,
+    },
     BoxPayloadEnum {
         value: Box<PayloadEnumExpression>,
     },
@@ -2258,7 +2401,7 @@ impl MixedExpression {
                 ..
             } => MixedOwnership::Owned,
             Self::BoxValue(_) => MixedOwnership::ShellOnly,
-            Self::BoxPayloadEnum { .. } => MixedOwnership::Owned,
+            Self::BoxPayloadEnum { .. } | Self::BoxError { .. } => MixedOwnership::Owned,
             Self::BoxString { payload_owned, .. } | Self::BoxClass { payload_owned, .. } => {
                 if *payload_owned {
                     MixedOwnership::Owned
@@ -2869,6 +3012,7 @@ pub enum StringExpression {
         object: LocalId,
         property: PropertyId,
     },
+    ErrorMessage(Box<ErrorExpression>),
     Static(StaticId),
     Concat(Vec<StringExpression>),
     Display(ValueExpression),
@@ -2911,6 +3055,7 @@ impl StringExpression {
             Self::Local(_)
                 | Self::NullableLocalAssumeNonNull(_)
                 | Self::Property { .. }
+                | Self::ErrorMessage(_)
                 | Self::Static(_)
                 | Self::MixedPayload(_)
         )
@@ -3148,6 +3293,7 @@ pub enum BoolExpression {
     NullableWritableWeakReferenceIsPresent(Box<NullableWritableWeakReferenceExpression>),
     NullableSharedReferenceAccessIsPresent(Box<NullableSharedReferenceAccessExpression>),
     NullableMixedIsPresent(Box<NullableMixedExpression>),
+    NullableErrorIsPresent(Box<NullableErrorExpression>),
     NullablePayloadEnumIsPresent(Box<NullablePayloadEnumExpression>),
     PayloadEnumCompare {
         op: CompareOp,
@@ -3331,6 +3477,18 @@ pub enum Statement {
     DropMixed {
         local: LocalId,
     },
+    EnsureErrorOrigin {
+        error: LocalId,
+        origin: ErrorOriginId,
+    },
+    ExtractErrorObject {
+        target: LocalId,
+        error: LocalId,
+        descriptor: ErrorDescriptorId,
+    },
+    DropError {
+        local: LocalId,
+    },
     CollectionAdd {
         collection: LocalId,
         value: Rvalue,
@@ -3397,21 +3555,17 @@ pub enum FinalizerAttachment {
     When,
     While,
     DoWhile,
+    Try,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StructuredExitKind {
     Normal,
-    WhenYield {
-        result: LocalId,
-    },
-    FunctionReturn {
-        value: Option<LocalId>,
-    },
+    WhenYield { result: LocalId },
+    FunctionReturn { value: Option<LocalId> },
     Break,
     Continue,
-    /// Reserved for Stage 29. Current MIR validation rejects executable uses.
-    CheckedError,
+    CheckedError { error: LocalId },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3510,6 +3664,35 @@ pub enum Terminator {
         then_block: BlockId,
         else_block: BlockId,
     },
+    CheckedCall {
+        function: FunctionId,
+        args: Vec<Rvalue>,
+        result: Option<LocalId>,
+        error: LocalId,
+        success: BlockId,
+        failure: BlockId,
+        span: Span,
+    },
+    CheckedConstruct {
+        class: ClassId,
+        properties: Vec<PropertyValue>,
+        constructor: FunctionId,
+        args: Vec<Rvalue>,
+        result: LocalId,
+        error: LocalId,
+        success: BlockId,
+        failure: BlockId,
+        span: Span,
+    },
+    ErrorSwitch {
+        error: LocalId,
+        cases: Vec<(ErrorDescriptorId, BlockId)>,
+        catch_all: Option<BlockId>,
+        fallback: BlockId,
+    },
+    PropagateError {
+        error: LocalId,
+    },
 }
 
 pub(crate) fn class_temporary_capacity(function: &Function) -> usize {
@@ -3552,6 +3735,9 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropSharedReferenceAccess { .. }
         | Statement::DropString { .. }
         | Statement::DropMixed { .. }
+        | Statement::EnsureErrorOrigin { .. }
+        | Statement::ExtractErrorObject { .. }
+        | Statement::DropError { .. }
         | Statement::DropPayloadEnum { .. }
         | Statement::CollectionClear { .. }
         | Statement::DropCollection { .. }
@@ -3582,6 +3768,28 @@ fn terminator_class_temporary_capacity(terminator: &Terminator) -> usize {
         Terminator::Return(value) => rvalue_class_temporary_capacity(value),
         Terminator::Panic { message, .. } => string_class_temporary_capacity(message),
         Terminator::Branch { condition, .. } => bool_class_temporary_capacity(condition),
+        Terminator::CheckedCall { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        Terminator::CheckedConstruct {
+            properties, args, ..
+        } => {
+            properties
+                .iter()
+                .map(|property| match &property.source {
+                    PropertyValueSource::Expression(value) => {
+                        rvalue_class_temporary_capacity(value)
+                    }
+                    PropertyValueSource::ConstructorArgument(_)
+                    | PropertyValueSource::ConstructorBody => 0,
+                })
+                .sum::<usize>()
+                + args
+                    .iter()
+                    .map(rvalue_class_temporary_capacity)
+                    .sum::<usize>()
+        }
+        Terminator::ErrorSwitch { .. } | Terminator::PropagateError { .. } => 0,
         Terminator::ReturnVoid | Terminator::Unreachable | Terminator::Jump(_) => 0,
     }
 }
@@ -3595,6 +3803,35 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
             Rvalue::NullableScalar(value) => nullable_scalar_class_temporary_capacity(value),
             Rvalue::NullableString(value) => nullable_string_class_temporary_capacity(value),
             Rvalue::NullableMixed(value) => nullable_mixed_class_temporary_capacity(value),
+            Rvalue::Error(value) => match value {
+                ErrorExpression::FromClass { object, .. } => {
+                    class_expression_temporary_capacity(object)
+                }
+                ErrorExpression::FromNullableClass { object, .. } => {
+                    nullable_class_temporary_capacity(object)
+                }
+                ErrorExpression::Call { args, .. } => {
+                    args.iter().map(rvalue_class_temporary_capacity).sum()
+                }
+                ErrorExpression::Local { .. }
+                | ErrorExpression::NullableLocalAssumeNonNull { .. }
+                | ErrorExpression::Property { .. }
+                | ErrorExpression::CollectionIndex { .. }
+                | ErrorExpression::MixedPayload { .. } => 0,
+            },
+            Rvalue::NullableError(value) => match value {
+                NullableErrorExpression::Error(value) => {
+                    rvalue_class_temporary_capacity(&Rvalue::Error(value.clone()))
+                }
+                NullableErrorExpression::Call { args, .. } => {
+                    args.iter().map(rvalue_class_temporary_capacity).sum()
+                }
+                NullableErrorExpression::Null
+                | NullableErrorExpression::Local { .. }
+                | NullableErrorExpression::Property { .. }
+                | NullableErrorExpression::DictionaryGet { .. }
+                | NullableErrorExpression::CollectionIndex { .. } => 0,
+            },
             Rvalue::Class(value) => class_expression_temporary_capacity(value),
             Rvalue::NullableClass(value) => nullable_class_temporary_capacity(value),
             Rvalue::SharedReference(value) => shared_class_temporary_capacity(value),
@@ -3974,6 +4211,9 @@ fn mixed_class_temporary_capacity(value: &MixedExpression) -> usize {
         MixedExpression::BoxValue(value) => value_class_temporary_capacity(value),
         MixedExpression::BoxString { value, .. } => string_class_temporary_capacity(value),
         MixedExpression::BoxClass { value, .. } => class_expression_temporary_capacity(value),
+        MixedExpression::BoxError { value } => {
+            rvalue_class_temporary_capacity(&Rvalue::Error((**value).clone()))
+        }
         MixedExpression::BoxPayloadEnum { value } => payload_enum_class_temporary_capacity(value),
         MixedExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
@@ -4113,6 +4353,9 @@ fn string_class_temporary_capacity(value: &StringExpression) -> usize {
             call.args.iter().map(rvalue_class_temporary_capacity).sum()
         }
         StringExpression::EnumBacking { value, .. } => enum_class_temporary_capacity(value),
+        StringExpression::ErrorMessage(value) => {
+            rvalue_class_temporary_capacity(&Rvalue::Error((**value).clone()))
+        }
         StringExpression::Literal(_)
         | StringExpression::Local(_)
         | StringExpression::NullableLocalAssumeNonNull(_)
@@ -4284,6 +4527,9 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
             nullable_string_class_temporary_capacity(left)
                 + nullable_string_class_temporary_capacity(right)
         }
+        BoolExpression::NullableErrorIsPresent(value) => {
+            rvalue_class_temporary_capacity(&Rvalue::NullableError((**value).clone()))
+        }
         BoolExpression::NullableScalarIsPresent(value) => {
             nullable_scalar_class_temporary_capacity(value)
         }
@@ -4432,6 +4678,8 @@ impl fmt::Display for Type {
             Type::NullableScalar(ty) => write!(formatter, "?{ty}"),
             Type::NullableString => write!(formatter, "?string"),
             Type::NullableMixed => write!(formatter, "?mixed"),
+            Type::Error => write!(formatter, "Error"),
+            Type::NullableError => write!(formatter, "?Error"),
             Type::Class(class) => write!(formatter, "class#{}", class.0),
             Type::NullableClass(class) => write!(formatter, "?class#{}", class.0),
             Type::SharedReference(class) => write!(formatter, "shared<class#{}>", class.0),
@@ -4539,6 +4787,101 @@ impl fmt::Display for Rvalue {
             Rvalue::NullableString(value) => write!(formatter, "{value}"),
             Rvalue::Mixed(value) => write!(formatter, "{value}"),
             Rvalue::NullableMixed(value) => write!(formatter, "{value}"),
+            Rvalue::Error(ErrorExpression::Local { local, transfer }) => write!(
+                formatter,
+                "{}Error local{}",
+                if *transfer { "move " } else { "borrow " },
+                local.0
+            ),
+            Rvalue::Error(ErrorExpression::NullableLocalAssumeNonNull { local, transfer }) => {
+                write!(
+                    formatter,
+                    "{}nonnull ?Error local{}",
+                    if *transfer { "move " } else { "borrow " },
+                    local.0
+                )
+            }
+            Rvalue::Error(ErrorExpression::FromClass { object, descriptor }) => {
+                write!(formatter, "erase {object} as error#{}", descriptor.0)
+            }
+            Rvalue::Error(ErrorExpression::FromNullableClass { object, descriptor }) => {
+                write!(formatter, "erase {object} as ?error#{}", descriptor.0)
+            }
+            Rvalue::Error(ErrorExpression::Property {
+                object,
+                property,
+                transfer,
+            }) => write!(
+                formatter,
+                "{}local{}->property#{}:{} as Error",
+                if *transfer { "move " } else { "borrow " },
+                object.0,
+                property.class.0,
+                property.index
+            ),
+            Rvalue::Error(ErrorExpression::Call { function, args, .. }) => {
+                write!(formatter, "call fn{}({args:?}) as Error", function.0)
+            }
+            Rvalue::Error(ErrorExpression::CollectionIndex {
+                collection,
+                index,
+                remove,
+                ..
+            }) => write!(
+                formatter,
+                "{}local{}[{index}] as Error",
+                if *remove { "remove " } else { "borrow " },
+                collection.0
+            ),
+            Rvalue::Error(ErrorExpression::MixedPayload { mixed, transfer }) => write!(
+                formatter,
+                "{}mixed Error local{}",
+                if *transfer { "move " } else { "borrow " },
+                mixed.0
+            ),
+            Rvalue::NullableError(NullableErrorExpression::Null) => {
+                write!(formatter, "null as ?Error")
+            }
+            Rvalue::NullableError(NullableErrorExpression::Error(value)) => {
+                write!(formatter, "some({})", Rvalue::Error(value.clone()))
+            }
+            Rvalue::NullableError(NullableErrorExpression::Local { local, transfer }) => write!(
+                formatter,
+                "{}?Error local{}",
+                if *transfer { "move " } else { "borrow " },
+                local.0
+            ),
+            Rvalue::NullableError(NullableErrorExpression::Property {
+                object,
+                property,
+                transfer,
+            }) => write!(
+                formatter,
+                "{}local{}->property#{}:{} as ?Error",
+                if *transfer { "move " } else { "borrow " },
+                object.0,
+                property.class.0,
+                property.index
+            ),
+            Rvalue::NullableError(NullableErrorExpression::Call { function, args, .. }) => {
+                write!(formatter, "call fn{}({args:?}) as ?Error", function.0)
+            }
+            Rvalue::NullableError(NullableErrorExpression::DictionaryGet {
+                collection,
+                key,
+                ..
+            }) => write!(formatter, "local{}->get({key}) as ?Error", collection.0),
+            Rvalue::NullableError(NullableErrorExpression::CollectionIndex {
+                collection,
+                index,
+                remove,
+                ..
+            }) => write!(
+                formatter,
+                "{}local{}[{index}] as ?Error",
+                if *remove { "remove " } else { "borrow " },
+                collection.0
+            ),
             Rvalue::Class(value) => write!(formatter, "{value}"),
             Rvalue::NullableClass(value) => write!(formatter, "{value}"),
             Rvalue::SharedReference(value) => write!(formatter, "{value}"),
@@ -4873,6 +5216,7 @@ impl fmt::Display for MixedTag {
             Self::Float(ty) => write!(formatter, "{ty}"),
             Self::String => formatter.write_str("string"),
             Self::Class(class) => write!(formatter, "class#{}", class.0),
+            Self::Error => formatter.write_str("Error"),
             Self::PayloadEnum(ty) => write!(formatter, "payload-enum#{}", ty.id.0),
         }
     }
@@ -4898,6 +5242,9 @@ impl fmt::Display for MixedExpression {
             Self::BoxValue(value) => write!(formatter, "mixed({value})"),
             Self::BoxString { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxClass { value, .. } => write!(formatter, "mixed({value})"),
+            Self::BoxError { value } => {
+                write!(formatter, "mixed({})", Rvalue::Error((**value).clone()))
+            }
             Self::BoxPayloadEnum { value } => {
                 write!(formatter, "mixed(payload-enum#{})", value.ty().id.0)
             }
@@ -5181,6 +5528,11 @@ impl fmt::Display for StringExpression {
             StringExpression::Property { object, property } => {
                 write!(formatter, "local{}->property{}", object.0, property.index)
             }
+            StringExpression::ErrorMessage(error) => write!(
+                formatter,
+                "error_message({})",
+                Rvalue::Error((**error).clone())
+            ),
             StringExpression::Static(id) => write!(formatter, "static{}", id.0),
             StringExpression::MixedPayload(local) => {
                 write!(formatter, "mixed_payload<string>(local{})", local.0)
@@ -5319,6 +5671,11 @@ impl fmt::Display for BoolExpression {
                 write!(formatter, "{left} {op} {right}")
             }
             Self::NullableScalarIsPresent(value) => write!(formatter, "present({value})"),
+            Self::NullableErrorIsPresent(value) => write!(
+                formatter,
+                "present({})",
+                Rvalue::NullableError((**value).clone())
+            ),
             Self::NullableClassIsPresent(value) => write!(formatter, "present({value})"),
             Self::NullableCollectionIsPresent(value) => {
                 write!(formatter, "present(?collection#{})", value.collection().0)
@@ -5685,6 +6042,21 @@ impl fmt::Display for Statement {
             ),
             Statement::DropString { local } => write!(formatter, "drop string local{}", local.0),
             Statement::DropMixed { local } => write!(formatter, "drop mixed local{}", local.0),
+            Statement::EnsureErrorOrigin { error, origin } => write!(
+                formatter,
+                "ensure origin#{} on error local{}",
+                origin.0, error.0
+            ),
+            Statement::ExtractErrorObject {
+                target,
+                error,
+                descriptor,
+            } => write!(
+                formatter,
+                "extract error#{} local{} -> local{}",
+                descriptor.0, error.0, target.0
+            ),
+            Statement::DropError { local } => write!(formatter, "drop Error local{}", local.0),
             Statement::CollectionAdd {
                 collection, value, ..
             } => {
@@ -5801,6 +6173,68 @@ impl fmt::Display for Terminator {
                 "branch {condition} -> block{}, block{}",
                 then_block.0, else_block.0
             ),
+            Terminator::CheckedCall {
+                function,
+                args,
+                result,
+                error,
+                success,
+                failure,
+                ..
+            } => {
+                write!(formatter, "checked ")?;
+                write_call(formatter, *function, args)?;
+                write!(
+                    formatter,
+                    " -> {}error local{}, block{}, block{}",
+                    result
+                        .map(|local| format!("local{}, ", local.0))
+                        .unwrap_or_default(),
+                    error.0,
+                    success.0,
+                    failure.0
+                )
+            }
+            Terminator::CheckedConstruct {
+                class,
+                constructor,
+                args,
+                result,
+                error,
+                success,
+                failure,
+                ..
+            } => {
+                write!(formatter, "checked construct class#{} with ", class.0)?;
+                write_call(formatter, *constructor, args)?;
+                write!(
+                    formatter,
+                    " -> local{}, error local{}, block{}, block{}",
+                    result.0, error.0, success.0, failure.0
+                )
+            }
+            Terminator::ErrorSwitch {
+                error,
+                cases,
+                catch_all,
+                fallback,
+            } => write!(
+                formatter,
+                "switch error local{} [{}] catch_all {} fallback block{}",
+                error.0,
+                cases
+                    .iter()
+                    .map(|(descriptor, block)| format!("error#{}=>block{}", descriptor.0, block.0))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                catch_all
+                    .map(|block| format!("block{}", block.0))
+                    .unwrap_or_else(|| "none".to_string()),
+                fallback.0
+            ),
+            Terminator::PropagateError { error } => {
+                write!(formatter, "propagate error local{}", error.0)
+            }
         }
     }
 }

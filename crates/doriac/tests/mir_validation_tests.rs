@@ -27,6 +27,294 @@ fn first_payload_binding<'a>(program: &'a mut Program, function_name: &str) -> &
         .expect("payload binding should exist")
 }
 
+fn assert_malformed(program: &Program, expected: &str) {
+    let error = doriac::mir_validation::validate_program(program)
+        .expect_err("malformed MIR must stop before backend execution");
+    assert!(
+        error.message.contains(expected),
+        "expected {expected:?}, got {:?}",
+        error.message
+    );
+}
+
+fn checked_call_mut(program: &mut Program) -> &mut Terminator {
+    program
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .map(|block| &mut block.terminator)
+        .find(|terminator| matches!(terminator, Terminator::CheckedCall { .. }))
+        .expect("fixture should contain a checked call")
+}
+
+fn checked_construct_mut(program: &mut Program) -> &mut Terminator {
+    program
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .map(|block| &mut block.terminator)
+        .find(|terminator| matches!(terminator, Terminator::CheckedConstruct { .. }))
+        .expect("fixture should contain checked construction")
+}
+
+#[test]
+fn shared_validator_rejects_malformed_checked_error_metadata_and_origins() {
+    let source = include_str!("../../../examples/native/main_checked_error_catch.doria");
+    let valid = doriac::lower_source_to_mir("checked-error-metadata.doria", source)
+        .expect("valid checked-error source should lower");
+    doriac::mir_validation::validate_program(&valid)
+        .expect("valid checked-error MIR should validate");
+
+    let mut wrong_descriptor_id = valid.clone();
+    wrong_descriptor_id.error_descriptors[0].id = mir::ErrorDescriptorId(7);
+    assert_malformed(&wrong_descriptor_id, "descriptor table slot 0");
+
+    let mut unbound_descriptor = valid.clone();
+    unbound_descriptor.classes[0].error_descriptor = None;
+    assert_malformed(&unbound_descriptor, "is not bound to class#0");
+
+    let mut missing_origin_slot = valid.clone();
+    missing_origin_slot.classes[0].error_origin_offset = None;
+    assert_malformed(&missing_origin_slot, "has no hidden origin slot");
+
+    let mut wrong_message = valid.clone();
+    wrong_message.error_descriptors[0].message_property = PropertyId {
+        class: ClassId(0),
+        index: 99,
+    };
+    assert_malformed(&wrong_message, "property99");
+
+    let mut wrong_type_name = valid.clone();
+    wrong_type_name.error_descriptors[0].type_name = "OtherFailure".to_string();
+    assert_malformed(&wrong_type_name, "type name does not match");
+
+    let mut wrong_origin_id = valid.clone();
+    wrong_origin_id.error_origins[0].id = mir::ErrorOriginId(4);
+    assert_malformed(&wrong_origin_id, "origin table slot 0");
+
+    let mut unknown_origin = valid.clone();
+    let ensure = unknown_origin
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.statements)
+        .find(|statement| matches!(statement, Statement::EnsureErrorOrigin { .. }))
+        .expect("direct throw should set an origin");
+    let Statement::EnsureErrorOrigin { origin, .. } = ensure else {
+        unreachable!()
+    };
+    *origin = mir::ErrorOriginId(99);
+    assert_malformed(&unknown_origin, "Error origin#99 does not exist");
+}
+
+#[test]
+fn shared_validator_rejects_malformed_checked_calls_catches_and_carrier_ownership() {
+    let source = include_str!("../../../examples/native/main_checked_error_catch.doria");
+    let valid = doriac::lower_source_to_mir("checked-error-edges.doria", source)
+        .expect("valid checked-error source should lower");
+
+    let mut nonthrowing_callee = valid.clone();
+    let Terminator::CheckedCall { function, .. } = checked_call_mut(&mut nonthrowing_callee) else {
+        unreachable!()
+    };
+    *function = FunctionId(0);
+    assert_malformed(
+        &nonthrowing_callee,
+        "checked call targets nonthrowing function",
+    );
+
+    let mut merged_edges = valid.clone();
+    let Terminator::CheckedCall {
+        success, failure, ..
+    } = checked_call_mut(&mut merged_edges)
+    else {
+        unreachable!()
+    };
+    *failure = *success;
+    assert_malformed(&merged_edges, "success and error edges are identical");
+
+    let mut borrowed_error_slot = valid.clone();
+    let error_local = {
+        let Terminator::CheckedCall { error, .. } = checked_call_mut(&mut borrowed_error_slot)
+        else {
+            unreachable!()
+        };
+        *error
+    };
+    let main = borrowed_error_slot
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    main.locals[error_local.0].owned = false;
+    assert_malformed(&borrowed_error_slot, "incompatible Error slot");
+
+    let mut unknown_catch_descriptor = valid.clone();
+    let switch = unknown_catch_descriptor
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .map(|block| &mut block.terminator)
+        .find(|terminator| matches!(terminator, Terminator::ErrorSwitch { .. }))
+        .expect("fixture should contain catch dispatch");
+    let Terminator::ErrorSwitch { cases, .. } = switch else {
+        unreachable!()
+    };
+    cases[0].0 = mir::ErrorDescriptorId(99);
+    assert_malformed(
+        &unknown_catch_descriptor,
+        "Error descriptor#99 does not exist",
+    );
+
+    let mut wrong_concrete_binding = valid.clone();
+    let extraction = wrong_concrete_binding
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.statements)
+        .find(|statement| matches!(statement, Statement::ExtractErrorObject { .. }))
+        .expect("exact catch should extract the concrete object");
+    let target = match extraction {
+        Statement::ExtractErrorObject { target, .. } => *target,
+        _ => unreachable!(),
+    };
+    let main = wrong_concrete_binding
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    main.locals[target.0].ty = Type::Error;
+    assert_malformed(
+        &wrong_concrete_binding,
+        "exact catch target does not own the descriptor's concrete class",
+    );
+
+    let mut ordinary_call = valid.clone();
+    let main = ordinary_call
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    let block = main
+        .blocks
+        .iter_mut()
+        .find(|block| matches!(block.terminator, Terminator::CheckedCall { .. }))
+        .expect("main should contain a checked call");
+    let Terminator::CheckedCall {
+        function,
+        args,
+        success,
+        span,
+        ..
+    } = block.terminator.clone()
+    else {
+        unreachable!()
+    };
+    block.statements.push(Statement::CallVoid {
+        function,
+        args,
+        span,
+    });
+    block.terminator = Terminator::Jump(success);
+    assert_malformed(&ordinary_call, "ordinary call targets throwing function");
+
+    let mut nonthrowing_propagation = valid.clone();
+    let fail = nonthrowing_propagation
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "fail")
+        .expect("fail should exist");
+    fail.checked_effects.clear();
+    assert_malformed(
+        &nonthrowing_propagation,
+        "nonthrowing function propagates a checked Error",
+    );
+}
+
+#[test]
+fn shared_validator_rejects_malformed_checked_finalizer_and_construction_plans() {
+    let finalizer_source =
+        include_str!("../../../examples/native/main_checked_error_control_finalizers.doria");
+    let valid_finalizer =
+        doriac::lower_source_to_mir("checked-error-finalizers.doria", finalizer_source)
+            .expect("valid checked-error finalizer source should lower");
+    doriac::mir_validation::validate_program(&valid_finalizer)
+        .expect("valid checked-error finalizer MIR should validate");
+
+    let mut wrong_finalizer_carrier = valid_finalizer.clone();
+    let checked_exit = wrong_finalizer_carrier
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::Finalizer(plan)) => plan
+                .exits
+                .iter_mut()
+                .find(|exit| matches!(exit.kind, mir::StructuredExitKind::CheckedError { .. })),
+            _ => None,
+        })
+        .expect("fixture should contain a checked finalizer exit");
+    checked_exit.kind = mir::StructuredExitKind::CheckedError { error: LocalId(1) };
+    assert_malformed(
+        &wrong_finalizer_carrier,
+        "checked-error finalizer exit does not own an Error carrier",
+    );
+
+    let construction_source =
+        include_str!("../../../examples/native/main_checked_error_constructor.doria");
+    let valid_construction =
+        doriac::lower_source_to_mir("checked-error-construction.doria", construction_source)
+            .expect("valid checked construction should lower");
+    doriac::mir_validation::validate_program(&valid_construction)
+        .expect("valid checked construction MIR should validate");
+
+    let mut merged_construct_edges = valid_construction.clone();
+    let Terminator::CheckedConstruct {
+        success, failure, ..
+    } = checked_construct_mut(&mut merged_construct_edges)
+    else {
+        unreachable!()
+    };
+    *failure = *success;
+    assert_malformed(
+        &merged_construct_edges,
+        "checked construction success and error edges are identical",
+    );
+
+    let mut wrong_constructor = valid_construction.clone();
+    let Terminator::CheckedConstruct { constructor, .. } =
+        checked_construct_mut(&mut wrong_constructor)
+    else {
+        unreachable!()
+    };
+    *constructor = FunctionId(0);
+    assert_malformed(
+        &wrong_constructor,
+        "checked construction names the wrong class constructor",
+    );
+
+    let mut borrowed_construct_result = valid_construction.clone();
+    let result_local = {
+        let Terminator::CheckedConstruct { result, .. } =
+            checked_construct_mut(&mut borrowed_construct_result)
+        else {
+            unreachable!()
+        };
+        *result
+    };
+    let main = borrowed_construct_result
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "main")
+        .expect("main should exist");
+    main.locals[result_local.0].owned = false;
+    assert_malformed(
+        &borrowed_construct_result,
+        "checked construction has an incompatible success slot",
+    );
+}
+
 #[test]
 fn shared_validator_rejects_malformed_match_dispatch_projection_and_result_plans() {
     let source = r#"
@@ -1128,11 +1416,11 @@ function main(): void { echo "{choose()}"; }
 
     let mut future_error = valid.clone();
     mutate_plan(&mut future_error, &mut |plan| {
-        plan.exits[0].kind = mir::StructuredExitKind::CheckedError;
+        plan.exits[0].kind = mir::StructuredExitKind::CheckedError { error: LocalId(0) };
     });
     malformed(
         &future_error,
-        "Stage 29 checked-error finalizer routing is not executable yet",
+        "checked-error finalizer exit does not own an Error carrier",
     );
 
     let mut same_loop_continue = valid;
@@ -1454,6 +1742,7 @@ fn shared_validator_rejects_mixed_width_float_binary_operands() {
         receiver_mode: None,
         params: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
+        checked_effects: Vec::new(),
         locals: Vec::new(),
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -1571,6 +1860,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
         receiver_mode: None,
         params: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
+        checked_effects: Vec::new(),
         locals: vec![Local {
             id: LocalId(0),
             name: "numbers".to_string(),
@@ -2486,6 +2776,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
             receiver_mode: None,
             params: vec![LocalId(0)],
             return_type: ReturnType::Value(Type::String),
+            checked_effects: Vec::new(),
             locals: vec![parameter],
             blocks: vec![BasicBlock {
                 id: BlockId(0),
@@ -2582,6 +2873,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
         receiver_mode: None,
         params: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(1))),
+        checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(1))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -2628,6 +2920,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
             Local {
@@ -2700,6 +2993,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0)), borrowed_child],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -2748,6 +3042,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![borrowed, class_local(1, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -2789,6 +3084,7 @@ fn shared_validator_enforces_writable_class_argument_rules() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![parameter],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -2867,6 +3163,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Value(Type::String),
+        checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -2885,6 +3182,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![
             Local {
                 id: LocalId(0),
@@ -2975,6 +3273,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Bool)),
+        checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -2995,6 +3294,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -3011,6 +3311,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -3060,6 +3361,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![
             borrowed,
             Local {
@@ -3086,6 +3388,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Value(Type::String),
+        checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -3152,6 +3455,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![
             class_local(0, ClassId(0)),
             Local {
@@ -3251,6 +3555,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(IntegerType::Int64))),
+        checked_effects: Vec::new(),
         locals: vec![writable],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -3398,6 +3703,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
             class_local(1, ClassId(1)),
@@ -3565,6 +3871,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Value(Type::Class(ClassId(1))),
+        checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(1))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -3632,6 +3939,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
             class_local(1, ClassId(1)),
@@ -3911,6 +4219,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![receiver, condition],
         blocks: vec![
             BasicBlock {
@@ -4115,6 +4424,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Value(Type::String),
+        checked_effects: Vec::new(),
         locals: vec![parameter],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4304,6 +4614,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(99))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4325,6 +4636,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         receiver_mode: None,
         params: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(99))),
+        checked_effects: Vec::new(),
         locals: vec![],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4352,6 +4664,7 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![receiver],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4412,6 +4725,7 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![borrowed],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4451,6 +4765,7 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4478,6 +4793,7 @@ fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
+        checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4536,6 +4852,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
+        checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4556,6 +4873,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
             class_local(1, ClassId(0)),
@@ -4605,6 +4923,7 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0)), class_local(1, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4713,6 +5032,7 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
         receiver_mode: None,
         params: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
+        checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
             id: BlockId(0),
@@ -4822,6 +5142,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
             Local {
@@ -4920,6 +5241,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Value(Type::SharedReference(ClassId(1))),
+        checked_effects: Vec::new(),
         locals: vec![Local {
             id: LocalId(0),
             name: "value".to_string(),
@@ -4998,6 +5320,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Value(Type::NullableSharedReference(ClassId(1))),
+        checked_effects: Vec::new(),
         locals: vec![Local {
             id: LocalId(0),
             name: "weak".to_string(),
@@ -5056,6 +5379,8 @@ fn valid_void_program() -> Program {
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
+        error_descriptors: Vec::new(),
+        error_origins: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -5064,6 +5389,7 @@ fn valid_void_program() -> Program {
             receiver_mode: None,
             params: Vec::new(),
             return_type: ReturnType::Void,
+            checked_effects: Vec::new(),
             locals: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
@@ -5087,6 +5413,8 @@ fn class_program() -> Program {
             layout: compute_class_layout(id, [], 8),
             constructor: None,
             destructor: None,
+            error_descriptor: None,
+            error_origin_offset: None,
         })
         .collect();
     program
@@ -5153,6 +5481,7 @@ fn class_new_program() -> Program {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
             Local {
@@ -5217,6 +5546,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
             borrowed_class_local(1, ClassId(1)),
@@ -5236,6 +5566,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         receiver_mode: None,
         params: vec![LocalId(0)],
         return_type: ReturnType::Void,
+        checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(1))],
         blocks: vec![BasicBlock {
             id: BlockId(0),

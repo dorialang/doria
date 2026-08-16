@@ -98,8 +98,6 @@ pub struct SemanticInfo {
     pub try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
     /// Resolved catch type for each catch clause.
     pub catch_error_types: HashMap<(usize, usize), ResolvedType>,
-    /// First checked-error syntax that requires Slice 2 execution support.
-    pub checked_error_boundary: Option<Span>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -397,7 +395,6 @@ pub fn analyze_program_for_ide_with_source<'source>(
             throw_error_types: checker.throw_error_types,
             try_uncovered_effects: checker.try_uncovered_effects,
             catch_error_types: checker.catch_error_types,
-            checked_error_boundary: checker.checked_error_boundary,
         },
         diagnostics: checker.diagnostics,
     }
@@ -1065,7 +1062,6 @@ struct Checker<'program> {
     throw_error_types: HashMap<(usize, usize), ResolvedType>,
     try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
     catch_error_types: HashMap<(usize, usize), ResolvedType>,
-    checked_error_boundary: Option<Span>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1594,7 +1590,6 @@ impl<'program> Checker<'program> {
             throw_error_types: HashMap::new(),
             try_uncovered_effects: HashMap::new(),
             catch_error_types: HashMap::new(),
-            checked_error_boundary: None,
         }
     }
 
@@ -2709,8 +2704,6 @@ impl<'program> Checker<'program> {
         let Some(clause) = &function.throws else {
             return Vec::new();
         };
-        self.checked_error_boundary
-            .get_or_insert(clause.keyword_span);
         if function.name == "__destruct" {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -5181,8 +5174,6 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
-        self.checked_error_boundary
-            .get_or_insert(statement.keyword_span);
         self.check_expr(&statement.expr, scopes, method_context);
         let error_type = self.infer_expr_type(&statement.expr, scopes, method_context);
         if self.is_unknown_type(error_type) {
@@ -5230,8 +5221,6 @@ impl<'program> Checker<'program> {
         return_context: Option<&ReturnContext>,
         loop_depth: usize,
     ) {
-        self.checked_error_boundary
-            .get_or_insert(statement.keyword_span);
         self.effect_scopes.push(CheckedEffectSet::default());
         let mut protected_scopes = scopes.clone();
         let mut protected_constructor =
@@ -8429,8 +8418,14 @@ impl<'program> Checker<'program> {
             }
             _ => {}
         }
-        if self.is_supported_nullable_equality(left, left_ty, right, right_ty)
-            || self.is_equality_compatible(left_ty, right_ty)
+        if self.is_supported_nullable_equality(
+            left,
+            left_ty,
+            right,
+            right_ty,
+            scopes,
+            method_context,
+        ) || self.is_equality_compatible(left_ty, right_ty)
         {
             return;
         }
@@ -8586,11 +8581,13 @@ impl<'program> Checker<'program> {
     }
 
     fn is_supported_nullable_equality(
-        &self,
+        &mut self,
         left: &Expr,
         left_ty: TypeId,
         right: &Expr,
         right_ty: TypeId,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
     ) -> bool {
         let left_is_null = Self::is_null_literal(left);
         let right_is_null = Self::is_null_literal(right);
@@ -8598,8 +8595,13 @@ impl<'program> Checker<'program> {
             if left_is_null && right_is_null {
                 return false;
             }
-            let other = if left_is_null { right_ty } else { left_ty };
-            return matches!(self.types.kind(other), TypeKind::Nullable(_));
+            let (other, other_ty) = if left_is_null {
+                (right, right_ty)
+            } else {
+                (left, left_ty)
+            };
+            return self.expr_declares_nullable(other, scopes, method_context)
+                || matches!(self.types.kind(other_ty), TypeKind::Nullable(_));
         }
 
         matches!(
@@ -12346,10 +12348,7 @@ impl<'program> Checker<'program> {
                 "write `?T` with a concrete type, such as `?string` or `?Person`",
             ),
             "mixed" => self.resolve_zero_arg_type(ty, span, TypeKind::Mixed),
-            "Error" => {
-                self.checked_error_boundary.get_or_insert(span);
-                self.resolve_zero_arg_type(ty, span, TypeKind::Error)
-            }
+            "Error" => self.resolve_zero_arg_type(ty, span, TypeKind::Error),
             "object" => self.reject_type_ref_with_help(
                 ty,
                 span,

@@ -302,8 +302,9 @@ Stage 33 Slice 1 implements Baton manifest schema 2, schema 1 compatibility,
 autoload and autoload-dev discovery, scopes, targets, and single-package build
 plans. Decision 0118 owns the rest of Stage 33.
 
-Stage 29 remains the next compiler stage. Stage 31 is scheduled, not
-implemented; this accepted authority does not start it.
+Stage 29 is in progress: Slices 1 and 2 are complete, and Slice 3 is next.
+Stage 31 is scheduled, not implemented; this accepted authority does not start
+it.
 
 ## Safe Deferrals
 

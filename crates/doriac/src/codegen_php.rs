@@ -11,6 +11,7 @@ use crate::semantics::{
     GivenSemanticInfo, MatchSemanticInfo, ResolvedMatchPattern, SemanticInfo, WhenSemanticInfo,
 };
 use crate::source::Span;
+use crate::symbols::BuiltinInterface;
 use crate::types::{ResolvedType, TypeRef};
 
 const PHP_INTEGER_UNSUPPORTED_CODE: &str = "B1301";
@@ -19,6 +20,49 @@ const PHP_CONSTANT_UNSUPPORTED_CODE: &str = "B2001";
 const PHP_COLLECTION_UNSUPPORTED_CODE: &str = "B2301";
 const PHP_GENERICS_UNSUPPORTED_CODE: &str = "B2401";
 const PHP_STRING_RUNTIME_UNSUPPORTED_CODE: &str = "B2501";
+
+const PHP_CHECKED_ERROR_HELPERS: &str = r#"
+interface __DoriaErrorValue
+{
+    public static function __doriaErrorType(): __DoriaErrorDescriptor;
+    public function __doriaErrorDescriptor(): __DoriaErrorDescriptor;
+    public function __doriaEnsureErrorOrigin(int $origin): void;
+    public function __doriaErrorOrigin(): int;
+}
+
+final class __DoriaErrorDescriptor
+{
+    public function __construct(public string $typeName) {}
+}
+
+final class __DoriaCheckedError extends Exception
+{
+    public function __construct(
+        public __DoriaErrorValue $error,
+        public __DoriaErrorDescriptor $descriptor,
+        public int $origin,
+    ) {
+        parent::__construct("");
+    }
+}
+
+function __doria_error_descriptor(string $typeName): __DoriaErrorDescriptor
+{
+    static $descriptors = [];
+    return $descriptors[$typeName] ??= new __DoriaErrorDescriptor($typeName);
+}
+
+function __doria_throw(__DoriaErrorValue $error, int $origin): void
+{
+    $error->__doriaEnsureErrorOrigin($origin);
+    throw new __DoriaCheckedError(
+        $error,
+        $error->__doriaErrorDescriptor(),
+        $error->__doriaErrorOrigin(),
+    );
+}
+
+"#;
 
 const PHP_STAGE26_COLLECTION_HELPERS: &str = r#"
 abstract class __DoriaOrderedCollection
@@ -385,6 +429,14 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
     let mut output = String::from(
         "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\ninterface __DoriaValueEquatable\n{\n    public function __doriaEquals(mixed $other): bool;\n}\n\nfinal class __DoriaMixedValue\n{\n    public function __construct(\n        private readonly string $typeTag,\n        private mixed $value,\n    ) {\n    }\n\n    public function is(string $typeTag): bool { return $this->typeTag === $typeTag; }\n    public function value(): mixed { return $this->value; }\n}\n\nfunction __doria_box_mixed(string $typeTag, mixed $value): __DoriaMixedValue\n{\n    if ($typeTag === 'float32') { $value = unpack('G', pack('G', $value))[1]; }\n    return new __DoriaMixedValue($value === null ? 'null' : $typeTag, $value);\n}\n\nfunction __doria_mixed_is(mixed $value, string $typeTag): bool\n{\n    return $value instanceof __DoriaMixedValue && $value->is($typeTag);\n}\n\nfunction __doria_mixed_value(mixed $value): mixed\n{\n    return $value instanceof __DoriaMixedValue ? $value->value() : $value;\n}\n\nfunction __doria_equal(mixed $left, mixed $right): bool\n{\n    if ($left instanceof __DoriaValueEquatable) { return $left->__doriaEquals($right); }\n    if ($right instanceof __DoriaValueEquatable) { return $right->__doriaEquals($left); }\n    return $left === $right;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
     );
+    if program
+        .semantic_info
+        .classes
+        .iter()
+        .any(|class| class.implements(BuiltinInterface::Error))
+    {
+        output.push_str(PHP_CHECKED_ERROR_HELPERS);
+    }
     output.push_str(PHP_STAGE26_COLLECTION_HELPERS);
     output.push_str(&format!(
         "$__doria_source_path = {};\n$__doria_source_text = hex2bin({});\n",
@@ -719,6 +771,8 @@ function __doria_printf(int $start, int $end, string $format, mixed ...$values):
     scopes.expression_types = program.semantic_info.expression_types.clone();
     scopes.type_test_types = program.semantic_info.type_test_types.clone();
     scopes.mixed_box_types = program.semantic_info.mixed_box_types.clone();
+    scopes.throw_error_types = program.semantic_info.throw_error_types.clone();
+    scopes.catch_error_types = program.semantic_info.catch_error_types.clone();
     scopes.const_evaluation = program.semantic_info.const_evaluation.clone();
     scopes.payload_case_tags = program
         .semantic_info
@@ -1782,6 +1836,8 @@ struct PhpNameScopes {
     expression_types: HashMap<(usize, usize), ResolvedType>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
     mixed_box_types: HashMap<(usize, usize), ResolvedType>,
+    throw_error_types: HashMap<(usize, usize), ResolvedType>,
+    catch_error_types: HashMap<(usize, usize), ResolvedType>,
     const_evaluation: Evaluation,
 }
 
@@ -1810,6 +1866,8 @@ impl PhpNameScopes {
             expression_types: HashMap::new(),
             type_test_types: HashMap::new(),
             mixed_box_types: HashMap::new(),
+            throw_error_types: HashMap::new(),
+            catch_error_types: HashMap::new(),
             const_evaluation: Evaluation::default(),
         }
     }
@@ -1829,6 +1887,8 @@ impl PhpNameScopes {
         scopes.expression_types = self.expression_types.clone();
         scopes.type_test_types = self.type_test_types.clone();
         scopes.mixed_box_types = self.mixed_box_types.clone();
+        scopes.throw_error_types = self.throw_error_types.clone();
+        scopes.catch_error_types = self.catch_error_types.clone();
         scopes.const_evaluation = self.const_evaluation.clone();
         scopes
     }
@@ -2159,14 +2219,25 @@ fn emit_class(
         })
         .collect::<Vec<_>>();
     let mut has_constructor = false;
-    let implements = if class_decl
+    let is_error = class_decl
+        .implements
+        .iter()
+        .any(|interface| interface == "Error");
+    let mut interfaces = Vec::new();
+    if class_decl
         .implements
         .iter()
         .any(|interface| interface == "Displayable")
     {
-        " implements __DoriaDisplayable"
+        interfaces.push("__DoriaDisplayable");
+    }
+    if is_error {
+        interfaces.push("__DoriaErrorValue");
+    }
+    let implements = if interfaces.is_empty() {
+        String::new()
     } else {
-        ""
+        format!(" implements {}", interfaces.join(", "))
     };
     writeln(
         output,
@@ -2174,6 +2245,53 @@ fn emit_class(
         &format!("class {}{implements}", class_decl.name),
     );
     writeln(output, indent, "{");
+    if is_error {
+        writeln(output, indent + 1, "private int $__doriaErrorOrigin = 0;");
+        writeln(
+            output,
+            indent + 1,
+            "public static function __doriaErrorType(): __DoriaErrorDescriptor",
+        );
+        writeln(output, indent + 1, "{");
+        writeln(
+            output,
+            indent + 2,
+            &format!(
+                "return __doria_error_descriptor({});",
+                emit_php_string_literal(&class_decl.name)
+            ),
+        );
+        writeln(output, indent + 1, "}");
+        writeln(
+            output,
+            indent + 1,
+            "public function __doriaErrorDescriptor(): __DoriaErrorDescriptor",
+        );
+        writeln(output, indent + 1, "{");
+        writeln(output, indent + 2, "return self::__doriaErrorType();");
+        writeln(output, indent + 1, "}");
+        writeln(
+            output,
+            indent + 1,
+            "public function __doriaEnsureErrorOrigin(int $origin): void",
+        );
+        writeln(output, indent + 1, "{");
+        writeln(
+            output,
+            indent + 2,
+            "if ($this->__doriaErrorOrigin === 0) { $this->__doriaErrorOrigin = $origin; }",
+        );
+        writeln(output, indent + 1, "}");
+        writeln(
+            output,
+            indent + 1,
+            "public function __doriaErrorOrigin(): int",
+        );
+        writeln(output, indent + 1, "{");
+        writeln(output, indent + 2, "return $this->__doriaErrorOrigin;");
+        writeln(output, indent + 1, "}");
+        output.push('\n');
+    }
     for member in &class_decl.members {
         match member {
             ClassMember::Property(property) => emit_property(
@@ -2790,7 +2908,101 @@ fn emit_statement(
             }
             writeln(output, indent, &format!("{};", emit_expr(expr, scopes)));
         }
-        Stmt::Throw(_) | Stmt::Try(_) => {}
+        Stmt::Throw(statement) => emit_throw_statement(statement, output, indent, scopes),
+        Stmt::Try(statement) => emit_try_statement(statement, output, indent, scopes),
+    }
+}
+
+fn emit_throw_statement(
+    statement: &ThrowStmt,
+    output: &mut String,
+    indent: usize,
+    scopes: &PhpNameScopes,
+) {
+    debug_assert!(scopes
+        .throw_error_types
+        .contains_key(&(statement.span.start, statement.span.end)));
+    writeln(
+        output,
+        indent,
+        &format!(
+            "__doria_throw({}, {});",
+            emit_expr(&statement.expr, scopes),
+            statement.span.start.saturating_add(1),
+        ),
+    );
+}
+
+fn emit_try_statement(
+    statement: &TryStmt,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    writeln(output, indent, "try");
+    emit_block(&statement.body, output, indent, scopes);
+
+    if !statement.catches.is_empty() {
+        let caught = scopes.fresh_temp("__doria_checked_error");
+        writeln(
+            output,
+            indent,
+            &format!("catch (__DoriaCheckedError ${caught})"),
+        );
+        writeln(output, indent, "{");
+        scopes.push();
+        let mut has_catch_all = false;
+        for (index, clause) in statement.catches.iter().enumerate() {
+            let error_type = scopes
+                .catch_error_types
+                .get(&(clause.span.start, clause.span.end))
+                .unwrap_or(&clause.error_type);
+            let condition = match error_type {
+                ResolvedType::Error => {
+                    has_catch_all = true;
+                    "true".to_string()
+                }
+                ResolvedType::Class(class) => format!(
+                    "${caught}->descriptor === {}::__doriaErrorType()",
+                    class.name
+                ),
+                _ => unreachable!("semantic checking restricts catch types to Error values"),
+            };
+            writeln(
+                output,
+                indent + 1,
+                &format!("{} ({condition})", if index == 0 { "if" } else { "elseif" }),
+            );
+            writeln(output, indent + 1, "{");
+            scopes.push();
+            let binding = match &clause.binding {
+                Some(binding) => scopes.declare(&binding.name),
+                None => scopes.fresh_temp("__doria_caught_value"),
+            };
+            writeln(
+                output,
+                indent + 2,
+                &format!("${binding} = ${caught}->error;"),
+            );
+            for body_statement in &clause.body.statements {
+                emit_statement(body_statement, output, indent + 2, scopes);
+            }
+            scopes.pop();
+            writeln(output, indent + 1, "}");
+        }
+        if !has_catch_all {
+            writeln(output, indent + 1, "else");
+            writeln(output, indent + 1, "{");
+            writeln(output, indent + 2, &format!("throw ${caught};"));
+            writeln(output, indent + 1, "}");
+        }
+        scopes.pop();
+        writeln(output, indent, "}");
+    }
+
+    if let Some(finally) = &statement.finally {
+        writeln(output, indent, "finally");
+        emit_block(&finally.body, output, indent, scopes);
     }
 }
 
@@ -3811,6 +4023,7 @@ fn php_mixed_type_tag(ty: &ResolvedType) -> String {
         ResolvedType::String => "string".to_string(),
         ResolvedType::Bool => "bool".to_string(),
         ResolvedType::Null => "null".to_string(),
+        ResolvedType::Error => "error".to_string(),
         ResolvedType::Enum(ty) => format!("enum:{}", ty.name),
         ResolvedType::Class(ty) => format!("class:{}", ty.name),
         ResolvedType::Nullable(inner) => php_mixed_type_tag(inner),
@@ -3999,6 +4212,7 @@ fn php_type(ty: &TypeRef) -> String {
     } else {
         match ty.name.as_str() {
             "List" | "Dictionary" | "Set" | "[]" => "array".to_string(),
+            "Error" => "__DoriaErrorValue".to_string(),
             name => name.to_string(),
         }
     };

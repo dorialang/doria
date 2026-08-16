@@ -3,11 +3,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::backend::BackendError;
-use crate::class_layout::{compute_class_layout, ClassId, FieldType};
+use crate::class_layout::{append_hidden_pointer, compute_class_layout, ClassId, FieldType};
 use crate::mir;
 use crate::numeric::{FloatType, IntegerType};
 
 pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
+    validate_error_metadata(program)?;
     for (index, definition) in program.enums.iter().enumerate() {
         if definition.id != crate::enums::EnumId(index) {
             return Err(malformed_mir(format!(
@@ -222,6 +223,84 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     Ok(())
 }
 
+fn validate_error_metadata(program: &mir::Program) -> Result<(), BackendError> {
+    for (index, descriptor) in program.error_descriptors.iter().enumerate() {
+        if descriptor.id != mir::ErrorDescriptorId(index) {
+            return Err(malformed_mir(format!(
+                "Error descriptor table slot {index} contains descriptor#{}",
+                descriptor.id.0
+            )));
+        }
+        let class = class_in(program, descriptor.class)?;
+        if class.error_descriptor != Some(descriptor.id) {
+            return Err(malformed_mir(format!(
+                "Error descriptor#{} is not bound to class#{}",
+                descriptor.id.0, descriptor.class.0
+            )));
+        }
+        if class.error_origin_offset.is_none() {
+            return Err(malformed_mir(format!(
+                "Error class#{} has no hidden origin slot",
+                descriptor.class.0
+            )));
+        }
+        let message = property_in(program, descriptor.class, descriptor.message_property)?;
+        if message.name != "message" || message.ty != mir::Type::String {
+            return Err(malformed_mir(format!(
+                "Error descriptor#{} has an invalid message projection",
+                descriptor.id.0
+            )));
+        }
+        if descriptor.type_name != class.name {
+            return Err(malformed_mir(format!(
+                "Error descriptor#{} type name does not match class#{}",
+                descriptor.id.0, descriptor.class.0
+            )));
+        }
+    }
+    for class in &program.classes {
+        match (class.error_descriptor, class.error_origin_offset) {
+            (Some(descriptor), Some(_)) => {
+                let found = program
+                    .error_descriptors
+                    .get(descriptor.0)
+                    .filter(|entry| entry.id == descriptor && entry.class == class.id);
+                if found.is_none() {
+                    return Err(malformed_mir(format!(
+                        "class#{} names an unknown Error descriptor",
+                        class.id.0
+                    )));
+                }
+            }
+            (None, None) => {}
+            _ => {
+                return Err(malformed_mir(format!(
+                    "class#{} has incomplete Error metadata",
+                    class.id.0
+                )));
+            }
+        }
+    }
+    for (index, origin) in program.error_origins.iter().enumerate() {
+        if origin.id != mir::ErrorOriginId(index) {
+            return Err(malformed_mir(format!(
+                "Error origin table slot {index} contains origin#{}",
+                origin.id.0
+            )));
+        }
+        let function = function_in(program, origin.function)?;
+        if origin.span.start < function.source_span.start
+            || origin.span.end > function.source_span.end
+        {
+            return Err(malformed_mir(format!(
+                "Error origin#{} is outside function{}",
+                origin.id.0, origin.function.0
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn static_value_matches(
     program: &mir::Program,
     value: &mir::StaticValue,
@@ -355,7 +434,7 @@ fn validate_class(
     }
 
     let pointer_size = std::mem::size_of::<usize>() as u32;
-    let expected_layout = compute_class_layout(
+    let mut expected_layout = compute_class_layout(
         class.id,
         class
             .properties
@@ -363,6 +442,15 @@ fn validate_class(
             .map(|property| (property.id, field_type(program, property.ty))),
         pointer_size,
     );
+    let expected_origin_offset = class
+        .error_descriptor
+        .map(|_| append_hidden_pointer(&mut expected_layout, pointer_size));
+    if class.error_origin_offset != expected_origin_offset {
+        return Err(malformed_mir(format!(
+            "class#{} has an invalid hidden Error-origin slot",
+            class.id.0
+        )));
+    }
     if class.layout != expected_layout {
         return Err(malformed_mir(format!(
             "class#{} layout does not match its property table",
@@ -439,6 +527,8 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         }
         mir::Type::NullableString => FieldType::NullableString,
         mir::Type::NullableMixed => FieldType::NullableMixed,
+        mir::Type::Error => FieldType::Error,
+        mir::Type::NullableError => FieldType::NullableError,
         mir::Type::Class(class) => FieldType::Class(class),
         mir::Type::NullableClass(class) => FieldType::NullableClass(class),
         mir::Type::SharedReference(class) => FieldType::SharedReference(class),
@@ -849,6 +939,33 @@ fn validate_statement(
                     "nullable-string local local{} receives another rvalue type",
                     target.0
                 ))),
+                (mir::Type::Error, mir::Rvalue::Error(expression)) => {
+                    validate_error_expression(program, function, expression)?;
+                    validate_error_assignment_ownership(
+                        local,
+                        error_expression_is_borrowed(expression),
+                    )
+                }
+                (mir::Type::Error, _) => Err(malformed_mir(format!(
+                    "Error local local{} receives a mismatched rvalue",
+                    target.0
+                ))),
+                (mir::Type::NullableError, mir::Rvalue::NullableError(expression)) => {
+                    validate_nullable_error_expression(program, function, expression)?;
+                    let borrowed = nullable_error_expression_is_borrowed(expression);
+                    if matches!(expression, mir::NullableErrorExpression::Null) {
+                        Ok(())
+                    } else {
+                        validate_error_assignment_ownership(local, borrowed)
+                    }
+                }
+                (mir::Type::NullableError, _) => Err(malformed_mir(format!(
+                    "nullable Error local local{} receives a mismatched rvalue",
+                    target.0
+                ))),
+                (_, mir::Rvalue::Error(_) | mir::Rvalue::NullableError(_)) => Err(malformed_mir(
+                    format!("non-Error local local{} receives an Error rvalue", target.0),
+                )),
                 (mir::Type::Mixed, mir::Rvalue::Mixed(expression)) => {
                     validate_mixed_expression(program, function, expression)?;
                     let borrowed = is_borrowed_mixed_expression(expression);
@@ -1509,6 +1626,51 @@ fn validate_statement(
             }
             Ok(())
         }
+        mir::Statement::EnsureErrorOrigin { error, origin } => {
+            let error = local_in(function, *error)?;
+            if error.ty != mir::Type::Error || !error.owned {
+                return Err(malformed_mir(
+                    "Error origin assignment requires an owned Error carrier",
+                ));
+            }
+            program
+                .error_origins
+                .get(origin.0)
+                .filter(|entry| entry.id == *origin)
+                .ok_or_else(|| {
+                    malformed_mir(format!("Error origin#{} does not exist", origin.0))
+                })?;
+            Ok(())
+        }
+        mir::Statement::ExtractErrorObject {
+            target,
+            error,
+            descriptor,
+        } => {
+            let target = local_in(function, *target)?;
+            let error = local_in(function, *error)?;
+            let descriptor = error_descriptor_in(program, *descriptor)?;
+            if target.ty != mir::Type::Class(descriptor.class) || !target.owned {
+                return Err(malformed_mir(
+                    "exact catch target does not own the descriptor's concrete class",
+                ));
+            }
+            if error.ty != mir::Type::Error || !error.owned {
+                return Err(malformed_mir(
+                    "exact catch extraction requires an owned Error carrier",
+                ));
+            }
+            Ok(())
+        }
+        mir::Statement::DropError { local } => {
+            let local = local_in(function, *local)?;
+            if !matches!(local.ty, mir::Type::Error | mir::Type::NullableError) || !local.owned {
+                return Err(malformed_mir(
+                    "Error drop must reference an owned Error carrier",
+                ));
+            }
+            Ok(())
+        }
         mir::Statement::CollectionAdd {
             collection,
             value,
@@ -1784,10 +1946,13 @@ fn validate_statement(
                         mir::StructuredExitKind::FunctionReturn { value: Some(value) } => {
                             local_in(function, value)?;
                         }
-                        mir::StructuredExitKind::CheckedError => {
-                            return Err(malformed_mir(
-                                "Stage 29 checked-error finalizer routing is not executable yet",
-                            ));
+                        mir::StructuredExitKind::CheckedError { error } => {
+                            let error = local_in(function, error)?;
+                            if error.ty != mir::Type::Error || !error.owned {
+                                return Err(malformed_mir(
+                                    "checked-error finalizer exit does not own an Error carrier",
+                                ));
+                            }
                         }
                         mir::StructuredExitKind::Normal
                         | mir::StructuredExitKind::FunctionReturn { value: None }
@@ -1803,6 +1968,10 @@ fn validate_statement(
 
 fn grouped_move_rvalue_is_null(ty: mir::Type, value: &mir::Rvalue) -> bool {
     match (ty, value) {
+        (
+            mir::Type::NullableError,
+            mir::Rvalue::NullableError(mir::NullableErrorExpression::Null),
+        ) => true,
         (mir::Type::NullableMixed, mir::Rvalue::NullableMixed(value)) => {
             matches!(value, mir::NullableMixedExpression::Null)
         }
@@ -1971,6 +2140,148 @@ fn validate_terminator(
             block_in(function, *then_block)?;
             block_in(function, *else_block)?;
             validate_condition(program, function, condition)
+        }
+        mir::Terminator::CheckedCall {
+            function: callee,
+            args,
+            result,
+            error,
+            success,
+            failure,
+            ..
+        } => {
+            let callee = function_in(program, *callee)?;
+            validate_checked_call_args(program, function, callee, args)?;
+            match (callee.return_type, result) {
+                (mir::ReturnType::Void, None) => {}
+                (mir::ReturnType::Value(expected), Some(result)) => {
+                    let result = local_in(function, *result)?;
+                    if result.ty != expected || !result.synthetic {
+                        return Err(malformed_mir(
+                            "checked call has an incompatible success slot",
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(malformed_mir(
+                        "checked call has the wrong success-slot shape",
+                    ));
+                }
+            }
+            let error = local_in(function, *error)?;
+            if error.ty != mir::Type::Error || !error.owned || !error.synthetic {
+                return Err(malformed_mir("checked call has an incompatible Error slot"));
+            }
+            block_in(function, *success)?;
+            block_in(function, *failure)?;
+            if success == failure {
+                return Err(malformed_mir(
+                    "checked call success and error edges are identical",
+                ));
+            }
+            Ok(())
+        }
+        mir::Terminator::CheckedConstruct {
+            class,
+            properties,
+            constructor,
+            args,
+            result,
+            error,
+            success,
+            failure,
+            ..
+        } => {
+            let class_definition = class_in(program, *class)?;
+            if class_definition.constructor != Some(*constructor) {
+                return Err(malformed_mir(
+                    "checked construction names the wrong class constructor",
+                ));
+            }
+            let constructor_definition = function_in(program, *constructor)?;
+            if constructor_definition.checked_effects.is_empty() {
+                return Err(malformed_mir(
+                    "checked construction targets a nonthrowing constructor",
+                ));
+            }
+            let result_definition = local_in(function, *result)?;
+            if result_definition.ty != mir::Type::Class(*class)
+                || !result_definition.owned
+                || !result_definition.synthetic
+            {
+                return Err(malformed_mir(
+                    "checked construction has an incompatible success slot",
+                ));
+            }
+            let error_definition = local_in(function, *error)?;
+            if error_definition.ty != mir::Type::Error
+                || !error_definition.owned
+                || !error_definition.synthetic
+            {
+                return Err(malformed_mir(
+                    "checked construction has an incompatible Error slot",
+                ));
+            }
+            validate_class_expression(
+                program,
+                function,
+                &mir::ClassExpression::New {
+                    class: *class,
+                    properties: properties.clone(),
+                    constructor: Some(*constructor),
+                    args: args.clone(),
+                },
+            )?;
+            block_in(function, *success)?;
+            block_in(function, *failure)?;
+            if success == failure {
+                return Err(malformed_mir(
+                    "checked construction success and error edges are identical",
+                ));
+            }
+            Ok(())
+        }
+        mir::Terminator::ErrorSwitch {
+            error,
+            cases,
+            catch_all,
+            fallback,
+        } => {
+            let error = local_in(function, *error)?;
+            if error.ty != mir::Type::Error || !error.owned {
+                return Err(malformed_mir(
+                    "Error dispatch does not own an Error carrier",
+                ));
+            }
+            let mut descriptors = HashSet::new();
+            for (descriptor, target) in cases {
+                error_descriptor_in(program, *descriptor)?;
+                block_in(function, *target)?;
+                if !descriptors.insert(*descriptor) {
+                    return Err(malformed_mir(
+                        "Error dispatch repeats a concrete descriptor",
+                    ));
+                }
+            }
+            if let Some(target) = catch_all {
+                block_in(function, *target)?;
+            }
+            block_in(function, *fallback)?;
+            Ok(())
+        }
+        mir::Terminator::PropagateError { error } => {
+            let error = local_in(function, *error)?;
+            if error.ty != mir::Type::Error || !error.owned {
+                return Err(malformed_mir(
+                    "checked propagation does not own an Error carrier",
+                ));
+            }
+            if function.checked_effects.is_empty() {
+                return Err(malformed_mir(
+                    "nonthrowing function propagates a checked Error",
+                ));
+            }
+            Ok(())
         }
     }
 }
@@ -2219,6 +2530,10 @@ fn validate_rvalue(
         mir::Rvalue::NullableMixed(value) => {
             validate_nullable_mixed_expression(program, function, value)
         }
+        mir::Rvalue::Error(value) => validate_error_expression(program, function, value),
+        mir::Rvalue::NullableError(value) => {
+            validate_nullable_error_expression(program, function, value)
+        }
         mir::Rvalue::Class(value) => validate_class_expression(program, function, value),
         mir::Rvalue::NullableClass(value) => {
             validate_nullable_class_expression(program, function, value)
@@ -2274,6 +2589,256 @@ fn validate_rvalue(
         &mut HashSet::new(),
     )?;
     Ok(())
+}
+
+fn validate_error_assignment_ownership(
+    local: &mir::Local,
+    borrowed: bool,
+) -> Result<(), BackendError> {
+    if local.owned == borrowed {
+        return Err(malformed_mir(format!(
+            "Error local local{} has inconsistent ownership",
+            local.id.0
+        )));
+    }
+    Ok(())
+}
+
+fn error_expression_is_borrowed(expression: &mir::ErrorExpression) -> bool {
+    match expression {
+        mir::ErrorExpression::Local { transfer, .. }
+        | mir::ErrorExpression::NullableLocalAssumeNonNull { transfer, .. }
+        | mir::ErrorExpression::Property { transfer, .. }
+        | mir::ErrorExpression::MixedPayload { transfer, .. } => !transfer,
+        mir::ErrorExpression::CollectionIndex { remove, .. } => !remove,
+        mir::ErrorExpression::Call { return_borrow, .. } => return_borrow.is_some(),
+        mir::ErrorExpression::FromClass { object, .. } => object.borrows_class_value(),
+        mir::ErrorExpression::FromNullableClass { object, .. } => object.borrows_class_value(),
+    }
+}
+
+fn nullable_error_expression_is_borrowed(expression: &mir::NullableErrorExpression) -> bool {
+    match expression {
+        mir::NullableErrorExpression::Null => true,
+        mir::NullableErrorExpression::Error(value) => error_expression_is_borrowed(value),
+        mir::NullableErrorExpression::Local { transfer, .. }
+        | mir::NullableErrorExpression::Property { transfer, .. } => !transfer,
+        mir::NullableErrorExpression::Call { return_borrow, .. } => return_borrow.is_some(),
+        mir::NullableErrorExpression::DictionaryGet { access, .. } => !matches!(
+            access,
+            mir::NullableCollectionAccess::Remove
+                | mir::NullableCollectionAccess::Pop
+                | mir::NullableCollectionAccess::PopFront
+                | mir::NullableCollectionAccess::PopBack
+        ),
+        mir::NullableErrorExpression::CollectionIndex { remove, .. } => !remove,
+    }
+}
+
+fn error_descriptor_in(
+    program: &mir::Program,
+    id: mir::ErrorDescriptorId,
+) -> Result<&mir::ErrorDescriptor, BackendError> {
+    program
+        .error_descriptors
+        .get(id.0)
+        .filter(|descriptor| descriptor.id == id)
+        .ok_or_else(|| malformed_mir(format!("Error descriptor#{} does not exist", id.0)))
+}
+
+fn validate_error_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::ErrorExpression,
+) -> Result<(), BackendError> {
+    match expression {
+        mir::ErrorExpression::Local { local, transfer } => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::Error || (*transfer && !definition.owned) {
+                return Err(malformed_mir("Error expression uses an incompatible local"));
+            }
+            Ok(())
+        }
+        mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer } => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::NullableError || (*transfer && !definition.owned) {
+                return Err(malformed_mir(
+                    "nonnull Error expression uses an incompatible nullable local",
+                ));
+            }
+            Ok(())
+        }
+        mir::ErrorExpression::FromClass { object, descriptor } => {
+            let descriptor = error_descriptor_in(program, *descriptor)?;
+            if object.class() != descriptor.class {
+                return Err(malformed_mir(
+                    "Error erasure descriptor does not match its concrete class",
+                ));
+            }
+            validate_class_expression(program, function, object)
+        }
+        mir::ErrorExpression::FromNullableClass { object, descriptor } => {
+            let descriptor = error_descriptor_in(program, *descriptor)?;
+            if object.class() != descriptor.class {
+                return Err(malformed_mir(
+                    "nullable Error erasure descriptor does not match its concrete class",
+                ));
+            }
+            validate_nullable_class_expression(program, function, object)
+        }
+        mir::ErrorExpression::Property {
+            object,
+            property,
+            transfer,
+        } => {
+            let definition = local_in(function, *object)?;
+            if *transfer && !definition.writable {
+                return Err(malformed_mir(
+                    "Error property transfer uses a readonly receiver",
+                ));
+            }
+            validate_property_operand(program, function, *object, *property, mir::Type::Error)
+        }
+        mir::ErrorExpression::Call {
+            function: callee,
+            args,
+            return_borrow,
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::Error)
+                || *return_borrow != infer_function_return_borrow(program, callee)?
+            {
+                return Err(malformed_mir("Error call has an incompatible result"));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::ErrorExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection) = local.ty else {
+                return Err(malformed_mir("Error index source is not a collection"));
+            };
+            let collection = collection_in(program, collection)?;
+            if collection.value != mir::Type::Error {
+                return Err(malformed_mir("Error collection element type mismatch"));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection,
+                index,
+                *remove,
+                *positional,
+            )
+        }
+        mir::ErrorExpression::MixedPayload { mixed, .. } => {
+            validate_mixed_payload_operand(function, *mixed, mir::MixedTag::Error, mir::Type::Error)
+        }
+    }
+}
+
+fn validate_nullable_error_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullableErrorExpression,
+) -> Result<(), BackendError> {
+    match expression {
+        mir::NullableErrorExpression::Null => Ok(()),
+        mir::NullableErrorExpression::Error(value) => {
+            validate_error_expression(program, function, value)
+        }
+        mir::NullableErrorExpression::Local { local, transfer } => {
+            let definition = local_in(function, *local)?;
+            if definition.ty != mir::Type::NullableError || (*transfer && !definition.owned) {
+                return Err(malformed_mir(
+                    "nullable Error expression uses an incompatible local",
+                ));
+            }
+            Ok(())
+        }
+        mir::NullableErrorExpression::Property {
+            object,
+            property,
+            transfer,
+        } => {
+            let definition = local_in(function, *object)?;
+            if *transfer && !definition.writable {
+                return Err(malformed_mir(
+                    "nullable Error property transfer uses a readonly receiver",
+                ));
+            }
+            validate_property_operand(
+                program,
+                function,
+                *object,
+                *property,
+                mir::Type::NullableError,
+            )
+        }
+        mir::NullableErrorExpression::Call {
+            function: callee,
+            args,
+            return_borrow,
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::NullableError)
+                || *return_borrow != infer_function_return_borrow(program, callee)?
+            {
+                return Err(malformed_mir(
+                    "nullable Error call has an incompatible result",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::NullableErrorExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+        } => validate_dictionary_get(
+            program,
+            function,
+            *collection,
+            key,
+            mir::Type::Error,
+            *access,
+        ),
+        mir::NullableErrorExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection) = local.ty else {
+                return Err(malformed_mir(
+                    "nullable Error index source is not a collection",
+                ));
+            };
+            let collection = collection_in(program, collection)?;
+            if !matches!(
+                collection.value,
+                mir::Type::Error | mir::Type::NullableError
+            ) {
+                return Err(malformed_mir(
+                    "nullable Error collection element type mismatch",
+                ));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection,
+                index,
+                *remove,
+                *positional,
+            )
+        }
+    }
 }
 
 fn validate_payload_enum_assignment_ownership(
@@ -3852,6 +4417,13 @@ fn validate_mixed_expression(
             }
             validate_class_expression(program, function, value)
         }
+        mir::MixedExpression::BoxError { value } => {
+            validate_error_expression(program, function, value)?;
+            if error_expression_is_borrowed(value) {
+                return Err(malformed_mir("mixed box borrows an Error payload"));
+            }
+            Ok(())
+        }
         mir::MixedExpression::BoxPayloadEnum { value } => {
             validate_payload_enum_expression(program, function, value)
         }
@@ -5177,6 +5749,7 @@ fn infer_mixed_expression_return_borrow(
         | mir::MixedExpression::BoxValue(_)
         | mir::MixedExpression::BoxString { .. }
         | mir::MixedExpression::BoxClass { .. }
+        | mir::MixedExpression::BoxError { .. }
         | mir::MixedExpression::BoxPayloadEnum { .. }
         | mir::MixedExpression::CollectionIndex { transfer: true, .. } => Ok(None),
     }
@@ -5745,6 +6318,10 @@ fn collect_rvalue_class_local_accesses<'a>(
         mir::Rvalue::NullableMixed(value) => {
             collect_nullable_mixed_class_local_accesses(value, accesses)
         }
+        mir::Rvalue::Error(value) => collect_error_class_local_accesses(value, accesses),
+        mir::Rvalue::NullableError(value) => {
+            collect_nullable_error_class_local_accesses(value, accesses)
+        }
         mir::Rvalue::Class(value) => collect_class_expression_local_accesses(value, accesses),
         mir::Rvalue::NullableClass(value) => collect_nullable_class_local_accesses(value, accesses),
         mir::Rvalue::Collection(value) => collect_collection_class_local_accesses(value, accesses),
@@ -6253,6 +6830,9 @@ fn collect_mixed_class_local_accesses<'a>(
         mir::MixedExpression::BoxClass { value, .. } => {
             collect_class_expression_local_accesses(value, accesses)
         }
+        mir::MixedExpression::BoxError { value } => {
+            collect_error_class_local_accesses(value, accesses)
+        }
         mir::MixedExpression::BoxPayloadEnum { value } => {
             collect_payload_enum_class_local_accesses(value, accesses)
         }
@@ -6265,6 +6845,64 @@ fn collect_mixed_class_local_accesses<'a>(
             collect_rvalue_class_local_accesses(index, accesses)
         }
         mir::MixedExpression::Local { .. } | mir::MixedExpression::Property { .. } => {}
+    }
+}
+
+fn collect_error_class_local_accesses<'a>(
+    value: &'a mir::ErrorExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::ErrorExpression::FromClass { object, .. } => {
+            collect_class_expression_local_accesses(object, accesses)
+        }
+        mir::ErrorExpression::FromNullableClass { object, .. } => {
+            collect_nullable_class_local_accesses(object, accesses)
+        }
+        mir::ErrorExpression::Property {
+            object, property, ..
+        } => accesses.borrow_property(*object, *property),
+        mir::ErrorExpression::Call { function, args, .. } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::ErrorExpression::CollectionIndex { index, .. } => {
+            collect_rvalue_class_local_accesses(index, accesses)
+        }
+        mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer } => {
+            accesses.assume_nullable_present(*local);
+            if *transfer {
+                accesses.transfer(*local);
+            } else {
+                accesses.borrow(*local);
+            }
+        }
+        mir::ErrorExpression::Local { .. } | mir::ErrorExpression::MixedPayload { .. } => {}
+    }
+}
+
+fn collect_nullable_error_class_local_accesses<'a>(
+    value: &'a mir::NullableErrorExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::NullableErrorExpression::Error(value) => {
+            collect_error_class_local_accesses(value, accesses)
+        }
+        mir::NullableErrorExpression::Property {
+            object, property, ..
+        } => accesses.borrow_property(*object, *property),
+        mir::NullableErrorExpression::Call { function, args, .. } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::NullableErrorExpression::DictionaryGet { key, .. }
+        | mir::NullableErrorExpression::CollectionIndex { index: key, .. } => {
+            collect_rvalue_class_local_accesses(key, accesses)
+        }
+        mir::NullableErrorExpression::Null | mir::NullableErrorExpression::Local { .. } => {}
     }
 }
 
@@ -6471,6 +7109,9 @@ fn collect_string_class_local_accesses<'a>(
         mir::StringExpression::Property { object, property } => {
             accesses.borrow_property(*object, *property)
         }
+        mir::StringExpression::ErrorMessage(error) => {
+            collect_error_class_local_accesses(error, accesses)
+        }
     }
 }
 
@@ -6651,6 +7292,9 @@ fn collect_bool_class_local_accesses<'a>(
         }
         mir::BoolExpression::NullableScalarIsPresent(value) => {
             collect_nullable_scalar_class_local_accesses(value, accesses);
+        }
+        mir::BoolExpression::NullableErrorIsPresent(value) => {
+            collect_nullable_error_class_local_accesses(value, accesses);
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
             collect_nullable_class_local_accesses(value, accesses);
@@ -6916,6 +7560,9 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         | mir::Statement::DropClass { .. }
         | mir::Statement::DropString { .. }
         | mir::Statement::DropMixed { .. }
+        | mir::Statement::EnsureErrorOrigin { .. }
+        | mir::Statement::ExtractErrorObject { .. }
+        | mir::Statement::DropError { .. }
         | mir::Statement::DropCollection { .. }
         | mir::Statement::DropPayloadEnum { .. }
         | mir::Statement::DropSharedReference { .. }
@@ -6940,7 +7587,31 @@ fn collect_terminator_class_local_accesses(terminator: &mir::Terminator) -> Clas
         mir::Terminator::Branch { condition, .. } => {
             collect_bool_class_local_accesses(condition, &mut accesses);
         }
-        mir::Terminator::ReturnVoid | mir::Terminator::Unreachable | mir::Terminator::Jump(_) => {}
+        mir::Terminator::CheckedCall { function, args, .. } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, &mut accesses);
+            accesses.call(*function, args);
+        }
+        mir::Terminator::CheckedConstruct {
+            properties,
+            constructor,
+            args,
+            ..
+        } => {
+            for property in properties {
+                if let mir::PropertyValueSource::Expression(value) = &property.source {
+                    collect_rvalue_class_local_accesses(value, &mut accesses);
+                }
+            }
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, &mut accesses);
+            accesses.constructor_call(*constructor, args);
+        }
+        mir::Terminator::ReturnVoid
+        | mir::Terminator::Unreachable
+        | mir::Terminator::Jump(_)
+        | mir::Terminator::ErrorSwitch { .. }
+        | mir::Terminator::PropagateError { .. } => {}
     }
     accesses
 }
@@ -7106,10 +7777,40 @@ fn validate_nullable_presence(
                     }
                 }
             }
+            mir::Terminator::CheckedCall {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedConstruct {
+                success, failure, ..
+            } => {
+                for target in [*success, *failure] {
+                    if merge_definitely_present(&mut entries[target.0], &present) {
+                        pending.push_back(target);
+                    }
+                }
+            }
+            mir::Terminator::ErrorSwitch {
+                cases,
+                catch_all,
+                fallback,
+                ..
+            } => {
+                let targets = cases
+                    .iter()
+                    .map(|(_, target)| *target)
+                    .chain(catch_all.iter().copied())
+                    .chain(std::iter::once(*fallback));
+                for target in targets {
+                    if merge_definitely_present(&mut entries[target.0], &present) {
+                        pending.push_back(target);
+                    }
+                }
+            }
             mir::Terminator::Return(_)
             | mir::Terminator::ReturnVoid
             | mir::Terminator::Panic { .. }
-            | mir::Terminator::Unreachable => {}
+            | mir::Terminator::Unreachable
+            | mir::Terminator::PropagateError { .. } => {}
         }
     }
 
@@ -7176,10 +7877,40 @@ fn validate_mixed_tag_proofs(
                     }
                 }
             }
+            mir::Terminator::CheckedCall {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedConstruct {
+                success, failure, ..
+            } => {
+                for target in [*success, *failure] {
+                    if merge_definite_mixed_tags(&mut entries[target.0], &tags) {
+                        pending.push_back(target);
+                    }
+                }
+            }
+            mir::Terminator::ErrorSwitch {
+                cases,
+                catch_all,
+                fallback,
+                ..
+            } => {
+                let targets = cases
+                    .iter()
+                    .map(|(_, target)| *target)
+                    .chain(catch_all.iter().copied())
+                    .chain(std::iter::once(*fallback));
+                for target in targets {
+                    if merge_definite_mixed_tags(&mut entries[target.0], &tags) {
+                        pending.push_back(target);
+                    }
+                }
+            }
             mir::Terminator::Return(_)
             | mir::Terminator::ReturnVoid
             | mir::Terminator::Panic { .. }
-            | mir::Terminator::Unreachable => {}
+            | mir::Terminator::Unreachable
+            | mir::Terminator::PropagateError { .. } => {}
         }
     }
 
@@ -7246,10 +7977,40 @@ fn validate_payload_case_proofs(
                     }
                 }
             }
+            mir::Terminator::CheckedCall {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedConstruct {
+                success, failure, ..
+            } => {
+                for target in [*success, *failure] {
+                    if merge_definite_payload_cases(&mut entries[target.0], &cases) {
+                        pending.push_back(target);
+                    }
+                }
+            }
+            mir::Terminator::ErrorSwitch {
+                cases: dispatch_cases,
+                catch_all,
+                fallback,
+                ..
+            } => {
+                let targets = dispatch_cases
+                    .iter()
+                    .map(|(_, target)| *target)
+                    .chain(catch_all.iter().copied())
+                    .chain(std::iter::once(*fallback));
+                for target in targets {
+                    if merge_definite_payload_cases(&mut entries[target.0], &cases) {
+                        pending.push_back(target);
+                    }
+                }
+            }
             mir::Terminator::Return(_)
             | mir::Terminator::ReturnVoid
             | mir::Terminator::Panic { .. }
-            | mir::Terminator::Unreachable => {}
+            | mir::Terminator::Unreachable
+            | mir::Terminator::PropagateError { .. } => {}
         }
     }
 
@@ -7568,10 +8329,21 @@ fn validate_finalizer_plan(
                     "same-loop continue incorrectly routes through its loop finalizer",
                 ));
             }
-            mir::StructuredExitKind::CheckedError => {
-                return Err(malformed_mir(
-                    "Stage 29 checked-error finalizer routing is not executable yet",
-                ));
+            mir::StructuredExitKind::CheckedError { error } => {
+                let error_id = error;
+                let error = local_in(function, error_id)?;
+                if error.ty != mir::Type::Error || !error.owned {
+                    return Err(malformed_mir(
+                        "checked-error finalizer exit does not own an Error carrier",
+                    ));
+                }
+                if !source.statements.iter().any(|statement| {
+                    matches!(statement, mir::Statement::AssignLocal { target, .. } if *target == error_id)
+                }) {
+                    return Err(malformed_mir(
+                        "checked-error exit enters a finalizer before acquiring its carrier",
+                    ));
+                }
             }
             mir::StructuredExitKind::Normal
             | mir::StructuredExitKind::FunctionReturn { value: None }
@@ -7839,6 +8611,29 @@ fn validate_result_path(
                 pending.push_back((*then_block, assignments));
                 pending.push_back((*else_block, assignments));
             }
+            mir::Terminator::CheckedCall {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedConstruct {
+                success, failure, ..
+            } => {
+                pending.push_back((*success, assignments));
+                pending.push_back((*failure, assignments));
+            }
+            mir::Terminator::ErrorSwitch {
+                cases,
+                catch_all,
+                fallback,
+                ..
+            } => {
+                for (_, target) in cases {
+                    pending.push_back((*target, assignments));
+                }
+                if let Some(target) = catch_all {
+                    pending.push_back((*target, assignments));
+                }
+                pending.push_back((*fallback, assignments));
+            }
             mir::Terminator::Panic { .. } => {
                 reached_fatal_panic = true;
             }
@@ -7847,7 +8642,7 @@ fn validate_result_path(
                     "{path_name} terminates before assigning and merging its result"
                 )));
             }
-            mir::Terminator::Unreachable => {}
+            mir::Terminator::Unreachable | mir::Terminator::PropagateError { .. } => {}
         }
     }
     if !reached_merge && !reached_fatal_panic {
@@ -8271,6 +9066,11 @@ fn apply_nullable_presence_condition(
     match condition {
         mir::BoolExpression::NullableScalarIsPresent(value) => {
             if let mir::NullableScalarExpression::Local { local, .. } = value.as_ref() {
+                set_nullable_presence(*local, when_true, present);
+            }
+        }
+        mir::BoolExpression::NullableErrorIsPresent(value) => {
+            if let mir::NullableErrorExpression::Local { local, .. } = value.as_ref() {
                 set_nullable_presence(*local, when_true, present);
             }
         }
@@ -9007,10 +9807,28 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
             else_block,
             ..
         } => vec![*then_block, *else_block],
+        mir::Terminator::CheckedCall {
+            success, failure, ..
+        }
+        | mir::Terminator::CheckedConstruct {
+            success, failure, ..
+        } => vec![*success, *failure],
+        mir::Terminator::ErrorSwitch {
+            cases,
+            catch_all,
+            fallback,
+            ..
+        } => cases
+            .iter()
+            .map(|(_, target)| *target)
+            .chain(catch_all.iter().copied())
+            .chain(std::iter::once(*fallback))
+            .collect(),
         mir::Terminator::Return(_)
         | mir::Terminator::ReturnVoid
         | mir::Terminator::Panic { .. }
-        | mir::Terminator::Unreachable => Vec::new(),
+        | mir::Terminator::Unreachable
+        | mir::Terminator::PropagateError { .. } => Vec::new(),
     }
 }
 
@@ -9079,6 +9897,9 @@ fn statement_observes_property(
         | mir::Statement::DropClass { .. }
         | mir::Statement::DropString { .. }
         | mir::Statement::DropMixed { .. }
+        | mir::Statement::EnsureErrorOrigin { .. }
+        | mir::Statement::ExtractErrorObject { .. }
+        | mir::Statement::DropError { .. }
         | mir::Statement::CollectionClear { .. }
         | mir::Statement::DropCollection { .. }
         | mir::Statement::DropPayloadEnum { .. }
@@ -9141,9 +9962,26 @@ fn terminator_observes_property(
         mir::Terminator::Branch { condition, .. } => {
             bool_observes_property(condition, receiver, property)
         }
+        mir::Terminator::CheckedCall { args, .. } => args
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::Terminator::CheckedConstruct {
+            properties, args, ..
+        } => {
+            properties.iter().any(|property_value| {
+                matches!(
+                    &property_value.source,
+                    mir::PropertyValueSource::Expression(value)
+                        if rvalue_observes_property(value, receiver, property)
+                )
+            }) || args
+                .iter()
+                .any(|value| rvalue_observes_property(value, receiver, property))
+        }
         mir::Terminator::ReturnVoid | mir::Terminator::Unreachable | mir::Terminator::Jump(_) => {
             false
         }
+        mir::Terminator::ErrorSwitch { .. } | mir::Terminator::PropagateError { .. } => false,
     }
 }
 
@@ -9164,6 +10002,10 @@ fn rvalue_observes_property(
         }
         mir::Rvalue::NullableMixed(value) => {
             nullable_mixed_observes_property(value, receiver, property)
+        }
+        mir::Rvalue::Error(value) => error_observes_property(value, receiver, property),
+        mir::Rvalue::NullableError(value) => {
+            nullable_error_observes_property(value, receiver, property)
         }
         mir::Rvalue::Class(value) => class_observes_property(value, receiver, property),
         mir::Rvalue::NullableClass(value) => {
@@ -9720,6 +10562,9 @@ fn mixed_observes_property(
         mir::MixedExpression::BoxClass { value, .. } => {
             class_observes_property(value, receiver, property)
         }
+        mir::MixedExpression::BoxError { value } => {
+            error_observes_property(value, receiver, property)
+        }
         mir::MixedExpression::BoxPayloadEnum { value } => {
             payload_enum_observes_property(value, receiver, property)
         }
@@ -9730,6 +10575,60 @@ fn mixed_observes_property(
             rvalue_observes_property(index, receiver, property)
         }
         mir::MixedExpression::Local { .. } | mir::MixedExpression::Property { .. } => false,
+    }
+}
+
+fn error_observes_property(
+    value: &mir::ErrorExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::ErrorExpression::FromClass { object, .. } => {
+            class_observes_property(object, receiver, property)
+        }
+        mir::ErrorExpression::FromNullableClass { object, .. } => {
+            nullable_class_observes_property(object, receiver, property)
+        }
+        mir::ErrorExpression::Property {
+            object,
+            property: observed,
+            ..
+        } => *object == receiver && *observed == property,
+        mir::ErrorExpression::Call { args, .. } => args
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::ErrorExpression::CollectionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
+        mir::ErrorExpression::Local { .. }
+        | mir::ErrorExpression::NullableLocalAssumeNonNull { .. }
+        | mir::ErrorExpression::MixedPayload { .. } => false,
+    }
+}
+
+fn nullable_error_observes_property(
+    value: &mir::NullableErrorExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::NullableErrorExpression::Error(value) => {
+            error_observes_property(value, receiver, property)
+        }
+        mir::NullableErrorExpression::Property {
+            object,
+            property: observed,
+            ..
+        } => *object == receiver && *observed == property,
+        mir::NullableErrorExpression::Call { args, .. } => args
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::NullableErrorExpression::DictionaryGet { key, .. }
+        | mir::NullableErrorExpression::CollectionIndex { index: key, .. } => {
+            rvalue_observes_property(key, receiver, property)
+        }
+        mir::NullableErrorExpression::Null | mir::NullableErrorExpression::Local { .. } => false,
     }
 }
 
@@ -9874,6 +10773,9 @@ fn string_observes_property(
         mir::StringExpression::EnumBacking { value, .. } => {
             enum_observes_property(value, receiver, property)
         }
+        mir::StringExpression::ErrorMessage(error) => {
+            error_observes_property(error, receiver, property)
+        }
         mir::StringExpression::Literal(_)
         | mir::StringExpression::Local(_)
         | mir::StringExpression::Static(_)
@@ -9997,6 +10899,9 @@ fn bool_observes_property(
         }
         mir::BoolExpression::NullableScalarIsPresent(value) => {
             nullable_scalar_observes_property(value, receiver, property)
+        }
+        mir::BoolExpression::NullableErrorIsPresent(value) => {
+            nullable_error_observes_property(value, receiver, property)
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
             nullable_class_observes_property(value, receiver, property)
@@ -10224,6 +11129,36 @@ fn validate_float_expression(
 }
 
 fn validate_call_args(
+    program: &mir::Program,
+    caller: &mir::Function,
+    callee: &mir::Function,
+    args: &[mir::Rvalue],
+) -> Result<(), BackendError> {
+    if !callee.checked_effects.is_empty() {
+        return Err(malformed_mir(format!(
+            "ordinary call targets throwing function {}",
+            callee.name
+        )));
+    }
+    validate_call_args_shape(program, caller, callee, args)
+}
+
+fn validate_checked_call_args(
+    program: &mir::Program,
+    caller: &mir::Function,
+    callee: &mir::Function,
+    args: &[mir::Rvalue],
+) -> Result<(), BackendError> {
+    if callee.checked_effects.is_empty() {
+        return Err(malformed_mir(format!(
+            "checked call targets nonthrowing function {}",
+            callee.name
+        )));
+    }
+    validate_call_args_shape(program, caller, callee, args)
+}
+
+fn validate_call_args_shape(
     program: &mir::Program,
     caller: &mir::Function,
     callee: &mir::Function,
@@ -10804,6 +11739,9 @@ fn validate_condition(
         mir::BoolExpression::NullableMixedIsPresent(value) => {
             validate_nullable_mixed_expression(program, function, value)
         }
+        mir::BoolExpression::NullableErrorIsPresent(value) => {
+            validate_nullable_error_expression(program, function, value)
+        }
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             validate_nullable_payload_enum_expression(program, function, value)
         }
@@ -11316,6 +12254,9 @@ fn validate_string_expression(
         mir::StringExpression::Property { object, property } => {
             validate_property_operand(program, function, *object, *property, mir::Type::String)
         }
+        mir::StringExpression::ErrorMessage(error) => {
+            validate_error_expression(program, function, error)
+        }
         mir::StringExpression::CollectionIndex {
             positional,
             collection,
@@ -11791,6 +12732,7 @@ fn validate_null_safe_call(
         mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
         mir::Type::String => mir::Type::NullableString,
         mir::Type::Mixed => mir::Type::NullableMixed,
+        mir::Type::Error => mir::Type::NullableError,
         mir::Type::Class(class) => mir::Type::NullableClass(class),
         mir::Type::SharedReference(class) => mir::Type::NullableSharedReference(class),
         mir::Type::WeakReference(class) => mir::Type::NullableWeakReference(class),
@@ -11813,6 +12755,7 @@ fn validate_null_safe_call(
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
+        | mir::Type::NullableError
         | mir::Type::NullableClass(_)
         | mir::Type::NullableCollection(_)
         | mir::Type::NullablePayloadEnum(_)

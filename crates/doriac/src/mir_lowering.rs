@@ -1,6 +1,8 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::class_layout::{compute_class_layout, ClassId, FieldType, PropertyId};
+use crate::class_layout::{
+    append_hidden_pointer, compute_class_layout, ClassId, FieldType, PropertyId,
+};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
@@ -105,6 +107,7 @@ struct FunctionSignature {
     parameter_owns: Vec<bool>,
     method_class: Option<ClassId>,
     receiver_mode: Option<mir::ReceiverMode>,
+    checked_effects: Vec<mir::CheckedEffect>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -656,6 +659,50 @@ fn lower_program_impl(
             })
             .collect(),
     };
+    let error_descriptors = program
+        .semantic_info
+        .classes
+        .iter()
+        .filter(|class| class.implements(crate::symbols::BuiltinInterface::Error))
+        .enumerate()
+        .map(|(index, class)| mir::ErrorDescriptor {
+            id: mir::ErrorDescriptorId(index),
+            class: class.id,
+            type_name: class.name.clone(),
+            message_property: class
+                .properties
+                .iter()
+                .find(|property| property.name == "message")
+                .expect("checked Error conformance has a message property")
+                .id,
+        })
+        .collect::<Vec<_>>();
+    let error_descriptor_ids = error_descriptors
+        .iter()
+        .map(|descriptor| (descriptor.class, descriptor.id))
+        .collect::<HashMap<_, _>>();
+    let mut origin_spans = program
+        .semantic_info
+        .throw_error_types
+        .keys()
+        .map(|(start, end)| Span::new(*start, *end))
+        .collect::<Vec<_>>();
+    origin_spans.sort_by_key(|span| (span.start, span.end));
+    origin_spans.dedup();
+    let mut error_origins = origin_spans
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, span)| mir::ErrorOrigin {
+            id: mir::ErrorOriginId(index),
+            span,
+            function: mir::FunctionId(usize::MAX),
+        })
+        .collect::<Vec<_>>();
+    let error_origin_ids = error_origins
+        .iter()
+        .map(|origin| ((origin.span.start, origin.span.end), origin.id))
+        .collect::<HashMap<_, _>>();
     let mut collection_registry = CollectionRegistry::default();
     let mut static_ids = HashMap::new();
     let mut statics = Vec::new();
@@ -886,10 +933,13 @@ fn lower_program_impl(
         let mut signature = collect_function_signature(
             function,
             mir::FunctionId(index),
-            &class_ids,
-            &program.semantic_info,
             &mut collection_registry,
-            &substitutions,
+            SignatureContext {
+                class_ids: &class_ids,
+                semantic_info: &program.semantic_info,
+                substitutions: &substitutions,
+                error_descriptor_ids: &error_descriptor_ids,
+            },
             SignatureOptions {
                 lifecycle: matches!(function.name.as_str(), "__construct" | "__destruct"),
                 is_entry: declaration.is_top_level() && function.name == "main",
@@ -958,6 +1008,8 @@ fn lower_program_impl(
             collection_registry: &collection_registry,
             enum_types: &class_ids.enum_types,
             type_substitutions: &substitutions,
+            error_descriptor_ids: &error_descriptor_ids,
+            error_origin_ids: &error_origin_ids,
         };
         functions.push(lower_function(
             declaration.function,
@@ -967,6 +1019,22 @@ fn lower_program_impl(
             declaration.receiver,
             metrics.as_deref_mut(),
         )?);
+    }
+    for origin in &mut error_origins {
+        origin.function = functions
+            .iter()
+            .filter(|function| {
+                origin.span.start >= function.source_span.start
+                    && origin.span.end <= function.source_span.end
+            })
+            .min_by_key(|function| {
+                (
+                    function.source_span.end - function.source_span.start,
+                    function.id.0,
+                )
+            })
+            .map(|function| function.id)
+            .expect("checked throw origin belongs to a lowered callable");
     }
 
     let classes = program
@@ -1005,7 +1073,7 @@ fn lower_program_impl(
                     })
                 })
                 .collect::<DiagnosticResult<Vec<_>>>()?;
-            let layout = compute_class_layout(
+            let mut layout = compute_class_layout(
                 class.id,
                 properties.iter().map(|property| {
                     (
@@ -1016,6 +1084,10 @@ fn lower_program_impl(
                 }),
                 std::mem::size_of::<usize>() as u32,
             );
+            let error_descriptor = error_descriptor_ids.get(&class.id).copied();
+            let error_origin_offset = error_descriptor.map(|_| {
+                append_hidden_pointer(&mut layout, std::mem::size_of::<usize>() as u32)
+            });
             let lifecycle = |name: &str| {
                 instances.iter().enumerate().find_map(|(index, instance)| {
                     let declaration = declarations[instance.declaration];
@@ -1032,6 +1104,8 @@ fn lower_program_impl(
                 layout,
                 constructor: lifecycle("__construct"),
                 destructor: lifecycle("__destruct"),
+                error_descriptor,
+                error_origin_offset,
             })
         })
         .collect::<DiagnosticResult<Vec<_>>>()?;
@@ -1095,6 +1169,8 @@ fn lower_program_impl(
         enums,
         collection_types: collection_registry.types,
         statics,
+        error_descriptors,
+        error_origins,
         functions,
         entry,
     })
@@ -1113,7 +1189,7 @@ fn intern_resolved_collection_types(
         ResolvedType::String => mir::Type::String,
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::Mixed => mir::Type::Mixed,
-        ResolvedType::Error => return None,
+        ResolvedType::Error => mir::Type::Error,
         ResolvedType::Enum(enum_type) => class_ids.mir_enum_type(enum_type.id),
         ResolvedType::Class(class) => mir::Type::Class(*class_ids.get(class)?),
         ResolvedType::SharedHandle(kind, payload) => match kind {
@@ -1207,6 +1283,7 @@ fn intern_resolved_collection_types(
                 mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
                 mir::Type::String => mir::Type::NullableString,
                 mir::Type::Mixed => mir::Type::NullableMixed,
+                mir::Type::Error => mir::Type::NullableError,
                 mir::Type::Class(class) => mir::Type::NullableClass(class),
                 mir::Type::SharedReference(class) => mir::Type::NullableSharedReference(class),
                 mir::Type::WeakReference(class) => mir::Type::NullableWeakReference(class),
@@ -1230,6 +1307,7 @@ fn intern_resolved_collection_types(
                 mir::Type::NullableScalar(_)
                 | mir::Type::NullableString
                 | mir::Type::NullableMixed
+                | mir::Type::NullableError
                 | mir::Type::NullableClass(_)
                 | mir::Type::NullableSharedReference(_)
                 | mir::Type::NullableWeakReference(_)
@@ -1443,12 +1521,16 @@ fn lower_static_value(
 fn collect_function_signature(
     function: &hir::FunctionDecl,
     id: mir::FunctionId,
-    class_ids: &ClassIds,
-    semantic_info: &SemanticInfo,
     collection_registry: &mut CollectionRegistry,
-    substitutions: &HashMap<String, crate::types::ResolvedType>,
+    context: SignatureContext<'_>,
     options: SignatureOptions,
 ) -> DiagnosticResult<FunctionSignature> {
+    let SignatureContext {
+        class_ids,
+        semantic_info,
+        substitutions,
+        error_descriptor_ids,
+    } = context;
     let return_type = match function.return_type.as_ref() {
         Some(ty) if scalar_type_ref(ty).is_some() => mir::ReturnType::Value(mir::Type::Scalar(
             scalar_type_ref(ty).expect("checked scalar type"),
@@ -1561,6 +1643,7 @@ fn collect_function_signature(
         let transfer_capable = matches!(
             parameter_type,
             mir::Type::Class(_)
+                | mir::Type::Error
                 | mir::Type::NullableClass(_)
                 | mir::Type::Collection(_)
                 | mir::Type::Mixed
@@ -1624,7 +1707,32 @@ fn collect_function_signature(
         parameter_owns,
         method_class: None,
         receiver_mode: None,
+        checked_effects: semantic_info
+            .callable_checked_effects
+            .get(&function.span.start)
+            .into_iter()
+            .flatten()
+            .filter_map(
+                |effect| match substitute_resolved_type(effect, substitutions) {
+                    ResolvedType::Error => Some(mir::CheckedEffect::Any),
+                    ResolvedType::Class(class) => class_ids
+                        .get(&class)
+                        .and_then(|class| error_descriptor_ids.get(class))
+                        .copied()
+                        .map(mir::CheckedEffect::Concrete),
+                    _ => None,
+                },
+            )
+            .collect(),
     })
+}
+
+#[derive(Clone, Copy)]
+struct SignatureContext<'a> {
+    class_ids: &'a ClassIds,
+    semantic_info: &'a SemanticInfo,
+    substitutions: &'a HashMap<String, crate::types::ResolvedType>,
+    error_descriptor_ids: &'a HashMap<ClassId, mir::ErrorDescriptorId>,
 }
 
 #[derive(Clone, Copy)]
@@ -1674,6 +1782,7 @@ fn resolved_type_ref_with_substitutions(
                 "Bytes" => ResolvedType::Bytes,
                 "bool" => ResolvedType::Bool,
                 "mixed" => ResolvedType::Mixed,
+                "Error" => ResolvedType::Error,
                 _ => ResolvedType::Class(ClassType::new(plain.name, Vec::new())),
             }
         }
@@ -1789,6 +1898,7 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         }
         mir::Type::String => Some(FieldType::String),
         mir::Type::Mixed => Some(FieldType::Mixed),
+        mir::Type::Error => Some(FieldType::Error),
         mir::Type::NullableScalar(mir::ScalarType::Integer(ty)) => {
             Some(FieldType::NullableInteger(ty))
         }
@@ -1799,6 +1909,7 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         }
         mir::Type::NullableString => Some(FieldType::NullableString),
         mir::Type::NullableMixed => Some(FieldType::NullableMixed),
+        mir::Type::NullableError => Some(FieldType::NullableError),
         mir::Type::Class(class) => Some(FieldType::Class(class)),
         mir::Type::NullableClass(class) => Some(FieldType::NullableClass(class)),
         mir::Type::SharedReference(class) => Some(FieldType::SharedReference(class)),
@@ -1886,6 +1997,8 @@ struct FunctionLoweringInputs<'a> {
     collection_registry: &'a CollectionRegistry,
     enum_types: &'a HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
     type_substitutions: &'a HashMap<String, crate::types::ResolvedType>,
+    error_descriptor_ids: &'a HashMap<ClassId, mir::ErrorDescriptorId>,
+    error_origin_ids: &'a HashMap<(usize, usize), mir::ErrorOriginId>,
 }
 
 fn lower_function(
@@ -1921,12 +2034,27 @@ fn lower_function(
             .collect::<Vec<_>>(),
     );
 
+    if !signature.checked_effects.is_empty() {
+        let error = context.declare_routed_error();
+        let propagation = context.create_block();
+        context.terminate_block(propagation, mir::Terminator::PropagateError { error });
+        context.push_error_target(ErrorTarget {
+            error,
+            destination: propagation,
+            finalizer_depth: 0,
+            cleanup_depth: 0,
+        });
+    }
+
     lower_function_body(
         &function.body,
         &function.name,
         signature.return_type,
         &mut context,
     )?;
+    if !signature.checked_effects.is_empty() {
+        context.pop_error_target();
+    }
     let (locals, blocks) = context.finish(metrics);
 
     Ok(mir::Function {
@@ -1946,6 +2074,7 @@ fn lower_function(
         }),
         params,
         return_type: signature.return_type,
+        checked_effects: signature.checked_effects,
         locals,
         blocks,
         entry_block: mir::BlockId(0),
@@ -2063,14 +2192,12 @@ fn lower_statement_sequence(
                 lower_loop_control(*span, LoopControl::Continue, context)?;
             }
             hir::Stmt::Throw(statement) => {
-                return Err(vec![crate::checked_error_execution_boundary(
-                    statement.span,
-                )]);
+                lower_with_statement_temporaries(context, |context| {
+                    lower_throw_statement(statement, context)
+                })?;
             }
             hir::Stmt::Try(statement) => {
-                return Err(vec![crate::checked_error_execution_boundary(
-                    statement.span,
-                )]);
+                lower_try_statement(statement, return_type, context)?;
             }
             hir::Stmt::Expr { expr, span } => {
                 lower_with_statement_temporaries(context, |context| {
@@ -2091,6 +2218,224 @@ fn lower_with_statement_temporaries(
     let result = lower(context);
     context.finish_statement_temporaries(result.is_ok());
     result
+}
+
+fn lower_throw_statement(
+    statement: &hir::ThrowStmt,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let value = match &statement.error_type {
+        ResolvedType::Error => {
+            let hir::Expr::Variable { name, .. } = &statement.expr else {
+                return Err(vec![unsupported(
+                    statement.expr.span(),
+                    "an erased Error throw must use an owned Error place",
+                )]);
+            };
+            let local = context.lookup_local(name, statement.expr.span())?;
+            if context.local_type(local) != mir::Type::Error {
+                return Err(vec![unsupported(
+                    statement.expr.span(),
+                    "checked Error throw resolved to another MIR type",
+                )]);
+            }
+            mir::Rvalue::Error(mir::ErrorExpression::Local {
+                local,
+                transfer: true,
+            })
+        }
+        ResolvedType::Class(class_type) => {
+            let class = context.class_id_for_type(class_type).ok_or_else(|| {
+                vec![unsupported(
+                    statement.expr.span(),
+                    "checked Error class has no native class identity",
+                )]
+            })?;
+            let descriptor = context
+                .error_descriptor_ids
+                .get(&class)
+                .copied()
+                .ok_or_else(|| {
+                    vec![unsupported(
+                        statement.expr.span(),
+                        "checked Error class has no native descriptor",
+                    )]
+                })?;
+            mir::Rvalue::Error(mir::ErrorExpression::FromClass {
+                object: Box::new(lower_class_expression(
+                    &statement.expr,
+                    class,
+                    true,
+                    context,
+                )?),
+                descriptor,
+            })
+        }
+        _ => {
+            return Err(vec![unsupported(
+                statement.expr.span(),
+                "checked throw has no Error MIR representation",
+            )])
+        }
+    };
+    let error = context.declare_routed_error();
+    context.push_statement(mir::Statement::AssignLocal {
+        target: error,
+        value,
+    });
+    let origin = context
+        .error_origin_ids
+        .get(&(statement.span.start, statement.span.end))
+        .copied()
+        .expect("checked throw has deterministic origin metadata");
+    context.push_statement(mir::Statement::EnsureErrorOrigin { error, origin });
+    context.route_checked_error(error);
+    Ok(())
+}
+
+fn lower_try_statement(
+    statement: &hir::TryStmt,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let outer_finalizer_depth = context.active_finalizers.len();
+    let finalizer = if statement.finally.is_some() {
+        context.push_scope();
+        Some(context.begin_finalizer_region(mir::FinalizerAttachment::Try))
+    } else {
+        None
+    };
+    let construct_scope_depth = context.local_scopes.len();
+    let handler_finalizer_depth = context.active_finalizers.len();
+
+    let protected_entry = context.current_block();
+    let dispatcher = context.create_block();
+    let continuation = context.create_block();
+    let protected_error = context.declare_routed_error();
+    context.push_error_target(ErrorTarget {
+        error: protected_error,
+        destination: dispatcher,
+        finalizer_depth: handler_finalizer_depth,
+        cleanup_depth: construct_scope_depth,
+    });
+    let protected_fallthrough =
+        lower_scoped_block(&statement.body, protected_entry, return_type, context)?;
+    context.pop_error_target();
+
+    for block in protected_fallthrough {
+        context.current_block = Some(block);
+        context.route_structured_exit(
+            RoutedExit {
+                exit: StructuredExit::Normal {
+                    destination: continuation,
+                },
+                target_finalizer_depth: outer_finalizer_depth,
+                cleanup_depth: construct_scope_depth,
+            },
+            context.local_scopes.len(),
+        );
+    }
+
+    let catch_entries = statement
+        .catches
+        .iter()
+        .map(|_| context.create_block())
+        .collect::<Vec<_>>();
+    let fallback = context.create_block();
+    let mut cases = Vec::new();
+    let mut catch_all = None;
+    for (clause, entry) in statement.catches.iter().zip(catch_entries.iter().copied()) {
+        match context.mir_resolved_type(&clause.error_type) {
+            Some(mir::Type::Error) => catch_all = Some(entry),
+            Some(mir::Type::Class(class)) => {
+                let descriptor = context
+                    .error_descriptor_ids
+                    .get(&class)
+                    .copied()
+                    .ok_or_else(|| {
+                        vec![unsupported(
+                            clause.span,
+                            "checked catch class has no runtime Error descriptor",
+                        )]
+                    })?;
+                cases.push((descriptor, entry));
+            }
+            _ => {
+                return Err(vec![unsupported(
+                    clause.span,
+                    "checked catch has no runtime Error representation",
+                )])
+            }
+        }
+    }
+    context.current_block = Some(dispatcher);
+    context.terminate_current(mir::Terminator::ErrorSwitch {
+        error: protected_error,
+        cases,
+        catch_all,
+        fallback,
+    });
+
+    for (clause, entry) in statement.catches.iter().zip(catch_entries) {
+        context.push_scope();
+        context.current_block = Some(entry);
+        let catch_ty = context
+            .mir_resolved_type(&clause.error_type)
+            .expect("checked catch type has executable MIR metadata");
+        let caught = if let Some(binding) = &clause.binding {
+            context.declare_pattern_local(&binding.name, catch_ty, true, true)
+        } else {
+            context.declare_hidden_owned_local(catch_ty)
+        };
+        match catch_ty {
+            mir::Type::Error => context.push_statement(mir::Statement::AssignLocal {
+                target: caught,
+                value: mir::Rvalue::Error(mir::ErrorExpression::Local {
+                    local: protected_error,
+                    transfer: true,
+                }),
+            }),
+            mir::Type::Class(class) => {
+                let descriptor = context.error_descriptor_ids[&class];
+                context.push_statement(mir::Statement::ExtractErrorObject {
+                    target: caught,
+                    error: protected_error,
+                    descriptor,
+                });
+            }
+            _ => unreachable!("semantic checking restricts catch types to Error values"),
+        }
+        lower_statement_sequence(&clause.body.statements, return_type, context)?;
+        let catch_fallthrough = context.current_block;
+        context.pop_scope();
+        if let Some(block) = catch_fallthrough {
+            context.current_block = Some(block);
+            context.route_structured_exit(
+                RoutedExit {
+                    exit: StructuredExit::Normal {
+                        destination: continuation,
+                    },
+                    target_finalizer_depth: outer_finalizer_depth,
+                    cleanup_depth: construct_scope_depth,
+                },
+                context.local_scopes.len(),
+            );
+        }
+    }
+
+    context.current_block = Some(fallback);
+    if statement.uncovered_effects.is_empty() {
+        context.terminate_current(mir::Terminator::Unreachable);
+    } else {
+        context.route_checked_error(protected_error);
+    }
+
+    if let (Some(region), Some(finally)) = (finalizer, statement.finally.as_ref()) {
+        finish_finalizer_region_block(region, &finally.body, return_type, context)?;
+        context.pop_scope_without_cleanup();
+    }
+    context.current_block = context.is_reachable(continuation).then_some(continuation);
+    Ok(())
 }
 
 fn lower_expression_statement(
@@ -2127,6 +2472,13 @@ fn lower_expression_statement(
         } else {
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *call_span, context)?;
+            if !signature.checked_effects.is_empty() {
+                let _ = discarded_call_statement("method", signature.clone(), args.clone(), span)?;
+                let _ = materialize_checked_signature_call(
+                    signature, args, *call_span, false, context,
+                )?;
+                return Ok(());
+            }
             discarded_call_statement("method", signature, args, span)?
         };
         context.push_statement(statement);
@@ -2141,6 +2493,13 @@ fn lower_expression_statement(
     {
         let (signature, args) =
             lower_static_method_call(class_name, method, args, *call_span, context)?;
+        if !signature.checked_effects.is_empty() {
+            let _ =
+                discarded_call_statement("static method", signature.clone(), args.clone(), span)?;
+            let _ =
+                materialize_checked_signature_call(signature, args, *call_span, false, context)?;
+            return Ok(());
+        }
         let statement = discarded_call_statement("static method", signature, args, span)?;
         context.push_statement(statement);
         return Ok(());
@@ -2207,8 +2566,22 @@ fn lower_expression_statement(
         let value = lower_string_expression(value, context)?;
         context.push_statement(mir::Statement::WriteStderr(value));
     } else {
-        let call = lower_statement_call(name, args, *call_span, context)?;
-        context.push_statement(call);
+        let signature = context.lookup_function(name, *call_span)?;
+        let lowered = lower_call_args(name, args, signature.clone(), *call_span, context)?;
+        if signature.checked_effects.is_empty() {
+            context.push_statement(discarded_call_statement(
+                "function", signature, lowered, *call_span,
+            )?);
+        } else {
+            let _ = discarded_call_statement(
+                "function",
+                signature.clone(),
+                lowered.clone(),
+                *call_span,
+            )?;
+            let _ =
+                materialize_checked_signature_call(signature, lowered, *call_span, false, context)?;
+        }
     }
     Ok(())
 }
@@ -3049,6 +3422,8 @@ fn lower_collection_foreach_in_scope(
             | mir::Type::String
             | mir::Type::NullableScalar(_)
             | mir::Type::NullableString
+            | mir::Type::Error
+            | mir::Type::NullableError
             | mir::Type::PayloadEnum(_)
             | mir::Type::NullablePayloadEnum(_) => {
                 // Write back to the slot being iterated, matching the
@@ -3164,6 +3539,19 @@ fn collection_value_rvalue(
                 collection,
                 index: Box::new(index),
                 remove: false,
+            },
+        )),
+        mir::Type::Error => Ok(mir::Rvalue::Error(mir::ErrorExpression::CollectionIndex {
+            positional,
+            collection,
+            index: Box::new(index),
+            remove: false,
+        })),
+        mir::Type::NullableError => Ok(mir::Rvalue::NullableError(
+            mir::NullableErrorExpression::DictionaryGet {
+                collection,
+                key: Box::new(offset),
+                access: mir::NullableCollectionAccess::At,
             },
         )),
         mir::Type::NullableScalar(ty) => Ok(mir::Rvalue::NullableScalar(
@@ -3623,6 +4011,10 @@ enum StructuredExit {
     Continue {
         destination: mir::BlockId,
     },
+    CheckedError {
+        error: mir::LocalId,
+        destination: mir::BlockId,
+    },
 }
 
 impl StructuredExit {
@@ -3635,6 +4027,7 @@ impl StructuredExit {
             },
             Self::Break { .. } => mir::StructuredExitKind::Break,
             Self::Continue { .. } => mir::StructuredExitKind::Continue,
+            Self::CheckedError { error, .. } => mir::StructuredExitKind::CheckedError { error },
         }
     }
 }
@@ -3661,6 +4054,14 @@ struct FinalizerRegionBuilder {
     exits: Vec<FinalizerExitBuilder>,
 }
 
+#[derive(Clone, Copy)]
+struct ErrorTarget {
+    error: mir::LocalId,
+    destination: mir::BlockId,
+    finalizer_depth: usize,
+    cleanup_depth: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CoalesceSelection {
     Left,
@@ -3678,6 +4079,8 @@ struct LoweringContext<'semantic> {
     collection_registry: CollectionRegistry,
     enum_types: HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
     type_substitutions: HashMap<String, crate::types::ResolvedType>,
+    error_descriptor_ids: HashMap<ClassId, mir::ErrorDescriptorId>,
+    error_origin_ids: HashMap<(usize, usize), mir::ErrorOriginId>,
     current_class: Option<ClassId>,
     locals: Vec<mir::Local>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
@@ -3693,6 +4096,7 @@ struct LoweringContext<'semantic> {
     finalizer_regions: Vec<FinalizerRegionBuilder>,
     active_finalizers: Vec<mir::FinalizerRegionId>,
     lexical_finalizers: Vec<mir::FinalizerRegionId>,
+    error_targets: Vec<ErrorTarget>,
     return_borrow: Option<mir::ReturnBorrow>,
 }
 
@@ -3706,6 +4110,7 @@ enum DropObligation {
     WritableWeak(mir::LocalId, mir::WritableSharedPayload),
     SharedAccess(mir::LocalId, mir::WritableSharedPayload, bool),
     Mixed(mir::LocalId),
+    Error(mir::LocalId),
     Collection(mir::LocalId, mir::CollectionTypeId),
     PayloadEnum(mir::LocalId, mir::PayloadEnumType, bool),
 }
@@ -3729,6 +4134,8 @@ fn user_local_type_owns_value(ty: mir::Type) -> bool {
             | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Mixed
             | mir::Type::NullableMixed
+            | mir::Type::Error
+            | mir::Type::NullableError
             | mir::Type::Collection(_)
             | mir::Type::NullableCollection(_)
             | mir::Type::PayloadEnum(mir::PayloadEnumType {
@@ -3771,6 +4178,7 @@ fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropOb
             DropObligation::WritableWeak(local, payload)
         }
         mir::Type::Mixed | mir::Type::NullableMixed => DropObligation::Mixed(local),
+        mir::Type::Error | mir::Type::NullableError => DropObligation::Error(local),
         mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
             DropObligation::Collection(local, collection)
         }
@@ -3792,6 +4200,8 @@ impl<'semantic> LoweringContext<'semantic> {
             collection_registry: inputs.collection_registry.clone(),
             enum_types: inputs.enum_types.clone(),
             type_substitutions: inputs.type_substitutions.clone(),
+            error_descriptor_ids: inputs.error_descriptor_ids.clone(),
+            error_origin_ids: inputs.error_origin_ids.clone(),
             current_class: None,
             locals: Vec::new(),
             local_scopes: vec![HashMap::new()],
@@ -3811,6 +4221,7 @@ impl<'semantic> LoweringContext<'semantic> {
             finalizer_regions: Vec::new(),
             active_finalizers: Vec::new(),
             lexical_finalizers: Vec::new(),
+            error_targets: Vec::new(),
             return_borrow: None,
         }
     }
@@ -3868,7 +4279,7 @@ impl<'semantic> LoweringContext<'semantic> {
                                         }
                                         mir::StructuredExitKind::Normal
                                         | mir::StructuredExitKind::WhenYield { .. }
-                                        | mir::StructuredExitKind::CheckedError => {}
+                                        | mir::StructuredExitKind::CheckedError { .. } => {}
                                     }
                                 }
                             }
@@ -4057,6 +4468,7 @@ impl<'semantic> LoweringContext<'semantic> {
                     }
                 }
                 DropObligation::Mixed(local) => mir::Statement::DropMixed { local },
+                DropObligation::Error(local) => mir::Statement::DropError { local },
                 DropObligation::Collection(local, collection) => {
                     mir::Statement::DropCollection { local, collection }
                 }
@@ -4157,12 +4569,53 @@ impl<'semantic> LoweringContext<'semantic> {
             | StructuredExit::WhenYield { destination, .. }
             | StructuredExit::Break { destination }
             | StructuredExit::Continue { destination } => mir::Terminator::Jump(destination),
+            StructuredExit::CheckedError { destination, .. } => mir::Terminator::Jump(destination),
             StructuredExit::FunctionReturn { value: None } => mir::Terminator::ReturnVoid,
             StructuredExit::FunctionReturn { value: Some(value) } => {
                 mir::Terminator::Return(local_rvalue(value.local, value.ty, value.transfer))
             }
         };
         self.terminate_current(terminator);
+    }
+
+    fn push_error_target(&mut self, target: ErrorTarget) {
+        self.error_targets.push(target);
+    }
+
+    fn pop_error_target(&mut self) -> ErrorTarget {
+        self.error_targets
+            .pop()
+            .expect("MIR lowering cannot pop an empty checked-error target stack")
+    }
+
+    fn current_error_target(&self) -> Option<ErrorTarget> {
+        self.error_targets.last().copied()
+    }
+
+    fn route_checked_error(&mut self, source: mir::LocalId) {
+        let target = self
+            .current_error_target()
+            .expect("checked source has a semantic propagation target");
+        if source != target.error {
+            self.push_statement(mir::Statement::AssignLocal {
+                target: target.error,
+                value: mir::Rvalue::Error(mir::ErrorExpression::Local {
+                    local: source,
+                    transfer: true,
+                }),
+            });
+        }
+        self.route_structured_exit(
+            RoutedExit {
+                exit: StructuredExit::CheckedError {
+                    error: target.error,
+                    destination: target.destination,
+                },
+                target_finalizer_depth: target.finalizer_depth,
+                cleanup_depth: target.cleanup_depth,
+            },
+            self.local_scopes.len(),
+        );
     }
 
     fn declare_user_local(&mut self, name: &str, writable: bool, ty: mir::Type) -> mir::LocalId {
@@ -4230,6 +4683,45 @@ impl<'semantic> LoweringContext<'semantic> {
         id
     }
 
+    fn declare_checked_call_slot(&mut self, ty: mir::Type, owned: bool) -> mir::LocalId {
+        let id = mir::LocalId(self.locals.len());
+        let name = format!("_checked{}", self.temp_counter);
+        self.temp_counter += 1;
+        self.locals.push(mir::Local {
+            id,
+            name,
+            ty,
+            writable: false,
+            owned,
+            synthetic: true,
+        });
+        id
+    }
+
+    fn declare_routed_error(&mut self) -> mir::LocalId {
+        let id = mir::LocalId(self.locals.len());
+        let name = format!("_error{}", self.temp_counter);
+        self.temp_counter += 1;
+        self.locals.push(mir::Local {
+            id,
+            name,
+            ty: mir::Type::Error,
+            writable: false,
+            owned: true,
+            synthetic: true,
+        });
+        // The structured checked-error edge owns and consumes this carrier.
+        // It is deliberately absent from lexical cleanup obligations.
+        id
+    }
+
+    fn track_statement_owned_local(&mut self, local: mir::LocalId, ty: mir::Type) {
+        self.statement_owned_locals
+            .last_mut()
+            .expect("checked call result requires an active statement scope")
+            .push(drop_obligation_for_owned_local(local, ty));
+    }
+
     fn declare_borrowed_temp(&mut self, ty: mir::Type, writable: bool) -> mir::LocalId {
         let id = mir::LocalId(self.locals.len());
         let name = format!("_borrow{}", self.temp_counter);
@@ -4276,6 +4768,25 @@ impl<'semantic> LoweringContext<'semantic> {
                 .expect("MIR lowering must have an ownership scope")
                 .push(drop_obligation_for_owned_local(id, ty));
         }
+        id
+    }
+
+    fn declare_hidden_owned_local(&mut self, ty: mir::Type) -> mir::LocalId {
+        let id = mir::LocalId(self.locals.len());
+        let name = format!("_catch{}", self.temp_counter);
+        self.temp_counter += 1;
+        self.locals.push(mir::Local {
+            id,
+            name,
+            ty,
+            writable: false,
+            owned: true,
+            synthetic: true,
+        });
+        self.scope_owned_locals
+            .last_mut()
+            .expect("a hidden catch owner requires an active scope")
+            .push(drop_obligation_for_owned_local(id, ty));
         id
     }
 
@@ -4665,6 +5176,7 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),
             ResolvedType::String => Some(mir::Type::String),
             ResolvedType::Mixed => Some(mir::Type::Mixed),
+            ResolvedType::Error => Some(mir::Type::Error),
             ResolvedType::Enum(enum_type) => {
                 Some(self.enum_types.get(&enum_type.id).copied().map_or(
                     mir::Type::Scalar(mir::ScalarType::Enum(enum_type.id)),
@@ -4794,6 +5306,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 mir::Type::Scalar(ty) => Some(mir::Type::NullableScalar(ty)),
                 mir::Type::String => Some(mir::Type::NullableString),
                 mir::Type::Mixed => Some(mir::Type::NullableMixed),
+                mir::Type::Error => Some(mir::Type::NullableError),
                 mir::Type::Class(class) => Some(mir::Type::NullableClass(class)),
                 mir::Type::SharedReference(class) => {
                     Some(mir::Type::NullableSharedReference(class))
@@ -4820,6 +5333,7 @@ impl<'semantic> LoweringContext<'semantic> {
                 already @ (mir::Type::NullableScalar(_)
                 | mir::Type::NullableString
                 | mir::Type::NullableMixed
+                | mir::Type::NullableError
                 | mir::Type::NullableClass(_)
                 | mir::Type::NullableCollection(_)
                 | mir::Type::NullableSharedReference(_)
@@ -4831,7 +5345,6 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullablePayloadEnum(_)) => Some(already),
             },
             ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
-            ResolvedType::Error => None,
         }
     }
 
@@ -4883,6 +5396,15 @@ fn finish_finalizer_region(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    finish_finalizer_region_block(region_id, &finally.block, return_type, context)
+}
+
+fn finish_finalizer_region_block(
+    region_id: mir::FinalizerRegionId,
+    finally: &hir::Block,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
     let active = context
         .active_finalizers
         .pop()
@@ -4891,7 +5413,7 @@ fn finish_finalizer_region(
 
     let body_block_start = context.blocks.len();
     let entry = context.finalizer_regions[region_id.0].entry;
-    let fallthrough = lower_scoped_block(&finally.block, entry, return_type, context)?;
+    let fallthrough = lower_scoped_block(finally, entry, return_type, context)?;
     let lexical = context
         .lexical_finalizers
         .pop()
@@ -4956,7 +5478,12 @@ fn finish_finalizer_region(
             continuation,
         });
         context.current_block = Some(continuation);
-        context.route_structured_exit(exit.route, scope_depth);
+        let mut route = exit.route;
+        // Scopes inside the completed finalizer region have already been
+        // cleaned. A route recorded from a deeper protected/catch scope may
+        // therefore name a cleanup depth that no longer exists here.
+        route.cleanup_depth = route.cleanup_depth.min(scope_depth);
+        context.route_structured_exit(route, scope_depth);
     }
 
     context.blocks[activation.0]
@@ -4986,9 +5513,27 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
             else_block,
             ..
         } => vec![*then_block, *else_block],
+        mir::Terminator::CheckedCall {
+            success, failure, ..
+        }
+        | mir::Terminator::CheckedConstruct {
+            success, failure, ..
+        } => vec![*success, *failure],
+        mir::Terminator::ErrorSwitch {
+            cases,
+            catch_all,
+            fallback,
+            ..
+        } => cases
+            .iter()
+            .map(|(_, block)| *block)
+            .chain(catch_all.iter().copied())
+            .chain(std::iter::once(*fallback))
+            .collect(),
         mir::Terminator::Return(_)
         | mir::Terminator::ReturnVoid
         | mir::Terminator::Panic { .. }
+        | mir::Terminator::PropagateError { .. }
         | mir::Terminator::Unreachable => Vec::new(),
     }
 }
@@ -5231,6 +5776,24 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         });
         return Ok(());
     }
+    if ty == mir::Type::Error {
+        let value = lower_error_expression(&decl.initializer, true, context)?;
+        let local = context.declare_user_local(name, decl.writable, ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::Error(value),
+        });
+        return Ok(());
+    }
+    if ty == mir::Type::NullableError {
+        let value = lower_nullable_error_expression(&decl.initializer, true, context)?;
+        let local = context.declare_user_local(name, decl.writable, ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableError(value),
+        });
+        return Ok(());
+    }
     if let mir::Type::PayloadEnum(enum_ty) = ty {
         let value = lower_payload_enum_expression(&decl.initializer, enum_ty, true, context)?;
         let local = context.declare_user_local_owned(
@@ -5365,6 +5928,8 @@ fn lower_grouped_var_decl(
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
         | mir::Type::Collection(_)
+        | mir::Type::Error
+        | mir::Type::NullableError
         | mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_) => {
             return Err(vec![Diagnostic::new(
@@ -5819,6 +6384,11 @@ fn lower_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
+    if let Some(mir::Rvalue::String(value)) =
+        materialize_checked_rvalue(expr, mir::Type::String, false, context)?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::String(value) =
             lower_branching_rvalue(expr, mir::Type::String, false, context)?
@@ -5895,6 +6465,11 @@ fn lower_string_expression(
         hir::Expr::PropertyAccess {
             object, property, ..
         } => {
+            if property == "message" && context.expression_type(object)? == mir::Type::Error {
+                return Ok(mir::StringExpression::ErrorMessage(Box::new(
+                    lower_error_expression(object, false, context)?,
+                )));
+            }
             if property == "value" {
                 if let mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) =
                     context.expression_type(object)?
@@ -6046,6 +6621,11 @@ fn lower_nullable_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableStringExpression> {
+    if let Some(mir::Rvalue::NullableString(value)) =
+        materialize_checked_rvalue(expr, mir::Type::NullableString, false, context)?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::NullableString(value) =
             lower_branching_rvalue(expr, mir::Type::NullableString, false, context)?
@@ -6352,6 +6932,11 @@ fn lower_nullable_scalar_expression(
     expected: mir::ScalarType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableScalarExpression> {
+    if let Some(mir::Rvalue::NullableScalar(value)) =
+        materialize_checked_rvalue(expr, mir::Type::NullableScalar(expected), false, context)?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::NullableScalar(value) =
             lower_branching_rvalue(expr, mir::Type::NullableScalar(expected), false, context)?
@@ -6744,6 +7329,11 @@ fn lower_nullable_class_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableClassExpression> {
+    if let Some(mir::Rvalue::NullableClass(value)) =
+        materialize_checked_rvalue(expr, mir::Type::NullableClass(expected), transfer, context)?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::NullableClass(value) =
             lower_branching_rvalue(expr, mir::Type::NullableClass(expected), transfer, context)?
@@ -7244,6 +7834,7 @@ fn lower_display_string_expression(
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
+        | mir::Type::NullableError
         | mir::Type::NullableClass(_)
         | mir::Type::NullableCollection(_)
         | mir::Type::NullableSharedReference(_)
@@ -7256,6 +7847,10 @@ fn lower_display_string_expression(
         mir::Type::Class(_) | mir::Type::SharedReference(_) => {
             unreachable!("class display handled above")
         }
+        mir::Type::Error => Err(vec![unsupported(
+            expr.span(),
+            "Error values expose their readonly `message` property rather than implicit display",
+        )]),
         mir::Type::WeakReference(_) => Err(vec![unsupported(
             expr.span(),
             "weak references do not provide direct payload display",
@@ -7356,17 +7951,6 @@ fn lower_byte_file_write_statement(
     });
     context.push_statement(mir::Statement::DropString { local: path_local });
     Ok(true)
-}
-
-fn lower_statement_call(
-    name: &str,
-    args: &[hir::Argument],
-    span: Span,
-    context: &mut LoweringContext,
-) -> DiagnosticResult<mir::Statement> {
-    let signature = context.lookup_function(name, span)?;
-    let args = lower_call_args(name, args, signature.clone(), span, context)?;
-    discarded_call_statement("function", signature, args, span)
 }
 
 fn discarded_call_statement(
@@ -7538,6 +8122,12 @@ fn lower_call_args_with_ownership(
             ),
             mir::Type::Collection(collection) => mir::Rvalue::Collection(
                 lower_collection_expression(value, collection, transfers, context)?,
+            ),
+            mir::Type::Error => {
+                mir::Rvalue::Error(lower_error_expression(value, transfers, context)?)
+            }
+            mir::Type::NullableError => mir::Rvalue::NullableError(
+                lower_nullable_error_expression(value, transfers, context)?,
             ),
             mir::Type::Mixed => {
                 mir::Rvalue::Mixed(lower_mixed_expression(value, transfers, context)?)
@@ -7732,6 +8322,8 @@ fn hoist_argument_temporary(
         }
         mir::Type::Mixed
         | mir::Type::NullableMixed
+        | mir::Type::Error
+        | mir::Type::NullableError
         | mir::Type::Class(_)
         | mir::Type::NullableClass(_)
         | mir::Type::SharedReference(_)
@@ -8248,6 +8840,7 @@ fn string_intrinsic_signature(
         parameter_owns: vec![false; count],
         method_class: None,
         receiver_mode: None,
+        checked_effects: Vec::new(),
     })
 }
 
@@ -8476,6 +9069,10 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
         mir::Type::Mixed => mir::Rvalue::Mixed(mir::MixedExpression::Local { local, transfer }),
         mir::Type::NullableMixed => {
             mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Local { local, transfer })
+        }
+        mir::Type::Error => mir::Rvalue::Error(mir::ErrorExpression::Local { local, transfer }),
+        mir::Type::NullableError => {
+            mir::Rvalue::NullableError(mir::NullableErrorExpression::Local { local, transfer })
         }
         mir::Type::Class(class) => mir::Rvalue::Class(mir::ClassExpression::Local {
             class,
@@ -9539,9 +10136,41 @@ fn reroute_condition_target(
                 *else_block = to;
             }
         }
+        mir::Terminator::CheckedCall {
+            success, failure, ..
+        }
+        | mir::Terminator::CheckedConstruct {
+            success, failure, ..
+        } => {
+            if *success == from {
+                *success = to;
+            }
+            if *failure == from {
+                *failure = to;
+            }
+        }
+        mir::Terminator::ErrorSwitch {
+            cases,
+            catch_all,
+            fallback,
+            ..
+        } => {
+            for (_, target) in cases {
+                if *target == from {
+                    *target = to;
+                }
+            }
+            if catch_all.as_ref().is_some_and(|target| *target == from) {
+                *catch_all = Some(to);
+            }
+            if *fallback == from {
+                *fallback = to;
+            }
+        }
         mir::Terminator::Return(_)
         | mir::Terminator::ReturnVoid
         | mir::Terminator::Panic { .. }
+        | mir::Terminator::PropagateError { .. }
         | mir::Terminator::Unreachable => {}
     }
 }
@@ -9593,6 +10222,14 @@ fn lower_condition(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
+    if let Some(mir::Rvalue::Value(mir::ValueExpression::Bool(value))) = materialize_checked_rvalue(
+        expr,
+        mir::Type::Scalar(mir::ScalarType::Bool),
+        false,
+        context,
+    )? {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::Value(mir::ValueExpression::Bool(value)) = lower_branching_rvalue(
             expr,
@@ -10039,6 +10676,9 @@ fn lower_null_comparison(
                 )?,
             ))
         }
+        mir::Type::NullableError => mir::BoolExpression::NullableErrorIsPresent(Box::new(
+            lower_nullable_error_expression(value, false, context)?,
+        )),
         mir::Type::NullableMixed => {
             let present = mir::BoolExpression::NullableMixedIsPresent(Box::new(
                 lower_nullable_mixed_presence_subject(value, context)?,
@@ -10106,6 +10746,11 @@ fn lower_is_condition(
             mir::BoolExpression::NullableClassIsPresent(Box::new(
                 lower_nullable_class_presence_subject(expr, class, context)?,
             ))
+        }
+        mir::Type::NullableError if tested_type == mir::Type::Error => {
+            mir::BoolExpression::NullableErrorIsPresent(Box::new(lower_nullable_error_expression(
+                expr, false, context,
+            )?))
         }
         mir::Type::NullableCollection(collection)
             if tested_type == mir::Type::Collection(collection) =>
@@ -10200,7 +10845,7 @@ fn lower_is_condition(
                 evaluate_then_false(present)
             }
         }
-        mir::Type::Scalar(_) | mir::Type::String | mir::Type::Class(_) => {
+        mir::Type::Scalar(_) | mir::Type::String | mir::Type::Class(_) | mir::Type::Error => {
             let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
             if value_type == tested_type {
                 evaluated
@@ -10223,6 +10868,11 @@ fn lower_is_condition(
         mir::Type::NullableClass(class) => {
             evaluate_then_false(mir::BoolExpression::NullableClassIsPresent(Box::new(
                 lower_nullable_class_presence_subject(expr, class, context)?,
+            )))
+        }
+        mir::Type::NullableError => {
+            evaluate_then_false(mir::BoolExpression::NullableErrorIsPresent(Box::new(
+                lower_nullable_error_expression(expr, false, context)?,
             )))
         }
         mir::Type::NullableCollection(collection) => {
@@ -10390,6 +11040,18 @@ fn lower_concrete_is_presence(
             mir::NullableClassExpression::Class(lower_class_expression(
                 expr, class, false, context,
             )?),
+        ))),
+        mir::Type::Error => {
+            lower_discarded_rvalue(
+                mir::Rvalue::Error(lower_error_expression(expr, false, context)?),
+                context,
+            );
+            Ok(mir::BoolExpression::Use {
+                operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+            })
+        }
+        mir::Type::NullableError => Ok(mir::BoolExpression::NullableErrorIsPresent(Box::new(
+            lower_nullable_error_expression(expr, false, context)?,
         ))),
         mir::Type::SharedReference(class) => {
             lower_discarded_rvalue(
@@ -10564,6 +11226,14 @@ fn lower_enum_expression(
     enum_id: crate::enums::EnumId,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::EnumExpression> {
+    if let Some(mir::Rvalue::Value(mir::ValueExpression::Enum(value))) = materialize_checked_rvalue(
+        expr,
+        mir::Type::Scalar(mir::ScalarType::Enum(enum_id)),
+        false,
+        context,
+    )? {
+        return Ok(value);
+    }
     if let Some(crate::const_eval::ConstValue::Enum(value)) = context.constant_value(expr) {
         if value.enum_id == enum_id {
             return Ok(mir::EnumExpression::Case(*value));
@@ -10836,11 +11506,338 @@ fn lower_shared_access_rvalue(
     }
 }
 
+fn lower_error_expression(
+    expr: &hir::Expr,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::ErrorExpression> {
+    if let Some(mir::Rvalue::Error(value)) =
+        materialize_checked_rvalue(expr, mir::Type::Error, transfer, context)?
+    {
+        return Ok(value);
+    }
+    if is_branching_expr(expr) {
+        let mir::Rvalue::Error(value) =
+            lower_branching_rvalue(expr, mir::Type::Error, transfer, context)?
+        else {
+            unreachable!("Error match lowering returned another MIR type");
+        };
+        return Ok(value);
+    }
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type != mir::Type::Error {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result is not Error",
+            )]);
+        }
+        return Ok(mir::ErrorExpression::CollectionIndex {
+            collection,
+            index: Box::new(index),
+            positional: false,
+            remove: true,
+        });
+    }
+    match expr {
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            match context.local_type(local) {
+                mir::Type::Error => Ok(mir::ErrorExpression::Local { local, transfer }),
+                mir::Type::NullableError
+                    if matches!(
+                        context.flow_fact(expr),
+                        Some(crate::narrowing::Fact::NonNull | crate::narrowing::Fact::Exact(_))
+                    ) =>
+                {
+                    Ok(mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer })
+                }
+                mir::Type::Class(class) if context.error_descriptor_ids.contains_key(&class) => {
+                    Ok(mir::ErrorExpression::FromClass {
+                        object: Box::new(lower_class_expression(expr, class, transfer, context)?),
+                        descriptor: context.error_descriptor_ids[&class],
+                    })
+                }
+                _ => Err(vec![unsupported(*span, "value is not an executable Error")]),
+            }
+        }
+        hir::Expr::PropertyAccess { .. } => {
+            let (object, property, ty) = lower_property_place(expr, context)?;
+            match ty {
+                mir::Type::Error => Ok(mir::ErrorExpression::Property {
+                    object,
+                    property,
+                    transfer,
+                }),
+                mir::Type::Class(class) if context.error_descriptor_ids.contains_key(&class) => {
+                    Ok(mir::ErrorExpression::FromClass {
+                        object: Box::new(mir::ClassExpression::Property {
+                            class,
+                            object,
+                            property,
+                        }),
+                        descriptor: context.error_descriptor_ids[&class],
+                    })
+                }
+                _ => Err(vec![unsupported(
+                    expr.span(),
+                    "property is not an Error value",
+                )]),
+            }
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Error) {
+                return Err(vec![unsupported(*span, "function does not return Error")]);
+            }
+            Ok(mir::ErrorExpression::Call {
+                function: signature.id,
+                args: lower_call_args(name, args, signature.clone(), *span, context)?,
+                return_borrow: signature.return_borrow,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            ..
+        } => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Error) {
+                return Err(vec![unsupported(*span, "method does not return Error")]);
+            }
+            Ok(mir::ErrorExpression::Call {
+                function: signature.id,
+                args,
+                return_borrow: signature.return_borrow,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Error) {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method does not return Error",
+                )]);
+            }
+            Ok(mir::ErrorExpression::Call {
+                function: signature.id,
+                args,
+                return_borrow: signature.return_borrow,
+            })
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, index) =
+                lower_collection_index_operand(collection, index, mir::Type::Error, context)?;
+            Ok(mir::ErrorExpression::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                positional: false,
+                remove: transfer,
+            })
+        }
+        hir::Expr::New { .. } => {
+            let class = inferred_class_type(expr, context).ok_or_else(|| {
+                vec![unsupported(
+                    expr.span(),
+                    "constructed Error has no concrete class",
+                )]
+            })?;
+            let descriptor = context
+                .error_descriptor_ids
+                .get(&class)
+                .copied()
+                .ok_or_else(|| {
+                    vec![unsupported(
+                        expr.span(),
+                        "constructed class does not implement Error",
+                    )]
+                })?;
+            Ok(mir::ErrorExpression::FromClass {
+                object: Box::new(lower_class_expression(expr, class, true, context)?),
+                descriptor,
+            })
+        }
+        hir::Expr::Grouped { expr, .. } => lower_error_expression(expr, transfer, context),
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this Error expression has no executable MIR form",
+        )]),
+    }
+}
+
+fn lower_nullable_error_expression(
+    expr: &hir::Expr,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullableErrorExpression> {
+    if let Some(mir::Rvalue::NullableError(value)) =
+        materialize_checked_rvalue(expr, mir::Type::NullableError, transfer, context)?
+    {
+        return Ok(value);
+    }
+    if context.expression_is_null(expr) {
+        return Ok(mir::NullableErrorExpression::Null);
+    }
+    if let hir::Expr::Variable { name, span } = unparenthesized_place(expr) {
+        let local = context.lookup_local(name, *span)?;
+        if context.local_type(local) == mir::Type::NullableError {
+            return Ok(mir::NullableErrorExpression::Local { local, transfer });
+        }
+    }
+    if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
+        if value_type != mir::Type::NullableError {
+            return Err(vec![unsupported(
+                expr.span(),
+                "List::removeAt result is not ?Error",
+            )]);
+        }
+        return Ok(mir::NullableErrorExpression::CollectionIndex {
+            collection,
+            index: Box::new(index),
+            positional: false,
+            remove: true,
+        });
+    }
+    if let Some((collection, key, value_type, access)) =
+        lower_collection_nullable_property(expr, context)?
+    {
+        if !nullable_collection_value_matches(value_type, mir::Type::Error) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "collection property does not produce ?Error",
+            )]);
+        }
+        return Ok(mir::NullableErrorExpression::DictionaryGet {
+            collection,
+            key: Box::new(key),
+            access,
+        });
+    }
+    match context.expression_type(expr)? {
+        mir::Type::Error | mir::Type::Class(_) => Ok(mir::NullableErrorExpression::Error(
+            lower_error_expression(expr, transfer, context)?,
+        )),
+        mir::Type::NullableError => match expr {
+            hir::Expr::Variable { name, span } => {
+                let local = context.lookup_local(name, *span)?;
+                Ok(mir::NullableErrorExpression::Local { local, transfer })
+            }
+            hir::Expr::PropertyAccess { .. } => {
+                let (object, property, _) = lower_property_place(expr, context)?;
+                Ok(mir::NullableErrorExpression::Property {
+                    object,
+                    property,
+                    transfer,
+                })
+            }
+            hir::Expr::FunctionCall { name, args, span } => {
+                let signature = context.lookup_function(name, *span)?;
+                Ok(mir::NullableErrorExpression::Call {
+                    function: signature.id,
+                    args: lower_call_args(name, args, signature.clone(), *span, context)?,
+                    return_borrow: signature.return_borrow,
+                })
+            }
+            hir::Expr::MethodCall {
+                object,
+                method,
+                args,
+                span,
+                null_safe: false,
+            } => {
+                if let Some((collection, key, value_type, access)) =
+                    lower_dictionary_get(object, method, args, context)?
+                {
+                    if !nullable_collection_value_matches(value_type, mir::Type::Error) {
+                        return Err(vec![unsupported(
+                            *span,
+                            "collection operation does not produce ?Error",
+                        )]);
+                    }
+                    return Ok(mir::NullableErrorExpression::DictionaryGet {
+                        collection,
+                        key: Box::new(key),
+                        access,
+                    });
+                }
+                let (signature, args) =
+                    lower_instance_method_call(object, method, args, *span, context)?;
+                Ok(mir::NullableErrorExpression::Call {
+                    function: signature.id,
+                    args,
+                    return_borrow: signature.return_borrow,
+                })
+            }
+            hir::Expr::Index {
+                collection, index, ..
+            } => {
+                let (collection, key) = lower_collection_index_operand(
+                    collection,
+                    index,
+                    mir::Type::NullableError,
+                    context,
+                )?;
+                Ok(mir::NullableErrorExpression::DictionaryGet {
+                    collection,
+                    key: Box::new(key),
+                    access: mir::NullableCollectionAccess::Index,
+                })
+            }
+            hir::Expr::StaticCall {
+                class_name,
+                method,
+                args,
+                span,
+            } => {
+                let (signature, args) =
+                    lower_static_method_call(class_name, method, args, *span, context)?;
+                Ok(mir::NullableErrorExpression::Call {
+                    function: signature.id,
+                    args,
+                    return_borrow: signature.return_borrow,
+                })
+            }
+            hir::Expr::Grouped { expr, .. } => {
+                lower_nullable_error_expression(expr, transfer, context)
+            }
+            _ => Err(vec![unsupported(
+                expr.span(),
+                "this nullable Error expression has no executable MIR form",
+            )]),
+        },
+        mir::Type::NullableClass(class) if context.error_descriptor_ids.contains_key(&class) => Ok(
+            mir::NullableErrorExpression::Error(mir::ErrorExpression::FromNullableClass {
+                object: Box::new(lower_nullable_class_expression(
+                    expr, class, transfer, context,
+                )?),
+                descriptor: context.error_descriptor_ids[&class],
+            }),
+        ),
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "value is not assignable to ?Error",
+        )]),
+    }
+}
+
 fn lower_rvalue_as_expected(
     expr: &hir::Expr,
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
+    if let Some(value) = materialize_checked_rvalue(expr, expected, true, context)? {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         return lower_branching_rvalue(expr, expected, true, context);
     }
@@ -10854,6 +11851,10 @@ fn lower_rvalue_as_expected(
         return collection_remove_at_rvalue(collection, index, expected);
     }
     match expected {
+        mir::Type::Error => lower_error_expression(expr, true, context).map(mir::Rvalue::Error),
+        mir::Type::NullableError => {
+            lower_nullable_error_expression(expr, true, context).map(mir::Rvalue::NullableError)
+        }
         mir::Type::String => lower_string_expression(expr, context).map(mir::Rvalue::String),
         mir::Type::NullableScalar(ty) => {
             lower_nullable_scalar_expression(expr, ty, context).map(mir::Rvalue::NullableScalar)
@@ -10933,11 +11934,130 @@ fn lower_rvalue_as_expected(
     }
 }
 
+fn materialize_checked_call(
+    expr: &hir::Expr,
+    consume_result: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    if crate::checked_effects::effects_at(&context.semantic_info.checked_effect_sites, expr.span())
+        .is_empty()
+    {
+        return Ok(None);
+    }
+    let (signature, args, span) = match expr {
+        hir::Expr::FunctionCall { name, args, span } => {
+            let Ok(signature) = context.lookup_function(name, *span) else {
+                return Ok(None);
+            };
+            if signature.checked_effects.is_empty() {
+                return Ok(None);
+            }
+            let lowered = lower_call_args(name, args, signature.clone(), *span, context)?;
+            (signature, lowered, *span)
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+        } => {
+            let (signature, lowered) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            if signature.checked_effects.is_empty() {
+                return Ok(None);
+            }
+            (signature, lowered, *span)
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, lowered) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            if signature.checked_effects.is_empty() {
+                return Ok(None);
+            }
+            (signature, lowered, *span)
+        }
+        _ => return Ok(None),
+    };
+
+    materialize_checked_signature_call(signature, args, span, consume_result, context)
+}
+
+fn materialize_checked_rvalue(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    consume_result: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<mir::Rvalue>> {
+    let Some((local, ty, transfer)) = materialize_checked_call(expr, consume_result, context)?
+    else {
+        return Ok(None);
+    };
+    if ty != expected {
+        return Err(vec![unsupported(
+            expr.span(),
+            "checked call result has another MIR type",
+        )]);
+    }
+    Ok(Some(local_rvalue(local, ty, transfer)))
+}
+
+fn materialize_checked_signature_call(
+    signature: FunctionSignature,
+    args: Vec<mir::Rvalue>,
+    span: Span,
+    consume_result: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    debug_assert!(!signature.checked_effects.is_empty());
+    let result = match signature.return_type {
+        mir::ReturnType::Void => None,
+        mir::ReturnType::Value(ty) => {
+            let owned = signature.return_borrow.is_none() && user_local_type_owns_value(ty);
+            Some((context.declare_checked_call_slot(ty, owned), ty, owned))
+        }
+    };
+    let error = context.declare_checked_call_slot(mir::Type::Error, true);
+    let success = context.create_block();
+    let failure = context.create_block();
+    context.terminate_current(mir::Terminator::CheckedCall {
+        function: signature.id,
+        args,
+        result: result.map(|(local, _, _)| local),
+        error,
+        success,
+        failure,
+        span,
+    });
+
+    let statement_temporaries = context.statement_owned_locals.clone();
+    context.current_block = Some(failure);
+    context.route_checked_error(error);
+    context.statement_owned_locals = statement_temporaries;
+    context.current_block = Some(success);
+    if let Some((local, ty, owned)) = result {
+        if owned {
+            context.track_statement_owned_local(local, ty);
+        }
+        Ok(Some((local, ty, owned && consume_result)))
+    } else {
+        Ok(None)
+    }
+}
+
 fn lower_rvalue_as_borrowed(
     expr: &hir::Expr,
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
+    if let Some(value) = materialize_checked_rvalue(expr, expected, false, context)? {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         return lower_branching_rvalue(expr, expected, false, context);
     }
@@ -11016,6 +12136,11 @@ fn lower_payload_enum_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::PayloadEnumExpression> {
+    if let Some(mir::Rvalue::PayloadEnum(value)) =
+        materialize_checked_rvalue(expr, mir::Type::PayloadEnum(ty), transfer, context)?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::PayloadEnum(value) =
             lower_branching_rvalue(expr, mir::Type::PayloadEnum(ty), transfer, context)?
@@ -11213,6 +12338,7 @@ fn lower_payload_enum_expression(
                 parameter_types,
                 method_class: None,
                 receiver_mode: None,
+                checked_effects: Vec::new(),
             };
             let fields = lower_call_args_with_ownership(
                 &format!("{}::{}", definition.name, case_definition.name),
@@ -11284,6 +12410,11 @@ fn lower_nullable_payload_enum_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullablePayloadEnumExpression> {
+    if let Some(mir::Rvalue::NullablePayloadEnum(value)) =
+        materialize_checked_rvalue(expr, mir::Type::NullablePayloadEnum(ty), transfer, context)?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::NullablePayloadEnum(value) =
             lower_branching_rvalue(expr, mir::Type::NullablePayloadEnum(ty), transfer, context)?
@@ -11489,6 +12620,11 @@ fn lower_mixed_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::MixedExpression> {
+    if let Some(mir::Rvalue::Mixed(value)) =
+        materialize_checked_rvalue(expr, mir::Type::Mixed, transfer, context)?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::Mixed(value) =
             lower_branching_rvalue(expr, mir::Type::Mixed, transfer, context)?
@@ -11622,6 +12758,9 @@ fn lower_mixed_expression(
                 payload_owned,
             })
         }
+        mir::Type::Error => Ok(mir::MixedExpression::BoxError {
+            value: Box::new(lower_error_expression(expr, transfer, context)?),
+        }),
         mir::Type::Class(class) => {
             let value = lower_class_expression(expr, class, transfer, context)?;
             let payload_owned = transfer || value.owned_temporary_class().is_some();
@@ -11667,6 +12806,7 @@ fn lower_mixed_expression(
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableClass(_)
+        | mir::Type::NullableError
         | mir::Type::NullableMixed => Err(vec![Diagnostic::unsupported_stage(
             "M1101",
             "boxing nullable values into `mixed` lands after Stage 23 Slice 3",
@@ -11683,6 +12823,7 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         mir::Type::Scalar(mir::ScalarType::Enum(enum_id)) => Ok(mir::MixedTag::Enum(enum_id)),
         mir::Type::PayloadEnum(ty) => Ok(mir::MixedTag::PayloadEnum(ty)),
         mir::Type::String => Ok(mir::MixedTag::String),
+        mir::Type::Error => Ok(mir::MixedTag::Error),
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
@@ -11703,6 +12844,7 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         | mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableClass(_)
+        | mir::Type::NullableError
         | mir::Type::NullableCollection(_)
         | mir::Type::Collection(_)
         | mir::Type::NullablePayloadEnum(_) => Err(vec![Diagnostic::unsupported_stage(
@@ -11718,6 +12860,11 @@ fn lower_nullable_mixed_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableMixedExpression> {
+    if let Some(mir::Rvalue::NullableMixed(value)) =
+        materialize_checked_rvalue(expr, mir::Type::NullableMixed, transfer, context)?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::NullableMixed(value) =
             lower_branching_rvalue(expr, mir::Type::NullableMixed, transfer, context)?
@@ -11813,6 +12960,11 @@ fn lower_collection_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::CollectionExpression> {
+    if let Some(mir::Rvalue::Collection(value)) =
+        materialize_checked_rvalue(expr, mir::Type::Collection(expected), transfer, context)?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::Collection(value) =
             lower_branching_rvalue(expr, mir::Type::Collection(expected), transfer, context)?
@@ -12218,6 +13370,14 @@ fn lower_nullable_collection_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableCollectionExpression> {
+    if let Some(mir::Rvalue::NullableCollection(value)) = materialize_checked_rvalue(
+        expr,
+        mir::Type::NullableCollection(expected),
+        transfer,
+        context,
+    )? {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::NullableCollection(value) = lower_branching_rvalue(
             expr,
@@ -12412,6 +13572,20 @@ fn collection_remove_at_rvalue(
                 positional: false,
                 collection,
                 index: Box::new(index),
+                remove: true,
+            },
+        )),
+        mir::Type::Error => Ok(mir::Rvalue::Error(mir::ErrorExpression::CollectionIndex {
+            collection,
+            index: Box::new(index),
+            positional: false,
+            remove: true,
+        })),
+        mir::Type::NullableError => Ok(mir::Rvalue::NullableError(
+            mir::NullableErrorExpression::CollectionIndex {
+                collection,
+                index: Box::new(index),
+                positional: false,
                 remove: true,
             },
         )),
@@ -13479,6 +14653,13 @@ fn nullable_collection_access_rvalue(
                 access,
             },
         )),
+        mir::Type::Error | mir::Type::NullableError => Ok(mir::Rvalue::NullableError(
+            mir::NullableErrorExpression::DictionaryGet {
+                collection,
+                key,
+                access,
+            },
+        )),
         mir::Type::Class(class) | mir::Type::NullableClass(class) => Ok(mir::Rvalue::NullableClass(
             mir::NullableClassExpression::DictionaryGet {
                 class,
@@ -13691,6 +14872,9 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         mir::Type::Mixed | mir::Type::NullableMixed => {
             context.push_statement(mir::Statement::DropMixed { local });
         }
+        mir::Type::Error | mir::Type::NullableError => {
+            context.push_statement(mir::Statement::DropError { local });
+        }
         mir::Type::PayloadEnum(ty) => {
             context.push_statement(mir::Statement::DropPayloadEnum {
                 local,
@@ -13844,6 +15028,11 @@ fn lower_class_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ClassExpression> {
+    if let Some(mir::Rvalue::Class(value)) =
+        materialize_checked_rvalue(expr, mir::Type::Class(expected), transfer, context)?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let mir::Rvalue::Class(value) =
             lower_branching_rvalue(expr, mir::Type::Class(expected), transfer, context)?
@@ -14052,6 +15241,10 @@ fn lower_class_expression(
                     format!("constructor for `{class_name}` does not produce expected class"),
                 )]);
             }
+            // Property initializers are source-ordered construction effects. Lower
+            // and materialize them before constructor arguments so a checked
+            // failure in a later initializer cannot leapfrog an earlier one.
+            let properties = lower_new_property_values(class, context)?;
             let constructor = context.lookup_lifecycle(class, "__construct");
             let constructor_args = if let Some(signature) = constructor.as_ref() {
                 lower_call_args_with_ownership(class_name, args, signature.clone(), *span, context)?
@@ -14064,7 +15257,38 @@ fn lower_class_expression(
                 }
                 Vec::new()
             };
-            let properties = lower_new_property_values(class, context)?;
+            if let Some(signature) = constructor
+                .as_ref()
+                .filter(|signature| !signature.checked_effects.is_empty())
+            {
+                let result = context.declare_checked_call_slot(mir::Type::Class(class), true);
+                let error = context.declare_checked_call_slot(mir::Type::Error, true);
+                let success = context.create_block();
+                let failure = context.create_block();
+                context.terminate_current(mir::Terminator::CheckedConstruct {
+                    class,
+                    properties,
+                    constructor: signature.id,
+                    args: constructor_args,
+                    result,
+                    error,
+                    success,
+                    failure,
+                    span: *span,
+                });
+
+                let statement_temporaries = context.statement_owned_locals.clone();
+                context.current_block = Some(failure);
+                context.route_checked_error(error);
+                context.statement_owned_locals = statement_temporaries;
+                context.current_block = Some(success);
+                context.track_statement_owned_local(result, mir::Type::Class(class));
+                return Ok(mir::ClassExpression::Local {
+                    class,
+                    local: result,
+                    transfer,
+                });
+            }
             Ok(mir::ClassExpression::New {
                 class,
                 properties,
@@ -16371,6 +17595,27 @@ fn lower_property_place(
             }
         },
     };
+    if matches!(
+        context.local_type(object_local),
+        mir::Type::Mixed | mir::Type::NullableMixed
+    ) {
+        let Some((mixed, mir::Type::Class(class))) = context.exact_mixed_local(object) else {
+            return Err(vec![unsupported(
+                object.span(),
+                "mixed property access requires exact class narrowing",
+            )]);
+        };
+        let projected = context.declare_borrowed_temp(mir::Type::Class(class), false);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: projected,
+            value: mir::Rvalue::Class(mir::ClassExpression::MixedPayload {
+                mixed,
+                class,
+                transfer: false,
+            }),
+        });
+        object_local = projected;
+    }
     let class = match context.local_type(object_local) {
         mir::Type::Class(class) | mir::Type::NullableClass(class) => class,
         mir::Type::SharedReference(class) | mir::Type::NullableSharedReference(class) => {
@@ -16527,7 +17772,8 @@ fn lower_new_property_values(
                     initializer.type_substitutions,
                 );
                 let source =
-                    lower_rvalue_as_expected(&initializer.expression, property_type, context);
+                    lower_rvalue_as_expected(&initializer.expression, property_type, context)
+                        .map(|value| materialize_property_initializer(value, context));
                 context.type_substitutions = caller_substitutions;
                 return Ok(mir::PropertyValue {
                     property: property.id,
@@ -16554,6 +17800,31 @@ fn lower_new_property_values(
         .collect()
 }
 
+fn materialize_property_initializer(
+    value: mir::Rvalue,
+    context: &mut LoweringContext,
+) -> mir::Rvalue {
+    let ty = value.ty();
+    let local = if matches!(ty, mir::Type::String | mir::Type::NullableString) {
+        let local = context.declare_borrowed_temp(ty, false);
+        context
+            .statement_owned_locals
+            .last_mut()
+            .expect("property initializer requires a statement-temporary scope")
+            .push(DropObligation::String(local));
+        local
+    } else if user_local_type_owns_value(ty) {
+        context.declare_owned_temp(ty)
+    } else {
+        context.declare_borrowed_temp(ty, false)
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value,
+    });
+    read_local_as_rvalue(local, ty, true)
+}
+
 fn promoted_constructor_argument_index(
     class: ClassId,
     property_name: &str,
@@ -16573,6 +17844,17 @@ fn lower_float_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::FloatExpression> {
+    let result_ty = context.float_type(expr)?;
+    if let Some(mir::Rvalue::Value(mir::ValueExpression::Float(value))) =
+        materialize_checked_rvalue(
+            expr,
+            mir::Type::Scalar(mir::ScalarType::Float(result_ty)),
+            false,
+            context,
+        )?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let ty = context.float_type(expr)?;
         let mir::Rvalue::Value(mir::ValueExpression::Float(value)) = lower_branching_rvalue(
@@ -16829,6 +18111,17 @@ fn lower_integer_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::IntegerExpression> {
+    let result_ty = context.integer_type(expr)?;
+    if let Some(mir::Rvalue::Value(mir::ValueExpression::Integer(value))) =
+        materialize_checked_rvalue(
+            expr,
+            mir::Type::Scalar(mir::ScalarType::Integer(result_ty)),
+            false,
+            context,
+        )?
+    {
+        return Ok(value);
+    }
     if is_branching_expr(expr) {
         let ty = context.integer_type(expr)?;
         let mir::Rvalue::Value(mir::ValueExpression::Integer(value)) = lower_branching_rvalue(

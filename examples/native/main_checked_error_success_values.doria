@@ -1,0 +1,72 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+class Item
+{
+    function __construct(string $name)
+    {
+    }
+}
+
+enum Choice
+{
+    case Ready(int $value);
+}
+
+function successfulVoid(): void throws Failure {}
+function successfulBool(): bool throws Failure { return true; }
+function successfulInt8(): int8 throws Failure { return -8; }
+function successfulUint64(): uint64 throws Failure { return 64; }
+function successfulFloat32(): float32 throws Failure { return 1.5; }
+function successfulFloat(): float throws Failure { return 2.5; }
+function successfulString(): string throws Failure { return "text"; }
+function successfulClass(): Item throws Failure { return new Item("item"); }
+function successfulNullableClass(): ?Item throws Failure { return null; }
+function successfulError(): Error throws Failure { return new Failure("error"); }
+function successfulNullableError(): ?Error throws Failure { return new Failure("optional"); }
+function successfulMixed(): mixed throws Failure { return "mixed"; }
+function successfulCollection(): List<int> throws Failure { return [20, 22]; }
+function successfulPayload(): Choice throws Failure { return Choice::Ready(42); }
+function successfulNullablePayload(): ?Choice throws Failure { return Choice::Ready(7); }
+function borrowItem(Item $item): Item throws Failure { return $item; }
+function identity<T>(T $value): T throws Failure { return $value; }
+
+class Provider
+{
+    function value(): int throws Failure { return 40; }
+    static function offset(): int throws Failure { return 2; }
+    function generic<T>(T $value): T throws Failure { return $value; }
+}
+
+function main(): void
+{
+    try {
+        successfulVoid();
+        echo "scalars {successfulBool()} {successfulInt8()} {successfulUint64()} {successfulFloat32()} {successfulFloat()}\n";
+        echo "string {successfulString()}\n";
+        let $item = successfulClass();
+        let $none = successfulNullableClass();
+        echo "class {$item->name} {($none == null)}\n";
+        Error $error = successfulError();
+        ?Error $optional = successfulNullableError();
+        if ($optional != null) { echo "errors {$error->message} {$optional->message}\n"; }
+        mixed $mixed = successfulMixed();
+        if ($mixed is string) { echo "{$mixed}\n"; }
+        let $values = successfulCollection();
+        echo "collection {$values[0] + $values[1]}\n";
+        let $choice = successfulPayload();
+        echo match ($choice) { Choice::Ready($value) => "payload {$value}" } . "\n";
+        let $maybeChoice = successfulNullablePayload();
+        if ($maybeChoice != null) { echo "nullable payload\n"; }
+        echo "borrow {borrowItem($item)->name}\n";
+        echo "generic {identity(42)}\n";
+        let $provider = new Provider();
+        echo "methods {$provider->value() + Provider::offset()} {$provider->generic(42)}\n";
+    } catch (Failure $failure) {
+        echo "unexpected {$failure->message}\n";
+    }
+}

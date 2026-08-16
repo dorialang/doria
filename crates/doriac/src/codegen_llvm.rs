@@ -46,25 +46,26 @@ use crate::native_abi::{
     COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
     FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
     MIXED_NEW_AGGREGATE, MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG,
-    MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64,
-    MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_PAYLOAD_ENUM,
-    MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8,
-    MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES,
-    READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK,
-    SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH,
-    STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE,
-    STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE,
-    STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32,
-    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH,
-    STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN,
-    STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST,
-    STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN,
-    STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE,
-    STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER,
-    STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE,
-    WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS, WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS,
-    WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK, WRITABLE_SHARED_READONLY_PAYLOAD,
-    WRITABLE_SHARED_RELEASE, WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
+    MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM, MIXED_TAG_ERROR, MIXED_TAG_FLOAT32,
+    MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8,
+    MIXED_TAG_PAYLOAD_ENUM, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64,
+    MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE,
+    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE,
+    SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
+    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
+    STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
+    STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
+    STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY,
+    STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER,
+    STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT,
+    STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
+    STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
+    STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
+    WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
+    WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS, WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK,
+    WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
+    WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
     WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_RETAIN,
     WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES,
     WRITE_STDOUT_BYTES,
@@ -144,11 +145,20 @@ fn build_module<'ctx>(
     let class_drop_functions = declare_class_drop_functions(context, &module, program);
     let collection_drop_functions = declare_collection_drop_functions(context, &module, program);
     let statics = declare_statics(context, &module, &target_data, program)?;
+    let (error_descriptors, error_origins) = declare_error_metadata(
+        context,
+        &module,
+        &target_data,
+        program,
+        &class_drop_functions,
+    )?;
     let declarations = DeclaredProgram {
         functions,
         class_drop_functions,
         collection_drop_functions,
         statics,
+        error_descriptors,
+        error_origins,
     };
     for function in &program.functions {
         define_function(
@@ -184,6 +194,8 @@ struct DeclaredProgram<'ctx> {
     class_drop_functions: Vec<FunctionValue<'ctx>>,
     collection_drop_functions: Vec<FunctionValue<'ctx>>,
     statics: Vec<GlobalValue<'ctx>>,
+    error_descriptors: Vec<GlobalValue<'ctx>>,
+    error_origins: Vec<GlobalValue<'ctx>>,
 }
 
 fn declare_class_drop_functions<'ctx>(
@@ -337,17 +349,137 @@ fn declare_statics<'ctx>(
     Ok(globals)
 }
 
+fn declare_error_metadata<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    target_data: &TargetData,
+    program: &mir::Program,
+    class_drop_functions: &[FunctionValue<'ctx>],
+) -> Result<(Vec<GlobalValue<'ctx>>, Vec<GlobalValue<'ctx>>), BackendError> {
+    let pointer = context.ptr_type(AddressSpace::default());
+    let word = context.ptr_sized_int_type(target_data, None);
+    let descriptor_type = error_descriptor_type(context, target_data);
+    let mut descriptors = Vec::with_capacity(program.error_descriptors.len());
+    for descriptor in &program.error_descriptors {
+        let class = class_definition(program, descriptor.class)?;
+        let message = class
+            .layout
+            .properties
+            .iter()
+            .find(|property| property.id == descriptor.message_property)
+            .ok_or_else(|| malformed_mir("Error message property has no class layout"))?;
+        let drop = class_drop_functions
+            .get(descriptor.class.0)
+            .ok_or_else(|| malformed_mir("Error class drop glue was not declared"))?
+            .as_global_value()
+            .as_pointer_value();
+        let type_name = define_bytes(
+            context,
+            module,
+            descriptor.type_name.as_bytes(),
+            &format!("__doria_error_descriptor_{}_type_name", descriptor.id.0),
+        );
+        let initializer = descriptor_type.const_named_struct(&[
+            type_name.into(),
+            word.const_int(descriptor.type_name.len() as u64, false)
+                .into(),
+            word.const_int(u64::from(message.offset), false).into(),
+            drop.into(),
+            word.const_int(u64::from(class.layout.size), false).into(),
+            word.const_int(
+                u64::from(class.error_origin_offset.ok_or_else(|| {
+                    malformed_mir("Error descriptor class has no hidden origin slot")
+                })?),
+                false,
+            )
+            .into(),
+            word.const_zero().into(),
+            word.const_zero().into(),
+        ]);
+        let global = module.add_global(
+            descriptor_type,
+            None,
+            &format!("__doria_error_descriptor_{}", descriptor.id.0),
+        );
+        global.set_initializer(&initializer);
+        global.set_constant(true);
+        global.set_linkage(Linkage::Internal);
+        descriptors.push(global);
+    }
+
+    let origin_type = context.struct_type(
+        &[
+            pointer.into(),
+            word.into(),
+            pointer.into(),
+            word.into(),
+            word.into(),
+            word.into(),
+            pointer.into(),
+            word.into(),
+        ],
+        false,
+    );
+    let mut origins = Vec::with_capacity(program.error_origins.len());
+    for origin in &program.error_origins {
+        let function = function_in(program, origin.function)?;
+        let prefix = format!("__doria_error_origin_{}", origin.id.0);
+        let path = define_bytes(
+            context,
+            module,
+            program.source.path.as_bytes(),
+            &format!("{prefix}_path"),
+        );
+        let source = define_bytes(
+            context,
+            module,
+            program.source.text.as_bytes(),
+            &format!("{prefix}_source"),
+        );
+        let callable = define_bytes(
+            context,
+            module,
+            function.name.as_bytes(),
+            &format!("{prefix}_callable"),
+        );
+        let initializer = origin_type.const_named_struct(&[
+            path.into(),
+            word.const_int(program.source.path.len() as u64, false)
+                .into(),
+            source.into(),
+            word.const_int(program.source.text.len() as u64, false)
+                .into(),
+            word.const_int(origin.span.start as u64, false).into(),
+            word.const_int(origin.span.end as u64, false).into(),
+            callable.into(),
+            word.const_int(function.name.len() as u64, false).into(),
+        ]);
+        let global = module.add_global(origin_type, None, &prefix);
+        global.set_initializer(&initializer);
+        global.set_constant(true);
+        global.set_linkage(Linkage::Internal);
+        origins.push(global);
+    }
+    Ok((descriptors, origins))
+}
+
 fn function_type<'ctx>(
     context: &'ctx Context,
     target_data: &TargetData,
     function: &mir::Function,
 ) -> Result<inkwell::types::FunctionType<'ctx>, BackendError> {
     let mut parameters = vec![context.ptr_type(AddressSpace::default()).into()];
+    let checked = !function.checked_effects.is_empty();
     let aggregate_return = matches!(
         function.return_type,
         mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
     );
-    if aggregate_return {
+    if checked {
+        if matches!(function.return_type, mir::ReturnType::Value(_)) {
+            parameters.push(context.ptr_type(AddressSpace::default()).into());
+        }
+        parameters.push(context.ptr_type(AddressSpace::default()).into());
+    } else if aggregate_return {
         parameters.push(context.ptr_type(AddressSpace::default()).into());
     }
     for parameter in &function.params {
@@ -362,6 +494,9 @@ fn function_type<'ctx>(
                 llvm_type(context, target_data, local.ty).into()
             },
         );
+    }
+    if checked {
+        return Ok(context.i8_type().fn_type(&parameters, false));
     }
     Ok(match function.return_type {
         mir::ReturnType::Void => context.void_type().fn_type(&parameters, false),
@@ -379,15 +514,21 @@ fn apply_function_abi_attributes(
     llvm_function: FunctionValue<'_>,
     function: &mir::Function,
 ) -> Result<(), BackendError> {
-    if let mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(ty))) =
-        function.return_type
-    {
-        apply_integer_extension_attribute(context, llvm_function, AttributeLoc::Return, ty);
+    if function.checked_effects.is_empty() {
+        if let mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(ty))) =
+            function.return_type
+        {
+            apply_integer_extension_attribute(context, llvm_function, AttributeLoc::Return, ty);
+        }
     }
-    let hidden_return = u32::from(matches!(
-        function.return_type,
-        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-    ));
+    let hidden_return = if function.checked_effects.is_empty() {
+        u32::from(matches!(
+            function.return_type,
+            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
+        ))
+    } else {
+        1 + u32::from(matches!(function.return_type, mir::ReturnType::Value(_)))
+    };
     for (index, parameter) in function.params.iter().enumerate() {
         let local = local_in(function, *parameter)?;
         if let mir::Type::Scalar(mir::ScalarType::Integer(ty)) = local.ty {
@@ -463,17 +604,33 @@ fn define_function<'ctx>(
         build(builder.build_store(slot, context.ptr_type(AddressSpace::default()).const_null()))?;
         deferred_class_temporary_slots.push(slot);
     }
-    let aggregate_return = matches!(
-        function.return_type,
-        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-    );
-    let return_address = aggregate_return
-        .then(|| llvm_function.get_nth_param(1))
+    let checked = !function.checked_effects.is_empty();
+    let aggregate_return = !checked
+        && matches!(
+            function.return_type,
+            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
+        );
+    let return_address = (aggregate_return
+        || (checked && matches!(function.return_type, mir::ReturnType::Value(_))))
+    .then(|| llvm_function.get_nth_param(1))
+    .flatten()
+    .map(BasicValueEnum::into_pointer_value);
+    let checked_error_address = checked
+        .then(|| {
+            llvm_function.get_nth_param(
+                1 + u32::from(matches!(function.return_type, mir::ReturnType::Value(_))),
+            )
+        })
         .flatten()
         .map(BasicValueEnum::into_pointer_value);
+    let hidden_parameters = if checked {
+        1 + u32::from(matches!(function.return_type, mir::ReturnType::Value(_)))
+    } else {
+        u32::from(aggregate_return)
+    };
     for (index, parameter) in function.params.iter().enumerate() {
         let value = llvm_function
-            .get_nth_param(index as u32 + 1 + u32::from(aggregate_return))
+            .get_nth_param(index as u32 + 1 + hidden_parameters)
             .ok_or_else(|| malformed_mir("LLVM function is missing a declared parameter"))?;
         let local = local_in(function, *parameter)?;
         let destination = local_slot(&local_slots, *parameter)?;
@@ -581,10 +738,13 @@ fn define_function<'ctx>(
         class_drop_functions: &declarations.class_drop_functions,
         collection_drop_functions: &declarations.collection_drop_functions,
         statics: &declarations.statics,
+        error_descriptors: &declarations.error_descriptors,
+        error_origins: &declarations.error_origins,
         local_slots,
         blocks,
         current_frame,
         return_address,
+        checked_error_address,
         next_data_id: 0,
         defer_class_temporary_drops: false,
         deferred_class_temporary_slots,
@@ -644,10 +804,13 @@ fn define_class_drop_functions<'ctx>(
             class_drop_functions: &declarations.class_drop_functions,
             collection_drop_functions: &declarations.collection_drop_functions,
             statics: &declarations.statics,
+            error_descriptors: &declarations.error_descriptors,
+            error_origins: &declarations.error_origins,
             local_slots: Vec::new(),
             blocks: Vec::new(),
             current_frame,
             return_address: None,
+            checked_error_address: None,
             next_data_id: 0,
             defer_class_temporary_drops: false,
             deferred_class_temporary_slots: Vec::new(),
@@ -692,10 +855,13 @@ fn define_collection_drop_functions<'ctx>(
             class_drop_functions: &declarations.class_drop_functions,
             collection_drop_functions: &declarations.collection_drop_functions,
             statics: &declarations.statics,
+            error_descriptors: &declarations.error_descriptors,
+            error_origins: &declarations.error_origins,
             local_slots: Vec::new(),
             blocks: Vec::new(),
             current_frame: context.ptr_type(AddressSpace::default()).const_null(),
             return_address: None,
+            checked_error_address: None,
             next_data_id: 0,
             defer_class_temporary_drops: false,
             deferred_class_temporary_slots: Vec::new(),
@@ -1100,15 +1266,25 @@ struct FunctionLowerer<'ctx, 'program> {
     class_drop_functions: &'program [FunctionValue<'ctx>],
     collection_drop_functions: &'program [FunctionValue<'ctx>],
     statics: &'program [GlobalValue<'ctx>],
+    error_descriptors: &'program [GlobalValue<'ctx>],
+    error_origins: &'program [GlobalValue<'ctx>],
     local_slots: Vec<Option<PointerValue<'ctx>>>,
     blocks: Vec<BasicBlock<'ctx>>,
     current_frame: PointerValue<'ctx>,
     return_address: Option<PointerValue<'ctx>>,
+    checked_error_address: Option<PointerValue<'ctx>>,
     next_data_id: usize,
     defer_class_temporary_drops: bool,
     deferred_class_temporary_slots: Vec<PointerValue<'ctx>>,
     deferred_class_temporary_slot_cursor: usize,
     deferred_class_temporary_drops: Vec<(PointerValue<'ctx>, DeferredOwnedTemporary)>,
+}
+
+struct LoweredCallArguments<'ctx> {
+    values: Vec<BasicMetadataValueEnum<'ctx>>,
+    lowered: Vec<BasicValueEnum<'ctx>>,
+    owned_strings: Vec<PointerValue<'ctx>>,
+    temporary_mixed: Vec<(usize, PointerValue<'ctx>, mir::MixedOwnership)>,
 }
 
 #[derive(Clone, Copy)]
@@ -1213,6 +1389,110 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             None => builder.position_at_end(self.entry_block),
         }
         build(builder.build_alloca(ty, name))
+    }
+
+    fn error_parts(
+        &self,
+        value: StructValue<'ctx>,
+    ) -> Result<(PointerValue<'ctx>, PointerValue<'ctx>), BackendError> {
+        let object =
+            build(self.builder.build_extract_value(value, 0, "error.object"))?.into_pointer_value();
+        let descriptor = build(
+            self.builder
+                .build_extract_value(value, 1, "error.descriptor"),
+        )?
+        .into_pointer_value();
+        Ok((object, descriptor))
+    }
+
+    fn error_value(
+        &self,
+        object: PointerValue<'ctx>,
+        descriptor: PointerValue<'ctx>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let value = error_carrier_type(self.context).const_zero();
+        let value = build(
+            self.builder
+                .build_insert_value(value, object, 0, "error.with-object"),
+        )?
+        .into_struct_value();
+        Ok(build(
+            self.builder
+                .build_insert_value(value, descriptor, 1, "error.with-descriptor"),
+        )?
+        .into_struct_value())
+    }
+
+    fn error_descriptor_address(
+        &self,
+        id: mir::ErrorDescriptorId,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        self.error_descriptors
+            .get(id.0)
+            .filter(|_| {
+                self.program
+                    .error_descriptors
+                    .get(id.0)
+                    .is_some_and(|d| d.id == id)
+            })
+            .map(|global| (*global).as_pointer_value())
+            .ok_or_else(|| malformed_mir(format!("Error descriptor{} was not declared", id.0)))
+    }
+
+    fn error_origin_address(
+        &self,
+        id: mir::ErrorOriginId,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        self.error_origins
+            .get(id.0)
+            .filter(|_| {
+                self.program
+                    .error_origins
+                    .get(id.0)
+                    .is_some_and(|o| o.id == id)
+            })
+            .map(|global| (*global).as_pointer_value())
+            .ok_or_else(|| malformed_mir(format!("Error origin{} was not declared", id.0)))
+    }
+
+    fn drop_error_value(&mut self, value: StructValue<'ctx>) -> Result<(), BackendError> {
+        let (object, descriptor) = self.error_parts(value)?;
+        let present = build(self.builder.build_is_not_null(object, "error.drop.present"))?;
+        let function = current_function(&self.builder)?;
+        let drop_block = self.context.append_basic_block(function, "error.drop");
+        let done = self.context.append_basic_block(function, "error.drop.done");
+        build(
+            self.builder
+                .build_conditional_branch(present, drop_block, done),
+        )?;
+        self.builder.position_at_end(drop_block);
+        let descriptor_type = error_descriptor_type(self.context, self.target_data);
+        let drop_field = build(self.builder.build_struct_gep(
+            descriptor_type,
+            descriptor,
+            3,
+            "error.drop.field",
+        ))?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let drop_function = build(self.builder.build_load(
+            pointer,
+            drop_field,
+            "error.drop.function",
+        ))?
+        .into_pointer_value();
+        let signature = self
+            .context
+            .void_type()
+            .fn_type(&[pointer.into(), pointer.into()], false);
+        let _ = build(self.builder.build_indirect_call(
+            signature,
+            drop_function,
+            &[self.current_frame.into(), object.into()],
+            "error.drop.call",
+        ))?;
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        Ok(())
     }
 
     fn entry_payload_alloca(
@@ -1762,6 +2042,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let property_ty = property_definition(self.program, *property)?.ty;
                 let value = self.lower_rvalue(value)?;
                 let address = self.lower_property_address(*object, *property)?;
+                let old_error = matches!(property_ty, mir::Type::Error | mir::Type::NullableError)
+                    .then(|| {
+                        build(self.builder.build_load(
+                            error_carrier_type(self.context),
+                            address,
+                            "property.old.error",
+                        ))
+                        .map(BasicValueEnum::into_struct_value)
+                    })
+                    .transpose()?;
                 let old = match property_ty {
                     mir::Type::String
                     | mir::Type::Class(_)
@@ -1805,7 +2095,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         self.copy_payload_bytes(old, address, payload, nullable)?;
                         Some(old)
                     }
-                    mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => None,
+                    mir::Type::Scalar(_)
+                    | mir::Type::NullableScalar(_)
+                    | mir::Type::Error
+                    | mir::Type::NullableError => None,
                 };
                 if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
                     property_ty
@@ -1853,11 +2146,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     }
                     _ => {}
                 }
+                if let Some(old_error) = old_error {
+                    self.drop_error_value(old_error)?;
+                }
             }
             mir::Statement::AssignStatic { target, value } => {
                 let property = static_definition(self.program, *target)?;
                 let value = self.lower_rvalue(value)?;
                 let address = self.static_address(*target)?;
+                let old_error = matches!(property.ty, mir::Type::Error | mir::Type::NullableError)
+                    .then(|| {
+                        build(self.builder.build_load(
+                            error_carrier_type(self.context),
+                            address,
+                            "static.old.error",
+                        ))
+                        .map(BasicValueEnum::into_struct_value)
+                    })
+                    .transpose()?;
                 let old = match property.ty {
                     mir::Type::String | mir::Type::Mixed | mir::Type::NullableMixed => Some(
                         build(self.builder.build_load(
@@ -1885,6 +2191,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     } else {
                         self.release_string(old)?;
                     }
+                }
+                if let Some(old_error) = old_error {
+                    self.drop_error_value(old_error)?;
                 }
             }
             mir::Statement::DropClass { local, .. } => {
@@ -1969,6 +2278,93 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 build(self.builder.build_store(slot, pointer.const_null()))?;
                 self.drop_mixed_value(value)?;
             }
+            mir::Statement::EnsureErrorOrigin { error, origin } => {
+                let slot = local_slot(&self.local_slots, *error)?;
+                let value = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    slot,
+                    "error.origin.value",
+                ))?
+                .into_struct_value();
+                let (object, descriptor) = self.error_parts(value)?;
+                let descriptor_type = error_descriptor_type(self.context, self.target_data);
+                let offset_field = build(self.builder.build_struct_gep(
+                    descriptor_type,
+                    descriptor,
+                    5,
+                    "error.origin.offset-field",
+                ))?;
+                let word = self.context.ptr_sized_int_type(self.target_data, None);
+                let offset = build(self.builder.build_load(
+                    word,
+                    offset_field,
+                    "error.origin.offset",
+                ))?
+                .into_int_value();
+                let origin_slot = unsafe {
+                    build(self.builder.build_in_bounds_gep(
+                        self.context.i8_type(),
+                        object,
+                        &[offset],
+                        "error.origin.slot",
+                    ))?
+                };
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let current = build(self.builder.build_load(
+                    pointer,
+                    origin_slot,
+                    "error.origin.current",
+                ))?
+                .into_pointer_value();
+                let empty = build(self.builder.build_is_null(current, "error.origin.empty"))?;
+                let function = current_function(&self.builder)?;
+                let write = self
+                    .context
+                    .append_basic_block(function, "error.origin.write");
+                let done = self
+                    .context
+                    .append_basic_block(function, "error.origin.done");
+                build(self.builder.build_conditional_branch(empty, write, done))?;
+                self.builder.position_at_end(write);
+                build(
+                    self.builder
+                        .build_store(origin_slot, self.error_origin_address(*origin)?),
+                )?;
+                build(self.builder.build_unconditional_branch(done))?;
+                self.builder.position_at_end(done);
+            }
+            mir::Statement::ExtractErrorObject { target, error, .. } => {
+                let error_slot = local_slot(&self.local_slots, *error)?;
+                let value = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    error_slot,
+                    "error.extract.value",
+                ))?
+                .into_struct_value();
+                let (object, _) = self.error_parts(value)?;
+                build(
+                    self.builder
+                        .build_store(local_slot(&self.local_slots, *target)?, object),
+                )?;
+                build(
+                    self.builder
+                        .build_store(error_slot, error_carrier_type(self.context).const_zero()),
+                )?;
+            }
+            mir::Statement::DropError { local } => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    slot,
+                    "error.drop.value",
+                ))?
+                .into_struct_value();
+                build(
+                    self.builder
+                        .build_store(slot, error_carrier_type(self.context).const_zero()),
+                )?;
+                self.drop_error_value(value)?;
+            }
             mir::Statement::DropSharedReference { local, .. } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let slot = local_slot(&self.local_slots, *local)?;
@@ -2025,6 +2421,31 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let value = self.lower_rvalue(expression)?;
                 self.defer_class_temporary_drops = false;
                 self.flush_deferred_class_temporary_drops()?;
+                if let Some(destination) = self
+                    .return_address
+                    .filter(|_| !self.function.checked_effects.is_empty())
+                {
+                    if let mir::Type::PayloadEnum(payload)
+                    | mir::Type::NullablePayloadEnum(payload) = expression.ty()
+                    {
+                        self.copy_payload_bytes(
+                            destination,
+                            value.into_pointer_value(),
+                            payload,
+                            matches!(expression.ty(), mir::Type::NullablePayloadEnum(_)),
+                        )?;
+                    } else {
+                        build(self.builder.build_store(destination, value))?;
+                    }
+                    self.cleanup_mixed_locals()?;
+                    self.cleanup_class_locals()?;
+                    self.cleanup_string_locals()?;
+                    build(
+                        self.builder
+                            .build_return(Some(&self.context.i8_type().const_zero())),
+                    )?;
+                    return Ok(());
+                }
                 self.cleanup_mixed_locals()?;
                 self.cleanup_class_locals()?;
                 self.cleanup_string_locals()?;
@@ -2049,7 +2470,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.cleanup_mixed_locals()?;
                 self.cleanup_class_locals()?;
                 self.cleanup_string_locals()?;
-                build(self.builder.build_return(None))?;
+                if self.checked_error_address.is_some() {
+                    build(
+                        self.builder
+                            .build_return(Some(&self.context.i8_type().const_zero())),
+                    )?;
+                } else {
+                    build(self.builder.build_return(None))?;
+                }
             }
             mir::Terminator::Panic { message, span } => {
                 self.set_active_panic_site(*span)?;
@@ -2132,6 +2560,222 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 build(
                     self.builder
                         .build_unconditional_branch(block_for(&self.blocks, *else_block)?),
+                )?;
+            }
+            mir::Terminator::CheckedCall {
+                function,
+                args,
+                result,
+                error,
+                success,
+                failure,
+                span,
+            } => {
+                self.set_active_panic_site(*span)?;
+                let callee = *self.functions.get(function.0).ok_or_else(|| {
+                    malformed_mir(format!("function{} does not exist", function.0))
+                })?;
+                let callee_definition = function_in(self.program, *function)?;
+                let lowered = self.lower_call_arguments(args)?;
+                let mut values = Vec::with_capacity(lowered.values.len() + 3);
+                values.push(self.current_frame.into());
+                if let Some(result) = result {
+                    values.push(local_slot(&self.local_slots, *result)?.into());
+                }
+                values.push(local_slot(&self.local_slots, *error)?.into());
+                values.extend(lowered.values.iter().copied());
+                let call = build(self.builder.build_call(callee, &values, "checked.call"))?;
+                apply_call_abi_attributes(self.context, call, callee_definition)?;
+                let status = call
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| malformed_mir("checked call produced no status"))?
+                    .into_int_value();
+                self.cleanup_call_arguments(*function, args, false, &lowered)?;
+
+                let current = current_function(&self.builder)?;
+                let failure_status = self
+                    .context
+                    .append_basic_block(current, "checked.call.failure-status");
+                let invalid_status = self
+                    .context
+                    .append_basic_block(current, "checked.call.invalid-status");
+                let succeeded = build(self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    status,
+                    self.context.i8_type().const_zero(),
+                    "checked.call.succeeded",
+                ))?;
+                build(self.builder.build_conditional_branch(
+                    succeeded,
+                    block_for(&self.blocks, *success)?,
+                    failure_status,
+                ))?;
+                self.builder.position_at_end(failure_status);
+                let failed = build(self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    status,
+                    self.context.i8_type().const_int(1, false),
+                    "checked.call.failed",
+                ))?;
+                build(self.builder.build_conditional_branch(
+                    failed,
+                    block_for(&self.blocks, *failure)?,
+                    invalid_status,
+                ))?;
+                self.builder.position_at_end(invalid_status);
+                build(self.builder.build_unreachable())?;
+            }
+            mir::Terminator::CheckedConstruct {
+                class,
+                properties,
+                constructor,
+                args,
+                result,
+                error,
+                success,
+                failure,
+                span,
+            } => {
+                self.set_active_panic_site(*span)?;
+                let (object, lowered) = self.lower_class_allocation(*class, properties, args)?;
+                let callee = *self.functions.get(constructor.0).ok_or_else(|| {
+                    malformed_mir(format!("function{} does not exist", constructor.0))
+                })?;
+                let callee_definition = function_in(self.program, *constructor)?;
+                let mut values = Vec::with_capacity(lowered.values.len() + 3);
+                values.push(self.current_frame.into());
+                values.push(local_slot(&self.local_slots, *error)?.into());
+                values.push(object.into());
+                values.extend(lowered.values.iter().copied());
+                let call = build(
+                    self.builder
+                        .build_call(callee, &values, "checked.construct"),
+                )?;
+                apply_call_abi_attributes(self.context, call, callee_definition)?;
+                let status = call
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| malformed_mir("checked constructor produced no status"))?
+                    .into_int_value();
+                self.cleanup_constructor_arguments(*constructor, properties, args, &lowered)?;
+
+                let current = current_function(&self.builder)?;
+                let success_store = self
+                    .context
+                    .append_basic_block(current, "checked.construct.success-store");
+                let failure_status = self
+                    .context
+                    .append_basic_block(current, "checked.construct.failure-status");
+                let failed_cleanup = self
+                    .context
+                    .append_basic_block(current, "checked.construct.failed-cleanup");
+                let invalid_status = self
+                    .context
+                    .append_basic_block(current, "checked.construct.invalid-status");
+                let succeeded = build(self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    status,
+                    self.context.i8_type().const_zero(),
+                    "checked.construct.succeeded",
+                ))?;
+                build(self.builder.build_conditional_branch(
+                    succeeded,
+                    success_store,
+                    failure_status,
+                ))?;
+
+                self.builder.position_at_end(success_store);
+                build(
+                    self.builder
+                        .build_store(local_slot(&self.local_slots, *result)?, object),
+                )?;
+                build(
+                    self.builder
+                        .build_unconditional_branch(block_for(&self.blocks, *success)?),
+                )?;
+
+                self.builder.position_at_end(failure_status);
+                let failed = build(self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    status,
+                    self.context.i8_type().const_int(1, false),
+                    "checked.construct.failed",
+                ))?;
+                build(self.builder.build_conditional_branch(
+                    failed,
+                    failed_cleanup,
+                    invalid_status,
+                ))?;
+
+                self.builder.position_at_end(failed_cleanup);
+                self.drop_failed_class_value(object, *class)?;
+                build(
+                    self.builder
+                        .build_unconditional_branch(block_for(&self.blocks, *failure)?),
+                )?;
+
+                self.builder.position_at_end(invalid_status);
+                build(self.builder.build_unreachable())?;
+            }
+            mir::Terminator::ErrorSwitch {
+                error,
+                cases,
+                catch_all,
+                fallback,
+            } => {
+                let slot = local_slot(&self.local_slots, *error)?;
+                let value = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    slot,
+                    "error.switch.value",
+                ))?
+                .into_struct_value();
+                let (_, descriptor) = self.error_parts(value)?;
+                let current = current_function(&self.builder)?;
+                for (expected, target) in cases {
+                    let next = self
+                        .context
+                        .append_basic_block(current, "error.switch.next");
+                    let matches = build(self.builder.build_int_compare(
+                        IntPredicate::EQ,
+                        descriptor,
+                        self.error_descriptor_address(*expected)?,
+                        "error.switch.matches",
+                    ))?;
+                    build(self.builder.build_conditional_branch(
+                        matches,
+                        block_for(&self.blocks, *target)?,
+                        next,
+                    ))?;
+                    self.builder.position_at_end(next);
+                }
+                build(self.builder.build_unconditional_branch(block_for(
+                    &self.blocks,
+                    catch_all.unwrap_or(*fallback),
+                )?))?;
+            }
+            mir::Terminator::PropagateError { error } => {
+                let destination = self.checked_error_address.ok_or_else(|| {
+                    malformed_mir("checked propagation has no caller Error out slot")
+                })?;
+                let slot = local_slot(&self.local_slots, *error)?;
+                let value = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    slot,
+                    "error.propagate.value",
+                ))?;
+                build(self.builder.build_store(destination, value))?;
+                build(
+                    self.builder
+                        .build_store(slot, error_carrier_type(self.context).const_zero()),
+                )?;
+                self.cleanup_mixed_locals()?;
+                self.cleanup_class_locals()?;
+                self.cleanup_string_locals()?;
+                build(
+                    self.builder
+                        .build_return(Some(&self.context.i8_type().const_int(1, false))),
                 )?;
             }
         }
@@ -2921,6 +3565,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match ty {
+            mir::Type::Error | mir::Type::NullableError => {
+                let value = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    address,
+                    "payload.error",
+                ))?
+                .into_struct_value();
+                self.drop_error_value(value)
+            }
             mir::Type::String | mir::Type::NullableString => {
                 let value = if ty == mir::Type::NullableString {
                     let stored = build(self.builder.build_load(
@@ -3292,6 +3945,34 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "payload.nullable.equal",
                 ))
             }
+            mir::Type::Error | mir::Type::NullableError => {
+                let carrier = error_carrier_type(self.context);
+                let left = build(self.builder.build_load(carrier, left, "payload.left.error"))?
+                    .into_struct_value();
+                let right = build(
+                    self.builder
+                        .build_load(carrier, right, "payload.right.error"),
+                )?
+                .into_struct_value();
+                let (left_object, left_descriptor) = self.error_parts(left)?;
+                let (right_object, right_descriptor) = self.error_parts(right)?;
+                let object_equal = build(self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    left_object,
+                    right_object,
+                    "payload.error.object.equal",
+                ))?;
+                let descriptor_equal = build(self.builder.build_int_compare(
+                    IntPredicate::EQ,
+                    left_descriptor,
+                    right_descriptor,
+                    "payload.error.descriptor.equal",
+                ))?;
+                build(
+                    self.builder
+                        .build_and(object_equal, descriptor_equal, "payload.error.equal"),
+                )
+            }
             mir::Type::String | mir::Type::NullableString => {
                 let (left, right, symbol) = if ty == mir::Type::NullableString {
                     let llvm_ty = llvm_type(self.context, self.target_data, ty);
@@ -3429,6 +4110,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Rvalue::NullableMixed(value) => {
                 Ok(self.lower_nullable_mixed_expression(value)?.into())
             }
+            mir::Rvalue::Error(value) => Ok(self.lower_error_expression(value)?.into()),
+            mir::Rvalue::NullableError(value) => {
+                Ok(self.lower_nullable_error_expression(value)?.into())
+            }
             mir::Rvalue::SharedReference(value) => {
                 Ok(self.lower_shared_reference_expression(value)?.into())
             }
@@ -3466,6 +4151,366 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 Ok(self.lower_nullable_payload_enum_expression(value)?.into())
             }
         }
+    }
+
+    fn lower_error_expression(
+        &mut self,
+        expression: &mir::ErrorExpression,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        match expression {
+            mir::ErrorExpression::Local { local, transfer } => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    slot,
+                    "error.local",
+                ))?
+                .into_struct_value();
+                if *transfer {
+                    build(
+                        self.builder
+                            .build_store(slot, error_carrier_type(self.context).const_zero()),
+                    )?;
+                }
+                Ok(value)
+            }
+            mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer } => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    slot,
+                    "error.nullable.local.nonnull",
+                ))?
+                .into_struct_value();
+                if *transfer {
+                    build(
+                        self.builder
+                            .build_store(slot, error_carrier_type(self.context).const_zero()),
+                    )?;
+                }
+                Ok(value)
+            }
+            mir::ErrorExpression::FromClass { object, descriptor } => {
+                let object = self.lower_class_expression(object)?;
+                self.error_value(object, self.error_descriptor_address(*descriptor)?)
+            }
+            mir::ErrorExpression::FromNullableClass { object, descriptor } => {
+                let object = self.lower_nullable_class_expression(object)?;
+                let present = build(self.builder.build_is_not_null(object, "error.present"))?;
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let descriptor = build(self.builder.build_select(
+                    present,
+                    self.error_descriptor_address(*descriptor)?,
+                    pointer.const_null(),
+                    "error.nullable.descriptor",
+                ))?
+                .into_pointer_value();
+                self.error_value(object, descriptor)
+            }
+            mir::ErrorExpression::Property {
+                object,
+                property,
+                transfer,
+            } => {
+                let address = self.lower_property_address(*object, *property)?;
+                let value = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    address,
+                    "error.property",
+                ))?
+                .into_struct_value();
+                if *transfer {
+                    build(
+                        self.builder
+                            .build_store(address, error_carrier_type(self.context).const_zero()),
+                    )?;
+                }
+                Ok(value)
+            }
+            mir::ErrorExpression::Call { function, args, .. } => Ok(self
+                .lower_call(*function, args, true)?
+                .ok_or_else(|| malformed_mir("Error call returned void"))?
+                .into_struct_value()),
+            mir::ErrorExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+            } => self.lower_error_collection_index(*collection, index, *positional, *remove),
+            mir::ErrorExpression::MixedPayload { mixed, transfer } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let slot = local_slot(&self.local_slots, *mixed)?;
+                let mixed = build(self.builder.build_load(pointer, slot, "mixed.error.local"))?
+                    .into_pointer_value();
+                let payload = self
+                    .call_runtime(
+                        MIXED_PAYLOAD,
+                        &[pointer.into()],
+                        Some(self.context.i64_type().into()),
+                        &[mixed.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("mixed Error payload read produced no result"))?
+                    .into_int_value();
+                let address = build(self.builder.build_int_to_ptr(
+                    payload,
+                    pointer,
+                    "mixed.error.payload",
+                ))?;
+                let value = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    address,
+                    "mixed.error.value",
+                ))?
+                .into_struct_value();
+                if *transfer {
+                    build(self.builder.build_store(slot, pointer.const_null()))?;
+                    let final_claim = self
+                        .call_runtime(
+                            MIXED_RELEASE_OWNED,
+                            &[pointer.into()],
+                            Some(self.context.i8_type().into()),
+                            &[mixed.into()],
+                        )?
+                        .ok_or_else(|| {
+                            backend_failure("mixed Error move released no ownership claim")
+                        })?
+                        .into_int_value();
+                    let shared = build(self.builder.build_int_compare(
+                        IntPredicate::EQ,
+                        final_claim,
+                        self.context.i8_type().const_zero(),
+                        "mixed.error.move.shared",
+                    ))?;
+                    self.lower_panic_if_code(shared, "P1321", self.function.source_span)?;
+                    let _ =
+                        self.call_runtime(MIXED_FREE, &[pointer.into()], None, &[mixed.into()])?;
+                }
+                Ok(value)
+            }
+        }
+    }
+
+    fn lower_nullable_error_expression(
+        &mut self,
+        expression: &mir::NullableErrorExpression,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        match expression {
+            mir::NullableErrorExpression::Null => Ok(error_carrier_type(self.context).const_zero()),
+            mir::NullableErrorExpression::Error(value) => self.lower_error_expression(value),
+            mir::NullableErrorExpression::Local { local, transfer } => {
+                self.lower_error_expression(&mir::ErrorExpression::Local {
+                    local: *local,
+                    transfer: *transfer,
+                })
+            }
+            mir::NullableErrorExpression::Property {
+                object,
+                property,
+                transfer,
+            } => self.lower_error_expression(&mir::ErrorExpression::Property {
+                object: *object,
+                property: *property,
+                transfer: *transfer,
+            }),
+            mir::NullableErrorExpression::Call { function, args, .. } => Ok(self
+                .lower_call(*function, args, true)?
+                .ok_or_else(|| malformed_mir("nullable Error call returned void"))?
+                .into_struct_value()),
+            mir::NullableErrorExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+            } => self.lower_error_collection_index(*collection, index, *positional, *remove),
+            mir::NullableErrorExpression::DictionaryGet {
+                collection,
+                key,
+                access,
+            } => self.lower_nullable_error_collection_get(*collection, key, *access),
+        }
+    }
+
+    fn lower_error_collection_index(
+        &mut self,
+        collection: mir::LocalId,
+        index: &mir::Rvalue,
+        positional: bool,
+        remove: bool,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let local = local_in(self.function, collection)?;
+        let mir::Type::Collection(collection_type) = local.ty else {
+            return Err(malformed_mir(
+                "Error collection place uses a non-collection local",
+            ));
+        };
+        let definition = self.collection_definition(collection_type)?.clone();
+        let index_type = match (positional, definition.key) {
+            (false, Some(key)) => key,
+            _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+        };
+        let collection_value = self.collection_pointer(collection)?;
+        let index_value = self.lower_rvalue(index)?;
+        let index_word = self.value_to_collection_word(index_value, index_type)?;
+        let address = if remove {
+            let slot =
+                self.entry_alloca(error_carrier_type(self.context), "error.collection.remove")?;
+            let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+            let index = if usize_type.get_bit_width() == 64 {
+                index_word
+            } else {
+                build(self.builder.build_int_truncate(
+                    index_word,
+                    usize_type,
+                    "error.collection.remove.index",
+                ))?
+            };
+            let _ = self.call_runtime(
+                COLLECTION_AGGREGATE_REMOVE_AT_INTO,
+                &[
+                    pointer.into(),
+                    pointer.into(),
+                    usize_type.into(),
+                    pointer.into(),
+                ],
+                None,
+                &[
+                    self.current_frame.into(),
+                    collection_value.into(),
+                    index.into(),
+                    slot.into(),
+                ],
+            )?;
+            slot
+        } else {
+            self.call_runtime(
+                COLLECTION_AGGREGATE_VALUE_AT,
+                &[
+                    pointer.into(),
+                    pointer.into(),
+                    self.context.i64_type().into(),
+                    self.context.i8_type().into(),
+                    self.context.i8_type().into(),
+                ],
+                Some(pointer.into()),
+                &[
+                    self.current_frame.into(),
+                    collection_value.into(),
+                    index_word.into(),
+                    self.context
+                        .i8_type()
+                        .const_int(u64::from(positional), false)
+                        .into(),
+                    self.collection_compare_kind(index_type)?.into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("Error collection read produced no slot"))?
+            .into_pointer_value()
+        };
+        if index_type == mir::Type::String {
+            self.release_string(index_value.into_pointer_value())?;
+        }
+        Ok(build(self.builder.build_load(
+            error_carrier_type(self.context),
+            address,
+            "error.collection.value",
+        ))?
+        .into_struct_value())
+    }
+
+    fn lower_nullable_error_collection_get(
+        &mut self,
+        collection: mir::LocalId,
+        key: &mir::Rvalue,
+        access: mir::NullableCollectionAccess,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let local = local_in(self.function, collection)?;
+        let mir::Type::Collection(collection_type) = local.ty else {
+            return Err(malformed_mir(
+                "nullable Error access uses a non-collection local",
+            ));
+        };
+        let definition = self.collection_definition(collection_type)?.clone();
+        let key_type = match access {
+            mir::NullableCollectionAccess::Get
+            | mir::NullableCollectionAccess::Index
+            | mir::NullableCollectionAccess::Remove => definition
+                .key
+                .ok_or_else(|| malformed_mir("dictionary access has no key type"))?,
+            _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+        };
+        let collection_value = self.collection_pointer(collection)?;
+        let key_value = self.lower_rvalue(key)?;
+        let key_word = self.value_to_collection_word(key_value, key_type)?;
+        let result = self.entry_alloca(
+            error_carrier_type(self.context),
+            "error.collection.optional",
+        )?;
+        build(
+            self.builder
+                .build_store(result, error_carrier_type(self.context).const_zero()),
+        )?;
+        let found = self.entry_alloca(self.context.i8_type(), "error.collection.found")?;
+        let removed_key =
+            self.entry_alloca(self.context.i64_type(), "error.collection.removed-key")?;
+        let stored_nullable = definition.value == mir::Type::NullableError;
+        let _ = self.call_runtime(
+            COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO,
+            &[
+                pointer.into(),
+                self.context.i64_type().into(),
+                self.context.i8_type().into(),
+                self.context.i8_type().into(),
+                self.context.i8_type().into(),
+                pointer.into(),
+                pointer.into(),
+                pointer.into(),
+            ],
+            None,
+            &[
+                collection_value.into(),
+                key_word.into(),
+                self.collection_compare_kind(key_type)?.into(),
+                self.context
+                    .i8_type()
+                    .const_int(
+                        u64::from(nullable_collection_access_code(access).ok_or_else(|| {
+                            malformed_mir("Error nullable index requires a direct access code")
+                        })?),
+                        false,
+                    )
+                    .into(),
+                self.context
+                    .i8_type()
+                    .const_int(u64::from(stored_nullable), false)
+                    .into(),
+                found.into(),
+                removed_key.into(),
+                result.into(),
+            ],
+        )?;
+        if key_type == mir::Type::String {
+            self.release_string(key_value.into_pointer_value())?;
+            if access == mir::NullableCollectionAccess::Remove {
+                let removed = build(self.builder.build_load(
+                    self.context.i64_type(),
+                    removed_key,
+                    "error.collection.removed-key.value",
+                ))?
+                .into_int_value();
+                self.release_string(
+                    self.collection_word_to_value(removed, mir::Type::String)?
+                        .into_pointer_value(),
+                )?;
+            }
+        }
+        Ok(build(self.builder.build_load(
+            error_carrier_type(self.context),
+            result,
+            "error.collection.optional.value",
+        ))?
+        .into_struct_value())
     }
 
     fn lower_nullable_collection_parts(
@@ -3548,6 +4593,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "payload enum collection values require aggregate comparison",
                 ))
             }
+            mir::Type::Error | mir::Type::NullableError => {
+                return Err(malformed_mir(
+                    "Error collection values require aggregate identity comparison",
+                ))
+            }
         };
         Ok(self.context.i8_type().const_int(u64::from(kind), false))
     }
@@ -3620,6 +4670,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )),
             mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => Err(malformed_mir(
                 "payload enum collection values require aggregate transport",
+            )),
+            mir::Type::Error | mir::Type::NullableError => Err(malformed_mir(
+                "Error collection values require aggregate transport",
             )),
         }
     }
@@ -3706,6 +4759,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
                 return Err(malformed_mir(
                     "payload enum collection values require aggregate transport",
+                ))
+            }
+            mir::Type::Error | mir::Type::NullableError => {
+                return Err(malformed_mir(
+                    "Error collection values require aggregate transport",
                 ))
             }
         })
@@ -3980,6 +5038,185 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(result)
     }
 
+    fn lower_error_collection_literal(
+        &mut self,
+        definition: &mir::CollectionType,
+        entries: &[mir::CollectionEntry],
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let byte = self.context.i8_type();
+        let fixed = definition.kind == mir::CollectionKind::TypedArray;
+        let carrier = error_carrier_type(self.context);
+        let result = self
+            .call_runtime(
+                COLLECTION_AGGREGATE_NEW,
+                &[
+                    pointer.into(),
+                    usize_type.into(),
+                    byte.into(),
+                    byte.into(),
+                    usize_type.into(),
+                    usize_type.into(),
+                    byte.into(),
+                    byte.into(),
+                ],
+                Some(pointer.into()),
+                &[
+                    self.current_frame.into(),
+                    usize_type.const_int(entries.len() as u64, false).into(),
+                    byte.const_int(u64::from(definition.key.is_some()), false)
+                        .into(),
+                    byte.const_int(u64::from(fixed), false).into(),
+                    usize_type
+                        .const_int(self.target_data.get_store_size(&carrier), false)
+                        .into(),
+                    usize_type
+                        .const_int(
+                            u64::from(self.target_data.get_abi_alignment(&carrier)),
+                            false,
+                        )
+                        .into(),
+                    byte.const_int(
+                        u64::from(stage26_collection_kind(definition.kind).unwrap_or(0)),
+                        false,
+                    )
+                    .into(),
+                    byte.const_int(
+                        u64::from(
+                            definition
+                                .comparator
+                                .map(collection_comparator_code)
+                                .unwrap_or(COLLECTION_COMPARE_WORD),
+                        ),
+                        false,
+                    )
+                    .into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("Error collection allocation produced no result"))?
+            .into_pointer_value();
+        for (index, entry) in entries.iter().enumerate() {
+            let value = self.lower_rvalue(&entry.value)?;
+            let destination = if let (Some(key_type), Some(key)) = (definition.key, &entry.key) {
+                let key = self.lower_rvalue(key)?;
+                self.lower_error_dictionary_write_slot(result, key, key_type, definition.value)?
+            } else if fixed {
+                self.call_runtime(
+                    COLLECTION_AGGREGATE_VALUE_AT,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        self.context.i64_type().into(),
+                        byte.into(),
+                        byte.into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        result.into(),
+                        self.context
+                            .i64_type()
+                            .const_int(index as u64, false)
+                            .into(),
+                        byte.const_int(1, false).into(),
+                        byte.const_int(u64::from(COLLECTION_COMPARE_WORD), false)
+                            .into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("Error array initialization produced no slot"))?
+                .into_pointer_value()
+            } else {
+                self.call_runtime(
+                    COLLECTION_AGGREGATE_PUSH_SLOT,
+                    &[pointer.into()],
+                    Some(pointer.into()),
+                    &[result.into()],
+                )?
+                .ok_or_else(|| backend_failure("Error collection insertion produced no slot"))?
+                .into_pointer_value()
+            };
+            self.store_value_at_address(destination, value, definition.value)?;
+        }
+        if stage26_collection_kind(definition.kind).is_some() {
+            let _ = self.call_runtime(
+                COLLECTION_STAGE26_FINALIZE,
+                &[pointer.into()],
+                None,
+                &[result.into()],
+            )?;
+        }
+        Ok(result)
+    }
+
+    fn lower_error_dictionary_write_slot(
+        &mut self,
+        collection: PointerValue<'ctx>,
+        key: BasicValueEnum<'ctx>,
+        key_type: mir::Type,
+        value_type: mir::Type,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let byte = self.context.i8_type();
+        let key_word = self.value_to_collection_word(key, key_type)?;
+        let replaced = self.entry_alloca(byte, "error.dictionary.replaced")?;
+        let destination = self
+            .call_runtime(
+                COLLECTION_AGGREGATE_KEYED_SET_SLOT,
+                &[
+                    pointer.into(),
+                    self.context.i64_type().into(),
+                    byte.into(),
+                    pointer.into(),
+                ],
+                Some(pointer.into()),
+                &[
+                    collection.into(),
+                    key_word.into(),
+                    self.collection_compare_kind(key_type)?.into(),
+                    replaced.into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("Error dictionary write produced no slot"))?
+            .into_pointer_value();
+        let replaced = build(self.builder.build_load(
+            byte,
+            replaced,
+            "error.dictionary.replaced.value",
+        ))?
+        .into_int_value();
+        let function = current_function(&self.builder)?;
+        let drop = self
+            .context
+            .append_basic_block(function, "error.dictionary.replace.drop");
+        let done = self
+            .context
+            .append_basic_block(function, "error.dictionary.replace.done");
+        let has_old = build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            replaced,
+            byte.const_zero(),
+            "error.dictionary.replaced",
+        ))?;
+        build(self.builder.build_conditional_branch(has_old, drop, done))?;
+        self.builder.position_at_end(drop);
+        let old = build(self.builder.build_load(
+            error_carrier_type(self.context),
+            destination,
+            "error.dictionary.old",
+        ))?
+        .into_struct_value();
+        self.drop_error_value(old)?;
+        self.drop_stored_value(key, key_type)?;
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        debug_assert!(matches!(
+            value_type,
+            mir::Type::Error | mir::Type::NullableError
+        ));
+        Ok(destination)
+    }
+
     fn lower_aggregate_dictionary_write_slot(
         &mut self,
         collection: PointerValue<'ctx>,
@@ -4173,6 +5410,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         ty,
                         nullable,
                     );
+                }
+                if matches!(
+                    definition.value,
+                    mir::Type::Error | mir::Type::NullableError
+                ) {
+                    return self.lower_error_collection_literal(&definition, entries);
                 }
                 let fixed = definition.kind == mir::CollectionKind::TypedArray;
                 let value_width = collection_value_width(
@@ -4988,6 +6231,53 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         } else {
             None
         };
+        if matches!(
+            definition.value,
+            mir::Type::Error | mir::Type::NullableError
+        ) {
+            if op == mir::CollectionMutationOp::Remove {
+                return Err(malformed_mir(
+                    "Error remove-by-value requires a collection equality capability",
+                ));
+            }
+            let value = self.lower_rvalue(value)?;
+            let destination = if op == mir::CollectionMutationOp::InsertAt {
+                self.call_runtime(
+                    COLLECTION_AGGREGATE_INSERT_SLOT,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        self.context
+                            .ptr_sized_int_type(self.target_data, None)
+                            .into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        collection_value.into(),
+                        index.expect("insertAt index was lowered").into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("Error collection insertion produced no slot"))?
+                .into_pointer_value()
+            } else {
+                let symbol = if op == mir::CollectionMutationOp::PushFront {
+                    COLLECTION_AGGREGATE_PUSH_FRONT_SLOT
+                } else {
+                    COLLECTION_AGGREGATE_PUSH_SLOT
+                };
+                self.call_runtime(
+                    symbol,
+                    &[pointer.into()],
+                    Some(pointer.into()),
+                    &[collection_value.into()],
+                )?
+                .ok_or_else(|| backend_failure("Error collection insertion produced no slot"))?
+                .into_pointer_value()
+            };
+            self.store_value_at_address(destination, value, definition.value)?;
+            return Ok(());
+        }
         if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
             if op == mir::CollectionMutationOp::Remove {
                 return Err(malformed_mir(
@@ -5273,6 +6563,59 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let definition = self.collection_definition(collection_type)?.clone();
         let collection_value = self.collection_pointer(collection)?;
         let index = self.lower_rvalue(index)?;
+        if matches!(
+            definition.value,
+            mir::Type::Error | mir::Type::NullableError
+        ) {
+            let replacement = self.lower_rvalue(value)?;
+            let destination = if let Some(key_type) = definition.key.filter(|_| !positional) {
+                self.lower_error_dictionary_write_slot(
+                    collection_value,
+                    index,
+                    key_type,
+                    definition.value,
+                )?
+            } else {
+                let index = self.value_to_collection_word(
+                    index,
+                    mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                )?;
+                let destination = self
+                    .call_runtime(
+                        COLLECTION_AGGREGATE_VALUE_AT,
+                        &[
+                            pointer.into(),
+                            pointer.into(),
+                            self.context.i64_type().into(),
+                            self.context.i8_type().into(),
+                            self.context.i8_type().into(),
+                        ],
+                        Some(pointer.into()),
+                        &[
+                            self.current_frame.into(),
+                            collection_value.into(),
+                            index.into(),
+                            self.context.i8_type().const_int(1, false).into(),
+                            self.context
+                                .i8_type()
+                                .const_int(u64::from(COLLECTION_COMPARE_WORD), false)
+                                .into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("Error collection write produced no slot"))?
+                    .into_pointer_value();
+                let old = build(self.builder.build_load(
+                    error_carrier_type(self.context),
+                    destination,
+                    "error.collection.old",
+                ))?
+                .into_struct_value();
+                self.drop_error_value(old)?;
+                destination
+            };
+            self.store_value_at_address(destination, replacement, definition.value)?;
+            return Ok(());
+        }
         if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
             let replacement = self.lower_rvalue(value)?.into_pointer_value();
             let destination = if let Some(key_type) = definition.key.filter(|_| !positional) {
@@ -6089,7 +7432,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<(), BackendError> {
         if !matches!(
             ty,
-            mir::Type::String
+            mir::Type::Error
+                | mir::Type::NullableError
+                | mir::Type::String
                 | mir::Type::NullableString
                 | mir::Type::Class(_)
                 | mir::Type::NullableClass(_)
@@ -6165,6 +7510,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ty: mir::Type,
     ) -> Result<(), BackendError> {
         match ty {
+            mir::Type::Error | mir::Type::NullableError => {
+                self.drop_error_value(value.into_struct_value())
+            }
             mir::Type::String => self.release_string(value.into_pointer_value()),
             mir::Type::Class(class) => {
                 self.drop_class_value_checked(value.into_pointer_value(), class)
@@ -6334,7 +7682,51 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             usize_type.const_int(1, false),
             "collection.drop.current",
         ))?;
-        if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
+        if matches!(
+            definition.value,
+            mir::Type::Error | mir::Type::NullableError
+        ) {
+            let index = if usize_type.get_bit_width() == 64 {
+                current
+            } else {
+                build(self.builder.build_int_z_extend(
+                    current,
+                    self.context.i64_type(),
+                    "error.collection.drop.index",
+                ))?
+            };
+            let value = self
+                .call_runtime(
+                    COLLECTION_AGGREGATE_VALUE_AT,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        self.context.i64_type().into(),
+                        self.context.i8_type().into(),
+                        self.context.i8_type().into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        cleanup_collection.into(),
+                        index.into(),
+                        self.context.i8_type().const_int(1, false).into(),
+                        self.context
+                            .i8_type()
+                            .const_int(u64::from(COLLECTION_COMPARE_WORD), false)
+                            .into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("Error collection value read produced no slot"))?
+                .into_pointer_value();
+            let value = build(self.builder.build_load(
+                error_carrier_type(self.context),
+                value,
+                "error.collection.drop.value",
+            ))?
+            .into_struct_value();
+            self.drop_error_value(value)?;
+        } else if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
             let index = if usize_type.get_bit_width() == 64 {
                 current
             } else {
@@ -6436,7 +7828,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         expression: &mir::ClassExpression,
     ) -> Result<PointerValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
-        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         match expression {
             mir::ClassExpression::Local {
                 local, transfer, ..
@@ -6498,92 +7889,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 constructor,
                 args,
             } => {
-                // Explicit property initializers precede promoted properties in
-                // the canonical construction order, so evaluate them before any
-                // constructor-argument side effects. Arguments remain exactly-once.
-                let mut lowered_properties = Vec::with_capacity(properties.len());
-                for property in properties {
-                    lowered_properties.push(match &property.source {
-                        mir::PropertyValueSource::Expression(value) => {
-                            Some(self.lower_rvalue(value)?)
-                        }
-                        mir::PropertyValueSource::ConstructorArgument(_)
-                        | mir::PropertyValueSource::ConstructorBody => None,
-                    });
-                }
-                let mut lowered_args = Vec::with_capacity(args.len());
-                let mut owned_strings = Vec::new();
-                let mut temporary_mixed = Vec::new();
-                for (index, argument) in args.iter().enumerate() {
-                    let value = self.lower_rvalue(argument)?;
-                    match argument.ty() {
-                        mir::Type::String => {
-                            owned_strings.push((index, value.into_pointer_value()));
-                        }
-                        mir::Type::NullableString => owned_strings.push((
-                            index,
-                            self.nullable_parts(value.into_struct_value())?
-                                .1
-                                .into_pointer_value(),
-                        )),
-                        _ => {}
-                    }
-                    let ownership = argument.mixed_ownership();
-                    if ownership.has_shell() {
-                        temporary_mixed.push((index, value.into_pointer_value(), ownership));
-                    }
-                    lowered_args.push(value);
-                }
-                let class_definition = class_definition(self.program, *class)?;
-                let size = class_definition.layout.size;
-                let align = class_definition.layout.align;
-                let object = self
-                    .call_runtime(
-                        CLASS_ALLOCATE,
-                        &[pointer.into(), usize_type.into(), usize_type.into()],
-                        Some(pointer.into()),
-                        &[
-                            self.current_frame.into(),
-                            usize_type.const_int(u64::from(size), false).into(),
-                            usize_type.const_int(u64::from(align), false).into(),
-                        ],
-                    )?
-                    .ok_or_else(|| backend_failure("class allocation produced no result"))?
-                    .into_pointer_value();
-                for (property, lowered_property) in properties.iter().zip(lowered_properties) {
-                    let value = match &property.source {
-                        mir::PropertyValueSource::Expression(_) => lowered_property,
-                        mir::PropertyValueSource::ConstructorArgument(index) => {
-                            Some(*lowered_args.get(*index).ok_or_else(|| {
-                                malformed_mir(format!(
-                                    "constructor argument {index} does not exist"
-                                ))
-                            })?)
-                        }
-                        mir::PropertyValueSource::ConstructorBody => None,
-                    };
-                    let Some(value) = value else {
-                        continue;
-                    };
-                    let address =
-                        self.lower_property_address_from_value(object, property.property)?;
-                    let property_ty = property_definition(self.program, property.property)?.ty;
-                    self.store_value_at_address(address, value, property_ty)?;
-                }
+                let (object, lowered) = self.lower_class_allocation(*class, properties, args)?;
                 if let Some(constructor) = constructor {
                     let callee = *self.functions.get(constructor.0).ok_or_else(|| {
                         malformed_mir(format!("function{} does not exist", constructor.0))
                     })?;
-                    let mut constructor_args =
-                        Vec::<BasicMetadataValueEnum<'ctx>>::with_capacity(lowered_args.len() + 2);
+                    let mut constructor_args = Vec::<BasicMetadataValueEnum<'ctx>>::with_capacity(
+                        lowered.values.len() + 2,
+                    );
                     constructor_args.push(self.current_frame.into());
                     constructor_args.push(object.into());
-                    constructor_args.extend(
-                        lowered_args
-                            .iter()
-                            .copied()
-                            .map(BasicMetadataValueEnum::from),
-                    );
+                    constructor_args.extend(lowered.values.iter().copied());
                     let call = build(self.builder.build_call(
                         callee,
                         &constructor_args,
@@ -6594,84 +7910,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         call,
                         function_in(self.program, *constructor)?,
                     )?;
-
-                    let constructor_definition = function_in(self.program, *constructor)?;
-                    for (index, value, ownership) in &temporary_mixed {
-                        if args[*index].transferred_owned_local().is_some() {
-                            continue;
-                        }
-                        let promoted = properties.iter().any(|property| {
-                            matches!(
-                                property.source,
-                                mir::PropertyValueSource::ConstructorArgument(argument)
-                                    if argument == *index
-                            )
-                        });
-                        let parameter =
-                            *constructor_definition
-                                .params
-                                .get(index + 1)
-                                .ok_or_else(|| {
-                                    malformed_mir(format!(
-                                        "constructor function{} is missing parameter {index}",
-                                        constructor.0
-                                    ))
-                                })?;
-                        if !promoted && !local_in(constructor_definition, parameter)?.owned {
-                            self.cleanup_mixed_temporary(*value, *ownership)?;
-                        }
-                    }
-                    for index in ordered_owned_argument_indices(args) {
-                        let argument = &args[index];
-                        let promoted = properties.iter().any(|property| {
-                            matches!(
-                                property.source,
-                                mir::PropertyValueSource::ConstructorArgument(argument)
-                                    if argument == index
-                            )
-                        });
-                        let parameter =
-                            *constructor_definition
-                                .params
-                                .get(index + 1)
-                                .ok_or_else(|| {
-                                    malformed_mir(format!(
-                                        "constructor function{} is missing parameter {index}",
-                                        constructor.0
-                                    ))
-                                })?;
-                        if !promoted && !local_in(constructor_definition, parameter)?.owned {
-                            let value = lowered_args[index].into_pointer_value();
-                            if let Some(class) = argument.owned_temporary_class() {
-                                self.defer_or_drop_class_temporary(value, class)?;
-                            } else if let Some(collection) = argument.owned_temporary_collection() {
-                                self.defer_or_drop_collection_temporary(value, collection)?;
-                            } else if let Some(shared) = argument.owned_temporary_shared() {
-                                self.defer_or_drop_owned_shared_temporary(value, shared)?;
-                            } else if let Some((payload, nullable)) =
-                                argument.owned_temporary_payload_enum()
-                            {
-                                self.drop_payload_enum_at(value, payload, nullable)?;
-                            } else if argument.mixed_ownership().has_shell() {
-                                self.defer_or_cleanup_mixed_temporary(
-                                    value,
-                                    argument.mixed_ownership(),
-                                )?;
-                            }
-                        }
-                    }
-                }
-                for (index, string) in owned_strings {
-                    let promoted = properties.iter().any(|property| {
-                        matches!(
-                            property.source,
-                            mir::PropertyValueSource::ConstructorArgument(argument)
-                                if argument == index
-                        )
-                    });
-                    if !promoted {
-                        self.release_string(string)?;
-                    }
+                    self.cleanup_constructor_arguments(*constructor, properties, args, &lowered)?;
                 }
                 Ok(object)
             }
@@ -9389,6 +10628,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::MixedTag::Float(FloatType::Float64) => (MIXED_TAG_FLOAT64, 0),
             mir::MixedTag::String => (MIXED_TAG_STRING, 0),
             mir::MixedTag::Class(class) => (MIXED_TAG_CLASS, class.0 as u32),
+            mir::MixedTag::Error => (MIXED_TAG_ERROR, 0),
             mir::MixedTag::Enum(enum_id) => (MIXED_TAG_ENUM, enum_id.0 as u32),
             mir::MixedTag::PayloadEnum(ty) => (MIXED_TAG_PAYLOAD_ENUM, ty.id.0 as u32),
         }
@@ -9480,6 +10720,54 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let class = value.class();
                 let payload = self.lower_class_expression(value)?;
                 self.lower_mixed_box(mir::MixedTag::Class(class), payload.into(), *payload_owned)
+            }
+            mir::MixedExpression::BoxError { value } => {
+                let value = self.lower_error_expression(value)?;
+                let source = self.entry_alloca(error_carrier_type(self.context), "mixed.error")?;
+                build(self.builder.build_store(source, value))?;
+                let (tag, type_id) = self.mixed_tag_value(mir::MixedTag::Error);
+                let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+                Ok(self
+                    .call_runtime(
+                        MIXED_NEW_AGGREGATE,
+                        &[
+                            self.context.i8_type().into(),
+                            self.context.i32_type().into(),
+                            pointer.into(),
+                            usize_type.into(),
+                            usize_type.into(),
+                        ],
+                        Some(pointer.into()),
+                        &[
+                            self.context
+                                .i8_type()
+                                .const_int(u64::from(tag), false)
+                                .into(),
+                            self.context
+                                .i32_type()
+                                .const_int(u64::from(type_id), false)
+                                .into(),
+                            source.into(),
+                            usize_type
+                                .const_int(
+                                    self.target_data
+                                        .get_store_size(&error_carrier_type(self.context)),
+                                    false,
+                                )
+                                .into(),
+                            usize_type
+                                .const_int(
+                                    u64::from(
+                                        self.target_data
+                                            .get_abi_alignment(&error_carrier_type(self.context)),
+                                    ),
+                                    false,
+                                )
+                                .into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("mixed Error allocation produced no result"))?
+                    .into_pointer_value())
             }
             mir::MixedExpression::BoxPayloadEnum { value } => {
                 let ty = value.ty();
@@ -9933,6 +11221,38 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         build(self.builder.build_unconditional_branch(after_string))?;
 
         self.builder.position_at_end(after_string);
+        let error_block = self
+            .context
+            .append_basic_block(function, "mixed.drop.error");
+        let after_error = self
+            .context
+            .append_basic_block(function, "mixed.drop.after.error");
+        let is_error = build(self.builder.build_int_compare(
+            IntPredicate::EQ,
+            tag,
+            i8_type.const_int(u64::from(MIXED_TAG_ERROR), false),
+            "mixed.drop.is_error",
+        ))?;
+        build(
+            self.builder
+                .build_conditional_branch(is_error, error_block, after_error),
+        )?;
+        self.builder.position_at_end(error_block);
+        let error_address = build(self.builder.build_int_to_ptr(
+            payload,
+            pointer,
+            "mixed.error.address",
+        ))?;
+        let error = build(self.builder.build_load(
+            error_carrier_type(self.context),
+            error_address,
+            "mixed.error.value",
+        ))?
+        .into_struct_value();
+        self.drop_error_value(error)?;
+        build(self.builder.build_unconditional_branch(after_error))?;
+
+        self.builder.position_at_end(after_error);
         let class_block = self
             .context
             .append_basic_block(function, "mixed.drop.class");
@@ -10451,11 +11771,28 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         object: PointerValue<'ctx>,
         class: crate::class_layout::ClassId,
     ) -> Result<(), BackendError> {
+        self.drop_class_value_impl(object, class, true)
+    }
+
+    fn drop_failed_class_value(
+        &mut self,
+        object: PointerValue<'ctx>,
+        class: crate::class_layout::ClassId,
+    ) -> Result<(), BackendError> {
+        self.drop_class_value_impl(object, class, false)
+    }
+
+    fn drop_class_value_impl(
+        &mut self,
+        object: PointerValue<'ctx>,
+        class: crate::class_layout::ClassId,
+        run_destructor: bool,
+    ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let class_definition = class_definition(self.program, class)?;
         let destructor = class_definition.destructor;
         let properties = class_definition.properties.clone();
-        if let Some(destructor) = destructor {
+        if let Some(destructor) = destructor.filter(|_| run_destructor) {
             let callee = *self
                 .functions
                 .get(destructor.0)
@@ -10470,6 +11807,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         for property in properties.iter().rev() {
             let address = self.lower_property_address_from_value(object, property.id)?;
             match property.ty {
+                mir::Type::Error | mir::Type::NullableError => {
+                    let value = build(self.builder.build_load(
+                        error_carrier_type(self.context),
+                        address,
+                        "property.error",
+                    ))?
+                    .into_struct_value();
+                    self.drop_error_value(value)?;
+                }
                 mir::Type::String | mir::Type::NullableString => {
                     let value = build(self.builder.build_load(
                         llvm_type(self.context, self.target_data, property.ty),
@@ -10649,6 +11995,36 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::StringExpression::Property { object, property } => {
                 let address = self.lower_property_address(*object, *property)?;
                 let value = build(self.builder.build_load(pointer, address, "string.property"))?
+                    .into_pointer_value();
+                self.retain_string(value)
+            }
+            mir::StringExpression::ErrorMessage(error) => {
+                let carrier = self.lower_error_expression(error)?;
+                let (object, descriptor) = self.error_parts(carrier)?;
+                let descriptor_type = error_descriptor_type(self.context, self.target_data);
+                let offset_field = build(self.builder.build_struct_gep(
+                    descriptor_type,
+                    descriptor,
+                    2,
+                    "error.message.offset-field",
+                ))?;
+                let word = self.context.ptr_sized_int_type(self.target_data, None);
+                let offset = build(self.builder.build_load(
+                    word,
+                    offset_field,
+                    "error.message.offset",
+                ))?
+                .into_int_value();
+                let address = unsafe {
+                    build(self.builder.build_in_bounds_gep(
+                        self.context.i8_type(),
+                        object,
+                        &[offset],
+                        "error.message.address",
+                    ))?
+                };
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let value = build(self.builder.build_load(pointer, address, "error.message"))?
                     .into_pointer_value();
                 self.retain_string(value)
             }
@@ -11921,6 +13297,220 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         self.lower_call_with_receiver(function, args, expects_result, None)
     }
 
+    fn lower_call_arguments(
+        &mut self,
+        args: &[mir::Rvalue],
+    ) -> Result<LoweredCallArguments<'ctx>, BackendError> {
+        let mut values = Vec::with_capacity(args.len());
+        let mut lowered = Vec::with_capacity(args.len());
+        let mut owned_strings = Vec::new();
+        let mut temporary_mixed = Vec::new();
+        for (index, argument) in args.iter().enumerate() {
+            let value = self.lower_rvalue(argument)?;
+            match argument.ty() {
+                mir::Type::String => owned_strings.push(value.into_pointer_value()),
+                mir::Type::NullableString => owned_strings.push(
+                    self.nullable_parts(value.into_struct_value())?
+                        .1
+                        .into_pointer_value(),
+                ),
+                _ => {}
+            }
+            let ownership = argument.mixed_ownership();
+            if ownership.has_shell() {
+                temporary_mixed.push((index, value.into_pointer_value(), ownership));
+            }
+            values.push(value.into());
+            lowered.push(value);
+        }
+        Ok(LoweredCallArguments {
+            values,
+            lowered,
+            owned_strings,
+            temporary_mixed,
+        })
+    }
+
+    fn cleanup_call_arguments(
+        &mut self,
+        function: mir::FunctionId,
+        args: &[mir::Rvalue],
+        receiver_present: bool,
+        lowered: &LoweredCallArguments<'ctx>,
+    ) -> Result<(), BackendError> {
+        let callee = function_in(self.program, function)?;
+        for string in &lowered.owned_strings {
+            self.release_string(*string)?;
+        }
+        for (index, value, ownership) in &lowered.temporary_mixed {
+            if args[*index].transferred_owned_local().is_some() {
+                continue;
+            }
+            let parameter_index = *index + usize::from(receiver_present);
+            let parameter = *callee.params.get(parameter_index).ok_or_else(|| {
+                malformed_mir(format!(
+                    "function{} is missing parameter {parameter_index}",
+                    function.0
+                ))
+            })?;
+            if !local_in(callee, parameter)?.owned {
+                self.cleanup_mixed_temporary(*value, *ownership)?;
+            }
+        }
+        for index in ordered_owned_argument_indices(args) {
+            let argument = &args[index];
+            let parameter_index = index + usize::from(receiver_present);
+            let parameter = *callee.params.get(parameter_index).ok_or_else(|| {
+                malformed_mir(format!(
+                    "function{} is missing parameter {parameter_index}",
+                    function.0
+                ))
+            })?;
+            if !local_in(callee, parameter)?.owned {
+                let value = lowered.lowered[index].into_pointer_value();
+                if let Some(class) = argument.owned_temporary_class() {
+                    self.defer_or_drop_class_temporary(value, class)?;
+                } else if let Some(collection) = argument.owned_temporary_collection() {
+                    self.defer_or_drop_collection_temporary(value, collection)?;
+                } else if let Some(shared) = argument.owned_temporary_shared() {
+                    self.defer_or_drop_owned_shared_temporary(value, shared)?;
+                } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
+                    self.drop_payload_enum_at(value, payload, nullable)?;
+                } else if argument.mixed_ownership().has_shell() {
+                    self.defer_or_cleanup_mixed_temporary(value, argument.mixed_ownership())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cleanup_constructor_arguments(
+        &mut self,
+        constructor: mir::FunctionId,
+        properties: &[mir::PropertyValue],
+        args: &[mir::Rvalue],
+        lowered: &LoweredCallArguments<'ctx>,
+    ) -> Result<(), BackendError> {
+        let definition = function_in(self.program, constructor)?;
+        let promoted = |index| {
+            properties.iter().any(|property| {
+                matches!(
+                    property.source,
+                    mir::PropertyValueSource::ConstructorArgument(argument)
+                        if argument == index
+                )
+            })
+        };
+        for (index, value, ownership) in &lowered.temporary_mixed {
+            if args[*index].transferred_owned_local().is_some() || promoted(*index) {
+                continue;
+            }
+            let parameter = *definition.params.get(index + 1).ok_or_else(|| {
+                malformed_mir(format!(
+                    "constructor function{} is missing parameter {index}",
+                    constructor.0
+                ))
+            })?;
+            if !local_in(definition, parameter)?.owned {
+                self.cleanup_mixed_temporary(*value, *ownership)?;
+            }
+        }
+        for index in ordered_owned_argument_indices(args) {
+            if promoted(index) {
+                continue;
+            }
+            let argument = &args[index];
+            let parameter = *definition.params.get(index + 1).ok_or_else(|| {
+                malformed_mir(format!(
+                    "constructor function{} is missing parameter {index}",
+                    constructor.0
+                ))
+            })?;
+            if !local_in(definition, parameter)?.owned {
+                let value = lowered.lowered[index].into_pointer_value();
+                if let Some(class) = argument.owned_temporary_class() {
+                    self.defer_or_drop_class_temporary(value, class)?;
+                } else if let Some(collection) = argument.owned_temporary_collection() {
+                    self.defer_or_drop_collection_temporary(value, collection)?;
+                } else if let Some(shared) = argument.owned_temporary_shared() {
+                    self.defer_or_drop_owned_shared_temporary(value, shared)?;
+                } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
+                    self.drop_payload_enum_at(value, payload, nullable)?;
+                } else if argument.mixed_ownership().has_shell() {
+                    self.defer_or_cleanup_mixed_temporary(value, argument.mixed_ownership())?;
+                }
+            }
+        }
+        let mut strings = lowered.owned_strings.iter();
+        for (index, argument) in args.iter().enumerate() {
+            if matches!(argument.ty(), mir::Type::String | mir::Type::NullableString) {
+                let string = *strings
+                    .next()
+                    .expect("lowered string arguments preserve source order");
+                if !promoted(index) {
+                    self.release_string(string)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_class_allocation(
+        &mut self,
+        class: crate::class_layout::ClassId,
+        properties: &[mir::PropertyValue],
+        args: &[mir::Rvalue],
+    ) -> Result<(PointerValue<'ctx>, LoweredCallArguments<'ctx>), BackendError> {
+        // Property initializers precede constructor arguments in Doria source order.
+        let mut lowered_properties = Vec::with_capacity(properties.len());
+        for property in properties {
+            lowered_properties.push(match &property.source {
+                mir::PropertyValueSource::Expression(value) => Some(self.lower_rvalue(value)?),
+                mir::PropertyValueSource::ConstructorArgument(_)
+                | mir::PropertyValueSource::ConstructorBody => None,
+            });
+        }
+        let lowered = self.lower_call_arguments(args)?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let class_definition = class_definition(self.program, class)?;
+        let object = self
+            .call_runtime(
+                CLASS_ALLOCATE,
+                &[pointer.into(), usize_type.into(), usize_type.into()],
+                Some(pointer.into()),
+                &[
+                    self.current_frame.into(),
+                    usize_type
+                        .const_int(u64::from(class_definition.layout.size), false)
+                        .into(),
+                    usize_type
+                        .const_int(u64::from(class_definition.layout.align), false)
+                        .into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("class allocation produced no result"))?
+            .into_pointer_value();
+        for (property, lowered_property) in properties.iter().zip(lowered_properties) {
+            let value = match &property.source {
+                mir::PropertyValueSource::Expression(_) => lowered_property,
+                mir::PropertyValueSource::ConstructorArgument(index) => {
+                    Some(*lowered.lowered.get(*index).ok_or_else(|| {
+                        malformed_mir(format!("constructor argument {index} does not exist"))
+                    })?)
+                }
+                mir::PropertyValueSource::ConstructorBody => None,
+            };
+            let Some(value) = value else {
+                continue;
+            };
+            let address = self.lower_property_address_from_value(object, property.property)?;
+            let property_ty = property_definition(self.program, property.property)?.ty;
+            self.store_value_at_address(address, value, property_ty)?;
+        }
+        Ok((object, lowered))
+    }
+
     fn lower_method_call(
         &mut self,
         receiver: PointerValue<'ctx>,
@@ -11964,27 +13554,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         if let Some(receiver) = receiver {
             values.push(receiver.into());
         }
-        let mut lowered_args = Vec::with_capacity(args.len());
-        let mut owned_strings = Vec::new();
-        let mut temporary_mixed = Vec::new();
-        for (index, argument) in args.iter().enumerate() {
-            let value = self.lower_rvalue(argument)?;
-            match argument.ty() {
-                mir::Type::String => owned_strings.push(value.into_pointer_value()),
-                mir::Type::NullableString => owned_strings.push(
-                    self.nullable_parts(value.into_struct_value())?
-                        .1
-                        .into_pointer_value(),
-                ),
-                _ => {}
-            }
-            let ownership = argument.mixed_ownership();
-            if ownership.has_shell() {
-                temporary_mixed.push((index, value.into_pointer_value(), ownership));
-            }
-            values.push(value.into());
-            lowered_args.push(value);
-        }
+        let lowered = self.lower_call_arguments(args)?;
+        values.extend(lowered.values.iter().copied());
         let call = build(self.builder.build_call(callee, &values, "call"))?;
         apply_call_abi_attributes(self.context, call, function_in(self.program, function)?)?;
         let result = if expects_result {
@@ -11998,54 +13569,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         } else {
             None
         };
-        for string in owned_strings {
-            self.release_string(string)?;
-        }
-        for (index, value, ownership) in &temporary_mixed {
-            if args[*index].transferred_owned_local().is_some() {
-                continue;
-            }
-            let parameter_index = *index + usize::from(receiver.is_some());
-            let parameter = *callee_definition
-                .params
-                .get(parameter_index)
-                .ok_or_else(|| {
-                    malformed_mir(format!(
-                        "function{} is missing parameter {parameter_index}",
-                        function.0
-                    ))
-                })?;
-            if !local_in(callee_definition, parameter)?.owned {
-                self.cleanup_mixed_temporary(*value, *ownership)?;
-            }
-        }
-        for index in ordered_owned_argument_indices(args) {
-            let argument = &args[index];
-            let parameter_index = index + usize::from(receiver.is_some());
-            let parameter = *callee_definition
-                .params
-                .get(parameter_index)
-                .ok_or_else(|| {
-                    malformed_mir(format!(
-                        "function{} is missing parameter {parameter_index}",
-                        function.0
-                    ))
-                })?;
-            if !local_in(callee_definition, parameter)?.owned {
-                let value = lowered_args[index].into_pointer_value();
-                if let Some(class) = argument.owned_temporary_class() {
-                    self.defer_or_drop_class_temporary(value, class)?;
-                } else if let Some(collection) = argument.owned_temporary_collection() {
-                    self.defer_or_drop_collection_temporary(value, collection)?;
-                } else if let Some(shared) = argument.owned_temporary_shared() {
-                    self.defer_or_drop_owned_shared_temporary(value, shared)?;
-                } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
-                    self.drop_payload_enum_at(value, payload, nullable)?;
-                } else if argument.mixed_ownership().has_shell() {
-                    self.defer_or_cleanup_mixed_temporary(value, argument.mixed_ownership())?;
-                }
-            }
-        }
+        self.cleanup_call_arguments(function, args, receiver.is_some(), &lowered)?;
         Ok(result)
     }
 }
@@ -12083,15 +13607,21 @@ fn apply_call_abi_attributes(
     call: inkwell::values::CallSiteValue<'_>,
     function: &mir::Function,
 ) -> Result<(), BackendError> {
-    if let mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(ty))) =
-        function.return_type
-    {
-        apply_call_integer_extension_attribute(context, call, AttributeLoc::Return, ty);
+    if function.checked_effects.is_empty() {
+        if let mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(ty))) =
+            function.return_type
+        {
+            apply_call_integer_extension_attribute(context, call, AttributeLoc::Return, ty);
+        }
     }
-    let hidden_return = u32::from(matches!(
-        function.return_type,
-        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-    ));
+    let hidden_return = if function.checked_effects.is_empty() {
+        u32::from(matches!(
+            function.return_type,
+            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
+        ))
+    } else {
+        1 + u32::from(matches!(function.return_type, mir::ReturnType::Value(_)))
+    };
     for (index, parameter) in function.params.iter().enumerate() {
         let local = local_in(function, *parameter)?;
         if let mir::Type::Scalar(mir::ScalarType::Integer(ty)) = local.ty {
@@ -12596,6 +14126,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .build_is_not_null(value, "nullable-mixed.present"),
                 )?;
                 self.cleanup_mixed_temporary(value, ownership)?;
+                build(
+                    self.builder
+                        .build_conditional_branch(condition, then_block, else_block),
+                )?;
+            }
+            mir::BoolExpression::NullableErrorIsPresent(value) => {
+                let value = self.lower_nullable_error_expression(value)?;
+                let (object, _) = self.error_parts(value)?;
+                let condition = build(
+                    self.builder
+                        .build_is_not_null(object, "nullable-error.present"),
+                )?;
                 build(
                     self.builder
                         .build_conditional_branch(condition, then_block, else_block),
@@ -13496,6 +15038,7 @@ fn collection_storage_type<'ctx>(
 ) -> Result<BasicTypeEnum<'ctx>, BackendError> {
     Ok(match ty {
         mir::Type::Scalar(ty) => scalar_type(context, ty),
+        mir::Type::Error | mir::Type::NullableError => llvm_type(context, target_data, ty),
         mir::Type::String
         | mir::Type::Mixed
         | mir::Type::Class(_)
@@ -13552,6 +15095,32 @@ fn nullable_type<'ctx>(
     context.struct_type(&[word.into(), payload], false)
 }
 
+fn error_carrier_type(context: &Context) -> StructType<'_> {
+    let pointer = context.ptr_type(AddressSpace::default());
+    context.struct_type(&[pointer.into(), pointer.into()], false)
+}
+
+fn error_descriptor_type<'ctx>(
+    context: &'ctx Context,
+    target_data: &TargetData,
+) -> StructType<'ctx> {
+    let pointer = context.ptr_type(AddressSpace::default());
+    let word = context.ptr_sized_int_type(target_data, None);
+    context.struct_type(
+        &[
+            pointer.into(),
+            word.into(),
+            word.into(),
+            pointer.into(),
+            word.into(),
+            word.into(),
+            word.into(),
+            word.into(),
+        ],
+        false,
+    )
+}
+
 fn collection_header_type<'ctx>(
     context: &'ctx Context,
     target_data: &TargetData,
@@ -13606,6 +15175,7 @@ fn llvm_type<'ctx>(
             context.ptr_type(AddressSpace::default()).into(),
         )
         .into(),
+        mir::Type::Error | mir::Type::NullableError => error_carrier_type(context).into(),
         mir::Type::String
         | mir::Type::Class(_)
         | mir::Type::NullableClass(_)
@@ -13917,7 +15487,8 @@ fn resolve_string_expression_from_definitions(
         | mir::StringExpression::Format(_)
         | mir::StringExpression::Coalesce { .. }
         | mir::StringExpression::CollectionIndex { .. }
-        | mir::StringExpression::CollectionKeyAt { .. } => {
+        | mir::StringExpression::CollectionKeyAt { .. }
+        | mir::StringExpression::ErrorMessage(_) => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
     }
@@ -13955,7 +15526,8 @@ fn resolve_string_expression(
         | mir::StringExpression::Format(_)
         | mir::StringExpression::Coalesce { .. }
         | mir::StringExpression::CollectionIndex { .. }
-        | mir::StringExpression::CollectionKeyAt { .. } => {
+        | mir::StringExpression::CollectionKeyAt { .. }
+        | mir::StringExpression::ErrorMessage(_) => {
             Err(malformed_mir("runtime string expression is not a constant"))
         }
     }

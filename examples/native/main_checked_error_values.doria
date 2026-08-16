@@ -1,0 +1,43 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+class Holder<T>
+{
+    function __construct(take T $value)
+    {
+    }
+}
+
+function makeFailure(string $message): Error
+{
+    return new Failure($message);
+}
+
+function inspect(Error $error): void
+{
+    echo "{$error->message}\n";
+}
+
+function consume(take Error $error): void
+{
+    echo "consumed {$error->message}\n";
+}
+
+function main(): void
+{
+    Error $error = makeFailure("value");
+    inspect($error);
+
+    ?Error $optional = new Failure("optional");
+    if ($optional != null) {
+        inspect($optional);
+    }
+
+    let $holder = new Holder<Error>(new Failure("generic"));
+    inspect($holder->value);
+    consume($error);
+}

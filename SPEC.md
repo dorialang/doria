@@ -1263,13 +1263,15 @@ reverse order, uninitialized fields are ignored, allocation is freed, and the
 error continues. Fatal panic remains separate, non-catchable, cleanup-free, and
 status 101.
 
-Stage 29 Slice 1 implements grammar, semantic checking, AST/HIR, and ownership.
-Valid checked-error source succeeds through `check`, `ast`, and `hir`; MIR and
-all execution/emission backends stop once with the Stage 29 Slice 2 boundary.
-Slice 2 owns the erased carrier, checked MIR, status/out-slot ABI, propagation,
-cleanup, and backend transport. Slice 3 owns the canonical `Doria\Std\Io` error
-types, I/O signature migration, and shared `Error[R1000]` status-70 unhandled
-outcome. Nonthrowing programs remain executable throughout.
+Stage 29 Slices 1 and 2 implement grammar, semantic checking, AST/HIR,
+ownership, the two-word erased carrier, hidden first-throw origin storage,
+checked MIR, the status/out-slot ABI, propagation, cleanup, exact catches,
+rethrow, and backend transport. Handled checked errors execute through the
+interpreter, Cranelift, LLVM, and the PHP compatibility backend. Slice 3 owns the
+canonical `Doria\Std\Io` error types, I/O signature migration, and shared
+`Error[R1000]` status-70 outcome for an Error escaping `main`; that entry-boundary
+case remains rejected before artifact emission until Slice 3. Nonthrowing
+programs remain executable throughout.
 
 `Result<T, E>` is not Doria's default error model. Runtime panic is separate
 from checked `throw` / `throws`.

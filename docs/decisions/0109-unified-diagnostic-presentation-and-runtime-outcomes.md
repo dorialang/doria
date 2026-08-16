@@ -123,8 +123,9 @@ existing diagnostic and runtime-outcome model.
 - The previous function-only `DrStackFrameV1` and message-based built-in panic
   path are retired from production use rather than silently reinterpreted.
 - Checked `throw`/`throws`, `try`, `catch`, Error conformance, and effect checking
-  are implemented in Stage 29 Slice 1. Propagation, runtime Error representation,
-  and R1000 execution remain deferred to Slices 2 and 3 under Decision 0119.
+  are implemented in Stage 29 Slice 1. Propagation and the runtime Error
+  representation are implemented in Slice 2; R1000 process-outcome execution
+  remains deferred to Slice 3 under Decision 0119.
 
 ## Invalidated elsewhere
 

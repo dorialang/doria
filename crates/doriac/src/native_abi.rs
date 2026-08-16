@@ -261,6 +261,7 @@ pub const MIXED_TAG_STRING: u8 = 12;
 pub const MIXED_TAG_CLASS: u8 = 13;
 pub const MIXED_TAG_ENUM: u8 = 14;
 pub const MIXED_TAG_PAYLOAD_ENUM: u8 = 15;
+pub const MIXED_TAG_ERROR: u8 = 16;
 
 pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<u8> {
     match ty {
@@ -289,6 +290,7 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_) => Some(pointer_width),
+        mir::Type::Error | mir::Type::NullableError => pointer_width.checked_mul(2),
         mir::Type::NullableScalar(_) => Some(16),
         mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => None,
     }
@@ -299,6 +301,7 @@ pub const fn nullable_payload_type(ty: mir::Type) -> Option<mir::Type> {
         mir::Type::NullableScalar(value) => Some(mir::Type::Scalar(value)),
         mir::Type::NullableString => Some(mir::Type::String),
         mir::Type::NullableMixed => Some(mir::Type::Mixed),
+        mir::Type::NullableError => Some(mir::Type::Error),
         mir::Type::NullableClass(value) => Some(mir::Type::Class(value)),
         mir::Type::NullableSharedReference(value) => Some(mir::Type::SharedReference(value)),
         mir::Type::NullableWeakReference(value) => Some(mir::Type::WeakReference(value)),

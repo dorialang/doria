@@ -1,0 +1,38 @@
+class BuildError implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+class Part
+{
+    function __destruct(): void
+    {
+        echo "part dropped\n";
+    }
+}
+
+class Container
+{
+    Part $part = new Part();
+
+    function __construct() throws BuildError
+    {
+        throw new BuildError("construction failed");
+    }
+
+    function __destruct(): void
+    {
+        echo "container dropped\n";
+    }
+}
+
+function main(): void
+{
+    try {
+        let $container = new Container();
+    } catch (BuildError $error) {
+        echo "caught {$error->message}\n";
+    }
+}

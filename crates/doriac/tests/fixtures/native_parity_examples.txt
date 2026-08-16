@@ -237,3 +237,17 @@ examples/native/main_finally_panic_while_condition.doria
 examples/native/main_finally_panic_do_body.doria
 examples/native/main_finally_panic_do_condition.doria
 examples/native/main_finally_panic_inner_finalizer.doria
+examples/native/main_checked_error_catch.doria
+examples/native/main_checked_error_catch_all.doria
+examples/native/main_checked_error_collections.doria
+examples/native/main_checked_error_constructor.doria
+examples/native/main_checked_error_control_finalizers.doria
+examples/native/main_checked_error_failed_construction.doria
+examples/native/main_checked_error_finally.doria
+examples/native/main_checked_error_mixed.doria
+examples/native/main_checked_error_nested_try.doria
+examples/native/main_checked_error_optional_binding.doria
+examples/native/main_checked_error_origin.doria
+examples/native/main_checked_error_rethrow.doria
+examples/native/main_checked_error_values.doria
+examples/native/main_checked_error_success_values.doria

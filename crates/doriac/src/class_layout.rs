@@ -26,6 +26,8 @@ pub enum FieldType {
     NullableString,
     Mixed,
     NullableMixed,
+    Error,
+    NullableError,
     Class(ClassId),
     NullableClass(ClassId),
     SharedReference(ClassId),
@@ -92,6 +94,22 @@ pub fn compute_class_layout(
     }
 }
 
+/// Reserves one compiler-private pointer slot after the source-visible payload.
+///
+/// Error-conforming classes use this for first-throw origin metadata. The slot
+/// is deliberately absent from `properties`: source property identity and
+/// reflection-like layout remain unchanged.
+pub fn append_hidden_pointer(layout: &mut ClassLayout, pointer_size: u32) -> u32 {
+    assert!(pointer_size.is_power_of_two());
+    let offset = align_up(layout.size, pointer_size);
+    layout.size = offset
+        .checked_add(pointer_size)
+        .expect("class payload size exceeds the private u32 layout limit");
+    layout.align = layout.align.max(pointer_size);
+    layout.size = align_up(layout.size, layout.align);
+    offset
+}
+
 pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
     match ty {
         FieldType::Integer(integer) => {
@@ -110,6 +128,7 @@ pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
         | FieldType::NullableFloat(_)
         | FieldType::NullableBool
         | FieldType::NullableString => (pointer_size * 2, pointer_size),
+        FieldType::Error | FieldType::NullableError => (pointer_size * 2, pointer_size),
         FieldType::String
         | FieldType::Mixed
         | FieldType::NullableMixed

@@ -714,29 +714,52 @@ function valid(bool $first): void throws SecondError
 }
 
 #[test]
-fn stage29_slice1_stops_once_before_mir_and_backends() {
+fn stage29_slice2_executes_handled_errors_and_gates_only_escaping_main() {
     let source = format!(
-        "{} function fail(): void throws Failure {{ throw new Failure(\"x\"); }}",
+        r#"
+{}
+function fail(): void throws Failure {{ throw new Failure("x"); }}
+function main(): void
+{{
+    try {{ fail(); }} catch (Failure) {{ echo "handled"; }}
+}}
+"#,
         error_class("Failure")
     );
     doriac::check_source("checked_error.doria", &source).expect("semantic checking should succeed");
     doriac::parse_source("checked_error.doria", &source).expect("AST should succeed");
     doriac::lower_source("checked_error.doria", &source).expect("HIR should succeed");
-
-    let mir = doriac::lower_source_to_mir("checked_error.doria", &source)
-        .expect_err("MIR should stop at the Slice 2 boundary");
-    assert_eq!(mir.len(), 1);
-    assert_eq!(mir[0].code, "B2901");
+    doriac::lower_source_to_mir("checked_error.doria", &source)
+        .expect("handled checked errors should reach MIR");
 
     for target in [
         doriac::backend::BackendTarget::Debug,
         doriac::backend::BackendTarget::Native,
         doriac::backend::BackendTarget::Php,
     ] {
-        let diagnostics = doriac::compile_source("checked_error.doria", &source, target)
-            .expect_err("every executable backend should stop at the shared boundary");
+        doriac::compile_source("checked_error.doria", &source, target)
+            .expect("handled checked errors should reach every executable backend");
+    }
+
+    let escaping = format!(
+        r#"
+{}
+function fail(): void throws Failure {{ throw new Failure("x"); }}
+function main(): void throws Failure {{ fail(); }}
+"#,
+        error_class("Failure")
+    );
+    doriac::lower_source_to_mir("escaping_error.doria", &escaping)
+        .expect("escaping-main reporting is a backend boundary, not a MIR boundary");
+    for target in [
+        doriac::backend::BackendTarget::Debug,
+        doriac::backend::BackendTarget::Native,
+        doriac::backend::BackendTarget::Php,
+    ] {
+        let diagnostics = doriac::compile_source("escaping_error.doria", &escaping, target)
+            .expect_err("an Error escaping main should stop at the Slice 3 boundary");
         assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "B2901");
+        assert_eq!(diagnostics[0].code, "B2902");
     }
 
     doriac::compile_source(

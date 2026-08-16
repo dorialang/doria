@@ -44,7 +44,13 @@ $typesPath = 'crates/doriac/src/types.rs';
 $semanticsPath = 'crates/doriac/src/semantics.rs';
 $ownershipPath = 'crates/doriac/src/ownership.rs';
 $libPath = 'crates/doriac/src/lib.rs';
+$mirPath = 'crates/doriac/src/mir.rs';
+$loweringPath = 'crates/doriac/src/mir_lowering.rs';
+$validationPath = 'crates/doriac/src/mir_validation.rs';
+$phpPath = 'crates/doriac/src/codegen_php.rs';
 $testsPath = 'crates/doriac/tests/checked_error_tests.rs';
+$validationTestsPath = 'crates/doriac/tests/mir_validation_tests.rs';
+$parityPath = 'crates/doriac/tests/fixtures/native_parity_examples.txt';
 $fixturePath = 'examples/compile-only/main_stage29_checked_error_foundation.doria';
 
 $decision = $read($decisionPath);
@@ -60,12 +66,18 @@ $types = $read($typesPath);
 $semantics = $read($semanticsPath);
 $ownership = $read($ownershipPath);
 $lib = $read($libPath);
+$mir = $read($mirPath);
+$lowering = $read($loweringPath);
+$validation = $read($validationPath);
+$php = $read($phpPath);
 $tests = $read($testsPath);
+$validationTests = $read($validationTestsPath);
+$parity = $read($parityPath);
 $fixture = $read($fixturePath);
 
 $require($decisionPath, $decision, [
     '**Status:** Accepted',
-    'Stage 29 Slice 1 complete; Slice 2 next; Slice 3 pending',
+    'Stage 29 Slices 1 and 2 complete; Slice 3 next',
     '`Error` is a compiler-known core interface',
     'explicitly declares `implements Error`',
     'externally accessible, readonly, stored `string $message`',
@@ -91,13 +103,16 @@ $require($decisionPath, $decision, [
     'Cleanup is not transactional',
     'ordinary `__destruct` does not run',
     'StructuredExitKind::CheckedError',
-    'Slice 2 introduces the carrier',
+    'erased Error carrier is two machine words',
+    'B2901 remains a historical catalogue identity with no valid',
+    'B2902',
     'Doria\\Std\\Io\\IoError',
     'Doria\\Std\\Io\\InvalidUtf8Error',
     '`Error[R1000]: Unhandled <ConcreteType>`',
     'status 70',
     'panic stays status 101',
-    '**Pending Available Runner**',
+    'Pending Available',
+    'Runner** and non-blocking',
     'Stage 30 is blocked until Stage 29 completes',
 ]);
 
@@ -106,8 +121,8 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 28a — Complete',
         'Stage 29 — In Progress',
         'Stage 29 Slice 1 — Complete',
-        'Stage 29 Slice 2 — Next',
-        'Stage 29 Slice 3 — Pending',
+        'Stage 29 Slice 2 — Complete',
+        'Stage 29 Slice 3 — Next',
         'Stage 30 — Blocked Until Stage 29 Completes',
         'Stage 26b — Complete',
         'Measurement Status: Pending Available Runner',
@@ -123,7 +138,7 @@ $require($specPath, $spec, [
     '`catch (Error)` catches every checked error',
     'Checked propagation performs deterministic cleanup',
     'never rolls back completed side effects',
-    'Stage 29 Slice 1 implements grammar',
+    'Stage 29 Slices 1 and 2 implement grammar',
 ]);
 
 $require($lexerPath, $lexer, [
@@ -192,10 +207,39 @@ $require($semanticsPath, $semantics, [
     'Implicit Constructor Cannot Hide A Throwing Initializer',
 ]);
 $require($ownershipPath, $ownership, ['Stmt::Throw(statement)', 'UseMode::Give', 'Stmt::Try(statement)']);
-$require($libPath, $lib, [
-    'reject_checked_error_execution(&hir)?',
-    'B2901',
-    'Checked Error Execution Lands In Stage 29 Slice 2',
+$require($libPath, $lib, ['B2902', 'Unhandled Main Error Reporting Lands In Stage 29 Slice 3']);
+$forbid($libPath, $lib, ['reject_checked_error_execution', 'Checked Error Execution Lands In Stage 29 Slice 2']);
+$require($mirPath, $mir, [
+    'pub error_descriptors: Vec<ErrorDescriptor>',
+    'pub error_origins: Vec<ErrorOrigin>',
+    'pub struct ErrorDescriptor',
+    'pub struct ErrorOrigin',
+    'EnsureErrorOrigin',
+    'DropError',
+    'CheckedCall',
+    'CheckedConstruct',
+    'ErrorSwitch',
+    'PropagateError',
+]);
+$require($loweringPath, $lowering, [
+    'StructuredExitKind::CheckedError',
+    'mir::Statement::EnsureErrorOrigin',
+    'mir::Terminator::CheckedCall',
+    'mir::Terminator::CheckedConstruct',
+]);
+$require($validationPath, $validation, [
+    'validate_error_metadata',
+    'checked call has an incompatible success slot',
+    'checked call has an incompatible Error slot',
+    'Error dispatch does not own an Error carrier',
+    'checked construction has an incompatible success slot',
+    'checked-error finalizer exit does not own an Error carrier',
+]);
+$require($phpPath, $php, [
+    'final class __DoriaCheckedError extends Exception',
+    'public __DoriaErrorDescriptor $descriptor',
+    '__doriaEnsureErrorOrigin',
+    'catch (__DoriaCheckedError',
 ]);
 $require($testsPath, $tests, [
     'error_conformance_accepts_both_property_forms_and_rejects_invalid_contracts',
@@ -205,8 +249,27 @@ $require($testsPath, $tests, [
     'construction_effects_cannot_hide_in_initialization',
     'checked_errors_cannot_escape_finally_or_static_initialization',
     'checked_error_scopes_and_optional_bindings_follow_lexical_blocks',
-    'stage29_slice1_stops_once_before_mir_and_backends',
+    'stage29_slice2_executes_handled_errors_and_gates_only_escaping_main',
     'nonthrowing programs must remain executable',
+]);
+$require($validationTestsPath, $validationTests, [
+    'shared_validator_rejects_malformed_checked_error_metadata_and_origins',
+    'shared_validator_rejects_malformed_checked_calls_catches_and_carrier_ownership',
+    'shared_validator_rejects_malformed_checked_finalizer_and_construction_plans',
+]);
+$require($parityPath, $parity, [
+    'main_checked_error_catch.doria',
+    'main_checked_error_catch_all.doria',
+    'main_checked_error_optional_binding.doria',
+    'main_checked_error_rethrow.doria',
+    'main_checked_error_finally.doria',
+    'main_checked_error_control_finalizers.doria',
+    'main_checked_error_constructor.doria',
+    'main_checked_error_failed_construction.doria',
+    'main_checked_error_values.doria',
+    'main_checked_error_mixed.doria',
+    'main_checked_error_collections.doria',
+    'main_checked_error_origin.doria',
 ]);
 $require($fixturePath, $fixture, [
     'implements Error',
@@ -217,6 +280,7 @@ $require($fixturePath, $fixture, [
     'finally',
 ]);
 $forbid($fixturePath, $fixture, ['Andrew', 'Lucy', 'Maya', 'Person']);
+$forbid($parityPath, $parity, ['Andrew', 'Lucy', 'Maya', 'Person']);
 
 if ($failures !== []) {
     fwrite(STDERR, "checked-error foundation check failed:\n");

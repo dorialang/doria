@@ -115,6 +115,8 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
+        error_descriptors: Vec::new(),
+        error_origins: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -123,6 +125,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
             receiver_mode: None,
             params: Vec::new(),
             return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(DEFAULT_INT))),
+            checked_effects: Vec::new(),
             locals: vec![Local {
                 id: LocalId(0),
                 name: "unassigned".to_string(),
@@ -794,6 +797,8 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
+        error_descriptors: Vec::new(),
+        error_origins: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -802,6 +807,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
             receiver_mode: None,
             params: Vec::new(),
             return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(DEFAULT_INT))),
+            checked_effects: Vec::new(),
             locals: vec![Local {
                 id: LocalId(0),
                 name: "_tmp0".to_string(),
@@ -1453,6 +1459,8 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
+        error_descriptors: Vec::new(),
+        error_origins: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -1461,6 +1469,7 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
             receiver_mode: None,
             params: Vec::new(),
             return_type: ReturnType::Void,
+            checked_effects: Vec::new(),
             locals: Vec::new(),
             blocks: vec![BasicBlock {
                 id: BlockId(0),
@@ -2931,6 +2940,8 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
         classes: vec![],
         collection_types: vec![],
         statics: vec![],
+        error_descriptors: Vec::new(),
+        error_origins: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -2939,6 +2950,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
             receiver_mode: None,
             params: Vec::new(),
             return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(DEFAULT_INT))),
+            checked_effects: Vec::new(),
             locals: vec![Local {
                 id: LocalId(0),
                 name: "_tmp0".to_string(),

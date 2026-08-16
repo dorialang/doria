@@ -1,0 +1,23 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function main(): void
+{
+    writable List<Error> $errors = [new Failure("first"), new Failure("second")];
+    Error $removed = $errors->removeAt(0);
+    echo "removed {$removed->message}\n";
+    $errors->add(new Failure("third"));
+    echo "list {$errors[0]->message} {$errors[1]->message}\n";
+
+    writable Dictionary<string, Error> $byName = ["entry" => new Failure("stored")];
+    echo "dictionary {$byName["entry"]->message}\n";
+    $byName["entry"] = new Failure("replaced");
+    ?Error $taken = $byName->remove("entry");
+    if ($taken != null) {
+        echo "removed {$taken->message}\n";
+    }
+}
