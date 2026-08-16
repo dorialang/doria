@@ -122,6 +122,7 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 29 — In Progress',
         'Stage 29 Slice 1 — Complete',
         'Stage 29 Slice 2 — Complete',
+        'Corrective Beat: Native Collection Property Initializers — Complete',
         'Stage 29 Slice 3 — Next',
         'Stage 30 — Blocked Until Stage 29 Completes',
         'Stage 26b — Complete',

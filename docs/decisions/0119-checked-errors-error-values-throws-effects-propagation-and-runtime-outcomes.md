@@ -3,7 +3,8 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-15
 - **Date:** 2026-08-15
-- **Implementation status:** Stage 29 Slices 1 and 2 complete; Slice 3 next
+- **Implementation status:** Stage 29 Slices 1 and 2 complete; native collection
+  property initializer corrective beat complete; Slice 3 next
 - **Scope:** Checked-error syntax, static effects, ownership, future execution,
   runtime outcomes, and I/O failure migration
 - **Amends:** Decisions 0035, 0109, 0116, and 0117
@@ -266,6 +267,10 @@ Runner** and non-blocking; the accepted performance standard is unchanged.
   diagnostics; tooling; and one execution boundary.
 - **Slice 2 - Complete:** runtime representation, checked MIR, ABI, propagation,
   cleanup, catch dispatch, rethrow, and backend execution parity.
+- **Corrective beat - Complete:** concrete specialized instance-property and
+  payload-enum storage types are interned before callable lowering. This closes
+  the native collection-property initializer N1101 ordering defect without
+  changing checked-error semantics or absorbing E0472 owned-property transfer.
 - **Slice 3 - Next:** canonical I/O errors and signature migration, R1000,
   status-70 entry handling, installed-tooling, and website closure.
 

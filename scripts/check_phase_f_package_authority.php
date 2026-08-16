@@ -143,6 +143,7 @@ $require($pipelinePath, $pipeline, [
     'Phase F Namespace, Autoload, Package, And Dependency Authority — Accepted',
     'Stage 29 — In Progress',
     'Stage 29 Slice 2 — Complete',
+    'Corrective Beat: Native Collection Property Initializers — Complete',
     'Stage 29 Slice 3 — Next',
     'Stage 31 — Scheduled, Not Implemented',
     'Stage 33 — Scheduled, Not Implemented',

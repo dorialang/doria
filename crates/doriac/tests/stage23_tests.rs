@@ -98,6 +98,49 @@ function main(): void
 }
 
 #[test]
+fn native_collection_property_initializers_cover_concrete_storage_types() {
+    let source =
+        include_str!("../../../examples/native/main_native_collection_property_initializers.doria");
+    let mir = doriac::lower_source_to_mir("collection-property-initializers.doria", source).expect(
+        "concrete collection property types should be interned before initializer lowering",
+    );
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("collection property initializers should execute through shared MIR");
+    assert_eq!(
+        output.stdout,
+        include_bytes!(
+            "fixtures/native_io/main_native_collection_property_initializers/expected_stdout"
+        )
+    );
+}
+
+#[test]
+fn unsupported_collection_property_capabilities_precede_native_lowering() {
+    let errors = diagnostics(
+        r#"
+class Scene {}
+class Unsupported
+{
+    Set<Scene> $set = Set::from([]);
+    SortedSet<Scene> $sorted = SortedSet::from([]);
+}
+function main(): void
+{
+    let $value = new Unsupported();
+}
+"#,
+    );
+    assert_eq!(
+        errors
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0523")
+            .count(),
+        2
+    );
+    assert!(!errors.iter().any(|diagnostic| diagnostic.code == "N1101"));
+}
+
+#[test]
 fn foreach_materializes_collection_expression_with_scoped_ownership() {
     let mir = doriac::lower_source_to_mir(
         "stage23-foreach-expression.doria",

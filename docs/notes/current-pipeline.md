@@ -182,6 +182,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 29 — In Progress.
 - Stage 29 Slice 1 — Complete.
 - Stage 29 Slice 2 — Complete.
+- Corrective Beat: Native Collection Property Initializers — Complete.
 - Stage 29 Slice 3 — Next.
 - Pre-Stage-30 Grammar Slice — Scheduled After Stage 29.
 - Stage 30 — Blocked Until Stage 29 Completes.

@@ -11471,12 +11471,12 @@ impl Interpreter<'_> {
             )));
         }
         let mut drops = Vec::new();
-        for property in object_value.properties.iter_mut().rev() {
+        for property in &mut object_value.properties {
             if let Some(value) = property.take() {
                 collect_owned_objects_from_value(value, &mut drops);
             }
         }
-        for drop in drops.into_iter().rev() {
+        for drop in drops {
             self.push_owned_drop_task(drop)?;
         }
         Ok(())

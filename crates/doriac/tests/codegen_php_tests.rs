@@ -2724,6 +2724,47 @@ class Config
 }
 
 #[test]
+fn php_backend_keeps_collection_property_defaults_per_instance() {
+    let php = doriac::compile_source_to_php(
+        "collection-property-defaults.doria",
+        r#"
+class Scene {}
+class SceneManager
+{
+    writable List<Scene> $scenes = [];
+}
+"#,
+    )
+    .expect("PHP compatibility output should preserve constant empty collection defaults");
+
+    assert!(php.contains("public array $scenes = [];"));
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+
+    let script = format!(
+        "{}\n$left = new SceneManager(); $right = new SceneManager(); $left->scenes[] = new Scene(); echo count($left->scenes) . ':' . count($right->scenes);",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated collection property defaults should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"1:0");
+}
+
+#[test]
 fn php_backend_emits_int_min_constants_without_php_literal_overflow() {
     let php = doriac::compile_source_to_php(
         "int-min-constant.doria",
