@@ -449,6 +449,28 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 }
 
 #[test]
+fn caught_invalid_utf8_line_is_consumed_before_the_next_read() {
+    let output = interpret(
+        r#"
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
+{
+    try {
+        let $invalid = read_line();
+    } catch (Doria\Std\Io\InvalidUtf8Error) {
+    }
+    echo read_line() ?? "missing";
+}
+"#,
+        &[0xff, b'\n', b'o', b'k', b'\n'],
+        BTreeMap::new(),
+    );
+
+    assert_eq!(output.output.exit_status, 0);
+    assert_eq!(output.output.stdout, b"ok");
+    assert!(output.output.runtime_diagnostic.is_none());
+}
+
+#[test]
 fn files_stderr_and_checked_formatting_share_deterministic_io() {
     let mut files = BTreeMap::new();
     files.insert("input.txt".to_string(), "Dória\0line".as_bytes().to_vec());

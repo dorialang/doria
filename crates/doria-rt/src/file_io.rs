@@ -107,6 +107,20 @@ pub(crate) unsafe fn append_file(path: &[u8], contents: &[u8]) -> Result<(), Fil
 }
 
 #[cfg(unix)]
+pub(crate) unsafe fn remove_file(path: &[u8]) -> Result<(), FileError> {
+    let path = unix_path(path)?;
+    let result = unlink(path.bytes.cast());
+    drop(path);
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(FileError::Write(
+            crate::platform_io::Failure::from_system_code(i64::from(last_errno())),
+        ))
+    }
+}
+
+#[cfg(unix)]
 unsafe fn write_file_mode(path: &[u8], contents: &[u8], append: bool) -> Result<(), FileError> {
     let path = unix_path(path)?;
     let mode = if append { O_APPEND } else { O_TRUNC };
@@ -290,6 +304,20 @@ pub(crate) unsafe fn append_file(path: &[u8], contents: &[u8]) -> Result<(), Fil
 }
 
 #[cfg(windows)]
+pub(crate) unsafe fn remove_file(path: &[u8]) -> Result<(), FileError> {
+    let path = windows_path(path)?;
+    let result = DeleteFileW(path.bytes.cast::<u16>());
+    drop(path);
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(FileError::Write(
+            crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
+        ))
+    }
+}
+
+#[cfg(windows)]
 unsafe fn write_file_mode(path: &[u8], contents: &[u8], append: bool) -> Result<(), FileError> {
     let path = windows_path(path)?;
     let handle = CreateFileW(
@@ -385,6 +413,11 @@ pub(crate) unsafe fn append_file(_path: &[u8], _contents: &[u8]) -> Result<(), F
     Err(FileError::Write(crate::platform_io::Failure::unsupported()))
 }
 
+#[cfg(not(any(unix, windows)))]
+pub(crate) unsafe fn remove_file(_path: &[u8]) -> Result<(), FileError> {
+    Err(FileError::Write(crate::platform_io::Failure::unsupported()))
+}
+
 #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
 unsafe fn last_errno() -> i32 {
     *__errno_location()
@@ -401,6 +434,7 @@ extern "C" {
     fn read(descriptor: i32, bytes: *mut c_void, byte_length: usize) -> isize;
     fn write(descriptor: i32, bytes: *const c_void, byte_length: usize) -> isize;
     fn close(descriptor: i32) -> i32;
+    fn unlink(path: *const u8) -> i32;
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
@@ -440,6 +474,7 @@ extern "system" {
     ) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn GetLastError() -> u32;
+    fn DeleteFileW(name: *const u16) -> i32;
 }
 
 #[cfg(test)]

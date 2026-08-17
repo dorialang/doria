@@ -106,6 +106,37 @@ fn checked_stdout_writes(function: &Function) -> Vec<&IoContents> {
         .collect()
 }
 
+#[test]
+fn checked_string_results_have_statement_lifetime_cleanup() {
+    let program = lower(include_str!(
+        "../../../examples/native/main_stage17_io_stress.doria"
+    ));
+    let main = function_named(&program, "main");
+    let checked_strings = main
+        .locals
+        .iter()
+        .filter(|local| {
+            local.name.starts_with("_checked")
+                && matches!(local.ty, Type::String | Type::NullableString)
+        })
+        .map(|local| local.id)
+        .collect::<Vec<_>>();
+    let dropped = main
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement {
+            Statement::DropString { local } => Some(*local),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(!checked_strings.is_empty());
+    for local in checked_strings {
+        assert!(dropped.contains(&local), "checked string {local:?} leaked");
+    }
+}
+
 fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     let ast = doriac::parse_source("test.doria", source).expect("source should parse");
     let hir = doriac::lowering::lower_program(&ast)

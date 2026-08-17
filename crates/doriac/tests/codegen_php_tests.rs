@@ -1841,11 +1841,60 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     assert!(run.stdout.is_empty());
     let stderr = String::from_utf8(run.stderr).expect("diagnostic must be UTF-8");
     assert!(stderr.starts_with("Error[R1000]: Unhandled Doria\\Std\\Io\\IoError\n\nWhere\n"));
+    assert!(stderr.contains(" · Reader::__doria_read_file\n\n"));
     assert!(stderr.contains("read_file(\"__doria_missing_stage17_frame_test__/missing.txt\")"));
     assert!(!stderr.contains("Call Path"));
     assert!(stderr.ends_with("\n\nProcess Exited With Status 70\n"));
     assert!(!stderr.contains("PHP"));
     assert!(!stderr.contains("Stack Trace"));
+}
+
+#[test]
+fn php_io_warning_fallback_preserves_portable_not_found_reason() {
+    let php = doriac::compile_source_to_php(
+        "php-io-reason.doria",
+        r#"
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
+{
+    try {
+        read_file("__doria_missing_php_reason_test__/missing.txt");
+    } catch (Doria\Std\Io\IoError $error) {
+        echo $error->reason == Doria\Std\Io\IoErrorReason::NotFound;
+        echo " ";
+        echo $error->systemCode ?? -1;
+    }
+}
+"#,
+    )
+    .expect("missing-file reason fixture should lower to PHP");
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated PHP reason fixture should execute");
+
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.stdout.starts_with(b"true "), "{:?}", run.stdout);
+    assert!(
+        run.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 #[test]
@@ -2210,14 +2259,14 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("Stage 17 PHP compatibility lowering should succeed");
 
-    assert!(
-        php.contains("function __doria_read_line(string $prompt, int $start, int $end): ?string")
-    );
+    assert!(php.contains(
+        "function __doria_read_line(string $prompt, int $start, int $end, string $callable): ?string"
+    ));
     // The prompt is written exactly and stdout is flushed before stdin is read,
     // without depending on PHP's optional readline extension.
     assert!(php.contains("if ($prompt !== \"\")"));
     assert!(php.contains("__DoriaStdIoIoTarget::__doriaCaseStandardOutput()"));
-    assert!(php.contains("__doria_flush_stdout($start, $end);"));
+    assert!(php.contains("__doria_flush_stdout($start, $end, $callable);"));
     assert!(php.contains("if (@fflush(STDOUT)) { return; }"));
     assert!(php.contains("if (__doria_is_broken_pipe(error_get_last())) { exit(0); }"));
     assert!(!php.contains("readline("));

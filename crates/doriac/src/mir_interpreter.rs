@@ -10121,6 +10121,7 @@ impl Interpreter<'_> {
             line_length -= 1;
         }
         let bytes = &remaining[..line_length];
+        self.stdin_cursor += consumed;
         let line = match core::str::from_utf8(bytes) {
             Ok(line) => line,
             Err(error) => {
@@ -10141,7 +10142,6 @@ impl Interpreter<'_> {
             }));
         }
         let line = line.to_string();
-        self.stdin_cursor += consumed;
         Ok(CheckedIoResult::Success(Some(LocalValue::NullableString(
             Some(line.into()),
         ))))

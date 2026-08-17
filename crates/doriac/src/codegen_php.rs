@@ -26,8 +26,9 @@ interface __DoriaErrorValue
 {
     public static function __doriaErrorType(): __DoriaErrorDescriptor;
     public function __doriaErrorDescriptor(): __DoriaErrorDescriptor;
-    public function __doriaEnsureErrorOrigin(int $origin): void;
+    public function __doriaEnsureErrorOrigin(int $origin, string $callable): void;
     public function __doriaErrorOrigin(): int;
+    public function __doriaErrorCallable(): string;
 }
 
 final class __DoriaErrorDescriptor
@@ -52,9 +53,9 @@ function __doria_error_descriptor(string $typeName): __DoriaErrorDescriptor
     return $descriptors[$typeName] ??= new __DoriaErrorDescriptor($typeName);
 }
 
-function __doria_throw(__DoriaErrorValue $error, int $origin): void
+function __doria_throw(__DoriaErrorValue $error, int $origin, string $callable): void
 {
-    $error->__doriaEnsureErrorOrigin($origin);
+    $error->__doriaEnsureErrorOrigin($origin, $callable);
     throw new __DoriaCheckedError(
         $error,
         $error->__doriaErrorDescriptor(),
@@ -95,7 +96,8 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
     $lineText = rtrim(substr($__doria_source_text, $lineStart, $lineEnd - $lineStart), "\r");
     $markerOffset = max(0, $origin - $lineStart);
     $message = "Error[R1000]: Unhandled " . $type . "\n\nWhere\n" .
-        $__doria_source_path . " · line " . $line . " · main\n\n" .
+        $__doria_source_path . " · line " . $line . " · " .
+        $caught->error->__doriaErrorCallable() . "\n\n" .
         $lineText . "\n" . str_repeat(" ", $markerOffset) . "^\n" .
         "This Error Was First Thrown Here\n\nWhy\n  " .
         __doria_safe_error_message($caught->error->message) .
@@ -614,7 +616,7 @@ function __doria_panic(string $code, int $start, int $end, ?string $message = nu
     exit(101);
 }
 
-function __doria_read_line(string $prompt, int $start, int $end): ?string
+function __doria_read_line(string $prompt, int $start, int $end, string $callable): ?string
 {
     if ($prompt !== "") {
         __doria_write_all(
@@ -624,9 +626,10 @@ function __doria_read_line(string $prompt, int $start, int $end): ?string
             $end,
             __DoriaStdIoIoTarget::__doriaCaseStandardOutput(),
             __DoriaStdIoIoOperation::Write,
+            $callable,
         );
     }
-    __doria_flush_stdout($start, $end);
+    __doria_flush_stdout($start, $end, $callable);
     error_clear_last();
     $line = @fgets(STDIN);
     if ($line === false) {
@@ -636,6 +639,7 @@ function __doria_read_line(string $prompt, int $start, int $end): ?string
             __DoriaStdIoIoTarget::__doriaCaseStandardInput(),
             error_get_last(),
             $start,
+            $callable,
         );
     }
     if (str_ends_with($line, "\n")) {
@@ -655,15 +659,16 @@ function __doria_read_line(string $prompt, int $start, int $end): ?string
                 $length,
             ),
             $start,
+            $callable,
         );
     }
     return $line;
 }
 
-function __doria_read_file(string $path, int $start, int $end): string
+function __doria_read_file(string $path, int $start, int $end, string $callable): string
 {
     if (str_contains($path, "\0")) {
-        __doria_throw_io_validation(__DoriaStdIoIoOperation::Open, $path, $start);
+        __doria_throw_io_validation(__DoriaStdIoIoOperation::Open, $path, $start, $callable);
     }
     error_clear_last();
     $file = @fopen($path, "rb");
@@ -673,6 +678,7 @@ function __doria_read_file(string $path, int $start, int $end): string
             __DoriaStdIoIoTarget::File($path),
             error_get_last(),
             $start,
+            $callable,
         );
     }
     $contents = "";
@@ -686,6 +692,7 @@ function __doria_read_file(string $path, int $start, int $end): string
                 __DoriaStdIoIoTarget::File($path),
                 error_get_last(),
                 $start,
+                $callable,
             );
         }
         $contents .= $chunk;
@@ -697,6 +704,7 @@ function __doria_read_file(string $path, int $start, int $end): string
             __DoriaStdIoIoTarget::File($path),
             error_get_last(),
             $start,
+            $callable,
         );
     }
     $invalid = __doria_invalid_utf8($contents);
@@ -710,19 +718,32 @@ function __doria_read_file(string $path, int $start, int $end): string
                 $length,
             ),
             $start,
+            $callable,
         );
     }
     return $contents;
 }
 
-function __doria_write_file(string $path, string $contents, int $start, int $end): void
+function __doria_write_file(
+    string $path,
+    string $contents,
+    int $start,
+    int $end,
+    string $callable,
+): void
 {
-    __doria_write_file_mode($path, $contents, false, $start, $end);
+    __doria_write_file_mode($path, $contents, false, $start, $end, $callable);
 }
 
-function __doria_append_file(string $path, string $contents, int $start, int $end): void
+function __doria_append_file(
+    string $path,
+    string $contents,
+    int $start,
+    int $end,
+    string $callable,
+): void
 {
-    __doria_write_file_mode($path, $contents, true, $start, $end);
+    __doria_write_file_mode($path, $contents, true, $start, $end, $callable);
 }
 
 function __doria_write_file_mode(
@@ -731,9 +752,10 @@ function __doria_write_file_mode(
     bool $append,
     int $start,
     int $end,
+    string $callable,
 ): void {
     if (str_contains($path, "\0")) {
-        __doria_throw_io_validation(__DoriaStdIoIoOperation::Open, $path, $start);
+        __doria_throw_io_validation(__DoriaStdIoIoOperation::Open, $path, $start, $callable);
     }
     error_clear_last();
     $file = @fopen($path, $append ? "ab" : "wb");
@@ -743,6 +765,7 @@ function __doria_write_file_mode(
             __DoriaStdIoIoTarget::File($path),
             error_get_last(),
             $start,
+            $callable,
         );
     }
     __doria_write_all(
@@ -752,6 +775,7 @@ function __doria_write_file_mode(
         $end,
         __DoriaStdIoIoTarget::File($path),
         $append ? __DoriaStdIoIoOperation::Append : __DoriaStdIoIoOperation::Write,
+        $callable,
     );
     error_clear_last();
     if (!@fclose($file)) {
@@ -760,6 +784,7 @@ function __doria_write_file_mode(
             __DoriaStdIoIoTarget::File($path),
             error_get_last(),
             $start,
+            $callable,
         );
     }
 }
@@ -782,11 +807,10 @@ function __doria_system_code(?array $error): ?int
     return (int) $match[1];
 }
 
-function __doria_io_reason(?int $code): __DoriaStdIoIoErrorReason
+function __doria_io_reason(?array $error): __DoriaStdIoIoErrorReason
 {
-    if ($code === null) { return __DoriaStdIoIoErrorReason::Other; }
-    if (PHP_OS_FAMILY === "Windows") {
-        return match ($code) {
+    $code = __doria_system_code($error);
+    $reason = PHP_OS_FAMILY === "Windows" ? match ($code) {
             2, 3 => __DoriaStdIoIoErrorReason::NotFound,
             5, 32 => __DoriaStdIoIoErrorReason::PermissionDenied,
             1, 87, 123, 206 => __DoriaStdIoIoErrorReason::InvalidInput,
@@ -795,9 +819,7 @@ function __doria_io_reason(?int $code): __DoriaStdIoIoErrorReason
             50 => __DoriaStdIoIoErrorReason::Unsupported,
             6, 109, 232 => __DoriaStdIoIoErrorReason::Closed,
             default => __DoriaStdIoIoErrorReason::Other,
-        };
-    }
-    return match ($code) {
+        } : match ($code) {
         2 => __DoriaStdIoIoErrorReason::NotFound,
         1, 13 => __DoriaStdIoIoErrorReason::PermissionDenied,
         22, 36, 63 => __DoriaStdIoIoErrorReason::InvalidInput,
@@ -807,6 +829,43 @@ function __doria_io_reason(?int $code): __DoriaStdIoIoErrorReason
         9, 32 => __DoriaStdIoIoErrorReason::Closed,
         default => __DoriaStdIoIoErrorReason::Other,
     };
+    if ($reason !== __DoriaStdIoIoErrorReason::Other) { return $reason; }
+    if ($error === null || !isset($error["message"])) { return $reason; }
+
+    $message = strtolower($error["message"]);
+    if (str_contains($message, "no such file or directory") ||
+        str_contains($message, "cannot find the file") ||
+        str_contains($message, "cannot find the path")) {
+        return __DoriaStdIoIoErrorReason::NotFound;
+    }
+    if (str_contains($message, "permission denied") ||
+        str_contains($message, "access is denied")) {
+        return __DoriaStdIoIoErrorReason::PermissionDenied;
+    }
+    if (str_contains($message, "invalid argument") ||
+        str_contains($message, "filename, directory name, or volume label syntax is incorrect")) {
+        return __DoriaStdIoIoErrorReason::InvalidInput;
+    }
+    if (str_contains($message, "interrupted system call")) {
+        return __DoriaStdIoIoErrorReason::Interrupted;
+    }
+    if (str_contains($message, "too many open files") ||
+        str_contains($message, "no space left") ||
+        str_contains($message, "not enough memory") ||
+        str_contains($message, "insufficient system resources")) {
+        return __DoriaStdIoIoErrorReason::ResourceExhausted;
+    }
+    if (str_contains($message, "operation not supported") ||
+        str_contains($message, "not supported")) {
+        return __DoriaStdIoIoErrorReason::Unsupported;
+    }
+    if (str_contains($message, "bad file descriptor") ||
+        str_contains($message, "broken pipe") ||
+        str_contains($message, "pipe has been ended") ||
+        str_contains($message, "closed stream")) {
+        return __DoriaStdIoIoErrorReason::Closed;
+    }
+    return $reason;
 }
 
 function __doria_io_operation_word(__DoriaStdIoIoOperation $operation): string
@@ -863,10 +922,11 @@ function __doria_throw_io(
     __DoriaStdIoIoTarget $target,
     ?array $hostError,
     int $origin,
+    string $callable,
 ): void {
     global $__doria_io_message_vocabulary;
     $systemCode = __doria_system_code($hostError);
-    $reason = __doria_io_reason($systemCode);
+    $reason = __doria_io_reason($hostError);
     $message = $__doria_io_message_vocabulary["ioPrefix"] .
         __doria_io_operation_word($operation) . " " . __doria_io_target_name($target) .
         $__doria_io_message_vocabulary["separator"] . __doria_io_reason_words($reason);
@@ -876,13 +936,14 @@ function __doria_throw_io(
         $target,
         $reason,
         $systemCode,
-    ), $origin);
+    ), $origin, $callable);
 }
 
 function __doria_throw_io_validation(
     __DoriaStdIoIoOperation $operation,
     string $path,
     int $origin,
+    string $callable,
 ): void {
     global $__doria_io_message_vocabulary;
     $target = __DoriaStdIoIoTarget::File($path);
@@ -896,7 +957,7 @@ function __doria_throw_io_validation(
         $target,
         $reason,
         null,
-    ), $origin);
+    ), $origin, $callable);
 }
 
 function __doria_invalid_utf8(string $value): ?array
@@ -941,6 +1002,7 @@ function __doria_write_all(
     int $end,
     __DoriaStdIoIoTarget $target,
     __DoriaStdIoIoOperation $operation,
+    string $callable,
 ): void
 {
     $offset = 0;
@@ -950,13 +1012,13 @@ function __doria_write_all(
         $written = @fwrite($stream, substr($value, $offset));
         if ($written === false || $written === 0) {
             if (__doria_is_broken_pipe(error_get_last())) { exit(0); }
-            __doria_throw_io($operation, $target, error_get_last(), $start);
+            __doria_throw_io($operation, $target, error_get_last(), $start, $callable);
         }
         $offset += $written;
     }
 }
 
-function __doria_flush_stdout(int $start, int $end): void
+function __doria_flush_stdout(int $start, int $end, string $callable): void
 {
     error_clear_last();
     if (@fflush(STDOUT)) { return; }
@@ -966,10 +1028,11 @@ function __doria_flush_stdout(int $start, int $end): void
         __DoriaStdIoIoTarget::__doriaCaseStandardOutput(),
         error_get_last(),
         $start,
+        $callable,
     );
 }
 
-function __doria_write_stdout(string $value, int $start, int $end): void
+function __doria_write_stdout(string $value, int $start, int $end, string $callable): void
 {
     __doria_write_all(
         STDOUT,
@@ -978,10 +1041,11 @@ function __doria_write_stdout(string $value, int $start, int $end): void
         $end,
         __DoriaStdIoIoTarget::__doriaCaseStandardOutput(),
         __DoriaStdIoIoOperation::Write,
+        $callable,
     );
 }
 
-function __doria_write_stderr(string $value, int $start, int $end): void
+function __doria_write_stderr(string $value, int $start, int $end, string $callable): void
 {
     __doria_write_all(
         STDERR,
@@ -990,6 +1054,7 @@ function __doria_write_stderr(string $value, int $start, int $end): void
         $end,
         __DoriaStdIoIoTarget::__doriaCaseStandardError(),
         __DoriaStdIoIoOperation::Write,
+        $callable,
     );
 }
 
@@ -998,10 +1063,16 @@ function __doria_sprintf(string $format, mixed ...$values): string
     return sprintf($format, ...$values);
 }
 
-function __doria_printf(int $start, int $end, string $format, mixed ...$values): void
+function __doria_printf(
+    int $start,
+    int $end,
+    string $callable,
+    string $format,
+    mixed ...$values,
+): void
 {
     $value = sprintf($format, ...$values);
-    __doria_write_stdout($value, $start, $end);
+    __doria_write_stdout($value, $start, $end, $callable);
 }
 
 "#,
@@ -2589,6 +2660,11 @@ fn emit_class(
         writeln(
             output,
             indent + 1,
+            "private string $__doriaErrorCallable = \"main\";",
+        );
+        writeln(
+            output,
+            indent + 1,
             "public static function __doriaErrorType(): __DoriaErrorDescriptor",
         );
         writeln(output, indent + 1, "{");
@@ -2612,13 +2688,13 @@ fn emit_class(
         writeln(
             output,
             indent + 1,
-            "public function __doriaEnsureErrorOrigin(int $origin): void",
+            "public function __doriaEnsureErrorOrigin(int $origin, string $callable): void",
         );
         writeln(output, indent + 1, "{");
         writeln(
             output,
             indent + 2,
-            "if ($this->__doriaErrorOrigin === 0) { $this->__doriaErrorOrigin = $origin; }",
+            "if ($this->__doriaErrorOrigin === 0) { $this->__doriaErrorOrigin = $origin; $this->__doriaErrorCallable = $callable; }",
         );
         writeln(output, indent + 1, "}");
         writeln(
@@ -2628,6 +2704,14 @@ fn emit_class(
         );
         writeln(output, indent + 1, "{");
         writeln(output, indent + 2, "return $this->__doriaErrorOrigin;");
+        writeln(output, indent + 1, "}");
+        writeln(
+            output,
+            indent + 1,
+            "public function __doriaErrorCallable(): string",
+        );
+        writeln(output, indent + 1, "{");
+        writeln(output, indent + 2, "return $this->__doriaErrorCallable;");
         writeln(output, indent + 1, "}");
         output.push('\n');
     }
@@ -3198,7 +3282,7 @@ fn emit_statement(
                 output,
                 indent,
                 &format!(
-                    "__doria_write_stdout(__doria_display({}), {}, {});",
+                    "__doria_write_stdout(__doria_display({}), {}, {}, __METHOD__);",
                     emit_expr(expr, scopes),
                     span.start,
                     span.end,
@@ -3291,7 +3375,7 @@ fn emit_throw_statement(
         output,
         indent,
         &format!(
-            "__doria_throw({}, {});",
+            "__doria_throw({}, {}, __METHOD__);",
             emit_expr(&statement.expr, scopes),
             statement.span.start.saturating_add(1),
         ),
@@ -4563,6 +4647,7 @@ fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNam
     if name == "printf" {
         emitted.insert(0, span.end.to_string());
         emitted.insert(0, span.start.to_string());
+        emitted.insert(2, "__METHOD__".to_string());
     } else if matches!(
         name,
         "read_line" | "read_file" | "write_file" | "append_file" | "write_stderr"
@@ -4572,6 +4657,7 @@ fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNam
         }
         emitted.push(format!("start: {}", span.start));
         emitted.push(format!("end: {}", span.end));
+        emitted.push("callable: __METHOD__".to_string());
     }
     format!("{helper}({})", emitted.join(", "))
 }

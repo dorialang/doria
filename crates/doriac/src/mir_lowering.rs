@@ -12607,9 +12607,7 @@ fn materialize_checked_io(
     context.statement_owned_locals = statement_temporaries;
     context.current_block = Some(success);
     if let Some((local, ty, owned)) = result {
-        if owned {
-            context.track_statement_owned_local(local, ty);
-        }
+        track_checked_result(local, ty, owned, context);
         Ok(Some((local, ty, owned && consume_result)))
     } else {
         Ok(None)
@@ -12669,9 +12667,7 @@ fn materialize_checked_signature_call(
     context.statement_owned_locals = statement_temporaries;
     context.current_block = Some(success);
     if let Some((local, ty, owned)) = result {
-        if owned {
-            context.track_statement_owned_local(local, ty);
-        }
+        track_checked_result(local, ty, owned, context);
         Ok(Some((local, ty, owned && consume_result)))
     } else {
         Ok(None)
@@ -12770,18 +12766,27 @@ fn materialize_checked_null_safe_signature_call(
     context.current_block = Some(merge);
 
     if let Some((local, ty, owned, _)) = result {
-        if owned {
-            context.track_statement_owned_local(local, ty);
-        } else if matches!(ty, mir::Type::String | mir::Type::NullableString) {
-            context
-                .statement_owned_locals
-                .last_mut()
-                .expect("checked null-safe result requires an active statement scope")
-                .push(DropObligation::String(local));
-        }
+        track_checked_result(local, ty, owned, context);
     }
 
     Ok(result.map(|(local, ty, owned, consume)| (local, ty, owned && consume)))
+}
+
+fn track_checked_result(
+    local: mir::LocalId,
+    ty: mir::Type,
+    owned: bool,
+    context: &mut LoweringContext,
+) {
+    if owned {
+        context.track_statement_owned_local(local, ty);
+    } else if matches!(ty, mir::Type::String | mir::Type::NullableString) {
+        context
+            .statement_owned_locals
+            .last_mut()
+            .expect("checked result requires an active statement scope")
+            .push(DropObligation::String(local));
+    }
 }
 
 fn widen_checked_null_safe_result(

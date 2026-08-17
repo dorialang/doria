@@ -48,6 +48,10 @@ pub(crate) unsafe fn take_buffered_input() -> BufferedInput {
 ///
 /// `Ok(None)` is EOF before bytes. A returned slice remains valid only until the next call.
 pub(crate) unsafe fn read_line() -> Result<Option<(*const u8, usize)>, ReadLineError> {
+    if EOF && START == END {
+        release_buffer();
+        return Ok(None);
+    }
     ensure_capacity(INITIAL_CAPACITY)?;
     loop {
         if let Some(newline) = find_newline() {
@@ -60,11 +64,12 @@ pub(crate) unsafe fn read_line() -> Result<Option<(*const u8, usize)>, ReadLineE
         }
 
         if EOF {
-            if START == END {
-                return Ok(None);
-            }
             let line_start = START;
             let line_length = END - START;
+            if line_length == 0 {
+                release_buffer();
+                return Ok(None);
+            }
             START = END;
             validate_utf8(BUFFER.add(line_start), line_length)?;
             return Ok(Some((BUFFER.add(line_start), line_length)));
@@ -79,6 +84,16 @@ pub(crate) unsafe fn read_line() -> Result<Option<(*const u8, usize)>, ReadLineE
             END += read;
         }
     }
+}
+
+unsafe fn release_buffer() {
+    if !BUFFER.is_null() {
+        super::deallocate(BUFFER);
+    }
+    BUFFER = ptr::null_mut();
+    CAPACITY = 0;
+    START = 0;
+    END = 0;
 }
 
 fn strip_line_ending(bytes: &[u8]) -> &[u8] {

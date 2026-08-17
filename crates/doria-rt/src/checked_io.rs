@@ -164,7 +164,10 @@ unsafe fn read_line(
             *result = crate::dr_v1_string_from_utf8(data, length).cast();
             0
         }
-        Ok(None) => 0,
+        Ok(None) => {
+            *result = ptr::null_mut();
+            0
+        }
         Err(line_io::ReadLineError::Read(failure)) => fail_io(
             frame,
             OP_READ,

@@ -2717,6 +2717,43 @@ unsafe fn emergency_runtime_panic() -> ! {
     exit_process(PANIC_STATUS)
 }
 
+struct PrivateRecordWriter<'path> {
+    path: &'path [u8],
+    published: bool,
+}
+
+impl<'path> PrivateRecordWriter<'path> {
+    unsafe fn begin(path: &'path [u8], header: &[u8]) -> Option<Self> {
+        if file_io::write_file(path, header).is_err() {
+            let _ = file_io::remove_file(path);
+            return None;
+        }
+        Some(Self {
+            path,
+            published: false,
+        })
+    }
+
+    unsafe fn append(&mut self, bytes: &[u8]) -> bool {
+        file_io::append_file(self.path, bytes).is_ok()
+    }
+
+    fn publish(mut self) -> bool {
+        self.published = true;
+        true
+    }
+}
+
+impl Drop for PrivateRecordWriter<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            unsafe {
+                let _ = file_io::remove_file(self.path);
+            }
+        }
+    }
+}
+
 unsafe fn write_runtime_error_record(
     descriptor: &DrErrorDescriptorV1,
     message: *const DrStringV1,
@@ -2763,33 +2800,30 @@ unsafe fn write_runtime_error_record(
     put_u64(&mut header[35..43], span_start as u64);
     put_u64(&mut header[43..51], span_end as u64);
 
-    file_io::write_file(channel_path, &header).is_ok()
-        && file_io::append_file(
-            channel_path,
-            core::slice::from_raw_parts(descriptor.type_name, descriptor.type_name_length),
-        )
-        .is_ok()
-        && file_io::append_file(
-            channel_path,
-            core::slice::from_raw_parts(string_bytes(message), (*message).byte_length),
-        )
-        .is_ok()
-        && (!known_origin
-            || (file_io::append_file(
-                channel_path,
-                core::slice::from_raw_parts((*origin).source_path, path_length),
-            )
-            .is_ok()
-                && file_io::append_file(
-                    channel_path,
-                    core::slice::from_raw_parts((*origin).source_text, source_length),
-                )
-                .is_ok()
-                && file_io::append_file(
-                    channel_path,
-                    core::slice::from_raw_parts((*origin).function_name, function_length),
-                )
-                .is_ok()))
+    let Some(mut record) = PrivateRecordWriter::begin(channel_path, &header) else {
+        return false;
+    };
+    if !record.append(core::slice::from_raw_parts(
+        descriptor.type_name,
+        descriptor.type_name_length,
+    )) || !record.append(core::slice::from_raw_parts(
+        string_bytes(message),
+        (*message).byte_length,
+    )) || (known_origin
+        && (!record.append(core::slice::from_raw_parts(
+            (*origin).source_path,
+            path_length,
+        )) || !record.append(core::slice::from_raw_parts(
+            (*origin).source_text,
+            source_length,
+        )) || !record.append(core::slice::from_raw_parts(
+            (*origin).function_name,
+            function_length,
+        ))))
+    {
+        return false;
+    }
+    record.publish()
 }
 
 unsafe fn write_runtime_outcome_record(
@@ -2869,38 +2903,24 @@ unsafe fn write_runtime_outcome_record(
     );
     put_u64(&mut header[38..46], (*current_frame).active_span_end as u64);
 
-    if file_io::write_file(channel_path, &header).is_err()
-        || file_io::append_file(channel_path, code).is_err()
+    let Some(mut record) = PrivateRecordWriter::begin(channel_path, &header) else {
+        return false;
+    };
+    if !record.append(code)
         || (message_length != 0
-            && file_io::append_file(
-                channel_path,
-                core::slice::from_raw_parts(message, message_length),
-            )
-            .is_err())
-        || file_io::append_file(
-            channel_path,
-            core::slice::from_raw_parts(
-                (*current_frame).source_path,
-                (*current_frame).source_path_length,
-            ),
-        )
-        .is_err()
-        || file_io::append_file(
-            channel_path,
-            core::slice::from_raw_parts(
-                (*current_frame).source_text,
-                (*current_frame).source_text_length,
-            ),
-        )
-        .is_err()
-        || file_io::append_file(
-            channel_path,
-            core::slice::from_raw_parts(
-                (*current_frame).function_name,
-                (*current_frame).function_name_length,
-            ),
-        )
-        .is_err()
+            && !record.append(core::slice::from_raw_parts(message, message_length)))
+        || !record.append(core::slice::from_raw_parts(
+            (*current_frame).source_path,
+            (*current_frame).source_path_length,
+        ))
+        || !record.append(core::slice::from_raw_parts(
+            (*current_frame).source_text,
+            (*current_frame).source_text_length,
+        ))
+        || !record.append(core::slice::from_raw_parts(
+            (*current_frame).function_name,
+            (*current_frame).function_name_length,
+        ))
     {
         return false;
     }
@@ -2912,19 +2932,14 @@ unsafe fn write_runtime_outcome_record(
         fact_header[2] = fact.kind as u8;
         put_u64(&mut fact_header[3..11], fact.value);
         put_u32(&mut fact_header[11..15], fact.value_length as u32);
-        if file_io::append_file(channel_path, &fact_header).is_err()
-            || file_io::append_file(
-                channel_path,
-                core::slice::from_raw_parts(fact.name, fact.name_length),
-            )
-            .is_err()
+        if !record.append(&fact_header)
+            || !record.append(core::slice::from_raw_parts(fact.name, fact.name_length))
             || (fact.kind == 4
                 && fact.value_length != 0
-                && file_io::append_file(
-                    channel_path,
-                    core::slice::from_raw_parts(fact.value as *const u8, fact.value_length),
-                )
-                .is_err())
+                && !record.append(core::slice::from_raw_parts(
+                    fact.value as *const u8,
+                    fact.value_length,
+                )))
         {
             return false;
         }
@@ -2937,23 +2952,21 @@ unsafe fn write_runtime_outcome_record(
         put_u32(&mut frame_header[2..6], (*frame).source_path_length as u32);
         put_u64(&mut frame_header[6..14], (*frame).active_span_start as u64);
         put_u64(&mut frame_header[14..22], (*frame).active_span_end as u64);
-        if file_io::append_file(channel_path, &frame_header).is_err()
-            || file_io::append_file(
-                channel_path,
-                core::slice::from_raw_parts((*frame).function_name, (*frame).function_name_length),
-            )
-            .is_err()
-            || file_io::append_file(
-                channel_path,
-                core::slice::from_raw_parts((*frame).source_path, (*frame).source_path_length),
-            )
-            .is_err()
+        if !record.append(&frame_header)
+            || !record.append(core::slice::from_raw_parts(
+                (*frame).function_name,
+                (*frame).function_name_length,
+            ))
+            || !record.append(core::slice::from_raw_parts(
+                (*frame).source_path,
+                (*frame).source_path_length,
+            ))
         {
             return false;
         }
         frame = (*frame).parent;
     }
-    true
+    record.publish()
 }
 
 fn put_u16(target: &mut [u8], value: u16) {
@@ -4140,6 +4153,32 @@ mod tests {
 
     fn shared_payload_drops() -> usize {
         SHARED_PAYLOAD_DROPS.get()
+    }
+
+    #[test]
+    fn unpublished_private_records_are_removed() {
+        let path =
+            std::env::temp_dir().join(format!("doria-private-record-{}", std::process::id(),));
+        let path_bytes = path.to_string_lossy().as_bytes().to_vec();
+        let _ = std::fs::remove_file(&path);
+
+        unsafe {
+            {
+                let mut record = PrivateRecordWriter::begin(&path_bytes, b"header")
+                    .expect("private record should start");
+                assert!(record.append(b"partial"));
+            }
+            assert!(
+                !path.exists(),
+                "an unpublished record must not remain visible"
+            );
+
+            let record = PrivateRecordWriter::begin(&path_bytes, b"complete")
+                .expect("private record should restart");
+            assert!(record.publish());
+        }
+        assert_eq!(std::fs::read(&path).expect("published record"), b"complete");
+        std::fs::remove_file(path).expect("fixture cleanup");
     }
 
     unsafe extern "C" fn drop_test_shared_payload(
