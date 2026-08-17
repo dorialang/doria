@@ -1,16 +1,13 @@
-Panic[P1405]: File Path Contains A NUL Byte
+Error[R1000]: Unhandled Doria\Std\Io\IoError
 
 Where
 examples/native/main_stage23_bytes_nul_path_panic.doria · line 5 · main
 
   5              Bytes $contents = read_file_bytes($path);
-                                                   ^^^^^
-                                                   Invalid File Path Used Here
+                                   ^^^^^^^^^^^^^^^^^^^^^^
+                                   This Error Was First Thrown Here
 
 Why
-A file path cannot contain an embedded NUL byte.
+  failed to open file `bad\u0000path`: invalid input
 
-Call Path
-main · examples/native/main_stage23_bytes_nul_path_panic.doria:5
-
-Process Exited With Status 101
+Process Exited With Status 70

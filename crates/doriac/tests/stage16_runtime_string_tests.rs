@@ -19,7 +19,7 @@ function join(string $left, string $right): string
     return $result;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $count = 42;
     let $enabled = false;
@@ -34,7 +34,7 @@ function main(): void
 #[test]
 fn canonical_float_and_bool_display_is_exact() {
     let output = run(r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     uint64 $maximum = 18446744073709551615;
     float32 $narrow = 1.5;
@@ -64,7 +64,7 @@ function main(): int
 #[test]
 fn copy_then_rebind_preserves_source_value_and_self_assignment() {
     let output = run(r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $original = "x";
     let writable $copy = $original;
@@ -104,7 +104,7 @@ fn cranelift_accepts_the_complete_runtime_string_slice() {
     let program = lower(
         r#"
 function identity(string $value): string { return $value; }
-function main(): void { echo identity("Doria") . 16 . false; }
+function main(): void throws Doria\Std\Io\IoError { echo identity("Doria") . 16 . false; }
 "#,
     );
     let object = doriac::codegen_cranelift::lower_mir_to_object(&program)

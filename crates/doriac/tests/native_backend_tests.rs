@@ -641,12 +641,12 @@ function main(): int
         (
             "main_function_void_echo",
             r#"
-function hello(): void
+function hello(): void throws Doria\Std\Io\IoError
 {
     echo "Hello Doria!";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     hello();
 }
@@ -656,17 +656,17 @@ function main(): void
         (
             "main_function_two_void_calls",
             r#"
-function hello(): void
+function hello(): void throws Doria\Std\Io\IoError
 {
     echo "Hello ";
 }
 
-function subject(): void
+function subject(): void throws Doria\Std\Io\IoError
 {
     echo "Doria!";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     hello();
     subject();
@@ -677,14 +677,14 @@ function main(): void
         (
             "main_function_void_string_concat",
             r#"
-function hello(): void
+function hello(): void throws Doria\Std\Io\IoError
 {
     let $name = "Doria";
 
     echo "Hello " . $name . "!";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     hello();
 }
@@ -694,21 +694,21 @@ function main(): void
         (
             "main_function_range_bound_helpers_call_once",
             r#"
-function start(): int
+function start(): int throws Doria\Std\Io\IoError
 {
     echo "s";
 
     return 0;
 }
 
-function limit(): int
+function limit(): int throws Doria\Std\Io\IoError
 {
     echo "e";
 
     return 2;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     foreach (start()..<limit() as $i) {
         echo "x";
@@ -720,12 +720,12 @@ function main(): void
         (
             "main_function_void_call_in_while_body",
             r#"
-function tick(): void
+function tick(): void throws Doria\Std\Io\IoError
 {
     echo ".";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $i = 0;
 
@@ -1185,7 +1185,7 @@ fn compiles_and_runs_void_main_string_literal_echo() {
 }
 
 #[test]
-fn native_read_file_panics_before_invalid_utf8_enters_a_string() {
+fn native_read_file_reports_checked_invalid_utf8_before_constructing_a_string() {
     if !host_linker_is_available() {
         eprintln!(
             "native invalid-UTF-8 integration test unavailable: host linker `{}` was not found",
@@ -1205,7 +1205,7 @@ fn native_read_file_panics_before_invalid_utf8_enters_a_string() {
     });
     compile_native_source(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     echo read_file("invalid.txt");
 }
@@ -1215,13 +1215,11 @@ function main(): void
 
     let run = run_native_executable_in_directory(&output, &directory)
         .expect("native executable should run");
-    assert_eq!(run.status.code(), Some(101));
+    assert_eq!(run.status.code(), Some(70));
     assert!(run.stdout.is_empty());
-    assert_native_runtime_panic(
+    assert_native_runtime_error(
         &run.stderr,
-        "P1406",
-        "File Text Is Not Valid UTF-8",
-        &["main"],
+        "Doria\\Std\\Io\\InvalidUtf8Error",
         "invalid UTF-8 file",
     );
 
@@ -1241,7 +1239,7 @@ fn compiles_and_runs_large_void_main_string_literal_echo() {
     let message = "Doria".repeat(64 * 1024);
     let source = format!(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {{
     echo "{message}";
 }}
@@ -1266,7 +1264,7 @@ fn native_stdout_broken_pipe_exits_cleanly() {
     let message = "Doria".repeat(64 * 1024);
     let source = format!(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {{
     echo "{message}";
 }}
@@ -1303,7 +1301,7 @@ fn native_stderr_broken_pipe_exits_cleanly() {
     let message = "Doria".repeat(64 * 1024);
     let source = format!(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {{
     write_stderr("{message}");
 }}
@@ -1340,7 +1338,7 @@ fn native_panic_stays_fatal_when_stderr_is_closed() {
     let output = temp_executable_path("main_panic_closed_stderr");
     compile_native_source(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $line = read_line();
     panic("boom");
@@ -1376,7 +1374,54 @@ function main(): void
 }
 
 #[test]
-fn native_file_write_failure_still_panics() {
+fn native_runtime_error_reporting_failure_exits_70_silently() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native runtime-error integration test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let output = temp_executable_path("main_runtime_error_closed_stderr");
+    compile_native_source(
+        r#"
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function main(): void throws Failure
+{
+    throw new Failure("reporting failed");
+}
+"#,
+        &output,
+    );
+
+    let mut child = retry_transient_executable_busy(|| {
+        Command::new(&output)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .expect("native executable should start");
+    drop(child.stderr.take());
+    let run = child
+        .wait_with_output()
+        .expect("native executable should exit");
+
+    assert_eq!(run.status.code(), Some(70));
+    assert!(run.stdout.is_empty());
+    assert!(run.stderr.is_empty());
+
+    let _ = fs::remove_file(output);
+}
+
+#[test]
+fn native_file_write_failure_reports_a_checked_io_error() {
     if !host_linker_is_available() {
         eprintln!(
             "native file-write integration test unavailable: host linker `{}` was not found",
@@ -1395,15 +1440,9 @@ fn native_file_write_failure_still_panics() {
 
     let run = run_native_executable_in_directory(&output, &directory)
         .expect("native executable should run");
-    assert_eq!(run.status.code(), Some(101));
+    assert_eq!(run.status.code(), Some(70));
     assert!(run.stdout.is_empty());
-    assert_native_runtime_panic(
-        &run.stderr,
-        "P1402",
-        "File Write Failed",
-        &["main"],
-        "file write failure",
-    );
+    assert_native_runtime_error(&run.stderr, "Doria\\Std\\Io\\IoError", "file write failure");
 
     let _ = fs::remove_file(output);
     let _ = fs::remove_dir_all(directory);
@@ -1411,7 +1450,7 @@ fn native_file_write_failure_still_panics() {
 
 #[cfg(unix)]
 #[test]
-fn native_stdin_byte_read_failure_panics_with_stable_message() {
+fn native_stdin_byte_read_failure_reports_a_checked_io_error() {
     if !host_linker_is_available() {
         eprintln!(
             "native stdin-read integration test unavailable: host linker `{}` was not found",
@@ -1423,7 +1462,7 @@ fn native_stdin_byte_read_failure_panics_with_stable_message() {
     let output = temp_executable_path("main_stdin_byte_read_failure");
     compile_native_source(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Bytes $contents = read_stdin_bytes();
     write_stdout_bytes($contents);
@@ -1443,15 +1482,9 @@ function main(): void
     })
     .expect("native executable should run with a write-only stdin");
 
-    assert_eq!(run.status.code(), Some(101));
+    assert_eq!(run.status.code(), Some(70));
     assert!(run.stdout.is_empty());
-    assert_native_runtime_panic(
-        &run.stderr,
-        "P1403",
-        "Standard Input Read Failed",
-        &["main"],
-        "stdin read failure",
-    );
+    assert_native_runtime_error(&run.stderr, "Doria\\Std\\Io\\IoError", "stdin read failure");
 
     let _ = fs::remove_file(output);
 }
@@ -1512,6 +1545,25 @@ fn assert_native_runtime_panic(
     assert!(!stderr.contains("-->"), "{context}: {stderr}");
 }
 
+fn assert_native_runtime_error(stderr: &[u8], error_type: &str, context: &str) {
+    let stderr = String::from_utf8(stderr.to_vec()).expect("runtime error stderr should be UTF-8");
+    assert!(
+        stderr.starts_with(&format!("Error[R1000]: Unhandled {error_type}\n\nWhere\n")),
+        "{context}: unexpected runtime-error header or Where section:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("\n\nWhy\n"),
+        "{context}: missing Why section:\n{stderr}"
+    );
+    assert!(
+        stderr.ends_with("\n\nProcess Exited With Status 70\n"),
+        "{context}: missing final process status:\n{stderr}"
+    );
+    assert!(!stderr.contains("Panic["), "{context}: {stderr}");
+    assert!(!stderr.contains("Call Path"), "{context}: {stderr}");
+    assert!(!stderr.contains("\n\nHelp\n"), "{context}: {stderr}");
+}
+
 fn inline_native_source(stem: &str) -> &'static str {
     match stem {
         "main_void_return" => {
@@ -1524,7 +1576,7 @@ function main(): void
         }
         "main_void_multiple_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo "Hello";
     echo " Doria!";
@@ -1533,7 +1585,7 @@ function main(): void
         }
         "main_void_empty_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo "";
 }
@@ -1541,7 +1593,7 @@ function main(): void
         }
         "main_void_typed_string_local_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     string $message = "Hello Doria!";
     echo $message;
@@ -1550,7 +1602,7 @@ function main(): void
         }
         "main_void_multiple_string_locals_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $hello = "Hello";
     string $space = " ";
@@ -1563,7 +1615,7 @@ function main(): void
         }
         "main_void_string_local_plus_literal_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $message = "Doria!";
     echo "Hello ";
@@ -1573,7 +1625,7 @@ function main(): void
         }
         "main_void_grouped_string_local_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $message = ("Hello Doria!");
     echo ($message);
@@ -1582,7 +1634,7 @@ function main(): void
         }
         "main_void_direct_string_concat_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $name = "Doria";
     echo "Hello " . $name . "!";
@@ -1591,7 +1643,7 @@ function main(): void
         }
         "main_void_string_local_concat_initializer_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $name = "Doria";
     let $message = "Hello " . $name . "!";
@@ -1601,7 +1653,7 @@ function main(): void
         }
         "main_void_string_concat_locals_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $hello = "Hello ";
     let $name = "Doria";
@@ -1612,7 +1664,7 @@ function main(): void
         }
         "main_void_string_local_after_guard_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     if (false) {
         return;
@@ -1625,7 +1677,7 @@ function main(): void
         }
         "main_void_string_local_guard_skip" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $message = "should not print";
 
@@ -1639,7 +1691,7 @@ function main(): void
         }
         "main_void_branch_string_shadowing_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $message = "outer";
 
@@ -1654,7 +1706,7 @@ function main(): void
         }
         "main_void_loop_body_string_local_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $count = 0;
 
@@ -1688,7 +1740,7 @@ function main(): void
         }
         "main_void_guard_true_skips_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     if (true) {
         return;
@@ -1700,7 +1752,7 @@ function main(): void
         }
         "main_void_guard_false_reaches_echo" => {
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     if (false) {
         return;

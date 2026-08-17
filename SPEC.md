@@ -1036,33 +1036,41 @@ Stage 17 provides these compiler-known built-ins:
 
 ```doria
 read_line(string $prompt = ""): ?string
+    throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 read_file(string $path): string
+    throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 write_file(string $path, string $contents): void
+    throws Doria\Std\Io\IoError
 write_stderr(string $value): void
+    throws Doria\Std\Io\IoError
 ```
 
-The compiler-known `sprintf` returns `string` and `printf` returns `void`. Each
+The compiler-known `sprintf` returns `string` and remains nonthrowing. `printf`
+returns `void` and throws `Doria\Std\Io\IoError`; every `echo` statement adds
+that same checked effect to its enclosing callable. Each formatting intrinsic
 takes a literal `string $format` first, followed by the typed operands required
 by that format. The intrinsic-only operand tail is not an untyped Doria
 parameter declaration.
 
 The additive text-file spelling is
-`append_file(string $path, string $contents): void`. It is implemented by Stage 23 Slice 2 alongside
+`append_file(string $path, string $contents): void throws Doria\Std\Io\IoError`. It is implemented by Stage 23 Slice 2 alongside
 the binary file tier; `write_file` remains truncate-only.
 
 `read_line` reads UTF-8 text, removes one LF ending and a preceding CR when present, preserves empty lines and final unterminated lines, and returns `null` only when EOF occurs before any bytes. Its return type was the first supported position for the nullable `?T` model now generalized by Decision 0093. A `!= null` guard narrows `?string` to `string`; assigning `null` or another nullable result invalidates that fact, while assigning a known `string` establishes a new non-null fact.
 
-`read_file` and `write_file` are text-file functions. `read_file` reads an entire file and validates UTF-8 before constructing a `string`; invalid bytes never enter a Doria string. `write_file` creates or truncates a text file and writes the string's exact bytes. `write_stderr` writes exact bytes without adding a newline. An ordinary program write to stdout or stderr that reports a closed pipe exits immediately with status 0 and emits no panic diagnostic or `Call Path`. This exception does not apply to panic diagnostics: a panic remains fatal with status 101 when stderr is unavailable, although its best-effort diagnostic output may be absent. Other Stage 17 I/O failures, including invalid UTF-8, file failures, and non-broken-pipe operating-system failures, use the fatal catalogued runtime-outcome path; `null` from `read_line` means EOF and never signals an error. At Stage 29 these free functions migrate to declared `throws` signatures when checked errors are implemented, but the ordinary standard-stream broken-pipe clean exit is permanent and is never thrown.
+`read_file` and `write_file` are text-file functions. `read_file` reads an entire file and validates UTF-8 before constructing a `string`; invalid bytes never enter a Doria string. `write_file` creates or truncates a text file and writes the string's exact bytes. `write_stderr` writes exact bytes without adding a newline. An ordinary program write to stdout or stderr that reports a closed pipe exits immediately with status 0 and emits no panic diagnostic or `Call Path`. This exception does not apply to panic diagnostics: a panic remains fatal with status 101 when stderr is unavailable, although its best-effort diagnostic output may be absent. Other I/O failures are checked errors: invalid UTF-8 is `Doria\Std\Io\InvalidUtf8Error`, while file, input, flush, and non-broken-pipe device failures are `Doria\Std\Io\IoError`. `null` from `read_line` means EOF and never signals an error.
 
-Stage 23 Slice 2 binary file I/O is whole-file: `read_file_bytes(string $path): Bytes`,
-`write_file_bytes(string $path, Bytes $contents): void`, and
-`append_file_bytes(string $path, Bytes $contents): void`. The write functions borrow `$contents`;
+Stage 23 Slice 2 binary file I/O is whole-file:
+`read_file_bytes(string $path): Bytes throws Doria\Std\Io\IoError`,
+`write_file_bytes(string $path, Bytes $contents): void throws Doria\Std\Io\IoError`, and
+`append_file_bytes(string $path, Bytes $contents): void throws Doria\Std\Io\IoError`. The write functions borrow `$contents`;
 they do not consume it. Reads and writes preserve exact bytes without UTF-8 validation or newline
 translation. `File` and stream objects, including RAII close and buffered/seekable access, are
 planned after Stage 29. These future tiers do not change the text and EOF contracts.
 
 Binary standard-stream I/O is `read_stdin_bytes(): Bytes`,
-`write_stdout_bytes(Bytes $contents): void`, and `write_stderr_bytes(Bytes $contents): void`.
+`write_stdout_bytes(Bytes $contents): void`, and `write_stderr_bytes(Bytes $contents): void`;
+each throws `Doria\Std\Io\IoError`.
 `read_stdin_bytes` slurps to EOF and returns an empty `Bytes` at immediate EOF. Byte output borrows
 its buffer and follows the ordinary closed-pipe clean-exit rule. All Stage 23 I/O intrinsics are
 unshadowable.
@@ -1263,15 +1271,26 @@ reverse order, uninitialized fields are ignored, allocation is freed, and the
 error continues. Fatal panic remains separate, non-catchable, cleanup-free, and
 status 101.
 
-Stage 29 Slices 1 and 2 implement grammar, semantic checking, AST/HIR,
+Stage 29 implements grammar, semantic checking, AST/HIR,
 ownership, the two-word erased carrier, hidden first-throw origin storage,
 checked MIR, the status/out-slot ABI, propagation, cleanup, exact catches,
-rethrow, and backend transport. Handled checked errors execute through the
-interpreter, Cranelift, LLVM, and the PHP compatibility backend. Slice 3 owns the
-canonical `Doria\Std\Io` error types, I/O signature migration, and shared
-`Error[R1000]` status-70 outcome for an Error escaping `main`; that entry-boundary
-case remains rejected before artifact emission until Slice 3. Nonthrowing
-programs remain executable throughout.
+rethrow, canonical `Doria\Std\Io` errors, checked I/O effects, and backend
+transport. Handled checked errors execute through the interpreter, Cranelift,
+LLVM, and the PHP compatibility backend. An Error escaping `main` performs
+required cleanup, is reported as `Error[R1000]`, and exits with status 70. A
+successful `main(): int` may independently return 70 without producing R1000.
+
+The compiler-known I/O family contains `IoOperation` (`Open`, `Read`, `Write`,
+`Append`, `Flush`), `IoTarget` (`File(string $path)`, `StandardInput`,
+`StandardOutput`, `StandardError`), `IoErrorReason` (`NotFound`,
+`PermissionDenied`, `InvalidInput`, `Interrupted`, `ResourceExhausted`,
+`Unsupported`, `Closed`, `Other`), and `Utf8InputSource` (`File(string $path)`,
+`StandardInput`). `IoError` exposes readonly `message`, `operation`, `target`,
+`reason`, and `?int systemCode`; `InvalidUtf8Error` exposes readonly `message`,
+`source`, `validByteCount`, and `?int invalidByteCount`. Counts are bytes.
+Stable messages are Doria-owned and host-localized error prose is not exposed.
+P1401 through P1407 remain historical catalogue identities with no ordinary
+valid source route; string and Bytes allocation failures remain P1206 and P1302.
 
 `Result<T, E>` is not Doria's default error model. Runtime panic is separate
 from checked `throw` / `throws`.
@@ -1303,7 +1322,7 @@ Process Exited With Status 101
 
 Checked integer addition, subtraction, multiplication, and signed negation overflow use this runtime-outcome path for every integer width. Division by zero, signed division overflow, remainder by zero, an out-of-range shift count, and an out-of-range explicit conversion use the same catalogue infrastructure with distinct codes and titles. Returning a process status outside `0..125` from `main(): int` also panics. A panic is not a compilation failure: it is a runtime outcome represented by the compiler-owned `Diagnostic`, with abort-without-cleanup termination semantics.
 
-Compiler implementation for `throw`, `throws`, `try`, and `catch` is future work.
+Checked `throw`, `throws`, `try`, and `catch` are implemented through Stage 29.
 
 ### given predicate blocks
 

@@ -1,0 +1,11 @@
+class MultilineFailure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function main(): void throws MultilineFailure
+{
+    throw new MultilineFailure("first\nWhere\nWhy\r\0\tlast");
+}

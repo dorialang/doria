@@ -113,6 +113,7 @@ three execution paths.
 | Decision 0113 Slice 3 collection members | Covered | Covered | Covered | Covered | First-match nullable `List::indexOf`, first-match writable `List::remove`, nullable map value membership, insertion-ordered `Set` endpoints, and ascending `SortedSet` endpoints preserve exact stdout, stderr, and status through one validated MIR contract. |
 | Decision 0113 Slice 4 collection clear | Covered | Covered | Covered | Covered | All seven named collections clear in place, invalidate old membership state, survive double clear, and preserve reuse order through one validated MIR statement and runtime reset contract. |
 | Stage 29 Slice 2 checked errors | Covered | Covered | Covered | Covered where lifecycle semantics permit | Two-word Error carriers, direct throw, checked calls, exact and catch-all dispatch, optional bindings, rethrow, nested handlers, structured finalizers, failed construction, ordinary Error values, `mixed`, supported collections, and first-origin preservation use one validated MIR contract. |
+| Stage 29 Slice 3 checked I/O and R1000 | Covered | Covered | Covered | Covered | Canonical I/O error facts, UTF-8 byte facts, built-in effects, first-origin construction, status-70 entry handling, cleanup, and private/standalone outcome reporting preserve exact stdout, stderr, status, files, and structured outcomes. |
 | Runtime panic diagnostic outcome | Covered | Covered | Covered | Covered | Catalogued `P` code, Title Case title, precise Doria source label, `Why`, `Call Path`, stderr bytes, and status 101 remain exact across the durable manifest. |
 | `take` ownership transfer | Covered | Covered | Covered | Covered | Transfer invalidates the caller slot and cleanup becomes the callee's obligation. |
 | Property loads and Stage 19 assignments | Covered | Covered | Covered | Covered | Shared class metadata supplies checked types and compiler-known offsets. |
@@ -183,7 +184,7 @@ three execution paths.
 | Checked `sprintf` | Covered | Covered | Covered | Covered | One validated MIR plan covers every accepted conversion, width, alignment, padding, and precision form. |
 | Checked `printf` | Covered | Covered | Covered | Covered | Same plan as `sprintf`; exact stdout, void result, and no implicit newline. |
 | Format failures | Frontend | Frontend | Frontend | Covered | Dynamic, malformed, unsupported, wrong-arity, and wrong-type formats are rejected before MIR. |
-| I/O panic failures | Covered | Covered | Covered | Covered | Missing-file panic preserves its exact catalogue entry, path-argument label, Doria call path, and status 101. |
+| Checked I/O failures | Covered | Covered | Covered | Covered | Missing files, invalid paths, invalid UTF-8, text/binary/device failures, and deterministic messages use canonical Doria Error types. P1401-P1407 are historical; allocation panic remains separate. |
 | Windows Unicode output | Unit + CI | Unit + CI | Unit + CI | Covered | Interactive console uses wide writes; redirected handles preserve exact UTF-8 bytes. |
 | Per-stream interactivity foundation | Runtime | Runtime | Runtime | Covered | Internal stdin/stdout/stderr detection is independent and is not exposed as a public Doria API. |
 | Native compile without execution preflight | Covered | Covered | Covered | Covered | Infinite-loop source compiles but is excluded from executable parity. |
@@ -199,11 +200,12 @@ front-to-back iteration across the interpreter, Cranelift, and LLVM. The Stage
 independent writable bindings, shared immutable strings, and nullable empty
 move bindings across the same three execution paths.
 
-Status: Passed through Stage 29 Slice 2. Stage 29 remains in progress. Handled
-checked errors are registered in the durable manifest and agree across the MIR
-interpreter, Cranelift, and LLVM on stdout, stderr, status, and destructor output.
-PHP compatibility executes the supported transport subset using Doria descriptor
-identity. Slice 3 is next; an Error escaping `main` remains gated before artifact
-emission, and existing nonthrowing parity remains unchanged.
+Status: Passed through Stage 29 Slice 3; Stage 29 is complete. Checked errors and
+checked I/O are registered in the durable manifest and agree across the MIR
+interpreter, Cranelift, and LLVM on stdout, stderr, status, files, origins, and
+destructor output. PHP compatibility executes the supported subset using Doria
+descriptor identity. An Error escaping `main` reports R1000 after cleanup and
+exits 70; a successful return of 70 emits no R1000. Existing nonthrowing parity,
+fatal status 101, and ordinary broken-pipe status 0 remain unchanged.
 
 All accepted native scalar, string, interpolation, checked-format, text-I/O, ownership, native-class, method, static, constant, concrete-display, nullable, collection, `Bytes`, boxed-`mixed`, monomorphized generic, and Stage 25a shared-ownership lowering passes through typed MIR and shared MIR validation. The interpreter, Cranelift fast profile, and LLVM release profile consume that same MIR; every finite native example is required in the executable manifest with deterministic sidecars where needed; Linux CI memory-checks the ownership-bearing native fixtures, including readonly collision projection, writable shared class, all writable payload domains, weak-cycle breaking, bounded stress, access lifetime, and stored-access paths; and the Stage 7-10 native smoke module remains retired and deleted. Stage 21 ordinary borrowing and constructor definite initialization and Stage 22 narrowing use the same backend-independent control-flow/dataflow foundation. Stage 24 specializes reachable free functions and instance/static methods once per concrete generic-argument set before any backend consumes the program. Stage 25 specializes generic classes. Stage 25a Slices 1 through 4 provide the two distinct non-atomic control models, per-allocation writable access state, owned access objects, collision projection, exact conflict reasons, and complete parity/tooling closure.

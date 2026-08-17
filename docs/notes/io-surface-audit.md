@@ -61,7 +61,7 @@ is now stale.
 | Flush | The standard-output flush is presently an intentional successful no-op over unbuffered writes, not durable filesystem synchronization. |
 | TTY | Runtime interactivity detection uses `isatty` on Unix and console-handle detection on Windows. |
 | Broken pipe | Unix ignores `SIGPIPE`; Unix `EPIPE` and Windows broken-pipe conditions cleanly exit status 0 for ordinary standard output. |
-| Failures | Runtime panics use decision 0109's unified structured outcomes; Stage 29 Slice 3 migrates ordinary I/O failures to the canonical decision-0119 checked errors. |
+| Failures | Ordinary I/O failures use decision 0119's canonical checked `Doria\Std\Io` errors. Allocation and other fatal panics retain decision 0109's status-101 outcomes; closed standard pipes retain status 0. |
 
 ## Architectural constraints carried into review
 
@@ -541,8 +541,8 @@ the capability-specific detail is normalized in the machine-readable manifest.
 - **Three-tier file family** (text now / `Bytes` Stage 23 / `File`+stream post-Stage-29) — 0075 §Decision; plan §9.
 - **`write_file` truncates** ("creates or truncates and writes exact bytes") — 0074 §Text files; SPEC "Stage 17" (`write_file creates or truncates`). *At audit time truncate was defined and shipped while append was open (Q3); Decision 0091 has since settled the additive `append_file` spelling for Stage 23.*
 - **Text tier does no newline normalization; byte-exact read & write** — 0074 ("preserves its bytes without newline normalization"; "writes exact bytes"). `read_line` strips exactly one LF or one CRLF at the line boundary — 0074 §Line input; SPEC.
-- **Invalid UTF-8 on read → panic, no lossy/replacement path** ("file contained invalid UTF-8" / "stdin contained invalid UTF-8") — 0074. Raw/undecoded bytes are the `Bytes` tier's job (Stage 23), not a lossy string path.
-- **Text-tier failure model:** panic + status 101 until Stage 29 Slice 3, then declared `throws`; `read_line` `null` = EOF only, never error — 0074, 0075, 0119.
+- **Invalid UTF-8 on text read → `Doria\Std\Io\InvalidUtf8Error`, no lossy/replacement path** — 0074 and implemented 0119. Raw/undecoded bytes are the `Bytes` tier's job, not a lossy string path.
+- **Text-tier failure model:** declared canonical checked errors are implemented; `read_line` `null` = EOF only, never error — 0074, 0075, 0119. P1401-P1407 remain historical and have no ordinary valid route.
 - **Terminal layer deferred and bounded:** capability-based `Console` static facade, no escape sequences/handles/ANSI in any public value, Stage 46 build-out, decision number assigned when authored — 0074 §Future terminal boundary; plan §9; 0006.
 - **RAII flush/close on normal exit and on `throws` propagation** (drop elaboration runs `__destruct` at every scope boundary) — plan §3.1, §5. **Abort-only panic runs no cleanup** — 0081 (this is the root of D6).
 - **SIGPIPE is ignored at the runtime** so a closed-pipe write reports EPIPE instead of killing by signal — `doria-rt/src/lib.rs:940` (impl). *The language-level contract was the audit's D1 gap and is now settled by Decision 0091.*
@@ -610,7 +610,7 @@ Format per item: **Status · Options · Tradeoffs · Recommendation (marked) · 
 
 ### D3 — byte-tier (Stage 23) failure model not explicit [minor gap]
 - **Status.** 0075 states the *text*-tier failure model precisely but does not spell out the Stage 23 byte functions'.
-- **Recommendation.** State that byte-tier functions follow the same model — panic until Stage 29, then migrate to `throws` with the text functions — so it is not re-invented at Stage 23. **Blast radius:** one-clause 0075/SPEC clarification.
+- **Implemented.** Byte-tier functions use the same checked `IoError` model as text I/O without performing UTF-8 validation. Allocation failure remains P1302.
 
 ### D4 — partial writes / short reads / EINTR [OPEN — contract clarification]
 - **Status.** The free-function tier is all-or-nothing (whole file / whole line; failure panics). Partial writes, short reads, and `EINTR` are handled inside `doria-rt` and never surface. **Verify:** confirm `doria-rt` actually retries `EINTR` and loops short writes to completion (I did not audit every write loop — flag for the implementer).

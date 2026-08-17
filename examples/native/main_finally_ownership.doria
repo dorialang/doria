@@ -5,7 +5,15 @@ class Note
     }
 }
 
-function main(): void
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
+function main(): void throws Doria\Std\Io\IoError
 {
     given {
         let $note = new Note("ready");
@@ -13,6 +21,6 @@ function main(): void
     } if (true) {
         echo "body\n";
     } finally {
-        echo "cleanup\n";
+        record("cleanup\n");
     }
 }

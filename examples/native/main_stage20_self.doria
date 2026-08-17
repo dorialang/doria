@@ -36,11 +36,14 @@ class Message
 
     function __destruct()
     {
-        echo "released:" . $this->text . "\n";
+        try {
+            echo "released:" . $this->text . "\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo Counter::next();
     echo ":";

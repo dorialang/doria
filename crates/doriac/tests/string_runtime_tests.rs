@@ -146,7 +146,7 @@ function main(): void
 fn php_backend_refuses_string_intrinsics_instead_of_changing_semantics() {
     let error = doriac::compile_source_with_options(
         "string-runtime.doria",
-        r#"function main(): void { echo String::upper("Straße"); }"#,
+        r#"function main(): void throws Doria\Std\Io\IoError { echo String::upper("Straße"); }"#,
         CompileOptions::new(BackendTarget::Php),
     )
     .expect_err("PHP must refuse Unicode String intrinsics it cannot preserve");
@@ -161,7 +161,7 @@ fn string_property_recognition_does_not_capture_other_length_properties() {
     doriac::lower_source_to_mir(
         "bytes-length.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Bytes $bytes = "abc"->bytes;
     echo $bytes->length;

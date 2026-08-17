@@ -1,24 +1,16 @@
 Panic[P1310]: Collection Index Is Out Of Bounds
 
 Where
-examples/native/main_stage23_collection_oob_panic.doria · line 1 · main
+examples/native/main_stage23_collection_oob_panic.doria · line 4 · main
 
-  1      function main(): void
-         ^^^^^^^^^^^^^^^^^^^^^
-         Invalid Collection Index
-  2      {
-         ^
-  3          int[] $values = [1];
-         ^^^^^^^^^^^^^^^^^^^^^^^^
   4          echo "{$values[1]}";
-         ^^^^^^^^^^^^^^^^^^^^^^^^
-  5      }
-         ^
+             ^^^^^^^^^^^^^^^^^^^^
+             Invalid Collection Index
 
 Why
 The collection index is outside the valid range of this collection.
 
 Call Path
-main · examples/native/main_stage23_collection_oob_panic.doria:1
+main · examples/native/main_stage23_collection_oob_panic.doria:4
 
 Process Exited With Status 101

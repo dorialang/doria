@@ -16,7 +16,7 @@ const BROKEN_PIPE_STDOUT_BYTES: &str =
 const BROKEN_PIPE_STDERR_BYTES: &str =
     include_str!("fixtures/native_io/broken_pipe_stderr_bytes.doria");
 const BROKEN_PIPE_READ_LINE_PROMPT: &str = r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $line = read_line("Name: ");
 }
@@ -802,7 +802,7 @@ fn make_executable(_path: &Path) {}
 fn prompted_read_line_writes_its_prompt_before_input_is_supplied() {
     const PROMPT: &[u8] = b"Name: ";
     let source = r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $name = read_line("Name: ");
 

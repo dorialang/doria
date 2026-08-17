@@ -141,6 +141,12 @@ struct ErrorValue {
     descriptor: mir::ErrorDescriptorId,
 }
 
+enum CheckedIoResult {
+    Success(Option<LocalValue>),
+    Error(ErrorValue),
+    RuntimePanic(RuntimePanicEvent),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum LocalValue {
     Scalar(mir::ScalarValue),
@@ -812,6 +818,14 @@ enum EvaluationTask {
         temporary_arg_drops: Vec<usize>,
         call_site: Span,
     },
+    FinishCheckedIo {
+        operation: mir::CheckedIoOperation,
+        result: Option<mir::LocalId>,
+        error: mir::LocalId,
+        success: mir::BlockId,
+        failure: mir::BlockId,
+        span: Span,
+    },
     FinishStatement,
     DropTemporaryValues(Vec<OwnedDrop>),
     Assign(mir::LocalId),
@@ -869,6 +883,7 @@ struct CallFrame {
     caller_expectation: Option<ReturnExpectation>,
     checked_continuation: Option<CheckedContinuation>,
     entered_from: Option<Span>,
+    active_panic_site: Span,
 }
 
 struct Interpreter<'program> {
@@ -895,12 +910,46 @@ pub enum MirIoWriteFailure {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MirIoFailureReason {
+    NotFound,
+    PermissionDenied,
+    InvalidInput,
+    Interrupted,
+    ResourceExhausted,
+    Unsupported,
+    Closed,
+    #[default]
+    Other,
+}
+
+impl MirIoFailureReason {
+    fn compiler_reason(self) -> crate::compiler_known_io::IoErrorReason {
+        use crate::compiler_known_io::IoErrorReason;
+
+        match self {
+            Self::NotFound => IoErrorReason::NotFound,
+            Self::PermissionDenied => IoErrorReason::PermissionDenied,
+            Self::InvalidInput => IoErrorReason::InvalidInput,
+            Self::Interrupted => IoErrorReason::Interrupted,
+            Self::ResourceExhausted => IoErrorReason::ResourceExhausted,
+            Self::Unsupported => IoErrorReason::Unsupported,
+            Self::Closed => IoErrorReason::Closed,
+            Self::Other => IoErrorReason::Other,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MirIoFaults {
     pub prompt_write: Option<MirIoWriteFailure>,
     pub stdout_flush: Option<MirIoWriteFailure>,
+    pub stdout_write: Option<MirIoWriteFailure>,
+    pub stderr_write: Option<MirIoWriteFailure>,
     pub stdin_line_read: bool,
     pub line_allocation: bool,
+    pub failure_reason: MirIoFailureReason,
+    pub system_code: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1633,6 +1682,7 @@ impl Interpreter<'_> {
                 args,
                 span,
             } => {
+                self.set_active_panic_site(span)?;
                 let owned_receiver = object.owned_temporary_class();
                 let frame = self.current_frame_mut()?;
                 frame
@@ -1736,7 +1786,10 @@ impl Interpreter<'_> {
                     .get_mut(local.0)
                     .and_then(Option::take)
                     .ok_or_else(|| {
-                        InterpreterError::new("string temporary was dropped before initialization")
+                        InterpreterError::new(format!(
+                            "string temporary local{} was dropped before initialization",
+                            local.0
+                        ))
                     })?;
                 if !matches!(value, LocalValue::String(_) | LocalValue::NullableString(_)) {
                     return Err(InterpreterError::new(
@@ -1884,6 +1937,7 @@ impl Interpreter<'_> {
                 Ok(StepOutcome::Continue)
             }
             mir::Terminator::Panic { message, span } => {
+                self.set_active_panic_site(span)?;
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::PanicString(span));
                 frame.tasks.push(EvaluationTask::String(message));
@@ -1920,6 +1974,7 @@ impl Interpreter<'_> {
                 failure,
                 span,
             } => {
+                self.set_active_panic_site(span)?;
                 let callee = function_in(self.program, function)?;
                 let temporary_arg_drops =
                     temporary_argument_drop_order(&args, callee, 0, |_| false)?;
@@ -1930,6 +1985,7 @@ impl Interpreter<'_> {
                     failure,
                 };
                 let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishStatement);
                 frame.tasks.push(EvaluationTask::InvokeChecked {
                     function,
                     argument_count: args.len(),
@@ -1953,6 +2009,7 @@ impl Interpreter<'_> {
                 failure,
                 span,
             } => {
+                self.set_active_panic_site(span)?;
                 let definition = function_in(self.program, constructor)?;
                 let temporary_arg_drops =
                     temporary_argument_drop_order(&args, definition, 1, |index| {
@@ -1978,6 +2035,7 @@ impl Interpreter<'_> {
                     call_site: span,
                 };
                 let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishStatement);
                 frame.tasks.push(EvaluationTask::BuildClassNew {
                     class,
                     properties: properties.clone(),
@@ -1994,6 +2052,57 @@ impl Interpreter<'_> {
                     if let mir::PropertyValueSource::Expression(value) = property.source {
                         frame.tasks.push(EvaluationTask::Rvalue(value));
                     }
+                }
+                Ok(StepOutcome::Continue)
+            }
+            mir::Terminator::CheckedIo {
+                operation,
+                result,
+                error,
+                success,
+                failure,
+                span,
+            } => {
+                self.set_active_panic_site(span)?;
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishStatement);
+                frame.tasks.push(EvaluationTask::FinishCheckedIo {
+                    operation: operation.clone(),
+                    result,
+                    error,
+                    success,
+                    failure,
+                    span,
+                });
+                match operation {
+                    mir::CheckedIoOperation::ReadLine { prompt } => {
+                        frame.tasks.push(EvaluationTask::String(prompt));
+                    }
+                    mir::CheckedIoOperation::ReadFile { path, .. } => {
+                        frame.tasks.push(EvaluationTask::String(path));
+                    }
+                    mir::CheckedIoOperation::ReadStdinBytes => {}
+                    mir::CheckedIoOperation::WriteFile { path, contents, .. } => {
+                        match contents {
+                            mir::IoContents::String(value) => {
+                                frame.tasks.push(EvaluationTask::String(value));
+                            }
+                            mir::IoContents::Format(value) => {
+                                frame.tasks.push(EvaluationTask::Format(value));
+                            }
+                            mir::IoContents::Bytes(_) => {}
+                        }
+                        frame.tasks.push(EvaluationTask::String(path));
+                    }
+                    mir::CheckedIoOperation::WriteStream { contents, .. } => match contents {
+                        mir::IoContents::String(value) => {
+                            frame.tasks.push(EvaluationTask::String(value));
+                        }
+                        mir::IoContents::Format(value) => {
+                            frame.tasks.push(EvaluationTask::Format(value));
+                        }
+                        mir::IoContents::Bytes(_) => {}
+                    },
                 }
                 Ok(StepOutcome::Continue)
             }
@@ -4928,6 +5037,16 @@ impl Interpreter<'_> {
             EvaluationTask::BuildFormat(format) => {
                 let values = self.take_evaluation_values(format.arguments.len())?;
                 self.push_string(render_format(&format, &values)?)?;
+            }
+            EvaluationTask::FinishCheckedIo {
+                operation,
+                result,
+                error,
+                success,
+                failure,
+                span,
+            } => {
+                return self.finish_checked_io(operation, result, error, success, failure, span);
             }
             EvaluationTask::ReadLine(prompt_span) => {
                 let prompt = self.pop_string()?;
@@ -9401,6 +9520,9 @@ impl Interpreter<'_> {
         expectation: ReturnExpectation,
         call_site: Option<Span>,
     ) -> Result<(), InterpreterError> {
+        if let Some(call_site) = call_site {
+            self.set_active_panic_site(call_site)?;
+        }
         let callee = function_in(self.program, function)?;
         let temporary_arg_drops = temporary_argument_drop_order(&args, callee, 0, |_| false)?;
         let frame = self.current_frame_mut()?;
@@ -9553,6 +9675,7 @@ impl Interpreter<'_> {
             caller_expectation,
             checked_continuation: None,
             entered_from,
+            active_panic_site: function.source_span,
         });
         Ok(())
     }
@@ -9665,9 +9788,9 @@ impl Interpreter<'_> {
                     .locals
                     .get_mut(local.0)
                     .ok_or_else(|| InterpreterError::new("checked call local does not exist"))?;
-                if slot.replace(value).is_some() {
+                if slot.replace(value).is_some() && local_in(caller, local)?.owned {
                     return Err(InterpreterError::new(
-                        "checked call initialized an occupied result local",
+                        "checked call overwrote an occupied owned result local",
                     ));
                 }
             }
@@ -9742,6 +9865,526 @@ impl Interpreter<'_> {
         frame.statement_index = 0;
         frame.entered_block = false;
         Ok(())
+    }
+
+    fn finish_checked_io(
+        &mut self,
+        operation: mir::CheckedIoOperation,
+        result: Option<mir::LocalId>,
+        error: mir::LocalId,
+        success: mir::BlockId,
+        failure: mir::BlockId,
+        span: Span,
+    ) -> Result<StepOutcome, InterpreterError> {
+        use crate::compiler_known_io::{IoErrorReason, IoOperation, IoTarget, Utf8InputSource};
+
+        let outcome = match operation {
+            mir::CheckedIoOperation::ReadLine { .. } => {
+                let prompt = self.pop_string()?;
+                if !prompt.is_empty() {
+                    self.io_trace.prompt_writes += 1;
+                    match self.io_faults.prompt_write {
+                        Some(MirIoWriteFailure::BrokenPipe) => return Ok(StepOutcome::CleanExit),
+                        Some(MirIoWriteFailure::Other) => {
+                            CheckedIoResult::Error(self.allocate_io_error(
+                                IoOperation::Write,
+                                IoTarget::StandardOutput,
+                                self.io_faults.failure_reason.compiler_reason(),
+                                self.io_faults.system_code,
+                            )?)
+                        }
+                        None => {
+                            self.stdout.extend_from_slice(prompt.as_bytes());
+                            self.io_trace.stdout_flushes += 1;
+                            match self.io_faults.stdout_flush {
+                                Some(MirIoWriteFailure::BrokenPipe) => {
+                                    return Ok(StepOutcome::CleanExit)
+                                }
+                                Some(MirIoWriteFailure::Other) => {
+                                    CheckedIoResult::Error(self.allocate_io_error(
+                                        IoOperation::Flush,
+                                        IoTarget::StandardOutput,
+                                        self.io_faults.failure_reason.compiler_reason(),
+                                        self.io_faults.system_code,
+                                    )?)
+                                }
+                                None => self.read_checked_line(span)?,
+                            }
+                        }
+                    }
+                } else {
+                    self.io_trace.stdout_flushes += 1;
+                    match self.io_faults.stdout_flush {
+                        Some(MirIoWriteFailure::BrokenPipe) => return Ok(StepOutcome::CleanExit),
+                        Some(MirIoWriteFailure::Other) => {
+                            CheckedIoResult::Error(self.allocate_io_error(
+                                IoOperation::Flush,
+                                IoTarget::StandardOutput,
+                                self.io_faults.failure_reason.compiler_reason(),
+                                self.io_faults.system_code,
+                            )?)
+                        }
+                        None => self.read_checked_line(span)?,
+                    }
+                }
+            }
+            mir::CheckedIoOperation::ReadFile { bytes, .. } => {
+                let path = self.pop_string()?.to_string();
+                if path.as_bytes().contains(&0) {
+                    CheckedIoResult::Error(self.allocate_io_error(
+                        IoOperation::Open,
+                        IoTarget::File(path),
+                        IoErrorReason::InvalidInput,
+                        None,
+                    )?)
+                } else if let Some(contents) = self.files.get(&path).cloned() {
+                    if bytes {
+                        let collection = self.checked_io_collection_result(result)?;
+                        self.push_byte_collection(collection, &contents)?;
+                        CheckedIoResult::Success(Some(self.pop_local_value()?))
+                    } else {
+                        match String::from_utf8(contents) {
+                            Ok(value) => {
+                                CheckedIoResult::Success(Some(LocalValue::String(value.into())))
+                            }
+                            Err(error) => {
+                                let utf8 = error.utf8_error();
+                                CheckedIoResult::Error(self.allocate_invalid_utf8_error(
+                                    Utf8InputSource::File(path),
+                                    utf8.valid_up_to(),
+                                    utf8.error_len(),
+                                )?)
+                            }
+                        }
+                    }
+                } else {
+                    CheckedIoResult::Error(self.allocate_io_error(
+                        IoOperation::Open,
+                        IoTarget::File(path),
+                        IoErrorReason::NotFound,
+                        None,
+                    )?)
+                }
+            }
+            mir::CheckedIoOperation::ReadStdinBytes => {
+                let contents = self.stdin[self.stdin_cursor..].to_vec();
+                self.stdin_cursor = self.stdin.len();
+                let collection = self.checked_io_collection_result(result)?;
+                self.push_byte_collection(collection, &contents)?;
+                CheckedIoResult::Success(Some(self.pop_local_value()?))
+            }
+            mir::CheckedIoOperation::WriteFile {
+                contents, append, ..
+            } => {
+                let (path, contents) = match contents {
+                    mir::IoContents::String(_) | mir::IoContents::Format(_) => {
+                        let contents = self.pop_string()?.as_bytes().to_vec();
+                        let path = self.pop_string()?.to_string();
+                        (path, contents)
+                    }
+                    mir::IoContents::Bytes(local) => {
+                        let path = self.pop_string()?.to_string();
+                        (path, self.byte_collection(local)?)
+                    }
+                };
+                if path.as_bytes().contains(&0) {
+                    CheckedIoResult::Error(self.allocate_io_error(
+                        if append {
+                            IoOperation::Append
+                        } else {
+                            IoOperation::Write
+                        },
+                        IoTarget::File(path),
+                        IoErrorReason::InvalidInput,
+                        None,
+                    )?)
+                } else {
+                    if append {
+                        self.files
+                            .entry(path)
+                            .or_default()
+                            .extend_from_slice(&contents);
+                    } else {
+                        self.files.insert(path, contents);
+                    }
+                    CheckedIoResult::Success(None)
+                }
+            }
+            mir::CheckedIoOperation::WriteStream { contents, stderr } => {
+                let contents = match contents {
+                    mir::IoContents::String(_) | mir::IoContents::Format(_) => {
+                        self.pop_string()?.as_bytes().to_vec()
+                    }
+                    mir::IoContents::Bytes(local) => self.byte_collection(local)?,
+                };
+                let fault = if stderr {
+                    self.io_faults.stderr_write
+                } else {
+                    self.io_faults.stdout_write
+                };
+                match fault {
+                    Some(MirIoWriteFailure::BrokenPipe) => return Ok(StepOutcome::CleanExit),
+                    Some(MirIoWriteFailure::Other) => {
+                        CheckedIoResult::Error(self.allocate_io_error(
+                            IoOperation::Write,
+                            if stderr {
+                                IoTarget::StandardError
+                            } else {
+                                IoTarget::StandardOutput
+                            },
+                            self.io_faults.failure_reason.compiler_reason(),
+                            self.io_faults.system_code,
+                        )?)
+                    }
+                    None => {
+                        if stderr {
+                            self.stderr.extend_from_slice(&contents);
+                        } else {
+                            self.stdout.extend_from_slice(&contents);
+                        }
+                        CheckedIoResult::Success(None)
+                    }
+                }
+            }
+        };
+
+        let function_id = self.current_frame()?.function;
+        let function = function_in(self.program, function_id)?.clone();
+        match outcome {
+            CheckedIoResult::Success(value) => {
+                match (result, value) {
+                    (Some(local), Some(value)) => {
+                        let replaced = assign_local(
+                            &function.locals,
+                            &mut self.current_frame_mut()?.locals,
+                            local,
+                            value,
+                        )?;
+                        if replaced.is_some() && local_in(&function, local)?.owned {
+                            return Err(InterpreterError::new(
+                                "checked I/O overwrote an occupied owned result local",
+                            ));
+                        }
+                    }
+                    (None, None) => {}
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "checked I/O result does not match its MIR result local",
+                        ))
+                    }
+                }
+                self.move_to_block(&function, success)?;
+            }
+            CheckedIoResult::Error(value) => {
+                let replaced = assign_local(
+                    &function.locals,
+                    &mut self.current_frame_mut()?.locals,
+                    error,
+                    LocalValue::Error(value),
+                )?;
+                if replaced.is_some() {
+                    return Err(InterpreterError::new(
+                        "checked I/O initialized an occupied Error local",
+                    ));
+                }
+                self.move_to_block(&function, failure)?;
+            }
+            CheckedIoResult::RuntimePanic(event) => {
+                return Ok(StepOutcome::RuntimePanic(event));
+            }
+        }
+        Ok(StepOutcome::Continue)
+    }
+
+    fn read_checked_line(&mut self, span: Span) -> Result<CheckedIoResult, InterpreterError> {
+        use crate::compiler_known_io::{IoOperation, IoTarget, Utf8InputSource};
+
+        self.io_trace.stdin_line_reads += 1;
+        if self.io_faults.stdin_line_read {
+            return Ok(CheckedIoResult::Error(self.allocate_io_error(
+                IoOperation::Read,
+                IoTarget::StandardInput,
+                self.io_faults.failure_reason.compiler_reason(),
+                self.io_faults.system_code,
+            )?));
+        }
+        if self.stdin_cursor == self.stdin.len() {
+            return Ok(CheckedIoResult::Success(Some(LocalValue::NullableString(
+                None,
+            ))));
+        }
+        let remaining = &self.stdin[self.stdin_cursor..];
+        let newline = remaining.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(remaining.len(), |index| index + 1);
+        let mut line_length = newline.unwrap_or(remaining.len());
+        if line_length != 0 && remaining[line_length - 1] == b'\r' {
+            line_length -= 1;
+        }
+        let bytes = &remaining[..line_length];
+        self.stdin_cursor += consumed;
+        let line = match core::str::from_utf8(bytes) {
+            Ok(line) => line,
+            Err(error) => {
+                return Ok(CheckedIoResult::Error(self.allocate_invalid_utf8_error(
+                    Utf8InputSource::StandardInput,
+                    error.valid_up_to(),
+                    error.error_len(),
+                )?))
+            }
+        };
+        if self.io_faults.line_allocation {
+            return Ok(CheckedIoResult::RuntimePanic(RuntimePanicEvent {
+                code: "P1206",
+                operation_span: span,
+                primary_span: span,
+                facts: Vec::new(),
+                explanation: None,
+            }));
+        }
+        let line = line.to_string();
+        Ok(CheckedIoResult::Success(Some(LocalValue::NullableString(
+            Some(line.into()),
+        ))))
+    }
+
+    fn checked_io_collection_result(
+        &self,
+        result: Option<mir::LocalId>,
+    ) -> Result<mir::CollectionTypeId, InterpreterError> {
+        let result = result
+            .ok_or_else(|| InterpreterError::new("checked byte input has no result local"))?;
+        let function = function_in(self.program, self.current_frame()?.function)?;
+        match local_in(function, result)?.ty {
+            mir::Type::Collection(collection) => Ok(collection),
+            _ => Err(InterpreterError::new(
+                "checked byte input result is not Bytes",
+            )),
+        }
+    }
+
+    fn allocate_io_error(
+        &mut self,
+        operation: crate::compiler_known_io::IoOperation,
+        target: crate::compiler_known_io::IoTarget,
+        reason: crate::compiler_known_io::IoErrorReason,
+        system_code: Option<i64>,
+    ) -> Result<ErrorValue, InterpreterError> {
+        let message = crate::compiler_known_io::io_error_message(operation, &target, reason);
+        let operation = self.unit_enum_value(
+            crate::compiler_known_io::IO_OPERATION,
+            operation.case_name(),
+        )?;
+        let target = self.payload_enum_value(
+            crate::compiler_known_io::IO_TARGET,
+            target.case_name(),
+            match target {
+                crate::compiler_known_io::IoTarget::File(path) => {
+                    vec![LocalValue::String(path.into())]
+                }
+                crate::compiler_known_io::IoTarget::StandardInput
+                | crate::compiler_known_io::IoTarget::StandardOutput
+                | crate::compiler_known_io::IoTarget::StandardError => Vec::new(),
+            },
+        )?;
+        let reason = self.unit_enum_value(
+            crate::compiler_known_io::IO_ERROR_REASON,
+            reason.case_name(),
+        )?;
+        let system_code = LocalValue::NullableScalar {
+            ty: mir::ScalarType::Integer(IntegerType::Int64),
+            value: system_code.map(|value| {
+                mir::ScalarValue::Integer(
+                    IntegerValue::from_i128(IntegerType::Int64, i128::from(value))
+                        .expect("i64 is representable as Doria int"),
+                )
+            }),
+        };
+        self.allocate_error_object(
+            crate::compiler_known_io::IO_ERROR,
+            vec![
+                ("message", LocalValue::String(message.into())),
+                ("operation", operation),
+                ("target", target),
+                ("reason", reason),
+                ("systemCode", system_code),
+            ],
+        )
+    }
+
+    fn allocate_invalid_utf8_error(
+        &mut self,
+        source: crate::compiler_known_io::Utf8InputSource,
+        valid_byte_count: usize,
+        invalid_byte_count: Option<usize>,
+    ) -> Result<ErrorValue, InterpreterError> {
+        let message = crate::compiler_known_io::invalid_utf8_message(
+            &source,
+            valid_byte_count,
+            invalid_byte_count,
+        );
+        let source = self.payload_enum_value(
+            crate::compiler_known_io::UTF8_INPUT_SOURCE,
+            source.case_name(),
+            match source {
+                crate::compiler_known_io::Utf8InputSource::File(path) => {
+                    vec![LocalValue::String(path.into())]
+                }
+                crate::compiler_known_io::Utf8InputSource::StandardInput => Vec::new(),
+            },
+        )?;
+        let valid_byte_count = LocalValue::Scalar(mir::ScalarValue::Integer(
+            IntegerValue::from_i128(IntegerType::Int64, valid_byte_count as i128)
+                .ok_or_else(|| InterpreterError::new("UTF-8 byte count exceeds Doria int"))?,
+        ));
+        let invalid_byte_count = LocalValue::NullableScalar {
+            ty: mir::ScalarType::Integer(IntegerType::Int64),
+            value: invalid_byte_count
+                .map(|value| {
+                    IntegerValue::from_i128(IntegerType::Int64, value as i128)
+                        .map(mir::ScalarValue::Integer)
+                        .ok_or_else(|| {
+                            InterpreterError::new("UTF-8 sequence length exceeds Doria int")
+                        })
+                })
+                .transpose()?,
+        };
+        self.allocate_error_object(
+            crate::compiler_known_io::INVALID_UTF8_ERROR,
+            vec![
+                ("message", LocalValue::String(message.into())),
+                ("source", source),
+                ("validByteCount", valid_byte_count),
+                ("invalidByteCount", invalid_byte_count),
+            ],
+        )
+    }
+
+    fn unit_enum_value(
+        &self,
+        type_name: &str,
+        case_name: &str,
+    ) -> Result<LocalValue, InterpreterError> {
+        let definition = self
+            .program
+            .enums
+            .iter()
+            .find(|definition| definition.name == type_name)
+            .ok_or_else(|| InterpreterError::new(format!("MIR enum `{type_name}` is missing")))?;
+        let case = definition
+            .cases
+            .iter()
+            .find(|case| case.name == case_name)
+            .ok_or_else(|| {
+                InterpreterError::new(format!("MIR enum `{type_name}` has no `{case_name}` case"))
+            })?;
+        if !case.payload.is_empty() {
+            return Err(InterpreterError::new(format!(
+                "MIR enum `{type_name}::{case_name}` is not a unit case"
+            )));
+        }
+        Ok(LocalValue::Scalar(mir::ScalarValue::Enum(
+            crate::enums::EnumValue {
+                enum_id: definition.id,
+                case_id: case.id,
+            },
+        )))
+    }
+
+    fn payload_enum_value(
+        &self,
+        type_name: &str,
+        case_name: &str,
+        fields: Vec<LocalValue>,
+    ) -> Result<LocalValue, InterpreterError> {
+        let definition = self
+            .program
+            .enums
+            .iter()
+            .find(|definition| definition.name == type_name)
+            .ok_or_else(|| InterpreterError::new(format!("MIR enum `{type_name}` is missing")))?;
+        let case = definition
+            .cases
+            .iter()
+            .find(|case| case.name == case_name)
+            .ok_or_else(|| {
+                InterpreterError::new(format!("MIR enum `{type_name}` has no `{case_name}` case"))
+            })?;
+        if case.payload.len() != fields.len() {
+            return Err(InterpreterError::new(format!(
+                "MIR enum `{type_name}::{case_name}` expects {} field(s), got {}",
+                case.payload.len(),
+                fields.len()
+            )));
+        }
+        let ty = definition.payload_type().ok_or_else(|| {
+            InterpreterError::new(format!("MIR enum `{type_name}` has no payload layout"))
+        })?;
+        Ok(LocalValue::PayloadEnum(PayloadEnumValue {
+            ty,
+            case: case.id,
+            fields,
+            moved_fields: vec![false; case.payload.len()],
+        }))
+    }
+
+    fn allocate_error_object(
+        &mut self,
+        type_name: &str,
+        properties: Vec<(&str, LocalValue)>,
+    ) -> Result<ErrorValue, InterpreterError> {
+        let descriptor = self
+            .program
+            .error_descriptors
+            .iter()
+            .find(|descriptor| descriptor.type_name == type_name)
+            .ok_or_else(|| {
+                InterpreterError::new(format!("MIR Error descriptor `{type_name}` is missing"))
+            })?
+            .clone();
+        let class = self
+            .program
+            .classes
+            .get(descriptor.class.0)
+            .ok_or_else(|| InterpreterError::new("MIR Error class is missing"))?;
+        let mut slots = vec![None; class.properties.len()];
+        for (name, value) in properties {
+            let property = class
+                .properties
+                .iter()
+                .find(|property| property.name == name)
+                .ok_or_else(|| {
+                    InterpreterError::new(format!(
+                        "MIR Error `{type_name}` has no `{name}` property"
+                    ))
+                })?;
+            if local_value_type(&value) != property.ty {
+                return Err(InterpreterError::new(format!(
+                    "MIR Error `{type_name}` property `{name}` expects {}, got {}",
+                    property.ty,
+                    local_value_type(&value)
+                )));
+            }
+            slots[property.id.index] = Some(value);
+        }
+        if slots.iter().any(Option::is_none) {
+            return Err(InterpreterError::new(format!(
+                "MIR Error `{type_name}` was not fully initialized"
+            )));
+        }
+        let object = self.next_object;
+        self.next_object += 1;
+        self.heap.insert(
+            object,
+            ObjectValue {
+                class: descriptor.class,
+                properties: slots,
+                error_origin: None,
+            },
+        );
+        Ok(ErrorValue {
+            object,
+            descriptor: descriptor.id,
+        })
     }
 
     fn take_call_arguments(&mut self, count: usize) -> Result<Vec<LocalValue>, InterpreterError> {
@@ -11559,6 +12202,11 @@ impl Interpreter<'_> {
             .ok_or_else(|| InterpreterError::new("MIR interpreter has no active call frame"))
     }
 
+    fn set_active_panic_site(&mut self, span: Span) -> Result<(), InterpreterError> {
+        self.current_frame_mut()?.active_panic_site = span;
+        Ok(())
+    }
+
     fn collection_local(&self, local: mir::LocalId) -> Result<&CollectionValue, InterpreterError> {
         match read_local(&self.current_frame()?.locals, local)? {
             LocalValue::Collection(value) => Ok(value),
@@ -11912,10 +12560,68 @@ impl Interpreter<'_> {
                     local_value_type(&value)
                 )))
             }
-            (_, FunctionOutcome::CheckedError(_)) => Err(InterpreterError::new(
-                "checked Error escaped from main before the Stage 29 Slice 3 entry boundary",
-            )),
+            (_, FunctionOutcome::CheckedError(error)) => self.runtime_error_output(error, entry),
         }
+    }
+
+    fn runtime_error_output(
+        &self,
+        error: ErrorValue,
+        entry: &mir::Function,
+    ) -> Result<InterpreterOutput, InterpreterError> {
+        let descriptor = self.error_descriptor(error.descriptor)?;
+        let object = self.heap.get(&error.object).ok_or_else(|| {
+            InterpreterError::new("escaping Error object was destroyed before reporting")
+        })?;
+        let message = object
+            .properties
+            .get(descriptor.message_property.index)
+            .and_then(Option::as_ref)
+            .and_then(|value| match value {
+                LocalValue::String(value) => Some(value.to_string()),
+                _ => None,
+            })
+            .ok_or_else(|| InterpreterError::new("escaping Error has no string message"))?;
+        let origin = object
+            .error_origin
+            .and_then(|origin| self.program.error_origins.get(origin.0))
+            .filter(|origin| origin.id == object.error_origin.expect("present above"));
+        let (span, function) = origin
+            .map(|origin| (origin.span, origin.callable.clone()))
+            .unwrap_or((entry.source_span, entry.name.clone()));
+        let outcome = RuntimeOutcomeDetails {
+            process_status: 70,
+            termination_behavior: TerminationBehavior::PropagateWithCleanup,
+            origin: RuntimeOutcomeOrigin {
+                source: DiagnosticSource::Current,
+                span,
+                function: Some(function),
+            },
+            path: Vec::new(),
+            facts: Vec::new(),
+            error_type: Some(descriptor.type_name.clone()),
+        };
+        let diagnostic =
+            Diagnostic::runtime_error(descriptor.type_name.clone(), message, span, outcome);
+        let rendered = crate::diagnostics::render_diagnostics(
+            &self.program.source,
+            std::slice::from_ref(&diagnostic),
+            RenderOptions {
+                format: DiagnosticFormat::Human,
+                color: ColorChoice::Never,
+                context_lines: 0,
+                ..RenderOptions::default()
+            },
+        );
+        let mut stderr = self.stderr.clone();
+        stderr.extend_from_slice(rendered.as_bytes());
+        stderr.push(b'\n');
+        Ok(InterpreterOutput {
+            stdout: self.stdout.clone(),
+            stderr,
+            exit_status: 70,
+            runtime_diagnostic: Some(diagnostic),
+        })
     }
 
     fn runtime_panic_step(&self, code: &'static str) -> Result<StepOutcome, InterpreterError> {
@@ -11937,8 +12643,7 @@ impl Interpreter<'_> {
         let span = self
             .frames
             .last()
-            .and_then(|frame| self.program.functions.get(frame.function.0))
-            .map_or(Span::default(), |function| function.source_span);
+            .map_or(Span::default(), |frame| frame.active_panic_site);
         self.collection_access_panic_step_at(error, span)
     }
 
@@ -11993,8 +12698,7 @@ impl Interpreter<'_> {
         let span = self
             .frames
             .last()
-            .and_then(|frame| self.program.functions.get(frame.function.0))
-            .map_or(Span::default(), |function| function.source_span);
+            .map_or(Span::default(), |frame| frame.active_panic_site);
         self.runtime_panic_step_with_facts_at(code, span, facts)
     }
 
@@ -12052,6 +12756,7 @@ impl Interpreter<'_> {
             },
             path,
             facts: event.facts,
+            error_type: None,
         };
         self.render_runtime_panic(code, primary_span, explanation, outcome)
     }
@@ -12078,6 +12783,7 @@ impl Interpreter<'_> {
                 span: event.operation_span,
             }],
             facts: event.facts,
+            error_type: None,
         };
         self.render_runtime_panic(code, primary_span, explanation, outcome)
     }

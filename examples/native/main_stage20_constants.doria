@@ -7,7 +7,7 @@ class Limits
     const RESULT = ANSWER;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo Limits::RESULT;
     echo "\n";

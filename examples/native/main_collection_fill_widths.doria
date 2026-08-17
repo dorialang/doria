@@ -1,4 +1,4 @@
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     // Constructing `[value; count]` fills the storage in bulk, switching on the
     // element width once instead of per element. Every width the representation

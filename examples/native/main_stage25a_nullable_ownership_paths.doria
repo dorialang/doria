@@ -4,7 +4,10 @@ class Item
 
     function __destruct()
     {
-        echo "drop item\n";
+        try {
+            echo "drop item\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -25,7 +28,7 @@ class AccessHolder
     writable ?ReadonlySharedReferenceAccess<Item> $read = makeReadProperty();
     writable ?WritableSharedReferenceAccess<Item> $write = makeWriteProperty();
 
-    function inspect(): void
+    function inspect(): void throws Doria\Std\Io\IoError
     {
         inspectRead($this->read);
         inspectWrite($this->write);
@@ -38,14 +41,14 @@ class AccessHolder
     }
 }
 
-function inspectRead(?ReadonlySharedReferenceAccess<Item> $access): void
+function inspectRead(?ReadonlySharedReferenceAccess<Item> $access): void throws Doria\Std\Io\IoError
 {
     if ($access != null) {
         echo "property read {$access->value}\n";
     }
 }
 
-function inspectWrite(?WritableSharedReferenceAccess<Item> $access): void
+function inspectWrite(?WritableSharedReferenceAccess<Item> $access): void throws Doria\Std\Io\IoError
 {
     if ($access != null) {
         echo "property write {$access->value}\n";
@@ -70,7 +73,7 @@ function reacquire(
     return $source?->acquire();
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $holder = new AccessHolder();
     $holder->inspect();

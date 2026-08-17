@@ -1,6 +1,6 @@
 // Set::contains in a loop body. The set holds the even values below 128, and
 // the loop queries 0..15, so exactly half of the queries hit.
-function main(List<string> $args): void
+function main(List<string> $args): void throws Doria\Std\Io\IoError
 {
     let $n = Int::parse($args[0]) ?? 0;
     writable Set<int> $values = Set::from([]);

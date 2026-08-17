@@ -13,7 +13,7 @@ class Counter
 function verifyLifetime<T>(
     string $name,
     WritableSharedReference<T> $owner,
-): void {
+): void throws Doria\Std\Io\IoError {
     let $additionalOwner = $owner->share();
     let $weak = $additionalOwner->createWeakReference();
     if ($weak->acquire() != null) {
@@ -21,7 +21,7 @@ function verifyLifetime<T>(
     }
 }
 
-function inspectBox(WritableSharedReference<Box<int>> $box): void
+function inspectBox(WritableSharedReference<Box<int>> $box): void throws Doria\Std\Io\IoError
 {
     let $boxAccess = $box->acquireReadonlyAccess();
     echo "generic class {$boxAccess->value}\n";
@@ -29,13 +29,13 @@ function inspectBox(WritableSharedReference<Box<int>> $box): void
 
 function inspectBoxes(
     WritableSharedReference<List<Box<int>>> $boxes,
-): void
+): void throws Doria\Std\Io\IoError
 {
     let $boxesAccess = $boxes->acquireReadonlyAccess();
     echo "generic collection {$boxesAccess[0]->value}\n";
 }
 
-function mutateBytes(WritableSharedReference<Bytes> $bytes): void
+function mutateBytes(WritableSharedReference<Bytes> $bytes): void throws Doria\Std\Io\IoError
 {
     let writable $bytesAccess = $bytes->acquireWritableAccess();
     $bytesAccess[1] += 5;
@@ -44,7 +44,7 @@ function mutateBytes(WritableSharedReference<Bytes> $bytes): void
 
 function inspectMaybeWritable(
     ?WritableSharedReference<Box<int>> $source,
-): void
+): void throws Doria\Std\Io\IoError
 {
     ?WritableSharedReferenceAccess<Box<int>> $access =
         $source?->acquireWritableAccess();
@@ -53,7 +53,7 @@ function inspectMaybeWritable(
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $counter = new WritableSharedReference(new Counter());
     verifyLifetime("class", $counter);

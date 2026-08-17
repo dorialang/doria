@@ -14,7 +14,7 @@ function choose(bool $primary): Label
     };
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $label = choose(true);
     echo "owned\n";

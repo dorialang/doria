@@ -33,7 +33,7 @@ fn empty_set_construction_uses_context_and_existing_sources_are_borrowed() {
     doriac::lower_source_to_mir(
         "stage23-set-construction.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Set<int> $empty = Set::from([]);
     List<int> $source = [1, 2];
@@ -50,7 +50,7 @@ fn nested_typed_array_indexing_materializes_borrowed_places() {
     doriac::lower_source_to_mir(
         "stage23-nested-index.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable int[][] $matrix = [[1, 2], [3, 4]];
     $matrix[1][0]++;
@@ -78,7 +78,7 @@ class Holder
     writable function append(int $value): void { $this->items->add($value); }
     writable function reset(): void { $this->items->clear(); }
 }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<Counter> $counters = [new Counter(1)];
     $counters[0]->increment();
@@ -145,7 +145,7 @@ fn foreach_materializes_collection_expression_with_scoped_ownership() {
     let mir = doriac::lower_source_to_mir(
         "stage23-foreach-expression.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     foreach ([1, 2] as int $value) {
         echo "{$value}";
@@ -164,7 +164,7 @@ fn collection_ingestion_moves_class_values() {
     let error = diagnostic(
         r#"
 class Token { function __construct(int $id) {} }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<Token> $tokens = [];
     let $token = new Token(1);
@@ -182,7 +182,7 @@ fn nested_collection_ingestion_tracks_moved_arguments() {
     let errors = diagnostics(
         r#"
 class Token { function __construct(int $id) {} }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<List<List<Token>>> $outer = [[[]]];
     List<Token> $inner = [new Token(1)];
@@ -290,7 +290,7 @@ fn bytes_surface_checks_lowers_and_executes_through_shared_mir() {
     let mir = doriac::lower_source_to_mir(
         "stage23-bytes.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable uint8[] $source = [0, 128, 255];
     writable Bytes $bytes = Bytes::fromArray($source);
@@ -331,7 +331,7 @@ fn non_bytes_collection_equality_is_rejected_before_mir() {
         "int[] $left = [1]; int[] $right = [1];",
     ] {
         let source = format!(
-            "function main(): void {{ {declaration} if ($left == $right) {{ echo \"same\"; }} }}"
+            "function main(): void throws Doria\\Std\\Io\\IoError {{ {declaration} if ($left == $right) {{ echo \"same\"; }} }}"
         );
         let error = diagnostic(&source, "E0525");
         assert!(error.message.contains("only `Bytes`"));
@@ -357,7 +357,7 @@ fn bytes_io_accepts_readonly_borrows_and_materializes_expression_temporaries() {
     doriac::lower_source_to_mir(
         "stage23-bytes-io.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     uint8[] $source = [0, 128, 255];
     Bytes $bytes = Bytes::fromArray($source);
@@ -420,7 +420,7 @@ fn runtime_mixed_collection_values_lower_to_stage23_slice3_boxes() {
     let program = doriac::lower_source_to_mir(
         "stage23-mixed-collection.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     List<mixed> $values = [1];
     foreach ($values as mixed $value) {
@@ -445,7 +445,10 @@ fn clear_releases_old_owned_values_once_and_scope_drop_releases_only_refill() {
 class Token
 {
     function __construct(int $id) {}
-    function __destruct() { echo "drop {$this->id}\n"; }
+    function __destruct()
+    {
+        try { echo "drop {$this->id}\n"; } catch (Doria\Std\Io\IoError) {}
+    }
 }
 function main(): void
 {
@@ -480,7 +483,7 @@ fn bytes_uses_move_ownership_and_readonly_borrow_parameters() {
         r#"
 function inspect(Bytes $contents): int { return $contents->length; }
 function consume(take Bytes $contents): int { return $contents->length; }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Bytes $contents = Bytes::fromArray([1]);
     echo "{inspect($contents)}";
@@ -493,7 +496,7 @@ function main(): void
     let moved = diagnostics(
         r#"
 function consume(take Bytes $contents): void {}
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Bytes $contents = Bytes::fromArray([1]);
     consume($contents);
@@ -511,7 +514,7 @@ fn builtin_bytes_results_and_byte_arrays_preserve_move_ownership() {
     for source in [
         r#"
 function consume(take Bytes $contents): void {}
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $contents = read_stdin_bytes();
     consume($contents);
@@ -520,7 +523,7 @@ function main(): void
 "#,
         r#"
 function consume(take Bytes $contents): void {}
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $contents = read_file_bytes("data.bin");
     consume($contents);
@@ -529,7 +532,7 @@ function main(): void
 "#,
         r#"
 function consume(take uint8[] $contents): void {}
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Bytes $bytes = Bytes::fromArray([1]);
     let $contents = $bytes->toArray();
@@ -585,7 +588,7 @@ fn clear_conflicts_with_live_collection_borrows_but_accepts_last_use() {
         let source = format!(
             r#"
 class Token {{ function __construct(int $id) {{}} }}
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {{
     writable List<Token> $values = [new Token(1)];
     foreach ($values as Token $value) {{
@@ -603,7 +606,7 @@ function main(): void
     let live_list = diagnostics(
         r#"
 class Token { function __construct(int $id) {} }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<Token> $values = [new Token(1)];
     let $first = $values->first;
@@ -619,7 +622,7 @@ function main(): void
     let live_dictionary = diagnostics(
         r#"
 class Token { function __construct(int $id) {} }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable Dictionary<string, Token> $values = ["one" => new Token(1)];
     let $found = $values->get("one");
@@ -636,7 +639,7 @@ function main(): void
         "clear-after-last-use.doria",
         r#"
 class Token { function __construct(int $id) {} }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<Token> $values = [new Token(1)];
     let $first = $values->first;
@@ -818,7 +821,7 @@ fn int_and_float_parse_type_and_lower_and_fixed_width_is_deferred() {
     doriac::lower_source_to_mir(
         "stage23-parse.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $n = Int::parse("42");
     if ($n != null) {
@@ -859,7 +862,7 @@ fn bool_collection_element_read_lowers_without_malformed_mir() {
     let program = doriac::lower_source_to_mir(
         "stage23-bool-collection.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<bool> $flags = [];
     $flags->add(true);
@@ -888,7 +891,7 @@ fn mixed_remove_at_lowers_to_a_removing_collection_index() {
     let program = doriac::lower_source_to_mir(
         "stage23-mixed-removeat.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<mixed> $items = [1, 2, 3];
     mixed $first = $items->removeAt(0);

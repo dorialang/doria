@@ -6,23 +6,26 @@ class Token
 
     function __destruct()
     {
-        echo "drop " . $this->name . "\n";
+        try {
+            echo "drop " . $this->name . "\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
 class Sink
 {
-    function inspect(int $marker, Token $token): void
+    function inspect(int $marker, Token $token): void throws Doria\Std\Io\IoError
     {
         echo "method borrow " . $token->name . " {$marker}\n";
     }
 
-    function consume(int $marker, take Token $token): void
+    function consume(int $marker, take Token $token): void throws Doria\Std\Io\IoError
     {
         echo "method take " . $token->name . " {$marker}\n";
     }
 
-    static function borrowStatic(int $marker, Token $token): void
+    static function borrowStatic(int $marker, Token $token): void throws Doria\Std\Io\IoError
     {
         echo "static borrow " . $token->name . " {$marker}\n";
     }
@@ -30,144 +33,147 @@ class Sink
 
 class Envelope
 {
-    function __construct(int $marker, take Token $token)
+    function __construct(int $marker, take Token $token) throws Doria\Std\Io\IoError
     {
         echo "construct {$marker}\n";
     }
 
     function __destruct()
     {
-        echo "drop envelope\n";
+        try {
+            echo "drop envelope\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function marker(string $name): int
+function marker(string $name): int throws Doria\Std\Io\IoError
 {
     echo "mark " . $name . "\n";
     return 1;
 }
 
-function makeToken(string $name): Token
+function makeToken(string $name): Token throws Doria\Std\Io\IoError
 {
     echo "make " . $name . "\n";
     return new Token($name);
 }
 
-function borrowToken(int $marker, Token $token): void
+function borrowToken(int $marker, Token $token): void throws Doria\Std\Io\IoError
 {
     echo "borrow " . $token->name . " {$marker}\n";
 }
 
-function identityToken(Token $token): Token
+function identityToken(Token $token): Token throws Doria\Std\Io\IoError
 {
     echo "identity " . $token->name . "\n";
     return $token;
 }
 
-function takeToken(int $marker, take Token $token): void
+function takeToken(int $marker, take Token $token): void throws Doria\Std\Io\IoError
 {
     echo "take " . $token->name . " {$marker}\n";
 }
 
-function borrowPair(Token $first, Token $second): void
+function borrowPair(Token $first, Token $second): void throws Doria\Std\Io\IoError
 {
     echo "borrow pair\n";
 }
 
-function makeTokens(string $name): List<Token>
+function makeTokens(string $name): List<Token> throws Doria\Std\Io\IoError
 {
     echo "make " . $name . "\n";
     return [new Token($name)];
 }
 
-function borrowTokens(int $marker, List<Token> $tokens): void
+function borrowTokens(int $marker, List<Token> $tokens): void throws Doria\Std\Io\IoError
 {
     echo "borrow list {$tokens->count} {$marker}\n";
 }
 
-function takeTokens(int $marker, take List<Token> $tokens): void
+function takeTokens(int $marker, take List<Token> $tokens): void throws Doria\Std\Io\IoError
 {
     echo "take list {$tokens->count} {$marker}\n";
 }
 
-function borrowTokenLists(List<Token> $first, List<Token> $second): void
+function borrowTokenLists(List<Token> $first, List<Token> $second): void throws Doria\Std\Io\IoError
 {
     echo "borrow list pair\n";
 }
 
-function makeBytes(string $name): Bytes
+function makeBytes(string $name): Bytes throws Doria\Std\Io\IoError
 {
     echo "make " . $name . "\n";
     return Bytes::fromArray([1, 2, 3]);
 }
 
-function borrowBytes(int $marker, Bytes $bytes): void
+function borrowBytes(int $marker, Bytes $bytes): void throws Doria\Std\Io\IoError
 {
     echo "borrow bytes {$bytes->length} {$marker}\n";
 }
 
-function takeBytes(int $marker, take Bytes $bytes): void
+function takeBytes(int $marker, take Bytes $bytes): void throws Doria\Std\Io\IoError
 {
     echo "take bytes {$bytes->length} {$marker}\n";
 }
 
-function makeMixed(string $name): mixed
+function makeMixed(string $name): mixed throws Doria\Std\Io\IoError
 {
     echo "make " . $name . "\n";
     return new Token($name);
 }
 
-function borrowMixed(int $marker, mixed $value): void
+function borrowMixed(int $marker, mixed $value): void throws Doria\Std\Io\IoError
 {
     if ($value is Token) {
         echo "borrow mixed {$marker}\n";
     }
 }
 
-function takeMixed(int $marker, take mixed $value): void
+function takeMixed(int $marker, take mixed $value): void throws Doria\Std\Io\IoError
 {
     if ($value is Token) {
         echo "take mixed {$marker}\n";
     }
 }
 
-function borrowMixedPair(mixed $first, mixed $second): void
+function borrowMixedPair(mixed $first, mixed $second): void throws Doria\Std\Io\IoError
 {
     echo "borrow mixed pair\n";
 }
 
-function borrowKinds(Token $token, List<Token> $tokens, mixed $value): void
+function borrowKinds(Token $token, List<Token> $tokens, mixed $value): void throws Doria\Std\Io\IoError
 {
     echo "borrow kinds\n";
 }
 
-function makeNullableToken(string $name): ?Token
+function makeNullableToken(string $name): ?Token throws Doria\Std\Io\IoError
 {
     echo "make " . $name . "\n";
     return new Token($name);
 }
 
-function borrowNullableToken(int $marker, ?Token $token): void
+function borrowNullableToken(int $marker, ?Token $token): void throws Doria\Std\Io\IoError
 {
     if ($token != null) {
         echo "borrow " . $token->name . " {$marker}\n";
     }
 }
 
-function makeNullableMixed(string $name): ?mixed
+function makeNullableMixed(string $name): ?mixed throws Doria\Std\Io\IoError
 {
     echo "make " . $name . "\n";
     return new Token($name);
 }
 
-function borrowNullableMixed(int $marker, ?mixed $value): void
+function borrowNullableMixed(int $marker, ?mixed $value): void throws Doria\Std\Io\IoError
 {
     if ($value is Token) {
         echo "borrow nullable mixed {$marker}\n";
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     borrowToken(token: makeToken("class-borrow"), marker: marker("class-borrow"));
     echo "after class borrow\n";

@@ -58,7 +58,10 @@ class DropToken
 
     function __destruct()
     {
-        echo "drop {$this->name}\n";
+        try {
+            echo "drop {$this->name}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -67,7 +70,7 @@ class DropHolder
     List<DropToken> $values = [new DropToken("first"), new DropToken("second")];
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $implicit = new ImplicitCollections();
     let $explicit = new ExplicitCollections("explicit");

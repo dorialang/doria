@@ -37,29 +37,29 @@ function maybeBox(bool $present, int $value): ?Box
     return null;
 }
 
-function showInt(int $value): void
+function showInt(int $value): void throws Doria\Std\Io\IoError
 {
     echo "{$value};";
 }
 
-function showString(string $value): void
+function showString(string $value): void throws Doria\Std\Io\IoError
 {
     echo $value . ";";
 }
 
-function showBox(Box $value): void
+function showBox(Box $value): void throws Doria\Std\Io\IoError
 {
     echo "{$value->id()};";
 }
 
-function showParameter(?int $value): void
+function showParameter(?int $value): void throws Doria\Std\Io\IoError
 {
     if ($value != null) {
         echo "parameter:{$value};";
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?string $nullString = null;
     if ($nullString != null) {

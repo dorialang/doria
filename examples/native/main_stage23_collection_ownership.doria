@@ -6,11 +6,14 @@ class Token
 
     function __destruct()
     {
-        echo "drop {$this->id}\n";
+        try {
+            echo "drop {$this->id}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<Token> $tokens = [];
     let $first = new Token(1);

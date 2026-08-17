@@ -1,6 +1,6 @@
 // Int::parse in a loop body. It reports success through a scratch flag slot,
 // which grew the frame on every pass before the entry-block fix.
-function main(List<string> $args): void
+function main(List<string> $args): void throws Doria\Std\Io\IoError
 {
     let $n = Int::parse($args[0]) ?? 0;
     let writable $checksum = 0;

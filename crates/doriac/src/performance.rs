@@ -38,16 +38,16 @@ pub fn compile_native(
     let parse = started.elapsed();
 
     let started = Instant::now();
-    let semantic_info = semantics::analyze_program(&ast)?;
+    crate::compiler_known_io::validate_reserved_identities(&ast)?;
+    let augmented_ast = crate::compiler_known_io::augment_program(&ast);
+    let semantic_info = semantics::analyze_program(&augmented_ast)?;
     let semantic = started.elapsed();
 
     let started = Instant::now();
-    let mut hir = lowering::lower_program_with_semantics(&ast, semantic_info)?;
+    let mut hir = lowering::lower_program_with_semantics(&augmented_ast, semantic_info)?;
     hir.source_path = source.path.clone();
     hir.source_text = source.text.clone();
     let hir_lowering = started.elapsed();
-    crate::reject_escaping_main_error(&hir)?;
-
     let started = Instant::now();
     let (mir, structure) = mir_lowering::lower_program_with_metrics(&hir)?;
     let mir_lowering = started.elapsed();

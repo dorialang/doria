@@ -19,7 +19,7 @@ function classify(mixed $value): string
     };
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo classify(42) . "\n";
     echo classify("text") . "\n";

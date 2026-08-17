@@ -685,18 +685,20 @@ fn lower_program_impl(
         .semantic_info
         .throw_error_types
         .keys()
+        .chain(program.semantic_info.checked_effect_sites.keys())
         .map(|(start, end)| Span::new(*start, *end))
         .collect::<Vec<_>>();
     origin_spans.sort_by_key(|span| (span.start, span.end));
     origin_spans.dedup();
-    let mut error_origins = origin_spans
+    let error_origins = origin_spans
         .iter()
         .copied()
         .enumerate()
         .map(|(index, span)| mir::ErrorOrigin {
             id: mir::ErrorOriginId(index),
             span,
-            function: mir::FunctionId(usize::MAX),
+            callable: error_origin_callable(program, span)
+                .unwrap_or_else(|| "<source>".to_string()),
         })
         .collect::<Vec<_>>();
     let error_origin_ids = error_origins
@@ -1021,23 +1023,6 @@ fn lower_program_impl(
             metrics.as_deref_mut(),
         )?);
     }
-    for origin in &mut error_origins {
-        origin.function = functions
-            .iter()
-            .filter(|function| {
-                origin.span.start >= function.source_span.start
-                    && origin.span.end <= function.source_span.end
-            })
-            .min_by_key(|function| {
-                (
-                    function.source_span.end - function.source_span.start,
-                    function.id.0,
-                )
-            })
-            .map(|function| function.id)
-            .expect("checked throw origin belongs to a lowered callable");
-    }
-
     let classes = program
         .semantic_info
         .classes
@@ -1175,6 +1160,49 @@ fn lower_program_impl(
         functions,
         entry,
     })
+}
+
+fn error_origin_callable(program: &hir::Program, origin: Span) -> Option<String> {
+    let contains = |outer: Span| origin.start >= outer.start && origin.end <= outer.end;
+    program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            hir::Item::Function(function) if contains(function.span) => Some((
+                function.span.end.saturating_sub(function.span.start),
+                function.name.clone(),
+            )),
+            hir::Item::Class(class) => class
+                .members
+                .iter()
+                .filter_map(|member| match member {
+                    hir::ClassMember::Method(method) if contains(method.span) => Some((
+                        method.span.end.saturating_sub(method.span.start),
+                        format!("{}::{}", class.name, method.name),
+                    )),
+                    hir::ClassMember::Property(property)
+                        if property
+                            .initializer
+                            .as_ref()
+                            .is_some_and(|initializer| contains(initializer.span())) =>
+                    {
+                        Some((
+                            property.span.end.saturating_sub(property.span.start),
+                            format!("{}::__construct", class.name),
+                        ))
+                    }
+                    hir::ClassMember::Property(_)
+                    | hir::ClassMember::Method(_)
+                    | hir::ClassMember::Constant(_) => None,
+                })
+                .min_by_key(|(width, _)| *width),
+            hir::Item::Function(_)
+            | hir::Item::Enum(_)
+            | hir::Item::Constant(_)
+            | hir::Item::Statement(_) => None,
+        })
+        .min_by_key(|(width, _)| *width)
+        .map(|(_, callable)| callable)
 }
 
 fn intern_resolved_collection_types(
@@ -2169,10 +2197,25 @@ fn lower_statement_sequence(
                 context.pop_scope();
                 result?;
             }
-            hir::Stmt::Echo { expr, .. } => {
+            hir::Stmt::Echo { expr, span } => {
                 lower_with_statement_temporaries(context, |context| {
-                    let echo = lower_echo(expr, context)?;
-                    context.push_statement(echo);
+                    let contents = match lower_echo(expr, context)? {
+                        mir::Statement::EchoStringLiteral(value) => {
+                            mir::IoContents::String(mir::StringExpression::Literal(value))
+                        }
+                        mir::Statement::EchoString(value) => mir::IoContents::String(value),
+                        _ => unreachable!("echo lowering returned another MIR statement"),
+                    };
+                    let _ = materialize_checked_io(
+                        mir::CheckedIoOperation::WriteStream {
+                            contents,
+                            stderr: false,
+                        },
+                        None,
+                        *span,
+                        false,
+                        context,
+                    )?;
                     Ok(())
                 })?;
             }
@@ -2473,6 +2516,12 @@ fn lower_expression_statement(
         span: call_span,
     } = expr
     {
+        if let Some(builtin) = crate::builtins::Builtin::from_name(name) {
+            if builtin_has_checked_effects(builtin) {
+                let _ = materialize_checked_call(expr, false, context)?;
+                return Ok(());
+            }
+        }
         if lower_byte_file_write_statement(name, args, *call_span, context)? {
             return Ok(());
         }
@@ -2490,6 +2539,14 @@ fn lower_expression_statement(
             return Ok(());
         }
         let statement = if *null_safe {
+            let (_, signature) = lookup_null_safe_method(object, method, *call_span, context)?;
+            if !signature.checked_effects.is_empty() {
+                let _ = discarded_call_statement("method", signature.clone(), Vec::new(), span)?;
+                let _ = materialize_checked_null_safe_signature_call(
+                    object, method, signature, args, *call_span, None, context,
+                )?;
+                return Ok(());
+            }
             let (object, signature, args) =
                 lower_null_safe_method_call(object, method, args, *call_span, context)?;
             discarded_null_safe_call_statement(object, signature, args, span)?
@@ -4829,6 +4886,15 @@ impl<'semantic> LoweringContext<'semantic> {
         id
     }
 
+    fn declare_statement_string_temp(&mut self) -> mir::LocalId {
+        let id = self.declare_string_temp();
+        self.statement_owned_locals
+            .last_mut()
+            .expect("string argument materialization requires an active statement scope")
+            .push(DropObligation::String(id));
+        id
+    }
+
     fn declare_owned_temp(&mut self, ty: mir::Type) -> mir::LocalId {
         let id = mir::LocalId(self.locals.len());
         let name = format!("_owned{}", self.temp_counter);
@@ -5541,6 +5607,9 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
             success, failure, ..
         }
         | mir::Terminator::CheckedConstruct {
+            success, failure, ..
+        }
+        | mir::Terminator::CheckedIo {
             success, failure, ..
         } => vec![*success, *failure],
         mir::Terminator::ErrorSwitch {
@@ -7721,8 +7790,19 @@ fn lower_null_safe_method_call(
     FunctionSignature,
     Vec<mir::Rvalue>,
 )> {
-    let object_type = context.expression_type(object)?;
-    let class = match object_type {
+    let (class, signature) = lookup_null_safe_method(object, method, span, context)?;
+    let object = lower_nullable_payload_expression(object, class, context)?;
+    let args = lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
+    Ok((object, signature, args))
+}
+
+fn lookup_null_safe_method(
+    object: &hir::Expr,
+    method: &str,
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<(ClassId, FunctionSignature)> {
+    let class = match context.expression_type(object)? {
         mir::Type::NullableClass(class) | mir::Type::NullableSharedReference(class) => class,
         _ => {
             return Err(vec![unsupported(
@@ -7738,12 +7818,7 @@ fn lower_null_safe_method_call(
             "null-safe call requires an instance method",
         )]);
     }
-    let args = lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
-    Ok((
-        lower_nullable_payload_expression(object, class, context)?,
-        signature,
-        args,
-    ))
+    Ok((class, signature))
 }
 
 fn lower_nullable_payload_expression(
@@ -7751,7 +7826,7 @@ fn lower_nullable_payload_expression(
     class: ClassId,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableClassExpression> {
-    match context.expression_type(object)? {
+    let value = match context.expression_type(object)? {
         mir::Type::NullableClass(actual) if actual == class => {
             lower_nullable_class_expression(object, class, false, context)
         }
@@ -7767,6 +7842,25 @@ fn lower_nullable_payload_expression(
             object.span(),
             "null-safe receiver payload has another class type",
         )]),
+    }?;
+
+    // A null-safe access may be lowered across several MIR blocks (and, for
+    // checked I/O, across a terminator). Keep an owned receiver in an explicit
+    // statement temporary so its lifetime covers the complete source statement
+    // instead of leaving backend expression lowering to release it early.
+    if value.owned_temporary_class().is_some() {
+        let receiver = context.declare_owned_temp(mir::Type::NullableClass(class));
+        context.push_statement(mir::Statement::AssignLocal {
+            target: receiver,
+            value: mir::Rvalue::NullableClass(value),
+        });
+        Ok(mir::NullableClassExpression::Local {
+            class,
+            local: receiver,
+            transfer: false,
+        })
+    } else {
+        Ok(value)
     }
 }
 
@@ -7795,6 +7889,7 @@ fn lower_format_expression(
         .map(|argument| &argument.value)
         .zip(specs)
         .map(|(argument, spec)| {
+            materialize_nested_collection_places(argument, false, context)?;
             if spec.conversion == FormatConversion::Display {
                 let lowered = lower_display_string_expression(argument, context)?;
                 if inferred_class_type(argument, context).is_some() {
@@ -8137,67 +8232,11 @@ fn lower_call_args_with_ownership(
         let expected = signature.parameter_types[param_index];
         let transfers = signature.parameter_transfers[param_index];
         let value = &arg.value;
-        let lowered = match expected {
-            mir::Type::Class(class) => {
-                mir::Rvalue::Class(lower_class_expression(value, class, transfers, context)?)
-            }
-            mir::Type::NullableClass(class) => mir::Rvalue::NullableClass(
-                lower_nullable_class_expression(value, class, transfers, context)?,
-            ),
-            mir::Type::Collection(collection) => mir::Rvalue::Collection(
-                lower_collection_expression(value, collection, transfers, context)?,
-            ),
-            mir::Type::Error => {
-                mir::Rvalue::Error(lower_error_expression(value, transfers, context)?)
-            }
-            mir::Type::NullableError => mir::Rvalue::NullableError(
-                lower_nullable_error_expression(value, transfers, context)?,
-            ),
-            mir::Type::Mixed => {
-                mir::Rvalue::Mixed(lower_mixed_expression(value, transfers, context)?)
-            }
-            mir::Type::NullableMixed => mir::Rvalue::NullableMixed(
-                lower_nullable_mixed_expression(value, transfers, context)?,
-            ),
-            mir::Type::SharedReference(class) => mir::Rvalue::SharedReference(
-                lower_shared_reference_expression(value, class, transfers, context)?,
-            ),
-            mir::Type::WeakReference(class) => mir::Rvalue::WeakReference(
-                lower_weak_reference_expression(value, class, transfers, context)?,
-            ),
-            mir::Type::NullableSharedReference(class) => mir::Rvalue::NullableSharedReference(
-                lower_nullable_shared_reference_expression(value, class, transfers, context)?,
-            ),
-            mir::Type::NullableWeakReference(class) => mir::Rvalue::NullableWeakReference(
-                lower_nullable_weak_reference_expression(value, class, transfers, context)?,
-            ),
-            mir::Type::WritableSharedReference(payload) => mir::Rvalue::WritableSharedReference(
-                lower_writable_shared_reference_expression(value, payload, transfers, context)?,
-            ),
-            mir::Type::WritableWeakReference(payload) => mir::Rvalue::WritableWeakReference(
-                lower_writable_weak_reference_expression(value, payload, transfers, context)?,
-            ),
-            mir::Type::NullableWritableSharedReference(payload) => {
-                mir::Rvalue::NullableWritableSharedReference(
-                    lower_nullable_writable_shared_reference_expression(
-                        value, payload, transfers, context,
-                    )?,
-                )
-            }
-            mir::Type::NullableWritableWeakReference(payload) => {
-                mir::Rvalue::NullableWritableWeakReference(
-                    lower_nullable_writable_weak_reference_expression(
-                        value, payload, transfers, context,
-                    )?,
-                )
-            }
-            ty @ (mir::Type::ReadonlySharedReferenceAccess(_)
-            | mir::Type::WritableSharedReferenceAccess(_)
-            | mir::Type::NullableReadonlySharedReferenceAccess(_)
-            | mir::Type::NullableWritableSharedReferenceAccess(_)) => {
-                lower_shared_access_rvalue(value, ty, transfers, context)?
-            }
-            _ => lower_rvalue_as_expected(value, expected, context)?,
+        materialize_nested_collection_places(value, false, context)?;
+        let lowered = if transfers {
+            lower_rvalue_as_expected(value, expected, context)?
+        } else {
+            lower_rvalue_as_borrowed(value, expected, context)?
         };
         if lowered.ty() != expected {
             return Err(vec![Diagnostic::new(
@@ -8223,7 +8262,7 @@ fn lower_call_args_with_ownership(
             if in_order || (!argument_evaluation_is_observable(value) && !owns_temporary) {
                 lowered
             } else {
-                hoist_argument_temporary(lowered, expected, context)
+                hoist_argument_temporary(lowered, expected, transfers, context)
             },
         );
     }
@@ -8297,25 +8336,10 @@ fn argument_evaluation_is_observable(expr: &hir::Expr) -> bool {
 fn hoist_argument_temporary(
     value: mir::Rvalue,
     ty: mir::Type,
+    transfers: bool,
     context: &mut LoweringContext,
 ) -> mir::Rvalue {
-    let borrowed_class_value = value.borrows_class_value();
-    let borrowed_shared_value = matches!(
-        ty,
-        mir::Type::SharedReference(_)
-            | mir::Type::WeakReference(_)
-            | mir::Type::NullableSharedReference(_)
-            | mir::Type::NullableWeakReference(_)
-            | mir::Type::WritableSharedReference(_)
-            | mir::Type::WritableWeakReference(_)
-            | mir::Type::NullableWritableSharedReference(_)
-            | mir::Type::NullableWritableWeakReference(_)
-            | mir::Type::ReadonlySharedReferenceAccess(_)
-            | mir::Type::WritableSharedReferenceAccess(_)
-            | mir::Type::NullableReadonlySharedReferenceAccess(_)
-            | mir::Type::NullableWritableSharedReferenceAccess(_)
-    ) && value.owned_temporary_shared().is_none();
-    let borrowed_move_value = borrowed_class_value || borrowed_shared_value;
+    let borrowed_move_value = value.borrows_move_value();
     let local = match ty {
         mir::Type::Scalar(_)
         | mir::Type::NullableScalar(_)
@@ -8326,22 +8350,7 @@ fn hoist_argument_temporary(
         {
             context.declare_borrowed_temp(ty, false)
         }
-        mir::Type::Class(_)
-        | mir::Type::NullableClass(_)
-        | mir::Type::SharedReference(_)
-        | mir::Type::WeakReference(_)
-        | mir::Type::NullableSharedReference(_)
-        | mir::Type::NullableWeakReference(_)
-        | mir::Type::WritableSharedReference(_)
-        | mir::Type::WritableWeakReference(_)
-        | mir::Type::NullableWritableSharedReference(_)
-        | mir::Type::NullableWritableWeakReference(_)
-        | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_)
-        | mir::Type::NullableReadonlySharedReferenceAccess(_)
-        | mir::Type::NullableWritableSharedReferenceAccess(_)
-            if borrowed_move_value =>
-        {
+        ty if ty.has_move_ownership() && borrowed_move_value => {
             context.declare_borrowed_temp(ty, false)
         }
         mir::Type::Mixed
@@ -8371,7 +8380,7 @@ fn hoist_argument_temporary(
         target: local,
         value,
     });
-    read_local_as_rvalue(local, ty, !borrowed_move_value)
+    read_local_as_rvalue(local, ty, transfers)
 }
 
 /// Read a temporary local back as an rvalue of its own type.
@@ -9267,7 +9276,15 @@ fn payload_enum_use_mode(ty: mir::PayloadEnumType, transfer: bool) -> mir::Paylo
 }
 
 fn is_branching_expr(expr: &hir::Expr) -> bool {
-    matches!(expr, hir::Expr::Match { .. } | hir::Expr::When(_))
+    matches!(
+        expr,
+        hir::Expr::Match { .. }
+            | hir::Expr::When(_)
+            | hir::Expr::Binary {
+                op: hir::BinaryOp::Coalesce | hir::BinaryOp::And | hir::BinaryOp::Or,
+                ..
+            }
+    )
 }
 
 fn lower_branching_rvalue(
@@ -9279,7 +9296,199 @@ fn lower_branching_rvalue(
     match expr {
         hir::Expr::Match { .. } => lower_match_rvalue(expr, expected, transfer, context),
         hir::Expr::When(_) => lower_when_rvalue(expr, expected, transfer, context),
-        _ => unreachable!("branching lowering requires match or when"),
+        hir::Expr::Binary {
+            left,
+            op: hir::BinaryOp::Coalesce,
+            right,
+            ..
+        } => lower_coalesce_rvalue(left, right, expected, transfer, context),
+        hir::Expr::Binary {
+            op: hir::BinaryOp::And | hir::BinaryOp::Or,
+            ..
+        } => lower_short_circuit_bool_rvalue(expr, expected, context),
+        _ => unreachable!(
+            "branching lowering requires match, when, coalesce, or a short-circuit boolean expression"
+        ),
+    }
+}
+
+fn lower_short_circuit_bool_rvalue(
+    expr: &hir::Expr,
+    expected: mir::Type,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    let bool_type = mir::Type::Scalar(mir::ScalarType::Bool);
+    if expected != bool_type {
+        return Err(vec![Diagnostic::new(
+            "I2901",
+            "short-circuit expression has a non-bool native result type",
+            expr.span(),
+        )]);
+    }
+
+    let when_true = context.create_block();
+    let when_false = context.create_block();
+    let merge = context.create_block();
+    let result = context.declare_borrowed_temp(bool_type, false);
+    lower_condition_to_blocks(expr, when_true, when_false, context)?;
+
+    context.current_block = Some(when_true);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: result,
+        value: mir::Rvalue::Value(mir::ValueExpression::Bool(mir::BoolExpression::Use {
+            operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+        })),
+    });
+    context.terminate_current(mir::Terminator::Jump(merge));
+
+    context.current_block = Some(when_false);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: result,
+        value: mir::Rvalue::Value(mir::ValueExpression::Bool(mir::BoolExpression::Use {
+            operand: mir::Operand::Scalar(mir::ScalarValue::Bool(false)),
+        })),
+    });
+    context.terminate_current(mir::Terminator::Jump(merge));
+
+    context.current_block = Some(merge);
+    Ok(local_rvalue(result, bool_type, false))
+}
+
+fn lower_coalesce_rvalue(
+    left: &hir::Expr,
+    right: &hir::Expr,
+    expected: mir::Type,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    match context.coalesce_selection(left) {
+        CoalesceSelection::Left => {
+            return if transfer {
+                lower_rvalue_as_expected(left, expected, context)
+            } else {
+                lower_rvalue_as_borrowed(left, expected, context)
+            };
+        }
+        CoalesceSelection::Right => {
+            return if transfer {
+                lower_rvalue_as_expected(right, expected, context)
+            } else {
+                lower_rvalue_as_borrowed(right, expected, context)
+            };
+        }
+        CoalesceSelection::Dynamic => {}
+    }
+
+    let left_type = if let hir::Expr::Variable { name, span } = unparenthesized_place(left) {
+        context
+            .lookup_local(name, *span)
+            .map(|local| context.local_type(local))
+            .unwrap_or(context.expression_type(left)?)
+    } else {
+        context.expression_type(left)?
+    };
+    let (present_type, nullable) = non_null_match_type(left_type);
+    if !nullable || (expected != present_type && expected != left_type) {
+        return Err(vec![Diagnostic::new(
+            "I2201",
+            "coalesce expression has inconsistent native result types",
+            left.span(),
+        )]);
+    }
+
+    let left_transfer = transfer && left_type.has_move_ownership();
+    let left_value = if left_transfer {
+        lower_rvalue_as_expected(left, left_type, context)?
+    } else {
+        lower_rvalue_as_borrowed(left, left_type, context)?
+    };
+    let left_owned = left_transfer || rvalue_has_owned_temporary(&left_value);
+    let left_local = if left_owned {
+        context.declare_owned_temp(left_type)
+    } else {
+        context.declare_borrowed_temp(left_type, false)
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: left_local,
+        value: left_value,
+    });
+
+    let present_block = context.create_block();
+    let absent_block = context.create_block();
+    let merge_block = context.create_block();
+    context.terminate_condition(
+        match_presence_condition(left_local, left_type, context)?,
+        present_block,
+        absent_block,
+    );
+
+    let result_transfer = expected.has_move_ownership() && transfer;
+    let result_local = if result_transfer {
+        context.declare_return_temp(expected, true)
+    } else {
+        context.declare_borrowed_temp(expected, false)
+    };
+
+    context.current_block = Some(present_block);
+    let present_value = if expected == left_type {
+        local_rvalue(left_local, left_type, result_transfer)
+    } else {
+        narrowed_match_local_rvalue(
+            left_local,
+            left_type,
+            expected,
+            result_transfer,
+            left.span(),
+        )?
+    };
+    let present_value =
+        stabilize_borrowed_branch_value(present_value, expected, result_transfer, context);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: result_local,
+        value: present_value,
+    });
+    context.terminate_current(mir::Terminator::Jump(merge_block));
+
+    context.current_block = Some(absent_block);
+    if result_transfer {
+        context.begin_statement_temporaries();
+    }
+    let absent_value = if result_transfer {
+        lower_rvalue_as_expected(right, expected, context)?
+    } else {
+        lower_rvalue_as_borrowed(right, expected, context)?
+    };
+    let absent_value =
+        stabilize_borrowed_branch_value(absent_value, expected, result_transfer, context);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: result_local,
+        value: absent_value,
+    });
+    if result_transfer {
+        let absent_cleanup = context.take_statement_temporaries();
+        context.emit_drop_obligations(&absent_cleanup);
+    }
+    context.terminate_current(mir::Terminator::Jump(merge_block));
+
+    context.current_block = Some(merge_block);
+    Ok(local_rvalue(result_local, expected, result_transfer))
+}
+
+fn stabilize_borrowed_branch_value(
+    value: mir::Rvalue,
+    ty: mir::Type,
+    transfers: bool,
+    context: &mut LoweringContext,
+) -> mir::Rvalue {
+    if !transfers && rvalue_has_owned_temporary(&value) {
+        let owner = context.declare_owned_temp(ty);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: owner,
+            value,
+        });
+        local_rvalue(owner, ty, false)
+    } else {
+        value
     }
 }
 
@@ -9842,8 +10051,24 @@ fn non_null_match_type(ty: mir::Type) -> (mir::Type, bool) {
     match ty {
         mir::Type::NullableScalar(ty) => (mir::Type::Scalar(ty), true),
         mir::Type::NullableString => (mir::Type::String, true),
+        mir::Type::NullableMixed => (mir::Type::Mixed, true),
+        mir::Type::NullableError => (mir::Type::Error, true),
         mir::Type::NullableClass(class) => (mir::Type::Class(class), true),
         mir::Type::NullableCollection(collection) => (mir::Type::Collection(collection), true),
+        mir::Type::NullableSharedReference(class) => (mir::Type::SharedReference(class), true),
+        mir::Type::NullableWeakReference(class) => (mir::Type::WeakReference(class), true),
+        mir::Type::NullableWritableSharedReference(payload) => {
+            (mir::Type::WritableSharedReference(payload), true)
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            (mir::Type::WritableWeakReference(payload), true)
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload) => {
+            (mir::Type::ReadonlySharedReferenceAccess(payload), true)
+        }
+        mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            (mir::Type::WritableSharedReferenceAccess(payload), true)
+        }
         mir::Type::NullablePayloadEnum(ty) => (mir::Type::PayloadEnum(ty), true),
         other => (other, false),
     }
@@ -9879,6 +10104,59 @@ fn match_presence_condition(
                 },
             ))
         }
+        mir::Type::NullableSharedReference(class) => {
+            mir::BoolExpression::NullableSharedReferenceIsPresent(Box::new(
+                mir::NullableSharedReferenceExpression::Local {
+                    class,
+                    local,
+                    transfer: false,
+                },
+            ))
+        }
+        mir::Type::NullableWeakReference(class) => {
+            mir::BoolExpression::NullableWeakReferenceIsPresent(Box::new(
+                mir::NullableWeakReferenceExpression::Local {
+                    class,
+                    local,
+                    transfer: false,
+                },
+            ))
+        }
+        mir::Type::NullableWritableSharedReference(payload) => {
+            mir::BoolExpression::NullableWritableSharedReferenceIsPresent(Box::new(
+                mir::NullableWritableSharedReferenceExpression::Local {
+                    payload,
+                    local,
+                    transfer: false,
+                },
+            ))
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            mir::BoolExpression::NullableWritableWeakReferenceIsPresent(Box::new(
+                mir::NullableWritableWeakReferenceExpression::Local {
+                    payload,
+                    local,
+                    transfer: false,
+                },
+            ))
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            mir::BoolExpression::NullableSharedReferenceAccessIsPresent(Box::new(
+                mir::NullableSharedReferenceAccessExpression::Local {
+                    payload,
+                    local,
+                    writable: matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_)),
+                    transfer: false,
+                },
+            ))
+        }
+        mir::Type::NullableError => mir::BoolExpression::NullableErrorIsPresent(Box::new(
+            mir::NullableErrorExpression::Local {
+                local,
+                transfer: false,
+            },
+        )),
         mir::Type::NullableMixed => mir::BoolExpression::NullableMixedIsPresent(Box::new(
             mir::NullableMixedExpression::Local {
                 local,
@@ -10035,6 +10313,79 @@ fn narrowed_match_local_rvalue(
                 transfer,
             })
         }
+        (mir::Type::NullableCollection(source), mir::Type::Collection(target))
+            if source == target =>
+        {
+            mir::Rvalue::Collection(mir::CollectionExpression::Local {
+                collection: target,
+                local,
+                transfer,
+            })
+        }
+        (mir::Type::NullableSharedReference(source), mir::Type::SharedReference(target))
+            if source == target =>
+        {
+            mir::Rvalue::SharedReference(
+                mir::SharedReferenceExpression::NullableLocalAssumeNonNull {
+                    class: target,
+                    local,
+                    transfer,
+                },
+            )
+        }
+        (mir::Type::NullableWeakReference(source), mir::Type::WeakReference(target))
+            if source == target =>
+        {
+            mir::Rvalue::WeakReference(mir::WeakReferenceExpression::NullableLocalAssumeNonNull {
+                class: target,
+                local,
+                transfer,
+            })
+        }
+        (
+            mir::Type::NullableWritableSharedReference(source),
+            mir::Type::WritableSharedReference(target),
+        ) if source == target => mir::Rvalue::WritableSharedReference(
+            mir::WritableSharedReferenceExpression::NullableLocalAssumeNonNull {
+                payload: target,
+                local,
+                transfer,
+            },
+        ),
+        (
+            mir::Type::NullableWritableWeakReference(source),
+            mir::Type::WritableWeakReference(target),
+        ) if source == target => mir::Rvalue::WritableWeakReference(
+            mir::WritableWeakReferenceExpression::NullableLocalAssumeNonNull {
+                payload: target,
+                local,
+                transfer,
+            },
+        ),
+        (
+            mir::Type::NullableReadonlySharedReferenceAccess(source),
+            mir::Type::ReadonlySharedReferenceAccess(target),
+        )
+        | (
+            mir::Type::NullableWritableSharedReferenceAccess(source),
+            mir::Type::WritableSharedReferenceAccess(target),
+        ) if source == target => mir::Rvalue::SharedReferenceAccess(
+            mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
+                payload: target,
+                local,
+                writable: matches!(narrowed, mir::Type::WritableSharedReferenceAccess(_)),
+                transfer,
+            },
+        ),
+        (mir::Type::NullableError, mir::Type::Error) => {
+            mir::Rvalue::Error(mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer })
+        }
+        (mir::Type::NullableMixed, mir::Type::Mixed) if !transfer => {
+            mir::Rvalue::Mixed(mir::MixedExpression::Local {
+                local,
+                transfer: false,
+            })
+        }
         (mir::Type::NullablePayloadEnum(source), mir::Type::PayloadEnum(target))
             if source == target =>
         {
@@ -10164,6 +10515,9 @@ fn reroute_condition_target(
             success, failure, ..
         }
         | mir::Terminator::CheckedConstruct {
+            success, failure, ..
+        }
+        | mir::Terminator::CheckedIo {
             success, failure, ..
         } => {
             if *success == from {
@@ -11970,6 +12324,17 @@ fn materialize_checked_call(
     }
     let (signature, args, span) = match expr {
         hir::Expr::FunctionCall { name, args, span } => {
+            if let Some(builtin) = crate::builtins::Builtin::from_name(name) {
+                if builtin_has_checked_effects(builtin) {
+                    return materialize_checked_builtin_call(
+                        builtin,
+                        args,
+                        *span,
+                        consume_result,
+                        context,
+                    );
+                }
+            }
             let Ok(signature) = context.lookup_function(name, *span) else {
                 return Ok(None);
             };
@@ -11978,6 +12343,28 @@ fn materialize_checked_call(
             }
             let lowered = lower_call_args(name, args, signature.clone(), *span, context)?;
             (signature, lowered, *span)
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: true,
+        } => {
+            let (_, signature) = lookup_null_safe_method(object, method, *span, context)?;
+            if signature.checked_effects.is_empty() {
+                return Ok(None);
+            }
+            let result_type = context.expression_type(expr)?;
+            return materialize_checked_null_safe_signature_call(
+                object,
+                method,
+                signature,
+                args,
+                *span,
+                Some((result_type, consume_result)),
+                context,
+            );
         }
         hir::Expr::MethodCall {
             object,
@@ -12010,6 +12397,221 @@ fn materialize_checked_call(
     };
 
     materialize_checked_signature_call(signature, args, span, consume_result, context)
+}
+
+fn builtin_has_checked_effects(builtin: crate::builtins::Builtin) -> bool {
+    !matches!(
+        builtin,
+        crate::builtins::Builtin::Panic | crate::builtins::Builtin::Sprintf
+    )
+}
+
+fn materialize_checked_builtin_call(
+    builtin: crate::builtins::Builtin,
+    args: &[hir::Argument],
+    span: Span,
+    consume_result: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    use crate::builtins::Builtin;
+
+    let values = argument_values(args);
+    let (operation, result_type) = match builtin {
+        Builtin::ReadLine => {
+            let prompt = match values[..] {
+                [] => mir::StringExpression::Literal(String::new()),
+                [prompt] => {
+                    materialize_nested_collection_places(prompt, false, context)?;
+                    lower_string_expression(prompt, context)?
+                }
+                _ => {
+                    return Err(vec![unsupported(
+                        span,
+                        "read_line expects at most 1 argument",
+                    )])
+                }
+            };
+            (
+                mir::CheckedIoOperation::ReadLine { prompt },
+                Some(mir::Type::NullableString),
+            )
+        }
+        Builtin::ReadFile => {
+            let [path] = values[..] else {
+                return Err(vec![unsupported(span, "read_file expects 1 argument")]);
+            };
+            materialize_nested_collection_places(path, false, context)?;
+            (
+                mir::CheckedIoOperation::ReadFile {
+                    path: lower_string_expression(path, context)?,
+                    bytes: false,
+                },
+                Some(mir::Type::String),
+            )
+        }
+        Builtin::ReadFileBytes => {
+            let [path] = values[..] else {
+                return Err(vec![unsupported(
+                    span,
+                    "read_file_bytes expects 1 argument",
+                )]);
+            };
+            materialize_nested_collection_places(path, false, context)?;
+            (
+                mir::CheckedIoOperation::ReadFile {
+                    path: lower_string_expression(path, context)?,
+                    bytes: true,
+                },
+                Some(context.expression_type(&hir::Expr::FunctionCall {
+                    name: builtin.name().to_string(),
+                    args: args.to_vec(),
+                    span,
+                })?),
+            )
+        }
+        Builtin::ReadStdinBytes => (
+            mir::CheckedIoOperation::ReadStdinBytes,
+            Some(context.expression_type(&hir::Expr::FunctionCall {
+                name: builtin.name().to_string(),
+                args: args.to_vec(),
+                span,
+            })?),
+        ),
+        Builtin::Printf => (
+            mir::CheckedIoOperation::WriteStream {
+                contents: mir::IoContents::Format(lower_format_expression(args, span, context)?),
+                stderr: false,
+            },
+            None,
+        ),
+        Builtin::WriteStderr => {
+            let [value] = values[..] else {
+                return Err(vec![unsupported(span, "write_stderr expects 1 argument")]);
+            };
+            materialize_nested_collection_places(value, false, context)?;
+            (
+                mir::CheckedIoOperation::WriteStream {
+                    contents: mir::IoContents::String(lower_string_expression(value, context)?),
+                    stderr: true,
+                },
+                None,
+            )
+        }
+        Builtin::WriteStdoutBytes | Builtin::WriteStderrBytes => {
+            let [value] = values[..] else {
+                return Err(vec![unsupported(
+                    span,
+                    format!("{} expects 1 argument", builtin.name()),
+                )]);
+            };
+            materialize_nested_collection_places(value, false, context)?;
+            materialize_collection_place(value, false, context)?;
+            let (contents, _) = lower_bytes_local(value, context)?;
+            (
+                mir::CheckedIoOperation::WriteStream {
+                    contents: mir::IoContents::Bytes(contents),
+                    stderr: matches!(builtin, Builtin::WriteStderrBytes),
+                },
+                None,
+            )
+        }
+        Builtin::WriteFile | Builtin::AppendFile => {
+            let [path, contents] = values[..] else {
+                return Err(vec![unsupported(
+                    span,
+                    format!("{} expects 2 arguments", builtin.name()),
+                )]);
+            };
+            let path = materialize_string_before_later_argument(path, context)?;
+            materialize_nested_collection_places(contents, false, context)?;
+            (
+                mir::CheckedIoOperation::WriteFile {
+                    path,
+                    contents: mir::IoContents::String(lower_string_expression(contents, context)?),
+                    append: matches!(builtin, Builtin::AppendFile),
+                },
+                None,
+            )
+        }
+        Builtin::WriteFileBytes | Builtin::AppendFileBytes => {
+            let [path, contents] = values[..] else {
+                return Err(vec![unsupported(
+                    span,
+                    format!("{} expects 2 arguments", builtin.name()),
+                )]);
+            };
+            let path = materialize_string_before_later_argument(path, context)?;
+            materialize_nested_collection_places(contents, false, context)?;
+            materialize_collection_place(contents, false, context)?;
+            let (contents, _) = lower_bytes_local(contents, context)?;
+            (
+                mir::CheckedIoOperation::WriteFile {
+                    path,
+                    contents: mir::IoContents::Bytes(contents),
+                    append: matches!(builtin, Builtin::AppendFileBytes),
+                },
+                None,
+            )
+        }
+        Builtin::Panic | Builtin::Sprintf => return Ok(None),
+    };
+    materialize_checked_io(operation, result_type, span, consume_result, context)
+}
+
+fn materialize_string_before_later_argument(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::StringExpression> {
+    materialize_nested_collection_places(expr, false, context)?;
+    let value = lower_string_expression(expr, context)?;
+    let local = context.declare_statement_string_temp();
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: mir::Rvalue::String(value),
+    });
+    Ok(mir::StringExpression::Local(local))
+}
+
+fn materialize_checked_io(
+    operation: mir::CheckedIoOperation,
+    result_type: Option<mir::Type>,
+    span: Span,
+    consume_result: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    let result = result_type.map(|ty| {
+        let owned = user_local_type_owns_value(ty);
+        (context.declare_checked_call_slot(ty, owned), ty, owned)
+    });
+    let error = context.declare_checked_call_slot(mir::Type::Error, true);
+    let success = context.create_block();
+    let failure = context.create_block();
+    context.terminate_current(mir::Terminator::CheckedIo {
+        operation,
+        result: result.map(|(local, _, _)| local),
+        error,
+        success,
+        failure,
+        span,
+    });
+
+    let statement_temporaries = context.statement_owned_locals.clone();
+    context.current_block = Some(failure);
+    let origin = context
+        .error_origin_ids
+        .get(&(span.start, span.end))
+        .copied()
+        .expect("checked I/O has deterministic origin metadata");
+    context.push_statement(mir::Statement::EnsureErrorOrigin { error, origin });
+    context.route_checked_error(error);
+    context.statement_owned_locals = statement_temporaries;
+    context.current_block = Some(success);
+    if let Some((local, ty, owned)) = result {
+        track_checked_result(local, ty, owned, context);
+        Ok(Some((local, ty, owned && consume_result)))
+    } else {
+        Ok(None)
+    }
 }
 
 fn materialize_checked_rvalue(
@@ -12065,12 +12667,180 @@ fn materialize_checked_signature_call(
     context.statement_owned_locals = statement_temporaries;
     context.current_block = Some(success);
     if let Some((local, ty, owned)) = result {
-        if owned {
-            context.track_statement_owned_local(local, ty);
-        }
+        track_checked_result(local, ty, owned, context);
         Ok(Some((local, ty, owned && consume_result)))
     } else {
         Ok(None)
+    }
+}
+
+fn materialize_checked_null_safe_signature_call(
+    object: &hir::Expr,
+    method: &str,
+    signature: FunctionSignature,
+    args: &[hir::Argument],
+    span: Span,
+    result: Option<(mir::Type, bool)>,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    debug_assert!(!signature.checked_effects.is_empty());
+    let class = signature
+        .method_class
+        .expect("null-safe checked call must have a method class");
+    let object = lower_nullable_payload_expression(object, class, context)?;
+    let receiver_type = mir::Type::NullableClass(class);
+    let receiver = if object.owned_temporary_class().is_some() {
+        context.declare_owned_temp(receiver_type)
+    } else {
+        context.declare_borrowed_temp(receiver_type, false)
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: receiver,
+        value: mir::Rvalue::NullableClass(object),
+    });
+
+    let result = result.map(|(ty, consume)| {
+        let owned = signature.return_borrow.is_none() && user_local_type_owns_value(ty);
+        let local = context.declare_checked_call_slot(ty, owned);
+        (local, ty, owned, consume)
+    });
+    let present = context.create_block();
+    let absent = context.create_block();
+    let merge = context.create_block();
+    context.terminate_condition(
+        match_presence_condition(receiver, receiver_type, context)?,
+        present,
+        absent,
+    );
+
+    context.current_block = Some(present);
+    context.begin_statement_temporaries();
+    let args = lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
+    let mut checked_args = Vec::with_capacity(args.len() + 1);
+    checked_args.push(mir::Rvalue::Class(
+        mir::ClassExpression::NullableLocalAssumeNonNull {
+            class,
+            local: receiver,
+            transfer: false,
+        },
+    ));
+    checked_args.extend(args);
+    let call_result = materialize_checked_signature_call(
+        signature,
+        checked_args,
+        span,
+        result.is_some(),
+        context,
+    )?;
+    if let Some((target, target_type, _, _)) = result {
+        let (source, source_type, transfer) = call_result.ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I2901",
+                "checked null-safe value call produced no MIR result",
+                span,
+            )]
+        })?;
+        context.push_statement(mir::Statement::AssignLocal {
+            target,
+            value: widen_checked_null_safe_result(
+                source,
+                source_type,
+                target_type,
+                transfer,
+                span,
+            )?,
+        });
+    }
+    let present_cleanup = context.take_statement_temporaries();
+    context.emit_drop_obligations(&present_cleanup);
+    context.terminate_current(mir::Terminator::Jump(merge));
+
+    context.current_block = Some(absent);
+    if let Some((target, target_type, _, _)) = result {
+        context.push_statement(mir::Statement::AssignLocal {
+            target,
+            value: absent_null_safe_result(target_type, span)?,
+        });
+    }
+    context.terminate_current(mir::Terminator::Jump(merge));
+    context.current_block = Some(merge);
+
+    if let Some((local, ty, owned, _)) = result {
+        track_checked_result(local, ty, owned, context);
+    }
+
+    Ok(result.map(|(local, ty, owned, consume)| (local, ty, owned && consume)))
+}
+
+fn track_checked_result(
+    local: mir::LocalId,
+    ty: mir::Type,
+    owned: bool,
+    context: &mut LoweringContext,
+) {
+    if owned {
+        context.track_statement_owned_local(local, ty);
+    } else if matches!(ty, mir::Type::String | mir::Type::NullableString) {
+        context
+            .statement_owned_locals
+            .last_mut()
+            .expect("checked result requires an active statement scope")
+            .push(DropObligation::String(local));
+    }
+}
+
+fn widen_checked_null_safe_result(
+    local: mir::LocalId,
+    source: mir::Type,
+    target: mir::Type,
+    transfer: bool,
+    span: Span,
+) -> DiagnosticResult<mir::Rvalue> {
+    if source == target {
+        return Ok(local_rvalue(local, target, transfer));
+    }
+    match (source, target) {
+        (mir::Type::Scalar(source), mir::Type::NullableScalar(target)) if source == target => Ok(
+            mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Value(
+                value_expression_from_operand(source, mir::Operand::Local(local)),
+            )),
+        ),
+        (mir::Type::String, mir::Type::NullableString) => Ok(mir::Rvalue::NullableString(
+            mir::NullableStringExpression::String(mir::StringExpression::Local(local)),
+        )),
+        (mir::Type::Class(source), mir::Type::NullableClass(target)) if source == target => {
+            Ok(mir::Rvalue::NullableClass(
+                mir::NullableClassExpression::Class(mir::ClassExpression::Local {
+                    class: source,
+                    local,
+                    transfer,
+                }),
+            ))
+        }
+        _ => Err(vec![Diagnostic::new(
+            "I2901",
+            "checked null-safe call result has no canonical nullable MIR form",
+            span,
+        )]),
+    }
+}
+
+fn absent_null_safe_result(ty: mir::Type, span: Span) -> DiagnosticResult<mir::Rvalue> {
+    match ty {
+        mir::Type::NullableScalar(ty) => Ok(mir::Rvalue::NullableScalar(
+            mir::NullableScalarExpression::Null(ty),
+        )),
+        mir::Type::NullableString => Ok(mir::Rvalue::NullableString(
+            mir::NullableStringExpression::Null,
+        )),
+        mir::Type::NullableClass(class) => Ok(mir::Rvalue::NullableClass(
+            mir::NullableClassExpression::Null(class),
+        )),
+        _ => Err(vec![Diagnostic::new(
+            "I2901",
+            "checked null-safe call result is not a supported nullable MIR type",
+            span,
+        )]),
     }
 }
 
@@ -12086,6 +12856,10 @@ fn lower_rvalue_as_borrowed(
         return lower_branching_rvalue(expr, expected, false, context);
     }
     match expected {
+        mir::Type::Error => lower_error_expression(expr, false, context).map(mir::Rvalue::Error),
+        mir::Type::NullableError => {
+            lower_nullable_error_expression(expr, false, context).map(mir::Rvalue::NullableError)
+        }
         mir::Type::Class(class) => {
             lower_class_expression(expr, class, false, context).map(mir::Rvalue::Class)
         }
@@ -14440,6 +15214,18 @@ fn materialize_collection_place_as(
     if lower_collection_local(expr, context).is_ok() {
         return Ok(());
     }
+    if let Some((local, ty, _)) = materialize_checked_call(expr, false, context)? {
+        if ty != mir::Type::Collection(collection) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "checked call result has another MIR collection type",
+            )]);
+        }
+        context
+            .materialized_collection_places
+            .insert((expr.span().start, expr.span().end), local);
+        return Ok(());
+    }
     let borrowed = collection_place_is_borrowed(expr);
     let value = lower_collection_expression(expr, collection, !borrowed, context)?;
     let local = if borrowed {
@@ -15408,6 +16194,14 @@ fn lower_shared_reference_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::SharedReferenceExpression> {
+    if let Some(mir::Rvalue::SharedReference(value)) = materialize_checked_rvalue(
+        expr,
+        mir::Type::SharedReference(expected),
+        transfer,
+        context,
+    )? {
+        return Ok(value);
+    }
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != mir::Type::SharedReference(expected) {
             return Err(vec![unsupported(
@@ -15637,6 +16431,14 @@ fn lower_writable_shared_reference_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::WritableSharedReferenceExpression> {
+    if let Some(mir::Rvalue::WritableSharedReference(value)) = materialize_checked_rvalue(
+        expr,
+        mir::Type::WritableSharedReference(expected),
+        transfer,
+        context,
+    )? {
+        return Ok(value);
+    }
     match unparenthesized_place(expr) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
@@ -15830,6 +16632,14 @@ fn lower_writable_weak_reference_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::WritableWeakReferenceExpression> {
+    if let Some(mir::Rvalue::WritableWeakReference(value)) = materialize_checked_rvalue(
+        expr,
+        mir::Type::WritableWeakReference(expected),
+        transfer,
+        context,
+    )? {
+        return Ok(value);
+    }
     match unparenthesized_place(expr) {
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
@@ -16249,6 +17059,16 @@ fn lower_shared_reference_access_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::SharedReferenceAccessExpression> {
+    let expected_ty = if writable {
+        mir::Type::WritableSharedReferenceAccess(expected)
+    } else {
+        mir::Type::ReadonlySharedReferenceAccess(expected)
+    };
+    if let Some(mir::Rvalue::SharedReferenceAccess(value)) =
+        materialize_checked_rvalue(expr, expected_ty, transfer, context)?
+    {
+        return Ok(value);
+    }
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         let expected_ty = if writable {
             mir::Type::WritableSharedReferenceAccess(expected)
@@ -16718,6 +17538,11 @@ fn lower_weak_reference_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::WeakReferenceExpression> {
+    if let Some(mir::Rvalue::WeakReference(value)) =
+        materialize_checked_rvalue(expr, mir::Type::WeakReference(expected), transfer, context)?
+    {
+        return Ok(value);
+    }
     if let Some((collection, index, value_type)) = lower_list_remove_at(expr, context)? {
         if value_type != mir::Type::WeakReference(expected) {
             return Err(vec![unsupported(

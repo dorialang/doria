@@ -1,4 +1,4 @@
-function main(): int
+function main(): int throws Doria\Std\Io\IoError
 {
     printf("code=%05d; enabled=%s", 42, false);
     return 42;

@@ -31,7 +31,7 @@ function advance(writable Counter $counter): void
     $counter->increment();
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $counter = new Counter(0, 1.5);
     advance($counter);

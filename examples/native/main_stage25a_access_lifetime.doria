@@ -6,7 +6,10 @@ class Node
 
     function __destruct()
     {
-        echo "drop {$this->name}\n";
+        try {
+            echo "drop {$this->name}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -17,12 +20,12 @@ function acquire(
     return $shared->acquireReadonlyAccess();
 }
 
-function inspect(ReadonlySharedReferenceAccess<Node> $access): void
+function inspect(ReadonlySharedReferenceAccess<Node> $access): void throws Doria\Std\Io\IoError
 {
     echo "access {$access->name}\n";
 }
 
-function keepAlive(): WritableWeakReference<Node>
+function keepAlive(): WritableWeakReference<Node> throws Doria\Std\Io\IoError
 {
     let $shared = new WritableSharedReference(new Node("guarded"));
     let $weak = $shared->createWeakReference();
@@ -37,7 +40,7 @@ function keepAlive(): WritableWeakReference<Node>
     return $weak;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $weak = keepAlive();
     if ($weak->acquire() == null) {

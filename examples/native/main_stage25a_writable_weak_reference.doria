@@ -6,7 +6,10 @@ class Node
 
     function __destruct()
     {
-        echo "drop {$this->name}\n";
+        try {
+            echo "drop {$this->name}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -16,7 +19,7 @@ function expired(): WritableWeakReference<Node>
     return $node->createWeakReference();
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $root = new WritableSharedReference(new Node("root"));
     let $weak = $root->createWeakReference();

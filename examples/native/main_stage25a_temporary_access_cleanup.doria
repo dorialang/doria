@@ -3,7 +3,7 @@ class Box
     writable int $value = 1;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $owner = new WritableSharedReference<List<int>>([1, 2, 3]);
 

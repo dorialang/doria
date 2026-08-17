@@ -1917,8 +1917,14 @@ impl Parser {
             });
         }
 
+        let enum_case_checkpoint = self.current;
         if let TokenKind::Identifier(name) = self.peek().kind.clone() {
             let qualifier_token = self.advance().clone();
+            let name = self.finish_qualified_name(
+                name,
+                "expected enum-name segment after namespace separator",
+            )?;
+            let qualifier_span = Span::new(qualifier_token.span.start, self.previous().span.end);
             if self.match_kind(&TokenKind::DoubleColon) {
                 let case_token = self.advance().clone();
                 let TokenKind::Identifier(case) = case_token.kind else {
@@ -1976,14 +1982,14 @@ impl Parser {
                 }
                 return Some(MatchPattern::EnumCase {
                     qualifier: name,
-                    qualifier_span: qualifier_token.span,
+                    qualifier_span,
                     case,
                     case_span: case_token.span,
                     bindings,
                     span: Span::new(qualifier_token.span.start, end),
                 });
             }
-            self.current -= 1;
+            self.current = enum_case_checkpoint;
         }
 
         let checkpoint = self.current;

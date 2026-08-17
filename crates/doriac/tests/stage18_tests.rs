@@ -75,7 +75,7 @@ function floatValue(): float { return 1.5; }
 function boolValue(): bool { return true; }
 function stringValue(): string { return "Doria"; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     int $right = 22;
     echo "{intValue() + $right}";
@@ -95,7 +95,7 @@ fn interpolation_preserves_nullable_narrowing_and_excluded_type_rules() {
     doriac::check_source(
         "stage18.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $line = read_line();
     if ($line != null) {
@@ -107,12 +107,12 @@ function main(): void
     .expect("a proven non-null string should be displayable");
 
     for source in [
-        "function main(): void { let $line = read_line(); echo \"{$line}\"; }",
-        "function show(mixed $value): void { echo \"{$value}\"; }",
-        "function show(List<int> $value): void { echo \"{$value}\"; }",
-        "function show(Dictionary<string, int> $value): void { echo \"{$value}\"; }",
-        "function show(Set<int> $value): void { echo \"{$value}\"; }",
-        "function main(): void { let $value = null; echo \"{$value}\"; }",
+        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { let $line = read_line(); echo \"{$line}\"; }",
+        "function show(mixed $value): void throws Doria\\Std\\Io\\IoError { echo \"{$value}\"; }",
+        "function show(List<int> $value): void throws Doria\\Std\\Io\\IoError { echo \"{$value}\"; }",
+        "function show(Dictionary<string, int> $value): void throws Doria\\Std\\Io\\IoError { echo \"{$value}\"; }",
+        "function show(Set<int> $value): void throws Doria\\Std\\Io\\IoError { echo \"{$value}\"; }",
+        "function main(): void throws Doria\\Std\\Io\\IoError { let $value = null; echo \"{$value}\"; }",
     ] {
         doriac::check_source("stage18.doria", source)
             .expect_err("excluded values must not become display-convertible");
@@ -123,14 +123,14 @@ function main(): void
 fn ordinary_expression_errors_are_preserved_inside_interpolation() {
     let missing = doriac::check_source(
         "stage18.doria",
-        "function main(): void { echo \"{$missing}\"; }",
+        "function main(): void throws Doria\\Std\\Io\\IoError { echo \"{$missing}\"; }",
     )
     .expect_err("an undeclared interpolation binding must fail");
     assert!(missing.iter().any(|diagnostic| diagnostic.code == "E0101"));
 
     let arithmetic = doriac::check_source(
         "stage18.doria",
-        "function main(): void { echo \"{1 + true}\"; }",
+        "function main(): void throws Doria\\Std\\Io\\IoError { echo \"{1 + true}\"; }",
     )
     .expect_err("invalid arithmetic must remain an arithmetic error");
     assert!(arithmetic
@@ -154,7 +154,7 @@ fn acceptance_example_executes_with_exact_output() {
 fn single_quoted_brace_backslashes_remain_literal_at_runtime() {
     let mir = doriac::lower_source_to_mir(
         "single_quotes.doria",
-        r#"function main(): void { echo '\{\}'; }"#,
+        r#"function main(): void throws Doria\Std\Io\IoError { echo '\{\}'; }"#,
     )
     .expect("single-quoted brace text should lower");
     let output =
@@ -217,6 +217,26 @@ fn invalid_displayable_signature_diagnostic_matches_snapshot() {
         ),
         include_str!("fixtures/diagnostics/stage18_invalid_displayable_signature.txt"),
     );
+}
+
+#[test]
+fn throwing_displayable_method_is_not_implicit_conversion() {
+    let diagnostics = doriac::check_source(
+        "test.doria",
+        r#"
+class Label implements Displayable
+{
+    function toString(): string throws Doria\Std\Io\IoError
+    {
+        return "Doria";
+    }
+}
+"#,
+    )
+    .expect_err("throwing Displayable method must fail");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0463"));
 }
 
 #[test]

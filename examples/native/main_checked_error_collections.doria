@@ -5,7 +5,7 @@ class Failure implements Error
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<Error> $errors = [new Failure("first"), new Failure("second")];
     Error $removed = $errors->removeAt(0);

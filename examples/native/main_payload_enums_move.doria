@@ -6,7 +6,10 @@ class Token
 
     function __destruct()
     {
-        echo "drop {$this->name}\n";
+        try {
+            echo "drop {$this->name}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -21,12 +24,12 @@ function load(): LoadResult
     return LoadResult::Loaded(new Token("moved"));
 }
 
-function consume(take LoadResult $result): void
+function consume(take LoadResult $result): void throws Doria\Std\Io\IoError
 {
     echo "consume\n";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     LoadResult $result = load();
     consume($result);

@@ -58,14 +58,13 @@ recommends. This is the whole-stream tier only.
 - **Output** (`write_stdout_bytes` / `write_stderr_bytes`) inherits the ordinary
   standard-stream rule from 0074/0091: a write that reports a **closed pipe**
   during ordinary program output exits immediately with status 0, no panic, no
-  trace — the same carve-out `echo` and `write_stderr` already have. Any other
-  write failure is a fatal status-101 panic until Stage 29.
-- **Input** (`read_stdin_bytes`) panics on an OS read failure with a stable
-  message (`failed to read stdin`, matching `read_line`). There is no UTF-8
-  validation and therefore no invalid-UTF-8 panic — raw bytes are the point.
-- At Stage 29 these migrate to declared `throws` with the rest of the family,
-  except the closed-output-pipe carve-out, which is permanent and never thrown
-  (0075/0091).
+  trace — the same carve-out `echo` and `write_stderr` have. Any other write
+  failure is `Doria\Std\Io\IoError`.
+- **Input** (`read_stdin_bytes`) reports an OS read failure as
+  `Doria\Std\Io\IoError`. There is no UTF-8 validation and therefore no
+  `InvalidUtf8Error` — raw bytes are the point.
+- Decision 0119 completed this checked-error migration. The closed-output-pipe
+  carve-out remains permanent and is never thrown (0075/0091).
 
 ### Platform parity
 

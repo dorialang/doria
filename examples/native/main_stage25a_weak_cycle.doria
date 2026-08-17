@@ -4,7 +4,10 @@ class Parent
 
     function __destruct()
     {
-        echo "drop parent\n";
+        try {
+            echo "drop parent\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -14,7 +17,7 @@ class Child
     {
     }
 
-    function inspectParent(): void
+    function inspectParent(): void throws Doria\Std\Io\IoError
     {
         let $parent = $this->parentReference->acquire();
         if ($parent != null) {
@@ -24,11 +27,14 @@ class Child
 
     function __destruct()
     {
-        echo "drop child\n";
+        try {
+            echo "drop child\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function makeExpiredParent(): WritableWeakReference<Parent>
+function makeExpiredParent(): WritableWeakReference<Parent> throws Doria\Std\Io\IoError
 {
     let $parent = new WritableSharedReference(new Parent());
     let $externalWeak = $parent->createWeakReference();
@@ -46,7 +52,7 @@ function makeExpiredParent(): WritableWeakReference<Parent>
     return $externalWeak;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $parent = makeExpiredParent();
     if ($parent->acquire() == null) {

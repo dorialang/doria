@@ -1,4 +1,6 @@
 use doriac::hir;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 fn error_class(name: &str) -> String {
     format!(
@@ -23,6 +25,65 @@ fn assert_code(source: &str, code: &str) {
     assert!(
         diagnostics.iter().any(|diagnostic| diagnostic.code == code),
         "expected {code}, got {diagnostics:?}"
+    );
+}
+
+fn collect_doria_sources(root: &Path, sources: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(root)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", root.display()))
+    {
+        let path = entry
+            .expect("source directory entry should be readable")
+            .path();
+        if path.is_dir() {
+            collect_doria_sources(&path, sources);
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "doria")
+        {
+            sources.push(path);
+        }
+    }
+}
+
+#[test]
+fn repository_doria_sources_cover_checked_io_effects_and_contain_finalizers() {
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("doriac should live below the workspace");
+    let roots = [
+        "examples/compile-only",
+        "examples/debug",
+        "examples/native",
+        "examples/php",
+        "crates/doriac/tests/fixtures/native_io",
+        "crates/doriac/tests/fixtures/native_stack",
+        "crates/doriac/tests/fixtures/stage28a_pending",
+    ];
+    let mut sources = Vec::new();
+    for root in roots {
+        collect_doria_sources(&workspace.join(root), &mut sources);
+    }
+    sources.sort();
+
+    let mut uncovered = Vec::new();
+    for path in sources {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+        if let Err(diagnostics) = doriac::check_source(path.to_string_lossy(), source) {
+            for diagnostic in diagnostics {
+                if matches!(diagnostic.code, "E0631" | "E0632") {
+                    uncovered.push(format!("{}: {}", path.display(), diagnostic.message));
+                }
+            }
+        }
+    }
+
+    assert!(
+        uncovered.is_empty(),
+        "executable sources have uncovered checked effects:\n{}",
+        uncovered.join("\n")
     );
 }
 
@@ -73,7 +134,7 @@ class Holder
 
 function accept(Error $error): void
 {{
-    echo $error->message;
+    let $message = $error->message;
 }}
 
 function same(Error $left, Error $right): bool
@@ -243,10 +304,8 @@ function consume(take Failure $failure): void
 {{
     try {{
         throw $failure;
-    }} catch (Failure) {{
-        echo "handled";
-    }}
-    echo $failure->message;
+    }} catch (Failure) {{}}
+    let $message = $failure->message;
 }}
 "#
         ),
@@ -271,7 +330,7 @@ function handled(): void
     try {{
         first();
     }} catch (FirstError $error) {{
-        echo $error->message;
+        let $message = $error->message;
     }}
 }}
 
@@ -280,7 +339,7 @@ function open(): void throws Error
     try {{
         first();
     }} catch (Error) {{
-        echo "handled";
+        let $handled = true;
     }}
 }}
 "#,
@@ -330,7 +389,7 @@ function caller(): void throws SecondError
     try {{
         load(true);
     }} catch (FirstError) {{
-        echo "first";
+        let $handled = true;
     }}
 }}
 "#,
@@ -490,6 +549,15 @@ function f(): void throws Failure
         "E0632",
     );
     assert_code(
+        r#"
+function main(): void throws Doria\Std\Io\IoError
+{
+    if (true) {} finally { echo "cleanup"; }
+}
+"#,
+        "E0632",
+    );
+    assert_code(
         &format!(
             r#"
 {failure}
@@ -522,8 +590,8 @@ fn checked_error_scopes_and_optional_bindings_follow_lexical_blocks() {
 function work(): void throws Failure {{ throw new Failure("work"); }}
 function handled(): void
 {{
-    try {{ work(); }} catch (Failure) {{ echo "handled"; }}
-    try {{ work(); }} catch (Failure $failure) {{ echo $failure->message; }}
+    try {{ work(); }} catch (Failure) {{ let $handled = true; }}
+    try {{ work(); }} catch (Failure $failure) {{ let $message = $failure->message; }}
 }}
 "#
         ),
@@ -537,7 +605,7 @@ function handled(): void
 function work(): void throws Failure {{ throw new Failure("work"); }}
 function invalid(): void
 {{
-    try {{ let $temporary = "try"; work(); }} catch (Failure $caught) {{ echo $temporary; }} finally {{ echo $caught->message; }}
+    try {{ let $temporary = "try"; work(); }} catch (Failure $caught) {{ let $outside = $temporary; }} finally {{ let $message = $caught->message; }}
 }}
 "#
         ),
@@ -555,13 +623,13 @@ class Resource
 {{
     function __destruct(): void
     {{
-        try {{ cleanup(); }} catch (CleanupError) {{ echo "recorded"; }}
+        try {{ cleanup(); }} catch (CleanupError) {{ let $recorded = true; }}
     }}
 }}
 function complete(): void
 {{
-    try {{ echo "body"; }} finally {{
-        try {{ cleanup(); }} catch (CleanupError) {{ echo "recorded"; }}
+    try {{ let $body = true; }} finally {{
+        try {{ cleanup(); }} catch (CleanupError) {{ let $recorded = true; }}
     }}
 }}
 "#,
@@ -714,12 +782,12 @@ function valid(bool $first): void throws SecondError
 }
 
 #[test]
-fn stage29_slice2_executes_handled_errors_and_gates_only_escaping_main() {
+fn stage29_slice3_executes_handled_and_escaping_main_errors() {
     let source = format!(
         r#"
 {}
 function fail(): void throws Failure {{ throw new Failure("x"); }}
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {{
     try {{ fail(); }} catch (Failure) {{ echo "handled"; }}
 }}
@@ -756,15 +824,25 @@ function main(): void throws Failure {{ fail(); }}
         doriac::backend::BackendTarget::Native,
         doriac::backend::BackendTarget::Php,
     ] {
-        let diagnostics = doriac::compile_source("escaping_error.doria", &escaping, target)
-            .expect_err("an Error escaping main should stop at the Slice 3 boundary");
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].code, "B2902");
+        doriac::compile_source("escaping_error.doria", &escaping, target)
+            .expect("an Error escaping main should be handled by the runtime boundary");
     }
+    let program = doriac::lower_source_to_mir("escaping_error.doria", &escaping)
+        .expect("escaping Error source should lower to MIR");
+    let interpreted = doriac::mir_interpreter::interpret(&program)
+        .expect("interpreter should report an escaping Error");
+    assert_eq!(interpreted.exit_status, 70);
+    assert_eq!(
+        interpreted
+            .runtime_diagnostic
+            .as_ref()
+            .map(|diagnostic| diagnostic.code),
+        Some("R1000")
+    );
 
     doriac::compile_source(
         "plain.doria",
-        "function main(): void { echo \"ok\"; }",
+        "function main(): void throws Doria\\Std\\Io\\IoError { echo \"ok\"; }",
         doriac::backend::BackendTarget::Debug,
     )
     .expect("nonthrowing programs must remain executable");
@@ -772,10 +850,98 @@ function main(): void throws Failure {{ fail(); }}
     doriac::compile_source(
         "unused_error.doria",
         format!(
-            "{} function main(): void {{ echo \"ok\"; }}",
+            "{} function main(): void throws Doria\\Std\\Io\\IoError {{ echo \"ok\"; }}",
             error_class("UnusedError")
         ),
         doriac::backend::BackendTarget::Debug,
     )
     .expect("an unused concrete Error declaration must not activate the execution boundary");
+}
+
+#[test]
+fn compiler_known_io_types_are_nominal_and_expose_typed_fields() {
+    let source = r#"
+function inspect(Error $error): string
+{
+    return $error->message;
+}
+
+function main(): int
+{
+    let $operation = Doria\Std\Io\IoOperation::Read;
+    let $target = Doria\Std\Io\IoTarget::File(path: "data.txt");
+    let $reason = Doria\Std\Io\IoErrorReason::NotFound;
+    let $error = new Doria\Std\Io\IoError(
+        message: "failed to read file `data.txt`: not found",
+        operation: $operation,
+        target: $target,
+        reason: $reason,
+    );
+    let $message = inspect($error);
+
+    let $source = Doria\Std\Io\Utf8InputSource::StandardInput;
+    let $encoding = new Doria\Std\Io\InvalidUtf8Error(
+        message: "invalid UTF-8 in standard input",
+        source: $source,
+        validByteCount: 3,
+    );
+    mixed $boxed = $encoding;
+
+    if (!($boxed is Doria\Std\Io\InvalidUtf8Error)) {
+        return 1;
+    }
+    if ($message != $error->message) {
+        return 2;
+    }
+    return match ($error->operation) {
+        Doria\Std\Io\IoOperation::Read => 0,
+        default => 3,
+    };
+}
+"#;
+
+    doriac::check_source("canonical_io.doria", source)
+        .expect("canonical I/O types should use the ordinary nominal type model");
+    doriac::lower_source_to_mir("canonical_io.doria", source)
+        .expect("canonical I/O types should lower through ordinary MIR");
+    for target in [
+        doriac::backend::BackendTarget::Debug,
+        doriac::backend::BackendTarget::Native,
+        doriac::backend::BackendTarget::Php,
+    ] {
+        doriac::compile_source("canonical_io.doria", source, target)
+            .expect("canonical I/O types should compile for every backend");
+    }
+
+    let diagnostics = doriac::check_source(
+        "short_alias.doria",
+        "function inspect(IoError $error): void {}",
+    )
+    .expect_err("unqualified temporary I/O aliases must not enter the prelude");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.message.contains("unknown type `IoError`")));
+}
+
+#[test]
+fn ide_analysis_uses_the_compiler_known_io_pipeline_without_exposing_synthetic_items() {
+    let source = r#"function main(): void throws Doria\Std\Io\IoError
+{
+    echo "ready";
+}
+"#;
+
+    let (program, analysis) = doriac::analyze_source_for_ide("ide_io.doria", source)
+        .expect("IDE analysis should parse compiler-known I/O types");
+
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    assert_eq!(
+        program.items.len(),
+        1,
+        "synthetic declarations stay compiler-owned"
+    );
 }

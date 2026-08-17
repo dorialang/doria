@@ -10,13 +10,21 @@ function fail(): void throws Failure
     throw new Failure("failure");
 }
 
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
 function main(): void
 {
     try {
         fail();
     } catch (Failure) {
-        echo "caught\n";
+        record("caught\n");
     } finally {
-        echo "finally\n";
+        record("finally\n");
     }
 }

@@ -6,7 +6,10 @@ class Token
 
     function __destruct()
     {
-        echo "drop {$this->id}\n";
+        try {
+            echo "drop {$this->id}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -76,7 +79,7 @@ class CollectionEvaluationOrder
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<List<int>> $matrix = [[1]];
     $matrix[0]->add(2);

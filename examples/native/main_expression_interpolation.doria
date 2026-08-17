@@ -8,7 +8,7 @@ function b(): int
     return 23;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo "sum: {a() + b()}";
 }

@@ -1,0 +1,12 @@
+function main(): void throws Doria\Std\Io\IoError
+{
+    try {
+        let $line = read_line("value: ");
+        echo $line ?? "eof";
+        echo "\n";
+    } catch (Doria\Std\Io\IoError $error) {
+        echo "io:{$error->message}\n";
+    } catch (Doria\Std\Io\InvalidUtf8Error $error) {
+        echo "utf8:{$error->validByteCount}\n";
+    }
+}

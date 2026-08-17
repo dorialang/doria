@@ -1,4 +1,12 @@
-function main(): void
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
+function main(): void throws Doria\Std\Io\IoError
 {
     int $value = given {
         true;
@@ -7,6 +15,6 @@ function main(): void
     } else {
         return 0;
     } finally {
-        echo "cleanup\n";
+        record("cleanup\n");
     };
 }

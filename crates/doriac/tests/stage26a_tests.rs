@@ -40,9 +40,9 @@ fn parser_preserves_one_initializer_and_each_binding_span() {
 #[test]
 fn all_four_grouped_forms_evaluate_once_and_initialize_independent_locals() {
     let source = r#"
-function value(): int { echo "value\n"; return 7; }
-function text(): string { echo "text\n"; return "same"; }
-function main(): void
+function value(): int throws Doria\Std\Io\IoError { echo "value\n"; return 7; }
+function text(): string throws Doria\Std\Io\IoError { echo "text\n"; return "same"; }
+function main(): void throws Doria\Std\Io\IoError
 {
     let $a, $b = value();
     let writable $c, $d = value();
@@ -81,7 +81,7 @@ fn explicitly_typed_nullable_move_bindings_accept_only_literal_null() {
         "stage26a-null.doria",
         r#"
 class Token { function __construct() {} }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?Token $left, $right = null;
     ?List<int> $first, $second = null;
@@ -219,8 +219,8 @@ fn traditional_for_initializer_uses_the_same_grouped_local_contract() {
     let mir = doriac::lower_source_to_mir(
         "stage26a-for.doria",
         r#"
-function seed(): int { echo "seed\n"; return 0; }
-function main(): void
+function seed(): int throws Doria\Std\Io\IoError { echo "seed\n"; return 0; }
+function main(): void throws Doria\Std\Io\IoError
 {
     for (let writable $index, $start = seed(); $index < 2; $index++) {
         echo "{$index}:{$start}\n";

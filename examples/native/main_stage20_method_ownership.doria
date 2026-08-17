@@ -4,7 +4,10 @@ class Token
 
     function __destruct()
     {
-        echo "drop " . $this->name . "\n";
+        try {
+            echo "drop " . $this->name . "\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -41,7 +44,7 @@ class Worker
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $worker = new Worker();
     let $token = $worker->relay($worker->make("owned"));

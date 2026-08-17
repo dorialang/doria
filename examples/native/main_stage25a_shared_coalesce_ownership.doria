@@ -6,7 +6,10 @@ class Node
 
     function __destruct()
     {
-        echo "drop {$this->name}\n";
+        try {
+            echo "drop {$this->name}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 
     function label(): string
@@ -15,7 +18,7 @@ class Node
     }
 }
 
-function makeStrong(string $name): SharedReference<Node>
+function makeStrong(string $name): SharedReference<Node> throws Doria\Std\Io\IoError
 {
     echo "make strong {$name}\n";
     return shared new Node($name);
@@ -24,18 +27,18 @@ function makeStrong(string $name): SharedReference<Node>
 function makeWeak(
     SharedReference<Node> $strong,
     string $label,
-): WeakReference<Node>
+): WeakReference<Node> throws Doria\Std\Io\IoError
 {
     echo "make weak {$label}\n";
     return $strong->createWeakReference();
 }
 
-function inspect(SharedReference<Node> $node): void
+function inspect(SharedReference<Node> $node): void throws Doria\Std\Io\IoError
 {
     echo "inspect {$node->name}\n";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $owner = shared new Node("Existing");
     let $weak = $owner->createWeakReference();

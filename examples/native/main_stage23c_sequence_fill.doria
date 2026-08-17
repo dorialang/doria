@@ -1,21 +1,21 @@
-function runtimeCount(): int
+function runtimeCount(): int throws Doria\Std\Io\IoError
 {
     echo "count\n";
     return 3;
 }
 
-function fillValue(): string
+function fillValue(): string throws Doria\Std\Io\IoError
 {
     echo "value\n";
     return "repeat";
 }
 
-function inspectWords(List<string> $words): void
+function inspectWords(List<string> $words): void throws Doria\Std\Io\IoError
 {
     echo "{$words->count}:{$words[1]}\n";
 }
 
-function main(): int
+function main(): int throws Doria\Std\Io\IoError
 {
     bool[] $flags = [true; runtimeCount()];
     int[] $numbers = [42; 2];

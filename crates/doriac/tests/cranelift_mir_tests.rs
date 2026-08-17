@@ -126,7 +126,7 @@ fn lowers_complete_stage17_io_and_format_mir_to_object() {
         include_str!("../../../examples/native/main_missing_file_panic.doria"),
         r#"
 function identity(?string $value): ?string { return $value; }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $line = identity(read_line());
     if ($line != null) { echo $line; }

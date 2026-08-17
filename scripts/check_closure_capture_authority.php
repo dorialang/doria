@@ -88,11 +88,11 @@ function check_closure_capture_authority(string $root): array
         'A closure with no surrounding-local dependency omits `with`',
         'Changing an arrow into a block closure preserves its capture list and ownership modes',
         'Decision 0120: explicit closure capture lists',
-        '**Pre-Stage-30 Grammar Slice — Closure accepted syntax.**',
-        'Scheduled immediately after Stage 29 and before Stage 30',
+        '**Pre-Stage-30 Grammar Slice — Closure accepted syntax — Next.**',
+        'Scheduled immediately after completed Stage 29 and before Stage 30',
         'Successfully parsed closures stop at one stage-named Stage 30 unsupported-feature boundary',
         'This slice does not perform free-variable discovery',
-        'Stage 30 remains blocked until Stage 29 and the pre-Stage-30 grammar slice complete',
+        'Stage 30 remains blocked until the pre-Stage-30 grammar slice completes',
         'A missing capture receives a capture-specific diagnostic',
         'Closure callable types preserve Stage 29',
         '`List<T>` `map`, `filter`, and `reduce` use this same closure model',
@@ -117,19 +117,19 @@ function check_closure_capture_authority(string $root): array
 
     $require($pipelinePath, $pipeline, [
         'Decision 0120 accepts one explicit closure-capture model',
-        'Stage 29 — In Progress',
+        'Stage 29 — Complete',
         'Stage 29 Slice 1 — Complete',
         'Stage 29 Slice 2 — Complete',
         'Corrective Beat: Native Collection Property Initializers — Complete',
-        'Stage 29 Slice 3 — Next',
-        'Stage 30 — Blocked Until Stage 29 Completes',
+        'Stage 29 Slice 3 — Complete',
+        'Stage 30 — Blocked Until The Pre-Stage-30 Grammar Slice Completes; Not Implemented',
         'Decision 0120 — Accepted; Stage 30 Authority Only',
-        'Pre-Stage-30 Grammar Slice — Scheduled After Stage 29',
+        'Pre-Stage-30 Grammar Slice — Next',
     ]);
 
     $require($auditPath, $audit, [
         'decision 0120 requires explicit `with` capture lists',
-        'pre-Stage-30 grammar slice owns accepted lexer/parser/AST syntax',
+        'pre-Stage-30 grammar slice is next and owns accepted lexer/parser/AST syntax',
         'No accepted authority grants those',
         'decision 0120 deliberately adds no public method',
     ]);
@@ -160,7 +160,7 @@ function check_closure_capture_authority(string $root): array
         }
     }
 
-    $grammarPosition = strpos($plan, '**Pre-Stage-30 Grammar Slice — Closure accepted syntax.**');
+    $grammarPosition = strpos($plan, '**Pre-Stage-30 Grammar Slice — Closure accepted syntax — Next.**');
     $stage30Position = strpos($plan, '**Stage 30 — Closures.**');
     if ($grammarPosition === false || $stage30Position === false || $grammarPosition >= $stage30Position) {
         $failures[] = "{$planPath}: the accepted-syntax grammar slice must precede Stage 30";

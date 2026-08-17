@@ -793,12 +793,13 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
     })?;
 
     let temp_path = temp_run_executable_path(input);
-    let outcome_path = temp_path.with_extension("doria-outcome-v2");
+    let outcome_path = temp_path.with_extension("doria-outcome");
     write_backend_output(&temp_path, output)
         .map_err(|error| format!("failed to write temp native executable: {error}"))?;
 
     let status = Command::new(&temp_path)
         .env("DORIA_RUNTIME_OUTCOME_V2", &outcome_path)
+        .env("DORIA_RUNTIME_OUTCOME_V3", &outcome_path)
         .args(program_args)
         .status()
         .map_err(|error| {
@@ -831,6 +832,9 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
 }
 
 fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnostic, CliError> {
+    if payload.starts_with(b"DORIAO3\0") {
+        return decode_runtime_error_outcome(payload, source_path);
+    }
     let mut decoder = RuntimeOutcomeDecoder::new(payload);
     if decoder.take(8)? != b"DORIAO2\0" || decoder.u16()? != 2 {
         return Err("native program returned an unsupported runtime outcome record".into());
@@ -959,6 +963,7 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
         },
         path: frames,
         facts,
+        error_type: None,
     };
     let mut diagnostic = Diagnostic::runtime_panic(code, primary_span, outcome);
     if code == "P1203" {
@@ -1016,6 +1021,70 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
     Ok(diagnostic)
 }
 
+fn decode_runtime_error_outcome(payload: &[u8], source_path: &str) -> Result<Diagnostic, CliError> {
+    let mut decoder = RuntimeOutcomeDecoder::new(payload);
+    if decoder.take(8)? != b"DORIAO3\0" || decoder.u16()? != 3 {
+        return Err("native program returned an unsupported runtime Error record".into());
+    }
+    let error_type_length = decoder.u32()? as usize;
+    let message_length = usize::try_from(decoder.u64()?)
+        .map_err(|_| "native program returned an impossible runtime Error message length")?;
+    let path_length = decoder.u32()? as usize;
+    let source_length = decoder.u32()? as usize;
+    let function_length = decoder.u32()? as usize;
+    let origin_known = match decoder.byte()? {
+        0 => false,
+        1 => true,
+        _ => return Err("native program returned an invalid runtime Error origin state".into()),
+    };
+    let span = Span::new(decoder.u64()? as usize, decoder.u64()? as usize);
+    if error_type_length > 4096
+        || path_length > 4096
+        || source_length > 4 * 1024 * 1024
+        || function_length > 1024
+        || message_length > decoder.remaining_len()
+    {
+        return Err("native program returned an oversized runtime Error record".into());
+    }
+    let error_type = decoder.text(error_type_length)?;
+    let message = decoder.text(message_length)?;
+    let (record_path, function) = if origin_known {
+        let path = decoder.text(path_length)?;
+        let _embedded_source = decoder.text(source_length)?;
+        let function = decoder.text(function_length)?;
+        (path, Some(function))
+    } else {
+        if path_length != 0 || source_length != 0 || function_length != 0 || span != Span::default()
+        {
+            return Err("native program returned facts for an unavailable Error origin".into());
+        }
+        (String::new(), None)
+    };
+    if !decoder.is_empty() {
+        return Err("native program returned trailing runtime Error bytes".into());
+    }
+    let source = if origin_known {
+        diagnostic_source(&record_path, source_path)
+    } else {
+        DiagnosticSource::Unavailable
+    };
+    let outcome = RuntimeOutcomeDetails {
+        process_status: 70,
+        termination_behavior: TerminationBehavior::PropagateWithCleanup,
+        origin: RuntimeOutcomeOrigin {
+            source,
+            span,
+            function,
+        },
+        path: Vec::new(),
+        facts: Vec::new(),
+        error_type: Some(error_type.clone()),
+    };
+    Ok(Diagnostic::runtime_error(
+        error_type, message, span, outcome,
+    ))
+}
+
 fn diagnostic_source(path: &str, current: &str) -> DiagnosticSource {
     if path == current {
         DiagnosticSource::Current
@@ -1068,6 +1137,10 @@ impl<'a> RuntimeOutcomeDecoder<'a> {
 
     fn is_empty(&self) -> bool {
         self.remaining.is_empty()
+    }
+
+    fn remaining_len(&self) -> usize {
+        self.remaining.len()
     }
 }
 

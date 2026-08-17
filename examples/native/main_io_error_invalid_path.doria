@@ -1,0 +1,16 @@
+function main(): void throws Doria\Std\Io\IoError
+{
+    try {
+        let $path = read_line();
+        if ($path != null) {
+            read_file($path);
+        }
+    } catch (Doria\Std\Io\IoError $error) {
+        echo match ($error->reason) {
+            Doria\Std\Io\IoErrorReason::InvalidInput => "invalid-input\n",
+            default => "unexpected\n",
+        };
+    } catch (Doria\Std\Io\InvalidUtf8Error) {
+        echo "unexpected-utf8\n";
+    }
+}

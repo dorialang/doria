@@ -2360,6 +2360,7 @@ impl<'program> Checker<'program> {
             && !method.is_static
             && method.type_params.is_empty()
             && method.params.is_empty()
+            && method.checked_effects.is_empty()
             && matches!(self.types.kind(method.return_ty), TypeKind::String);
         if !valid {
             self.diagnostics.push(
@@ -4498,6 +4499,23 @@ impl<'program> Checker<'program> {
         );
     }
 
+    fn report_finally_checked_effects(&mut self, effects: CheckedEffectSet, span: Span) {
+        for effect in effects.ordered {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0632",
+                    format!(
+                        "checked error `{}` cannot escape `finally`",
+                        self.types.display(effect)
+                    ),
+                    span,
+                )
+                .with_title("Checked Error Cannot Escape Finally")
+                .with_help("catch the checked error inside `finally`"),
+            );
+        }
+    }
+
     fn check_parameter_default_support(
         &mut self,
         function: &FunctionDecl,
@@ -4537,9 +4555,20 @@ impl<'program> Checker<'program> {
             }
             _ => false,
         };
+        let compiler_known_nullable_scalar = method_context.is_some_and(|context| {
+            matches!(
+                context.class_name.as_str(),
+                crate::compiler_known_io::IO_ERROR | crate::compiler_known_io::INVALID_UTF8_ERROR
+            ) && matches!(default, Expr::Null { .. })
+                && matches!(
+                    &kind,
+                    TypeKind::Nullable(inner)
+                        if matches!(self.types.kind(*inner), TypeKind::Integer(_))
+                )
+        });
 
         if let TypeKind::Nullable(inner) = &kind {
-            if !nullable_copy_enum {
+            if !nullable_copy_enum && !compiler_known_nullable_scalar {
                 let message = if matches!(self.types.kind(*inner), TypeKind::String) {
                     "default values for nullable string parameters are not yet supported"
                 } else {
@@ -4561,6 +4590,7 @@ impl<'program> Checker<'program> {
         }
 
         if !nullable_copy_enum
+            && !compiler_known_nullable_scalar
             && !matches!(
                 &kind,
                 TypeKind::Integer(_)
@@ -4739,7 +4769,8 @@ impl<'program> Checker<'program> {
                     self.check_expr(&assignment.value, scopes, method_context);
                 }
             }
-            Stmt::Echo { expr, .. } => {
+            Stmt::Echo { expr, span } => {
+                let diagnostics_before = self.diagnostics.len();
                 self.check_expr(expr, scopes, method_context);
                 self.check_mixed_value_operation(expr, "echo", scopes, method_context);
                 let ty = self.infer_expr_type(expr, scopes, method_context);
@@ -4757,6 +4788,12 @@ impl<'program> Checker<'program> {
                         ),
                         expr.span(),
                     ));
+                }
+                if self.diagnostics.len() == diagnostics_before {
+                    self.record_compiler_known_effects(
+                        crate::builtins::ECHO_CHECKED_ERROR_TYPES,
+                        *span,
+                    );
                 }
             }
             Stmt::Expr { expr, .. } => match expr {
@@ -5366,20 +5403,7 @@ impl<'program> Checker<'program> {
                 .pop()
                 .expect("checked try finalizer boundary");
             let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
-            for effect in finalizer_effects.ordered {
-                self.diagnostics.push(
-                    Diagnostic::new(
-                        "E0632",
-                        format!(
-                            "checked error `{}` cannot escape `finally`",
-                            self.types.display(effect)
-                        ),
-                        finally.span,
-                    )
-                    .with_title("Checked Error Cannot Escape Finally")
-                    .with_help("catch the checked error inside `finally`"),
-                );
-            }
+            self.report_finally_checked_effects(finalizer_effects, finally.span);
         }
 
         self.try_uncovered_effects.insert(
@@ -5947,6 +5971,7 @@ impl<'program> Checker<'program> {
         let Some(finally) = finally else {
             return;
         };
+        self.effect_scopes.push(CheckedEffectSet::default());
         self.finalizer_boundaries.push(FinalizerBoundary {
             loop_depth,
             when_depth: self.when_contexts.len(),
@@ -5965,6 +5990,8 @@ impl<'program> Checker<'program> {
         self.finalizer_boundaries
             .pop()
             .expect("checked finalizer boundary");
+        let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
+        self.report_finally_checked_effects(finalizer_effects, finally.span);
         self.active_loop_depth = loop_depth;
     }
 
@@ -6574,7 +6601,8 @@ impl<'program> Checker<'program> {
                     }
                     return;
                 }
-                let qualified = class_name.contains('\\');
+                let qualified = class_name.contains('\\')
+                    && !crate::compiler_known_io::is_canonical_type(class_name);
                 let is_current_class = class_name == "self"
                     && class_type.arguments.is_empty()
                     && method_context.is_some();
@@ -9561,6 +9589,7 @@ impl<'program> Checker<'program> {
             return;
         }
 
+        let diagnostics_before = self.diagnostics.len();
         match builtin {
             Builtin::ReadFile | Builtin::WriteStderr => {
                 self.require_builtin_string_arg(builtin, &args[0].value, scopes, method_context)
@@ -9667,6 +9696,17 @@ impl<'program> Checker<'program> {
             }
             Builtin::ReadStdinBytes | Builtin::Panic => {}
         }
+        if self.diagnostics.len() == diagnostics_before {
+            self.record_compiler_known_effects(builtin.checked_error_types(), span);
+        }
+    }
+
+    fn record_compiler_known_effects(&mut self, names: &[&str], span: Span) {
+        let effects = names
+            .iter()
+            .map(|name| self.resolve_type_ref(&TypeRef::named(*name), span))
+            .collect::<Vec<_>>();
+        self.record_checked_effects(effects, span);
     }
 
     fn require_builtin_bytes_arg(
@@ -10119,7 +10159,7 @@ impl<'program> Checker<'program> {
             return;
         };
         let class_name = class_name.as_str();
-        if class_name.contains('\\') {
+        if class_name.contains('\\') && !crate::compiler_known_io::is_canonical_type(class_name) {
             self.report_deferred_qualified_name(class_name, access.span);
             return;
         }
@@ -10536,7 +10576,7 @@ impl<'program> Checker<'program> {
             return;
         };
         let class_name = class_name.as_str();
-        if class_name.contains('\\') {
+        if class_name.contains('\\') && !crate::compiler_known_io::is_canonical_type(class_name) {
             self.report_deferred_qualified_name(class_name, access.span);
             return;
         }
@@ -10825,7 +10865,7 @@ impl<'program> Checker<'program> {
         span: Span,
         method_context: Option<&MethodContext>,
     ) {
-        if class_name.contains('\\') {
+        if class_name.contains('\\') && !crate::compiler_known_io::is_canonical_type(class_name) {
             self.report_deferred_qualified_name(class_name, span);
             return;
         }
@@ -12254,7 +12294,7 @@ impl<'program> Checker<'program> {
             ));
             return self.types.unknown();
         }
-        if ty.name.contains('\\') {
+        if ty.name.contains('\\') && !crate::compiler_known_io::is_canonical_type(&ty.name) {
             for arg in ty.type_arguments() {
                 self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
             }

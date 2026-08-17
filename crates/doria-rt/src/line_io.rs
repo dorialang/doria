@@ -12,8 +12,11 @@ static mut EOF: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadLineError {
-    Read,
-    InvalidUtf8,
+    Read(crate::platform_io::Failure),
+    InvalidUtf8 {
+        valid_byte_count: usize,
+        invalid_byte_count: Option<usize>,
+    },
     Allocation,
 }
 
@@ -45,6 +48,10 @@ pub(crate) unsafe fn take_buffered_input() -> BufferedInput {
 ///
 /// `Ok(None)` is EOF before bytes. A returned slice remains valid only until the next call.
 pub(crate) unsafe fn read_line() -> Result<Option<(*const u8, usize)>, ReadLineError> {
+    if EOF && START == END {
+        release_buffer();
+        return Ok(None);
+    }
     ensure_capacity(INITIAL_CAPACITY)?;
     loop {
         if let Some(newline) = find_newline() {
@@ -57,11 +64,12 @@ pub(crate) unsafe fn read_line() -> Result<Option<(*const u8, usize)>, ReadLineE
         }
 
         if EOF {
-            if START == END {
-                return Ok(None);
-            }
             let line_start = START;
             let line_length = END - START;
+            if line_length == 0 {
+                release_buffer();
+                return Ok(None);
+            }
             START = END;
             validate_utf8(BUFFER.add(line_start), line_length)?;
             return Ok(Some((BUFFER.add(line_start), line_length)));
@@ -69,13 +77,23 @@ pub(crate) unsafe fn read_line() -> Result<Option<(*const u8, usize)>, ReadLineE
 
         prepare_write_space()?;
         let read = device_io::read(StandardStream::Stdin, BUFFER.add(END), CAPACITY - END)
-            .map_err(|()| ReadLineError::Read)?;
+            .map_err(ReadLineError::Read)?;
         if read == 0 {
             EOF = true;
         } else {
             END += read;
         }
     }
+}
+
+unsafe fn release_buffer() {
+    if !BUFFER.is_null() {
+        super::deallocate(BUFFER);
+    }
+    BUFFER = ptr::null_mut();
+    CAPACITY = 0;
+    START = 0;
+    END = 0;
 }
 
 fn strip_line_ending(bytes: &[u8]) -> &[u8] {
@@ -100,7 +118,10 @@ unsafe fn validate_utf8(bytes: *const u8, length: usize) -> Result<(), ReadLineE
     let bytes = core::slice::from_raw_parts(bytes, length);
     core::str::from_utf8(bytes)
         .map(|_| ())
-        .map_err(|_| ReadLineError::InvalidUtf8)
+        .map_err(|error| ReadLineError::InvalidUtf8 {
+            valid_byte_count: error.valid_up_to(),
+            invalid_byte_count: error.error_len(),
+        })
 }
 
 unsafe fn prepare_write_space() -> Result<(), ReadLineError> {

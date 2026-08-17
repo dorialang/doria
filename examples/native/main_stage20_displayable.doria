@@ -6,12 +6,15 @@ class Label implements Displayable
 
     function toString(): string
     {
-        echo $this->text . "!";
+        try {
+            echo $this->text . "!";
+        } catch (Doria\Std\Io\IoError) {
+        }
         return $this->text;
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $left = new Label("L");
     let $right = new Label("R");

@@ -1,4 +1,12 @@
-function main(): void
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
+function main(): void throws Doria\Std\Io\IoError
 {
     if (true) {
         echo "body\n";
@@ -9,7 +17,7 @@ function main(): void
             return 0;
         };
         while ($choice > 0) {
-            echo "contained {$choice}\n";
+            record("contained {$choice}\n");
             break;
         }
     }

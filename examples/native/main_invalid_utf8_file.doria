@@ -1,0 +1,14 @@
+function main(): void throws Doria\Std\Io\IoError
+{
+    try {
+        read_file("invalid-stage29.txt");
+    } catch (Doria\Std\Io\InvalidUtf8Error $error) {
+        let $source = match ($error->source) {
+            Doria\Std\Io\Utf8InputSource::File($path) => $path,
+            default => "unexpected",
+        };
+        echo "{$source}:{$error->validByteCount}:" . ($error->invalidByteCount ?? -1) . "\n";
+    } catch (Doria\Std\Io\IoError) {
+        echo "unexpected-io\n";
+    }
+}

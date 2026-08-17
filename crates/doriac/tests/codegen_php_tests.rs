@@ -8,9 +8,12 @@ fn emits_php_for_simple_program() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-let writable $count = 0;
-$count = 1;
-echo $count;
+function main(): void throws Doria\Std\Io\IoError
+{
+    let writable $count = 0;
+    $count = 1;
+    echo $count;
+}
 "#,
     )
     .expect("compilation should succeed");
@@ -29,7 +32,7 @@ fn php_backend_emits_native_unit_and_backed_enums() {
 enum Status { case Draft; case Published; }
 enum Priority: int { case Low = 1; case High = 10; }
 enum Transport: string { case Road = "road"; case Rail = "rail"; }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     Status $status = Status::Draft;
     Priority $priority = Priority::High;
@@ -81,8 +84,8 @@ fn php_backend_executes_core_match_payloads_narrowing_conditions_and_ternary() {
 enum Delivery { case Waiting; case Sent(string $reference); }
 class Note { function __construct(string $text) {} }
 enum NoteResult { case Found(Note $note); case Missing; }
-function condition(string $name, bool $value): bool { echo $name; return $value; }
-function describe(Delivery $delivery): string
+function condition(string $name, bool $value): bool throws Doria\Std\Io\IoError { echo $name; return $value; }
+function describe(Delivery $delivery): string throws Doria\Std\Io\IoError
 {
     return match ($delivery) {
         Delivery::Waiting => "waiting",
@@ -107,7 +110,7 @@ function inspect(mixed $value): string
         default => "other",
     };
 }
-function choose(): string
+function choose(): string throws Doria\Std\Io\IoError
 {
     return match (true) {
         condition("a", false) => "A",
@@ -116,7 +119,7 @@ function choose(): string
         default => "D",
     };
 }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     echo describe(Delivery::Sent("R-12")) . "\n";
     echo inspect(true) . " " . inspect("text") . "\n";
@@ -198,7 +201,7 @@ function makeInt(): mixed
     return 7;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     int8 $int8Value = 1;
     int16 $int16Value = 1;
@@ -268,7 +271,7 @@ class Drawing
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     Coordinate $point = Coordinate::Point(y: 22, x: 20);
     Coordinate $copy = $point;
@@ -330,14 +333,12 @@ function describe(?Coordinate $value = Coordinate::Origin): string
     return "point";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     echo describe(null);
     echo " ";
     echo describe();
 }
-
-main();
 "#,
     )
     .expect("nullable Copy payload defaults should lower to PHP");
@@ -346,9 +347,13 @@ main();
     assert!(php.contains("if ($value === [])"));
     assert!(!php.contains("$value ??="));
 
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
     let run = Command::new("php")
         .arg("-r")
-        .arg(php.strip_prefix("<?php").expect("generated PHP header"))
+        .arg(script)
         .output()
         .expect("PHP should execute nullable payload defaults");
     assert!(
@@ -380,12 +385,10 @@ class Vault
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     echo Vault::reveal() == Label::Text("secret");
 }
-
-main();
 "#,
     )
     .expect("internal static payload initializers should lower to PHP");
@@ -395,9 +398,13 @@ main();
     assert!(php.contains("self::$label = Label::Text(\"secret\");"));
     assert!(!php.contains("Vault::$label ="));
 
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
     let run = Command::new("php")
         .arg("-r")
-        .arg(php.strip_prefix("<?php").expect("generated PHP header"))
+        .arg(script)
         .output()
         .expect("PHP should execute internal static payload initialization");
     assert!(
@@ -413,14 +420,13 @@ fn php_grouped_declarations_use_one_collision_safe_temporary_in_order() {
     let php = doriac::compile_source_to_php(
         "stage26a.doria",
         r#"
-function value(): string { echo "once\n"; return "shared"; }
-function main(): void
+function value(): string throws Doria\Std\Io\IoError { echo "once\n"; return "shared"; }
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $__doria_grouped_value0 = "user";
     let $first, $second, $third = value();
     echo "{$first}:{$second}:{$third}:{$__doria_grouped_value0}\n";
 }
-main();
 "#,
     )
     .expect("PHP should lower grouped Copy declarations");
@@ -439,9 +445,13 @@ main();
     assert!(first < second && second < third && third < cleanup);
     assert!(!php.contains("$first = $second ="));
 
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
     let run = Command::new("php")
         .arg("-r")
-        .arg(php.strip_prefix("<?php").expect("generated PHP header"))
+        .arg(script)
         .output()
         .expect("PHP should execute grouped declarations");
     assert!(
@@ -477,10 +487,13 @@ fn emits_php_for_boolean_word_operators() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-echo true and false;
-echo false or true;
-echo not false;
-echo true xor false;
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo true and false;
+    echo false or true;
+    echo not false;
+    echo true xor false;
+}
 "#,
     )
     .expect("compilation should succeed");
@@ -496,8 +509,11 @@ fn parenthesizes_logical_operands_for_php() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-echo true and null ?? true;
-echo false or null ?? true;
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo true and null ?? true;
+    echo false or null ?? true;
+}
 "#,
     )
     .expect("compilation should succeed");
@@ -513,8 +529,11 @@ fn parenthesizes_xor_operands_for_php() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-echo true == true xor false;
-echo false xor true != false;
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo true == true xor false;
+    echo false xor true != false;
+}
 "#,
     )
     .expect("compilation should succeed");
@@ -530,8 +549,11 @@ fn emits_typed_php_comparisons() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-echo "01" == "1";
-echo "01" != "1";
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo "01" == "1";
+    echo "01" != "1";
+}
 "#,
     )
     .expect("compilation should succeed");
@@ -547,7 +569,7 @@ fn php_backend_preserves_byte_lexicographic_string_ordering() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function main(): int
+function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     if ("10" < "2") {
         return 42;
@@ -751,9 +773,9 @@ function total(): float64
 #[test]
 fn php_backend_rejects_noncanonical_float_display() {
     for source in [
-        "function main(): void { echo 10000000000.0 * 10000000000.0; }",
-        "function main(): void { echo \"value=\" . 1.5; }",
-        "function show(float $value): void { echo \"value={$value}\"; } function main(): void {}",
+        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { echo 10000000000.0 * 10000000000.0; }",
+        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { echo \"value=\" . 1.5; }",
+        "function show(float $value): void throws Doria\\Std\\Io\\IoError { echo \"value={$value}\"; } function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error {}",
     ] {
         let diagnostics = doriac::compile_source_to_php("test.doria", source)
             .expect_err("PHP must reject float display it cannot preserve canonically");
@@ -785,8 +807,8 @@ function divide(float $left, float64 $right): float
     assert!(!php.contains("float64"), "{php}");
 
     for source in [
-        "function main(): int { return Float::toInt(42.0); }",
-        "function helper(): float { return Int::toFloat(42); } function main(): void {}",
+        "function main(): int throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { return Float::toInt(42.0); }",
+        "function helper(): float { return Int::toFloat(42); } function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error {}",
     ] {
         let diagnostics = doriac::compile_source_to_php("test.doria", source)
             .expect_err("PHP must reject conversions it cannot prove exact");
@@ -880,7 +902,10 @@ fn parenthesizes_unary_not_operands_for_php() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-echo not (1 < 2);
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo not (1 < 2);
+}
 "#,
     )
     .expect("compilation should succeed");
@@ -894,7 +919,7 @@ fn php_backend_preserves_main_string_local_echo() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $message = "Hello Doria!";
     echo $message;
@@ -912,7 +937,7 @@ fn php_backend_preserves_main_string_concat_echo() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $name = "Doria";
     echo "Hello " . $name . "!";
@@ -930,7 +955,7 @@ fn php_backend_preserves_main_string_concat_local_initializer() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $name = "Doria";
     let $message = "Hello " . $name . "!";
@@ -955,7 +980,7 @@ function identity(int $value): int
     return $value;
 }
 
-function main(): int
+function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     return identity(42);
 }
@@ -979,7 +1004,7 @@ function isAnswer(int $value): bool
     return $value == 42;
 }
 
-function main(): int
+function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     if (isAnswer(42)) {
         return 42;
@@ -1000,12 +1025,12 @@ fn emits_php_for_string_helper_echo() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function greet(string $name): void
+function greet(string $name): void throws Doria\Std\Io\IoError
 {
     echo "Hello " . $name . "!";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     greet("Doria");
 }
@@ -1023,12 +1048,12 @@ fn emits_php_for_stage_10_void_helper_call() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function hello(): void
+function hello(): void throws Doria\Std\Io\IoError
 {
     echo "Hello Doria!";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     hello();
 }
@@ -1048,7 +1073,7 @@ fn lowers_checked_program_to_hir() {
         "test.doria",
         r#"
 let $name = "Doria";
-echo $name;
+let $copy = $name;
 "#,
     )
     .expect("lowering should succeed");
@@ -1067,9 +1092,9 @@ fn lowers_control_flow_to_hir() {
         r#"
 let writable $count = 0;
 if ($count < 10) {
-    echo "small";
+    let $label = "small";
 } else {
-    echo "large";
+    let $label = "large";
 }
 
 while ($count < 10) {
@@ -1127,18 +1152,21 @@ fn emits_php_for_basic_control_flow() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-let writable $count = 0;
-if ($count < 10) {
-    echo "small";
-} else if ($count < 20) {
-    echo "medium";
-} else {
-    echo "large";
-}
+function main(): void throws Doria\Std\Io\IoError
+{
+    let writable $count = 0;
+    if ($count < 10) {
+        echo "small";
+    } else if ($count < 20) {
+        echo "medium";
+    } else {
+        echo "large";
+    }
 
-while ($count < 10) {
-    echo $count;
-    $count = 10;
+    while ($count < 10) {
+        echo $count;
+        $count = 10;
+    }
 }
 "#,
     )
@@ -1159,25 +1187,25 @@ fn php_backend_executes_stage28a_slice1_control_flow() {
     let php = doriac::compile_source_to_php(
         "stage28a.doria",
         r#"
-function probe(bool $value): bool
+function probe(bool $value): bool throws Doria\Std\Io\IoError
 {
     echo $value ? "predicate true\n" : "predicate false\n";
     return $value;
 }
 
-function skipped(): bool
+function skipped(): bool throws Doria\Std\Io\IoError
 {
     echo "condition\n";
     return true;
 }
 
-function whenGate(): bool
+function whenGate(): bool throws Doria\Std\Io\IoError
 {
     echo "when gate\n";
     return true;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     string $label = given {
         let $prepared = "ready";
@@ -1252,25 +1280,33 @@ fn php_backend_executes_stage28a_finalizers() {
     let php = doriac::compile_source_to_php(
         "stage28a-finalizers.doria",
         r#"
-function returnThroughFinalizer(): int
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
+function returnThroughFinalizer(): int throws Doria\Std\Io\IoError
 {
     if (true) {
         return 42;
     } finally {
-        echo "return cleanup\n";
+        record("return cleanup\n");
     }
 
     return 0;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     given {
         let $prepared = "prepared";
     } if (true) {
         echo "if {$prepared}\n";
     } finally {
-        echo "if cleanup {$prepared}\n";
+        record("if cleanup {$prepared}\n");
     }
 
     string $selected = when (true): string {
@@ -1278,7 +1314,7 @@ function main(): void
     } else {
         return "wrong";
     } finally {
-        echo "when cleanup\n";
+        record("when cleanup\n");
     };
     echo "{$selected}\n";
 
@@ -1291,23 +1327,23 @@ function main(): void
         $count = 2;
         break;
     } finally {
-        echo "while cleanup {$count}\n";
+        record("while cleanup {$count}\n");
     }
 
     do {
         echo "do body\n";
     } while (false) finally {
-        echo "do cleanup\n";
+        record("do cleanup\n");
     }
 
     if (true) {
         if (true) {
             echo "nested body\n";
         } finally {
-            echo "inner cleanup\n";
+            record("inner cleanup\n");
         }
     } finally {
-        echo "outer cleanup\n";
+        record("outer cleanup\n");
     }
 
     echo "return {returnThroughFinalizer()}\n";
@@ -1346,16 +1382,24 @@ function main(): void
     let panic_php = doriac::compile_source_to_php(
         "stage28a-panic-finalizers.doria",
         r#"
-function main(): void
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     if (true) {
         if (true) {
             panic("stop");
         } finally {
-            echo "wrong inner\n";
+            record("wrong inner\n");
         }
     } finally {
-        echo "wrong outer\n";
+        record("wrong outer\n");
     }
 }
 "#,
@@ -1468,7 +1512,7 @@ fn emits_php_for_loop_control() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let writable $code = 0;
 
@@ -1497,7 +1541,7 @@ fn emits_php_for_stage_9_range_iteration() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     foreach (0..<10 as $i) {
         echo "x";
@@ -1528,7 +1572,7 @@ fn guards_inclusive_php_ranges_before_terminal_increment() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     foreach (9223372036854775807..9223372036854775807 as $i) {
         echo "x";
@@ -1553,7 +1597,7 @@ fn rejects_standalone_range_before_php_codegen() {
     let err = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $range = 0..10;
 }
@@ -1572,13 +1616,11 @@ fn emits_void_main_without_exit_wrapper_for_php() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     echo "Hello Doria!";
     return;
 }
-
-main();
 "#,
     )
     .expect("compilation should succeed");
@@ -1586,7 +1628,6 @@ main();
     assert!(php.contains("function main(): void"));
     assert!(php.contains("__doria_write_stdout(__doria_display(\"Hello Doria!\"), "));
     assert!(php.contains("return;"));
-    assert!(php.contains("main();"));
     assert!(!php.contains("exit(main())"));
 }
 
@@ -1595,13 +1636,6 @@ fn preserves_block_local_bindings_in_php_output() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-let $name = "outer";
-if (true) {
-    let $name = $name . " inner";
-    echo "block {$name}";
-}
-echo $name;
-
 function greet(string $name): string
 {
     if (true) {
@@ -1610,6 +1644,16 @@ function greet(string $name): string
     }
 
     return $name;
+}
+
+function main(): void throws Doria\Std\Io\IoError
+{
+    let $name = "outer";
+    if (true) {
+        let $name = $name . " inner";
+        echo "block {$name}";
+    }
+    echo $name;
 }
 "#,
     )
@@ -1627,7 +1671,7 @@ function greet(string $name): string
 }
 
 #[test]
-fn debug_backend_emits_stage_11_artifact_and_rejects_broader_source() {
+fn debug_backend_emits_stage_11_artifact_and_supports_runtime_string_output() {
     let output = doriac::compile_source(
         "test.doria",
         include_str!("../../../examples/debug/main_for_count_10.doria"),
@@ -1645,29 +1689,34 @@ fn debug_backend_emits_stage_11_artifact_and_rejects_broader_source() {
     assert_eq!(extension, "debug");
     assert_eq!(contents, "exit_status: 10\nstdout:\n");
 
-    let err = doriac::compile_source(
+    let output = doriac::compile_source(
         "test.doria",
         r#"
-let $name = "Doria";
-echo $name;
+function main(): void throws Doria\Std\Io\IoError
+{
+    let $name = "Doria";
+    echo $name;
+}
 "#,
         BackendTarget::Debug,
     )
-    .expect_err("broader source should remain outside native compilation coverage");
-
-    assert_eq!(err[0].code, "M1101");
-    assert!(err[0]
-        .message
-        .contains("top-level executable statements are not supported"));
-    assert!(!err[0].message.contains("Stage "));
-    assert!(!err[0].message.contains("MIR"));
+    .expect("debug backend should execute supported runtime string output");
+    let BackendOutput::Text {
+        extension,
+        contents,
+    } = output
+    else {
+        panic!("debug backend should return text output");
+    };
+    assert_eq!(extension, "debug");
+    assert_eq!(contents, "exit_status: 0\nstdout: Doria\n");
 }
 
 #[test]
 fn php_backend_lowers_panic_to_stderr_and_status_101() {
     let php = doriac::compile_source_to_php(
         "test.doria",
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     panic("boom");
 }
@@ -1681,7 +1730,12 @@ fn php_backend_lowers_panic_to_stderr_and_status_101() {
     assert!(php.contains("\"\\n\\nCall Path\""));
     assert!(php.contains("\"\\n\\nProcess Exited With Status 101\\n\""));
     assert!(php.contains("exit(101);"));
-    assert!(!php.contains("throw new"));
+    let panic_helper = php
+        .split("function __doria_panic")
+        .nth(1)
+        .and_then(|tail| tail.split("function __doria_read_line").next())
+        .expect("panic helper should be emitted before I/O helpers");
+    assert!(!panic_helper.contains("throw new"));
 }
 
 #[test]
@@ -1698,7 +1752,7 @@ function middle(): void
     panicNow();
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     middle();
 }
@@ -1748,12 +1802,13 @@ fn php_io_panic_trace_preserves_allowed_doria_helper_named_methods() {
 class Reader
 {
     function __doria_read_file(): void
+        throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     {
         read_file("__doria_missing_stage17_frame_test__/missing.txt");
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $reader = new Reader();
     $reader->__doria_read_file();
@@ -1782,15 +1837,64 @@ function main(): void
         .output()
         .expect("PHP should execute generated output");
 
-    assert_eq!(run.status.code(), Some(101));
+    assert_eq!(run.status.code(), Some(70));
     assert!(run.stdout.is_empty());
     let stderr = String::from_utf8(run.stderr).expect("diagnostic must be UTF-8");
-    assert!(stderr.starts_with("Panic[P1401]: File Read Failed\n\nWhere\n"));
-    assert!(stderr.contains("\n\nCall Path\nReader::__doria_read_file · test.doria:"));
-    assert!(stderr.contains("\nmain · test.doria:"));
-    assert!(stderr.ends_with("\n\nProcess Exited With Status 101\n"));
+    assert!(stderr.starts_with("Error[R1000]: Unhandled Doria\\Std\\Io\\IoError\n\nWhere\n"));
+    assert!(stderr.contains(" · Reader::__doria_read_file\n\n"));
+    assert!(stderr.contains("read_file(\"__doria_missing_stage17_frame_test__/missing.txt\")"));
+    assert!(!stderr.contains("Call Path"));
+    assert!(stderr.ends_with("\n\nProcess Exited With Status 70\n"));
     assert!(!stderr.contains("PHP"));
     assert!(!stderr.contains("Stack Trace"));
+}
+
+#[test]
+fn php_io_warning_fallback_preserves_portable_not_found_reason() {
+    let php = doriac::compile_source_to_php(
+        "php-io-reason.doria",
+        r#"
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
+{
+    try {
+        read_file("__doria_missing_php_reason_test__/missing.txt");
+    } catch (Doria\Std\Io\IoError $error) {
+        echo $error->reason == Doria\Std\Io\IoErrorReason::NotFound;
+        echo " ";
+        echo $error->systemCode ?? -1;
+    }
+}
+"#,
+    )
+    .expect("missing-file reason fixture should lower to PHP");
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated PHP reason fixture should execute");
+
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(run.stdout.starts_with(b"true "), "{:?}", run.stdout);
+    assert!(
+        run.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 #[test]
@@ -1798,8 +1902,11 @@ fn php_backend_uses_text_output_shape() {
     let output = doriac::compile_source(
         "test.doria",
         r#"
-let $name = "Doria";
-echo $name;
+function main(): void throws Doria\Std\Io\IoError
+{
+    let $name = "Doria";
+    echo $name;
+}
 "#,
         BackendTarget::Php,
     )
@@ -1902,7 +2009,7 @@ fn rejects_deterministic_destruction_that_php_cannot_preserve() {
 fn allows_take_on_copy_parameters_in_php() {
     let php = doriac::compile_source_to_php(
         "test.doria",
-        "function identity(take int $value): int { return $value; } function main(): int { return identity(42); }",
+        "function identity(take int $value): int { return $value; } function main(): int throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { return identity(42); }",
     )
     .expect("take on a Copy value is a semantic no-op");
 
@@ -1929,7 +2036,7 @@ fn php_backend_rejects_shared_ownership_in_every_declared_type_position() {
         "class Node {} function inspect(SharedReference<Node> $node): void {}",
         "class Node {} function make(): SharedReference<Node> { return shared new Node(); }",
         "class Node {} class Box { ?SharedReference<Node> $node = null; }",
-        "class Node {} function main(): void { ?SharedReference<Node> $node = null; }",
+        "class Node {} function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { ?SharedReference<Node> $node = null; }",
     ] {
         let diagnostics = doriac::compile_source_to_php("shared-type.doria", source)
             .expect_err("PHP must reject shared ownership at the type boundary");
@@ -2034,15 +2141,15 @@ fn lowers_interpolated_string_to_hir() {
         "test.doria",
         r#"
 let $name = "Doria";
-echo "Hello, {$name}";
+let $message = "Hello, {$name}";
 "#,
     )
     .expect("lowering should succeed");
 
-    let hir::Item::Statement(hir::Stmt::Echo { expr, .. }) = &lowered.items[1] else {
-        panic!("expected echo statement");
+    let hir::Item::Statement(hir::Stmt::VarDecl(declaration)) = &lowered.items[1] else {
+        panic!("expected interpolated-string declaration");
     };
-    let hir::Expr::InterpolatedString { parts, .. } = expr else {
+    let hir::Expr::InterpolatedString { parts, .. } = &declaration.initializer else {
         panic!("expected interpolated string in HIR");
     };
 
@@ -2062,8 +2169,11 @@ fn emits_explicit_php_concat_for_interpolated_strings() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-let $name = "Andrew";
-echo "Hello, {$name}!";
+function main(): void throws Doria\Std\Io\IoError
+{
+    let $name = "Andrew";
+    echo "Hello, {$name}!";
+}
 "#,
     )
     .expect("compilation should succeed");
@@ -2080,7 +2190,7 @@ class Person
     {
     }
 
-    function greet(): void
+    function greet(): void throws Doria\Std\Io\IoError
     {
         echo "Hello, {$this->name}";
     }
@@ -2098,11 +2208,14 @@ fn escapes_php_interpolation_markers_in_string_text() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-let $name = "Andrew";
-let $amount = 10;
-echo "Hello, $name";
-echo 'Literal $name';
-echo "Total: {$amount} ($currency)";
+function main(): void throws Doria\Std\Io\IoError
+{
+    let $name = "Andrew";
+    let $amount = 10;
+    echo "Hello, $name";
+    echo 'Literal $name';
+    echo "Total: {$amount} ($currency)";
+}
 "#,
     )
     .expect("compilation should succeed");
@@ -2132,7 +2245,7 @@ fn php_backend_lowers_stage17_io_with_doria_failure_checks() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let writable $line = read_line();
     if ($line != null) { write_stderr($line); }
@@ -2146,15 +2259,14 @@ function main(): void
     )
     .expect("Stage 17 PHP compatibility lowering should succeed");
 
-    assert!(
-        php.contains("function __doria_read_line(string $prompt, int $start, int $end): ?string")
-    );
+    assert!(php.contains(
+        "function __doria_read_line(string $prompt, int $start, int $end, string $callable): ?string"
+    ));
     // The prompt is written exactly and stdout is flushed before stdin is read,
     // without depending on PHP's optional readline extension.
-    assert!(
-        php.contains("if ($prompt !== \"\") { __doria_write_all(STDOUT, $prompt, $start, $end); }")
-    );
-    assert!(php.contains("__doria_flush_stdout($start, $end);"));
+    assert!(php.contains("if ($prompt !== \"\")"));
+    assert!(php.contains("__DoriaStdIoIoTarget::__doriaCaseStandardOutput()"));
+    assert!(php.contains("__doria_flush_stdout($start, $end, $callable);"));
     assert!(php.contains("if (@fflush(STDOUT)) { return; }"));
     assert!(php.contains("if (__doria_is_broken_pipe(error_get_last())) { exit(0); }"));
     assert!(!php.contains("readline("));
@@ -2164,19 +2276,21 @@ function main(): void
     assert!(!php.contains("): never"));
     assert!(php.contains("if ($line === false)"));
     assert!(php.contains("if (feof(STDIN)) { return null; }"));
-    assert!(php.contains("__doria_panic(\"P1403\", $start, $end)"));
-    assert!(php.contains(
-        "if (preg_match('//u', $line) !== 1) { __doria_panic(\"P1404\", $start, $end); }"
-    ));
+    assert!(php.contains("__DoriaStdIoIoOperation::Read"));
+    assert!(php.contains("new __DoriaStdIoInvalidUtf8Error("));
+    assert!(!php.contains("__doria_panic(\"P1403\""));
+    assert!(!php.contains("__doria_panic(\"P1404\""));
     assert!(php.contains("str_ends_with($line, \"\\n\")"));
     assert!(php.contains("str_ends_with($line, \"\\r\")"));
     assert!(php.contains("__doria_read_file(\"input.txt\", start:"));
-    assert!(php.contains("$contents === false"));
+    assert!(php.contains("$file === false"));
+    assert!(php.contains("$chunk = @fread($file, 8192)"));
     assert!(php.contains("__doria_write_file(\"copy.txt\", $contents, start:"));
     assert!(php.contains("__doria_append_file(\"copy.txt\", $contents, start:"));
-    assert!(php.contains("file_put_contents($path, $contents, FILE_APPEND)"));
-    assert!(php.contains("__doria_panic(\"P1402\", $start, $end)"));
-    assert!(php.contains("$written === false || $written !== strlen($contents)"));
+    assert!(php.contains("@fopen($path, $append ? \"ab\" : \"wb\")"));
+    assert!(!php.contains("__doria_panic(\"P1402\""));
+    assert!(php.contains("while ($offset < $length)"));
+    assert!(php.contains("$written === false || $written === 0"));
     assert!(php.contains("__doria_write_stderr($line, start:"));
     assert!(php.contains("__doria_printf("));
     assert!(php.contains("\"enabled=%s\", __doria_display(false))"));
@@ -2195,7 +2309,7 @@ fn php_prompted_read_line_preserves_prompt_and_line_discipline() {
     let php = doriac::compile_source_to_php(
         "prompted-input.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $first = read_line("P: ");
     if ($first != null) { echo "<{$first}>\n"; }
@@ -2250,7 +2364,7 @@ fn php_backend_exits_cleanly_only_for_user_output_to_closed_pipes() {
     ] {
         let source = format!(
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {{
     let $line = read_line();
     {statement}
@@ -2295,7 +2409,7 @@ function main(): void
 
     let php = doriac::compile_source_to_php(
         "closed-prompt.doria",
-        "function main(): void { let $line = read_line(\"Prompt: \" ); }",
+        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { let $line = read_line(\"Prompt: \" ); }",
     )
     .expect("closed prompt fixture should lower to PHP");
     let script = format!(
@@ -2329,7 +2443,7 @@ fn php_backend_keeps_panic_fatal_when_stderr_is_closed() {
     let php = doriac::compile_source_to_php(
         "panic-closed-stderr.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $line = read_line();
     panic("boom");
@@ -2366,8 +2480,8 @@ function main(): void
 #[test]
 fn php_backend_rejects_noncanonical_float_display_in_checked_formats() {
     for source in [
-        "function main(): void { echo sprintf(\"%s\", 1.5); }",
-        "function main(): void { printf(\"%s\", 1.5); }",
+        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { echo sprintf(\"%s\", 1.5); }",
+        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { printf(\"%s\", 1.5); }",
     ] {
         let diagnostics = doriac::compile_source_to_php("test.doria", source)
             .expect_err("PHP must reject float display formatting it cannot preserve canonically");
@@ -2381,8 +2495,8 @@ fn php_backend_rejects_noncanonical_float_display_in_checked_formats() {
 #[test]
 fn php_backend_keeps_stage17_frontend_rejections_and_uint64_honesty() {
     for source in [
-        "function main(): void { print(\"x\"); }",
-        "function main(): void { let $format = \"%d\"; echo sprintf($format, 1); }",
+        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { print(\"x\"); }",
+        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { let $format = \"%d\"; echo sprintf($format, 1); }",
     ] {
         doriac::compile_source_to_php("test.doria", source)
             .expect_err("invalid Doria must fail before PHP lowering");
@@ -2390,7 +2504,7 @@ fn php_backend_keeps_stage17_frontend_rejections_and_uint64_honesty() {
 
     let error = doriac::compile_source_to_php(
         "test.doria",
-        "function main(): void { uint64 $value = 18446744073709551615; echo sprintf(\"%d\", $value); }",
+        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { uint64 $value = 18446744073709551615; echo sprintf(\"%d\", $value); }",
     )
     .expect_err("PHP must reject uint64 formatting it cannot preserve");
     assert!(error.iter().any(|diagnostic| diagnostic.code == "B1301"));
@@ -2401,19 +2515,19 @@ fn php_backend_preserves_stage_18_expression_interpolation_order() {
     let php = doriac::compile_source_to_php(
         "test.doria",
         r#"
-function left(): int
+function left(): int throws Doria\Std\Io\IoError
 {
     echo "L";
     return 20;
 }
 
-function right(): int
+function right(): int throws Doria\Std\Io\IoError
 {
     echo "R";
     return 22;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     echo "={left() == 20 and right() == 22}";
 }
@@ -2479,9 +2593,13 @@ fn php_backend_preserves_the_exact_displayable_contract() {
     if !version.status.success() {
         return;
     }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
     let run = Command::new("php")
         .arg("-r")
-        .arg(php.strip_prefix("<?php").expect("generated PHP header"))
+        .arg(script)
         .output()
         .expect("PHP should execute generated Displayable output");
     assert!(run.status.success());
@@ -2533,7 +2651,7 @@ class Counter
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     Counter::current = "done";
     echo Counter::LABEL;
@@ -2567,8 +2685,11 @@ class Counter
     static writable int $value = Counter::initial + 1;
 }
 
-echo ANSWER;
-echo Counter::value;
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo ANSWER;
+    echo Counter::value;
+}
 "#,
     )
     .expect("evaluated declarations should lower to PHP literals");
@@ -2580,9 +2701,13 @@ echo Counter::value;
     assert!(!php.contains("= LATER + 1"));
     assert!(!php.contains("= Counter::$initial + 1"));
 
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
     let run = Command::new("php")
         .arg("-r")
-        .arg(php.strip_prefix("<?php").expect("generated PHP header"))
+        .arg(script)
         .output()
         .expect("PHP should execute evaluated declarations");
     assert!(
@@ -2602,9 +2727,12 @@ fn php_backend_mangles_every_top_level_constant_away_from_php_names() {
 const CLASS = 1;
 const INF = 2;
 const NAN = 3;
-echo CLASS;
-echo INF;
-echo NAN;
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo CLASS;
+    echo INF;
+    echo NAN;
+}
 "#,
     )
     .expect("top-level Doria constants should not collide with PHP names");
@@ -2831,7 +2959,7 @@ fn php_backend_rejects_unimplemented_stage23_runtime_surfaces_consistently() {
         (
             "indexed read",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     List<int> $items = [1];
     echo $items[0];
@@ -2841,7 +2969,7 @@ function main(): void
         (
             "collection mutator",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     writable List<int> $items = [];
     $items->add(1);
@@ -2851,7 +2979,7 @@ function main(): void
         (
             "list indexOf",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     List<int> $items = [1];
     echo $items->indexOf(1) ?? -1;
@@ -2861,7 +2989,7 @@ function main(): void
         (
             "list remove",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     writable List<int> $items = [1];
     $items->remove(1);
@@ -2871,7 +2999,7 @@ function main(): void
         (
             "dictionary containsValue",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     Dictionary<string, int> $items = ["answer" => 42];
     echo $items->containsValue(42);
@@ -2881,7 +3009,7 @@ function main(): void
         (
             "set endpoints",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     Set<int> $items = Set::from([1]);
     echo $items->first ?? -1;
@@ -2892,7 +3020,7 @@ function main(): void
         (
             "default collection clear",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     writable List<int> $items = [1];
     $items->clear();
@@ -2902,7 +3030,7 @@ function main(): void
         (
             "writable foreach",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     writable List<int> $items = [1];
     foreach ($items as writable int $item) {
@@ -2914,7 +3042,7 @@ function main(): void
         (
             "byte I/O",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     write_stdout_bytes(read_stdin_bytes());
 }
@@ -2936,7 +3064,7 @@ fn php_backend_keeps_readonly_dictionary_projections_iterable() {
     let php = doriac::compile_source_to_php(
         "dictionary-projection.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     Dictionary<string, int> $items = ["answer" => 42];
     foreach ($items->keys as string $key) {
@@ -2955,7 +3083,7 @@ fn php_backend_executes_the_stage26_collection_family_with_doria_ordering() {
     let php = doriac::compile_source_to_php(
         "stage26.php.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     writable SortedDictionary<int, string> $map =
         SortedDictionary::from([2 => "two", -1 => "minus", 1 => "one"]);
@@ -3127,7 +3255,7 @@ fn php_collection_clear_releases_owned_deque_values_in_doria_order() {
     let php = doriac::compile_source_to_php(
         "stage26-clear-order.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     writable Deque<int> $values = Deque::from([1]);
     $values->clear();
@@ -3177,7 +3305,7 @@ fn php_backend_executes_ordered_slice3_members_with_strict_nullable_semantics() 
     let php = doriac::compile_source_to_php(
         "stage26-slice3.php.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     writable SortedDictionary<string, ?int> $numbers = SortedDictionary::from([]);
     $numbers->set("empty", null);

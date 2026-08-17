@@ -125,7 +125,7 @@ class Limits
     const DOUBLE = ANSWER * 2;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo LABEL;
     echo Limits::DOUBLE;
@@ -322,7 +322,7 @@ class Counter
     static string $label = "ready";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Counter::value = 43;
     echo Counter::initial;
@@ -337,7 +337,7 @@ function main(): void
         r#"
 class Left { static writable int $value = 1; }
 class Right { static writable int $value = 2; }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Left::value = 3;
     echo Left::value;
@@ -350,7 +350,7 @@ function main(): void
     let grouped_place = interpret(
         r#"
 class Counter { static writable int $value = 1; }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     (Counter::value) = 2;
     (Counter::value) += 3;
@@ -403,7 +403,7 @@ class Config
     static ?string $maybe = null;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     if (Config::maybe == "value") { echo "wrong"; }
     if (Config::maybe == null) { echo "ok"; }
@@ -496,7 +496,10 @@ fn method_calls_support_recursion_class_returns_moves_and_deterministic_drops() 
 class Token
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct()
+    {
+        try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {}
+    }
 }
 
 class Worker
@@ -518,7 +521,7 @@ class Worker
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $worker = new Worker();
     let $token = $worker->relay($worker->make("owned"));
@@ -575,7 +578,7 @@ class Message
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $message = new Message();
     echo $message->text;
@@ -591,7 +594,10 @@ fn panic_inside_a_method_keeps_the_accepted_no_cleanup_behavior() {
     let source = r#"
 class Token
 {
-    function __destruct() { echo "unexpected cleanup"; }
+    function __destruct()
+    {
+        try { echo "unexpected cleanup"; } catch (Doria\Std\Io\IoError) {}
+    }
 }
 
 class Runner
@@ -935,7 +941,7 @@ class Vault
     }
     static function reveal(): int { return self::advance(); }
 }
-function main(): void { echo Vault::reveal(); }
+function main(): void throws Doria\Std\Io\IoError { echo Vault::reveal(); }
 "#,
     )
     .expect("self access inside the declaring class should reach internal members");

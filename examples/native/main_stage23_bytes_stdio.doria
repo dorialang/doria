@@ -1,4 +1,4 @@
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Bytes $input = read_stdin_bytes();
     write_stdout_bytes($input);

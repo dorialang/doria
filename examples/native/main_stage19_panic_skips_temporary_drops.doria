@@ -2,7 +2,10 @@ class Guard
 {
     function __destruct()
     {
-        echo "dropped\n";
+        try {
+            echo "dropped\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 

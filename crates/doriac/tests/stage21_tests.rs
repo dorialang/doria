@@ -63,7 +63,7 @@ class Guard {}
 
 function touch(writable Guard $slot, Guard $view): void {}
 
-function route(writable Guard $guard): void
+function route(writable Guard $guard): void throws Doria\Std\Io\IoError
 {
     touch($guard, $guard);
 }
@@ -325,7 +325,7 @@ class Guard
     writable function mutate(): void { $this->value++; }
 }
 function identity(Guard $guard): Guard { return $guard; }
-function route(writable Guard $guard): void
+function route(writable Guard $guard): void throws Doria\Std\Io\IoError
 {
     let $alias = identity($guard);
     $guard->mutate();
@@ -381,22 +381,25 @@ fn borrowed_return_calls_are_evaluated_before_local_cleanup() {
     let source = r#"
 class Guard
 {
-    function __destruct() { echo "drop\n"; }
+    function __destruct()
+    {
+        try { echo "drop\n"; } catch (Doria\Std\Io\IoError) {}
+    }
 }
 
-function identity(Guard $guard): Guard
+function identity(Guard $guard): Guard throws Doria\Std\Io\IoError
 {
     echo "identity\n";
     return $guard;
 }
 
-function forward(Guard $guard): Guard
+function forward(Guard $guard): Guard throws Doria\Std\Io\IoError
 {
     let $temporary = new Guard();
     return identity($guard);
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $owner = new Guard();
     forward($owner);
@@ -469,12 +472,15 @@ fn borrowed_call_arguments_are_never_dropped_as_owned_temporaries() {
 class Guard
 {
     function inspect(): self { return $this; }
-    function __destruct() { echo "drop\n"; }
+    function __destruct()
+    {
+        try { echo "drop\n"; } catch (Doria\Std\Io\IoError) {}
+    }
 }
 
 function observe(Guard $guard): void {}
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $guard = new Guard();
     observe($guard->inspect());
@@ -496,13 +502,16 @@ fn temporary_sources_of_returned_borrows_live_through_the_enclosing_statement() 
     let source = r#"
 class Guard
 {
-    function __destruct() { echo "drop\n"; }
+    function __destruct()
+    {
+        try { echo "drop\n"; } catch (Doria\Std\Io\IoError) {}
+    }
 }
 
 function identity(Guard $guard): Guard { return $guard; }
-function observe(Guard $guard): void { echo "observe\n"; }
+function observe(Guard $guard): void throws Doria\Std\Io\IoError { echo "observe\n"; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     observe(identity(new Guard()));
     echo "after\n";
@@ -696,10 +705,13 @@ fn discarded_fluent_borrow_calls_lower_and_run_without_dropping_the_owner() {
 class Guard
 {
     writable function add(): self { return $this; }
-    function __destruct() { echo "drop\n"; }
+    function __destruct()
+    {
+        try { echo "drop\n"; } catch (Doria\Std\Io\IoError) {}
+    }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $guard = new Guard();
     $guard->add()->add();
@@ -1068,10 +1080,10 @@ class Label
         }
     }
 
-    function show(): void { echo $this->text . "\n"; }
+    function show(): void throws Doria\Std\Io\IoError { echo $this->text . "\n"; }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $formal = new Label(true, "Doria");
     let $plain = new Label(false, "Welcome");
@@ -1139,7 +1151,7 @@ class Counter
         $this->value += 1;
     }
 }
-function main(): void { let $counter = new Counter(false); echo $counter->value; }
+function main(): void throws Doria\Std\Io\IoError { let $counter = new Counter(false); echo $counter->value; }
 "#,
     );
 
@@ -1157,7 +1169,7 @@ class Pair
         $this->right = 4;
     }
 }
-function main(): void { let $pair = new Pair(true); echo $pair->left + $pair->right; }
+function main(): void throws Doria\Std\Io\IoError { let $pair = new Pair(true); echo $pair->left + $pair->right; }
 "#,
     );
 }
@@ -1174,7 +1186,7 @@ class Token
         for ($this->value = "ready"; false;) {}
     }
 }
-function main(): void { let $token = new Token(); echo $token->value; }
+function main(): void throws Doria\Std\Io\IoError { let $token = new Token(); echo $token->value; }
 "#,
     );
 }
@@ -1242,7 +1254,7 @@ fn constructor_rejects_property_reads_and_incomplete_this_exposure() {
 class Token
 {
     string $value;
-    function __construct() { echo $this->value; }
+    function __construct() { let $copy = $this->value; }
 }
 "#,
             "E0501",
@@ -1333,7 +1345,7 @@ class Counter
     function __construct(bool $set)
     {
         while ($set) {
-            echo $this->value;
+            let $copy = $this->value;
             $this->value = 1;
         }
         $this->value = 2;
@@ -1364,7 +1376,7 @@ fn constructor_initialization_diagnostics_match_snapshots() {
         ),
         (
             "read before initialization",
-            r#"class A { string $x; function __construct() { echo $this->x; } }"#,
+            r#"class A { string $x; function __construct() { let $copy = $this->x; } }"#,
             "E0501",
         ),
         (

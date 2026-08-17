@@ -1,14 +1,14 @@
-function hello(): void
+function hello(): void throws Doria\Std\Io\IoError
 {
     echo "Hello ";
 }
 
-function subject(): void
+function subject(): void throws Doria\Std\Io\IoError
 {
     echo "Doria!";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     hello();
     subject();

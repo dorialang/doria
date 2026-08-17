@@ -9,11 +9,14 @@ class Message
 
     function __destruct()
     {
-        echo "message released\n";
+        try {
+            echo "message released\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $message = new Message("hello");
     echo Message::age;

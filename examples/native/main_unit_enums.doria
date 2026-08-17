@@ -10,7 +10,7 @@ function isDraft(Status $status = Status::Draft): bool
     return $status == Status::Draft;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Status $first, $second = Status::Draft;
     Status $copy = $first;

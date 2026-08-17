@@ -295,8 +295,9 @@ preservation, backend parity, and tooling synchronization.
 
 Slice 2 implements shared finalizer regions and routes normal completion,
 `return`, `break`, `continue`, and `when` yields through them. The same region
-model now also executes checked-error crossings under Decision 0119 Slice 2.
-Stage 28a and Stage 29 Slices 1 and 2 are complete; Stage 29 Slice 3 is next.
+model now also executes checked-error crossings under Decision 0119. Stage 28a
+and all Stage 29 slices are complete; the pre-Stage-30 closure grammar slice is
+next.
 
 ## PR #134 Closure Audit
 

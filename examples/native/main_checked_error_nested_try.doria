@@ -10,7 +10,7 @@ function fail(): void throws Failure
     throw new Failure("nested");
 }
 
-function inner(): void throws Failure
+function inner(): void throws Failure, Doria\Std\Io\IoError
 {
     try {
         fail();
@@ -20,7 +20,7 @@ function inner(): void throws Failure
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     try {
         inner();

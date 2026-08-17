@@ -11,11 +11,14 @@ class Token
 
     function __destruct()
     {
-        echo "<drop " . $this->name . ">\n";
+        try {
+            echo "<drop " . $this->name . ">\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function describe(mixed $value): void
+function describe(mixed $value): void throws Doria\Std\Io\IoError
 {
     if ($value is int) {
         echo "int={$value}\n";
@@ -36,12 +39,12 @@ function describe(mixed $value): void
     }
 }
 
-function consume(take Token $token): void
+function consume(take Token $token): void throws Doria\Std\Io\IoError
 {
     echo "take=" . $token->text() . "\n";
 }
 
-function movePayload(take mixed $value): void
+function movePayload(take mixed $value): void throws Doria\Std\Io\IoError
 {
     if ($value is Token) {
         consume($value);
@@ -50,7 +53,7 @@ function movePayload(take mixed $value): void
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     describe(42);
     describe("hello");

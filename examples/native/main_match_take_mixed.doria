@@ -19,7 +19,7 @@ function consume(take mixed $value): string
     };
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo consume(new Message("class")) . "\n";
     echo consume("string") . "\n";

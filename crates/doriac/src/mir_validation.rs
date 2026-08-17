@@ -288,13 +288,16 @@ fn validate_error_metadata(program: &mir::Program) -> Result<(), BackendError> {
                 origin.id.0
             )));
         }
-        let function = function_in(program, origin.function)?;
-        if origin.span.start < function.source_span.start
-            || origin.span.end > function.source_span.end
-        {
+        if origin.span.start > origin.span.end || origin.span.end > program.source.text.len() {
             return Err(malformed_mir(format!(
-                "Error origin#{} is outside function{}",
-                origin.id.0, origin.function.0
+                "Error origin#{} is outside the source file",
+                origin.id.0
+            )));
+        }
+        if origin.callable.is_empty() {
+            return Err(malformed_mir(format!(
+                "Error origin#{} has no source callable identity",
+                origin.id.0
             )));
         }
     }
@@ -912,6 +915,9 @@ fn validate_statement(
                 {
                     validate_nullable_class_expression(program, function, expression)?;
                     if !local.owned {
+                        if matches!(expression, mir::NullableClassExpression::Null(_)) {
+                            return Ok(());
+                        }
                         if nullable_class_expression_accesses_local(expression, *target) {
                             return Err(malformed_mir(format!(
                                 "borrowed nullable class local{} reads its own uninitialized value",
@@ -2241,6 +2247,68 @@ fn validate_terminator(
             }
             Ok(())
         }
+        mir::Terminator::CheckedIo {
+            operation,
+            result,
+            error,
+            success,
+            failure,
+            ..
+        } => {
+            validate_checked_io_operation(program, function, operation)?;
+            let expected = match operation {
+                mir::CheckedIoOperation::ReadLine { .. } => Some(mir::Type::NullableString),
+                mir::CheckedIoOperation::ReadFile { bytes: false, .. } => Some(mir::Type::String),
+                mir::CheckedIoOperation::ReadFile { bytes: true, .. }
+                | mir::CheckedIoOperation::ReadStdinBytes => result
+                    .map(|local| local_in(function, local).map(|definition| definition.ty))
+                    .transpose()?,
+                mir::CheckedIoOperation::WriteFile { .. }
+                | mir::CheckedIoOperation::WriteStream { .. } => None,
+            };
+            match (expected, result) {
+                (None, None) => {}
+                (Some(expected), Some(result)) => {
+                    let definition = local_in(function, *result)?;
+                    if definition.ty != expected || !definition.synthetic {
+                        return Err(malformed_mir(
+                            "checked I/O has an incompatible success slot",
+                        ));
+                    }
+                    if matches!(
+                        operation,
+                        mir::CheckedIoOperation::ReadFile { bytes: true, .. }
+                            | mir::CheckedIoOperation::ReadStdinBytes
+                    ) {
+                        let mir::Type::Collection(collection) = expected else {
+                            return Err(malformed_mir(
+                                "checked byte input does not return a collection",
+                            ));
+                        };
+                        if collection_in(program, collection)?.kind != mir::CollectionKind::Bytes {
+                            return Err(malformed_mir("checked byte input does not return Bytes"));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(malformed_mir(
+                        "checked I/O has the wrong success-slot shape",
+                    ))
+                }
+            }
+            let error = local_in(function, *error)?;
+            if error.ty != mir::Type::Error || !error.owned || !error.synthetic {
+                return Err(malformed_mir("checked I/O has an incompatible Error slot"));
+            }
+            block_in(function, *success)?;
+            block_in(function, *failure)?;
+            if success == failure {
+                return Err(malformed_mir(
+                    "checked I/O success and error edges are identical",
+                ));
+            }
+            Ok(())
+        }
         mir::Terminator::ErrorSwitch {
             error,
             cases,
@@ -2280,6 +2348,50 @@ fn validate_terminator(
                 return Err(malformed_mir(
                     "nonthrowing function propagates a checked Error",
                 ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_checked_io_operation(
+    program: &mir::Program,
+    function: &mir::Function,
+    operation: &mir::CheckedIoOperation,
+) -> Result<(), BackendError> {
+    match operation {
+        mir::CheckedIoOperation::ReadLine { prompt } => {
+            validate_string_expression(program, function, prompt)
+        }
+        mir::CheckedIoOperation::ReadFile { path, .. } => {
+            validate_string_expression(program, function, path)
+        }
+        mir::CheckedIoOperation::ReadStdinBytes => Ok(()),
+        mir::CheckedIoOperation::WriteFile { path, contents, .. } => {
+            validate_string_expression(program, function, path)?;
+            validate_io_contents(program, function, contents)
+        }
+        mir::CheckedIoOperation::WriteStream { contents, .. } => {
+            validate_io_contents(program, function, contents)
+        }
+    }
+}
+
+fn validate_io_contents(
+    program: &mir::Program,
+    function: &mir::Function,
+    contents: &mir::IoContents,
+) -> Result<(), BackendError> {
+    match contents {
+        mir::IoContents::String(value) => validate_string_expression(program, function, value),
+        mir::IoContents::Format(value) => validate_format_expression(program, function, value),
+        mir::IoContents::Bytes(local) => {
+            let local = local_in(function, *local)?;
+            let mir::Type::Collection(collection) = local.ty else {
+                return Err(malformed_mir("checked byte I/O uses another local type"));
+            };
+            if collection_in(program, collection)?.kind != mir::CollectionKind::Bytes {
+                return Err(malformed_mir("checked byte I/O local is not Bytes"));
             }
             Ok(())
         }
@@ -2605,34 +2717,11 @@ fn validate_error_assignment_ownership(
 }
 
 fn error_expression_is_borrowed(expression: &mir::ErrorExpression) -> bool {
-    match expression {
-        mir::ErrorExpression::Local { transfer, .. }
-        | mir::ErrorExpression::NullableLocalAssumeNonNull { transfer, .. }
-        | mir::ErrorExpression::Property { transfer, .. }
-        | mir::ErrorExpression::MixedPayload { transfer, .. } => !transfer,
-        mir::ErrorExpression::CollectionIndex { remove, .. } => !remove,
-        mir::ErrorExpression::Call { return_borrow, .. } => return_borrow.is_some(),
-        mir::ErrorExpression::FromClass { object, .. } => object.borrows_class_value(),
-        mir::ErrorExpression::FromNullableClass { object, .. } => object.borrows_class_value(),
-    }
+    expression.is_borrowed()
 }
 
 fn nullable_error_expression_is_borrowed(expression: &mir::NullableErrorExpression) -> bool {
-    match expression {
-        mir::NullableErrorExpression::Null => true,
-        mir::NullableErrorExpression::Error(value) => error_expression_is_borrowed(value),
-        mir::NullableErrorExpression::Local { transfer, .. }
-        | mir::NullableErrorExpression::Property { transfer, .. } => !transfer,
-        mir::NullableErrorExpression::Call { return_borrow, .. } => return_borrow.is_some(),
-        mir::NullableErrorExpression::DictionaryGet { access, .. } => !matches!(
-            access,
-            mir::NullableCollectionAccess::Remove
-                | mir::NullableCollectionAccess::Pop
-                | mir::NullableCollectionAccess::PopFront
-                | mir::NullableCollectionAccess::PopBack
-        ),
-        mir::NullableErrorExpression::CollectionIndex { remove, .. } => !remove,
-    }
+    expression.is_borrowed()
 }
 
 fn error_descriptor_in(
@@ -5921,6 +6010,7 @@ fn infer_synthetic_local_return_borrow(
                     infer_expression_return_borrow(program, function, expression)?,
                     class_expression_accesses_local(expression, local),
                 ),
+                mir::Rvalue::NullableClass(mir::NullableClassExpression::Null(_)) => continue,
                 mir::Rvalue::NullableClass(expression) => (
                     infer_nullable_expression_return_borrow(program, function, expression)?,
                     nullable_class_expression_accesses_local(expression, local),
@@ -5940,13 +6030,35 @@ fn infer_synthetic_local_return_borrow(
                 ),
                 _ => continue,
             };
-            if inferred.is_some() || recursive {
+            if recursive {
                 return Err(malformed_mir(format!(
-                    "borrowed local{} must have one non-recursive assignment",
+                    "borrowed local{} has a recursive assignment",
                     local.0
                 )));
             }
-            inferred = Some(borrow);
+            merge_synthetic_local_borrow(&mut inferred, borrow, local)?;
+        }
+        if let mir::Terminator::CheckedCall {
+            function: callee,
+            args,
+            result: Some(target),
+            ..
+        } = &block.terminator
+        {
+            if *target == local {
+                let callee = function_in(program, *callee)?;
+                let borrow = match infer_function_return_borrow(program, callee)? {
+                    Some(return_borrow) => infer_borrowed_rvalue_source(
+                        program,
+                        function,
+                        callee.id,
+                        args,
+                        return_borrow,
+                    )?,
+                    None => None,
+                };
+                merge_synthetic_local_borrow(&mut inferred, borrow, local)?;
+            }
         }
     }
     match inferred {
@@ -5957,6 +6069,30 @@ fn infer_synthetic_local_return_borrow(
         ))),
         None => Ok(None),
     }
+}
+
+fn merge_synthetic_local_borrow(
+    inferred: &mut Option<Option<mir::ReturnBorrow>>,
+    candidate: Option<mir::ReturnBorrow>,
+    local: mir::LocalId,
+) -> Result<(), BackendError> {
+    match (*inferred, candidate) {
+        (None, candidate) => *inferred = Some(candidate),
+        (Some(Some(existing)), Some(candidate)) if existing.source == candidate.source => {
+            *inferred = Some(Some(mir::ReturnBorrow {
+                writable: existing.writable && candidate.writable,
+                ..existing
+            }));
+        }
+        (Some(None), None) => {}
+        _ => {
+            return Err(malformed_mir(format!(
+                "borrowed local{} mixes owned and borrowed assignments",
+                local.0
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn infer_local_return_borrow(
@@ -7607,6 +7743,9 @@ fn collect_terminator_class_local_accesses(terminator: &mir::Terminator) -> Clas
             collect_rvalue_args_class_local_accesses(args, &mut accesses);
             accesses.constructor_call(*constructor, args);
         }
+        mir::Terminator::CheckedIo { operation, .. } => {
+            collect_checked_io_class_local_accesses(operation, &mut accesses);
+        }
         mir::Terminator::ReturnVoid
         | mir::Terminator::Unreachable
         | mir::Terminator::Jump(_)
@@ -7614,6 +7753,39 @@ fn collect_terminator_class_local_accesses(terminator: &mir::Terminator) -> Clas
         | mir::Terminator::PropagateError { .. } => {}
     }
     accesses
+}
+
+fn collect_checked_io_class_local_accesses<'a>(
+    operation: &'a mir::CheckedIoOperation,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match operation {
+        mir::CheckedIoOperation::ReadLine { prompt } => {
+            collect_string_class_local_accesses(prompt, accesses)
+        }
+        mir::CheckedIoOperation::ReadFile { path, .. } => {
+            collect_string_class_local_accesses(path, accesses)
+        }
+        mir::CheckedIoOperation::ReadStdinBytes => {}
+        mir::CheckedIoOperation::WriteFile { path, contents, .. } => {
+            collect_string_class_local_accesses(path, accesses);
+            collect_io_contents_class_local_accesses(contents, accesses);
+        }
+        mir::CheckedIoOperation::WriteStream { contents, .. } => {
+            collect_io_contents_class_local_accesses(contents, accesses)
+        }
+    }
+}
+
+fn collect_io_contents_class_local_accesses<'a>(
+    contents: &'a mir::IoContents,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match contents {
+        mir::IoContents::String(value) => collect_string_class_local_accesses(value, accesses),
+        mir::IoContents::Format(value) => collect_format_class_local_accesses(value, accesses),
+        mir::IoContents::Bytes(_) => {}
+    }
 }
 
 fn reachable_blocks_and_predecessors(
@@ -7782,6 +7954,9 @@ fn validate_nullable_presence(
             }
             | mir::Terminator::CheckedConstruct {
                 success, failure, ..
+            }
+            | mir::Terminator::CheckedIo {
+                success, failure, ..
             } => {
                 for target in [*success, *failure] {
                     if merge_definitely_present(&mut entries[target.0], &present) {
@@ -7882,6 +8057,9 @@ fn validate_mixed_tag_proofs(
             }
             | mir::Terminator::CheckedConstruct {
                 success, failure, ..
+            }
+            | mir::Terminator::CheckedIo {
+                success, failure, ..
             } => {
                 for target in [*success, *failure] {
                     if merge_definite_mixed_tags(&mut entries[target.0], &tags) {
@@ -7981,6 +8159,9 @@ fn validate_payload_case_proofs(
                 success, failure, ..
             }
             | mir::Terminator::CheckedConstruct {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedIo {
                 success, failure, ..
             } => {
                 for target in [*success, *failure] {
@@ -8117,12 +8298,9 @@ fn validate_control_flow_plans(function: &mir::Function) -> Result<(), BackendEr
                         let gate_failed = plan
                             .gate_failed
                             .expect("a non-empty given predicate plan has a false target");
-                        let predicate_block = block_in(function, predicate.block)?;
-                        if !matches!(
-                            predicate_block.terminator,
-                            mir::Terminator::Branch { .. } | mir::Terminator::Jump(_)
-                        ) || (!cfg_reaches(function, predicate.block, next)?
-                            && !cfg_reaches(function, predicate.block, gate_failed)?)
+                        if !checked_success_reaches_bool_control(function, predicate.block)?
+                            || (!cfg_reaches(function, predicate.block, next)?
+                                && !cfg_reaches(function, predicate.block, gate_failed)?)
                         {
                             return Err(malformed_mir(
                                 "given predicate chain does not preserve source-order short-circuiting",
@@ -8130,10 +8308,7 @@ fn validate_control_flow_plans(function: &mir::Function) -> Result<(), BackendEr
                         }
                     }
                     if plan.condition_type != mir::Type::Scalar(mir::ScalarType::Bool)
-                        || !matches!(
-                            block_in(function, plan.condition)?.terminator,
-                            mir::Terminator::Branch { .. } | mir::Terminator::Jump(_)
-                        )
+                        || !checked_success_reaches_bool_control(function, plan.condition)?
                     {
                         return Err(malformed_mir(
                             "given attached condition is not represented by bool control flow",
@@ -8337,9 +8512,17 @@ fn validate_finalizer_plan(
                         "checked-error finalizer exit does not own an Error carrier",
                     ));
                 }
-                if !source.statements.iter().any(|statement| {
+                let acquired_here = source.statements.iter().any(|statement| {
                     matches!(statement, mir::Statement::AssignLocal { target, .. } if *target == error_id)
-                }) {
+                });
+                if !acquired_here
+                    && !checked_error_forwarded_from_child_finalizer(
+                        function,
+                        plan.id,
+                        exit.source,
+                        error_id,
+                    )
+                {
                     return Err(malformed_mir(
                         "checked-error exit enters a finalizer before acquiring its carrier",
                     ));
@@ -8353,6 +8536,31 @@ fn validate_finalizer_plan(
     }
     validate_finalizer_dispatch(function, plan)?;
     Ok(())
+}
+
+fn checked_error_forwarded_from_child_finalizer(
+    function: &mir::Function,
+    parent: mir::FinalizerRegionId,
+    continuation: mir::BlockId,
+    error: mir::LocalId,
+) -> bool {
+    function.blocks.iter().any(|block| {
+        block.statements.iter().any(|statement| {
+            let mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::Finalizer(child)) = statement
+            else {
+                return false;
+            };
+            child.parent == Some(parent)
+                && child.exits.iter().any(|exit| {
+                    exit.continuation == continuation
+                        && matches!(
+                            exit.kind,
+                            mir::StructuredExitKind::CheckedError { error: forwarded }
+                                if forwarded == error
+                        )
+                })
+        })
+    })
 }
 
 fn validate_finalizer_dispatch(
@@ -8432,6 +8640,24 @@ fn is_finalizer_discriminator_condition(
     )
 }
 
+fn checked_success_reaches_bool_control(
+    function: &mir::Function,
+    start: mir::BlockId,
+) -> Result<bool, BackendError> {
+    let mut current = start;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        match &block_in(function, current)?.terminator {
+            mir::Terminator::Branch { .. } | mir::Terminator::Jump(_) => return Ok(true),
+            mir::Terminator::CheckedCall { success, .. }
+            | mir::Terminator::CheckedConstruct { success, .. }
+            | mir::Terminator::CheckedIo { success, .. } => current = *success,
+            _ => return Ok(false),
+        }
+    }
+    Ok(false)
+}
+
 fn cfg_reaches(
     function: &mir::Function,
     start: mir::BlockId,
@@ -8493,10 +8719,7 @@ fn validate_match_binding_plans(function: &mir::Function) -> Result<(), BackendE
                 let Some(guard) = arm.guard else {
                     continue;
                 };
-                if !matches!(
-                    block_in(function, guard)?.terminator,
-                    mir::Terminator::Branch { .. }
-                ) || !match_guard_reaches_binding(
+                if !match_guard_reaches_binding(
                     function,
                     guard,
                     arm.binding,
@@ -8546,11 +8769,31 @@ fn match_guard_reaches_binding(
         {
             continue;
         }
-        pending.extend(terminator_targets(
+        pending.extend(match_guard_success_targets(
             &block_in(function, block_id)?.terminator,
         ));
     }
     Ok(false)
+}
+
+fn match_guard_success_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
+    match terminator {
+        mir::Terminator::CheckedCall { success, .. }
+        | mir::Terminator::CheckedConstruct { success, .. }
+        | mir::Terminator::CheckedIo { success, .. } => vec![*success],
+        mir::Terminator::ErrorSwitch { .. }
+        | mir::Terminator::Return(_)
+        | mir::Terminator::ReturnVoid
+        | mir::Terminator::Panic { .. }
+        | mir::Terminator::Unreachable
+        | mir::Terminator::PropagateError { .. } => Vec::new(),
+        mir::Terminator::Jump(target) => vec![*target],
+        mir::Terminator::Branch {
+            then_block,
+            else_block,
+            ..
+        } => vec![*then_block, *else_block],
+    }
 }
 
 fn validate_match_arm_result_path(
@@ -8615,6 +8858,9 @@ fn validate_result_path(
                 success, failure, ..
             }
             | mir::Terminator::CheckedConstruct {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedIo {
                 success, failure, ..
             } => {
                 pending.push_back((*success, assignments));
@@ -9812,6 +10058,9 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
         }
         | mir::Terminator::CheckedConstruct {
             success, failure, ..
+        }
+        | mir::Terminator::CheckedIo {
+            success, failure, ..
         } => vec![*success, *failure],
         mir::Terminator::ErrorSwitch {
             cases,
@@ -9978,10 +10227,48 @@ fn terminator_observes_property(
                 .iter()
                 .any(|value| rvalue_observes_property(value, receiver, property))
         }
+        mir::Terminator::CheckedIo { operation, .. } => {
+            checked_io_observes_property(operation, receiver, property)
+        }
         mir::Terminator::ReturnVoid | mir::Terminator::Unreachable | mir::Terminator::Jump(_) => {
             false
         }
         mir::Terminator::ErrorSwitch { .. } | mir::Terminator::PropagateError { .. } => false,
+    }
+}
+
+fn checked_io_observes_property(
+    operation: &mir::CheckedIoOperation,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match operation {
+        mir::CheckedIoOperation::ReadLine { prompt } => {
+            string_observes_property(prompt, receiver, property)
+        }
+        mir::CheckedIoOperation::ReadFile { path, .. } => {
+            string_observes_property(path, receiver, property)
+        }
+        mir::CheckedIoOperation::ReadStdinBytes => false,
+        mir::CheckedIoOperation::WriteFile { path, contents, .. } => {
+            string_observes_property(path, receiver, property)
+                || io_contents_observes_property(contents, receiver, property)
+        }
+        mir::CheckedIoOperation::WriteStream { contents, .. } => {
+            io_contents_observes_property(contents, receiver, property)
+        }
+    }
+}
+
+fn io_contents_observes_property(
+    contents: &mir::IoContents,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match contents {
+        mir::IoContents::String(value) => string_observes_property(value, receiver, property),
+        mir::IoContents::Format(value) => format_observes_property(value, receiver, property),
+        mir::IoContents::Bytes(_) => false,
     }
 }
 
@@ -12725,6 +13012,11 @@ fn validate_null_safe_call(
 ) -> Result<(), BackendError> {
     validate_nullable_class_expression(program, caller, object)?;
     let callee = function_in(program, callee)?;
+    if !callee.checked_effects.is_empty() {
+        return Err(malformed_mir(
+            "checked null-safe value call was not lowered to explicit checked control flow",
+        ));
+    }
     let Some(method) = &callee.method else {
         return Err(malformed_mir("null-safe call targets a free function"));
     };
@@ -12798,6 +13090,11 @@ fn validate_null_safe_statement_call(
 ) -> Result<(), BackendError> {
     validate_nullable_class_expression(program, caller, object)?;
     let callee = function_in(program, callee)?;
+    if !callee.checked_effects.is_empty() {
+        return Err(malformed_mir(
+            "checked null-safe statement call was not lowered to explicit checked control flow",
+        ));
+    }
     let Some(method) = &callee.method else {
         return Err(malformed_mir(
             "null-safe statement call targets a free function",

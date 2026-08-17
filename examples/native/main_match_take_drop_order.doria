@@ -6,7 +6,10 @@ class Marker
 
     function __destruct()
     {
-        echo "drop {$this->name}\n";
+        try {
+            echo "drop {$this->name}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -16,7 +19,7 @@ enum Bundle
     case Single(Marker $marker);
 }
 
-function ignorePair(): void
+function ignorePair(): void throws Doria\Std\Io\IoError
 {
     Bundle $bundle = Bundle::Pair(new Marker("first"), new Marker("second"));
     string $result = match (take $bundle) {
@@ -26,7 +29,7 @@ function ignorePair(): void
     echo "{$result}\n";
 }
 
-function takeSingle(): void
+function takeSingle(): void throws Doria\Std\Io\IoError
 {
     Bundle $bundle = Bundle::Single(new Marker("selected"));
     Marker $selected = match (take $bundle) {
@@ -36,7 +39,7 @@ function takeSingle(): void
     echo "selected acquired\n";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ignorePair();
     takeSingle();

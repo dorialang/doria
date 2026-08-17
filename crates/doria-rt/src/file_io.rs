@@ -4,8 +4,9 @@ use core::ptr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FileError {
     PathNul,
-    Read,
-    Write,
+    Open(crate::platform_io::Failure),
+    Read(crate::platform_io::Failure),
+    Write(crate::platform_io::Failure),
     Allocation,
 }
 
@@ -42,11 +43,15 @@ pub(crate) unsafe fn read_file(path: &[u8]) -> Result<OwnedBytes, FileError> {
     let descriptor = open(path.bytes.cast(), O_RDONLY, 0);
     drop(path);
     if descriptor < 0 {
-        return Err(FileError::Read);
+        return Err(FileError::Open(
+            crate::platform_io::Failure::from_system_code(i64::from(last_errno())),
+        ));
     }
     let result = read_descriptor(descriptor);
     if close(descriptor) != 0 && result.is_ok() {
-        return Err(FileError::Read);
+        return Err(FileError::Read(
+            crate::platform_io::Failure::from_system_code(i64::from(last_errno())),
+        ));
     }
     result
 }
@@ -82,8 +87,11 @@ unsafe fn read_descriptor(descriptor: i32) -> Result<OwnedBytes, FileError> {
         } else if result == 0 {
             return Ok(OwnedBytes { bytes, length });
         } else if last_errno() != EINTR {
+            let error = last_errno();
             super::deallocate(bytes);
-            return Err(FileError::Read);
+            return Err(FileError::Read(
+                crate::platform_io::Failure::from_system_code(i64::from(error)),
+            ));
         }
     }
 }
@@ -99,16 +107,32 @@ pub(crate) unsafe fn append_file(path: &[u8], contents: &[u8]) -> Result<(), Fil
 }
 
 #[cfg(unix)]
+pub(crate) unsafe fn remove_file(path: &[u8]) -> Result<(), FileError> {
+    let path = unix_path(path)?;
+    let result = unlink(path.bytes.cast());
+    drop(path);
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(FileError::Write(
+            crate::platform_io::Failure::from_system_code(i64::from(last_errno())),
+        ))
+    }
+}
+
+#[cfg(unix)]
 unsafe fn write_file_mode(path: &[u8], contents: &[u8], append: bool) -> Result<(), FileError> {
     let path = unix_path(path)?;
     let mode = if append { O_APPEND } else { O_TRUNC };
     let descriptor = open(path.bytes.cast(), O_WRONLY | O_CREAT | mode, 0o666);
     drop(path);
     if descriptor < 0 {
-        return Err(FileError::Write);
+        return Err(FileError::Open(
+            crate::platform_io::Failure::from_system_code(i64::from(last_errno())),
+        ));
     }
     let mut offset = 0;
-    let mut failed = false;
+    let mut failed = None;
     while offset < contents.len() {
         let result = write(
             descriptor,
@@ -120,15 +144,19 @@ unsafe fn write_file_mode(path: &[u8], contents: &[u8], append: bool) -> Result<
         } else if result < 0 && last_errno() == EINTR {
             continue;
         } else {
-            failed = true;
+            failed = Some(crate::platform_io::Failure::from_system_code(i64::from(
+                if result < 0 { last_errno() } else { 0 },
+            )));
             break;
         }
     }
-    if close(descriptor) != 0 {
-        failed = true;
+    if close(descriptor) != 0 && failed.is_none() {
+        failed = Some(crate::platform_io::Failure::from_system_code(i64::from(
+            last_errno(),
+        )));
     }
-    if failed {
-        Err(FileError::Write)
+    if let Some(failure) = failed {
+        Err(FileError::Write(failure))
     } else {
         Ok(())
     }
@@ -207,7 +235,9 @@ pub(crate) unsafe fn read_file(path: &[u8]) -> Result<OwnedBytes, FileError> {
     );
     drop(path);
     if handle == INVALID_HANDLE_VALUE {
-        return Err(FileError::Read);
+        return Err(FileError::Open(
+            crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
+        ));
     }
     let mut capacity = 4096_usize;
     let mut bytes = super::allocate(capacity);
@@ -216,13 +246,13 @@ pub(crate) unsafe fn read_file(path: &[u8]) -> Result<OwnedBytes, FileError> {
         return Err(FileError::Allocation);
     }
     let mut length = 0;
-    let mut failed = false;
+    let mut failed = None;
     loop {
         if length == capacity {
             let next = capacity.checked_mul(2).ok_or(FileError::Allocation)?;
             let replacement = super::allocate(next);
             if replacement.is_null() {
-                failed = true;
+                failed = Some(FileError::Allocation);
                 break;
             }
             ptr::copy_nonoverlapping(bytes, replacement, length);
@@ -240,7 +270,9 @@ pub(crate) unsafe fn read_file(path: &[u8]) -> Result<OwnedBytes, FileError> {
             ptr::null_mut(),
         ) == 0
         {
-            failed = true;
+            failed = Some(FileError::Read(
+                crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
+            ));
             break;
         }
         if read == 0 {
@@ -248,12 +280,14 @@ pub(crate) unsafe fn read_file(path: &[u8]) -> Result<OwnedBytes, FileError> {
         }
         length += read as usize;
     }
-    if CloseHandle(handle) == 0 {
-        failed = true;
+    if CloseHandle(handle) == 0 && failed.is_none() {
+        failed = Some(FileError::Read(
+            crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
+        ));
     }
-    if failed {
+    if let Some(failure) = failed {
         super::deallocate(bytes);
-        Err(FileError::Read)
+        Err(failure)
     } else {
         Ok(OwnedBytes { bytes, length })
     }
@@ -267,6 +301,20 @@ pub(crate) unsafe fn write_file(path: &[u8], contents: &[u8]) -> Result<(), File
 #[cfg(windows)]
 pub(crate) unsafe fn append_file(path: &[u8], contents: &[u8]) -> Result<(), FileError> {
     write_file_mode(path, contents, true)
+}
+
+#[cfg(windows)]
+pub(crate) unsafe fn remove_file(path: &[u8]) -> Result<(), FileError> {
+    let path = windows_path(path)?;
+    let result = DeleteFileW(path.bytes.cast::<u16>());
+    drop(path);
+    if result != 0 {
+        Ok(())
+    } else {
+        Err(FileError::Write(
+            crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
+        ))
+    }
 }
 
 #[cfg(windows)]
@@ -287,10 +335,12 @@ unsafe fn write_file_mode(path: &[u8], contents: &[u8], append: bool) -> Result<
     );
     drop(path);
     if handle == INVALID_HANDLE_VALUE {
-        return Err(FileError::Write);
+        return Err(FileError::Open(
+            crate::platform_io::Failure::from_system_code(i64::from(GetLastError())),
+        ));
     }
     let mut offset = 0;
-    let mut failed = false;
+    let mut failed = None;
     while offset < contents.len() {
         let request = core::cmp::min(contents.len() - offset, u32::MAX as usize) as u32;
         let mut written = 0_u32;
@@ -303,16 +353,20 @@ unsafe fn write_file_mode(path: &[u8], contents: &[u8], append: bool) -> Result<
         ) == 0
             || written == 0
         {
-            failed = true;
+            failed = Some(crate::platform_io::Failure::from_system_code(i64::from(
+                GetLastError(),
+            )));
             break;
         }
         offset += written as usize;
     }
-    if CloseHandle(handle) == 0 {
-        failed = true;
+    if CloseHandle(handle) == 0 && failed.is_none() {
+        failed = Some(crate::platform_io::Failure::from_system_code(i64::from(
+            GetLastError(),
+        )));
     }
-    if failed {
-        Err(FileError::Write)
+    if let Some(failure) = failed {
+        Err(FileError::Write(failure))
     } else {
         Ok(())
     }
@@ -346,17 +400,22 @@ unsafe fn windows_path(path: &[u8]) -> Result<OwnedBytes, FileError> {
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) unsafe fn read_file(_path: &[u8]) -> Result<OwnedBytes, FileError> {
-    Err(FileError::Read)
+    Err(FileError::Read(crate::platform_io::Failure::unsupported()))
 }
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) unsafe fn write_file(_path: &[u8], _contents: &[u8]) -> Result<(), FileError> {
-    Err(FileError::Write)
+    Err(FileError::Write(crate::platform_io::Failure::unsupported()))
 }
 
 #[cfg(not(any(unix, windows)))]
 pub(crate) unsafe fn append_file(_path: &[u8], _contents: &[u8]) -> Result<(), FileError> {
-    Err(FileError::Write)
+    Err(FileError::Write(crate::platform_io::Failure::unsupported()))
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) unsafe fn remove_file(_path: &[u8]) -> Result<(), FileError> {
+    Err(FileError::Write(crate::platform_io::Failure::unsupported()))
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
@@ -375,6 +434,7 @@ extern "C" {
     fn read(descriptor: i32, bytes: *mut c_void, byte_length: usize) -> isize;
     fn write(descriptor: i32, bytes: *const c_void, byte_length: usize) -> isize;
     fn close(descriptor: i32) -> i32;
+    fn unlink(path: *const u8) -> i32;
 }
 
 #[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
@@ -413,6 +473,8 @@ extern "system" {
         overlapped: *mut c_void,
     ) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn GetLastError() -> u32;
+    fn DeleteFileW(name: *const u16) -> i32;
 }
 
 #[cfg(test)]
@@ -460,7 +522,10 @@ mod tests {
         unsafe {
             assert!(matches!(
                 read_file(&path_bytes(&missing)),
-                Err(FileError::Read)
+                Err(FileError::Open(crate::platform_io::Failure {
+                    reason: crate::platform_io::Reason::NotFound,
+                    system_code: Some(_),
+                }))
             ));
             assert!(matches!(read_file(b"bad\0path"), Err(FileError::PathNul)));
             assert!(matches!(

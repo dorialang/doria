@@ -87,9 +87,8 @@ runs no cleanup or destructors, and exits with status 101.
 
 ## Checked-error compatibility
 
-Decision 0119 implements checked-error grammar and static checking in Stage 29
-Slice 1. Slice 2 execution and Slice 3 runtime reporting remain bound to this
-architecture:
+Decision 0119 implements checked errors end to end across Stage 29. Slice 3's
+runtime reporting remains bound to this architecture:
 
 - compile-time checked-error violations are ordinary language diagnostics;
 - a caught checked error is ordinary program control flow and emits no
@@ -107,7 +106,9 @@ permanent rendering contract. Decision 0119 settles the shared presentation as
 `Error[R1000]: Unhandled <ConcreteType>` with status 70, first-throw origin, no
 default propagation path or automatic cause chain, and safe human rendering of
 untrusted message text. Slice 3 implements that target through this decision's
-existing diagnostic and runtime-outcome model.
+existing diagnostic and runtime-outcome model. R1000 is `runtimeError`, status
+70, and `propagateWithCleanup`; it carries no call path. The private V3 transport
+adds runtime Error outcomes while retaining V2 panic decoding during transition.
 
 ## Consequences
 
@@ -122,10 +123,9 @@ existing diagnostic and runtime-outcome model.
   fallback.
 - The previous function-only `DrStackFrameV1` and message-based built-in panic
   path are retired from production use rather than silently reinterpreted.
-- Checked `throw`/`throws`, `try`, `catch`, Error conformance, and effect checking
-  are implemented in Stage 29 Slice 1. Propagation and the runtime Error
-  representation are implemented in Slice 2; R1000 process-outcome execution
-  remains deferred to Slice 3 under Decision 0119.
+- Checked `throw`/`throws`, `try`, `catch`, Error conformance, effects,
+  propagation, runtime Error representation, checked I/O, and R1000 reporting
+  are implemented through Stage 29 Slices 1 through 3.
 
 ## Invalidated elsewhere
 

@@ -1,7 +1,15 @@
-function main(): void
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
+function main(): void throws Doria\Std\Io\IoError
 {
     while (false) {
     } finally {
-        echo "cleanup\n";
+        record("cleanup\n");
     }
 }

@@ -42,7 +42,7 @@ class Provider
     function generic<T>(T $value): T throws Failure { return $value; }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     try {
         successfulVoid();

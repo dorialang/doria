@@ -1,0 +1,20 @@
+function main(): void throws Doria\Std\Io\IoError
+{
+    try {
+        read_file("missing-stage29.txt");
+    } catch (Doria\Std\Io\IoError $error) {
+        let $target = match ($error->target) {
+            Doria\Std\Io\IoTarget::File($path) => $path,
+            default => "unexpected",
+        };
+        echo match ($error->operation) {
+            Doria\Std\Io\IoOperation::Open => "open",
+            default => "unexpected",
+        } . ":" . match ($error->reason) {
+            Doria\Std\Io\IoErrorReason::NotFound => "not-found",
+            default => "unexpected",
+        } . ":{$target}\n";
+    } catch (Doria\Std\Io\InvalidUtf8Error) {
+        echo "unexpected-utf8\n";
+    }
+}

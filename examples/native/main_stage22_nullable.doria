@@ -9,16 +9,19 @@ class Label
         return $this->text;
     }
 
-    function use(Label $other): void
+    function use(Label $other): void throws Doria\Std\Io\IoError
     {
         echo ":used:" . $other->read();
     }
 
     function __destruct()
     {
-        echo "<" . $this->text . ">";
-        if ($this->text == "label") {
-            echo "\n";
+        try {
+            echo "<" . $this->text . ">";
+            if ($this->text == "label") {
+                echo "\n";
+            }
+        } catch (Doria\Std\Io\IoError) {
         }
     }
 }
@@ -50,13 +53,13 @@ function maybeLabel(bool $present): ?Label
     return null;
 }
 
-function inspectLabel(Label $label): bool
+function inspectLabel(Label $label): bool throws Doria\Std\Io\IoError
 {
     echo ":inspected:" . $label->read();
     return true;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $number = maybeInt(true);
     let $missingNumber = maybeInt(false);

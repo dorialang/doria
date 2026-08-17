@@ -1,6 +1,11 @@
+function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
 function main(): void
 {
-    echo "before\n";
+    record("before\n");
 
     string $value = when (true): string {
         panic("stop in when branch");
@@ -8,6 +13,6 @@ function main(): void
     } else {
         return "wrong";
     } finally {
-        echo "wrong cleanup\n";
+        record("wrong cleanup\n");
     };
 }

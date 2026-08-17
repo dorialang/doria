@@ -5,7 +5,7 @@ class Settings
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $settings =
         new WritableSharedReference(

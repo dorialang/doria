@@ -11,7 +11,10 @@ class Token
 
     function __destruct()
     {
-        echo "<drop " . $this->name . ">\n";
+        try {
+            echo "<drop " . $this->name . ">\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -25,7 +28,7 @@ class Holder
     }
 }
 
-function describe(mixed $value): void
+function describe(mixed $value): void throws Doria\Std\Io\IoError
 {
     if ($value is string) {
         echo "string=" . $value . "\n";
@@ -41,19 +44,19 @@ function makeMixedToken(): mixed
     return new Token("is-temporary");
 }
 
-function describeNullable(?mixed $value): void
+function describeNullable(?mixed $value): void throws Doria\Std\Io\IoError
 {
     if ($value != null) {
         describe($value);
     }
 }
 
-function describeFallback(?mixed $value): void
+function describeFallback(?mixed $value): void throws Doria\Std\Io\IoError
 {
     describeNullable($value ?? new Token("fallback"));
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $token = new Token("borrowed");
     describe($token);

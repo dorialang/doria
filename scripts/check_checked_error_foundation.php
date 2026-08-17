@@ -77,10 +77,10 @@ $fixture = $read($fixturePath);
 
 $require($decisionPath, $decision, [
     '**Status:** Accepted',
-    'Stage 29 Slices 1 and 2 complete',
+    'Stage 29 Slices 1 through 3 complete',
     'native collection',
     'property initializer corrective beat complete',
-    'Slice 3 next',
+    'Stage 29 complete',
     '`Error` is a compiler-known core interface',
     'explicitly declares `implements Error`',
     'externally accessible, readonly, stored `string $message`',
@@ -116,18 +116,18 @@ $require($decisionPath, $decision, [
     'panic stays status 101',
     'Pending Available',
     'Runner** and non-blocking',
-    'Stage 30 is blocked until Stage 29 completes',
+    'pre-Stage-30 closure grammar slice is next',
 ]);
 
 foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
     $require($path, $contents, [
         'Stage 28a — Complete',
-        'Stage 29 — In Progress',
+        'Stage 29 — Complete',
         'Stage 29 Slice 1 — Complete',
         'Stage 29 Slice 2 — Complete',
         'Corrective Beat: Native Collection Property Initializers — Complete',
-        'Stage 29 Slice 3 — Next',
-        'Stage 30 — Blocked Until Stage 29 Completes',
+        'Stage 29 Slice 3 — Complete',
+        'Stage 30 — Blocked Until The Pre-Stage-30 Grammar Slice Completes',
         'Stage 26b — Complete',
         'Measurement Status: Pending Available Runner',
     ]);
@@ -142,7 +142,7 @@ $require($specPath, $spec, [
     '`catch (Error)` catches every checked error',
     'Checked propagation performs deterministic cleanup',
     'never rolls back completed side effects',
-    'Stage 29 Slices 1 and 2 implement grammar',
+    'Stage 29 implements grammar',
 ]);
 
 $require($lexerPath, $lexer, [
@@ -211,8 +211,12 @@ $require($semanticsPath, $semantics, [
     'Implicit Constructor Cannot Hide A Throwing Initializer',
 ]);
 $require($ownershipPath, $ownership, ['Stmt::Throw(statement)', 'UseMode::Give', 'Stmt::Try(statement)']);
-$require($libPath, $lib, ['B2902', 'Unhandled Main Error Reporting Lands In Stage 29 Slice 3']);
-$forbid($libPath, $lib, ['reject_checked_error_execution', 'Checked Error Execution Lands In Stage 29 Slice 2']);
+$forbid($libPath, $lib, [
+    'B2902',
+    'reject_checked_error_execution',
+    'Checked Error Execution Lands In Stage 29 Slice 2',
+    'Unhandled Main Error Reporting Lands In Stage 29 Slice 3',
+]);
 $require($mirPath, $mir, [
     'pub error_descriptors: Vec<ErrorDescriptor>',
     'pub error_origins: Vec<ErrorOrigin>',
@@ -253,7 +257,7 @@ $require($testsPath, $tests, [
     'construction_effects_cannot_hide_in_initialization',
     'checked_errors_cannot_escape_finally_or_static_initialization',
     'checked_error_scopes_and_optional_bindings_follow_lexical_blocks',
-    'stage29_slice2_executes_handled_errors_and_gates_only_escaping_main',
+    'stage29_slice3_executes_handled_and_escaping_main_errors',
     'nonthrowing programs must remain executable',
 ]);
 $require($validationTestsPath, $validationTests, [

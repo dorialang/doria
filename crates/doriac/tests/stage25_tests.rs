@@ -181,7 +181,7 @@ class Box<T>
         return $value;
     }
 }
-function main(): int
+function main(): int throws Doria\Std\Io\IoError
 {
     let $number = new Box<int>(41);
     let $word = new Box<string>("generic");
@@ -212,7 +212,10 @@ fn generic_class_drop_glue_uses_the_substituted_field_type() {
 class Token
 {
     function __construct(string $name) {}
-    function __destruct() { echo "<drop:" . $this->name . ">\n"; }
+    function __destruct()
+    {
+        try { echo "<drop:" . $this->name . ">\n"; } catch (Doria\Std\Io\IoError) {}
+    }
 }
 class Box<T>
 {
@@ -317,7 +320,7 @@ class Pair<T, U>
 {
     function __construct(take T $left, take U $right) {}
 }
-function main(): int
+function main(): int throws Doria\Std\Io\IoError
 {
     writable List<Pair<int, string>> $pairs = [new Pair<int, string>(42, "answer")];
     Pair<int, string> $pair = $pairs->removeAt(0);
@@ -605,7 +608,7 @@ function render<T implements Displayable>(T $value): string
 {
     return $value->toString();
 }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo render(42) . "\n";
     echo render("text") . "\n";
@@ -1015,7 +1018,7 @@ class Sink<T>
 {
     function consume(take T $value): void {}
 }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $token = new Token("owned");
     let $sink = new Sink<Token>();

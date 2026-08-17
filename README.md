@@ -19,7 +19,7 @@ function greet(string $name, int $year): string
     return "Hello, {$name}! Welcome to {$year}.";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $message = greet("newcomer", 2026);
     echo "{$message}\n";
@@ -136,9 +136,10 @@ cleanup.
 Doria parses, checks, and executes explicit `Error` conformance, `throw`,
 source-ordered `throws`, and `try`/`catch`/`finally`. Handled errors use one
 backend-independent MIR and deterministic cleanup model across the interpreter,
-Cranelift, LLVM, and the PHP compatibility backend. Process-level reporting for
-an Error escaping `main`, the canonical checked-I/O migration, and its runtime
-outcome remain under development.
+Cranelift, LLVM, and the PHP compatibility backend. Text, file, and standard-
+device I/O expose canonical checked errors under `Doria\Std\Io`; an Error that
+escapes `main` is reported as `R1000` after cleanup and exits with status 70.
+Fatal panic remains a distinct cleanup-free status-101 outcome.
 
 ## Tooling
 
@@ -185,6 +186,12 @@ Built-in panics have stable `P` codes, a precise Doria source label, an
 explanation, a Doria-only `Call Path`, and status 101. `doriac run` receives
 native runtime facts over a private structured channel; neither it, the
 language server, nor the Playground parses rendered terminal prose.
+
+Unhandled checked errors use that same structured model without becoming
+panics. Human and concise output safely escape untrusted Error messages, JSON
+preserves the exact logical message, and the first Doria throw or built-in I/O
+effect site remains the origin. Ordinary closed stdout/stderr pipes retain their
+separate clean status-0 behavior.
 
 ---
 

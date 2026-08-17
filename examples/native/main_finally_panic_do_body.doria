@@ -1,10 +1,15 @@
+function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
 function main(): void
 {
-    echo "before\n";
+    record("before\n");
 
     do {
         panic("stop in do body");
     } while (false) finally {
-        echo "wrong cleanup\n";
+        record("wrong cleanup\n");
     }
 }

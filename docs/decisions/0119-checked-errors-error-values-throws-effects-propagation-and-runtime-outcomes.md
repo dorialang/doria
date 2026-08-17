@@ -3,8 +3,8 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-15
 - **Date:** 2026-08-15
-- **Implementation status:** Stage 29 Slices 1 and 2 complete; native collection
-  property initializer corrective beat complete; Slice 3 next
+- **Implementation status:** Stage 29 Slices 1 through 3 complete; native
+  collection property initializer corrective beat complete; Stage 29 complete
 - **Scope:** Checked-error syntax, static effects, ownership, future execution,
   runtime outcomes, and I/O failure migration
 - **Amends:** Decisions 0035, 0109, 0116, and 0117
@@ -191,10 +191,10 @@ Slice 2 implements the carrier, descriptors, hidden origin, explicit checked
 calls, `StructuredExitKind::CheckedError`, propagation, exact/catch-all dispatch,
 rethrow, failed-construction cleanup, and interpreter/Cranelift/LLVM/PHP
 transport parity. B2901 remains a historical catalogue identity with no valid
-Slice 2 source route. A nonempty checked-effect set on `main` remains gated by
-B2902 before artifact emission because Slice 3 owns process-level reporting.
+source route. Slice 3 removes B2902 from valid programs: a checked Error escaping
+any accepted `main` shape performs cleanup, reports R1000, and exits status 70.
 
-## I/O Migration Reserved For Slice 3
+## Canonical Checked I/O
 
 Slice 3 migrates the accepted text and binary free-function I/O failures to
 declared checked errors and supplies these canonical identities without short
@@ -213,7 +213,27 @@ optional system code. `InvalidUtf8Error` carries message, source, valid byte
 count, and optional invalid byte count. The permanent ordinary stdout/stderr
 closed-pipe status-0 rule remains neither panic nor throw.
 
-## Unhandled `main` Outcome Reserved For Slice 3
+`IoOperation` has `Open`, `Read`, `Write`, `Append`, and `Flush`. `IoTarget` has
+`File(string $path)`, `StandardInput`, `StandardOutput`, and `StandardError`.
+`IoErrorReason` has `NotFound`, `PermissionDenied`, `InvalidInput`,
+`Interrupted`, `ResourceExhausted`, `Unsupported`, `Closed`, and `Other`.
+`Utf8InputSource` has `File(string $path)` and `StandardInput`.
+
+`IoError` exposes externally accessible readonly `message`, `operation`,
+`target`, `reason`, and `?int systemCode`. `InvalidUtf8Error` exposes externally
+accessible readonly `message`, `source`, `validByteCount`, and
+`?int invalidByteCount`. Counts are bytes. The stable messages are Doria-owned:
+`failed to <operation> <target>: <reason>` and `invalid UTF-8 in <source>`.
+Localized host prose is not public API; the optional platform code remains a
+typed fact.
+
+The compiler-owned built-in table is authoritative for I/O effects. `read_line`
+and `read_file` throw both concrete I/O Error types. Text and binary writes,
+`printf`, and `echo` throw `IoError`; `sprintf` remains nonthrowing. EOF is
+successful `null`, blank input is `""`, P1206/P1302 remain allocation panics,
+and P1401 through P1407 are historical identities with no ordinary valid route.
+
+## Unhandled `main` Outcome
 
 An Error escaping `main` is `R1000`, kind `runtimeError`, status 70, and
 termination `propagateWithCleanup`. It uses Decision 0109's one structured
@@ -228,6 +248,12 @@ ANSI, and carriage-return sequences so message text cannot impersonate
 diagnostic headings. JSON preserves the exact logical string. This is rendering
 safety, not secret detection or automatic redaction; Error authors must not put
 secrets in reportable messages. There is no automatic Help or cause chain.
+
+R1000 is catalogue kind `runtimeError`, severity `error`, status 70, and
+termination `propagateWithCleanup`. It preserves the first throw or compiler-
+known I/O effect origin and has no propagation path. Reporting is best effort:
+an unavailable stderr still exits 70 silently after dropping the Error exactly
+once. A successful `main(): int` returning 70 is not an R1000 outcome.
 
 ## PHP And Foreign Boundaries
 
@@ -271,14 +297,17 @@ Runner** and non-blocking; the accepted performance standard is unchanged.
   payload-enum storage types are interned before callable lowering. This closes
   the native collection-property initializer N1101 ordering defect without
   changing checked-error semantics or absorbing E0472 owned-property transfer.
-- **Slice 3 - Next:** canonical I/O errors and signature migration, R1000,
-  status-70 entry handling, installed-tooling, and website closure.
+- **Slice 3 - Complete:** canonical I/O errors and signature migration, R1000,
+  status-70 entry handling, generalized private runtime-outcome transport, and
+  interpreter/Cranelift/LLVM/PHP parity.
 
-Stage 29 is in progress. Stage 30 is blocked until Stage 29 completes.
+Stage 29 is complete. The pre-Stage-30 closure grammar slice is next. Decision
+0120 remains accepted and awaiting grammar and Stage 30 implementation; Stage 30
+is not implemented and remains blocked until the grammar slice completes.
 
 ## Explicit Exclusions
 
-Slice 3 does not implement expression-position throw, bare rethrow, union
+Stage 29 does not implement expression-position throw, bare rethrow, union
 catches, inheritance/interface
 catch matching, closure effects, namespaces, streams, PHP export conversion,
 native unwinding, reflection, or a second diagnostic/cleanup model. It also
@@ -292,8 +321,8 @@ retains ownership of runtime reporting and I/O migration.
 - Ownership, cleanup, and diagnostics remain one language-wide model.
 - Stage 30 and Stage 35 must preserve effect-set substitution and extend the
   existing conformance/coverage abstractions rather than creating parallel ones.
-- I/O migration and unhandled-error reporting remain visible, bounded work
-  rather than accidental consequences of Slice 1.
+- I/O migration and unhandled-error reporting use the same checked-effect,
+  cleanup, descriptor, and diagnostic architecture as user errors.
 
 ## Affected Components
 
@@ -314,5 +343,11 @@ remain unchanged.
 - Decision 0117's ordinary namespace dependency is relaxed only for the exact
   compiler-known `Doria\Std\Io` identities before Stage 31. No short alias exists.
 - Stage 30 closure work must carry checked-effect sets and the subset law.
-- I/O documentation that says only "panic until Stage 29" must identify the
-  Slice 3 migration rather than implying Slice 1 changes runtime behavior.
+- I/O documentation that says "panic until Stage 29" is obsolete: ordinary I/O
+  failures are checked errors, while allocation failure and fatal panic remain
+  separate.
+- E0472 owned-property move-in, replacement, and move-out remains a separate
+  unimplemented authority and implementation beat.
+- The pre-Stage-30 closure grammar slice is next; Stage 30 closure semantics,
+  Stage 31 namespaces, Stage 34 inheritance, Stage 35 interfaces, Stage 36a
+  streams, and Stage 41 PHP-library conversion remain separate.

@@ -18,6 +18,8 @@ pub enum Builtin {
 
 const RESERVED_FUTURE_INTRINSIC_NAMES: &[&str] = &[];
 
+pub const ECHO_CHECKED_ERROR_TYPES: &[&str] = &[crate::compiler_known_io::IO_ERROR];
+
 /// A PHP free-function spelling and its Doria naming-charter replacement.
 ///
 /// This table is compiler-owned data so diagnostics and the future PHP
@@ -92,6 +94,56 @@ impl Builtin {
         }
     }
 
+    /// Canonical source-facing signature used by compiler-adjacent tooling.
+    pub const fn signature(self) -> &'static str {
+        match self {
+            Self::Panic => "panic(string $message)",
+            Self::ReadLine => concat!(
+                "read_line(string $prompt = \"\"): ?string throws ",
+                "Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error"
+            ),
+            Self::Sprintf => "sprintf(string $format, ...): string",
+            Self::Printf => "printf(string $format, ...): void throws Doria\\Std\\Io\\IoError",
+            Self::ReadFile => concat!(
+                "read_file(string $path): string throws ",
+                "Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error"
+            ),
+            Self::WriteFile => concat!(
+                "write_file(string $path, string $contents): void throws ",
+                "Doria\\Std\\Io\\IoError"
+            ),
+            Self::AppendFile => concat!(
+                "append_file(string $path, string $contents): void throws ",
+                "Doria\\Std\\Io\\IoError"
+            ),
+            Self::WriteStderr => concat!(
+                "write_stderr(string $value): void throws ",
+                "Doria\\Std\\Io\\IoError"
+            ),
+            Self::ReadFileBytes => concat!(
+                "read_file_bytes(string $path): Bytes throws ",
+                "Doria\\Std\\Io\\IoError"
+            ),
+            Self::WriteFileBytes => concat!(
+                "write_file_bytes(string $path, Bytes $contents): void throws ",
+                "Doria\\Std\\Io\\IoError"
+            ),
+            Self::AppendFileBytes => concat!(
+                "append_file_bytes(string $path, Bytes $contents): void throws ",
+                "Doria\\Std\\Io\\IoError"
+            ),
+            Self::ReadStdinBytes => "read_stdin_bytes(): Bytes throws Doria\\Std\\Io\\IoError",
+            Self::WriteStdoutBytes => concat!(
+                "write_stdout_bytes(Bytes $contents): void throws ",
+                "Doria\\Std\\Io\\IoError"
+            ),
+            Self::WriteStderrBytes => concat!(
+                "write_stderr_bytes(Bytes $contents): void throws ",
+                "Doria\\Std\\Io\\IoError"
+            ),
+        }
+    }
+
     /// The accepted argument count as an inclusive `(minimum, maximum)` range, or
     /// `None` when the builtin is variadic.
     ///
@@ -148,6 +200,30 @@ impl Builtin {
                 | Self::WriteStderrBytes
         )
     }
+
+    /// Canonical checked Error identities contributed by this builtin.
+    ///
+    /// Semantic checking and compiler-known type activation both consume this
+    /// table so a builtin cannot acquire an I/O effect in only one phase.
+    pub const fn checked_error_types(self) -> &'static [&'static str] {
+        match self {
+            Self::Panic | Self::Sprintf => &[],
+            Self::ReadLine | Self::ReadFile => &[
+                crate::compiler_known_io::IO_ERROR,
+                crate::compiler_known_io::INVALID_UTF8_ERROR,
+            ],
+            Self::Printf
+            | Self::WriteFile
+            | Self::AppendFile
+            | Self::WriteStderr
+            | Self::ReadFileBytes
+            | Self::WriteFileBytes
+            | Self::AppendFileBytes
+            | Self::ReadStdinBytes
+            | Self::WriteStdoutBytes
+            | Self::WriteStderrBytes => &[crate::compiler_known_io::IO_ERROR],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -171,5 +247,32 @@ mod tests {
         }
         assert!(is_reserved_intrinsic_name("read_file"));
         assert!(!is_reserved_intrinsic_name("user_function"));
+    }
+
+    #[test]
+    fn checked_io_effects_are_owned_by_the_builtin_table() {
+        assert!(Builtin::Sprintf.checked_error_types().is_empty());
+        assert_eq!(
+            Builtin::ReadLine.checked_error_types(),
+            &[
+                crate::compiler_known_io::IO_ERROR,
+                crate::compiler_known_io::INVALID_UTF8_ERROR
+            ]
+        );
+        assert_eq!(
+            Builtin::WriteStdoutBytes.checked_error_types(),
+            &[crate::compiler_known_io::IO_ERROR]
+        );
+        assert_eq!(
+            ECHO_CHECKED_ERROR_TYPES,
+            &[crate::compiler_known_io::IO_ERROR]
+        );
+        assert_eq!(
+            Builtin::ReadLine.signature(),
+            concat!(
+                "read_line(string $prompt = \"\"): ?string throws ",
+                "Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error"
+            )
+        );
     }
 }

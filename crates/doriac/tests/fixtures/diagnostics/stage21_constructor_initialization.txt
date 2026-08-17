@@ -17,7 +17,7 @@ span: 46..53
 code: E0501
 message: property `A::x` is read before it is initialized
 help:
-span: 51..59
+span: 58..66
 [incomplete this]
 code: E0503
 message: `$this` cannot be observed or passed from `A::__construct` before `$x` is initialized

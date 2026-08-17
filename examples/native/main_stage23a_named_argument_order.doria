@@ -1,32 +1,32 @@
-function g(): int
+function g(): int throws Doria\Std\Io\IoError
 {
     echo "g";
     return 1;
 }
 
-function h(): int
+function h(): int throws Doria\Std\Io\IoError
 {
     echo "h";
     return 2;
 }
 
-function k(): int
+function k(): int throws Doria\Std\Io\IoError
 {
     echo "k";
     return 3;
 }
 
-function pair(int $a, int $b): void
+function pair(int $a, int $b): void throws Doria\Std\Io\IoError
 {
     printf("|a=%d b=%d\n", $a, $b);
 }
 
-function triple(int $a, int $b, int $c = 9): void
+function triple(int $a, int $b, int $c = 9): void throws Doria\Std\Io\IoError
 {
     printf("|a=%d b=%d c=%d\n", $a, $b, $c);
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     // Decision 0098: arguments evaluate in source (written) order regardless of
     // the parameter each one binds to. `g()` runs before `h()` even though

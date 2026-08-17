@@ -1,4 +1,4 @@
-function update(WritableSharedReference<List<int>> $values): void
+function update(WritableSharedReference<List<int>> $values): void throws Doria\Std\Io\IoError
 {
     let writable $access = $values->acquireWritableAccess();
     $access[0] += 9;
@@ -7,13 +7,13 @@ function update(WritableSharedReference<List<int>> $values): void
     echo "removed {$removed}\n";
 }
 
-function inspect(WritableSharedReference<List<int>> $values): void
+function inspect(WritableSharedReference<List<int>> $values): void throws Doria\Std\Io\IoError
 {
     let $access = $values->acquireReadonlyAccess();
     echo "{$access[0]}:{$access->count}:{$access[1]}\n";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $values = new WritableSharedReference([1, 2, 3]);
     update($values);

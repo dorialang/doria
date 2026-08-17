@@ -14,20 +14,26 @@ pub(crate) enum StandardStream {
 pub(crate) enum WriteOutcome {
     Success,
     BrokenPipe,
-    OtherFailure,
+    OtherFailure(crate::platform_io::Failure),
 }
 
 #[cfg(unix)]
 const EINTR: i32 = 4;
 #[cfg(unix)]
 const EPIPE: i32 = 32;
+#[cfg(unix)]
+const SIGPIPE: i32 = 13;
+#[cfg(unix)]
+const SIG_IGN: usize = 1;
 
 #[cfg(unix)]
 const fn classify_unix_write_error(error: Option<i32>) -> WriteOutcome {
     match error {
         None => WriteOutcome::Success,
         Some(EPIPE) => WriteOutcome::BrokenPipe,
-        Some(_) => WriteOutcome::OtherFailure,
+        Some(code) => {
+            WriteOutcome::OtherFailure(crate::platform_io::Failure::from_system_code(code as i64))
+        }
     }
 }
 
@@ -48,9 +54,9 @@ pub(crate) unsafe fn read(
     stream: StandardStream,
     destination: *mut u8,
     capacity: usize,
-) -> Result<usize, ()> {
+) -> Result<usize, crate::platform_io::Failure> {
     if stream != StandardStream::Stdin {
-        return Err(());
+        return Err(crate::platform_io::Failure::invalid_input());
     }
     loop {
         let result = libc_read(descriptor(stream), destination.cast::<c_void>(), capacity);
@@ -58,7 +64,9 @@ pub(crate) unsafe fn read(
             return Ok(result as usize);
         }
         if last_errno() != EINTR {
-            return Err(());
+            return Err(crate::platform_io::Failure::from_system_code(i64::from(
+                last_errno(),
+            )));
         }
     }
 }
@@ -70,8 +78,11 @@ pub(crate) unsafe fn write(
     bytes: *const u8,
     byte_length: usize,
 ) -> WriteOutcome {
+    // Every runtime output path must observe EPIPE so Doria can apply its
+    // status-0 closed-pipe rule instead of being terminated by the host signal.
+    signal(SIGPIPE, SIG_IGN);
     if stream == StandardStream::Stdin {
-        return WriteOutcome::OtherFailure;
+        return WriteOutcome::OtherFailure(crate::platform_io::Failure::invalid_input());
     }
     let mut offset = 0;
     while offset < byte_length {
@@ -88,11 +99,16 @@ pub(crate) unsafe fn write(
             return if result < 0 {
                 classify_unix_write_error(Some(last_errno()))
             } else {
-                WriteOutcome::OtherFailure
+                WriteOutcome::OtherFailure(crate::platform_io::Failure::other())
             };
         }
     }
     WriteOutcome::Success
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn signal(signal: i32, handler: usize) -> usize;
 }
 
 #[cfg(unix)]
@@ -109,7 +125,7 @@ pub(crate) unsafe fn read_bytes(
     stream: StandardStream,
     destination: *mut u8,
     capacity: usize,
-) -> Result<usize, ()> {
+) -> Result<usize, crate::platform_io::Failure> {
     read(stream, destination, capacity)
 }
 
@@ -123,7 +139,7 @@ pub(crate) unsafe fn read_bytes(
 /// meaningful operation and is reported as a failure.
 pub(crate) unsafe fn flush(stream: StandardStream) -> WriteOutcome {
     if stream == StandardStream::Stdin {
-        return WriteOutcome::OtherFailure;
+        return WriteOutcome::OtherFailure(crate::platform_io::Failure::invalid_input());
     }
     WriteOutcome::Success
 }
@@ -156,7 +172,9 @@ const fn classify_windows_write_error(error: Option<u32>) -> WriteOutcome {
     match error {
         None => WriteOutcome::Success,
         Some(ERROR_BROKEN_PIPE) | Some(ERROR_NO_DATA) => WriteOutcome::BrokenPipe,
-        Some(_) => WriteOutcome::OtherFailure,
+        Some(code) => {
+            WriteOutcome::OtherFailure(crate::platform_io::Failure::from_system_code(code as i64))
+        }
     }
 }
 
@@ -202,10 +220,12 @@ pub(crate) unsafe fn write(
     byte_length: usize,
 ) -> WriteOutcome {
     if stream == StandardStream::Stdin {
-        return WriteOutcome::OtherFailure;
+        return WriteOutcome::OtherFailure(crate::platform_io::Failure::invalid_input());
     }
     let Some(handle) = valid_handle(stream) else {
-        return WriteOutcome::OtherFailure;
+        return WriteOutcome::OtherFailure(crate::platform_io::Failure::from_system_code(
+            i64::from(GetLastError()),
+        ));
     };
     if is_interactive(stream) {
         return write_console_utf8(handle, bytes, byte_length);
@@ -220,10 +240,12 @@ pub(crate) unsafe fn write_bytes(
     byte_length: usize,
 ) -> WriteOutcome {
     if stream == StandardStream::Stdin {
-        return WriteOutcome::OtherFailure;
+        return WriteOutcome::OtherFailure(crate::platform_io::Failure::invalid_input());
     }
     let Some(handle) = valid_handle(stream) else {
-        return WriteOutcome::OtherFailure;
+        return WriteOutcome::OtherFailure(crate::platform_io::Failure::from_system_code(
+            i64::from(GetLastError()),
+        ));
     };
     write_file_bytes(handle, bytes, byte_length)
 }
@@ -249,7 +271,7 @@ unsafe fn write_file_bytes(
             return classify_windows_write_error(Some(GetLastError()));
         }
         if written == 0 {
-            return WriteOutcome::OtherFailure;
+            return WriteOutcome::OtherFailure(crate::platform_io::Failure::other());
         }
         offset += written as usize;
     }
@@ -264,7 +286,7 @@ unsafe fn write_console_utf8(
 ) -> WriteOutcome {
     let input = core::slice::from_raw_parts(bytes, byte_length);
     let Ok(text) = core::str::from_utf8(input) else {
-        return WriteOutcome::OtherFailure;
+        return WriteOutcome::OtherFailure(crate::platform_io::Failure::invalid_input());
     };
     let mut wide = [0_u16; 1024];
     let mut length = 0_usize;
@@ -309,7 +331,7 @@ unsafe fn write_console_units(
             return classify_windows_write_error(Some(GetLastError()));
         }
         if written == 0 {
-            return WriteOutcome::OtherFailure;
+            return WriteOutcome::OtherFailure(crate::platform_io::Failure::other());
         }
         offset += written as usize;
     }
@@ -328,12 +350,14 @@ pub(crate) unsafe fn read(
     stream: StandardStream,
     destination: *mut u8,
     capacity: usize,
-) -> Result<usize, ()> {
+) -> Result<usize, crate::platform_io::Failure> {
     if stream != StandardStream::Stdin {
-        return Err(());
+        return Err(crate::platform_io::Failure::invalid_input());
     }
     let Some(handle) = valid_handle(stream) else {
-        return Err(());
+        return Err(crate::platform_io::Failure::from_system_code(i64::from(
+            GetLastError(),
+        )));
     };
     if !is_interactive(stream) {
         let request = core::cmp::min(capacity, u32::MAX as usize) as u32;
@@ -349,7 +373,9 @@ pub(crate) unsafe fn read(
             if is_pipe_eof(GetLastError()) {
                 return Ok(0);
             }
-            return Err(());
+            return Err(crate::platform_io::Failure::from_system_code(i64::from(
+                GetLastError(),
+            )));
         }
         return Ok(read as usize);
     }
@@ -365,7 +391,9 @@ pub(crate) unsafe fn read(
             ptr::null_mut(),
         ) == 0
         {
-            return Err(());
+            return Err(crate::platform_io::Failure::from_system_code(i64::from(
+                GetLastError(),
+            )));
         }
         if read == 0 {
             return Ok(0);
@@ -376,7 +404,7 @@ pub(crate) unsafe fn read(
             core::ptr::addr_of_mut!(CONSOLE_INPUT_BYTES).cast::<u8>(),
             2048,
         )
-        .ok_or(())?;
+        .ok_or_else(crate::platform_io::Failure::invalid_input)?;
     }
 
     let available = CONSOLE_INPUT_END - CONSOLE_INPUT_START;
@@ -397,12 +425,14 @@ pub(crate) unsafe fn read_bytes(
     stream: StandardStream,
     destination: *mut u8,
     capacity: usize,
-) -> Result<usize, ()> {
+) -> Result<usize, crate::platform_io::Failure> {
     if stream != StandardStream::Stdin {
-        return Err(());
+        return Err(crate::platform_io::Failure::invalid_input());
     }
     let Some(handle) = valid_handle(stream) else {
-        return Err(());
+        return Err(crate::platform_io::Failure::from_system_code(i64::from(
+            GetLastError(),
+        )));
     };
     let request = core::cmp::min(capacity, u32::MAX as usize) as u32;
     let mut read = 0_u32;
@@ -417,7 +447,9 @@ pub(crate) unsafe fn read_bytes(
         if is_pipe_eof(GetLastError()) {
             return Ok(0);
         }
-        return Err(());
+        return Err(crate::platform_io::Failure::from_system_code(i64::from(
+            GetLastError(),
+        )));
     }
     Ok(read as usize)
 }
@@ -443,8 +475,8 @@ pub(crate) unsafe fn read(
     _stream: StandardStream,
     _destination: *mut u8,
     _capacity: usize,
-) -> Result<usize, ()> {
-    Err(())
+) -> Result<usize, crate::platform_io::Failure> {
+    Err(crate::platform_io::Failure::unsupported())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -453,7 +485,7 @@ pub(crate) unsafe fn write(
     _bytes: *const u8,
     _byte_length: usize,
 ) -> WriteOutcome {
-    WriteOutcome::OtherFailure
+    WriteOutcome::OtherFailure(crate::platform_io::Failure::unsupported())
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -470,7 +502,7 @@ pub(crate) unsafe fn read_bytes(
     stream: StandardStream,
     destination: *mut u8,
     capacity: usize,
-) -> Result<usize, ()> {
+) -> Result<usize, crate::platform_io::Failure> {
     read(stream, destination, capacity)
 }
 
@@ -599,10 +631,10 @@ mod tests {
             classify_unix_write_error(Some(EPIPE)),
             WriteOutcome::BrokenPipe
         );
-        assert_eq!(
+        assert!(matches!(
             classify_unix_write_error(Some(5)),
-            WriteOutcome::OtherFailure
-        );
+            WriteOutcome::OtherFailure(_)
+        ));
     }
 
     #[cfg(windows)]
@@ -617,10 +649,10 @@ mod tests {
             classify_windows_write_error(Some(ERROR_NO_DATA)),
             WriteOutcome::BrokenPipe
         );
-        assert_eq!(
+        assert!(matches!(
             classify_windows_write_error(Some(5)),
-            WriteOutcome::OtherFailure
-        );
+            WriteOutcome::OtherFailure(_)
+        ));
     }
 
     #[cfg(windows)]
