@@ -4499,6 +4499,23 @@ impl<'program> Checker<'program> {
         );
     }
 
+    fn report_finally_checked_effects(&mut self, effects: CheckedEffectSet, span: Span) {
+        for effect in effects.ordered {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0632",
+                    format!(
+                        "checked error `{}` cannot escape `finally`",
+                        self.types.display(effect)
+                    ),
+                    span,
+                )
+                .with_title("Checked Error Cannot Escape Finally")
+                .with_help("catch the checked error inside `finally`"),
+            );
+        }
+    }
+
     fn check_parameter_default_support(
         &mut self,
         function: &FunctionDecl,
@@ -5386,20 +5403,7 @@ impl<'program> Checker<'program> {
                 .pop()
                 .expect("checked try finalizer boundary");
             let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
-            for effect in finalizer_effects.ordered {
-                self.diagnostics.push(
-                    Diagnostic::new(
-                        "E0632",
-                        format!(
-                            "checked error `{}` cannot escape `finally`",
-                            self.types.display(effect)
-                        ),
-                        finally.span,
-                    )
-                    .with_title("Checked Error Cannot Escape Finally")
-                    .with_help("catch the checked error inside `finally`"),
-                );
-            }
+            self.report_finally_checked_effects(finalizer_effects, finally.span);
         }
 
         self.try_uncovered_effects.insert(
@@ -5967,6 +5971,7 @@ impl<'program> Checker<'program> {
         let Some(finally) = finally else {
             return;
         };
+        self.effect_scopes.push(CheckedEffectSet::default());
         self.finalizer_boundaries.push(FinalizerBoundary {
             loop_depth,
             when_depth: self.when_contexts.len(),
@@ -5985,6 +5990,8 @@ impl<'program> Checker<'program> {
         self.finalizer_boundaries
             .pop()
             .expect("checked finalizer boundary");
+        let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
+        self.report_finally_checked_effects(finalizer_effects, finally.span);
         self.active_loop_depth = loop_depth;
     }
 

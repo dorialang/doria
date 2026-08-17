@@ -548,6 +548,15 @@ function f(): void throws Failure
         "E0632",
     );
     assert_code(
+        r#"
+function main(): void throws Doria\Std\Io\IoError
+{
+    if (true) {} finally { echo "cleanup"; }
+}
+"#,
+        "E0632",
+    );
+    assert_code(
         &format!(
             r#"
 {failure}
