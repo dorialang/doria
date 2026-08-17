@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::enums::EnumType;
+use crate::source::Span;
 
 pub use crate::numeric::{FloatType, IntegerType};
 
@@ -13,6 +14,9 @@ pub struct TypeRef {
     /// position without pretending every argument is a type.
     pub arguments: Vec<TypeArgumentRef>,
     pub nullable: bool,
+    /// Source-preserving syntax for the accepted `function(T): R` type form.
+    /// Semantic callable compatibility remains a Stage 30 concern.
+    pub function: Option<Box<FunctionTypeRef>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,12 +25,29 @@ pub enum TypeArgumentRef {
     Value(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionTypeRef {
+    pub keyword_span: Span,
+    pub parameter_list_span: Span,
+    pub parameters: Vec<FunctionTypeParameterRef>,
+    pub return_type: Box<TypeRef>,
+    pub return_type_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionTypeParameterRef {
+    pub ty: TypeRef,
+    pub span: Span,
+}
+
 impl TypeRef {
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
             arguments: Vec::new(),
             nullable: false,
+            function: None,
         }
     }
 
@@ -35,6 +56,7 @@ impl TypeRef {
             name: name.into(),
             arguments: args.into_iter().map(TypeArgumentRef::Type).collect(),
             nullable: false,
+            function: None,
         }
     }
 
@@ -46,6 +68,16 @@ impl TypeRef {
             name: name.into(),
             arguments,
             nullable: false,
+            function: None,
+        }
+    }
+
+    pub fn function(function: FunctionTypeRef) -> Self {
+        Self {
+            name: "function".to_string(),
+            arguments: Vec::new(),
+            nullable: false,
+            function: Some(Box::new(function)),
         }
     }
 
@@ -103,10 +135,30 @@ impl TypeRef {
                 })
                 .collect(),
             nullable: self.nullable,
+            function: self.function.as_ref().map(|function| {
+                Box::new(FunctionTypeRef {
+                    keyword_span: function.keyword_span,
+                    parameter_list_span: function.parameter_list_span,
+                    parameters: function
+                        .parameters
+                        .iter()
+                        .map(|parameter| FunctionTypeParameterRef {
+                            ty: parameter.ty.resolve_self_in(self_type),
+                            span: parameter.span,
+                        })
+                        .collect(),
+                    return_type: Box::new(function.return_type.resolve_self_in(self_type)),
+                    return_type_span: function.return_type_span,
+                    span: function.span,
+                })
+            }),
         }
     }
 
     pub fn as_class_name(&self) -> Option<&str> {
+        if self.function.is_some() {
+            return None;
+        }
         if IntegerType::from_source_name(&self.name).is_some() {
             return None;
         }
@@ -127,6 +179,19 @@ impl fmt::Display for TypeRef {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.nullable {
             write!(formatter, "?")?;
+        }
+        if let Some(function) = &self.function {
+            let parameters = function
+                .parameters
+                .iter()
+                .map(|parameter| parameter.ty.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return write!(
+                formatter,
+                "function({parameters}): {}",
+                function.return_type
+            );
         }
         if self.name == "[]" && self.arguments.len() == 1 {
             if let TypeArgumentRef::Type(element) = &self.arguments[0] {

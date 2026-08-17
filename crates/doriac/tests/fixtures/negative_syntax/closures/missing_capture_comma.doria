@@ -1,0 +1,1 @@
+let $closure = fn(int $value) with ($left $right) => $value;

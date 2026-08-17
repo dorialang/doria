@@ -3,7 +3,7 @@ use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::lexer::{Lexer, StringQuoteKind, Token, TokenKind};
 use crate::source::{SourceFile, Span};
 use crate::string_literal::{decode_escape, interpolation_close};
-use crate::types::TypeRef;
+use crate::types::{FunctionTypeParameterRef, FunctionTypeRef, TypeRef};
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -69,7 +69,13 @@ impl Parser {
             self.parse_interface().map(Item::Interface)
         } else if self.match_kind(&TokenKind::Trait) {
             self.parse_trait().map(Item::Trait)
-        } else if self.match_kind(&TokenKind::Function) {
+        } else if self.check(&TokenKind::Function)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Identifier(_)))
+        {
+            self.advance();
             self.parse_function(MemberAccess::External, None, None, self.previous().span)
                 .map(Item::Function)
         } else if self.match_kind(&TokenKind::Const) {
@@ -250,7 +256,13 @@ impl Parser {
         let writable_span = self
             .match_kind(&TokenKind::Writable)
             .then(|| self.previous().span);
-        if self.match_kind(&TokenKind::Function) {
+        if self.check(&TokenKind::Function)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Identifier(_)))
+        {
+            self.advance();
             let start = self.previous().span.start;
             return self
                 .parse_function(access, writable_span, static_span, Span::new(start, start))
@@ -531,6 +543,347 @@ impl Parser {
             name,
             default,
             span: Span::new(start, end),
+        })
+    }
+
+    fn parse_arrow_closure(&mut self, keyword_span: Span) -> Option<Expr> {
+        let (parameters, parameter_list_span) = self.parse_closure_parameters()?;
+        if self.check(&TokenKind::Colon) {
+            let colon = self.advance().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "an explicit arrow return annotation has not been accepted; omit it and let the arrow body determine the return type",
+                    colon,
+                )
+                .with_title("Arrow Return Annotation Is Not Accepted"),
+            );
+            let _ = self.parse_type_ref();
+        }
+        let captures = self.parse_optional_closure_captures()?;
+        let arrow_span = self
+            .expect(
+                TokenKind::FatArrow,
+                "expected `=>` before arrow closure body",
+            )?
+            .span;
+        let expression = self.parse_expression()?;
+        let span = Span::new(keyword_span.start, expression.span().end);
+        Some(Expr::Closure(Box::new(ClosureExpression {
+            form: ClosureForm::Arrow,
+            keyword_span,
+            parameter_list_span,
+            parameters,
+            return_type: None,
+            captures,
+            body: ClosureBody::Expression {
+                arrow_span,
+                expression: Box::new(expression),
+            },
+            span,
+        })))
+    }
+
+    fn parse_anonymous_block_closure(&mut self, keyword_span: Span) -> Option<Expr> {
+        let (parameters, parameter_list_span) = self.parse_closure_parameters()?;
+        let return_type = if self.match_kind(&TokenKind::Colon) {
+            let colon_span = self.previous().span;
+            let return_start = self.peek().span.start;
+            let return_type = self.parse_type_ref()?;
+            let return_span = Span::new(return_start, self.previous().span.end);
+            Some(ClosureReturnType {
+                colon_span,
+                ty: return_type,
+                type_span: return_span,
+                span: Span::new(colon_span.start, return_span.end),
+            })
+        } else {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "an anonymous block closure requires a written return type after its parameter list",
+                    self.peek().span,
+                )
+                .with_title("Anonymous Closure Return Type Is Required")
+                .with_help("write `: ReturnType` before `with` or the block body"),
+            );
+            None
+        };
+        let captures = self.parse_optional_closure_captures()?;
+        if self.check(&TokenKind::FatArrow) {
+            let arrow = self.advance().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "anonymous `function` closures use a block body; use `fn` for an arrow body",
+                    arrow,
+                )
+                .with_title("Anonymous Closure Requires A Block"),
+            );
+            return None;
+        }
+        let block = self.parse_block()?;
+        let span = Span::new(keyword_span.start, block.span.end);
+        Some(Expr::Closure(Box::new(ClosureExpression {
+            form: ClosureForm::AnonymousBlock,
+            keyword_span,
+            parameter_list_span,
+            parameters,
+            return_type,
+            captures,
+            body: ClosureBody::Block(block),
+            span,
+        })))
+    }
+
+    fn parse_closure_parameters(&mut self) -> Option<(Vec<ClosureParameter>, Span)> {
+        let open_span = self
+            .expect(TokenKind::LeftParen, "expected `(` after closure keyword")?
+            .span;
+        let mut parameters = Vec::new();
+        if !self.check(&TokenKind::RightParen) {
+            loop {
+                parameters.push(self.parse_closure_parameter()?);
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightParen) {
+                    break;
+                }
+            }
+        }
+        let close_span = self
+            .expect(
+                TokenKind::RightParen,
+                "expected `)` after closure parameters",
+            )?
+            .span;
+        Some((parameters, open_span.merge(close_span)))
+    }
+
+    fn parse_closure_parameter(&mut self) -> Option<ClosureParameter> {
+        let start = self.peek().span.start;
+        let ownership_modifier_insert = Span::new(start, start);
+        let mut take_span = None;
+        let mut writable_span = None;
+        while self.check(&TokenKind::Take) || self.check(&TokenKind::Writable) {
+            let token = self.advance().clone();
+            match token.kind {
+                TokenKind::Take if take_span.is_none() => take_span = Some(token.span),
+                TokenKind::Writable if writable_span.is_none() => writable_span = Some(token.span),
+                TokenKind::Take => {
+                    self.error("duplicate `take` closure parameter modifier", token.span)
+                }
+                TokenKind::Writable => self.error(
+                    "duplicate `writable` closure parameter modifier",
+                    token.span,
+                ),
+                _ => unreachable!("closure parameter modifier loop is exact"),
+            }
+        }
+
+        if let Some((name, name_span)) = self.consume_variable() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    format!("closure parameter `${name}` requires a written type"),
+                    name_span,
+                )
+                .with_title("Closure Parameter Type Is Required")
+                .with_help("write the parameter type before the variable name"),
+            );
+            return Some(ClosureParameter {
+                take: take_span.is_some(),
+                take_span,
+                writable: writable_span.is_some(),
+                writable_span,
+                ty: TypeRef::unknown(),
+                type_span: ownership_modifier_insert,
+                name,
+                name_span,
+                span: Span::new(start, name_span.end),
+            });
+        }
+
+        let type_start = self.peek().span.start;
+        let ty = self.parse_type_ref()?;
+        let type_span = Span::new(type_start, self.previous().span.end);
+        let (name, name_span) = self.expect_variable("expected closure parameter variable name")?;
+        if self.match_kind(&TokenKind::Equals) {
+            let equals = self.previous().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "closure parameter defaults are not part of the accepted closure grammar",
+                    equals,
+                )
+                .with_title("Closure Parameter Default Is Not Accepted"),
+            );
+            let _ = self.parse_expression();
+        }
+        Some(ClosureParameter {
+            take: take_span.is_some(),
+            take_span,
+            writable: writable_span.is_some(),
+            writable_span,
+            ty,
+            type_span,
+            name,
+            name_span,
+            span: Span::new(start, name_span.end),
+        })
+    }
+
+    fn parse_optional_closure_captures(&mut self) -> Option<Option<ClosureCaptureClause>> {
+        if self.match_kind(&TokenKind::With) {
+            let keyword_span = self.previous().span;
+            return self.parse_closure_capture_clause(keyword_span).map(Some);
+        }
+        if matches!(&self.peek().kind, TokenKind::Identifier(name) if name == "use")
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::LeftParen))
+        {
+            let keyword_span = self.advance().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "Doria closure captures use `with`, not PHP closure `use`",
+                    keyword_span,
+                )
+                .with_title("Closure Capture Uses With")
+                .with_help("replace `use` with `with`"),
+            );
+            return self.parse_closure_capture_clause(keyword_span).map(Some);
+        }
+        Some(None)
+    }
+
+    fn parse_closure_capture_clause(&mut self, keyword_span: Span) -> Option<ClosureCaptureClause> {
+        let open_span = self
+            .expect(
+                TokenKind::LeftParen,
+                "expected `(` after closure capture keyword",
+            )?
+            .span;
+        let mut captures = Vec::new();
+        if self.check(&TokenKind::RightParen) {
+            let close_span = self.advance().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "a closure without captures omits the `with` clause",
+                    keyword_span.merge(close_span),
+                )
+                .with_title("Empty Closure Capture List Is Not Accepted")
+                .with_help("remove `with ()`"),
+            );
+            return Some(ClosureCaptureClause {
+                keyword_span,
+                open_span,
+                close_span,
+                captures,
+                span: keyword_span.merge(close_span),
+            });
+        }
+
+        loop {
+            captures.push(self.parse_closure_capture()?);
+            if self.match_kind(&TokenKind::Comma) {
+                if self.check(&TokenKind::RightParen) {
+                    self.error(
+                        "expected a captured variable after `,`",
+                        self.previous().span,
+                    );
+                    break;
+                }
+                continue;
+            }
+            if self.check(&TokenKind::RightParen) {
+                break;
+            }
+            if matches!(
+                self.peek().kind,
+                TokenKind::Variable(_)
+                    | TokenKind::Writable
+                    | TokenKind::Take
+                    | TokenKind::Readonly
+                    | TokenKind::Ampersand
+            ) {
+                self.error("expected `,` between closure captures", self.peek().span);
+                continue;
+            }
+            break;
+        }
+
+        let close_span = self
+            .expect(TokenKind::RightParen, "expected `)` after closure captures")?
+            .span;
+        Some(ClosureCaptureClause {
+            keyword_span,
+            open_span,
+            close_span,
+            captures,
+            span: keyword_span.merge(close_span),
+        })
+    }
+
+    fn parse_closure_capture(&mut self) -> Option<ClosureCapture> {
+        let start = self.peek().span.start;
+        let (mode, modifier_span) = if self.match_kind(&TokenKind::Writable) {
+            (ClosureCaptureMode::Writable, Some(self.previous().span))
+        } else if self.match_kind(&TokenKind::Take) {
+            (ClosureCaptureMode::Take, Some(self.previous().span))
+        } else if self.match_kind(&TokenKind::Readonly) {
+            let span = self.previous().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "readonly closure capture is written as a bare variable",
+                    span,
+                )
+                .with_title("Readonly Capture Does Not Use A Modifier")
+                .with_help("remove `readonly` and keep the captured variable"),
+            );
+            (ClosureCaptureMode::Readonly, Some(span))
+        } else {
+            (ClosureCaptureMode::Readonly, None)
+        };
+
+        while self.check(&TokenKind::Writable)
+            || self.check(&TokenKind::Take)
+            || self.check(&TokenKind::Readonly)
+        {
+            let span = self.advance().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "a closure capture has exactly one ownership mode",
+                    span,
+                )
+                .with_title("Closure Capture Has Multiple Modifiers"),
+            );
+        }
+        if self.match_kind(&TokenKind::Ampersand) {
+            let span = self.previous().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "Doria closure captures do not use PHP reference `&` syntax",
+                    span,
+                )
+                .with_title("Closure Capture Does Not Use Ampersand")
+                .with_help("use a bare variable for readonly capture or `writable $value` for an exclusive borrow"),
+            );
+        }
+        let (name, name_span) = self.expect_variable("expected captured variable")?;
+        Some(ClosureCapture {
+            mode,
+            modifier_span,
+            name,
+            name_span,
+            span: Span::new(start, name_span.end),
         })
     }
 
@@ -1770,6 +2123,19 @@ impl Parser {
                 span: token.span,
             }),
             TokenKind::Null => Some(Expr::Null { span: token.span }),
+            TokenKind::Fn => self.parse_arrow_closure(token.span),
+            TokenKind::Function => self.parse_anonymous_block_closure(token.span),
+            TokenKind::With => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "a closure capture clause must appear after its parameter list and before its body",
+                        token.span,
+                    )
+                    .with_title("Closure Capture Clause Is In The Wrong Position"),
+                );
+                None
+            }
             TokenKind::When => self.parse_when_expression(token.span.start, None),
             TokenKind::Given => {
                 let given = self.parse_given_prelude(token.span.start)?;
@@ -2278,7 +2644,7 @@ impl Parser {
             Expr::Range { start, end, .. } => {
                 Self::contains_bare_identifier(start) || Self::contains_bare_identifier(end)
             }
-            Expr::Match { .. } | Expr::When(_) => false,
+            Expr::Closure(_) | Expr::Match { .. } | Expr::When(_) => false,
             Expr::Variable { .. }
             | Expr::This { .. }
             | Expr::StaticMember { .. }
@@ -2554,9 +2920,69 @@ impl Parser {
         }
     }
 
+    fn parse_function_type_ref(&mut self, keyword_span: Span, nullable: bool) -> Option<TypeRef> {
+        let open_span = self
+            .expect(TokenKind::LeftParen, "expected `(` after `function` type")?
+            .span;
+        let mut parameters = Vec::new();
+        if !self.check(&TokenKind::RightParen) {
+            loop {
+                let start = self.peek().span.start;
+                let ty = self.parse_type_ref_inner()?;
+                let span = Span::new(start, self.previous().span.end);
+                if let Some((_name, name_span)) = self.consume_variable() {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "P0001",
+                            "function-type parameters contain types, not parameter names",
+                            name_span,
+                        )
+                        .with_title("Function Type Parameter Has A Name")
+                        .with_help("remove the variable name from the function type"),
+                    );
+                }
+                parameters.push(FunctionTypeParameterRef { ty, span });
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+                if self.check(&TokenKind::RightParen) {
+                    break;
+                }
+            }
+        }
+        let close_span = self
+            .expect(
+                TokenKind::RightParen,
+                "expected `)` after function-type parameters",
+            )?
+            .span;
+        self.expect(
+            TokenKind::Colon,
+            "expected `:` before function-type return type",
+        )?;
+        let return_start = self.peek().span.start;
+        let return_type = self.parse_type_ref_inner()?;
+        let return_type_span = Span::new(return_start, self.previous().span.end);
+        let span = Span::new(keyword_span.start, return_type_span.end);
+        let mut ty = TypeRef::function(FunctionTypeRef {
+            keyword_span,
+            parameter_list_span: open_span.merge(close_span),
+            parameters,
+            return_type: Box::new(return_type),
+            return_type_span,
+            span,
+        });
+        ty.nullable = nullable;
+        Some(ty)
+    }
+
     fn parse_type_ref_inner(&mut self) -> Option<TypeRef> {
         let nullable = self.match_kind(&TokenKind::Question);
-        let name = match self.advance().kind.clone() {
+        let token = self.advance().clone();
+        if matches!(token.kind, TokenKind::Function) {
+            return self.parse_function_type_ref(token.span, nullable);
+        }
+        let name = match token.kind {
             TokenKind::Void => "void".to_string(),
             TokenKind::IntType => "int".to_string(),
             TokenKind::Int8Type => "int8".to_string(),
@@ -2748,6 +3174,7 @@ impl Parser {
                 | TokenKind::Object
                 | TokenKind::Resource
                 | TokenKind::SelfType
+                | TokenKind::Function
                 | TokenKind::Identifier(_)
         )
     }
@@ -2902,12 +3329,14 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Namespace => "namespace",
         TokenKind::Extends => "extends",
         TokenKind::Function => "function",
+        TokenKind::Fn => "fn",
         TokenKind::Const => "const",
         TokenKind::Internal => "internal",
         TokenKind::Static => "static",
         TokenKind::SelfType => "self",
         TokenKind::Parent => "parent",
         TokenKind::Let => "let",
+        TokenKind::With => "with",
         TokenKind::Take => "take",
         TokenKind::Writable => "writable",
         TokenKind::Readonly => "readonly",

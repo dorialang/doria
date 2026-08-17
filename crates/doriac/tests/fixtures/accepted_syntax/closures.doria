@@ -1,0 +1,30 @@
+let $minimum = 70;
+let writable $count = 0;
+let $message = "ready";
+
+let $double = fn(int $value) => $value * 2;
+let $passes = fn(int $score) with ($minimum) => $score >= $minimum;
+let $operation = fn(int $increment)
+    with (writable $count, take $message, $minimum, $minimum) =>
+    process($increment, $count, $message);
+
+let $positive = function (int $value): bool {
+    return $value > 0;
+};
+
+let $capturing = function (int $score): bool with ($minimum) {
+    return $score >= $minimum;
+};
+
+let $nested = fn(int $outer) => fn(int $inner) => $outer + $inner;
+let $items = [fn(int $value) => $value];
+consume(fn(string $label) => $label);
+
+function make(): function(int): int
+{
+    return fn(int $value) => $value + 1;
+}
+
+function accept(function(int, string): bool $predicate, function(): void $done): void
+{
+}

@@ -4,8 +4,8 @@
 - **Accepted:** 2026-08-14
 - **Date:** 2026-08-14
 - **Implementation status:** Scheduled for Stage 31 and Stage 33; not implemented
-- **Current pipeline:** Stage 29 — Checked errors end-to-end — Complete; the
-  pre-Stage-30 closure grammar slice is next
+- **Current pipeline:** Stage 29 — Checked errors end-to-end — Complete;
+  pre-Stage-30 closure grammar — Complete; Stage 30 semantics — Next
 - **Scope:** Package source discovery, file layout, compilation inputs, package
   visibility, and the Baton-to-compiler boundary
 - **Amends:** Decision 0028
@@ -306,8 +306,9 @@ plans. Decision 0118 owns the rest of Stage 33.
 
 Stage 29 is complete. Its six exact compiler-known `Doria\Std\Io` identities
 are a bounded exception that does not provide general namespace resolution or
-short aliases. The pre-Stage-30 closure grammar slice is next. Stage 31 is scheduled,
-not implemented; this accepted authority does not start it.
+short aliases. The pre-Stage-30 closure grammar slice is complete. Stage 30
+closure semantics is next; Stage 31 is scheduled, not implemented, and this
+accepted authority does not start it.
 
 ## Safe Deferrals
 

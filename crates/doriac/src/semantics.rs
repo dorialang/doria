@@ -6351,6 +6351,9 @@ impl<'program> Checker<'program> {
         allow_range_expr: bool,
     ) {
         match expr {
+            Expr::Closure(closure) => {
+                self.report_stage_30_closure_boundary("closure", closure.span);
+            }
             Expr::Variable { name, span } => {
                 if scopes.lookup(name).is_none() {
                     self.undeclared_variable(name, *span);
@@ -6708,6 +6711,23 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+    }
+
+    fn report_stage_30_closure_boundary(&mut self, surface: &str, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::unsupported_stage(
+                "E0641",
+                format!(
+                    "{surface} syntax is accepted Doria; closure checking and execution land in Stage 30"
+                ),
+                span,
+            )
+            .with_title("Closure Semantics Await Stage 30")
+            .with_explanation(
+                "The compiler preserves this syntax now so valid Doria can be edited and inspected before closure semantics land.",
+            )
+            .with_help("keep the closure source as written; it is valid Doria syntax and does not need rewriting"),
+        );
     }
 
     fn check_match_expression(
@@ -12276,6 +12296,10 @@ impl<'program> Checker<'program> {
         position: TypePosition,
         declaring_class: Option<&str>,
     ) -> TypeId {
+        if let Some(function) = &ty.function {
+            self.report_stage_30_closure_boundary("function type", function.span);
+            return self.types.unknown();
+        }
         if ty.has_value_arguments() {
             for argument in ty.type_arguments() {
                 self.resolve_type_ref_in_position(
@@ -13709,6 +13733,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> TypeId {
         match expr {
+            Expr::Closure(_) => self.types.unknown(),
             Expr::String { .. } | Expr::InterpolatedString { .. } => {
                 self.types.intern(TypeKind::String)
             }
