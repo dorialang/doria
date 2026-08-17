@@ -75,6 +75,28 @@ pub fn check_source(path: impl Into<String>, text: impl Into<String>) -> Diagnos
     Ok(program)
 }
 
+/// Parses and semantically analyzes one source file for editor tooling.
+///
+/// The returned program is the user-authored syntax tree, while the semantic
+/// analysis includes compiler-known declarations required by the source. This
+/// keeps editor spans anchored to source without bypassing compiler setup.
+pub fn analyze_source_for_ide(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<(Program, semantics::SemanticAnalysis)> {
+    let source = SourceFile::new(path, text);
+    let program = parse_source_file(&source)?;
+    compiler_known_io::validate_reserved_identities(&program)?;
+    let analyzed_program = if compiler_known_io::source_uses_canonical_io(&source)? {
+        compiler_known_io::augment_program(&program)
+    } else {
+        program.clone()
+    };
+    let analysis =
+        semantics::analyze_program_for_ide_with_source(&analyzed_program, Some(&source.text));
+    Ok((program, analysis))
+}
+
 pub fn compile_source_to_php(
     path: impl Into<String>,
     text: impl Into<String>,

@@ -912,3 +912,26 @@ function main(): int
         .iter()
         .any(|diagnostic| diagnostic.message.contains("unknown type `IoError`")));
 }
+
+#[test]
+fn ide_analysis_uses_the_compiler_known_io_pipeline_without_exposing_synthetic_items() {
+    let source = r#"function main(): void throws Doria\Std\Io\IoError
+{
+    echo "ready";
+}
+"#;
+
+    let (program, analysis) = doriac::analyze_source_for_ide("ide_io.doria", source)
+        .expect("IDE analysis should parse compiler-known I/O types");
+
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    assert_eq!(
+        program.items.len(),
+        1,
+        "synthetic declarations stay compiler-owned"
+    );
+}
