@@ -305,12 +305,16 @@ function repeat(): void
         if ($count < 2) { continue; }
     } while ($count < 3);
 }
+function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
 function finalized(bool $ready): int throws Doria\Std\Io\IoError
 {
     if ($ready) {
         return 42;
     } finally {
-        echo "cleanup";
+        record("cleanup");
     }
     return 0;
 }
@@ -322,7 +326,7 @@ function loopFinalizer(): void throws Doria\Std\Io\IoError
         if ($count == 1) { continue; }
         break;
     } finally {
-        echo "loop cleanup";
+        record("loop cleanup");
     }
 }
 function main(): void throws Doria\Std\Io\IoError

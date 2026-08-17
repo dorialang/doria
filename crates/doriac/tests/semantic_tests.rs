@@ -4496,7 +4496,10 @@ function main(): void throws Doria\Std\Io\IoError
         $prepared = 3;
         $finished = true;
         let $cleanupLocal = $prepared;
-        echo $cleanupLocal;
+        try {
+            echo $cleanupLocal;
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 
     echo $finished;
