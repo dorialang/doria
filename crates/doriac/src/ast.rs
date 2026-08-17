@@ -398,6 +398,79 @@ pub struct ForeachBinding {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct ClosureExpression {
+    pub form: ClosureForm,
+    pub keyword_span: Span,
+    pub parameter_list_span: Span,
+    pub parameters: Vec<ClosureParameter>,
+    pub return_type: Option<ClosureReturnType>,
+    pub captures: Option<ClosureCaptureClause>,
+    pub body: ClosureBody,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureForm {
+    Arrow,
+    AnonymousBlock,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureParameter {
+    pub take: bool,
+    pub take_span: Option<Span>,
+    pub writable: bool,
+    pub writable_span: Option<Span>,
+    pub ty: TypeRef,
+    pub type_span: Span,
+    pub name: String,
+    pub name_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureReturnType {
+    pub colon_span: Span,
+    pub ty: TypeRef,
+    pub type_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureCaptureClause {
+    pub keyword_span: Span,
+    pub open_span: Span,
+    pub close_span: Span,
+    pub captures: Vec<ClosureCapture>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureCapture {
+    pub mode: ClosureCaptureMode,
+    pub modifier_span: Option<Span>,
+    pub name: String,
+    pub name_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureCaptureMode {
+    Readonly,
+    Writable,
+    Take,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClosureBody {
+    Expression {
+        arrow_span: Span,
+        expression: Box<Expr>,
+    },
+    Block(Block),
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Variable {
         name: String,
@@ -530,6 +603,7 @@ pub enum Expr {
         span: Span,
     },
     When(Box<WhenExpression>),
+    Closure(Box<ClosureExpression>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -684,6 +758,7 @@ impl Expr {
             | Expr::Range { span, .. }
             | Expr::Match { span, .. } => *span,
             Expr::When(when) => when.span,
+            Expr::Closure(closure) => closure.span,
         }
     }
 }

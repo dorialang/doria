@@ -1,0 +1,3 @@
+let $closure = function (int $value) {
+    return $value;
+};

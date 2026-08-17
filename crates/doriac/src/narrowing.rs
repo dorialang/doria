@@ -1110,6 +1110,7 @@ fn kill_mutated_call_arguments(
             }
         }
         Expr::Variable { .. }
+        | Expr::Closure(_)
         | Expr::This { .. }
         | Expr::Identifier { .. }
         | Expr::String { .. }
@@ -1279,7 +1280,7 @@ fn expression_fact(
         | Expr::This { .. }
         | Expr::Unary { .. }
         | Expr::IsType { .. } => Some(Fact::NonNull),
-        Expr::Match { .. } | Expr::When(_) => None,
+        Expr::Closure(_) | Expr::Match { .. } | Expr::When(_) => None,
         Expr::Variable { .. } => variable_binding(value, resolution).and_then(|binding| {
             state.facts.get(&binding).cloned().or_else(|| {
                 resolution
@@ -1704,6 +1705,7 @@ fn collect_expr(
             incoming
         }
         Expr::This { .. }
+        | Expr::Closure(_)
         | Expr::Identifier { .. }
         | Expr::String { .. }
         | Expr::Int { .. }
@@ -2193,6 +2195,7 @@ impl Resolver {
                 }
             }
             Expr::This { .. }
+            | Expr::Closure(_)
             | Expr::Identifier { .. }
             | Expr::String { .. }
             | Expr::Int { .. }

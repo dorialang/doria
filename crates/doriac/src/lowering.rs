@@ -656,6 +656,9 @@ fn lower_argument(argument: &ast::Argument, class_name: Option<ClassContext<'_>>
 
 fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Expr {
     match expr {
+        ast::Expr::Closure(_) => {
+            unreachable!("closure expressions must stop at the Stage 30 semantic boundary")
+        }
         ast::Expr::Variable { name, span } => hir::Expr::Variable {
             name: name.clone(),
             span: *span,

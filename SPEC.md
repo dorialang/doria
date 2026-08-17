@@ -388,10 +388,12 @@ between arrow and block bodies preserves the capture list and its ownership
 modes. Own parameters and locals, top-level functions, constants, statics, type
 names, and enum cases do not require capture.
 
-This accepted surface is not implemented yet. Under the two-clocks rule, a
-pre-Stage-30 grammar slice will first accept and preserve the syntax in AST while
-emitting one Stage 30 unsupported-feature boundary. Stage 30 then owns semantic
-capture diagnostics, callable-effect integration, borrow-bound escape checking,
+This accepted surface is parseable and preserved in the source AST. Function
+types use `function(int): int` in type position, contain parameter types without
+parameter names, and use `function(): void` for a zero-parameter void form.
+Closure expressions and function-type semantic use currently emit the single
+catalogued `E0641` Stage 30 development boundary. Stage 30 owns semantic capture
+diagnostics, callable compatibility and effects, borrow-bound escape checking,
 HIR/MIR lowering, and execution. `$this` capture remains a bounded Stage 30
 design question; this specification does not invent `with ($this)` or assign it
 automatic behavior.

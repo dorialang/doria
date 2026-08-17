@@ -116,7 +116,8 @@ $require($decisionPath, $decision, [
     'panic stays status 101',
     'Pending Available',
     'Runner** and non-blocking',
-    'pre-Stage-30 closure grammar slice is next',
+    'pre-Stage-30 closure grammar slice is complete',
+    'accepted closure syntax stops at the catalogued E0641 boundary',
 ]);
 
 foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
@@ -127,7 +128,8 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 29 Slice 2 — Complete',
         'Corrective Beat: Native Collection Property Initializers — Complete',
         'Stage 29 Slice 3 — Complete',
-        'Stage 30 — Blocked Until The Pre-Stage-30 Grammar Slice Completes',
+        'Pre-Stage-30 Grammar Slice — Complete',
+        'Stage 30 — Next, Not Implemented',
         'Stage 26b — Complete',
         'Measurement Status: Pending Available Runner',
     ]);
