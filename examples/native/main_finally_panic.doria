@@ -2,11 +2,14 @@ class Guard
 {
     function __destruct()
     {
-        echo "wrong destructor\n";
+        try {
+            echo "wrong destructor\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $guard = new Guard();
     echo "before\n";

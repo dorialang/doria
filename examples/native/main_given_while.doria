@@ -1,15 +1,15 @@
-function prepare(): void
+function prepare(): void throws Doria\Std\Io\IoError
 {
     echo "setup\n";
 }
 
-function ready(int $remaining): bool
+function ready(int $remaining): bool throws Doria\Std\Io\IoError
 {
     echo "predicate {$remaining}\n";
     return true;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     given {
         prepare();

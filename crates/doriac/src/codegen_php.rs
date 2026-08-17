@@ -62,6 +62,49 @@ function __doria_throw(__DoriaErrorValue $error, int $origin): void
     );
 }
 
+function __doria_safe_error_message(string $message): string
+{
+    $safe = "";
+    $length = strlen($message);
+    for ($index = 0; $index < $length; ++$index) {
+        $byte = ord($message[$index]);
+        $safe .= match ($byte) {
+            0 => "\\u0000",
+            10 => "\n  ",
+            13 => "\\r",
+            9 => "\\t",
+            default => $byte < 0x20 || $byte === 0x7f
+                ? sprintf("\\u00%02x", $byte)
+                : $message[$index],
+        };
+    }
+    return $safe;
+}
+
+function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
+{
+    global $__doria_source_path, $__doria_source_text;
+    $type = $caught->descriptor->typeName;
+    $origin = $caught->origin;
+    $line = __doria_source_line($origin);
+    $before = substr($__doria_source_text, 0, max(0, $origin));
+    $lineStart = strrpos($before, "\n");
+    $lineStart = $lineStart === false ? 0 : $lineStart + 1;
+    $lineEnd = strpos($__doria_source_text, "\n", max(0, $origin));
+    $lineEnd = $lineEnd === false ? strlen($__doria_source_text) : $lineEnd;
+    $lineText = rtrim(substr($__doria_source_text, $lineStart, $lineEnd - $lineStart), "\r");
+    $markerOffset = max(0, $origin - $lineStart);
+    $message = "Error[R1000]: Unhandled " . $type . "\n\nWhere\n" .
+        $__doria_source_path . " · line " . $line . " · main\n\n" .
+        $lineText . "\n" . str_repeat(" ", $markerOffset) . "^\n" .
+        "This Error Was First Thrown Here\n\nWhy\n  " .
+        __doria_safe_error_message($caught->error->message) .
+        "\n\nProcess Exited With Status 70\n";
+    @fwrite(STDERR, $message);
+    unset($caught);
+    exit(70);
+}
+
 "#;
 
 const PHP_STAGE26_COLLECTION_HELPERS: &str = r#"
@@ -493,6 +536,7 @@ pub fn generate(program: &Program) -> Result<String, BackendError> {
         }
     }
     output.push_str("];\n\n");
+    emit_checked_io_message_vocabulary(&mut output);
     output.push_str(
         r#"function __doria_source_line(int $offset): int
 {
@@ -572,42 +616,152 @@ function __doria_panic(string $code, int $start, int $end, ?string $message = nu
 
 function __doria_read_line(string $prompt, int $start, int $end): ?string
 {
-    if ($prompt !== "") { __doria_write_all(STDOUT, $prompt, $start, $end); }
+    if ($prompt !== "") {
+        __doria_write_all(
+            STDOUT,
+            $prompt,
+            $start,
+            $end,
+            __DoriaStdIoIoTarget::__doriaCaseStandardOutput(),
+            __DoriaStdIoIoOperation::Write,
+        );
+    }
     __doria_flush_stdout($start, $end);
+    error_clear_last();
     $line = @fgets(STDIN);
     if ($line === false) {
         if (feof(STDIN)) { return null; }
-        __doria_panic("P1403", $start, $end);
+        __doria_throw_io(
+            __DoriaStdIoIoOperation::Read,
+            __DoriaStdIoIoTarget::__doriaCaseStandardInput(),
+            error_get_last(),
+            $start,
+        );
     }
-    if (preg_match('//u', $line) !== 1) { __doria_panic("P1404", $start, $end); }
     if (str_ends_with($line, "\n")) {
         $line = substr($line, 0, -1);
         if (str_ends_with($line, "\r")) { $line = substr($line, 0, -1); }
+    }
+    $invalid = __doria_invalid_utf8($line);
+    if ($invalid !== null) {
+        [$valid, $length] = $invalid;
+        __doria_throw(
+            new __DoriaStdIoInvalidUtf8Error(
+                __doria_invalid_utf8_message(
+                    __DoriaStdIoUtf8InputSource::__doriaCaseStandardInput()
+                ),
+                __DoriaStdIoUtf8InputSource::__doriaCaseStandardInput(),
+                $valid,
+                $length,
+            ),
+            $start,
+        );
     }
     return $line;
 }
 
 function __doria_read_file(string $path, int $start, int $end): string
 {
-    if (str_contains($path, "\0")) { __doria_panic("P1405", $start, $end); }
-    $contents = @file_get_contents($path);
-    if ($contents === false) { __doria_panic("P1401", $start, $end); }
-    if (preg_match('//u', $contents) !== 1) { __doria_panic("P1406", $start, $end); }
+    if (str_contains($path, "\0")) {
+        __doria_throw_io_validation(__DoriaStdIoIoOperation::Open, $path, $start);
+    }
+    error_clear_last();
+    $file = @fopen($path, "rb");
+    if ($file === false) {
+        __doria_throw_io(
+            __DoriaStdIoIoOperation::Open,
+            __DoriaStdIoIoTarget::File($path),
+            error_get_last(),
+            $start,
+        );
+    }
+    $contents = "";
+    while (!feof($file)) {
+        error_clear_last();
+        $chunk = @fread($file, 8192);
+        if ($chunk === false) {
+            @fclose($file);
+            __doria_throw_io(
+                __DoriaStdIoIoOperation::Read,
+                __DoriaStdIoIoTarget::File($path),
+                error_get_last(),
+                $start,
+            );
+        }
+        $contents .= $chunk;
+    }
+    error_clear_last();
+    if (!@fclose($file)) {
+        __doria_throw_io(
+            __DoriaStdIoIoOperation::Read,
+            __DoriaStdIoIoTarget::File($path),
+            error_get_last(),
+            $start,
+        );
+    }
+    $invalid = __doria_invalid_utf8($contents);
+    if ($invalid !== null) {
+        [$valid, $length] = $invalid;
+        __doria_throw(
+            new __DoriaStdIoInvalidUtf8Error(
+                __doria_invalid_utf8_message(__DoriaStdIoUtf8InputSource::File($path)),
+                __DoriaStdIoUtf8InputSource::File($path),
+                $valid,
+                $length,
+            ),
+            $start,
+        );
+    }
     return $contents;
 }
 
 function __doria_write_file(string $path, string $contents, int $start, int $end): void
 {
-    if (str_contains($path, "\0")) { __doria_panic("P1405", $start, $end); }
-    $written = @file_put_contents($path, $contents);
-    if ($written === false || $written !== strlen($contents)) { __doria_panic("P1402", $start, $end); }
+    __doria_write_file_mode($path, $contents, false, $start, $end);
 }
 
 function __doria_append_file(string $path, string $contents, int $start, int $end): void
 {
-    if (str_contains($path, "\0")) { __doria_panic("P1405", $start, $end); }
-    $written = @file_put_contents($path, $contents, FILE_APPEND);
-    if ($written === false || $written !== strlen($contents)) { __doria_panic("P1402", $start, $end); }
+    __doria_write_file_mode($path, $contents, true, $start, $end);
+}
+
+function __doria_write_file_mode(
+    string $path,
+    string $contents,
+    bool $append,
+    int $start,
+    int $end,
+): void {
+    if (str_contains($path, "\0")) {
+        __doria_throw_io_validation(__DoriaStdIoIoOperation::Open, $path, $start);
+    }
+    error_clear_last();
+    $file = @fopen($path, $append ? "ab" : "wb");
+    if ($file === false) {
+        __doria_throw_io(
+            __DoriaStdIoIoOperation::Open,
+            __DoriaStdIoIoTarget::File($path),
+            error_get_last(),
+            $start,
+        );
+    }
+    __doria_write_all(
+        $file,
+        $contents,
+        $start,
+        $end,
+        __DoriaStdIoIoTarget::File($path),
+        $append ? __DoriaStdIoIoOperation::Append : __DoriaStdIoIoOperation::Write,
+    );
+    error_clear_last();
+    if (!@fclose($file)) {
+        __doria_throw_io(
+            $append ? __DoriaStdIoIoOperation::Append : __DoriaStdIoIoOperation::Write,
+            __DoriaStdIoIoTarget::File($path),
+            error_get_last(),
+            $start,
+        );
+    }
 }
 
 function __doria_is_broken_pipe(?array $error): bool
@@ -621,7 +775,173 @@ function __doria_is_broken_pipe(?array $error): bool
     return stripos($message, "broken pipe") !== false;
 }
 
-function __doria_write_all(mixed $stream, string $value, int $start, int $end): void
+function __doria_system_code(?array $error): ?int
+{
+    if ($error === null || !isset($error["message"])) { return null; }
+    if (preg_match('/\berrno=(\d+)\b/', $error["message"], $match) !== 1) { return null; }
+    return (int) $match[1];
+}
+
+function __doria_io_reason(?int $code): __DoriaStdIoIoErrorReason
+{
+    if ($code === null) { return __DoriaStdIoIoErrorReason::Other; }
+    if (PHP_OS_FAMILY === "Windows") {
+        return match ($code) {
+            2, 3 => __DoriaStdIoIoErrorReason::NotFound,
+            5, 32 => __DoriaStdIoIoErrorReason::PermissionDenied,
+            1, 87, 123, 206 => __DoriaStdIoIoErrorReason::InvalidInput,
+            995 => __DoriaStdIoIoErrorReason::Interrupted,
+            4, 8, 14, 39, 112 => __DoriaStdIoIoErrorReason::ResourceExhausted,
+            50 => __DoriaStdIoIoErrorReason::Unsupported,
+            6, 109, 232 => __DoriaStdIoIoErrorReason::Closed,
+            default => __DoriaStdIoIoErrorReason::Other,
+        };
+    }
+    return match ($code) {
+        2 => __DoriaStdIoIoErrorReason::NotFound,
+        1, 13 => __DoriaStdIoIoErrorReason::PermissionDenied,
+        22, 36, 63 => __DoriaStdIoIoErrorReason::InvalidInput,
+        4 => __DoriaStdIoIoErrorReason::Interrupted,
+        12, 23, 24, 28 => __DoriaStdIoIoErrorReason::ResourceExhausted,
+        38, 45, 78, 95 => __DoriaStdIoIoErrorReason::Unsupported,
+        9, 32 => __DoriaStdIoIoErrorReason::Closed,
+        default => __DoriaStdIoIoErrorReason::Other,
+    };
+}
+
+function __doria_io_operation_word(__DoriaStdIoIoOperation $operation): string
+{
+    global $__doria_io_message_vocabulary;
+    return match ($operation) {
+        __DoriaStdIoIoOperation::Open => $__doria_io_message_vocabulary["operations"][0],
+        __DoriaStdIoIoOperation::Read => $__doria_io_message_vocabulary["operations"][1],
+        __DoriaStdIoIoOperation::Write => $__doria_io_message_vocabulary["operations"][2],
+        __DoriaStdIoIoOperation::Append => $__doria_io_message_vocabulary["operations"][3],
+        __DoriaStdIoIoOperation::Flush => $__doria_io_message_vocabulary["operations"][4],
+    };
+}
+
+function __doria_io_reason_words(__DoriaStdIoIoErrorReason $reason): string
+{
+    global $__doria_io_message_vocabulary;
+    return match ($reason) {
+        __DoriaStdIoIoErrorReason::NotFound => $__doria_io_message_vocabulary["reasons"][0],
+        __DoriaStdIoIoErrorReason::PermissionDenied => $__doria_io_message_vocabulary["reasons"][1],
+        __DoriaStdIoIoErrorReason::InvalidInput => $__doria_io_message_vocabulary["reasons"][2],
+        __DoriaStdIoIoErrorReason::Interrupted => $__doria_io_message_vocabulary["reasons"][3],
+        __DoriaStdIoIoErrorReason::ResourceExhausted => $__doria_io_message_vocabulary["reasons"][4],
+        __DoriaStdIoIoErrorReason::Unsupported => $__doria_io_message_vocabulary["reasons"][5],
+        __DoriaStdIoIoErrorReason::Closed => $__doria_io_message_vocabulary["reasons"][6],
+        __DoriaStdIoIoErrorReason::Other => $__doria_io_message_vocabulary["reasons"][7],
+    };
+}
+
+function __doria_io_target_name(__DoriaStdIoIoTarget $target): string
+{
+    global $__doria_io_message_vocabulary;
+    if ($target->__doriaMatchesCase(0)) {
+        return $__doria_io_message_vocabulary["filePrefix"] .
+            $target->__doriaPayloadAt(0) . $__doria_io_message_vocabulary["fileSuffix"];
+    }
+    if ($target->__doriaMatchesCase(1)) { return $__doria_io_message_vocabulary["stdin"]; }
+    if ($target->__doriaMatchesCase(2)) { return $__doria_io_message_vocabulary["stdout"]; }
+    return $__doria_io_message_vocabulary["stderr"];
+}
+
+function __doria_invalid_utf8_message(__DoriaStdIoUtf8InputSource $source): string
+{
+    global $__doria_io_message_vocabulary;
+    $target = $source->__doriaMatchesCase(0)
+        ? $__doria_io_message_vocabulary["filePrefix"] . $source->__doriaPayloadAt(0) .
+            $__doria_io_message_vocabulary["fileSuffix"]
+        : $__doria_io_message_vocabulary["stdin"];
+    return $__doria_io_message_vocabulary["invalidUtf8Prefix"] . $target;
+}
+
+function __doria_throw_io(
+    __DoriaStdIoIoOperation $operation,
+    __DoriaStdIoIoTarget $target,
+    ?array $hostError,
+    int $origin,
+): void {
+    global $__doria_io_message_vocabulary;
+    $systemCode = __doria_system_code($hostError);
+    $reason = __doria_io_reason($systemCode);
+    $message = $__doria_io_message_vocabulary["ioPrefix"] .
+        __doria_io_operation_word($operation) . " " . __doria_io_target_name($target) .
+        $__doria_io_message_vocabulary["separator"] . __doria_io_reason_words($reason);
+    __doria_throw(new __DoriaStdIoIoError(
+        $message,
+        $operation,
+        $target,
+        $reason,
+        $systemCode,
+    ), $origin);
+}
+
+function __doria_throw_io_validation(
+    __DoriaStdIoIoOperation $operation,
+    string $path,
+    int $origin,
+): void {
+    global $__doria_io_message_vocabulary;
+    $target = __DoriaStdIoIoTarget::File($path);
+    $reason = __DoriaStdIoIoErrorReason::InvalidInput;
+    $message = $__doria_io_message_vocabulary["ioPrefix"] .
+        __doria_io_operation_word($operation) . " " . __doria_io_target_name($target) .
+        $__doria_io_message_vocabulary["separator"] . __doria_io_reason_words($reason);
+    __doria_throw(new __DoriaStdIoIoError(
+        $message,
+        $operation,
+        $target,
+        $reason,
+        null,
+    ), $origin);
+}
+
+function __doria_invalid_utf8(string $value): ?array
+{
+    $length = strlen($value);
+    for ($index = 0; $index < $length;) {
+        $first = ord($value[$index]);
+        if ($first <= 0x7f) { ++$index; continue; }
+        if ($first >= 0xc2 && $first <= 0xdf) {
+            $width = 2; $secondMin = 0x80; $secondMax = 0xbf;
+        } elseif ($first === 0xe0) {
+            $width = 3; $secondMin = 0xa0; $secondMax = 0xbf;
+        } elseif (($first >= 0xe1 && $first <= 0xec) || ($first >= 0xee && $first <= 0xef)) {
+            $width = 3; $secondMin = 0x80; $secondMax = 0xbf;
+        } elseif ($first === 0xed) {
+            $width = 3; $secondMin = 0x80; $secondMax = 0x9f;
+        } elseif ($first === 0xf0) {
+            $width = 4; $secondMin = 0x90; $secondMax = 0xbf;
+        } elseif ($first >= 0xf1 && $first <= 0xf3) {
+            $width = 4; $secondMin = 0x80; $secondMax = 0xbf;
+        } elseif ($first === 0xf4) {
+            $width = 4; $secondMin = 0x80; $secondMax = 0x8f;
+        } else {
+            return [$index, 1];
+        }
+        if ($index + $width > $length) { return [$index, null]; }
+        $second = ord($value[$index + 1]);
+        if ($second < $secondMin || $second > $secondMax) { return [$index, 1]; }
+        for ($offset = 2; $offset < $width; ++$offset) {
+            $continuation = ord($value[$index + $offset]);
+            if ($continuation < 0x80 || $continuation > 0xbf) { return [$index, 1]; }
+        }
+        $index += $width;
+    }
+    return null;
+}
+
+function __doria_write_all(
+    mixed $stream,
+    string $value,
+    int $start,
+    int $end,
+    __DoriaStdIoIoTarget $target,
+    __DoriaStdIoIoOperation $operation,
+): void
 {
     $offset = 0;
     $length = strlen($value);
@@ -630,7 +950,7 @@ function __doria_write_all(mixed $stream, string $value, int $start, int $end): 
         $written = @fwrite($stream, substr($value, $offset));
         if ($written === false || $written === 0) {
             if (__doria_is_broken_pipe(error_get_last())) { exit(0); }
-            __doria_panic("P1407", $start, $end);
+            __doria_throw_io($operation, $target, error_get_last(), $start);
         }
         $offset += $written;
     }
@@ -641,17 +961,36 @@ function __doria_flush_stdout(int $start, int $end): void
     error_clear_last();
     if (@fflush(STDOUT)) { return; }
     if (__doria_is_broken_pipe(error_get_last())) { exit(0); }
-    __doria_panic("P1407", $start, $end);
+    __doria_throw_io(
+        __DoriaStdIoIoOperation::Flush,
+        __DoriaStdIoIoTarget::__doriaCaseStandardOutput(),
+        error_get_last(),
+        $start,
+    );
 }
 
 function __doria_write_stdout(string $value, int $start, int $end): void
 {
-    __doria_write_all(STDOUT, $value, $start, $end);
+    __doria_write_all(
+        STDOUT,
+        $value,
+        $start,
+        $end,
+        __DoriaStdIoIoTarget::__doriaCaseStandardOutput(),
+        __DoriaStdIoIoOperation::Write,
+    );
 }
 
 function __doria_write_stderr(string $value, int $start, int $end): void
 {
-    __doria_write_all(STDERR, $value, $start, $end);
+    __doria_write_all(
+        STDERR,
+        $value,
+        $start,
+        $end,
+        __DoriaStdIoIoTarget::__doriaCaseStandardError(),
+        __DoriaStdIoIoOperation::Write,
+    );
 }
 
 function __doria_sprintf(string $format, mixed ...$values): string
@@ -662,7 +1001,7 @@ function __doria_sprintf(string $format, mixed ...$values): string
 function __doria_printf(int $start, int $end, string $format, mixed ...$values): void
 {
     $value = sprintf($format, ...$values);
-    __doria_write_all(STDOUT, $value, $start, $end);
+    __doria_write_stdout($value, $start, $end);
 }
 
 "#,
@@ -2061,7 +2400,7 @@ fn emit_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize, scopes: &
     }
     write_indent(output, indent);
     output.push_str("enum ");
-    output.push_str(&enum_decl.name);
+    output.push_str(&php_symbol_name(&enum_decl.name));
     if let Some(backing) = &enum_decl.backing_type {
         output.push_str(": ");
         output.push_str(&backing.name);
@@ -2087,7 +2426,7 @@ fn emit_payload_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize) {
         indent,
         &format!(
             "final class {} implements __DoriaValueEquatable",
-            enum_decl.name
+            php_symbol_name(&enum_decl.name)
         ),
     );
     writeln(output, indent, "{");
@@ -2242,7 +2581,7 @@ fn emit_class(
     writeln(
         output,
         indent,
-        &format!("class {}{implements}", class_decl.name),
+        &format!("class {}{implements}", php_symbol_name(&class_decl.name)),
     );
     writeln(output, indent, "{");
     if is_error {
@@ -2396,7 +2735,10 @@ fn emit_class(
         writeln(
             output,
             indent,
-            &format!("}}, null, {}::class))();", class_decl.name),
+            &format!(
+                "}}, null, {}::class))();",
+                php_symbol_name(&class_decl.name)
+            ),
         );
     }
 }
@@ -2558,7 +2900,8 @@ fn emit_const_value(value: &ConstValue, evaluation: &Evaluation) -> String {
             .enum_cases
             .iter()
             .find_map(|((enum_name, case_name), candidate)| {
-                (*candidate == *value).then(|| format!("{enum_name}::{case_name}"))
+                (*candidate == *value)
+                    .then(|| format!("{}::{case_name}", php_symbol_name(enum_name)))
             })
             .expect("checked enum constant must name a declared case"),
         ConstValue::PayloadEnum(value) => {
@@ -2567,7 +2910,8 @@ fn emit_const_value(value: &ConstValue, evaluation: &Evaluation) -> String {
                 .expect("checked payload enum constant must name a declared case");
             let method = php_payload_case_method(case_name, !value.fields.is_empty());
             format!(
-                "{enum_name}::{method}({})",
+                "{}::{method}({})",
+                php_symbol_name(enum_name),
                 value
                     .fields
                     .iter()
@@ -2639,11 +2983,17 @@ fn emit_function(
     }
     output.push('\n');
     writeln(output, indent, "{");
+    let is_entry = !is_method && function.name == "main";
+    let body_indent = if is_entry { indent + 2 } else { indent + 1 };
+    if is_entry {
+        writeln(output, indent + 1, "try");
+        writeln(output, indent + 1, "{");
+    }
     scopes.push();
     for (name, initializer) in property_initializers {
         writeln(
             output,
-            indent + 1,
+            body_indent,
             &format!("$this->{name} = {};", emit_expr(initializer, &scopes)),
         );
     }
@@ -2657,24 +3007,39 @@ fn emit_function(
             continue;
         };
         let name = scopes.php_name(&param.name);
-        writeln(output, indent + 1, &format!("if (${name} === []) {{"));
+        writeln(output, body_indent, &format!("if (${name} === []) {{"));
         writeln(
             output,
-            indent + 2,
+            body_indent + 1,
             &format!(
                 "${name} = {};",
                 emit_const_value(default, &semantic_info.const_evaluation)
             ),
         );
         if param.promoted_access.is_some() {
-            writeln(output, indent + 2, &format!("$this->{name} = ${name};"));
+            writeln(
+                output,
+                body_indent + 1,
+                &format!("$this->{name} = ${name};"),
+            );
         }
-        writeln(output, indent + 1, "}");
+        writeln(output, body_indent, "}");
     }
     for statement in &function.body.statements {
-        emit_statement(statement, output, indent + 1, &mut scopes);
+        emit_statement(statement, output, body_indent, &mut scopes);
     }
     scopes.pop();
+    if is_entry {
+        writeln(output, indent + 1, "}");
+        writeln(output, indent + 1, "catch (__DoriaCheckedError $error)");
+        writeln(output, indent + 1, "{");
+        writeln(
+            output,
+            indent + 2,
+            "__doria_report_unhandled_error($error);",
+        );
+        writeln(output, indent + 1, "}");
+    }
     writeln(output, indent, "}");
 }
 
@@ -2964,7 +3329,7 @@ fn emit_try_statement(
                 }
                 ResolvedType::Class(class) => format!(
                     "${caught}->descriptor === {}::__doriaErrorType()",
-                    class.name
+                    php_symbol_name(&class.name)
                 ),
                 _ => unreachable!("semantic checking restricts catch types to Error values"),
             };
@@ -3581,29 +3946,41 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
                     }
                 }
             }
-            format!("{class_name}::{method}({})", emit_arguments(args, scopes))
+            format!(
+                "{}::{method}({})",
+                php_symbol_name(class_name),
+                emit_arguments(args, scopes)
+            )
         }
         Expr::StaticMember {
             class_name, member, ..
         } if scopes.is_static_property(class_name, member) => {
-            format!("{class_name}::${member}")
+            format!("{}::${member}", php_symbol_name(class_name))
         }
         Expr::StaticMember {
             class_name, member, ..
         } if scopes.is_payload_unit_case(class_name, member) => {
-            format!("{class_name}::{}()", php_payload_case_method(member, false))
+            format!(
+                "{}::{}()",
+                php_symbol_name(class_name),
+                php_payload_case_method(member, false)
+            )
         }
         Expr::StaticMember {
             class_name, member, ..
         } if scopes.is_payload_class_constant(class_name, member) => {
-            format!("{class_name}::__doriaConst{member}()")
+            format!("{}::__doriaConst{member}()", php_symbol_name(class_name))
         }
         Expr::StaticMember {
             class_name, member, ..
-        } => format!("{class_name}::{member}"),
+        } => format!("{}::{member}", php_symbol_name(class_name)),
         Expr::New {
             class_type, args, ..
-        } => format!("new {class_type}({})", emit_arguments(args, scopes)),
+        } => format!(
+            "new {}({})",
+            php_symbol_name(&class_type.name),
+            emit_arguments(args, scopes)
+        ),
         Expr::Grouped { expr, .. } => format!("({})", emit_expr(expr, scopes)),
         Expr::IsType { expr, ty: _, span } => {
             let value = emit_expr(expr, scopes);
@@ -4010,8 +4387,12 @@ fn php_host_exact_type_test(value: &str, type_tag: &str) -> String {
         "string" => format!("is_string({value})"),
         "bool" => format!("is_bool({value})"),
         "null" => format!("{value} === null"),
-        tag if tag.starts_with("enum:") => format!("{value} instanceof {}", &tag[5..]),
-        tag if tag.starts_with("class:") => format!("{value} instanceof {}", &tag[6..]),
+        tag if tag.starts_with("enum:") => {
+            format!("{value} instanceof {}", php_symbol_name(&tag[5..]))
+        }
+        tag if tag.starts_with("class:") => {
+            format!("{value} instanceof {}", php_symbol_name(&tag[6..]))
+        }
         _ => unreachable!("semantic checking rejects non-narrowable exact PHP type tests"),
     }
 }
@@ -4070,6 +4451,49 @@ fn emit_interpolated_string(parts: &[InterpolatedStringPart], scopes: &PhpNameSc
         1 if has_expr => format!("{} . {}", emit_php_string_literal(""), emitted[0]),
         _ => emitted.join(" . "),
     }
+}
+
+fn emit_checked_io_message_vocabulary(output: &mut String) {
+    use doria_diagnostic_catalogue::{
+        IoMessageOperation, IoMessageReason, INVALID_UTF8_MESSAGE_PREFIX, IO_ERROR_MESSAGE_PREFIX,
+        IO_ERROR_MESSAGE_SEPARATOR, IO_FILE_MESSAGE_PREFIX, IO_FILE_MESSAGE_SUFFIX,
+        IO_STANDARD_ERROR_NAME, IO_STANDARD_INPUT_NAME, IO_STANDARD_OUTPUT_NAME,
+    };
+
+    output.push_str("$__doria_io_message_vocabulary = [\n");
+    for (key, value) in [
+        ("ioPrefix", IO_ERROR_MESSAGE_PREFIX),
+        ("separator", IO_ERROR_MESSAGE_SEPARATOR),
+        ("filePrefix", IO_FILE_MESSAGE_PREFIX),
+        ("fileSuffix", IO_FILE_MESSAGE_SUFFIX),
+        ("stdin", IO_STANDARD_INPUT_NAME),
+        ("stdout", IO_STANDARD_OUTPUT_NAME),
+        ("stderr", IO_STANDARD_ERROR_NAME),
+        ("invalidUtf8Prefix", INVALID_UTF8_MESSAGE_PREFIX),
+    ] {
+        output.push_str(&format!(
+            "    {} => {},\n",
+            emit_php_string_literal(key),
+            emit_php_string_literal(value),
+        ));
+    }
+    output.push_str("    \"operations\" => [");
+    output.push_str(
+        &IoMessageOperation::ALL
+            .iter()
+            .map(|operation| emit_php_string_literal(operation.word()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    output.push_str("],\n    \"reasons\" => [");
+    output.push_str(
+        &IoMessageReason::ALL
+            .iter()
+            .map(|reason| emit_php_string_literal(reason.words()))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    output.push_str("],\n];\n\n");
 }
 
 fn emit_php_string_literal(value: &str) -> String {
@@ -4213,13 +4637,25 @@ fn php_type(ty: &TypeRef) -> String {
         match ty.name.as_str() {
             "List" | "Dictionary" | "Set" | "[]" => "array".to_string(),
             "Error" => "__DoriaErrorValue".to_string(),
-            name => name.to_string(),
+            name => php_symbol_name(name),
         }
     };
     if ty.nullable {
         format!("?{name}")
     } else {
         name
+    }
+}
+
+fn php_symbol_name(name: &str) -> String {
+    match name {
+        crate::compiler_known_io::IO_OPERATION => "__DoriaStdIoIoOperation".to_string(),
+        crate::compiler_known_io::IO_TARGET => "__DoriaStdIoIoTarget".to_string(),
+        crate::compiler_known_io::IO_ERROR_REASON => "__DoriaStdIoIoErrorReason".to_string(),
+        crate::compiler_known_io::UTF8_INPUT_SOURCE => "__DoriaStdIoUtf8InputSource".to_string(),
+        crate::compiler_known_io::IO_ERROR => "__DoriaStdIoIoError".to_string(),
+        crate::compiler_known_io::INVALID_UTF8_ERROR => "__DoriaStdIoInvalidUtf8Error".to_string(),
+        _ => name.to_string(),
     }
 }
 

@@ -21,7 +21,10 @@ class Greeter
 
     function __destruct()
     {
-        echo "drop:" . $this->prefix . "\n";
+        try {
+            echo "drop:" . $this->prefix . "\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -40,7 +43,7 @@ function stringThenScalar(string $label = "items", int $count = 2): string
     return $label . ":" . $count;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $defaultGreeter = new Greeter();
     let $explicitGreeter = new Greeter("hello");

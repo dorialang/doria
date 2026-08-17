@@ -31,7 +31,7 @@ function boxId(?Box $box): int
     };
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo "{numberLabel(null)} {numberLabel(2)} {numberLabel(7)}\n";
     echo "{textLength(null)} {textLength("hello")}\n";

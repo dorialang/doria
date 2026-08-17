@@ -34,7 +34,7 @@ function choose(?Status $status): Status
     return Status::Published;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?Status $missing = null;
     ?Status $first = Status::Draft;

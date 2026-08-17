@@ -6,7 +6,10 @@ class Token
 
     function __destruct()
     {
-        echo "<drop:" . $this->text . ">\n";
+        try {
+            echo "<drop:" . $this->text . ">\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -33,7 +36,7 @@ function identity<T>(T $value): T
     return $value;
 }
 
-function main(): int
+function main(): int throws Doria\Std\Io\IoError
 {
     List<int> $numbers = [42];
     ?int $number = first($numbers);

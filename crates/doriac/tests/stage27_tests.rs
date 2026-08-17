@@ -42,7 +42,7 @@ enum Transport: string
     case Rail = "rail";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Status $status = Status::Draft;
     Priority $priority = Priority::High;
@@ -74,7 +74,7 @@ function read(?Status $status): Status
     return Status::Published;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?Status $missing = null;
     ?Status $first = Status::Draft;
@@ -95,7 +95,7 @@ fn nullable_backed_enum_value_projection_preserves_presence() {
 enum Priority: int { case Low = 1; case High = 10; }
 enum Transport: string { case Road = "road"; case Rail = "rail"; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?Priority $priority = Priority::High;
     ?Priority $missingPriority = null;
@@ -122,7 +122,7 @@ fn enum_identity_survives_mixed_boxing_and_exact_narrowing() {
 enum Status { case Draft; case Published; }
 enum Other { case Draft; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     mixed $value = Status::Draft;
     if ($value is Status) {
@@ -144,12 +144,12 @@ fn unit_cases_are_constants_and_copy_defaults() {
 enum Status { case Draft; case Published; }
 const Status DEFAULT_STATUS = Status::Draft;
 
-function show(Status $status = Status::Draft): void
+function show(Status $status = Status::Draft): void throws Doria\Std\Io\IoError
 {
     echo $status == DEFAULT_STATUS;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     show();
     show(Status::Published);
@@ -449,7 +449,7 @@ class Box<T>
     }
 }
 
-function mark(string $name, int $value): int
+function mark(string $name, int $value): int throws Doria\Std\Io\IoError
 {
     echo $name;
     return $value;
@@ -460,7 +460,7 @@ function defaulted(Label $label = Label::Text("default")): bool
     return $label == DEFAULT_LABEL;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Coordinate $point = Coordinate::Point(
         y: mark("y", 22),
@@ -483,7 +483,7 @@ fn payload_ownership_layout_equality_and_observation_boundaries_are_checked() {
         r#"
 class Document {}
 enum LoadResult { case Loaded(Document $document); }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Document $document = new Document();
     LoadResult $result = LoadResult::Loaded($document);
@@ -508,7 +508,7 @@ function main(): void
     diagnostic(
         r#"
 enum Bucket { case Values(List<int> $values); }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Bucket $left = Bucket::Values([1]);
     Bucket $right = Bucket::Values([1]);
@@ -520,7 +520,7 @@ function main(): void
     diagnostic(
         r#"
 enum Coordinate { case Point(int $x, int $y); }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Coordinate $point = Coordinate::Point(1, 2);
     echo $point->x;

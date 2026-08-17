@@ -52,7 +52,7 @@ function resultKind(Result $result): string
     };
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo stateName(State::Draft) . " " . stateName(State::Ready) . " " . stateName(State::Done) . "\n";
     echo resultName(Result::Sent("R-12")) . "\n";
@@ -69,7 +69,7 @@ function main(): void
     assert_code(
         r#"
 enum Result { case Value(int $value); }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Result $result = Result::Value(42);
     int $selected = match ($result) { Result::Value($value) => $value, };
@@ -100,7 +100,7 @@ function describe(DeliveryStatus $status): string
     };
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $status = DeliveryStatus::InTransit("Lusaka");
     echo describe($status) . "\n";
@@ -120,9 +120,9 @@ fn match_evaluates_one_scrutinee_and_only_the_selected_arm() {
     let output = interpret(
         r#"
 enum State { case Draft; case Ready; }
-function selectedState(): State { echo "scrutinee "; return State::Ready; }
-function selected(string $name): string { echo "arm {$name} "; return $name; }
-function main(): void
+function selectedState(): State throws Doria\Std\Io\IoError { echo "scrutinee "; return State::Ready; }
+function selected(string $name): string throws Doria\Std\Io\IoError { echo "arm {$name} "; return $name; }
+function main(): void throws Doria\Std\Io\IoError
 {
     echo match (selectedState()) {
         State::Draft => selected("draft"),
@@ -224,7 +224,7 @@ class Codes { const string READY = "ready"; }
 function integer(int $value): string { return match ($value) { ANSWER => "answer", default => "other", }; }
 function text(string $value): string { return match ($value) { Codes::READY => "ready", default => "other", }; }
 function decimal(float $value): string { return match ($value) { 1.5 => "one", default => "other", }; }
-function main(): void { echo integer(42) . " " . text("ready") . " " . decimal(1.5); }
+function main(): void throws Doria\Std\Io\IoError { echo integer(42) . " " . text("ready") . " " . decimal(1.5); }
 "#,
     );
     assert_eq!(output.stdout, b"answer ready one");
@@ -274,7 +274,7 @@ function maybe(?Document $value): string
     };
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo inspect(42) . "\n" . inspect("text") . "\n" . inspect(State::Ready) . "\n";
     echo inspect(new Document(7)) . "\n" . maybe(null) . " " . maybe(new Document(9));
@@ -300,8 +300,8 @@ function main(): void
 fn match_true_is_strict_ordered_lazy_and_requires_default() {
     let output = interpret(
         r#"
-function condition(string $name, bool $value): bool { echo $name; return $value; }
-function choose(): string
+function condition(string $name, bool $value): bool throws Doria\Std\Io\IoError { echo $name; return $value; }
+function choose(): string throws Doria\Std\Io\IoError
 {
     return match (true) {
         condition("a", false) => "A",
@@ -310,7 +310,7 @@ function choose(): string
         default => "D",
     };
 }
-function main(): void { echo choose(); }
+function main(): void throws Doria\Std\Io\IoError { echo choose(); }
 "#,
     );
     assert_eq!(output.stdout, b"abB");
@@ -406,7 +406,7 @@ fn copy_pattern_bindings_mask_moved_outer_bindings_without_changing_outer_state(
     let valid = r#"
 class Box {}
 function consume(take Box $value): void {}
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $value = new Box();
     consume($value);
@@ -447,7 +447,7 @@ function label(LoadResult $result): string
     bool $stillUsable = $result == LoadResult::Missing;
     return $text;
 }
-function main(): void { LoadResult $result = load(7); echo label($result) . " " . label(load(9)); }
+function main(): void throws Doria\Std\Io\IoError { LoadResult $result = load(7); echo label($result) . " " . label(load(9)); }
 "#,
     );
     assert_eq!(output.stdout, b"loaded 7 loaded 9");
@@ -477,7 +477,7 @@ fn match_and_ternary_remain_bounded_inside_loops() {
     let output = interpret(
         r#"
 enum Counter { case Even(int $value); case Odd(int $value); }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $index = 0;
     let writable $total = 0;
@@ -503,8 +503,8 @@ function main(): void
 fn ternary_is_right_associative_strict_lazy_and_rejects_elvis() {
     let output = interpret(
         r#"
-function selected(string $name): string { echo $name; return $name; }
-function main(): void
+function selected(string $name): string throws Doria\Std\Io\IoError { echo $name; return $name; }
+function main(): void throws Doria\Std\Io\IoError
 {
     bool $first = false;
     bool $second = true;
@@ -535,8 +535,8 @@ fn pattern_guards_use_if_require_bool_and_reject_redundant_positions() {
     let output = interpret(
         r#"
 enum State { case Ready(int $value); case Waiting; }
-function mark(string $name, bool $result): bool { echo $name; return $result; }
-function main(): void
+function mark(string $name, bool $result): bool throws Doria\Std\Io\IoError { echo $name; return $result; }
+function main(): void throws Doria\Std\Io\IoError
 {
     State $state = State::Ready(42);
     echo match ($state) {
@@ -616,7 +616,7 @@ function select(take LoadResult $result): Document
         LoadResult::Missing => new Document("fallback"),
     };
 }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     LoadResult $result = LoadResult::Loaded(new Document("ready"));
     let $document = select($result);
@@ -649,7 +649,7 @@ function fromMixed(take mixed $value): Document
 {
     return match (take $value) { Document $present => $present, default => new Document("other"), };
 }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?Document $none = null;
     mixed $boxed = new Document("mixed");

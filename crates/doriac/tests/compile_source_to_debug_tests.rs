@@ -31,7 +31,7 @@ fn captures_stdout() {
     let debug = doriac::compile_source_to_debug(
         "test.doria",
         r#"
-function main(): int
+function main(): int throws Doria\Std\Io\IoError
 {
     echo "hello";
     return 0;

@@ -15,7 +15,7 @@ class Service
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     try {
         let $service = new Service();

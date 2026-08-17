@@ -1,4 +1,4 @@
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<string> $list = ["old-a", "old-b"];
     $list->clear();

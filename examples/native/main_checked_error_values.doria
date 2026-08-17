@@ -17,17 +17,17 @@ function makeFailure(string $message): Error
     return new Failure($message);
 }
 
-function inspect(Error $error): void
+function inspect(Error $error): void throws Doria\Std\Io\IoError
 {
     echo "{$error->message}\n";
 }
 
-function consume(take Error $error): void
+function consume(take Error $error): void throws Doria\Std\Io\IoError
 {
     echo "consumed {$error->message}\n";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Error $error = makeFailure("value");
     inspect($error);

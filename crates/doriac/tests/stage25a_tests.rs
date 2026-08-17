@@ -19,7 +19,8 @@ class Other {}
 "#;
 
 fn check(body: &str) -> Result<(), Vec<Diagnostic>> {
-    let source = format!("{NODE}\nfunction main(): void\n{{\n{body}\n}}\n");
+    let source =
+        format!("{NODE}\nfunction main(): void throws Doria\\Std\\Io\\IoError\n{{\n{body}\n}}\n");
     doriac::check_source("stage25a.doria", &source).map(|_| ())
 }
 
@@ -126,7 +127,7 @@ fn shared_access_conflicts_preserve_their_exact_structured_reason() {
 fn shared_new_parses_without_errors() {
     doriac::parse_source(
         "stage25a-syntax.doria",
-        "function main(): void { let $node = shared new Node(); }",
+        "function main(): void throws Doria\\Std\\Io\\IoError { let $node = shared new Node(); }",
     )
     .expect("`shared new` is accepted Stage 25a syntax and must parse cleanly");
 }
@@ -164,7 +165,8 @@ fn shared_writable_new_chain_is_rejected() {
 
 #[test]
 fn weak_new_is_not_doria_syntax() {
-    let source = "function main(): void { let $bad = weak new Node(); }";
+    let source =
+        "function main(): void throws Doria\\Std\\Io\\IoError { let $bad = weak new Node(); }";
     assert!(
         doriac::parse_source("stage25a-weak-new.doria", source).is_err(),
         "`weak new` is not Doria syntax and must not parse"
@@ -224,7 +226,8 @@ fn superseded_names_are_rejected_with_replacements() {
 
 #[test]
 fn compiler_known_names_cannot_be_redeclared() {
-    let source = "class SharedReference {}\nfunction main(): void {}";
+    let source =
+        "class SharedReference {}\nfunction main(): void throws Doria\\Std\\Io\\IoError {}";
     let diagnostics =
         doriac::check_source("stage25a-redeclare.doria", source).expect_err("must be rejected");
     assert!(
@@ -345,7 +348,7 @@ class Consumer
 
 function consumeAgain(take Child $child): void {}
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $consumer = shared new Consumer();
     let $child = new Child();
@@ -379,7 +382,7 @@ fn access_objects_forward_without_a_value_wrapper() {
 fn writable_access_mutates_the_shared_class_payload() {
     let source = format!(
         "{NODE}
-function main(): void
+function main(): void throws Doria\\Std\\Io\\IoError
 {{
     let $shared = new WritableSharedReference(new Node());
     let writable $write = $shared->acquireWritableAccess();
@@ -400,7 +403,7 @@ function main(): void
 #[test]
 fn writable_access_mutates_the_shared_collection_payload() {
     let source = r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $shared = new WritableSharedReference([1, 2, 3]);
     let writable $access = $shared->acquireWritableAccess();
@@ -475,7 +478,7 @@ class Document
     function share(): string { return "domain"; }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $document = shared new Document();
     // The wrapper member wins on the direct receiver.
@@ -542,11 +545,11 @@ fn nullable_shared_members_are_lazy_and_preserve_handle_families() {
 class Node
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
     function label(): string { return $this->name; }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $root = shared new Node("root");
     ?SharedReference<Node> $present = $root->share();
@@ -611,7 +614,7 @@ class Node { string $name = ""; }
 
 function accept(SharedReference<Node> $value): void {}
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $settings = new WritableSharedReference(new Node());
     accept($settings);
@@ -693,13 +696,13 @@ class Node
 {
     string $name = "Root";
 
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
     function describe(): string { return $this->name; }
 }
 
 function consume(take SharedReference<Node> $value): void {}
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $first = shared new Node();
     let $weak = $first->createWeakReference();
@@ -729,7 +732,7 @@ class Node
 {
     function __construct(string $name) {}
     function label(): string { return $this->name; }
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
 function makeStrong(string $name): SharedReference<Node>
@@ -742,7 +745,7 @@ function makeWeak(string $name): WeakReference<Node>
     return (shared new Node($name))->createWeakReference();
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $shared = makeStrong("shared")->share();
     echo $shared->name . "\n";
@@ -775,15 +778,15 @@ fn shared_rebinding_coalescing_and_foreach_preserve_handle_ownership() {
 class Node
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
-function show(SharedReference<Node> $node): void
+function show(SharedReference<Node> $node): void throws Doria\Std\Io\IoError
 {
     echo $node->name . "\n";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $current = shared new Node("old");
     $current = shared new Node("current");
@@ -829,22 +832,22 @@ class Node
 {
     function __construct(string $name) {}
     function label(): string { return $this->name; }
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
-function makeStrong(string $name): SharedReference<Node>
+function makeStrong(string $name): SharedReference<Node> throws Doria\Std\Io\IoError
 {
     echo "make " . $name . "\n";
     return shared new Node($name);
 }
 
-function inspect(?SharedReference<Node> $candidate, SharedReference<Node> $fallback): void
+function inspect(?SharedReference<Node> $candidate, SharedReference<Node> $fallback): void throws Doria\Std\Io\IoError
 {
     echo ($candidate ?? $fallback)->name . "\n";
     echo $fallback->name . "\n";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $fallback = makeStrong("fallback");
     ?SharedReference<Node> $missing = null;
@@ -880,10 +883,10 @@ fn shared_coalesces_cleanup_only_the_selected_owned_branch() {
 class Node
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
-function makeStrong(string $name): SharedReference<Node>
+function makeStrong(string $name): SharedReference<Node> throws Doria\Std\Io\IoError
 {
     echo "make strong " . $name . "\n";
     return shared new Node($name);
@@ -892,18 +895,18 @@ function makeStrong(string $name): SharedReference<Node>
 function makeWeak(
     SharedReference<Node> $strong,
     string $label,
-): WeakReference<Node>
+): WeakReference<Node> throws Doria\Std\Io\IoError
 {
     echo "make weak " . $label . "\n";
     return $strong->createWeakReference();
 }
 
-function inspect(SharedReference<Node> $node): void
+function inspect(SharedReference<Node> $node): void throws Doria\Std\Io\IoError
 {
     echo "inspect " . $node->name . "\n";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $owner = shared new Node("Existing");
     let $weak = $owner->createWeakReference();
@@ -951,7 +954,7 @@ fn nullable_shared_coalesces_preserve_nullable_results_and_owned_branches() {
 class Node
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
 function chooseStrong(
@@ -984,7 +987,7 @@ function chooseWeakOrNull(
     return $value ?? null;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $left = shared new Node("left");
     let $right = shared new Node("right");
@@ -1043,7 +1046,7 @@ class Store
     static writable ?{handle}<Node> $value = null;
 }}
 
-function main(): void {{}}
+function main(): void throws Doria\Std\Io\IoError {{}}
 "#
         );
         let diagnostics = doriac::check_source("stage25a-shared-static.doria", &source)
@@ -1069,10 +1072,10 @@ fn borrowed_dictionary_shared_results_do_not_acquire_cleanup_obligations() {
     let source = r#"
 class Node
 {
-    function __destruct() { echo "drop\n"; }
+    function __destruct() { try { echo "drop\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $root = shared new Node();
     Dictionary<string, SharedReference<Node>> $values = ["node" => $root->share()];
@@ -1108,7 +1111,7 @@ class Repository<T>
 class Customer { function __construct(string $name) {} }
 class Invoice { function __construct(string $number) {} }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $customers = new Repository<Customer>();
     let writable $invoices = new Repository<Invoice>();
@@ -1136,7 +1139,7 @@ fn weak_reference_survives_payload_destruction_without_resurrection() {
 class Node
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
 function makeWeak(): WeakReference<Node>
@@ -1145,7 +1148,7 @@ function makeWeak(): WeakReference<Node>
     return $strong->createWeakReference();
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $weak = makeWeak();
     let $live = $weak->acquire();
@@ -1165,7 +1168,7 @@ fn nullable_weak_references_preserve_weak_ownership_across_storage_paths() {
 class Node
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
 class Holder
@@ -1178,7 +1181,7 @@ function maybeWeak(SharedReference<Node> $root): ?WeakReference<Node>
     return $root->createWeakReference();
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $root = shared new Node("root");
     writable ?WeakReference<Node> $maybe = null;
@@ -1221,7 +1224,7 @@ fn shared_handles_flow_through_borrowed_calls_collections_and_generics() {
 class Node
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
 class Box<T>
@@ -1229,16 +1232,16 @@ class Box<T>
     function __construct(take T $value) {}
 }
 
-function inspect(SharedReference<Node> $node): void { echo $node->name . "\n"; }
-function inspectNamed(int $marker, SharedReference<Node> $node): void
+function inspect(SharedReference<Node> $node): void throws Doria\Std\Io\IoError { echo $node->name . "\n"; }
+function inspectNamed(int $marker, SharedReference<Node> $node): void throws Doria\Std\Io\IoError
 {
     echo "{$marker}:{$node->name}\n";
 }
-function marker(): int { echo "marker\n"; return 7; }
+function marker(): int throws Doria\Std\Io\IoError { echo "marker\n"; return 7; }
 function consume(take SharedReference<Node> $node): void {}
 function identity<T>(take T $value): T { return $value; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $root = shared new Node("Root");
     inspect($root->share());
@@ -1270,7 +1273,7 @@ fn shared_handles_flow_through_properties_arrays_and_dictionary_values() {
 class Node
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
 class Holder
@@ -1282,9 +1285,9 @@ class Holder
     ) {}
 }
 
-function inspect(SharedReference<Node> $node): void { echo $node->name . "\n"; }
+function inspect(SharedReference<Node> $node): void throws Doria\Std\Io\IoError { echo $node->name . "\n"; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $root = shared new Node("stored");
     let $holder = new Holder(
@@ -1347,7 +1350,7 @@ fn mixed_boundary_reports_runtime_pending_instead_of_losing_handle_ownership() {
     let source = r#"
 class Node {}
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $node = shared new Node();
     mixed $boxed = $node;
@@ -1379,7 +1382,7 @@ function identity<T>(
     return $value;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $node = identity(shared new Node("generic"));
     echo $node->name . "\n";
@@ -1405,7 +1408,7 @@ class Box<T>
     ?SharedReference<T> $value = null;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $box = new Box<int>();
 }
@@ -1425,15 +1428,15 @@ fn nullable_weak_temporaries_transfer_through_reordered_calls_and_cleanup_return
 class Node
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop " . $this->name . "\n"; }
+    function __destruct() { try { echo "drop " . $this->name . "\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
 class Cleanup
 {
-    function __destruct() { echo "cleanup\n"; }
+    function __destruct() { try { echo "cleanup\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
-function marker(): int
+function marker(): int throws Doria\Std\Io\IoError
 {
     echo "marker\n";
     return 7;
@@ -1445,12 +1448,12 @@ function makeWeak(SharedReference<Node> $node): ?WeakReference<Node>
     return $node->createWeakReference();
 }
 
-function consume(int $marker, take ?WeakReference<Node> $weak): void
+function consume(int $marker, take ?WeakReference<Node> $weak): void throws Doria\Std\Io\IoError
 {
     if ($weak != null) { echo "{$marker}:alive\n"; }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $node = shared new Node("root");
     consume(weak: makeWeak($node), marker: marker());
@@ -1518,7 +1521,7 @@ class Node { string $name = ""; }
 
 function keep<T>(SharedReference<T> $value): void {}
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $node = shared new Node();
     keep($node);
@@ -1610,7 +1613,7 @@ fn property_rooted_collection_slots_accept_owned_values_and_replace_once() {
 class Customer
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop {$this->name}\n"; }
+    function __destruct() { try { echo "drop {$this->name}\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
 class Repository<T>
@@ -1623,7 +1626,7 @@ class Repository<T>
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $repository = new Repository<Customer>();
     $repository->save("42", new Customer("first"));
@@ -1647,7 +1650,7 @@ class Customer { function __construct(string $name) {} }
 class Repository
 {
     internal writable Dictionary<string, Customer> $items = [];
-    writable function save(string $id, take Customer $item): void
+    writable function save(string $id, take Customer $item): void throws Doria\Std\Io\IoError
     {
         $this->items[$id] = $item;
         echo $item->name;
@@ -1699,10 +1702,10 @@ fn standalone_blocks_are_lexical_scopes_and_cleanup_boundaries() {
 class Marker
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop {$this->name}\n"; }
+    function __destruct() { try { echo "drop {$this->name}\n"; } catch (Doria\Std\Io\IoError) {} }
 }
 
-function returnFromBlock(): void
+function returnFromBlock(): void throws Doria\Std\Io\IoError
 {
     {
         let $marker = new Marker("return");
@@ -1710,7 +1713,7 @@ function returnFromBlock(): void
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     {
         let $outer = new Marker("outer");
@@ -1747,7 +1750,7 @@ function main(): void
     let diagnostics = doriac::check_source(
         "stage25a-lexical-block-scope.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     { let $hidden = 1; }
     echo "{$hidden}";
@@ -1771,7 +1774,7 @@ class Settings
     function __construct(writable string $theme) {}
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $settings = new WritableSharedReference(new Settings("light"));
     {
@@ -1799,7 +1802,7 @@ class Counter
 
 function inspect(
     ?ReadonlySharedReferenceAccess<Counter> $access,
-): void
+): void throws Doria\Std\Io\IoError
 {
     if ($access != null) {
         echo "inspect {$access->name}\n";
@@ -1815,7 +1818,7 @@ function increment(
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $readShared = new WritableSharedReference(new Counter("read"));
     ?ReadonlySharedReferenceAccess<Counter> $read =
@@ -1855,7 +1858,7 @@ class Counter
     function __construct(string $name, writable int $value = 0) {}
 }
 
-function marker(string $name): int
+function marker(string $name): int throws Doria\Std\Io\IoError
 {
     echo "marker {$name}\n";
     return 7;
@@ -1864,7 +1867,7 @@ function marker(string $name): int
 function consumeReadonly(
     int $marker,
     take ?ReadonlySharedReferenceAccess<Counter> $access,
-): void
+): void throws Doria\Std\Io\IoError
 {
     if ($access != null) {
         echo "{$marker}:{$access->name}\n";
@@ -1874,7 +1877,7 @@ function consumeReadonly(
 function consumeWritable(
     int $marker,
     take ?WritableSharedReferenceAccess<Counter> $access,
-): void
+): void throws Doria\Std\Io\IoError
 {
     if ($access != null) {
         echo "{$marker}:{$access->name}:{$access->value}\n";
@@ -1883,7 +1886,7 @@ function consumeWritable(
 
 function exerciseReordering(
     ?WritableSharedReference<Counter> $source,
-): void
+): void throws Doria\Std\Io\IoError
 {
     consumeReadonly(
         access: $source?->acquireReadonlyAccess(),
@@ -1895,7 +1898,7 @@ function exerciseReordering(
     );
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $owner = new WritableSharedReference(new Counter("owned"));
     exerciseReordering($owner);
@@ -1984,7 +1987,7 @@ function acquireWritable(WritableSharedReference<List<int>> $owner): bool
     return true;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $owner = new WritableSharedReference<List<int>>([1]);
     if (
@@ -2019,7 +2022,7 @@ class Guard
 
 function identity(Guard $guard): Guard { return $guard; }
 
-function route(writable Guard $guard): void
+function route(writable Guard $guard): void throws Doria\Std\Io\IoError
 {
     let $alias = identity($guard);
     {
@@ -2044,7 +2047,7 @@ class Guard
 function identity(Guard $guard): Guard { return $guard; }
 function consume(take Guard $guard): void {}
 
-function route(writable Guard $guard): void
+function route(writable Guard $guard): void throws Doria\Std\Io\IoError
 {
     let $alias = identity($guard);
     {

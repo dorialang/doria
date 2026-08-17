@@ -198,7 +198,7 @@ fn narrowing_is_lexical_path_sensitive_and_short_circuit_aware() {
         "stage22-flow.doria",
         r#"
 class Label { function text(): string { return "label"; } }
-function read(?Label $label, mixed $value): string
+function read(?Label $label, mixed $value): string throws Doria\Std\Io\IoError
 {
     if ($label != null && $label->text() == "label") {
         let $value = 1;
@@ -216,7 +216,7 @@ function read(?Label $label, mixed $value): string
     assert_code(
         r#"
 class Label { function text(): string { return "label"; } }
-function read(?Label $label): string
+function read(?Label $label): string throws Doria\Std\Io\IoError
 {
     if ($label != null) { echo $label->text(); }
     return $label->text();
@@ -375,7 +375,7 @@ function read(?int $value): string
     let program = doriac::lower_source_to_mir(
         "stage22-impossible-is.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?int $value = 1;
     if ($value is string) { echo "wrong"; }
@@ -396,7 +396,7 @@ class Label
 {
     function matches(?Label $value): bool { return $value is self; }
 }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $label = new Label();
     if ($label->matches($label)) { echo "match"; }
@@ -535,7 +535,7 @@ fn mixed_runtime_representation_lowers_after_stage23_slice3() {
     let program = doriac::lower_source_to_mir(
         "stage22-mixed-runtime.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     mixed $value = 1;
     if ($value is int) {
@@ -631,6 +631,71 @@ fn nullable_native_fixture_lowers_to_valid_mir_and_interprets_exactly() {
 }
 
 #[test]
+fn checked_null_safe_value_calls_lower_to_explicit_checked_control_flow() {
+    let source = r#"
+class Reporter
+{
+    function label(): string throws Doria\Std\Io\IoError
+    {
+        echo "called:";
+        return "value";
+    }
+}
+
+function maybe(bool $present): ?Reporter
+{
+    if ($present) { return new Reporter(); }
+    return null;
+}
+
+function main(): void throws Doria\Std\Io\IoError
+{
+    let $present = maybe(true);
+    let $absent = maybe(false);
+    echo $present?->label() ?? "none";
+    echo ":" . ($absent?->label() ?? "none");
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage22-checked-null-safe.doria", source)
+        .expect("checked null-safe value calls should lower");
+    let label = program
+        .functions
+        .iter()
+        .find(|function| function.name == "Reporter::label")
+        .expect("fixture should contain Reporter::label")
+        .id;
+    assert!(program
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .any(|block| matches!(
+            block.terminator,
+            doriac::mir::Terminator::CheckedCall { function, .. } if function == label
+        )));
+    assert!(!program
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.statements)
+        .any(|statement| matches!(
+            statement,
+            doriac::mir::Statement::CallNullSafe { function, .. } if *function == label
+        )));
+    doriac::mir_validation::validate_program(&program)
+        .expect("checked null-safe MIR should validate");
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower checked null-safe values")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower checked null-safe values")
+        .is_empty());
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("checked null-safe values should execute");
+    assert_eq!(output.stdout, b"called:value:none");
+}
+
+#[test]
 fn nullable_scalar_destinations_contextualize_literals_and_static_initializers() {
     let source = r#"
 class Limits
@@ -649,7 +714,7 @@ function accept(?int16 $value): void {}
 function narrow(?int8 $value): int8 { return $value ?? 1; }
 function narrowRatio(?float32 $value): float32 { return $value ?? 2.5; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?int8 $small = 1;
     writable ?float32 $ratio = 1.5;
@@ -969,14 +1034,18 @@ class Tracked
     ?int8 $code = 7;
     ?Other $other = null;
     function __construct(string $name) {}
-    function __destruct() { echo "<" . $this->name . ">"; }
+    function __destruct()
+    {
+        try { echo "<" . $this->name . ">"; }
+        catch (Doria\Std\Io\IoError) {}
+    }
     function maybeName(bool $present): ?string
     {
         if ($present) { return "value"; }
         return null;
     }
     function maybeOther(): ?Tracked { return null; }
-    function announce(string $message): void { echo $message; }
+    function announce(string $message): void throws Doria\Std\Io\IoError { echo $message; }
 }
 
 class Holder
@@ -994,9 +1063,9 @@ function make(bool $present, string $name): ?Tracked
 
 function inspect(?Tracked $value): void {}
 function forward(?Tracked $value): ?Tracked { return $value; }
-function sideEffect(): string { echo "wrong"; return "wrong"; }
+function sideEffect(): string throws Doria\Std\Io\IoError { echo "wrong"; return "wrong"; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $owner = new Tracked("owner");
     let $holder = new Holder();
@@ -1050,14 +1119,18 @@ class Tracked
 {
     ?string $label = "property";
     function __construct(string $name) {}
-    function __destruct() { echo "<" . $this->name . ">"; }
+    function __destruct()
+    {
+        try { echo "<" . $this->name . ">"; }
+        catch (Doria\Std\Io\IoError) {}
+    }
     function maybeLabel(): ?string { return "method"; }
 }
 
 function make(string $name): ?Tracked { return new Tracked($name); }
 function inspect(?Tracked $value): void {}
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo make("call")?->maybeLabel() ?? "none";
     echo ":";
@@ -1107,7 +1180,7 @@ fn non_null_intrinsics_establish_nullable_flow_facts() {
     doriac::check_source(
         "stage22-intrinsic-flow-facts.doria",
         r#"
-function read(): string
+function read(): string throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     ?string $formatted = sprintf("%s", "value");
     ?string $contents = read_file("input.txt");
@@ -1148,7 +1221,7 @@ function describe(?Holder $holder, bool $flag): string
     return $name . ":" . itemLabel($holder->item) . ":{$count}:{$staticName}:{$staticCount}";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $holder = new Holder(7, "held", new Item("child"));
     echo describe($holder, false);
@@ -1282,7 +1355,7 @@ function number(): int { return 1; }
 function text(): string { return "free"; }
 function item(): Item { return new Item("free-item"); }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $factory = new Factory();
     ?int $freeNumber = number();
@@ -1328,9 +1401,9 @@ class Item
 
 function chooseInt(?int $left, ?int $right): ?int { return $left ?? $right; }
 function chooseString(?string $left, ?string $right): ?string { return $left ?? $right; }
-function inspect(?Item $value): void { echo $value?->label() ?? "none"; }
+function inspect(?Item $value): void throws Doria\Std\Io\IoError { echo $value?->label() ?? "none"; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?int $emptyInt = null;
     ?int $number = 7;
@@ -1367,20 +1440,24 @@ fn conditional_class_temporaries_and_borrowed_returns_keep_lifetime_order() {
 class Tracked
 {
     function __construct(string $name) {}
-    function __destruct() { echo "<" . $this->name . ">"; }
-    function use(Tracked $value): void { echo "use"; }
+    function __destruct()
+    {
+        try { echo "<" . $this->name . ">"; }
+        catch (Doria\Std\Io\IoError) {}
+    }
+    function use(Tracked $value): void throws Doria\Std\Io\IoError { echo "use"; }
 }
 
 function make(string $name): ?Tracked { return new Tracked($name); }
-function inspect(?Tracked $value): void { echo "inspect"; }
-function identity(?Tracked $value): ?Tracked { echo "call"; return $value; }
-function forward(?Tracked $value): ?Tracked
+function inspect(?Tracked $value): void throws Doria\Std\Io\IoError { echo "inspect"; }
+function identity(?Tracked $value): ?Tracked throws Doria\Std\Io\IoError { echo "call"; return $value; }
+function forward(?Tracked $value): ?Tracked throws Doria\Std\Io\IoError
 {
     let $temporary = new Tracked("local");
     return identity($value);
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?Tracked $empty = null;
     inspect($empty ?? new Tracked("fallback"));
@@ -1703,7 +1780,7 @@ fn shared_validation_requires_presence_for_every_nullable_payload_read() {
     let mut program = doriac::lower_source_to_mir(
         "stage22-nullable-payload-presence.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?int $value = maybe();
     if ($value == null) { return; }
@@ -1733,12 +1810,7 @@ function maybe(): ?int { return 1; }
     let payload_block = main
         .blocks
         .iter_mut()
-        .find(|block| {
-            block
-                .statements
-                .iter()
-                .any(|statement| matches!(statement, doriac::mir::Statement::EchoString(_)))
-        })
+        .find(|block| matches!(block.terminator, doriac::mir::Terminator::CheckedIo { .. }))
         .expect("fixture should contain the narrowed payload read");
     payload_block.statements.insert(
         0,
@@ -1939,7 +2011,7 @@ fn narrowed_nullable_scalars_support_read_modify_write() {
     let source = r#"
 function initialValue(): ?int { return 40; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable ?int $value = initialValue();
     if ($value != null) {
@@ -1978,7 +2050,7 @@ class Values
     static bool $hasEnabled = self::enabled != null;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     if (Values::hasNumber && Values::hasRatio && !Values::hasEnabled) {
         echo "ok";
@@ -2016,7 +2088,7 @@ function label(bool $present): ?Label
     return null;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?Label $none = label(false);
     ?Label $some = label(true);
@@ -2050,13 +2122,17 @@ fn concrete_is_tests_evaluate_their_operands_once() {
     let source = r#"
 class Tracked
 {
-    function __destruct() { echo "<drop>"; }
+    function __destruct()
+    {
+        try { echo "<drop>"; }
+        catch (Doria\Std\Io\IoError) {}
+    }
 }
 
-function make(): Tracked { echo "make"; return new Tracked(); }
-function maybe(): ?Tracked { echo "maybe"; return null; }
+function make(): Tracked throws Doria\Std\Io\IoError { echo "make"; return new Tracked(); }
+function maybe(): ?Tracked throws Doria\Std\Io\IoError { echo "maybe"; return null; }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     if (make() is Tracked) { echo "true"; }
     if (make() is string) { echo "bad"; } else { echo "false"; }

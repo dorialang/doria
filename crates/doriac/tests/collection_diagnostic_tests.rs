@@ -43,7 +43,7 @@ fn map_membership_spellings_have_receiver_aware_applied_fixes() {
                 "SortedDictionary::from([\"present\" => null])".to_string()
             };
             let source = format!(
-                "function main(): void {{ {family}<string, ?int> $values = {initializer}; echo $values->{written}(\"present\"); }}"
+                "function main(): void throws Doria\\Std\\Io\\IoError {{ {family}<string, ?int> $values = {initializer}; echo $values->{written}(\"present\"); }}"
             );
             let error = diagnostic(&source, "E0521");
             assert_eq!(error.span, error.fixes[0].edits[0].span);
@@ -72,7 +72,7 @@ fn element_membership_and_size_suggestions_follow_receiver_semantics() {
     ] {
         for written in ["in_array", "includes"] {
             let source =
-                format!("function main(): void {{ {declaration} echo $values->{written}(1); }}");
+                format!("function main(): void throws Doria\\Std\\Io\\IoError {{ {declaration} echo $values->{written}(1); }}");
             let error = diagnostic(&source, "E0521");
             assert_eq!(error.fixes[0].edits[0].replacement, "contains");
             doriac::check_source("fixed-element-membership.doria", apply_fix(&source, &error))
@@ -88,7 +88,7 @@ fn element_membership_and_size_suggestions_follow_receiver_semantics() {
 
     doriac::check_source(
         "array-length.doria",
-        "function main(): void { int[] $values = [1]; echo $values->length; }",
+        "function main(): void throws Doria\\Std\\Io\\IoError { int[] $values = [1]; echo $values->length; }",
     )
     .expect("typed-array length remains canonical");
     let array_wrong_count = diagnostic(
@@ -160,7 +160,7 @@ fn peer_spellings_cover_size_mutation_search_endpoints_and_queue_vocabulary() {
 
 #[test]
 fn property_invocation_has_safe_and_combined_fixes() {
-    let source = "function main(): void { List<int> $values = [1]; echo $values->Count(); }";
+    let source = "function main(): void throws Doria\\Std\\Io\\IoError { List<int> $values = [1]; echo $values->Count(); }";
     let error = diagnostic(source, "E0557");
     assert_eq!(error.title, "Property Is Not A Method");
     assert_eq!(
@@ -253,7 +253,8 @@ fn decision_0113_members_all_execute() {
         "SortedSet<int> $v = SortedSet::from([1]); echo $v->first ?? -1; echo $v->last ?? -1;",
     ];
     for statement in executable {
-        let source = format!("function main(): void {{ {statement} }}");
+        let source =
+            format!("function main(): void throws Doria\\Std\\Io\\IoError {{ {statement} }}");
         doriac::lower_source_to_mir("slice-three-member.doria", source)
             .expect("Slice 3 collection members should lower");
     }
@@ -274,14 +275,14 @@ fn decision_0113_members_all_execute() {
     }
 
     let suggested = diagnostic(
-        "function main(): void { List<int> $v = [1]; echo $v->find(1) ?? -1; }",
+        "function main(): void throws Doria\\Std\\Io\\IoError { List<int> $v = [1]; echo $v->find(1) ?? -1; }",
         "E0521",
     );
     assert_eq!(suggested.fixes[0].edits[0].replacement, "indexOf");
     doriac::check_source(
         "fixed-member.doria",
         apply_fix(
-            "function main(): void { List<int> $v = [1]; echo $v->find(1) ?? -1; }",
+            "function main(): void throws Doria\\Std\\Io\\IoError { List<int> $v = [1]; echo $v->find(1) ?? -1; }",
             &suggested,
         ),
     )

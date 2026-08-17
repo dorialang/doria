@@ -401,8 +401,8 @@ and the language-server sweep in `dorialang/doria-language-server`.
   routed to E0559.
 - **Decision 0113 — Complete.** All four implementation slices are complete.
 - **Stage 27 — Complete.** Both Stage 28 slices and both Stage 28a slices are
-  also complete. Stage 29 Slices 1 and 2 are complete, Slice 3 is next, and
-  pending controlled performance measurement remains non-blocking.
+  also complete. Stage 29 is complete, the pre-Stage-30 closure grammar slice
+  is next, and pending controlled performance measurement remains non-blocking.
 
 ### Slice 2 performance impact
 

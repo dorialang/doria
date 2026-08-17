@@ -14,7 +14,10 @@ class Counter
 
     function __destruct()
     {
-        echo "drop counter\n";
+        try {
+            echo "drop counter\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -25,14 +28,14 @@ function update(WritableSharedReference<Counter> $counter): void
     $access->add(6);
 }
 
-function inspect(WritableSharedReference<Counter> $counter): void
+function inspect(WritableSharedReference<Counter> $counter): void throws Doria\Std\Io\IoError
 {
     let $first = $counter->acquireReadonlyAccess();
     let $second = $counter->acquireReadonlyAccess();
     echo "{$first->current()}:{$second->value}\n";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $counter = new WritableSharedReference(new Counter());
     let $second = $counter->share();

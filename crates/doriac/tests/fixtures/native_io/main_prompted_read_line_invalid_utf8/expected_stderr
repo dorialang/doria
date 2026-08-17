@@ -1,0 +1,13 @@
+Error[R1000]: Unhandled Doria\Std\Io\InvalidUtf8Error
+
+Where
+examples/native/main_prompted_read_line_invalid_utf8.doria · line 3 · main
+
+  3          let $line = read_line("decode: ");
+                         ^^^^^^^^^^^^^^^^^^^^^
+                         This Error Was First Thrown Here
+
+Why
+  invalid UTF-8 in standard input
+
+Process Exited With Status 70

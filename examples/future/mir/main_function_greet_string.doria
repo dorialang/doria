@@ -1,9 +1,9 @@
-function greet(string $name): void
+function greet(string $name): void throws Doria\Std\Io\IoError
 {
     echo "Hello " . $name . "!";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     greet("Doria");
 }

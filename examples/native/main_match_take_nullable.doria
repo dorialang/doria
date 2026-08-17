@@ -18,7 +18,7 @@ function consume(take ?Entry $entry): string
     };
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo consume(new Entry("present")) . "\n";
     echo consume(null) . "\n";

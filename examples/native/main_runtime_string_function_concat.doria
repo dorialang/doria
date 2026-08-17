@@ -8,7 +8,7 @@ function subject(): string
     return "Doria";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo greeting() . " " . subject() . "!";
 }

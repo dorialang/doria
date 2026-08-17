@@ -1,4 +1,4 @@
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable int[] $array = [1, 2, 3];
     $array[0]++;

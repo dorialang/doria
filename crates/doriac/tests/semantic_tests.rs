@@ -1162,12 +1162,12 @@ function main(): int
     doriac::check_source(
         "test.doria",
         r#"
-function printHello(): void
+function printHello(): void throws Doria\Std\Io\IoError
 {
     echo "Hello";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     printHello();
 }
@@ -1593,7 +1593,7 @@ function log(): void
     return;
 }
 
-function noop(): void
+function noop(): void throws Doria\Std\Io\IoError
 {
     echo "ok";
 }
@@ -1654,7 +1654,7 @@ function main(): void
 }
 "#,
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo "Hello Doria!";
 }
@@ -1727,12 +1727,12 @@ function isAnswer(int $value): bool
     return $value == 42;
 }
 
-function greet(string $name): void
+function greet(string $name): void throws Doria\Std\Io\IoError
 {
     echo "Hello " . $name . "!";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     if (isAnswer(42)) {
         greet("Doria");
@@ -2018,7 +2018,7 @@ function value(bool $flag): int
     }
 }
 
-function chained(bool $left, bool $right): int
+function chained(bool $left, bool $right): int throws Doria\Std\Io\IoError
 {
     if ($left) {
         echo "left";
@@ -2105,7 +2105,7 @@ fn checks_string_interpolation_semantics() {
     doriac::check_source(
         "test.doria",
         r#"
-function render(): void
+function render(): void throws Doria\Std\Io\IoError
 {
     string $name = "Andrew";
     int $age = 37;
@@ -2131,7 +2131,7 @@ class Person
     {
     }
 
-    function greet(): void
+    function greet(): void throws Doria\Std\Io\IoError
     {
         echo "Hello, {$this->profile->displayName}";
     }
@@ -2255,11 +2255,14 @@ class Label implements Displayable
     }
 }
 
-let $label = new Label();
-echo $label;
-echo "label={$label}";
-echo "label=" . $label;
-echo sprintf("%s", $label);
+function main(): void throws Doria\Std\Io\IoError
+{
+    let $label = new Label();
+    echo $label;
+    echo "label={$label}";
+    echo "label=" . $label;
+    echo sprintf("%s", $label);
+}
 "#,
     )
     .expect("explicit Displayable conformance should enable every display context");
@@ -2471,22 +2474,25 @@ fn checks_basic_control_flow_semantics() {
     doriac::check_source(
         "test.doria",
         r#"
-bool $flag = true;
-if ($flag) {
-    echo "yes";
-}
+function main(): void throws Doria\Std\Io\IoError
+{
+    bool $flag = true;
+    if ($flag) {
+        echo "yes";
+    }
 
-writable int $age = 12;
-if ($age < 13) {
-    echo "child";
-} else if ($age < 20) {
-    echo "teen";
-} else {
-    echo "adult";
-}
+    writable int $age = 12;
+    if ($age < 13) {
+        echo "child";
+    } else if ($age < 20) {
+        echo "teen";
+    } else {
+        echo "adult";
+    }
 
-while ($age < 20) {
-    $age += 1;
+    while ($age < 20) {
+        $age += 1;
+    }
 }
 "#,
     )
@@ -3558,7 +3564,7 @@ class Person
         return "Hello";
     }
 
-    function greet(): void
+    function greet(): void throws Doria\Std\Io\IoError
     {
         echo $this->message();
     }
@@ -3577,7 +3583,7 @@ class Parser
 {
     internal int $position = 0;
 
-    function parse(): void
+    function parse(): void throws Doria\Std\Io\IoError
     {
         echo $this->position;
     }
@@ -3754,7 +3760,7 @@ class Person
 {
     internal string $cacheKey = "person";
 
-    function __construct(string $name)
+    function __construct(string $name) throws Doria\Std\Io\IoError
     {
         echo $this->cacheKey;
         echo $this->buildCacheKey($name);
@@ -4279,7 +4285,7 @@ fn checks_stage28a_given_phases_scope_and_do_while_conditions() {
         r#"
 function prepare(): void {}
 function ready(): bool { return true; }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     given {
         prepare();
@@ -4339,7 +4345,7 @@ function missing(): int
     doriac::check_source(
         "test.doria",
         r#"
-function inspect(bool $running, bool $stop): void
+function inspect(bool $running, bool $stop): void throws Doria\Std\Io\IoError
 {
     while ($running) {
         int $value = when ($stop): int {
@@ -4385,7 +4391,7 @@ fn do_while_ownership_exit_excludes_the_unexecuted_pre_body_state() {
         r#"
 class Value {}
 function consume(take Value $value): void {}
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $value = new Value();
     consume($value);
@@ -4424,7 +4430,7 @@ fn finalizer_transfers_are_checked_by_destination() {
     let diagnostics = doriac::check_source(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     if (true) {
         echo "body";
@@ -4454,7 +4460,7 @@ function main(): void
     doriac::check_source(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     if (true) {
         echo "body";
@@ -4479,7 +4485,7 @@ fn finalizer_scope_follows_the_complete_attached_construct() {
     doriac::check_source(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $finished = false;
     given {
@@ -4638,7 +4644,7 @@ class Session
     string $state;
     writable int $attempts;
 
-    function __construct(bool $ready)
+    function __construct(bool $ready) throws Doria\Std\Io\IoError
     {
         if ($ready) {
             echo "ready";

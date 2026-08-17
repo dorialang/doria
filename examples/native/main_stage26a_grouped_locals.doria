@@ -1,10 +1,10 @@
-function number(): int
+function number(): int throws Doria\Std\Io\IoError
 {
     echo "number\n";
     return 7;
 }
 
-function text(): string
+function text(): string throws Doria\Std\Io\IoError
 {
     echo "text\n";
     return "shared";
@@ -17,7 +17,7 @@ class Token
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $first, $second = number();
     let writable $third, $fourth = number();

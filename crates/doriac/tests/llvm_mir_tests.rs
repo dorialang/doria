@@ -101,7 +101,7 @@ fn enum_ir_preserves_inline_tags_backings_nullability_and_mixed_identity() {
 enum Status { case Draft; case Published; }
 enum Priority: int { case Low = 1; case High = 10; }
 enum Transport: string { case Road = "road"; case Rail = "rail"; }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Status $status = Status::Draft;
     Priority $priority = Priority::High;
@@ -305,7 +305,7 @@ function repeat(): void
         if ($count < 2) { continue; }
     } while ($count < 3);
 }
-function finalized(bool $ready): int
+function finalized(bool $ready): int throws Doria\Std\Io\IoError
 {
     if ($ready) {
         return 42;
@@ -314,7 +314,7 @@ function finalized(bool $ready): int
     }
     return 0;
 }
-function loopFinalizer(): void
+function loopFinalizer(): void throws Doria\Std\Io\IoError
 {
     let writable $count = 0;
     while ($count < 2) {
@@ -325,7 +325,7 @@ function loopFinalizer(): void
         echo "loop cleanup";
     }
 }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo "{select(true)}:{finalized(true)}";
     gated(true);
@@ -582,7 +582,7 @@ fn lowers_complete_stage17_io_and_format_mir_to_verified_objects() {
         include_str!("../../../examples/native/main_missing_file_panic.doria"),
         r#"
 function identity(?string $value): ?string { return $value; }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $line = identity(read_line());
     if ($line != null) { echo $line; }
@@ -685,7 +685,7 @@ fn allocates_every_scratch_slot_in_the_entry_block() {
     let sources: [&str; 8] = [
         // Dictionary get, set, index, and remove: the shape that first failed.
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable Dictionary<string, int> $values = [];
     writable List<string> $keys = [];
@@ -711,7 +711,7 @@ function main(): void
         include_str!("../../../examples/native/main_payload_enums_collections.doria"),
         // Set construction, membership, and removal inside a loop.
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable Set<int> $seen = Set::from([]);
     let writable $hits = 0;
@@ -727,7 +727,7 @@ function main(): void
 "#,
         // List access and removal, which drive the collection drop loops.
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<string> $items = [];
     for (let writable $index = 0; $index < 8; $index++) {
@@ -743,7 +743,7 @@ function main(): void
 "#,
         // String search and parse, each of which allocates an out-parameter.
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $found = 0;
     for (let writable $index = 0; $index < 8; $index++) {
@@ -756,7 +756,7 @@ function main(): void
 "#,
         // Sorted collections, which take the ordered runtime paths.
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable SortedSet<int> $ordered = SortedSet::from([]);
     writable SortedDictionary<string, int> $indexed = SortedDictionary::from([]);
@@ -775,7 +775,7 @@ function main(): void
         // Collection clear uses the same release loop repeatedly; its index
         // scratch must remain in the fixed entry frame.
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable List<string> $values = [];
     for (let writable $index = 0; $index < 8; $index++) {
@@ -794,7 +794,7 @@ class Point
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $total = 0;
     for (let writable $index = 0; $index < 8; $index++) {
@@ -887,7 +887,7 @@ function main(): void
     let bytes = doriac::lower_source_to_mir(
         "llvm-bytes-drop.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Bytes $contents = read_stdin_bytes();
     write_stdout_bytes($contents);
@@ -953,7 +953,7 @@ fn dictionary_iteration_reads_elements_positionally() {
         (
             "sorted dictionary, values projection",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable SortedDictionary<int, int> $values = SortedDictionary::from([]);
     for (let writable $index = 0; $index < 8; $index++) { $values->set($index, $index); }
@@ -966,7 +966,7 @@ function main(): void
         (
             "sorted dictionary, key and value bound",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable SortedDictionary<int, int> $values = SortedDictionary::from([]);
     for (let writable $index = 0; $index < 8; $index++) { $values->set($index, $index); }
@@ -979,7 +979,7 @@ function main(): void
         (
             "unordered dictionary, values projection",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable Dictionary<int, int> $values = [];
     for (let writable $index = 0; $index < 8; $index++) { $values->set($index, $index); }
@@ -992,7 +992,7 @@ function main(): void
         (
             "string-keyed dictionary with string values",
             r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable Dictionary<string, string> $values = [];
     for (let writable $index = 0; $index < 8; $index++) { $values->set("k{$index}", "v{$index}"); }
@@ -1027,7 +1027,7 @@ function main(): void
 #[test]
 fn a_values_only_walk_does_not_read_keys() {
     let source = r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable SortedDictionary<int, int> $values = SortedDictionary::from([]);
     for (let writable $index = 0; $index < 8; $index++) { $values->set($index, $index); }

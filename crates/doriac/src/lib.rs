@@ -10,6 +10,7 @@ pub mod codegen_llvm;
 pub mod codegen_native;
 pub mod codegen_php;
 pub mod collection_diagnostics;
+pub mod compiler_known_io;
 pub mod const_eval;
 mod constructor_init;
 pub mod control_flow;
@@ -64,7 +65,13 @@ pub fn parse_source(path: impl Into<String>, text: impl Into<String>) -> Diagnos
 pub fn check_source(path: impl Into<String>, text: impl Into<String>) -> DiagnosticResult<Program> {
     let source = SourceFile::new(path, text);
     let program = parse_source_file(&source)?;
-    semantics::analyze_program_with_source(&program, &source.text)?;
+    compiler_known_io::validate_reserved_identities(&program)?;
+    let augmented = if compiler_known_io::source_uses_canonical_io(&source)? {
+        compiler_known_io::augment_program(&program)
+    } else {
+        program.clone()
+    };
+    semantics::analyze_program_with_source(&augmented, &source.text)?;
     Ok(program)
 }
 
@@ -102,6 +109,12 @@ pub fn lower_source(
 ) -> DiagnosticResult<hir::Program> {
     let source = SourceFile::new(path, text);
     let program = parse_source_file(&source)?;
+    compiler_known_io::validate_reserved_identities(&program)?;
+    let program = if compiler_known_io::source_uses_canonical_io(&source)? {
+        compiler_known_io::augment_program(&program)
+    } else {
+        program
+    };
     let semantic_info = semantics::analyze_program_with_source(&program, &source.text)?;
     let mut hir = lowering::lower_program_with_semantics(&program, semantic_info)?;
     hir.source_path = source.path;
@@ -148,36 +161,6 @@ pub fn compile_source_with_options(
             ]
         })
     })
-}
-
-pub(crate) fn reject_escaping_main_error(program: &hir::Program) -> DiagnosticResult<()> {
-    let Some(main) = program.items.iter().find_map(|item| match item {
-        hir::Item::Function(function) if function.name == "main" => Some(function),
-        _ => None,
-    }) else {
-        return Ok(());
-    };
-    let effects = program
-        .semantic_info
-        .callable_checked_effects
-        .get(&main.span.start);
-    if effects.is_some_and(|effects| !effects.is_empty()) {
-        return Err(vec![escaping_main_error_boundary(main.span)]);
-    }
-    Ok(())
-}
-
-pub(crate) fn escaping_main_error_boundary(span: Span) -> Diagnostic {
-    Diagnostic::unsupported_stage(
-        "B2902",
-        "process-level reporting for an Error escaping `main` lands in Stage 29 Slice 3",
-        span,
-    )
-    .with_title("Unhandled Main Error Reporting Lands In Stage 29 Slice 3")
-    .with_explanation(
-        "Checked-error execution is available. Stage 29 Slice 3 will define process-level reporting for an Error that escapes `main`.",
-    )
-    .with_help("handle every checked Error before `main` returns")
 }
 
 pub fn parse_source_file(source: &SourceFile) -> DiagnosticResult<Program> {

@@ -1,7 +1,7 @@
 // Nullable dictionary indexing in a loop body. `$values[$key]` on a nullable
 // value type lowers through a different nullable-access path than
 // Dictionary::get and allocates a scratch slot of its own.
-function main(List<string> $args): void
+function main(List<string> $args): void throws Doria\Std\Io\IoError
 {
     let $n = Int::parse($args[0]) ?? 0;
     writable Dictionary<int, ?int> $values = [];

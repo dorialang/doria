@@ -1,4 +1,4 @@
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Bytes $contents = read_file_bytes("missing.bin");
     echo "{$contents->length}";

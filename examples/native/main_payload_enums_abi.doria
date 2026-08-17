@@ -20,7 +20,7 @@ function same(Coordinate $left, Coordinate $right): bool
     return $left == $right;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Coordinate $point = make(20, 22);
     let $box = new Box<Coordinate>($point);

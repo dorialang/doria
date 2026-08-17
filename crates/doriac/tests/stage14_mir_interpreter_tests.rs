@@ -98,9 +98,9 @@ function main(): int
 #[test]
 fn bool_value_short_circuits_while_xor_is_eager() {
     let short = run(r#"
-function left(): bool { echo "L"; return false; }
-function right(): bool { echo "R"; return true; }
-function main(): int
+function left(): bool throws Doria\Std\Io\IoError { echo "L"; return false; }
+function right(): bool throws Doria\Std\Io\IoError { echo "R"; return true; }
+function main(): int throws Doria\Std\Io\IoError
 {
     bool $value = left() and right();
     if (not $value) { return 42; }
@@ -111,9 +111,9 @@ function main(): int
     assert_eq!(short.exit_status, 42);
 
     let eager = run(r#"
-function left(): bool { echo "L"; return false; }
-function right(): bool { echo "R"; return true; }
-function main(): int
+function left(): bool throws Doria\Std\Io\IoError { echo "L"; return false; }
+function right(): bool throws Doria\Std\Io\IoError { echo "R"; return true; }
+function main(): int throws Doria\Std\Io\IoError
 {
     bool $value = left() xor right();
     if ($value) { return 42; }

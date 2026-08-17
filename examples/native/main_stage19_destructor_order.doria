@@ -6,9 +6,12 @@ class Token
 
     function __destruct()
     {
-        echo "drop token ";
-        echo $this->name;
-        echo "\n";
+        try {
+            echo "drop token ";
+            echo $this->name;
+            echo "\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -20,7 +23,10 @@ class Pair
 
     function __destruct()
     {
-        echo "drop pair\n";
+        try {
+            echo "drop pair\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -57,7 +63,7 @@ function leaveEarly(): void
     return;
 }
 
-function scenario(): void
+function scenario(): void throws Doria\Std\Io\IoError
 {
     let $first = new Token("first");
     let $second = new Token("second");
@@ -96,7 +102,7 @@ function scenario(): void
     return;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     scenario();
 }

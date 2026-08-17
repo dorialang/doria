@@ -14,7 +14,7 @@ function label(Status $status): string
     };
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo "{label(Status::Draft)} {label(Status::Published)} {label(Status::Archived)}\n";
 }

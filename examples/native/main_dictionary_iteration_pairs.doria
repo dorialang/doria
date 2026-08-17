@@ -2,7 +2,7 @@
 // one up by key. Keys and values are parallel arrays, so every iteration form
 // must still pair key i with value i, in the collection's own order.
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Dictionary<string, int> $scores = ["charlie" => 3, "alice" => 1, "bob" => 2];
 

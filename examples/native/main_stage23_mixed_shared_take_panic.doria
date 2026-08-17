@@ -6,16 +6,19 @@ class Token
 
     function __destruct()
     {
-        echo "<drop " . $this->name . ">\n";
+        try {
+            echo "<drop " . $this->name . ">\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function consume(take Token $token): void
+function consume(take Token $token): void throws Doria\Std\Io\IoError
 {
     echo "consumed\n";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     // `mixed $borrowed = $items[0]` clones the box, sharing the payload owner with the
     // element still in the collection. Taking that class payload out by `take` would

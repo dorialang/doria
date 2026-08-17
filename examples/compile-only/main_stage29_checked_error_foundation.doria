@@ -36,7 +36,7 @@ class Repository
     }
 }
 
-function main(): void throws StorageError
+function main(): void throws StorageError, Doria\Std\Io\IoError
 {
     try {
         echo loadRecord("missing");

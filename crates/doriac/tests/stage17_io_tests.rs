@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use doriac::diagnostics::{ColorChoice, DiagnosticFormat, RenderOptions};
-use doriac::mir_interpreter::{interpret_with_io, MirIo, MirIoFaults, MirIoWriteFailure};
+use doriac::mir_interpreter::{
+    interpret_with_io, MirIo, MirIoFailureReason, MirIoFaults, MirIoWriteFailure,
+};
 
 fn interpret(
     source: &str,
@@ -27,7 +29,7 @@ fn interpret_with_host(source: &str, io: MirIo) -> doriac::mir_interpreter::Inte
 }
 
 const PROMPTED_READ: &str = r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $line = read_line("Name: ");
     if ($line != null) { echo $line; }
@@ -50,7 +52,7 @@ fn prompted_read_line_observes_write_flush_and_read_in_order() {
     assert_eq!(output.trace.stdin_line_reads, 1);
 
     let empty = interpret_with_host(
-        "function main(): void { let $line = read_line(); }",
+        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { let $line = read_line(); }",
         MirIo::default(),
     );
     assert_eq!(empty.trace.prompt_writes, 0);
@@ -86,7 +88,7 @@ fn prompted_read_line_broken_pipes_exit_cleanly_before_stdin() {
 }
 
 #[test]
-fn prompted_read_line_host_failures_keep_their_runtime_codes() {
+fn prompted_read_line_failures_use_checked_errors_except_for_allocation() {
     let cases = [
         (
             MirIoFaults {
@@ -94,7 +96,7 @@ fn prompted_read_line_host_failures_keep_their_runtime_codes() {
                 ..MirIoFaults::default()
             },
             b"".as_slice(),
-            "P1407",
+            "Doria\\Std\\Io\\IoError",
         ),
         (
             MirIoFaults {
@@ -102,7 +104,7 @@ fn prompted_read_line_host_failures_keep_their_runtime_codes() {
                 ..MirIoFaults::default()
             },
             b"Name: ".as_slice(),
-            "P1407",
+            "Doria\\Std\\Io\\IoError",
         ),
         (
             MirIoFaults {
@@ -110,7 +112,7 @@ fn prompted_read_line_host_failures_keep_their_runtime_codes() {
                 ..MirIoFaults::default()
             },
             b"Name: ".as_slice(),
-            "P1403",
+            "Doria\\Std\\Io\\IoError",
         ),
         (
             MirIoFaults {
@@ -122,7 +124,7 @@ fn prompted_read_line_host_failures_keep_their_runtime_codes() {
         ),
     ];
 
-    for (faults, stdout, code) in cases {
+    for (faults, stdout, outcome) in cases {
         let output = interpret_with_host(
             PROMPTED_READ,
             MirIo {
@@ -131,16 +133,33 @@ fn prompted_read_line_host_failures_keep_their_runtime_codes() {
                 ..MirIo::default()
             },
         );
-        assert_eq!(output.output.stdout, stdout, "{code}");
-        assert_eq!(output.output.exit_status, 101, "{code}");
+        assert_eq!(output.output.stdout, stdout, "{outcome}");
+        let expected_status = if outcome == "P1206" { 101 } else { 70 };
+        let expected_code = if outcome == "P1206" { "P1206" } else { "R1000" };
+        assert_eq!(output.output.exit_status, expected_status, "{outcome}");
         assert_eq!(
             output
                 .output
                 .runtime_diagnostic
                 .as_ref()
                 .map(|diagnostic| diagnostic.code),
-            Some(code),
+            Some(expected_code),
         );
+        if outcome != "P1206" {
+            assert_eq!(
+                output
+                    .output
+                    .runtime_diagnostic
+                    .as_ref()
+                    .and_then(|diagnostic| {
+                        diagnostic
+                            .runtime_outcome
+                            .as_ref()
+                            .and_then(|details| details.error_type.as_deref())
+                    }),
+                Some(outcome),
+            );
+        }
     }
 
     let invalid_utf8 = interpret_with_host(
@@ -151,22 +170,113 @@ fn prompted_read_line_host_failures_keep_their_runtime_codes() {
         },
     );
     assert_eq!(invalid_utf8.output.stdout, b"Name: ");
-    assert_eq!(invalid_utf8.output.exit_status, 101);
+    assert_eq!(invalid_utf8.output.exit_status, 70);
     assert_eq!(
         invalid_utf8
             .output
             .runtime_diagnostic
             .as_ref()
             .map(|diagnostic| diagnostic.code),
-        Some("P1404"),
+        Some("R1000"),
     );
+    assert_eq!(
+        invalid_utf8
+            .output
+            .runtime_diagnostic
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.runtime_outcome.as_ref())
+            .and_then(|details| details.error_type.as_deref()),
+        Some("Doria\\Std\\Io\\InvalidUtf8Error"),
+    );
+}
+
+#[test]
+fn interpreter_faults_preserve_every_io_reason_system_code_and_standard_error_target() {
+    const REASON_SOURCE: &str = r#"
+function main(): int throws Doria\Std\Io\InvalidUtf8Error
+{
+    try {
+        read_line();
+    } catch (Doria\Std\Io\IoError $error) {
+        ?int $systemCode = $error->systemCode;
+        if ($systemCode == null) {
+            return 9;
+        } else {
+            if ($systemCode != 28) { return 9; }
+        }
+        return match ($error->reason) {
+            Doria\Std\Io\IoErrorReason::NotFound => 1,
+            Doria\Std\Io\IoErrorReason::PermissionDenied => 2,
+            Doria\Std\Io\IoErrorReason::InvalidInput => 3,
+            Doria\Std\Io\IoErrorReason::Interrupted => 4,
+            Doria\Std\Io\IoErrorReason::ResourceExhausted => 5,
+            Doria\Std\Io\IoErrorReason::Unsupported => 6,
+            Doria\Std\Io\IoErrorReason::Closed => 7,
+            Doria\Std\Io\IoErrorReason::Other => 8,
+        };
+    }
+    return 0;
+}
+"#;
+    for (reason, expected) in [
+        (MirIoFailureReason::NotFound, 1),
+        (MirIoFailureReason::PermissionDenied, 2),
+        (MirIoFailureReason::InvalidInput, 3),
+        (MirIoFailureReason::Interrupted, 4),
+        (MirIoFailureReason::ResourceExhausted, 5),
+        (MirIoFailureReason::Unsupported, 6),
+        (MirIoFailureReason::Closed, 7),
+        (MirIoFailureReason::Other, 8),
+    ] {
+        let output = interpret_with_host(
+            REASON_SOURCE,
+            MirIo {
+                faults: MirIoFaults {
+                    stdin_line_read: true,
+                    failure_reason: reason,
+                    system_code: Some(28),
+                    ..MirIoFaults::default()
+                },
+                ..MirIo::default()
+            },
+        );
+        assert_eq!(output.output.exit_status, expected, "{reason:?}");
+    }
+
+    let standard_error = interpret_with_host(
+        r#"
+function main(): int
+{
+    try {
+        write_stderr("test");
+    } catch (Doria\Std\Io\IoError $error) {
+        return match ($error->target) {
+            Doria\Std\Io\IoTarget::StandardError => 42,
+            default => 1,
+        };
+    }
+    return 0;
+}
+"#,
+        MirIo {
+            faults: MirIoFaults {
+                stderr_write: Some(MirIoWriteFailure::Other),
+                failure_reason: MirIoFailureReason::Closed,
+                system_code: Some(9),
+                ..MirIoFaults::default()
+            },
+            ..MirIo::default()
+        },
+    );
+    assert_eq!(standard_error.output.exit_status, 42);
+    assert!(standard_error.output.stderr.is_empty());
 }
 
 #[test]
 fn read_line_distinguishes_empty_lines_final_bytes_and_eof() {
     let output = interpret(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let writable $line = read_line();
     while ($line != null) {
@@ -308,12 +418,12 @@ function main(): void
 }
 
 #[test]
-fn read_file_rejects_invalid_utf8_before_constructing_a_string() {
+fn read_file_reports_checked_invalid_utf8_before_constructing_a_string() {
     let mut files = BTreeMap::new();
     files.insert("invalid.txt".to_string(), vec![b'D', 0xff, b'a']);
     let output = interpret(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     echo read_file("invalid.txt");
 }
@@ -323,13 +433,19 @@ function main(): void
     );
 
     assert!(output.output.stdout.is_empty());
-    assert_eq!(output.output.exit_status, 101);
+    assert_eq!(output.output.exit_status, 70);
     let diagnostic = output
         .output
         .runtime_diagnostic
         .expect("invalid UTF-8 should retain a structured diagnostic");
-    assert_eq!(diagnostic.code, "P1406");
-    assert_eq!(diagnostic.title, "File Text Is Not Valid UTF-8");
+    assert_eq!(diagnostic.code, "R1000");
+    assert_eq!(
+        diagnostic
+            .runtime_outcome
+            .as_ref()
+            .and_then(|details| details.error_type.as_deref()),
+        Some("Doria\\Std\\Io\\InvalidUtf8Error"),
+    );
 }
 
 #[test]
@@ -338,7 +454,7 @@ fn files_stderr_and_checked_formatting_share_deterministic_io() {
     files.insert("input.txt".to_string(), "Dória\0line".as_bytes().to_vec());
     let output = interpret(
         r#"
-function main(): int
+function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $contents = read_file("input.txt");
     write_file("copy.txt", $contents);
@@ -375,7 +491,7 @@ fn nullable_and_format_diagnostics_are_checked_before_mir() {
 #[test]
 fn nullable_assignment_invalidates_non_null_narrowing() {
     let source = r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let writable $line = read_line();
     if ($line != null) {
@@ -396,7 +512,7 @@ function main(): void
     doriac::lower_source_to_mir(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let writable $line = read_line();
     if ($line != null) {
@@ -414,13 +530,13 @@ fn narrowed_read_line_values_lower_as_strings_in_calls_and_returns() {
     let output = interpret(
         r#"
 function identity(string $value): string { return $value; }
-function nextLine(): string
+function nextLine(): string throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $line = read_line();
     if ($line != null) { return identity($line); }
     return "fallback";
 }
-function main(): void { echo nextLine(); }
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error { echo nextLine(); }
 "#,
         "Dória\n".as_bytes(),
         BTreeMap::new(),
@@ -452,7 +568,7 @@ function check(bool $condition): void
 function main(): void { check(true); }
 "#,
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let writable $line = read_line();
     while ($line != null) {
@@ -475,7 +591,7 @@ function main(): void
     doriac::lower_source_to_mir(
         "test.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $line = read_line();
     if ($line != null) {
@@ -508,7 +624,7 @@ fn format_type_diagnostics_use_source_specifiers() {
 fn accepted_format_matrix_is_exact_and_width_aware() {
     let output = interpret(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     int8 $i8 = -1;
     int16 $i16 = -1;
@@ -557,13 +673,13 @@ function main(): void
 fn format_arguments_evaluate_left_to_right_once_and_printf_adds_no_newline() {
     let output = interpret(
         r#"
-function mark(int $value): int
+function mark(int $value): int throws Doria\Std\Io\IoError
 {
     echo $value;
     return $value;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo sprintf("[%d,%d,%d]", mark(1), mark(2), mark(3));
     printf("<%s>", false);

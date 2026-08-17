@@ -19,8 +19,14 @@ use crate::mir_validation;
 use crate::native_abi::{
     collection_comparator_code, collection_header_size, collection_value_width, function_symbol,
     nullable_collection_access_code, nullable_payload_type, stage26_collection_kind, APPEND_FILE,
-    APPEND_FILE_BYTES, BYTES_EQUAL, BYTES_FREE, BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH,
-    BYTES_SET, BYTES_TO_COLLECTION, CLASS_ALLOCATE, CLASS_FREE, COLLECTION_AGGREGATE_INSERT_SLOT,
+    APPEND_FILE_BYTES, BYTES_DATA, BYTES_EQUAL, BYTES_FREE, BYTES_FROM_COLLECTION, BYTES_GET,
+    BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CHECKED_IO, CHECKED_IO_APPEND_FILE,
+    CHECKED_IO_ERROR_INVALID_UTF8, CHECKED_IO_ERROR_IO, CHECKED_IO_META_HAS_INVALID_COUNT_SHIFT,
+    CHECKED_IO_META_HAS_SYSTEM_CODE_SHIFT, CHECKED_IO_META_KIND_SHIFT,
+    CHECKED_IO_META_OPERATION_SHIFT, CHECKED_IO_META_REASON_SHIFT, CHECKED_IO_META_TARGET_SHIFT,
+    CHECKED_IO_READ_FILE_BYTES, CHECKED_IO_READ_FILE_TEXT, CHECKED_IO_READ_LINE,
+    CHECKED_IO_READ_STDIN_BYTES, CHECKED_IO_WRITE_FILE, CHECKED_IO_WRITE_STDERR,
+    CHECKED_IO_WRITE_STDOUT, CLASS_ALLOCATE, CLASS_FREE, COLLECTION_AGGREGATE_INSERT_SLOT,
     COLLECTION_AGGREGATE_KEYED_SET_SLOT, COLLECTION_AGGREGATE_NEW,
     COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO, COLLECTION_AGGREGATE_PUSH_FRONT_SLOT,
     COLLECTION_AGGREGATE_PUSH_SLOT, COLLECTION_AGGREGATE_REMOVE_AT_INTO,
@@ -594,7 +600,6 @@ fn define_static_data(
             .map_err(|error| backend_failure(error.to_string()))?;
         let mut description = DataDescription::new();
         description.set_align(pointer_bytes as u64);
-        let function = function_in(program, origin.function)?;
         let path_id = module
             .declare_data(&format!("{symbol}_path"), Linkage::Local, false, false)
             .map_err(|error| backend_failure(error.to_string()))?;
@@ -615,7 +620,7 @@ fn define_static_data(
             .declare_data(&format!("{symbol}_callable"), Linkage::Local, false, false)
             .map_err(|error| backend_failure(error.to_string()))?;
         let mut callable = DataDescription::new();
-        callable.define(function.name.as_bytes().to_vec().into_boxed_slice());
+        callable.define(origin.callable.as_bytes().to_vec().into_boxed_slice());
         module
             .define_data(callable_id, &callable)
             .map_err(|error| backend_failure(error.to_string()))?;
@@ -627,7 +632,7 @@ fn define_static_data(
         append_target_word(&mut bytes, origin.span.start as u64, pointer_bytes);
         append_target_word(&mut bytes, origin.span.end as u64, pointer_bytes);
         append_target_word(&mut bytes, 0, pointer_bytes);
-        append_target_word(&mut bytes, function.name.len() as u64, pointer_bytes);
+        append_target_word(&mut bytes, origin.callable.len() as u64, pointer_bytes);
         description.define(bytes.into_boxed_slice());
         let path_reference = module.declare_data_in_data(path_id, &mut description);
         description.write_data_addr(0, path_reference, 0);
@@ -1477,11 +1482,13 @@ fn define_process_main(
             }
         }
         runtime_signature.returns.push(AbiParam::new(types::I32));
-        let runtime_symbol = match (entry.return_type, takes_arguments) {
+        let checked_entry = !entry.checked_effects.is_empty();
+        let runtime_symbol = match (entry.return_type, takes_arguments, checked_entry) {
             (
                 mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
                     IntegerType::Int64,
                 ))),
+                false,
                 false,
             ) => "dr_v2_main_int",
             (
@@ -1489,10 +1496,27 @@ fn define_process_main(
                     IntegerType::Int64,
                 ))),
                 true,
+                false,
             ) => "dr_v2_main_int_args",
-            (mir::ReturnType::Void, false) => "dr_v2_main_void",
-            (mir::ReturnType::Void, true) => "dr_v2_main_void_args",
-            (mir::ReturnType::Value(other), _) => {
+            (
+                mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
+                    IntegerType::Int64,
+                ))),
+                false,
+                true,
+            ) => "dr_v3_main_checked_int",
+            (
+                mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Integer(
+                    IntegerType::Int64,
+                ))),
+                true,
+                true,
+            ) => "dr_v3_main_checked_int_args",
+            (mir::ReturnType::Void, false, false) => "dr_v2_main_void",
+            (mir::ReturnType::Void, true, false) => "dr_v2_main_void_args",
+            (mir::ReturnType::Void, false, true) => "dr_v3_main_checked_void",
+            (mir::ReturnType::Void, true, true) => "dr_v3_main_checked_void_args",
+            (mir::ReturnType::Value(other), _, _) => {
                 return Err(malformed_mir(format!(
                     "entry function has unsupported process return type {other}"
                 )));
@@ -2100,8 +2124,7 @@ fn lower_statement(
             args,
             span,
         } => {
-            set_active_panic_site(builder, *span, resources);
-            let _ = lower_function_call(builder, *function, args, resources)?;
+            let _ = lower_function_call_at(builder, *function, args, *span, resources)?;
         }
         mir::Statement::CallNullSafe {
             object,
@@ -2880,6 +2903,9 @@ fn lower_terminator(
             resources.defer_class_temporary_drops = true;
             let string = lower_string_expression(builder, message, resources)?;
             resources.defer_class_temporary_drops = false;
+            // Message evaluation may call another Doria function and update the
+            // active panic site. The explicit panic itself originates here.
+            set_active_panic_site(builder, *span, resources);
             // Abort-only panic never reaches statement-end destruction.
             resources.deferred_class_temporary_drops.clear();
             let pointer_type = resources.module.target_config().pointer_type();
@@ -3073,6 +3099,23 @@ fn lower_terminator(
                 .ins()
                 .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
         }
+        mir::Terminator::CheckedIo {
+            operation,
+            result,
+            error,
+            success,
+            failure,
+            span,
+        } => lower_checked_io_terminator(
+            builder,
+            operation,
+            *result,
+            *error,
+            block_for(blocks, *success)?,
+            block_for(blocks, *failure)?,
+            *span,
+            resources,
+        )?,
         mir::Terminator::ErrorSwitch {
             error,
             cases,
@@ -3117,6 +3160,615 @@ fn lower_terminator(
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_checked_io_terminator(
+    builder: &mut FunctionBuilder,
+    operation: &mir::CheckedIoOperation,
+    result: Option<mir::LocalId>,
+    error: mir::LocalId,
+    success: Block,
+    failure: Block,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    set_active_panic_site(builder, span, resources);
+    debug_assert!(resources.deferred_class_temporary_drops.is_empty());
+    resources.defer_class_temporary_drops = true;
+    let pointer = resources.module.target_config().pointer_type();
+    let zero_pointer = builder.ins().iconst(pointer, 0);
+    let mut owned_strings = Vec::new();
+
+    let (operation_code, path_or_prompt, contents_object, contents_is_bytes) = match operation {
+        mir::CheckedIoOperation::ReadLine { prompt } => {
+            let prompt = lower_string_expression(builder, prompt, resources)?;
+            owned_strings.push(prompt);
+            (CHECKED_IO_READ_LINE, prompt, zero_pointer, false)
+        }
+        mir::CheckedIoOperation::ReadFile { path, bytes } => {
+            let path = lower_string_expression(builder, path, resources)?;
+            owned_strings.push(path);
+            (
+                if *bytes {
+                    CHECKED_IO_READ_FILE_BYTES
+                } else {
+                    CHECKED_IO_READ_FILE_TEXT
+                },
+                path,
+                zero_pointer,
+                false,
+            )
+        }
+        mir::CheckedIoOperation::ReadStdinBytes => (
+            CHECKED_IO_READ_STDIN_BYTES,
+            zero_pointer,
+            zero_pointer,
+            false,
+        ),
+        mir::CheckedIoOperation::WriteFile {
+            path,
+            contents,
+            append,
+        } => {
+            let path = lower_string_expression(builder, path, resources)?;
+            owned_strings.push(path);
+            let (contents, bytes) =
+                lower_checked_io_contents(builder, contents, &mut owned_strings, resources)?;
+            (
+                if *append {
+                    CHECKED_IO_APPEND_FILE
+                } else {
+                    CHECKED_IO_WRITE_FILE
+                },
+                path,
+                contents,
+                bytes,
+            )
+        }
+        mir::CheckedIoOperation::WriteStream { contents, stderr } => {
+            let (contents, bytes) =
+                lower_checked_io_contents(builder, contents, &mut owned_strings, resources)?;
+            (
+                if *stderr {
+                    CHECKED_IO_WRITE_STDERR
+                } else {
+                    CHECKED_IO_WRITE_STDOUT
+                },
+                zero_pointer,
+                contents,
+                bytes,
+            )
+        }
+    };
+
+    let (contents_data, contents_length) = if contents_object == zero_pointer {
+        (zero_pointer, zero_pointer)
+    } else {
+        let data_symbol = if contents_is_bytes {
+            BYTES_DATA
+        } else {
+            STRING_DATA
+        };
+        let length_symbol = if contents_is_bytes {
+            BYTES_LENGTH
+        } else {
+            STRING_BYTE_LENGTH
+        };
+        let data = runtime_call(
+            builder,
+            data_symbol,
+            &[pointer],
+            Some(pointer),
+            &[contents_object],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("checked I/O contents data produced no result"))?;
+        let length = runtime_call(
+            builder,
+            length_symbol,
+            &[pointer],
+            Some(pointer),
+            &[contents_object],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("checked I/O contents length produced no result"))?;
+        (data, length)
+    };
+
+    let pointer_slot = || {
+        StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            pointer.bytes(),
+            pointer.bytes().ilog2() as u8,
+        )
+    };
+    let result_slot = builder.create_sized_stack_slot(pointer_slot());
+    let message_slot = builder.create_sized_stack_slot(pointer_slot());
+    let path_slot = builder.create_sized_stack_slot(pointer_slot());
+    let system_code_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+    let valid_count_slot = builder.create_sized_stack_slot(pointer_slot());
+    let invalid_count_slot = builder.create_sized_stack_slot(pointer_slot());
+    let meta_slot =
+        builder.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 3));
+    let operation_code = builder.ins().iconst(types::I8, i64::from(operation_code));
+    let out = [
+        builder.ins().stack_addr(pointer, result_slot, 0),
+        builder.ins().stack_addr(pointer, message_slot, 0),
+        builder.ins().stack_addr(pointer, path_slot, 0),
+        builder.ins().stack_addr(pointer, system_code_slot, 0),
+        builder.ins().stack_addr(pointer, valid_count_slot, 0),
+        builder.ins().stack_addr(pointer, invalid_count_slot, 0),
+        builder.ins().stack_addr(pointer, meta_slot, 0),
+    ];
+    let status = runtime_call(
+        builder,
+        CHECKED_IO,
+        &[
+            pointer,
+            types::I8,
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+            pointer,
+        ],
+        Some(types::I8),
+        &[
+            resources.current_frame,
+            operation_code,
+            path_or_prompt,
+            contents_data,
+            contents_length,
+            out[0],
+            out[1],
+            out[2],
+            out[3],
+            out[4],
+            out[5],
+            out[6],
+        ],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("checked I/O produced no status"))?;
+    for string in owned_strings {
+        release_string(builder, string, resources)?;
+    }
+    resources.defer_class_temporary_drops = false;
+    flush_deferred_class_temporary_drops(builder, resources)?;
+
+    let succeeded = builder.ins().icmp_imm_u(IntCC::Equal, status, 0);
+    let success_store = builder.create_block();
+    let failure_status = builder.create_block();
+    let invalid_status = builder.create_block();
+    builder
+        .ins()
+        .brif(succeeded, success_store, &[], failure_status, &[]);
+
+    builder.switch_to_block(success_store);
+    if let Some(result) = result {
+        let raw = builder.ins().stack_load(pointer, pointer, result_slot, 0);
+        let definition = local_definition(resources.program, resources.function_id, result)?;
+        let slot = local_slot(resources.local_slots, result)?;
+        match definition.ty {
+            mir::Type::NullableString => {
+                let present = presence_word(builder, raw, pointer);
+                builder.ins().stack_store(pointer, present, slot, 0);
+                builder
+                    .ins()
+                    .stack_store(pointer, raw, slot, pointer.bytes() as i32);
+            }
+            mir::Type::String | mir::Type::Collection(_) => {
+                builder.ins().stack_store(pointer, raw, slot, 0);
+            }
+            _ => {
+                return Err(malformed_mir(
+                    "checked I/O has an unsupported native result type",
+                ))
+            }
+        }
+    }
+    builder.ins().jump(success, &[]);
+
+    builder.switch_to_block(failure_status);
+    let failed = builder.ins().icmp_imm_u(IntCC::Equal, status, 1);
+    let build_error = builder.create_block();
+    builder
+        .ins()
+        .brif(failed, build_error, &[], invalid_status, &[]);
+    builder.switch_to_block(build_error);
+    lower_checked_io_error(
+        builder,
+        error,
+        message_slot,
+        path_slot,
+        system_code_slot,
+        valid_count_slot,
+        invalid_count_slot,
+        meta_slot,
+        failure,
+        resources,
+    )?;
+
+    builder.switch_to_block(invalid_status);
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
+    Ok(())
+}
+
+fn lower_checked_io_contents(
+    builder: &mut FunctionBuilder,
+    contents: &mir::IoContents,
+    owned_strings: &mut Vec<Value>,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(Value, bool), BackendError> {
+    match contents {
+        mir::IoContents::String(value) => {
+            let value = lower_string_expression(builder, value, resources)?;
+            owned_strings.push(value);
+            Ok((value, false))
+        }
+        mir::IoContents::Format(value) => {
+            let value = lower_format_expression(builder, value, resources)?;
+            owned_strings.push(value);
+            Ok((value, false))
+        }
+        mir::IoContents::Bytes(local) => {
+            Ok((lower_collection_pointer(builder, *local, resources)?, true))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_checked_io_error(
+    builder: &mut FunctionBuilder,
+    error: mir::LocalId,
+    message_slot: StackSlot,
+    path_slot: StackSlot,
+    system_code_slot: StackSlot,
+    valid_count_slot: StackSlot,
+    invalid_count_slot: StackSlot,
+    meta_slot: StackSlot,
+    failure: Block,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let meta = builder.ins().stack_load(pointer, types::I64, meta_slot, 0);
+    let kind = checked_io_meta_byte(builder, meta, CHECKED_IO_META_KIND_SHIFT);
+    let invalid_utf8 =
+        builder
+            .ins()
+            .icmp_imm_u(IntCC::Equal, kind, i64::from(CHECKED_IO_ERROR_INVALID_UTF8));
+    let invalid = builder.create_block();
+    let ordinary = builder.create_block();
+    builder
+        .ins()
+        .brif(invalid_utf8, invalid, &[], ordinary, &[]);
+
+    builder.switch_to_block(ordinary);
+    let is_io = builder
+        .ins()
+        .icmp_imm_u(IntCC::Equal, kind, i64::from(CHECKED_IO_ERROR_IO));
+    let valid_io = builder.create_block();
+    let malformed = builder.create_block();
+    builder.ins().brif(is_io, valid_io, &[], malformed, &[]);
+    builder.switch_to_block(valid_io);
+    lower_checked_io_error_object(
+        builder,
+        crate::compiler_known_io::IO_ERROR,
+        error,
+        message_slot,
+        path_slot,
+        system_code_slot,
+        valid_count_slot,
+        invalid_count_slot,
+        meta,
+        resources,
+    )?;
+    builder.ins().jump(failure, &[]);
+
+    builder.switch_to_block(invalid);
+    lower_checked_io_error_object(
+        builder,
+        crate::compiler_known_io::INVALID_UTF8_ERROR,
+        error,
+        message_slot,
+        path_slot,
+        system_code_slot,
+        valid_count_slot,
+        invalid_count_slot,
+        meta,
+        resources,
+    )?;
+    builder.ins().jump(failure, &[]);
+
+    builder.switch_to_block(malformed);
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
+    let _ = pointer;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_checked_io_error_object(
+    builder: &mut FunctionBuilder,
+    type_name: &str,
+    error: mir::LocalId,
+    message_slot: StackSlot,
+    path_slot: StackSlot,
+    system_code_slot: StackSlot,
+    valid_count_slot: StackSlot,
+    invalid_count_slot: StackSlot,
+    meta: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let class = resources
+        .program
+        .classes
+        .iter()
+        .find(|class| class.name == type_name)
+        .ok_or_else(|| malformed_mir(format!("compiler-known class `{type_name}` is missing")))?
+        .clone();
+    let descriptor = resources
+        .program
+        .error_descriptors
+        .iter()
+        .find(|descriptor| descriptor.type_name == type_name)
+        .ok_or_else(|| {
+            malformed_mir(format!(
+                "compiler-known Error `{type_name}` has no descriptor"
+            ))
+        })?
+        .id;
+    let size = builder.ins().iconst(pointer, i64::from(class.layout.size));
+    let align = builder.ins().iconst(pointer, i64::from(class.layout.align));
+    let object = runtime_call(
+        builder,
+        CLASS_ALLOCATE,
+        &[pointer, pointer, pointer],
+        Some(pointer),
+        &[resources.current_frame, size, align],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("checked I/O Error allocation produced no result"))?;
+    let message = builder.ins().stack_load(pointer, pointer, message_slot, 0);
+    store_known_property(
+        builder,
+        object,
+        &class,
+        "message",
+        LoweredValue::Single(message),
+        resources,
+    )?;
+
+    if type_name == crate::compiler_known_io::IO_ERROR {
+        let operation = checked_io_meta_byte(builder, meta, CHECKED_IO_META_OPERATION_SHIFT);
+        let operation = builder.ins().uextend(types::I32, operation);
+        store_known_property(
+            builder,
+            object,
+            &class,
+            "operation",
+            LoweredValue::Single(operation),
+            resources,
+        )?;
+        let target = checked_io_meta_byte(builder, meta, CHECKED_IO_META_TARGET_SHIFT);
+        let path = builder.ins().stack_load(pointer, pointer, path_slot, 0);
+        store_checked_io_payload_property(
+            builder,
+            object,
+            &class,
+            "target",
+            crate::compiler_known_io::IO_TARGET,
+            target,
+            path,
+            resources,
+        )?;
+        let reason = checked_io_meta_byte(builder, meta, CHECKED_IO_META_REASON_SHIFT);
+        let reason = builder.ins().uextend(types::I32, reason);
+        store_known_property(
+            builder,
+            object,
+            &class,
+            "reason",
+            LoweredValue::Single(reason),
+            resources,
+        )?;
+        let present = checked_io_meta_bit(builder, meta, CHECKED_IO_META_HAS_SYSTEM_CODE_SHIFT);
+        let system_code = builder
+            .ins()
+            .stack_load(pointer, types::I64, system_code_slot, 0);
+        store_known_property(
+            builder,
+            object,
+            &class,
+            "systemCode",
+            LoweredValue::Nullable {
+                present,
+                payload: system_code,
+            },
+            resources,
+        )?;
+    } else {
+        let source = checked_io_meta_byte(builder, meta, CHECKED_IO_META_TARGET_SHIFT);
+        let path = builder.ins().stack_load(pointer, pointer, path_slot, 0);
+        store_checked_io_payload_property(
+            builder,
+            object,
+            &class,
+            "source",
+            crate::compiler_known_io::UTF8_INPUT_SOURCE,
+            source,
+            path,
+            resources,
+        )?;
+        let valid = builder
+            .ins()
+            .stack_load(pointer, pointer, valid_count_slot, 0);
+        let valid = if pointer == types::I64 {
+            valid
+        } else {
+            builder.ins().uextend(types::I64, valid)
+        };
+        store_known_property(
+            builder,
+            object,
+            &class,
+            "validByteCount",
+            LoweredValue::Single(valid),
+            resources,
+        )?;
+        let present = checked_io_meta_bit(builder, meta, CHECKED_IO_META_HAS_INVALID_COUNT_SHIFT);
+        let invalid = builder
+            .ins()
+            .stack_load(pointer, pointer, invalid_count_slot, 0);
+        let invalid = if pointer == types::I64 {
+            invalid
+        } else {
+            builder.ins().uextend(types::I64, invalid)
+        };
+        store_known_property(
+            builder,
+            object,
+            &class,
+            "invalidByteCount",
+            LoweredValue::Nullable {
+                present,
+                payload: invalid,
+            },
+            resources,
+        )?;
+    }
+
+    let error_slot = local_slot(resources.local_slots, error)?;
+    let error_address = builder.ins().stack_addr(pointer, error_slot, 0);
+    let descriptor = lower_error_descriptor_address(builder, descriptor, resources)?;
+    store_lowered_to_address(
+        builder,
+        mir::Type::Error,
+        error_address,
+        LoweredValue::Nullable {
+            present: object,
+            payload: descriptor,
+        },
+        pointer,
+    )?;
+    Ok(())
+}
+
+fn store_known_property(
+    builder: &mut FunctionBuilder,
+    object: Value,
+    class: &mir::Class,
+    name: &str,
+    value: LoweredValue,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let property = class
+        .properties
+        .iter()
+        .find(|property| property.name == name)
+        .ok_or_else(|| malformed_mir(format!("class `{}` has no `${name}`", class.name)))?;
+    let address = lower_property_address_from_value(builder, object, property.id, resources)?;
+    store_lowered_to_address(
+        builder,
+        property.ty,
+        address,
+        value,
+        resources.module.target_config().pointer_type(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_checked_io_payload_property(
+    builder: &mut FunctionBuilder,
+    object: Value,
+    class: &mir::Class,
+    property_name: &str,
+    enum_name: &str,
+    tag: Value,
+    path: Value,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let property = class
+        .properties
+        .iter()
+        .find(|property| property.name == property_name)
+        .ok_or_else(|| {
+            malformed_mir(format!("class `{}` has no `${property_name}`", class.name))
+        })?;
+    let mir::Type::PayloadEnum(payload) = property.ty else {
+        return Err(malformed_mir(format!(
+            "compiler-known `${property_name}` is not a payload enum"
+        )));
+    };
+    let definition = resources
+        .program
+        .enums
+        .iter()
+        .find(|definition| definition.name == enum_name)
+        .ok_or_else(|| malformed_mir(format!("compiler-known enum `{enum_name}` is missing")))?
+        .clone();
+    if definition.id != payload.id {
+        return Err(malformed_mir(
+            "compiler-known payload enum identity changed",
+        ));
+    }
+    let address = lower_property_address_from_value(builder, object, property.id, resources)?;
+    let pointer = resources.module.target_config().pointer_type();
+    zero_inline_bytes(builder, address, payload.size, pointer);
+    let tag_type = clif_tag_type(definition.layout.tag_width)?;
+    let tag = if tag_type == types::I8 {
+        tag
+    } else {
+        builder.ins().uextend(tag_type, tag)
+    };
+    builder.ins().store(
+        cranelift_codegen::ir::MachMemFlags::trusted(),
+        tag,
+        address,
+        definition.layout.tag_offset as i32,
+    );
+    let file_case = definition
+        .cases
+        .first()
+        .filter(|case| case.name == "File")
+        .ok_or_else(|| malformed_mir("compiler-known I/O enum has no leading File case"))?;
+    let field = definition
+        .layout
+        .cases
+        .get(file_case.id.index)
+        .and_then(|layout| layout.fields.first())
+        .ok_or_else(|| malformed_mir("compiler-known File case has no path field"))?;
+    builder.ins().store(
+        cranelift_codegen::ir::MachMemFlags::trusted(),
+        path,
+        address,
+        field.offset as i32,
+    );
+    Ok(())
+}
+
+fn checked_io_meta_byte(builder: &mut FunctionBuilder, meta: Value, shift: u32) -> Value {
+    let shifted = builder.ins().ushr_imm_u(meta, i64::from(shift));
+    let masked = builder.ins().band_imm_u(shifted, 0xff);
+    builder.ins().ireduce(types::I8, masked)
+}
+
+fn checked_io_meta_bit(builder: &mut FunctionBuilder, meta: Value, shift: u32) -> Value {
+    let shifted = builder.ins().ushr_imm_u(meta, i64::from(shift));
+    let masked = builder.ins().band_imm_u(shifted, 1);
+    let bit = builder.ins().ireduce(types::I8, masked);
+    builder.ins().uextend(types::I64, bit)
 }
 
 fn lower_value_expression(
@@ -3410,13 +4062,7 @@ fn lower_error_expression(
                 )?
                 .ok_or_else(|| backend_failure("mixed Error move released no ownership claim"))?;
                 let no_claim = builder.ins().icmp_imm_u(IntCC::Equal, final_claim, 0);
-                lower_panic_if_code(
-                    builder,
-                    no_claim,
-                    "P1321",
-                    function_in(resources.program, resources.function_id)?.source_span,
-                    resources,
-                )?;
+                lower_panic_if_code_at_active_site(builder, no_claim, "P1321", resources)?;
                 runtime_call(
                     builder,
                     MIXED_FREE,
@@ -4036,13 +4682,7 @@ fn lower_payload_enum_place(
         )?
         .ok_or_else(|| backend_failure("mixed payload move released no ownership claim"))?;
         let no_claim = builder.ins().icmp_imm_u(IntCC::Equal, final_claim, 0);
-        lower_panic_if_code(
-            builder,
-            no_claim,
-            "P1321",
-            function_in(resources.program, resources.function_id)?.source_span,
-            resources,
-        )?;
+        lower_panic_if_code_at_active_site(builder, no_claim, "P1321", resources)?;
         runtime_call(
             builder,
             MIXED_FREE,
@@ -5939,13 +6579,7 @@ fn lower_collection_index(
         let found = builder.ins().stack_load(pointer, types::I8, found_slot, 0);
         let zero = builder.ins().iconst(types::I8, 0);
         let missing = builder.ins().icmp(IntCC::Equal, found, zero);
-        lower_panic_if_code(
-            builder,
-            missing,
-            "P1312",
-            function_in(resources.program, resources.function_id)?.source_span,
-            resources,
-        )?;
+        lower_panic_if_code_at_active_site(builder, missing, "P1312", resources)?;
         if index_type == mir::Type::String {
             release_string(builder, index_value, resources)?;
         }
@@ -6072,13 +6706,7 @@ fn lower_dictionary_get(
         let found = builder.ins().stack_load(pointer, types::I8, found_slot, 0);
         let zero = builder.ins().iconst(types::I8, 0);
         let missing = builder.ins().icmp(IntCC::Equal, found, zero);
-        lower_panic_if_code(
-            builder,
-            missing,
-            "P1312",
-            function_in(resources.program, resources.function_id)?.source_span,
-            resources,
-        )?;
+        lower_panic_if_code_at_active_site(builder, missing, "P1312", resources)?;
         if key_type == mir::Type::String {
             release_string(builder, key_value, resources)?;
         }
@@ -10360,13 +10988,7 @@ fn lower_take_mixed_payload(
     if matches!(tag, mir::MixedTag::String | mir::MixedTag::Class(_)) {
         let zero_flag = builder.ins().iconst(types::I8, 0);
         let not_final = builder.ins().icmp(IntCC::Equal, owns_final, zero_flag);
-        lower_panic_if_code(
-            builder,
-            not_final,
-            "P1321",
-            function_in(resources.program, resources.function_id)?.source_span,
-            resources,
-        )?;
+        lower_panic_if_code_at_active_site(builder, not_final, "P1321", resources)?;
     }
     runtime_call(
         builder,
@@ -11875,6 +12497,25 @@ fn lower_panic_if_code(
     span: crate::source::Span,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
+    lower_panic_if_code_with_site(builder, condition, code, Some(span), resources)
+}
+
+fn lower_panic_if_code_at_active_site(
+    builder: &mut FunctionBuilder,
+    condition: Value,
+    code: &'static str,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    lower_panic_if_code_with_site(builder, condition, code, None, resources)
+}
+
+fn lower_panic_if_code_with_site(
+    builder: &mut FunctionBuilder,
+    condition: Value,
+    code: &'static str,
+    span: Option<crate::source::Span>,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
     let panic_block = builder.create_block();
     let continue_block = builder.create_block();
     builder
@@ -11882,7 +12523,9 @@ fn lower_panic_if_code(
         .brif(condition, panic_block, &[], continue_block, &[]);
 
     builder.switch_to_block(panic_block);
-    set_active_panic_site(builder, span, resources);
+    if let Some(span) = span {
+        set_active_panic_site(builder, span, resources);
+    }
     lower_runtime_panic_code(builder, code.as_bytes(), &[], resources)?;
 
     builder.switch_to_block(continue_block);
@@ -12730,6 +13373,18 @@ fn lower_function_call(
     args: &[mir::Rvalue],
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<Option<LoweredValue>, BackendError> {
+    let span = function_in(resources.program, resources.function_id)?.source_span;
+    lower_function_call_at(builder, function, args, span, resources)
+}
+
+fn lower_function_call_at(
+    builder: &mut FunctionBuilder,
+    function: mir::FunctionId,
+    args: &[mir::Rvalue],
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Option<LoweredValue>, BackendError> {
+    set_active_panic_site(builder, span, resources);
     let lowered = lower_call_args(builder, args, resources)?;
     let mut values = vec![resources.current_frame];
     let callee_definition = function_in(resources.program, function)?;

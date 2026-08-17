@@ -1,6 +1,6 @@
 class RawModeGuard
 {
-    function __construct(string $label)
+    function __construct(string $label) throws Doria\Std\Io\IoError
     {
         echo "enable ";
         echo $this->label;
@@ -9,20 +9,23 @@ class RawModeGuard
 
     function __destruct()
     {
-        echo "restore ";
-        echo $this->label;
-        echo "\n";
+        try {
+            echo "restore ";
+            echo $this->label;
+            echo "\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function run_screen(): void
+function run_screen(): void throws Doria\Std\Io\IoError
 {
     let $guard = new RawModeGuard("terminal");
     echo "screen work\n";
     return;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     run_screen();
 }

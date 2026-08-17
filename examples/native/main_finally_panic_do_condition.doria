@@ -1,3 +1,8 @@
+function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
 function stop(): bool
 {
     panic("stop in do condition");
@@ -7,8 +12,8 @@ function stop(): bool
 function main(): void
 {
     do {
-        echo "before\n";
+        record("before\n");
     } while (stop()) finally {
-        echo "wrong cleanup\n";
+        record("wrong cleanup\n");
     }
 }

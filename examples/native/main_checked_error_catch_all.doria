@@ -10,7 +10,7 @@ function fail(): void throws Failure
     throw new Failure("catch all");
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     try {
         fail();

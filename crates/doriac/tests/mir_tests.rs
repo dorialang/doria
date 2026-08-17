@@ -2,9 +2,9 @@ use doriac::backend::{BackendOutput, BackendTarget};
 use doriac::class_layout::compute_class_layout;
 use doriac::mir::{
     BasicBlock, BlockId, BoolBinaryOp as ConditionBinaryOp, BoolExpression as Condition,
-    ClassExpression, CompareOp, Function, FunctionId, IntegerBinaryOp, IntegerExpression, Local,
-    LocalId, Operand, Program, ReturnType, Rvalue, ScalarType, ScalarValue, Statement,
-    StringExpression, Terminator, Type, ValueExpression,
+    CheckedIoOperation, ClassExpression, CompareOp, Function, FunctionId, IntegerBinaryOp,
+    IntegerExpression, IoContents, Local, LocalId, Operand, Program, ReturnType, Rvalue,
+    ScalarType, ScalarValue, Statement, StringExpression, Terminator, Type, ValueExpression,
 };
 use doriac::numeric::{IntegerType, IntegerValue};
 
@@ -69,6 +69,41 @@ fn lower_object(source: &str) -> Vec<u8> {
     let program = lower(source);
     doriac::codegen_cranelift::lower_mir_to_object(&program)
         .expect("MIR should lower to a Cranelift object")
+}
+
+fn function_named<'a>(program: &'a Program, name: &str) -> &'a Function {
+    program
+        .functions
+        .iter()
+        .find(|function| function.name == name)
+        .unwrap_or_else(|| panic!("MIR should contain function `{name}`"))
+}
+
+fn local_named<'a>(function: &'a Function, name: &str) -> (LocalId, &'a Local) {
+    function
+        .locals
+        .iter()
+        .find(|local| local.name == name)
+        .map(|local| (local.id, local))
+        .unwrap_or_else(|| panic!("MIR should contain local `${name}`"))
+}
+
+fn checked_stdout_writes(function: &Function) -> Vec<&IoContents> {
+    function
+        .blocks
+        .iter()
+        .filter_map(|block| match &block.terminator {
+            Terminator::CheckedIo {
+                operation:
+                    CheckedIoOperation::WriteStream {
+                        contents,
+                        stderr: false,
+                    },
+                ..
+            } => Some(contents),
+            _ => None,
+        })
+        .collect()
 }
 
 fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
@@ -525,7 +560,7 @@ fn lowers_main_void_bare_return_to_return_void() {
 #[test]
 fn lowers_string_literal_echo() {
     let program = lower(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     echo "Hello Doria!";
 }
@@ -533,19 +568,17 @@ fn lowers_string_literal_echo() {
     );
 
     assert_eq!(
-        program.functions[0].blocks[0].statements,
-        vec![Statement::EchoStringLiteral("Hello Doria!".to_string())]
-    );
-    assert_eq!(
-        program.to_string(),
-        "function main(): void {\nblock0:\n    echo \"Hello Doria!\"\n    return\n}\n"
+        checked_stdout_writes(function_named(&program, "main")),
+        vec![&IoContents::String(StringExpression::Literal(
+            "Hello Doria!".to_string()
+        ))]
     );
 }
 
 #[test]
 fn lowers_multiple_string_literal_echoes_in_order() {
     let program = lower(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     echo "Hello ";
     echo "Doria!";
@@ -554,10 +587,10 @@ fn lowers_multiple_string_literal_echoes_in_order() {
     );
 
     assert_eq!(
-        program.functions[0].blocks[0].statements,
+        checked_stdout_writes(function_named(&program, "main")),
         vec![
-            Statement::EchoStringLiteral("Hello ".to_string()),
-            Statement::EchoStringLiteral("Doria!".to_string()),
+            &IoContents::String(StringExpression::Literal("Hello ".to_string())),
+            &IoContents::String(StringExpression::Literal("Doria!".to_string())),
         ]
     );
 }
@@ -763,7 +796,7 @@ fn interprets_main_void_bare_return() {
 #[test]
 fn interprets_main_void_hello() {
     let output = interpret(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     echo "Hello Doria!";
 }
@@ -777,7 +810,7 @@ fn interprets_main_void_hello() {
 #[test]
 fn interprets_multiple_echoes_without_newline() {
     let output = interpret(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     echo "Hello ";
     echo "Doria!";
@@ -893,7 +926,7 @@ fn debug_target_renders_interpreter_process_status_panic() {
 fn debug_target_emits_interpreter_artifact() {
     assert_eq!(
         debug_contents(
-            r#"function main(): void
+            r#"function main(): void throws Doria\Std\Io\IoError
 {
     echo "Hello Doria!";
 }
@@ -993,7 +1026,7 @@ fn lowers_comparison_result_as_runtime_bool_value() {
 #[test]
 fn lowers_readonly_string_local_and_echo() {
     let program = lower(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     let $message = "Hello Doria!";
     echo $message;
@@ -1001,25 +1034,26 @@ fn lowers_readonly_string_local_and_echo() {
 "#,
     );
 
-    let function = &program.functions[program.entry.0];
-    assert_eq!(function.locals[0].ty, Type::String);
-    assert!(!function.locals[0].writable);
+    let function = function_named(&program, "main");
+    let (message, local) = local_named(function, "message");
+    assert_eq!(local.ty, Type::String);
+    assert!(!local.writable);
+    assert!(function.blocks[0]
+        .statements
+        .contains(&Statement::AssignLocal {
+            target: message,
+            value: Rvalue::String(StringExpression::Literal("Hello Doria!".to_string())),
+        }));
     assert_eq!(
-        function.blocks[0].statements,
-        vec![
-            Statement::AssignLocal {
-                target: LocalId(0),
-                value: Rvalue::String(StringExpression::Literal("Hello Doria!".to_string(),)),
-            },
-            Statement::EchoString(StringExpression::Local(LocalId(0))),
-        ]
+        checked_stdout_writes(function),
+        vec![&IoContents::String(StringExpression::Local(message))]
     );
 }
 
 #[test]
 fn lowers_string_literal_concat_echo() {
     let program = lower(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     echo "Hello " . "Doria!";
 }
@@ -1027,8 +1061,8 @@ fn lowers_string_literal_concat_echo() {
     );
 
     assert_eq!(
-        program.functions[program.entry.0].blocks[0].statements,
-        vec![Statement::EchoString(StringExpression::Concat(vec![
+        checked_stdout_writes(function_named(&program, "main")),
+        vec![&IoContents::String(StringExpression::Concat(vec![
             StringExpression::Literal("Hello ".to_string()),
             StringExpression::Literal("Doria!".to_string()),
         ]))]
@@ -1156,9 +1190,10 @@ fn lowers_echo_and_assignment_inside_if_branches() {
     let echo = lower(include_str!(
         "../../../examples/debug/main_if_fallthrough_echo.doria"
     ));
-    assert_eq!(
-        echo.functions[0].blocks[1].statements,
-        vec![Statement::EchoStringLiteral("Hello ".to_string())]
+    assert!(
+        checked_stdout_writes(function_named(&echo, "main")).contains(&&IoContents::String(
+            StringExpression::Literal("Hello ".to_string())
+        ))
     );
 
     let assignment = lower(include_str!(
@@ -1592,9 +1627,10 @@ fn lowers_assignment_and_echo_inside_while() {
     let echo = lower(include_str!(
         "../../../examples/debug/main_while_echo_xxx.doria"
     ));
-    assert_eq!(
-        echo.functions[0].blocks[2].statements[0],
-        Statement::EchoStringLiteral("x".to_string())
+    assert!(
+        checked_stdout_writes(function_named(&echo, "main")).contains(&&IoContents::String(
+            StringExpression::Literal("x".to_string())
+        ))
     );
 }
 
@@ -2355,7 +2391,7 @@ fn mixed_nested_loops_use_innermost_break_and_continue_targets() {
 #[test]
 fn interpreter_preserves_stdout_across_for_and_foreach_iterations() {
     let output = interpret(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     for (let writable $i = 0; $i < 3; $i++) {
         echo "x";
@@ -2661,29 +2697,29 @@ fn stage_11f_lowers_void_calls_and_literal_echo_helpers() {
         "../../../examples/debug/main_function_echo_hello.doria"
     ));
 
+    let hello = function_named(&program, "hello");
+    let subject = function_named(&program, "subject");
     assert_eq!(
-        program.functions[0].blocks[0].statements,
-        vec![Statement::EchoStringLiteral("Hello ".to_string())]
+        checked_stdout_writes(hello),
+        vec![&IoContents::String(StringExpression::Literal(
+            "Hello ".to_string()
+        ))]
     );
     assert_eq!(
-        program.functions[1].blocks[0].statements,
-        vec![Statement::EchoStringLiteral("Doria!".to_string())]
+        checked_stdout_writes(subject),
+        vec![&IoContents::String(StringExpression::Literal(
+            "Doria!".to_string()
+        ))]
     );
-    assert!(matches!(
-        program.functions[2].blocks[0].statements.as_slice(),
-        [
-            Statement::CallVoid {
-                function: FunctionId(0),
-                args,
-                ..
-            },
-            Statement::CallVoid {
-                function: FunctionId(1),
-                args: other_args,
-                ..
-            },
-        ] if args.is_empty() && other_args.is_empty()
-    ));
+    let checked_calls = function_named(&program, "main")
+        .blocks
+        .iter()
+        .filter_map(|block| match block.terminator {
+            Terminator::CheckedCall { function, .. } => Some(function),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(checked_calls, vec![hello.id, subject.id]);
 }
 
 #[test]
@@ -2729,7 +2765,7 @@ fn stage_16_accepts_string_helper_signatures() {
     return "Hello " . $name;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo title("Doria");
 }
@@ -3005,7 +3041,7 @@ fn stage_11f_cranelift_object_supports_helpers_without_linker() {
 #[test]
 fn stage_11g_lowers_explicit_string_locals_and_local_concat_in_source_order() {
     let explicit = lower(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     string $name = "Doria";
 
@@ -3013,24 +3049,28 @@ fn stage_11g_lowers_explicit_string_locals_and_local_concat_in_source_order() {
 }
 "#,
     );
-    let main = &explicit.functions[explicit.entry.0];
-    assert_eq!(main.locals[0].ty, Type::String);
+    let main = function_named(&explicit, "main");
+    let (name, local) = local_named(main, "name");
+    assert_eq!(local.ty, Type::String);
     assert_eq!(
-        main.blocks[0].statements[1],
-        Statement::EchoString(StringExpression::Local(LocalId(0)))
+        checked_stdout_writes(main),
+        vec![&IoContents::String(StringExpression::Local(name))]
     );
 
     let concat = lower(include_str!(
         "../../../examples/debug/main_string_concat_from_locals.doria"
     ));
-    let main = &concat.functions[concat.entry.0];
+    let main = function_named(&concat, "main");
+    let (hello, _) = local_named(main, "hello");
+    let (name, _) = local_named(main, "name");
+    let (bang, _) = local_named(main, "bang");
     assert_eq!(
-        main.blocks[0].statements.last(),
-        Some(&Statement::EchoString(StringExpression::Concat(vec![
-            StringExpression::Local(LocalId(0)),
-            StringExpression::Local(LocalId(1)),
-            StringExpression::Local(LocalId(2)),
-        ])))
+        checked_stdout_writes(main),
+        vec![&IoContents::String(StringExpression::Concat(vec![
+            StringExpression::Local(hello),
+            StringExpression::Local(name),
+            StringExpression::Local(bang),
+        ]))]
     );
 }
 
@@ -3039,17 +3079,18 @@ fn stage_11g_lowers_string_concat_inside_void_helpers() {
     let program = lower(include_str!(
         "../../../examples/debug/main_function_string_local_echo.doria"
     ));
-    let helper = &program.functions[0];
+    let helper = function_named(&program, "hello");
 
     assert_eq!(helper.name, "hello");
-    assert_eq!(helper.locals[0].ty, Type::String);
+    let (name, local) = local_named(helper, "name");
+    assert_eq!(local.ty, Type::String);
     assert_eq!(
-        helper.blocks[0].statements[1],
-        Statement::EchoString(StringExpression::Concat(vec![
+        checked_stdout_writes(helper),
+        vec![&IoContents::String(StringExpression::Concat(vec![
             StringExpression::Literal("Hello ".to_string()),
-            StringExpression::Local(LocalId(0)),
+            StringExpression::Local(name),
             StringExpression::Literal("!".to_string()),
-        ]))
+        ]))]
     );
 }
 
@@ -3058,16 +3099,14 @@ fn stage_11g_lowers_string_echo_inside_loop_blocks() {
     let program = lower(include_str!(
         "../../../examples/debug/main_string_loop_echo_xxx.doria"
     ));
-    let main = &program.functions[program.entry.0];
-
-    assert!(main.blocks.iter().any(|block| {
-        block.statements.iter().any(|statement| {
-            *statement == Statement::EchoString(StringExpression::Local(LocalId(1)))
-        })
-    }));
+    let main = function_named(&program, "main");
+    let (mark, _) = local_named(main, "mark");
+    assert!(
+        checked_stdout_writes(main).contains(&&IoContents::String(StringExpression::Local(mark)))
+    );
 
     let output = interpret(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     let $mark = "x";
 
@@ -3087,7 +3126,7 @@ fn stage_11g_lowers_string_echo_inside_loop_blocks() {
 #[test]
 fn stage_11g_supports_readonly_string_local_concat_initializers() {
     let output = interpret(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     let $name = "Doria";
     let $message = "Hello " . $name . "!";
@@ -3123,7 +3162,7 @@ fn stage_16_accepts_writable_string_locals() {
 #[test]
 fn stage_16_lowers_string_assignment() {
     let output = interpret(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     let writable $name = "Doria";
     $name = "Other";
@@ -3137,7 +3176,7 @@ fn stage_16_lowers_string_assignment() {
 #[test]
 fn stage_16_displays_integer_in_string_concat() {
     let output = interpret(
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     echo "count: " . 42;
 }
@@ -3155,7 +3194,7 @@ fn stage_16_accepts_string_parameters_and_returns() {
     return "Hello " . $name;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo greet("Doria");
 }
@@ -3201,21 +3240,21 @@ fn stage_11g_interprets_all_string_examples() {
 #[test]
 fn stage_11g_stdout_accumulates_across_helpers_and_string_expressions() {
     let output = interpret(
-        r#"function greeting(): void
+        r#"function greeting(): void throws Doria\Std\Io\IoError
 {
     let $hello = "Hello ";
 
     echo $hello;
 }
 
-function subject(): void
+function subject(): void throws Doria\Std\Io\IoError
 {
     let $name = "Doria";
 
     echo $name . "!";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     greeting();
     subject();
@@ -3246,14 +3285,7 @@ fn stage_11h_supports_string_echo_inside_int_returning_functions() {
         assert!(program.functions.iter().any(|function| {
             function.return_type
                 == ReturnType::Value(Type::Scalar(ScalarType::Integer(DEFAULT_INT)))
-                && function.blocks.iter().any(|block| {
-                    block.statements.iter().any(|statement| {
-                        matches!(
-                            statement,
-                            Statement::EchoStringLiteral(_) | Statement::EchoString(_)
-                        )
-                    })
-                })
+                && !checked_stdout_writes(function).is_empty()
         }));
 
         let output = interpret(source);
@@ -3354,7 +3386,7 @@ fn stage_18_expression_interpolation_reuses_ordered_display_mir() {
     let first = lower(source);
     let second = lower(source);
     assert_eq!(first.to_string(), second.to_string());
-    assert!(first.to_string().contains("display("));
+    assert!(first.to_string().contains("Display("));
 
     let output = doriac::mir_interpreter::interpret(&first).expect("MIR should interpret");
     assert_eq!(output.exit_status, 0);
@@ -3373,23 +3405,24 @@ fn stage_18_expression_interpolation_reuses_ordered_display_mir() {
 }
 
 #[test]
-fn stage_19_class_metadata_precedes_top_level_execution_lowering() {
-    let diagnostics = doriac::lower_source_to_mir(
+fn stage_19_class_metadata_and_entrypoint_lower_together() {
+    let program = doriac::lower_source_to_mir(
         "displayable.doria",
         include_str!("../../../examples/php/displayable.doria"),
     )
-    .expect_err("top-level executable statements remain outside native MIR");
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "M1101"
-            && diagnostic
-                .message
-                .contains("top-level executable statements are not supported")
-    }));
+    .expect("class metadata and a normal entrypoint should lower together");
+    assert!(program.classes.iter().any(|class| class.name == "Label"));
+    assert_eq!(function_named(&program, "main").id, program.entry);
 }
 
 #[test]
 fn stage_19_class_property_access_and_destructor_execute_in_debug_mir() {
-    let source = r#"class Message
+    let source = r#"function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
+class Message
 {
     function __construct(string $text)
     {
@@ -3397,13 +3430,13 @@ fn stage_19_class_property_access_and_destructor_execute_in_debug_mir() {
 
     function __destruct()
     {
-        echo "message released\n";
+        record("message released\n");
     }
 }
 
 function deliver(take Message $message): void
 {
-    echo $message->text . "\n";
+    record($message->text . "\n");
 }
 
 function main(): void
@@ -3424,20 +3457,25 @@ function main(): void
 
 #[test]
 fn stage_19_constructor_body_executes_after_promoted_properties_are_initialized() {
-    let source = r#"class Message
+    let source = r#"function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
+class Message
 {
     function __construct(string $text)
     {
-        echo "constructed ";
-        echo $this->text;
-        echo "\n";
+        record("constructed ");
+        record($this->text);
+        record("\n");
     }
 
     function __destruct()
     {
-        echo "released ";
-        echo $this->text;
-        echo "\n";
+        record("released ");
+        record($this->text);
+        record("\n");
     }
 }
 
@@ -3456,7 +3494,12 @@ function main(): void
 
 #[test]
 fn stage_19_constructor_body_can_directly_initialize_a_proven_property() {
-    let source = r#"class Message
+    let source = r#"function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
+class Message
 {
     string $text;
 
@@ -3467,8 +3510,8 @@ fn stage_19_constructor_body_can_directly_initialize_a_proven_property() {
 
     function __destruct()
     {
-        echo $this->text;
-        echo " released\n";
+        record($this->text);
+        record(" released\n");
     }
 }
 
@@ -3489,13 +3532,18 @@ function main(): void
 fn stage_21_rejects_constructor_reads_before_property_initialization() {
     let diagnostics = doriac::lower_source_to_mir(
         "constructor-read-before-init.doria",
-        r#"class Message
+        r#"function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
+class Message
 {
     string $text;
 
     function __construct(string $value)
     {
-        echo $this->text;
+        record($this->text);
         $this->text = $value;
     }
 }
@@ -3582,7 +3630,7 @@ fn stage_19_infers_string_property_loads_and_comparisons() {
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $message = new Message("ready");
     let $copy = $message->text;
@@ -3606,7 +3654,7 @@ fn stage_19_infers_nullable_string_property_loads_and_comparisons() {
     ?string $value = null;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $left = new Box();
     let $right = new Box();
@@ -3626,7 +3674,12 @@ function main(): void
 
 #[test]
 fn stage_19_allows_writable_property_mutation_after_constructor_initialization() {
-    let source = r#"class Message
+    let source = r#"function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
+class Message
 {
     writable string $text;
 
@@ -3638,7 +3691,7 @@ fn stage_19_allows_writable_property_mutation_after_constructor_initialization()
 
     function __destruct()
     {
-        echo $this->text;
+        record($this->text);
     }
 }
 
@@ -3657,7 +3710,12 @@ function main(): void
 
 #[test]
 fn stage_19_lowers_grouped_property_assignment_targets() {
-    let source = r#"class Message
+    let source = r#"function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
+class Message
 {
     writable string $text;
 
@@ -3668,7 +3726,7 @@ fn stage_19_lowers_grouped_property_assignment_targets() {
 
     function __destruct()
     {
-        echo $this->text;
+        record($this->text);
     }
 }
 
@@ -3688,7 +3746,12 @@ function main(): void
 #[test]
 fn stage_19_mir_drops_borrowed_constructor_temporaries_in_reverse_order() {
     let mut program = lower(
-        r#"class Child
+        r#"function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
+class Child
 {
     function __construct(string $name)
     {
@@ -3696,9 +3759,9 @@ fn stage_19_mir_drops_borrowed_constructor_temporaries_in_reverse_order() {
 
     function __destruct()
     {
-        echo "drop ";
-        echo $this->name;
-        echo "\n";
+        record("drop ");
+        record($this->name);
+        record("\n");
     }
 }
 
@@ -3762,9 +3825,14 @@ function main(): void
 
 #[test]
 fn stage_19_property_initializers_run_before_the_constructor_body() {
-    let source = r#"function initializeText(): string
+    let source = r#"function record(string $message): void
 {
-    echo "property initializer\n";
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
+function initializeText(): string
+{
+    record("property initializer\n");
     return "ready";
 }
 
@@ -3774,9 +3842,9 @@ class Message
 
     function __construct(string $label)
     {
-        echo "constructor ";
-        echo $this->text;
-        echo "\n";
+        record("constructor ");
+        record($this->text);
+        record("\n");
     }
 }
 
@@ -3795,7 +3863,12 @@ function main(): void
 
 #[test]
 fn stage_19_class_values_move_through_arguments_and_returns() {
-    let source = r#"class Token
+    let source = r#"function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
+class Token
 {
     function __construct(string $name)
     {
@@ -3803,9 +3876,9 @@ fn stage_19_class_values_move_through_arguments_and_returns() {
 
     function __destruct()
     {
-        echo "drop ";
-        echo $this->name;
-        echo "\n";
+        record("drop ");
+        record($this->name);
+        record("\n");
     }
 }
 
@@ -3822,8 +3895,8 @@ function relay(take Token $token): Token
 function main(): void
 {
     let $token = relay(makeToken());
-    echo $token->name;
-    echo "\n";
+    record($token->name);
+    record("\n");
 }
 "#;
 

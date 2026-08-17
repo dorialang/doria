@@ -4,7 +4,10 @@ class Item
 
     function __destruct()
     {
-        echo "drop item\n";
+        try {
+            echo "drop item\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -24,7 +27,7 @@ class WriteHolder
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $readShared = new WritableSharedReference(new Item());
     let $readHolder = new ReadHolder($readShared->acquireReadonlyAccess());

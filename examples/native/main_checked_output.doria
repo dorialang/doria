@@ -1,0 +1,6 @@
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo "echo|";
+    printf("%s\n", "printf");
+    write_stderr("stderr\n");
+}

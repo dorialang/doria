@@ -1,10 +1,10 @@
-function observedPrompt(): string
+function observedPrompt(): string throws Doria\Std\Io\IoError
 {
     echo "[eval]";
     return "Side: ";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let $name = read_line("Name: ");
     if ($name != null) { echo "<{$name}>\n"; }

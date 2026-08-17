@@ -1,11 +1,11 @@
-function hello(): void
+function hello(): void throws Doria\Std\Io\IoError
 {
     let $name = "Doria";
 
     echo "Hello " . $name . "!";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     hello();
 }

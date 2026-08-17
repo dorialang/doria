@@ -30,15 +30,194 @@ pub const DIAGNOSTIC_CODES: &[&str] = &[
     "E0600", "E0601", "E0602", "E0603", "E0604", "E0605", "E0606", "E0607", "E0608", "E0609",
     "E0610", "E0611", "E0612", "E0613", "E0614", "E0615", "E0616", "E0617", "E0618", "E0619",
     "E0620", "E0621", "E0622", "E0623", "E0624", "E0625", "E0626", "E0627", "E0628", "E0629",
-    "E0630", "E0631", "E0632", "E0633", "E0634", "E0635", "E0636", "E0637", "I0001", "I1101",
-    "I1301", "I1302", "I1401", "I2001", "I2002", "I2003", "I2201", "I2401", "I2601", "I2701",
-    "I2702", "I2801", "I2802", "I2803", "L0001", "L0002", "M1101", "M1102", "P0001", "P0002",
-    "P0017", "P0018", "P0019", "P0020", "P0021", "P1000", "P1001", "P1101", "P1102", "P1103",
-    "P1104", "P1105", "P1106", "P1107", "P1108", "P1109", "P1110", "P1111", "P1201", "P1202",
-    "P1203", "P1204", "P1205", "P1206", "P1301", "P1302", "P1310", "P1311", "P1312", "P1313",
-    "P1320", "P1321", "P1322", "P1401", "P1402", "P1403", "P1404", "P1405", "P1406", "P1407",
-    "P1410", "P1501", "P1502", "P1503", "P1504", "P1505", "P1601",
+    "E0630", "E0631", "E0632", "E0633", "E0634", "E0635", "E0636", "E0637", "E0640", "I0001",
+    "I1101", "I1301", "I1302", "I1401", "I2001", "I2002", "I2003", "I2201", "I2401", "I2601",
+    "I2701", "I2702", "I2801", "I2802", "I2803", "I2901", "L0001", "L0002", "M1101", "M1102",
+    "P0001", "P0002", "P0017", "P0018", "P0019", "P0020", "P0021", "P1000", "P1001", "P1101",
+    "P1102", "P1103", "P1104", "P1105", "P1106", "P1107", "P1108", "P1109", "P1110", "P1111",
+    "P1201", "P1202", "P1203", "P1204", "P1205", "P1206", "P1301", "P1302", "P1310", "P1311",
+    "P1312", "P1313", "P1320", "P1321", "P1322", "P1401", "P1402", "P1403", "P1404", "P1405",
+    "P1406", "P1407", "P1410", "P1501", "P1502", "P1503", "P1504", "P1505", "P1601", "R1000",
 ];
+
+/// Presentation context for untrusted runtime-message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeTextPresentation {
+    /// Preserve logical line breaks while indenting every resulting line.
+    Human,
+    /// Keep the complete message on one physical line.
+    Concise,
+}
+
+/// Emits terminal-safe bytes without changing the underlying logical message.
+///
+/// JSON renderers must serialize the original message instead. This function is
+/// the shared byte-level policy for hosted diagnostics and standalone runtime
+/// diagnostics, so control-byte handling cannot drift between those paths.
+pub fn write_terminal_safe_runtime_text(
+    bytes: &[u8],
+    presentation: RuntimeTextPresentation,
+    mut write: impl FnMut(&[u8]),
+) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+
+    for byte in bytes {
+        match (*byte, presentation) {
+            (b'\n', RuntimeTextPresentation::Human) => write(b"\n  "),
+            (b'\n', RuntimeTextPresentation::Concise) => write(b"\\n"),
+            (b'\r', _) => write(b"\\r"),
+            (b'\t', _) => write(b"\\t"),
+            (value, _) if value < 0x20 || value == 0x7f => {
+                let escaped = [
+                    b'\\',
+                    b'u',
+                    b'0',
+                    b'0',
+                    HEX[(value >> 4) as usize],
+                    HEX[(value & 0xf) as usize],
+                ];
+                write(&escaped);
+            }
+            (value, _) => write(core::slice::from_ref(&value)),
+        }
+    }
+}
+
+/// Stable vocabulary used to construct compiler-known I/O Error messages.
+///
+/// The compiler, freestanding runtime, and compatibility backends all consume
+/// this model so the public Doria message cannot drift between execution paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoMessageOperation {
+    Open,
+    Read,
+    Write,
+    Append,
+    Flush,
+}
+
+impl IoMessageOperation {
+    pub const ALL: [Self; 5] = [
+        Self::Open,
+        Self::Read,
+        Self::Write,
+        Self::Append,
+        Self::Flush,
+    ];
+
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Append => "append",
+            Self::Flush => "flush",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoMessageReason {
+    NotFound,
+    PermissionDenied,
+    InvalidInput,
+    Interrupted,
+    ResourceExhausted,
+    Unsupported,
+    Closed,
+    Other,
+}
+
+impl IoMessageReason {
+    pub const ALL: [Self; 8] = [
+        Self::NotFound,
+        Self::PermissionDenied,
+        Self::InvalidInput,
+        Self::Interrupted,
+        Self::ResourceExhausted,
+        Self::Unsupported,
+        Self::Closed,
+        Self::Other,
+    ];
+
+    pub const fn words(self) -> &'static str {
+        match self {
+            Self::NotFound => "not found",
+            Self::PermissionDenied => "permission denied",
+            Self::InvalidInput => "invalid input",
+            Self::Interrupted => "interrupted",
+            Self::ResourceExhausted => "resource exhausted",
+            Self::Unsupported => "unsupported",
+            Self::Closed => "closed",
+            Self::Other => "other failure",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoMessageTarget<'a> {
+    File(&'a [u8]),
+    StandardInput,
+    StandardOutput,
+    StandardError,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Utf8MessageSource<'a> {
+    File(&'a [u8]),
+    StandardInput,
+}
+
+pub const IO_ERROR_MESSAGE_PREFIX: &str = "failed to ";
+pub const IO_ERROR_MESSAGE_SEPARATOR: &str = ": ";
+pub const IO_FILE_MESSAGE_PREFIX: &str = "file `";
+pub const IO_FILE_MESSAGE_SUFFIX: &str = "`";
+pub const IO_STANDARD_INPUT_NAME: &str = "standard input";
+pub const IO_STANDARD_OUTPUT_NAME: &str = "standard output";
+pub const IO_STANDARD_ERROR_NAME: &str = "standard error";
+pub const INVALID_UTF8_MESSAGE_PREFIX: &str = "invalid UTF-8 in ";
+
+pub fn visit_io_error_message_parts(
+    operation: IoMessageOperation,
+    target: IoMessageTarget<'_>,
+    reason: IoMessageReason,
+    mut write: impl FnMut(&[u8]),
+) {
+    write(IO_ERROR_MESSAGE_PREFIX.as_bytes());
+    write(operation.word().as_bytes());
+    write(b" ");
+    visit_io_target_parts(target, &mut write);
+    write(IO_ERROR_MESSAGE_SEPARATOR.as_bytes());
+    write(reason.words().as_bytes());
+}
+
+pub fn visit_invalid_utf8_message_parts(
+    source: Utf8MessageSource<'_>,
+    mut write: impl FnMut(&[u8]),
+) {
+    write(INVALID_UTF8_MESSAGE_PREFIX.as_bytes());
+    match source {
+        Utf8MessageSource::File(path) => {
+            write(IO_FILE_MESSAGE_PREFIX.as_bytes());
+            write(path);
+            write(IO_FILE_MESSAGE_SUFFIX.as_bytes());
+        }
+        Utf8MessageSource::StandardInput => write(IO_STANDARD_INPUT_NAME.as_bytes()),
+    }
+}
+
+fn visit_io_target_parts(target: IoMessageTarget<'_>, write: &mut impl FnMut(&[u8])) {
+    match target {
+        IoMessageTarget::File(path) => {
+            write(IO_FILE_MESSAGE_PREFIX.as_bytes());
+            write(path);
+            write(IO_FILE_MESSAGE_SUFFIX.as_bytes());
+        }
+        IoMessageTarget::StandardInput => write(IO_STANDARD_INPUT_NAME.as_bytes()),
+        IoMessageTarget::StandardOutput => write(IO_STANDARD_OUTPUT_NAME.as_bytes()),
+        IoMessageTarget::StandardError => write(IO_STANDARD_ERROR_NAME.as_bytes()),
+    }
+}
 
 /// One stable runtime-outcome identity shared by the compiler and `doria-rt`.
 ///
@@ -96,6 +275,15 @@ pub fn runtime_entry(code: &str) -> Option<&'static RuntimeCatalogueEntry> {
 }
 
 pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
+    RuntimeCatalogueEntry {
+        code: "R1000",
+        title: "Unhandled Error",
+        domain: "runtime",
+        primary_label: "This Error Was First Thrown Here",
+        explanation: "A checked Error reached the program boundary without being handled.",
+        process_status: 70,
+        fact_names: &[],
+    },
     RuntimeCatalogueEntry {
         code: "P1000",
         title: "Program Panicked",

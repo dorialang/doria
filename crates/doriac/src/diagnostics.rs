@@ -43,6 +43,7 @@ pub enum DiagnosticKind {
     ExternalTool,
     InternalCompiler,
     RuntimePanic,
+    RuntimeError,
 }
 
 impl DiagnosticKind {
@@ -54,12 +55,14 @@ impl DiagnosticKind {
             Self::ExternalTool => "externalTool",
             Self::InternalCompiler => "internalCompiler",
             Self::RuntimePanic => "runtimePanic",
+            Self::RuntimeError => "runtimeError",
         }
     }
 
     fn title(self, severity: DiagnosticSeverity) -> &'static str {
         match self {
             Self::RuntimePanic => "Panic",
+            Self::RuntimeError => "Error",
             _ => severity.title(),
         }
     }
@@ -115,6 +118,7 @@ pub struct RuntimeOutcomeDetails {
     pub origin: RuntimeOutcomeOrigin,
     pub path: Vec<RuntimeOutcomeFrame>,
     pub facts: Vec<RuntimeFact>,
+    pub error_type: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +140,7 @@ impl LabelRole {
 pub enum DiagnosticSource {
     Current,
     Path(String),
+    Unavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +310,23 @@ impl Diagnostic {
         diagnostic
     }
 
+    pub fn runtime_error(
+        error_type: impl Into<String>,
+        message: impl Into<String>,
+        span: Span,
+        outcome: RuntimeOutcomeDetails,
+    ) -> Self {
+        let error_type = error_type.into();
+        let message = message.into();
+        let mut diagnostic =
+            Self::build("R1000", message.clone(), span, DiagnosticKind::RuntimeError)
+                .with_title(format!("Unhandled {error_type}"))
+                .with_primary_label("This Error Was First Thrown Here")
+                .with_explanation(message);
+        diagnostic.runtime_outcome = Some(outcome);
+        diagnostic
+    }
+
     fn build(code: &'static str, message: String, span: Span, kind: DiagnosticKind) -> Self {
         debug_assert!(
             is_catalogued_code(code),
@@ -327,6 +349,7 @@ impl Diagnostic {
             DiagnosticKind::Backend | DiagnosticKind::ExternalTool => {
                 metadata.title_family.to_string()
             }
+            DiagnosticKind::RuntimeError => "Runtime Error".to_string(),
             _ => to_title_case(&message),
         };
         debug_assert!(
@@ -564,7 +587,6 @@ impl Diagnostic {
     }
 
     pub fn with_runtime_outcome(mut self, outcome: RuntimeOutcomeDetails) -> Self {
-        self.kind = DiagnosticKind::RuntimePanic;
         self.runtime_outcome = Some(outcome);
         self
     }
@@ -716,7 +738,7 @@ fn render_human(
         );
         let prefix = if color {
             let ansi = match (diagnostic.kind, diagnostic.severity) {
-                (DiagnosticKind::RuntimePanic, _) => "31;1",
+                (DiagnosticKind::RuntimePanic | DiagnosticKind::RuntimeError, _) => "31;1",
                 (_, DiagnosticSeverity::Error) => "31;1",
                 (_, DiagnosticSeverity::Warning) => "33;1",
                 (_, DiagnosticSeverity::Note) => "36;1",
@@ -759,7 +781,15 @@ fn render_human(
             }
         }
         if let Some(explanation) = &diagnostic.explanation {
-            push_prose_section(&mut block, "Why", explanation, options.terminal_width, true);
+            if diagnostic.kind == DiagnosticKind::RuntimeError {
+                block.push_str("\n\nWhy\n  ");
+                block.push_str(&terminal_safe_runtime_text(
+                    explanation,
+                    doria_diagnostic_catalogue::RuntimeTextPresentation::Human,
+                ));
+            } else {
+                push_prose_section(&mut block, "Why", explanation, options.terminal_width, true);
+            }
         }
         for note in &diagnostic.notes {
             push_prose_section(&mut block, "Note", note, options.terminal_width, true);
@@ -973,10 +1003,23 @@ fn render_concise(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String {
                 (source_name(&label.source, source), line, col)
             });
             format!(
-                "{path}:{line}:{col}: {}[{}]: {}",
+                "{path}:{line}:{col}: {}[{}]: {}{}",
                 diagnostic.kind.title(diagnostic.severity),
                 diagnostic.code,
-                diagnostic.title
+                if diagnostic.kind == DiagnosticKind::RuntimeError {
+                    terminal_safe_runtime_text(
+                        &diagnostic.title,
+                        doria_diagnostic_catalogue::RuntimeTextPresentation::Concise,
+                    )
+                } else {
+                    diagnostic.title.clone()
+                },
+                diagnostic
+                    .runtime_outcome
+                    .as_ref()
+                    .map_or_else(String::new, |outcome| {
+                        format!(" (status {})", outcome.process_status)
+                    })
             )
         })
         .collect::<Vec<_>>();
@@ -988,6 +1031,19 @@ fn render_concise(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String {
         lines.push(format_summary(summary));
     }
     lines.join("\n")
+}
+
+fn terminal_safe_runtime_text(
+    value: &str,
+    presentation: doria_diagnostic_catalogue::RuntimeTextPresentation,
+) -> String {
+    let mut bytes = Vec::with_capacity(value.len());
+    doria_diagnostic_catalogue::write_terminal_safe_runtime_text(
+        value.as_bytes(),
+        presentation,
+        |chunk| bytes.extend_from_slice(chunk),
+    );
+    String::from_utf8(bytes).expect("terminal-safe runtime text remains valid UTF-8")
 }
 
 fn diagnostics_json(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String {
@@ -1037,12 +1093,13 @@ fn diagnostics_json(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String 
                     "url": docs.url,
                 })),
                 "developerDetails": diagnostic.developer_details,
+                "errorType": diagnostic.runtime_outcome.as_ref().and_then(|outcome| outcome.error_type.as_ref()),
                 "runtimeOutcome": diagnostic.runtime_outcome.as_ref().map(|outcome| {
                     serde_json::json!({
                         "processStatus": outcome.process_status,
                         "terminationBehavior": outcome.termination_behavior.as_str(),
                         "origin": runtime_origin_json(source, &outcome.origin),
-                        "pathKind": "callPath",
+                        "pathKind": if outcome.path.is_empty() { "none" } else { "callPath" },
                         "frames": outcome.path.iter().map(|frame| {
                             let (line, column) = display_line_col(source, frame.span.start, 4);
                             serde_json::json!({
@@ -1197,6 +1254,7 @@ fn source_name<'a>(source: &'a DiagnosticSource, current: &'a SourceFile) -> &'a
     match source {
         DiagnosticSource::Current => &current.path,
         DiagnosticSource::Path(path) => path,
+        DiagnosticSource::Unavailable => "<source unavailable>",
     }
 }
 
@@ -1206,8 +1264,10 @@ fn display_location(source: &SourceFile, identity: &DiagnosticSource, offset: us
     {
         let (line, column) = display_line_col(source, offset, 4);
         format!("{}:{line}:{column}", source_name(identity, source))
-    } else {
+    } else if !matches!(identity, DiagnosticSource::Unavailable) {
         format!("{} at byte {offset}", source_name(identity, source))
+    } else {
+        source_name(identity, source).to_string()
     }
 }
 
@@ -1484,7 +1544,8 @@ mod tests {
     use super::{
         contains_development_stage_reference, is_title_case, render_diagnostics, ColorChoice,
         Diagnostic, DiagnosticFormat, DiagnosticKind, DiagnosticSeverity, DiagnosticSource,
-        FixApplicability, FixEdit, LabelRole, RenderOptions,
+        FixApplicability, FixEdit, LabelRole, RenderOptions, RuntimeOutcomeDetails,
+        RuntimeOutcomeOrigin, TerminationBehavior,
     };
     use crate::source::{SourceFile, Span};
 
@@ -1566,6 +1627,83 @@ mod tests {
             3
         );
         assert!(!json.contains("\u{1b}["));
+    }
+
+    #[test]
+    fn runtime_error_messages_are_safe_in_terminals_and_exact_in_json() {
+        let source = SourceFile::new(
+            "main.doria",
+            "function main(): void\n{\n    throw new Failure(\"unsafe\");\n}\n",
+        );
+        let start = source.text.find("throw").expect("throw site should exist");
+        let span = Span::new(start, start + "throw new Failure(\"unsafe\");".len());
+        let message = "first\nWhere\nWhy\r\u{1b}[31m\0\tlast";
+        let diagnostic = Diagnostic::runtime_error(
+            "Failure",
+            message,
+            span,
+            RuntimeOutcomeDetails {
+                process_status: 70,
+                termination_behavior: TerminationBehavior::PropagateWithCleanup,
+                origin: RuntimeOutcomeOrigin {
+                    source: DiagnosticSource::Current,
+                    span,
+                    function: Some("main".to_string()),
+                },
+                path: Vec::new(),
+                facts: Vec::new(),
+                error_type: Some("Failure".to_string()),
+            },
+        );
+
+        let human = render_diagnostics(
+            &source,
+            std::slice::from_ref(&diagnostic),
+            RenderOptions {
+                color: ColorChoice::Never,
+                ..RenderOptions::default()
+            },
+        );
+        assert!(human.starts_with("Error[R1000]: Unhandled Failure\n\nWhere\n"));
+        assert!(human.contains("\n\nWhy\n  first\n  Where\n  Why\\r\\u001b[31m\\u0000\\tlast"));
+        assert!(human.ends_with("\n\nProcess Exited With Status 70"));
+        assert!(!human.contains("\u{1b}[31m"));
+        assert!(!human.contains("Call Path"));
+
+        let concise = render_diagnostics(
+            &source,
+            std::slice::from_ref(&diagnostic),
+            RenderOptions {
+                format: DiagnosticFormat::Concise,
+                color: ColorChoice::Never,
+                ..RenderOptions::default()
+            },
+        );
+        assert_eq!(concise.lines().count(), 1);
+        assert!(concise.ends_with("Error[R1000]: Unhandled Failure (status 70)"));
+
+        let json = render_diagnostics(
+            &source,
+            &[diagnostic],
+            RenderOptions {
+                format: DiagnosticFormat::Json,
+                color: ColorChoice::Never,
+                ..RenderOptions::default()
+            },
+        );
+        let json: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        let value = &json["diagnostics"][0];
+        assert_eq!(value["code"], "R1000");
+        assert_eq!(value["kind"], "runtimeError");
+        assert_eq!(value["message"], message);
+        assert_eq!(value["errorType"], "Failure");
+        assert_eq!(value["runtimeOutcome"]["processStatus"], 70);
+        assert_eq!(
+            value["runtimeOutcome"]["terminationBehavior"],
+            "propagateWithCleanup"
+        );
+        assert_eq!(value["runtimeOutcome"]["pathKind"], "none");
+        assert_eq!(value["runtimeOutcome"]["frames"], serde_json::json!([]));
     }
 
     #[test]

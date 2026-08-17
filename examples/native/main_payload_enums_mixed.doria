@@ -8,7 +8,7 @@ enum Other
     case Text(string $value);
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     mixed $value = Label::Text("hello");
     echo "{($value is Label)} {($value is Other)}\n";

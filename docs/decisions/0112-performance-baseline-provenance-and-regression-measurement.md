@@ -184,8 +184,8 @@ evidence, and an accepted exact structural baseline. Slice 3 adds peer sources
 for the new runtime cases, controlled-runner and baseline-promotion workflows,
 the exact native acceptance policy, and the stage-completion workflow. All three
 Stage 26b slices are complete. Decision 0113 and all four slices, Stages 27,
-28, and 28a are complete. Stage 29 is in progress: Slices 1 and 2 are complete,
-and Slice 3 is next with no performance-evidence dependency.
+28, and 28a are complete. Stage 29 is complete; the pre-Stage-30 grammar slice
+is next with no performance-evidence dependency.
 
 Slice 3 is split. Part 1 delivers the peer matrix, peer fairness and
 semantic-equivalence records, controlled candidate measurement, and a timing
@@ -215,7 +215,7 @@ pending release validation under the non-blocking gate above.
   baseline or cross-language acceptance matrix is promoted. That pending
   release validation does not reopen Stage 26b or block compiler development.
 - Decision 0113 and all four slices, Stages 27, 28, and 28a are complete.
-  Stage 29 Slices 1 and 2 are complete, Slice 3 is next, and none depends on
+  Stage 29 Slices 1 through 3 are complete, and none depends on
   pending performance evidence.
 - The compiler pins the benchmark repository revision used by its coordinated
   checks in `benchmarks-revision.json` without requiring network access. The

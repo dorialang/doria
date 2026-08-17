@@ -3,7 +3,7 @@ function negativeCount(): int
     return -1;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     bool[] $flags = [true; negativeCount()];
     echo "{$flags->length}\n";

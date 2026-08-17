@@ -1,6 +1,6 @@
 // The `?T` first/last projections in a loop body. They share the nullable
 // access lowering that Dictionary::get and List::pop use.
-function main(List<string> $args): void
+function main(List<string> $args): void throws Doria\Std\Io\IoError
 {
     let $n = Int::parse($args[0]) ?? 0;
     writable List<int> $values = [];

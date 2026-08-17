@@ -14,18 +14,21 @@ class Message
         }
     }
 
-    function show(): void
+    function show(): void throws Doria\Std\Io\IoError
     {
         echo $this->text . " [" . $this->code . "]\n";
     }
 
     function __destruct()
     {
-        echo "released " . $this->code . "\n";
+        try {
+            echo "released " . $this->code . "\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $formal = new Message(true, "Doria");
     let $casual = new Message(false, "Andrew");

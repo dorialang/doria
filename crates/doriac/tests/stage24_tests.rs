@@ -121,7 +121,7 @@ function main(): void { let $value = first([]); }
 fn mir_monomorphization_deduplicates_equal_type_sets() {
     let source = r#"
 function identity<T>(T $value): T { return $value; }
-function main(): int
+function main(): int throws Doria\Std\Io\IoError
 {
     int $one = identity(1);
     int $two = identity(2);

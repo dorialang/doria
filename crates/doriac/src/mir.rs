@@ -217,11 +217,11 @@ pub struct ErrorDescriptor {
     pub message_property: PropertyId,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErrorOrigin {
     pub id: ErrorOriginId,
     pub span: Span,
-    pub function: FunctionId,
+    pub callable: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -786,6 +786,35 @@ impl Rvalue {
         }
     }
 
+    pub fn borrows_move_value(&self) -> bool {
+        match self {
+            Self::Class(value) => value.borrows_class_value(),
+            Self::NullableClass(value) => value.borrows_class_value(),
+            Self::Collection(value) => value.owned_temporary_collection().is_none(),
+            Self::NullableCollection(value) => value.owned_temporary_collection().is_none(),
+            Self::SharedReference(_)
+            | Self::WeakReference(_)
+            | Self::NullableSharedReference(_)
+            | Self::NullableWeakReference(_)
+            | Self::WritableSharedReference(_)
+            | Self::WritableWeakReference(_)
+            | Self::NullableWritableSharedReference(_)
+            | Self::NullableWritableWeakReference(_)
+            | Self::SharedReferenceAccess(_)
+            | Self::NullableSharedReferenceAccess(_) => self.owned_temporary_shared().is_none(),
+            Self::Mixed(value) => value.ownership() == MixedOwnership::None,
+            Self::NullableMixed(value) => value.ownership() == MixedOwnership::None,
+            Self::Error(value) => value.is_borrowed(),
+            Self::NullableError(value) => value.is_borrowed(),
+            Self::PayloadEnum(value) => !value.owned_temporary(),
+            Self::NullablePayloadEnum(value) => !value.owned_temporary(),
+            Self::Value(_)
+            | Self::String(_)
+            | Self::NullableScalar(_)
+            | Self::NullableString(_) => false,
+        }
+    }
+
     pub const fn transferred_owned_local(&self) -> Option<LocalId> {
         match self {
             Self::Mixed(MixedExpression::Local {
@@ -1034,6 +1063,40 @@ pub enum NullableErrorExpression {
         positional: bool,
         remove: bool,
     },
+}
+
+impl ErrorExpression {
+    pub fn is_borrowed(&self) -> bool {
+        match self {
+            Self::Local { transfer, .. }
+            | Self::NullableLocalAssumeNonNull { transfer, .. }
+            | Self::Property { transfer, .. }
+            | Self::MixedPayload { transfer, .. } => !transfer,
+            Self::CollectionIndex { remove, .. } => !remove,
+            Self::Call { return_borrow, .. } => return_borrow.is_some(),
+            Self::FromClass { object, .. } => object.borrows_class_value(),
+            Self::FromNullableClass { object, .. } => object.borrows_class_value(),
+        }
+    }
+}
+
+impl NullableErrorExpression {
+    pub fn is_borrowed(&self) -> bool {
+        match self {
+            Self::Null => true,
+            Self::Error(value) => value.is_borrowed(),
+            Self::Local { transfer, .. } | Self::Property { transfer, .. } => !transfer,
+            Self::Call { return_borrow, .. } => return_borrow.is_some(),
+            Self::DictionaryGet { access, .. } => !matches!(
+                access,
+                NullableCollectionAccess::Remove
+                    | NullableCollectionAccess::Pop
+                    | NullableCollectionAccess::PopFront
+                    | NullableCollectionAccess::PopBack
+            ),
+            Self::CollectionIndex { remove, .. } => !remove,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3522,6 +3585,34 @@ pub enum Statement {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckedIoOperation {
+    ReadLine {
+        prompt: StringExpression,
+    },
+    ReadFile {
+        path: StringExpression,
+        bytes: bool,
+    },
+    ReadStdinBytes,
+    WriteFile {
+        path: StringExpression,
+        contents: IoContents,
+        append: bool,
+    },
+    WriteStream {
+        contents: IoContents,
+        stderr: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IoContents {
+    String(StringExpression),
+    Format(FormatExpression),
+    Bytes(LocalId),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchOwnershipMode {
     Borrowed,
@@ -3684,6 +3775,14 @@ pub enum Terminator {
         failure: BlockId,
         span: Span,
     },
+    CheckedIo {
+        operation: CheckedIoOperation,
+        result: Option<LocalId>,
+        error: LocalId,
+        success: BlockId,
+        failure: BlockId,
+        span: Span,
+    },
     ErrorSwitch {
         error: LocalId,
         cases: Vec<(ErrorDescriptorId, BlockId)>,
@@ -3789,8 +3888,31 @@ fn terminator_class_temporary_capacity(terminator: &Terminator) -> usize {
                     .map(rvalue_class_temporary_capacity)
                     .sum::<usize>()
         }
+        Terminator::CheckedIo { operation, .. } => checked_io_class_temporary_capacity(operation),
         Terminator::ErrorSwitch { .. } | Terminator::PropagateError { .. } => 0,
         Terminator::ReturnVoid | Terminator::Unreachable | Terminator::Jump(_) => 0,
+    }
+}
+
+fn checked_io_class_temporary_capacity(operation: &CheckedIoOperation) -> usize {
+    match operation {
+        CheckedIoOperation::ReadLine { prompt } => string_class_temporary_capacity(prompt),
+        CheckedIoOperation::ReadFile { path, .. } => string_class_temporary_capacity(path),
+        CheckedIoOperation::ReadStdinBytes => 0,
+        CheckedIoOperation::WriteFile { path, contents, .. } => {
+            string_class_temporary_capacity(path) + io_contents_class_temporary_capacity(contents)
+        }
+        CheckedIoOperation::WriteStream { contents, .. } => {
+            io_contents_class_temporary_capacity(contents)
+        }
+    }
+}
+
+fn io_contents_class_temporary_capacity(contents: &IoContents) -> usize {
+    match contents {
+        IoContents::String(value) => string_class_temporary_capacity(value),
+        IoContents::Format(value) => format_class_temporary_capacity(value),
+        IoContents::Bytes(_) => 0,
     }
 }
 
@@ -6213,6 +6335,23 @@ impl fmt::Display for Terminator {
                     result.0, error.0, success.0, failure.0
                 )
             }
+            Terminator::CheckedIo {
+                operation,
+                result,
+                error,
+                success,
+                failure,
+                ..
+            } => write!(
+                formatter,
+                "checked io {operation:?} -> {}error local{}, block{}, block{}",
+                result
+                    .map(|local| format!("local{}, ", local.0))
+                    .unwrap_or_default(),
+                error.0,
+                success.0,
+                failure.0
+            ),
             Terminator::ErrorSwitch {
                 error,
                 cases,

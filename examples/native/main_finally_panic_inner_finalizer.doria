@@ -1,14 +1,19 @@
+function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
 function main(): void
 {
-    echo "before\n";
+    record("before\n");
 
     if (true) {
         if (true) {
         } finally {
-            echo "inner\n";
+            record("inner\n");
             panic("stop in inner finalizer");
         }
     } finally {
-        echo "wrong outer cleanup\n";
+        record("wrong outer cleanup\n");
     }
 }

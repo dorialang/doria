@@ -1,28 +1,28 @@
-function orderedOutputPath(): string
+function orderedOutputPath(): string throws Doria\Std\Io\IoError
 {
     echo "path:";
     return "copy.bin";
 }
 
-function orderedInputPath(): string
+function orderedInputPath(): string throws Doria\Std\Io\IoError
 {
     echo "contents\n";
     return "roundtrip.bin";
 }
 
-function falseGuard(): bool
+function falseGuard(): bool throws Doria\Std\Io\IoError
 {
     echo "and:";
     return false;
 }
 
-function trueGuard(): bool
+function trueGuard(): bool throws Doria\Std\Io\IoError
 {
     echo "or:";
     return true;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     uint8[] $firstArray = [0, 128, 255];
     Bytes $first = Bytes::fromArray($firstArray);

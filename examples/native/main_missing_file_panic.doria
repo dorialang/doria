@@ -1,4 +1,4 @@
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     echo read_file("does-not-exist.txt");
 }

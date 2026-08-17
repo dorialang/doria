@@ -5,7 +5,7 @@ class Note
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     given {
         let $note = new Note("ready");

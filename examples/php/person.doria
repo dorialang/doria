@@ -7,7 +7,7 @@ class Person
     {
     }
 
-    function greet(): void
+    function greet(): void throws Doria\Std\Io\IoError
     {
         echo $this->getGreetingMessage();
     }
@@ -33,9 +33,12 @@ class Person
     }
 }
 
-let writable $person = new Person();
+function main(): void throws Doria\Std\Io\IoError
+{
+    let writable $person = new Person();
 
-$person->greet();
-$person->rename("Lucy");
-echo "\n---\n";
-$person->greet();
+    $person->greet();
+    $person->rename("Lucy");
+    echo "\n---\n";
+    $person->greet();
+}

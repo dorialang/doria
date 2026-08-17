@@ -5,7 +5,7 @@ class Failure implements Error
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     mixed $value = new Failure("mixed");
     if ($value is Failure) {

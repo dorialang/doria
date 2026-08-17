@@ -433,7 +433,7 @@ fn generic_class_fixture_reports_structural_and_class_specialization_counts() {
         directory.join("main.doria"),
         concat!(
             "class Box<T> { function __construct(take T $value) {} }\n",
-            "function main(): void {\n",
+            "function main(): void throws Doria\\Std\\Io\\IoError {\n",
             "    let $number = new Box<int>(42);\n",
             "    let $text = new Box<string>(\"doria\");\n",
             "    echo \"{$number->value}:{$text->value}\\n\";\n",
@@ -512,23 +512,26 @@ fn enum_fixture_reports_additive_structural_counts_without_a_schema_bump() {
         serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
             .expect("JSON");
     assert_eq!(report["schemaVersion"], 1);
-    assert_eq!(report["metrics"]["enumCount"], 6);
-    assert_eq!(report["metrics"]["unitEnumCount"], 1);
+    // The report describes the complete semantic/MIR program. Stage 29's four
+    // compiler-known I/O enums are therefore counted alongside these six
+    // source declarations, including their cases, payloads, and glue needs.
+    assert_eq!(report["metrics"]["enumCount"], 10);
+    assert_eq!(report["metrics"]["unitEnumCount"], 3);
     assert_eq!(report["metrics"]["backedEnumCount"], 2);
-    assert_eq!(report["metrics"]["payloadEnumCount"], 3);
-    assert_eq!(report["metrics"]["copyPayloadEnumCount"], 2);
+    assert_eq!(report["metrics"]["payloadEnumCount"], 5);
+    assert_eq!(report["metrics"]["copyPayloadEnumCount"], 4);
     assert_eq!(report["metrics"]["movePayloadEnumCount"], 1);
-    assert_eq!(report["metrics"]["enumCaseCount"], 10);
-    assert_eq!(report["metrics"]["enumPayloadFieldCount"], 6);
+    assert_eq!(report["metrics"]["enumCaseCount"], 29);
+    assert_eq!(report["metrics"]["enumPayloadFieldCount"], 8);
     assert!(report["metrics"]["maximumPayloadEnumSize"]
         .as_u64()
         .is_some_and(|value| value > 0));
     assert!(report["metrics"]["maximumPayloadEnumAlignment"]
         .as_u64()
         .is_some_and(|value| value > 0));
-    assert_eq!(report["metrics"]["enumCopyGlueTypeCount"], 2);
-    assert_eq!(report["metrics"]["enumDropGlueTypeCount"], 2);
-    assert_eq!(report["metrics"]["enumEqualityGlueTypeCount"], 3);
+    assert_eq!(report["metrics"]["enumCopyGlueTypeCount"], 4);
+    assert_eq!(report["metrics"]["enumDropGlueTypeCount"], 4);
+    assert_eq!(report["metrics"]["enumEqualityGlueTypeCount"], 5);
     let _ = fs::remove_dir_all(directory);
 }
 
@@ -555,7 +558,7 @@ fn match_fixture_reports_additive_structural_counts_without_a_schema_bump() {
             "  do { $count++; } while ($count < 2);\n",
             "  return given { $ready; } when ($ready): int { return 1; } else when (false) { return 2; } else { return 0; };\n",
             "}\n",
-            "function main(): void { echo classify(\"value\", 90, true); echo \"{control(true)}\"; }\n",
+            "function main(): void throws Doria\\Std\\Io\\IoError { echo classify(\"value\", 90, true); echo \"{control(true)}\"; }\n",
         ),
     )
     .expect("source");

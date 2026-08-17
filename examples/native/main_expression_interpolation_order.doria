@@ -1,18 +1,18 @@
-function left(): int
+function left(): int throws Doria\Std\Io\IoError
 {
     echo "L";
 
     return 20;
 }
 
-function right(): int
+function right(): int throws Doria\Std\Io\IoError
 {
     echo "R";
 
     return 22;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo "={left() + right()}";
 }

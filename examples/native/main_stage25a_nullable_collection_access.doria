@@ -1,4 +1,4 @@
-function marker(): int
+function marker(): int throws Doria\Std\Io\IoError
 {
     echo "argument\n";
     return 2;
@@ -16,7 +16,7 @@ function maybeWrite(
     return $owner?->acquireWritableAccess();
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $listOwner = new WritableSharedReference<List<int>>([1, 2, 3]);
     ?WritableSharedReference<List<int>> $missingListOwner = null;

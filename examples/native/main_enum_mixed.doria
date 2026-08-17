@@ -16,7 +16,7 @@ enum Transport: string
     case Rail = "rail";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     mixed $unit = Status::Draft;
     mixed $number = Priority::High;

@@ -277,8 +277,7 @@ Stage 33 has three implementation slices:
 Stage 32 owns typed attribute metadata and the processor protocol, not automatic
 package processor orchestration. Stage 33 Slice 3 performs that orchestration.
 
-Stage 29 is in progress and Slice 3 is next. Stage 33 is scheduled, not implemented,
-and does not move before Stage 32.
+Stage 29 is complete and the pre-Stage-30 closure grammar slice is next. Stage 33 is scheduled, not implemented, and does not move before Stage 32.
 
 ## Safe Deferrals
 

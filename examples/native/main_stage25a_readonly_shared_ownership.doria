@@ -6,7 +6,10 @@ class Node
 
     function __destruct()
     {
-        echo "drop {$this->name}\n";
+        try {
+            echo "drop {$this->name}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 
     function label(): string
@@ -15,18 +18,18 @@ class Node
     }
 }
 
-function inspect(SharedReference<Node> $node): void
+function inspect(SharedReference<Node> $node): void throws Doria\Std\Io\IoError
 {
     echo "inspect {$node->name}\n";
 }
 
-function marker(): int
+function marker(): int throws Doria\Std\Io\IoError
 {
     echo "marker\n";
     return 7;
 }
 
-function inspectNamed(int $marker, SharedReference<Node> $node): void
+function inspectNamed(int $marker, SharedReference<Node> $node): void throws Doria\Std\Io\IoError
 {
     echo "{$marker}:{$node->name}\n";
 }
@@ -47,7 +50,7 @@ function makeTemporaryWeak(): WeakReference<Node>
     return makeStrong("temporary")->createWeakReference();
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $current = shared new Node("old current");
     $current = shared new Node("current");

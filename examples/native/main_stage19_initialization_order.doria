@@ -1,10 +1,10 @@
-function initializeLabel(): string
+function initializeLabel(): string throws Doria\Std\Io\IoError
 {
     echo "property initializer\n";
     return "ready";
 }
 
-function initializeMessage(): string
+function initializeMessage(): string throws Doria\Std\Io\IoError
 {
     echo "constructor argument\n";
     return "message";
@@ -15,7 +15,7 @@ class Message
     string $label = initializeLabel();
     string $state;
 
-    function __construct(string $text)
+    function __construct(string $text) throws Doria\Std\Io\IoError
     {
         echo "constructor ";
         echo $this->label;
@@ -27,13 +27,16 @@ class Message
 
     function __destruct()
     {
-        echo "destructor ";
-        echo $this->state;
-        echo "\n";
+        try {
+            echo "destructor ";
+            echo $this->state;
+            echo "\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $message = new Message(initializeMessage());
 }

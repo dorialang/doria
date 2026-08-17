@@ -6,7 +6,10 @@ class Token
 
     function __destruct()
     {
-        echo "drop {$this->label}\n";
+        try {
+            echo "drop {$this->label}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 

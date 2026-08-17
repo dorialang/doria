@@ -85,7 +85,7 @@ fn named_arguments_evaluate_in_source_order() {
 #[test]
 fn reordered_repeat_literals_panic_before_later_arguments_run() {
     let source = r#"
-function marker(): int
+function marker(): int throws Doria\Std\Io\IoError
 {
     echo "marker\n";
     return 1;
@@ -93,12 +93,12 @@ function marker(): int
 
 function sink(int $first, List<bool> $second): void {}
 
-function route(int $count): void
+function route(int $count): void throws Doria\Std\Io\IoError
 {
     sink(second: [true; $count], first: marker());
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     route(-1);
 }
@@ -135,7 +135,7 @@ function middle(int $first, int $second = 20, int $third = 30, int $fourth = 40)
     return $first + $second + $third + $fourth;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo middle(1, fourth: 4);
     echo ":";

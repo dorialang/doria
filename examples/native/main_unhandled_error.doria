@@ -1,0 +1,11 @@
+class Stage29Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function main(): void throws Stage29Failure
+{
+    throw new Stage29Failure("unhandled user error");
+}

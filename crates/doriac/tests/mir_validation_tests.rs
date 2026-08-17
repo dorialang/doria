@@ -347,7 +347,10 @@ function takeMove(take MoveResult $result): Box
         MoveResult::Empty => new Box(0),
     };
 }
-function main(): void { echo copyLabel(CopyResult::Text("ready")); }
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo copyLabel(CopyResult::Text("ready"));
+}
 "#;
     let valid = doriac::lower_source_to_mir("stage28-validation.doria", source)
         .expect("valid match source should lower");
@@ -731,7 +734,8 @@ function select(Value $value, bool $left, bool $right): int
         Value::Number($number) => $number + 2,
     };
 }
-function main(): void
+
+function main(): void throws Doria\Std\Io\IoError
 {
     echo select(Value::Number(1), false, true);
 }
@@ -740,6 +744,67 @@ function main(): void
         .expect("multi-block match guards should lower");
     doriac::mir_validation::validate_program(&program)
         .expect("multi-block match guard success paths should reach their binding blocks");
+}
+
+#[test]
+fn shared_validator_accepts_checked_calls_in_match_guard_cfgs() {
+    let source = r#"
+enum Value { case Number(int $number); }
+function mark(bool $selected): bool throws Doria\Std\Io\IoError
+{
+    echo "guard";
+    return $selected;
+}
+function select(Value $value): int throws Doria\Std\Io\IoError
+{
+    return match ($value) {
+        Value::Number($number) if mark(true) => $number,
+        Value::Number($number) => $number + 1,
+    };
+}
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo select(Value::Number(41));
+}
+"#;
+    let program = doriac::lower_source_to_mir("checked-match-guard-cfg.doria", source)
+        .expect("checked calls inside match guards should lower");
+    doriac::mir_validation::validate_program(&program)
+        .expect("a checked guard's normal-success path should reach its binding block");
+
+    let mut malformed = program;
+    let function = malformed
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "select")
+        .expect("select should exist");
+    let (guard, binding, merge) = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .find_map(|statement| match statement {
+            Statement::MatchResultPlan { arms, merge, .. } => arms
+                .iter()
+                .find_map(|arm| arm.guard.map(|guard| (guard, arm.binding, *merge))),
+            _ => None,
+        })
+        .expect("guarded arm should exist");
+    let Terminator::CheckedCall {
+        success, failure, ..
+    } = &mut function.blocks[guard.0].terminator
+    else {
+        panic!("guard block should contain the checked call");
+    };
+    *success = merge;
+    *failure = binding;
+    let error = doriac::mir_validation::validate_program(&malformed)
+        .expect_err("a checked guard's failure edge must not prove a successful binding path");
+    assert!(
+        error
+            .message
+            .contains("match guard must branch through a success path to its final binding block"),
+        "unexpected validation error: {error:?}"
+    );
 }
 
 #[test]
@@ -965,7 +1030,10 @@ function repeat(): void
         if ($count < 2) { continue; }
     } while ($count < 3);
 }
-function main(): void { echo "{choose(true)}"; }
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo "{choose(true)}";
+}
 "#;
     let valid = doriac::lower_source_to_mir("stage28a-validation.doria", source)
         .expect("valid Stage 28a source should lower");
@@ -1294,16 +1362,21 @@ fn enum_case_assignment<'a>(program: &'a mut Program, local_name: &str) -> &'a m
 #[test]
 fn shared_validator_rejects_malformed_finalizer_regions_and_exit_routes() {
     let source = r#"
+function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
 function choose(): int
 {
     if (true) {
         return 42;
     } finally {
-        echo "cleanup";
+        record("cleanup");
     }
     return 0;
 }
-function main(): void { echo "{choose()}"; }
+function main(): void { record("{choose()}"); }
 "#;
     let valid = doriac::lower_source_to_mir("finalizer-validation.doria", source)
         .expect("valid finalizer source should lower");
@@ -1439,15 +1512,20 @@ fn nested_finalizers_inside_finalizer_bodies_preserve_lexical_parentage() {
     let program = doriac::lower_source_to_mir(
         "nested-finalizer-parent.doria",
         r#"
+function record(string $message): void
+{
+    try { echo $message; } catch (Doria\Std\Io\IoError) {}
+}
+
 function main(): void
 {
     if (true) {
-        echo "outer body";
+        record("outer body");
     } finally {
         if (true) {
-            echo "inner body";
+            record("inner body");
         } finally {
-            echo "inner cleanup";
+            record("inner cleanup");
         }
     }
 }
@@ -1455,7 +1533,11 @@ function main(): void
     )
     .expect("nested finalizers should lower");
 
-    let plans = program.functions[0]
+    let plans = program
+        .functions
+        .iter()
+        .find(|function| function.name == "main")
+        .expect("main should exist")
         .blocks
         .iter()
         .flat_map(|block| &block.statements)
@@ -1804,7 +1886,7 @@ class Ratios
     static bool $on = true;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     float[] $array = [2.5, 1.5];
     float $bound = $array[0];
@@ -2357,7 +2439,7 @@ class Value
     int $number = 1;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     ?WritableSharedReference<Value> $source = null;
     ?ReadonlySharedReferenceAccess<Value> $access =

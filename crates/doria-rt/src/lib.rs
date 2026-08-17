@@ -8,21 +8,19 @@ use core::ptr;
 use unicode_width::UnicodeWidthChar;
 
 mod bytes;
+mod checked_io;
 mod collection;
 mod device_io;
 mod entry_args;
 mod file_io;
 mod line_io;
 mod mixed;
+mod platform_io;
 mod string_ops;
 
 use device_io::{StandardStream, WriteOutcome};
 
 const PANIC_STATUS: i32 = 101;
-#[cfg(unix)]
-const SIGPIPE: i32 = 13;
-#[cfg(unix)]
-const SIG_IGN: usize = 1;
 
 #[cfg(all(not(test), panic = "abort"))]
 struct RuntimeAllocator;
@@ -176,6 +174,15 @@ pub unsafe extern "C" fn dr_v1_bytes_free(value: *mut DrBytesV1) {
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_bytes_length(value: *const DrBytesV1) -> usize {
     bytes::length(value)
+}
+
+/// Returns a borrowed pointer to the first byte, or null for an empty buffer.
+///
+/// # Safety
+/// `value` must point to a live byte buffer.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_bytes_data(value: *const DrBytesV1) -> *const u8 {
+    bytes::data(value)
 }
 
 /// # Safety
@@ -1145,6 +1152,49 @@ pub type DrMainVoidV2 = unsafe extern "C" fn(*const DrStackFrameV2);
 pub type DrMainIntArgsV2 = unsafe extern "C" fn(*const DrStackFrameV2, *mut DrCollectionV1) -> i64;
 pub type DrMainVoidArgsV2 = unsafe extern "C" fn(*const DrStackFrameV2, *mut DrCollectionV1);
 
+#[repr(C)]
+pub struct DrErrorCarrierV1 {
+    object: *mut u8,
+    descriptor: *const DrErrorDescriptorV1,
+}
+
+#[repr(C)]
+struct DrErrorDescriptorV1 {
+    type_name: *const u8,
+    type_name_length: usize,
+    message_offset: usize,
+    drop: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
+    _class_size: usize,
+    origin_offset: usize,
+    _reserved_0: usize,
+    _reserved_1: usize,
+}
+
+#[repr(C)]
+struct DrErrorOriginV1 {
+    source_path: *const u8,
+    source_path_length: usize,
+    source_text: *const u8,
+    source_text_length: usize,
+    span_start: usize,
+    span_end: usize,
+    function_name: *const u8,
+    function_name_length: usize,
+}
+
+pub type DrMainCheckedIntV3 =
+    unsafe extern "C" fn(*const DrStackFrameV2, *mut i64, *mut DrErrorCarrierV1) -> u8;
+pub type DrMainCheckedVoidV3 =
+    unsafe extern "C" fn(*const DrStackFrameV2, *mut DrErrorCarrierV1) -> u8;
+pub type DrMainCheckedIntArgsV3 = unsafe extern "C" fn(
+    *const DrStackFrameV2,
+    *mut i64,
+    *mut DrErrorCarrierV1,
+    *mut DrCollectionV1,
+) -> u8;
+pub type DrMainCheckedVoidArgsV3 =
+    unsafe extern "C" fn(*const DrStackFrameV2, *mut DrErrorCarrierV1, *mut DrCollectionV1) -> u8;
+
 /// Validates process arguments for an entrypoint that does not request the list.
 ///
 /// # Safety
@@ -1706,6 +1756,178 @@ pub unsafe extern "C" fn dr_v2_main_void(entry: DrMainVoidV2) -> i32 {
     0
 }
 
+/// Invokes a checked Doria `main(): int` and reports an escaping Error as R1000.
+///
+/// # Safety
+/// `entry` must implement the compiler's checked-entry ABI.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_main_checked_int(
+    entry: DrMainCheckedIntV3,
+    source_path: *const u8,
+    source_path_length: usize,
+    source_text: *const u8,
+    source_text_length: usize,
+    source_span_start: usize,
+    source_span_end: usize,
+) -> i32 {
+    let mut value = 0_i64;
+    let mut error = empty_error_carrier();
+    match entry(ptr::null(), &mut value, &mut error) {
+        0 => process_status(
+            value,
+            source_path,
+            source_path_length,
+            source_text,
+            source_text_length,
+            source_span_start,
+            source_span_end,
+        ),
+        1 => report_unhandled_error(error),
+        _ => emergency_runtime_panic(),
+    }
+}
+
+/// Invokes a checked Doria `main(): void` and reports an escaping Error as R1000.
+///
+/// # Safety
+/// `entry` must implement the compiler's checked-entry ABI.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_main_checked_void(entry: DrMainCheckedVoidV3) -> i32 {
+    let mut error = empty_error_carrier();
+    match entry(ptr::null(), &mut error) {
+        0 => 0,
+        1 => report_unhandled_error(error),
+        _ => emergency_runtime_panic(),
+    }
+}
+
+/// Invokes a checked Doria `main(List<string> $args): int`.
+///
+/// # Safety
+/// `entry`, `argc`, and `argv` must satisfy the generated entry ABI.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_main_checked_int_args(
+    entry: DrMainCheckedIntArgsV3,
+    argc: i32,
+    argv: *const *const u8,
+    source_path: *const u8,
+    source_path_length: usize,
+    source_text: *const u8,
+    source_text_length: usize,
+    source_span_start: usize,
+    source_span_end: usize,
+) -> i32 {
+    let args = entry_args::build(argc, argv);
+    let mut value = 0_i64;
+    let mut error = empty_error_carrier();
+    let status = entry(ptr::null(), &mut value, &mut error, args);
+    entry_args::release(args);
+    match status {
+        0 => process_status(
+            value,
+            source_path,
+            source_path_length,
+            source_text,
+            source_text_length,
+            source_span_start,
+            source_span_end,
+        ),
+        1 => report_unhandled_error(error),
+        _ => emergency_runtime_panic(),
+    }
+}
+
+/// Invokes a checked Doria `main(List<string> $args): void`.
+///
+/// # Safety
+/// `entry`, `argc`, and `argv` must satisfy the generated entry ABI.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_main_checked_void_args(
+    entry: DrMainCheckedVoidArgsV3,
+    argc: i32,
+    argv: *const *const u8,
+) -> i32 {
+    let args = entry_args::build(argc, argv);
+    let mut error = empty_error_carrier();
+    let status = entry(ptr::null(), &mut error, args);
+    entry_args::release(args);
+    match status {
+        0 => 0,
+        1 => report_unhandled_error(error),
+        _ => emergency_runtime_panic(),
+    }
+}
+
+const fn empty_error_carrier() -> DrErrorCarrierV1 {
+    DrErrorCarrierV1 {
+        object: ptr::null_mut(),
+        descriptor: ptr::null(),
+    }
+}
+
+unsafe fn report_unhandled_error(error: DrErrorCarrierV1) -> i32 {
+    if error.object.is_null() || error.descriptor.is_null() {
+        emergency_runtime_panic();
+    }
+    let descriptor = &*error.descriptor;
+    let message_slot = error.object.add(descriptor.message_offset) as *const *const DrStringV1;
+    let message = *message_slot;
+    if descriptor.type_name.is_null() || message.is_null() {
+        emergency_runtime_panic();
+    }
+    let origin_slot = error.object.add(descriptor.origin_offset) as *const *const DrErrorOriginV1;
+    let origin = *origin_slot;
+
+    if !write_runtime_error_record(descriptor, message, origin) {
+        render_runtime_error(descriptor, message, origin);
+    }
+    (descriptor.drop)(ptr::null(), error.object);
+    70
+}
+
+unsafe fn render_runtime_error(
+    descriptor: &DrErrorDescriptorV1,
+    message: *const DrStringV1,
+    origin: *const DrErrorOriginV1,
+) {
+    write_panic_fragment(b"Error[R1000]: Unhandled ");
+    write_panic_bytes(descriptor.type_name, descriptor.type_name_length);
+    if !origin.is_null() {
+        let frame = DrStackFrameV2 {
+            parent: ptr::null(),
+            function_name: (*origin).function_name,
+            function_name_length: (*origin).function_name_length,
+            source_path: (*origin).source_path,
+            source_path_length: (*origin).source_path_length,
+            source_text: (*origin).source_text,
+            source_text_length: (*origin).source_text_length,
+            function_span_start: (*origin).span_start,
+            function_span_end: (*origin).span_end,
+            active_span_start: (*origin).span_start,
+            active_span_end: (*origin).span_end,
+        };
+        let Some(entry) = doria_diagnostic_catalogue::runtime_entry("R1000") else {
+            emergency_runtime_panic();
+        };
+        render_runtime_where(&raw const frame, entry.primary_label.as_bytes());
+    }
+    write_panic_fragment(b"\n\nWhy\n  ");
+    write_safe_runtime_error_message(string_bytes(message), (*message).byte_length);
+    write_panic_fragment(b"\n\nProcess Exited With Status 70\n");
+}
+
+unsafe fn write_safe_runtime_error_message(bytes: *const u8, length: usize) {
+    if bytes.is_null() && length != 0 {
+        return;
+    }
+    let bytes = core::slice::from_raw_parts(bytes, length);
+    doria_diagnostic_catalogue::write_terminal_safe_runtime_text(
+        bytes,
+        doria_diagnostic_catalogue::RuntimeTextPresentation::Human,
+        |chunk| unsafe { write_panic_fragment(chunk) },
+    );
+}
+
 /// Terminates a CRT-free native process with the supplied status.
 ///
 /// Windows process wrappers call this instead of returning from the custom PE
@@ -1732,7 +1954,7 @@ pub unsafe extern "C" fn dr_v2_write_stdout(
     match write_standard_stream(StandardStream::Stdout, bytes, byte_length) {
         WriteOutcome::Success => return,
         WriteOutcome::BrokenPipe => exit_process(0),
-        WriteOutcome::OtherFailure => {}
+        WriteOutcome::OtherFailure(_) => {}
     }
     panic_catalogued(current_frame, b"P1407")
 }
@@ -1749,7 +1971,7 @@ pub unsafe extern "C" fn dr_v1_write_stderr(bytes: *const u8, byte_length: usize
     match write_standard_stream(StandardStream::Stderr, bytes, byte_length) {
         WriteOutcome::Success => {}
         WriteOutcome::BrokenPipe => exit_process(0),
-        WriteOutcome::OtherFailure => exit_process(PANIC_STATUS),
+        WriteOutcome::OtherFailure(_) => exit_process(PANIC_STATUS),
     }
 }
 
@@ -1831,7 +2053,7 @@ pub unsafe extern "C" fn dr_v2_read_stdin_bytes(
         match device_io::read_bytes(StandardStream::Stdin, data.add(length), capacity - length) {
             Ok(0) => return bytes::from_owned(data, length),
             Ok(read) => length += read,
-            Err(()) => {
+            Err(_) => {
                 deallocate(data);
                 panic_catalogued(current_frame, b"P1403");
             }
@@ -1850,7 +2072,7 @@ pub unsafe extern "C" fn dr_v2_flush_stdout(current_frame: *const DrStackFrameV2
         // A closed downstream pipe is the permanent clean status-0 exit, exactly as
         // for an ordinary write. It must never become a status-101 panic.
         WriteOutcome::BrokenPipe => exit_process(0),
-        WriteOutcome::OtherFailure => {}
+        WriteOutcome::OtherFailure(_) => {}
     }
     panic_catalogued(current_frame, b"P1407")
 }
@@ -1866,7 +2088,7 @@ pub unsafe extern "C" fn dr_v2_flush_stderr(current_frame: *const DrStackFrameV2
         // A closed downstream pipe is the permanent clean status-0 exit, exactly as
         // for an ordinary write. It must never become a status-101 panic.
         WriteOutcome::BrokenPipe => exit_process(0),
-        WriteOutcome::OtherFailure => {}
+        WriteOutcome::OtherFailure(_) => {}
     }
     panic_catalogued(current_frame, b"P1407")
 }
@@ -1901,8 +2123,10 @@ pub unsafe extern "C" fn dr_v2_read_stdin_line(
     match line_io::read_line() {
         Ok(Some((bytes, length))) => dr_v1_string_from_utf8(bytes, length),
         Ok(None) => ptr::null_mut(),
-        Err(line_io::ReadLineError::InvalidUtf8) => panic_catalogued(current_frame, b"P1404"),
-        Err(line_io::ReadLineError::Read) => panic_catalogued(current_frame, b"P1403"),
+        Err(line_io::ReadLineError::InvalidUtf8 { .. }) => {
+            panic_catalogued(current_frame, b"P1404")
+        }
+        Err(line_io::ReadLineError::Read(_)) => panic_catalogued(current_frame, b"P1403"),
         Err(line_io::ReadLineError::Allocation) => panic_catalogued(current_frame, b"P1206"),
     }
 }
@@ -1940,7 +2164,7 @@ pub unsafe extern "C" fn dr_v2_read_stdin_line_prompted(
         match write_standard_stream(StandardStream::Stdout, string_bytes(prompt), prompt_length) {
             WriteOutcome::Success => {}
             WriteOutcome::BrokenPipe => exit_process(0),
-            WriteOutcome::OtherFailure => panic_catalogued(current_frame, b"P1407"),
+            WriteOutcome::OtherFailure(_) => panic_catalogued(current_frame, b"P1407"),
         }
     }
 
@@ -1949,7 +2173,7 @@ pub unsafe extern "C" fn dr_v2_read_stdin_line_prompted(
     match device_io::flush(StandardStream::Stdout) {
         WriteOutcome::Success => {}
         WriteOutcome::BrokenPipe => exit_process(0),
-        WriteOutcome::OtherFailure => panic_catalogued(current_frame, b"P1407"),
+        WriteOutcome::OtherFailure(_) => panic_catalogued(current_frame, b"P1407"),
     }
 
     // 3. Read one line under the existing line discipline.
@@ -2493,6 +2717,81 @@ unsafe fn emergency_runtime_panic() -> ! {
     exit_process(PANIC_STATUS)
 }
 
+unsafe fn write_runtime_error_record(
+    descriptor: &DrErrorDescriptorV1,
+    message: *const DrStringV1,
+    origin: *const DrErrorOriginV1,
+) -> bool {
+    const MAX_TYPE: usize = 4096;
+    const MAX_PATH: usize = 4096;
+    const MAX_SOURCE: usize = 4 * 1024 * 1024;
+    const MAX_FUNCTION: usize = 1024;
+
+    let mut path_buffer = [0_u8; MAX_PATH];
+    let Some(channel_path) = runtime_error_channel_path(&mut path_buffer) else {
+        return false;
+    };
+    let known_origin = !origin.is_null();
+    let (path_length, source_length, function_length, span_start, span_end) = if known_origin {
+        (
+            (*origin).source_path_length,
+            (*origin).source_text_length,
+            (*origin).function_name_length,
+            (*origin).span_start,
+            (*origin).span_end,
+        )
+    } else {
+        (0, 0, 0, 0, 0)
+    };
+    if descriptor.type_name_length > MAX_TYPE
+        || path_length > MAX_PATH
+        || source_length > MAX_SOURCE
+        || function_length > MAX_FUNCTION
+    {
+        return false;
+    }
+
+    let mut header = [0_u8; 51];
+    header[..8].copy_from_slice(b"DORIAO3\0");
+    put_u16(&mut header[8..10], 3);
+    put_u32(&mut header[10..14], descriptor.type_name_length as u32);
+    put_u64(&mut header[14..22], (*message).byte_length as u64);
+    put_u32(&mut header[22..26], path_length as u32);
+    put_u32(&mut header[26..30], source_length as u32);
+    put_u32(&mut header[30..34], function_length as u32);
+    header[34] = u8::from(known_origin);
+    put_u64(&mut header[35..43], span_start as u64);
+    put_u64(&mut header[43..51], span_end as u64);
+
+    file_io::write_file(channel_path, &header).is_ok()
+        && file_io::append_file(
+            channel_path,
+            core::slice::from_raw_parts(descriptor.type_name, descriptor.type_name_length),
+        )
+        .is_ok()
+        && file_io::append_file(
+            channel_path,
+            core::slice::from_raw_parts(string_bytes(message), (*message).byte_length),
+        )
+        .is_ok()
+        && (!known_origin
+            || (file_io::append_file(
+                channel_path,
+                core::slice::from_raw_parts((*origin).source_path, path_length),
+            )
+            .is_ok()
+                && file_io::append_file(
+                    channel_path,
+                    core::slice::from_raw_parts((*origin).source_text, source_length),
+                )
+                .is_ok()
+                && file_io::append_file(
+                    channel_path,
+                    core::slice::from_raw_parts((*origin).function_name, function_length),
+                )
+                .is_ok()))
+}
+
 unsafe fn write_runtime_outcome_record(
     current_frame: *const DrStackFrameV2,
     code: &[u8],
@@ -2686,9 +2985,37 @@ unsafe fn runtime_outcome_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
     None
 }
 
+#[cfg(unix)]
+unsafe fn runtime_error_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
+    let name = b"DORIA_RUNTIME_OUTCOME_V3\0";
+    let value = getenv(name.as_ptr());
+    if value.is_null() {
+        return None;
+    }
+    for index in 0..buffer.len() {
+        let byte = *value.add(index);
+        if byte == 0 {
+            return Some(&buffer[..index]);
+        }
+        buffer[index] = byte;
+    }
+    None
+}
+
 #[cfg(windows)]
 unsafe fn runtime_outcome_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
     let name = b"DORIA_RUNTIME_OUTCOME_V2\0";
+    let length = GetEnvironmentVariableA(
+        name.as_ptr(),
+        buffer.as_mut_ptr(),
+        buffer.len().try_into().ok()?,
+    ) as usize;
+    (length != 0 && length < buffer.len()).then_some(&buffer[..length])
+}
+
+#[cfg(windows)]
+unsafe fn runtime_error_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
+    let name = b"DORIA_RUNTIME_OUTCOME_V3\0";
     let length = GetEnvironmentVariableA(
         name.as_ptr(),
         buffer.as_mut_ptr(),
@@ -3055,7 +3382,7 @@ pub unsafe extern "C" fn dr_v2_write_string_stderr(
     ) {
         WriteOutcome::Success => return,
         WriteOutcome::BrokenPipe => exit_process(0),
-        WriteOutcome::OtherFailure => {}
+        WriteOutcome::OtherFailure(_) => {}
     }
     panic_catalogued(current_frame, b"P1407");
 }
@@ -3544,12 +3871,6 @@ unsafe fn allocate(_byte_length: usize) -> *mut u8 {
 #[cfg(not(any(unix, windows)))]
 unsafe fn deallocate(_memory: *mut u8) {}
 
-#[cfg(unix)]
-unsafe fn ignore_sigpipe() {
-    // Ignoring it makes write(2) report EPIPE instead of terminating the process by signal.
-    signal(SIGPIPE, SIG_IGN);
-}
-
 unsafe fn write_panic_fragment(bytes: &[u8]) {
     write_panic_bytes(bytes.as_ptr(), bytes.len());
 }
@@ -3564,9 +3885,6 @@ unsafe fn write_standard_stream(
     bytes: *const u8,
     byte_length: usize,
 ) -> WriteOutcome {
-    #[cfg(unix)]
-    ignore_sigpipe();
-
     device_io::write(stream, bytes, byte_length)
 }
 
@@ -3577,13 +3895,10 @@ unsafe fn write_byte_stream(
     length: usize,
     failure: &'static [u8],
 ) {
-    #[cfg(unix)]
-    ignore_sigpipe();
-
     match device_io::write_bytes(stream, data, length) {
         WriteOutcome::Success => {}
         WriteOutcome::BrokenPipe => exit_process(0),
-        WriteOutcome::OtherFailure => {
+        WriteOutcome::OtherFailure(_) => {
             let _ = failure;
             panic_catalogued(current_frame, b"P1407")
         }
@@ -3609,7 +3924,6 @@ unsafe fn exit_process(_status: i32) -> ! {
 
 #[cfg(unix)]
 extern "C" {
-    fn signal(signal: i32, handler: usize) -> usize;
     fn getenv(name: *const u8) -> *const u8;
     fn _exit(status: i32) -> !;
     fn malloc(byte_length: usize) -> *mut c_void;

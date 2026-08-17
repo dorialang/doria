@@ -1,4 +1,4 @@
-function main(): void
+function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     let writable $contents = read_file("seed.txt");
     let writable $line = read_line();

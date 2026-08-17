@@ -19,7 +19,7 @@ function rethrow(): void throws Failure
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     try {
         rethrow();

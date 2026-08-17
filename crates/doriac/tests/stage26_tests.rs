@@ -45,14 +45,14 @@ class Calls
 {
     static writable int $step = 0;
 
-    static function list(): List<int>
+    static function list(): List<int> throws Doria\Std\Io\IoError
     {
         echo "receiver" . Calls::step;
         Calls::step++;
         return [7, 8];
     }
 
-    static function probe(): int
+    static function probe(): int throws Doria\Std\Io\IoError
     {
         echo " probe" . Calls::step;
         Calls::step++;
@@ -60,7 +60,7 @@ class Calls
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo " index=" . (Calls::list()->indexOf(Calls::probe()) ?? -1) .
         " calls=" . Calls::step;
@@ -74,7 +74,7 @@ function main(): void
 fn signed_ordering_mutation_and_set_algebra_are_exact() {
     let output = interpret(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable SortedDictionary<int, string> $map =
         SortedDictionary::from([2 => "two", -1 => "minus", 1 => "one"]);
@@ -104,7 +104,7 @@ function main(): void
 fn sorted_dictionary_projections_follow_sorted_key_order() {
     let output = interpret(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     SortedDictionary<int, string> $priorities = SortedDictionary::from([
         30 => "low",
@@ -124,7 +124,7 @@ function main(): void
 fn priority_queue_and_deque_preserve_their_authored_orders() {
     let output = interpret(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable PriorityQueue<int> $queue = PriorityQueue::from([4, -2, 4, 1]);
     let $peek = $queue->peek ?? -99;
@@ -157,7 +157,7 @@ function main(): void
 fn existing_sources_are_preserved() {
     let output = interpret(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     List<int> $source = [3, 1, 2];
     SortedSet<int> $set = SortedSet::from($source);
@@ -180,9 +180,9 @@ fn nested_and_move_elements_preserve_single_ownership() {
 class Token
 {
     function __construct(string $name) {}
-    function __destruct() { echo "drop {$this->name}\n"; }
+    function __destruct() { try { echo "drop {$this->name}\n"; } catch (Doria\Std\Io\IoError) {} }
 }
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable Deque<Token> $tokens = Deque::from([]);
     $tokens->pushBack(new Token("back"));
@@ -255,7 +255,7 @@ fn non_consuming_operations_reject_move_values_without_clone_suggestions() {
     let from = diagnostic(
         r#"
 class Token {}
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     List<Token> $source = [new Token()];
     Deque<Token> $values = Deque::from($source);
@@ -273,7 +273,7 @@ fn writable_shared_payloads_accept_all_stage26_collection_kinds() {
     doriac::lower_source_to_mir(
         "stage26-shared.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $map = new WritableSharedReference<SortedDictionary<string, int>>(
         SortedDictionary::from(["a" => 1])
@@ -301,7 +301,7 @@ function main(): void
     let diagnostics = doriac::check_source(
         "readonly-shared-clear.doria",
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $shared = new WritableSharedReference<List<int>>([1]);
     let $access = $shared->acquireReadonlyAccess();
@@ -324,7 +324,7 @@ function aSet(): ?SortedSet<int> { return SortedSet::from([2, 1]); }
 function noQueue(): ?PriorityQueue<int> { return null; }
 function aDeque(): ?Deque<int> { return Deque::from([1, 2]); }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $map = noMap();
     let $set = aSet();
@@ -351,7 +351,7 @@ class Marker
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     writable Dictionary<int, ?int> $plain = [1 => null, 2 => 0];
     $plain->set(3, null);
@@ -403,7 +403,7 @@ function main(): void
 fn nullable_dictionary_index_keeps_missing_keys_distinct_from_stored_null() {
     let output = interpret(
         r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Dictionary<int, ?int> $values = [1 => null];
     echo $values[2] ?? -1;

@@ -12,8 +12,11 @@ static mut EOF: bool = false;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadLineError {
-    Read,
-    InvalidUtf8,
+    Read(crate::platform_io::Failure),
+    InvalidUtf8 {
+        valid_byte_count: usize,
+        invalid_byte_count: Option<usize>,
+    },
     Allocation,
 }
 
@@ -69,7 +72,7 @@ pub(crate) unsafe fn read_line() -> Result<Option<(*const u8, usize)>, ReadLineE
 
         prepare_write_space()?;
         let read = device_io::read(StandardStream::Stdin, BUFFER.add(END), CAPACITY - END)
-            .map_err(|()| ReadLineError::Read)?;
+            .map_err(ReadLineError::Read)?;
         if read == 0 {
             EOF = true;
         } else {
@@ -100,7 +103,10 @@ unsafe fn validate_utf8(bytes: *const u8, length: usize) -> Result<(), ReadLineE
     let bytes = core::slice::from_raw_parts(bytes, length);
     core::str::from_utf8(bytes)
         .map(|_| ())
-        .map_err(|_| ReadLineError::InvalidUtf8)
+        .map_err(|error| ReadLineError::InvalidUtf8 {
+            valid_byte_count: error.valid_up_to(),
+            invalid_byte_count: error.error_len(),
+        })
 }
 
 unsafe fn prepare_write_space() -> Result<(), ReadLineError> {

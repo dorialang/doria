@@ -1,11 +1,11 @@
-function answer(): int
+function answer(): int throws Doria\Std\Io\IoError
 {
     echo "Hello ";
 
     return 42;
 }
 
-function main(): int
+function main(): int throws Doria\Std\Io\IoError
 {
     let $answer = answer();
 

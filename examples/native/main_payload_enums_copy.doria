@@ -13,7 +13,7 @@ const Label DEFAULT_LABEL = Label::Text("default");
 
 class LabelReader
 {
-    function __construct(Label $label)
+    function __construct(Label $label) throws Doria\Std\Io\IoError
     {
         echo " {$label == Label::Text("constructor")}";
     }
@@ -29,7 +29,7 @@ class LabelReader
     }
 }
 
-function mark(string $label, int $value): int
+function mark(string $label, int $value): int throws Doria\Std\Io\IoError
 {
     echo $label;
     return $value;
@@ -47,7 +47,7 @@ function describe(?Coordinate $value = Coordinate::Origin): string
     return "point";
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Coordinate $point = Coordinate::Point(
         y: mark("y", 22),

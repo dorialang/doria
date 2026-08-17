@@ -1,0 +1,23 @@
+class CleanupFailure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+class CleanupMarker
+{
+    function __destruct()
+    {
+        try {
+            echo "cleanup-before-report\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
+    }
+}
+
+function main(): void throws CleanupFailure
+{
+    let $marker = new CleanupMarker();
+    throw new CleanupFailure("cleanup completed");
+}

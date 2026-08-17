@@ -13,18 +13,21 @@ class Document
 
     function __destruct()
     {
-        echo "drop {$this->title}\n";
+        try {
+            echo "drop {$this->title}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function inspect(SharedReference<Document> $document): void
+function inspect(SharedReference<Document> $document): void throws Doria\Std\Io\IoError
 {
     let $additionalOwner = $document->share();
     echo $document->referencedValue->share() . "\n";
     echo $document->referencedValue->referencedValue . "\n";
 }
 
-function makeExpiredWeak(): WeakReference<Document>
+function makeExpiredWeak(): WeakReference<Document> throws Doria\Std\Io\IoError
 {
     let $document = shared new Document("report", "payload property");
     let $weak = $document->createWeakReference();
@@ -32,7 +35,7 @@ function makeExpiredWeak(): WeakReference<Document>
     return $weak;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let $weak = makeExpiredWeak();
     if ($weak->acquire() == null) {

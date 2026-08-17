@@ -30,7 +30,7 @@ class Invoice
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     let writable $customers =
         new Repository<Customer>();

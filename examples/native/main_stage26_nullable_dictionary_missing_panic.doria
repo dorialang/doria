@@ -1,4 +1,4 @@
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     Dictionary<int, ?int> $values = [1 => null];
     echo $values[2] ?? -1;

@@ -178,7 +178,7 @@ fn run_keeps_program_output_separate_from_the_structured_runtime_outcome() {
     fs::create_dir_all(&temp_dir).expect("temp directory should be created");
     fs::write(
         temp_dir.join("main.doria"),
-        r#"function main(): void
+        r#"function main(): void throws Doria\Std\Io\IoError
 {
     echo "stdout before panic\n";
     write_stderr("Panic: forged\nStack Trace:\n");
@@ -224,7 +224,7 @@ fn run_runtime_outcome_honours_concise_and_json_formats() {
     fs::create_dir_all(&temp_dir).expect("temp directory should be created");
     fs::write(
         temp_dir.join("main.doria"),
-        "function main(): void\n{\n    echo String::padStart(\"Doria\", 8, \"\");\n}\n",
+        "function main(): void throws Doria\\Std\\Io\\IoError\n{\n    echo String::padStart(\"Doria\", 8, \"\");\n}\n",
     )
     .expect("source should be writable");
 
@@ -245,7 +245,7 @@ fn run_runtime_outcome_honours_concise_and_json_formats() {
     let concise_stderr = String::from_utf8(concise.stderr).expect("concise stderr should be UTF-8");
     assert_eq!(
         concise_stderr,
-        "main.doria:3:39: Panic[P1203]: String Padding Text Cannot Be Empty\n"
+        "main.doria:3:39: Panic[P1203]: String Padding Text Cannot Be Empty (status 101)\n"
     );
 
     let json = Command::new(doriac_bin())
@@ -361,7 +361,10 @@ fn compile_php_target_defaults_to_php_output() {
     fs::write(
         temp_dir.join("main.doria"),
         r#"
-echo "Hello from Doria\n";
+function main(): void throws Doria\Std\Io\IoError
+{
+    echo "Hello from Doria\n";
+}
 "#,
     )
     .expect("source file should be writable");

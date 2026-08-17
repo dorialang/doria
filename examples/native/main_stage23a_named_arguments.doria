@@ -4,20 +4,20 @@ class Store
     {
     }
 
-    function describe(string $prefix, int $count = 7): int
+    function describe(string $prefix, int $count = 7): int throws Doria\Std\Io\IoError
     {
         printf("%s|%d|%s|%d\n", $prefix, $count, $this->label, $this->size);
         return $count;
     }
 
-    static function build(string $tag, int $weight = 2, bool $ready = false): int
+    static function build(string $tag, int $weight = 2, bool $ready = false): int throws Doria\Std\Io\IoError
     {
         printf("static|%s|%d|%s\n", $tag, $weight, $ready);
         return $weight;
     }
 }
 
-function describe(string $name, int $age, string $city = "unknown"): void
+function describe(string $name, int $age, string $city = "unknown"): void throws Doria\Std\Io\IoError
 {
     printf("free|%s|%d|%s\n", $name, $age, $city);
 }
@@ -27,7 +27,7 @@ function middle(int $first, int $second = 20, int $third = 30, int $fourth = 40)
     return $first + $second + $third + $fourth;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     // Free function: fully named, reordered, and mixed positional-then-named.
     describe(name: "Ada", age: 36, city: "London");

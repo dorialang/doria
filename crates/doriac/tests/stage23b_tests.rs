@@ -68,7 +68,7 @@ fn a_single_argument_is_not_mistaken_for_the_executable_path() {
 #[test]
 fn both_return_types_accept_the_argument_list() {
     let void_entry = r#"
-function main(List<string> $args): void
+function main(List<string> $args): void throws Doria\Std\Io\IoError
 {
     printf("count=%d\n", $args->count);
 }
@@ -80,7 +80,7 @@ function main(List<string> $args): void
 fn the_parameterless_entry_forms_keep_working() {
     // Regression: decision 0032's forms are unchanged by the optional parameter.
     let int_entry = r#"
-function main(): int
+function main(): int throws Doria\Std\Io\IoError
 {
     echo "int entry\n";
     return 0;
@@ -89,7 +89,7 @@ function main(): int
     assert_eq!(run_with_args(int_entry, &[]), "int entry\n");
 
     let void_entry = r#"
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo "void entry\n";
 }

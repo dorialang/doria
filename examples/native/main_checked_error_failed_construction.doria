@@ -9,7 +9,10 @@ class Part
 {
     function __destruct(): void
     {
-        echo "part dropped\n";
+        try {
+            echo "part dropped\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
@@ -24,11 +27,14 @@ class Container
 
     function __destruct(): void
     {
-        echo "container dropped\n";
+        try {
+            echo "container dropped\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
     }
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     try {
         let $container = new Container();

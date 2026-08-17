@@ -869,7 +869,7 @@ fn finalizer_ownership_updates_every_normally_crossing_exit() {
         r#"
 class Guard {}
 function consume(take Guard $guard): void {}
-function route(bool $ready): void
+function route(bool $ready): void throws Doria\Std\Io\IoError
 {
     given {
         let $guard = new Guard();

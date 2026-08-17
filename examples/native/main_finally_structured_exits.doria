@@ -1,4 +1,4 @@
-function choose(): int
+function choose(): int throws Doria\Std\Io\IoError
 {
     if (true) {
         return 42;
@@ -8,7 +8,7 @@ function choose(): int
     return 0;
 }
 
-function main(): void
+function main(): void throws Doria\Std\Io\IoError
 {
     echo "value {choose()}\n";
     let writable $index = 0;
