@@ -47,7 +47,7 @@ fn collect_doria_sources(root: &Path, sources: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn repository_executable_sources_cover_checked_io_effects() {
+fn repository_doria_sources_cover_checked_io_effects_and_contain_finalizers() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
@@ -59,6 +59,7 @@ fn repository_executable_sources_cover_checked_io_effects() {
         "examples/php",
         "crates/doriac/tests/fixtures/native_io",
         "crates/doriac/tests/fixtures/native_stack",
+        "crates/doriac/tests/fixtures/stage28a_pending",
     ];
     let mut sources = Vec::new();
     for root in roots {
@@ -72,7 +73,7 @@ fn repository_executable_sources_cover_checked_io_effects() {
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         if let Err(diagnostics) = doriac::check_source(path.to_string_lossy(), source) {
             for diagnostic in diagnostics {
-                if diagnostic.code == "E0631" {
+                if matches!(diagnostic.code, "E0631" | "E0632") {
                     uncovered.push(format!("{}: {}", path.display(), diagnostic.message));
                 }
             }

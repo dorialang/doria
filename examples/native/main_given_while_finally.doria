@@ -1,3 +1,11 @@
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
 function main(): void throws Doria\Std\Io\IoError
 {
     let writable $index = 0;
@@ -7,6 +15,6 @@ function main(): void throws Doria\Std\Io\IoError
     } while ($index < $limit) {
         $index++;
     } finally {
-        echo "cleanup {$index}/{$limit}\n";
+        record("cleanup {$index}/{$limit}\n");
     }
 }

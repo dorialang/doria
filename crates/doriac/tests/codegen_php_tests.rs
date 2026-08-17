@@ -1280,12 +1280,20 @@ fn php_backend_executes_stage28a_finalizers() {
     let php = doriac::compile_source_to_php(
         "stage28a-finalizers.doria",
         r#"
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
 function returnThroughFinalizer(): int throws Doria\Std\Io\IoError
 {
     if (true) {
         return 42;
     } finally {
-        echo "return cleanup\n";
+        record("return cleanup\n");
     }
 
     return 0;
@@ -1298,7 +1306,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     } if (true) {
         echo "if {$prepared}\n";
     } finally {
-        echo "if cleanup {$prepared}\n";
+        record("if cleanup {$prepared}\n");
     }
 
     string $selected = when (true): string {
@@ -1306,7 +1314,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     } else {
         return "wrong";
     } finally {
-        echo "when cleanup\n";
+        record("when cleanup\n");
     };
     echo "{$selected}\n";
 
@@ -1319,23 +1327,23 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         $count = 2;
         break;
     } finally {
-        echo "while cleanup {$count}\n";
+        record("while cleanup {$count}\n");
     }
 
     do {
         echo "do body\n";
     } while (false) finally {
-        echo "do cleanup\n";
+        record("do cleanup\n");
     }
 
     if (true) {
         if (true) {
             echo "nested body\n";
         } finally {
-            echo "inner cleanup\n";
+            record("inner cleanup\n");
         }
     } finally {
-        echo "outer cleanup\n";
+        record("outer cleanup\n");
     }
 
     echo "return {returnThroughFinalizer()}\n";
@@ -1374,16 +1382,24 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     let panic_php = doriac::compile_source_to_php(
         "stage28a-panic-finalizers.doria",
         r#"
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
 function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
     if (true) {
         if (true) {
             panic("stop");
         } finally {
-            echo "wrong inner\n";
+            record("wrong inner\n");
         }
     } finally {
-        echo "wrong outer\n";
+        record("wrong outer\n");
     }
 }
 "#,

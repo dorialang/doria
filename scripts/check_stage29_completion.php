@@ -167,7 +167,7 @@ $require($specPath, $spec, [
 $require($checkedTestsPath, $checkedTests, [
     'compiler_known_io_types_are_nominal_and_expose_typed_fields',
     'stage29_slice3_executes_handled_and_escaping_main_errors',
-    'repository_executable_sources_cover_checked_io_effects',
+    'repository_doria_sources_cover_checked_io_effects_and_contain_finalizers',
 ]);
 $require($testsPath, $tests, [
     'prompted_read_line_failures_use_checked_errors_except_for_allocation',

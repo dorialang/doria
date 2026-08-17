@@ -1,9 +1,17 @@
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
 function choose(): int throws Doria\Std\Io\IoError
 {
     if (true) {
         return 42;
     } finally {
-        echo "return cleanup\n";
+        record("return cleanup\n");
     }
     return 0;
 }
@@ -17,10 +25,10 @@ function main(): void throws Doria\Std\Io\IoError
         if ($index == 1) {
             continue;
         } finally {
-            echo "iteration {$index}\n";
+            record("iteration {$index}\n");
         }
         break;
     } finally {
-        echo "loop cleanup\n";
+        record("loop cleanup\n");
     }
 }

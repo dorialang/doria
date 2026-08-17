@@ -27,6 +27,14 @@ function relay(take StorageError $error): void throws StorageError
     throw $error;
 }
 
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
 class Repository
 {
     string $status = loadRecord("ready");
@@ -45,7 +53,7 @@ function main(): void throws StorageError, Doria\Std\Io\IoError
     } catch (StorageError) {
         echo "storage failure";
     } finally {
-        echo "checked\n";
+        record("checked\n");
     }
 
     relay(new StorageError("relay"));

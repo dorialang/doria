@@ -1,9 +1,17 @@
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
 function main(): void throws Doria\Std\Io\IoError
 {
     let writable $count = 0;
     do {
         $count++;
     } while ($count < 2) finally {
-        echo "cleanup {$count}\n";
+        record("cleanup {$count}\n");
     }
 }

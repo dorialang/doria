@@ -2518,8 +2518,7 @@ fn lower_expression_statement(
     {
         if let Some(builtin) = crate::builtins::Builtin::from_name(name) {
             if builtin_has_checked_effects(builtin) {
-                let _ =
-                    materialize_checked_builtin_call(builtin, args, *call_span, false, context)?;
+                let _ = materialize_checked_call(expr, false, context)?;
                 return Ok(());
             }
         }
@@ -7890,6 +7889,7 @@ fn lower_format_expression(
         .map(|argument| &argument.value)
         .zip(specs)
         .map(|(argument, spec)| {
+            materialize_nested_collection_places(argument, false, context)?;
             if spec.conversion == FormatConversion::Display {
                 let lowered = lower_display_string_expression(argument, context)?;
                 if inferred_class_type(argument, context).is_some() {
@@ -8232,6 +8232,7 @@ fn lower_call_args_with_ownership(
         let expected = signature.parameter_types[param_index];
         let transfers = signature.parameter_transfers[param_index];
         let value = &arg.value;
+        materialize_nested_collection_places(value, false, context)?;
         let lowered = if transfers {
             lower_rvalue_as_expected(value, expected, context)?
         } else {
@@ -12419,7 +12420,10 @@ fn materialize_checked_builtin_call(
         Builtin::ReadLine => {
             let prompt = match values[..] {
                 [] => mir::StringExpression::Literal(String::new()),
-                [prompt] => lower_string_expression(prompt, context)?,
+                [prompt] => {
+                    materialize_nested_collection_places(prompt, false, context)?;
+                    lower_string_expression(prompt, context)?
+                }
                 _ => {
                     return Err(vec![unsupported(
                         span,
@@ -12436,6 +12440,7 @@ fn materialize_checked_builtin_call(
             let [path] = values[..] else {
                 return Err(vec![unsupported(span, "read_file expects 1 argument")]);
             };
+            materialize_nested_collection_places(path, false, context)?;
             (
                 mir::CheckedIoOperation::ReadFile {
                     path: lower_string_expression(path, context)?,
@@ -12451,6 +12456,7 @@ fn materialize_checked_builtin_call(
                     "read_file_bytes expects 1 argument",
                 )]);
             };
+            materialize_nested_collection_places(path, false, context)?;
             (
                 mir::CheckedIoOperation::ReadFile {
                     path: lower_string_expression(path, context)?,
@@ -12482,6 +12488,7 @@ fn materialize_checked_builtin_call(
             let [value] = values[..] else {
                 return Err(vec![unsupported(span, "write_stderr expects 1 argument")]);
             };
+            materialize_nested_collection_places(value, false, context)?;
             (
                 mir::CheckedIoOperation::WriteStream {
                     contents: mir::IoContents::String(lower_string_expression(value, context)?),
@@ -12516,6 +12523,7 @@ fn materialize_checked_builtin_call(
                 )]);
             };
             let path = materialize_string_before_later_argument(path, context)?;
+            materialize_nested_collection_places(contents, false, context)?;
             (
                 mir::CheckedIoOperation::WriteFile {
                     path,
@@ -12554,6 +12562,7 @@ fn materialize_string_before_later_argument(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
+    materialize_nested_collection_places(expr, false, context)?;
     let value = lower_string_expression(expr, context)?;
     let local = context.declare_statement_string_temp();
     context.push_statement(mir::Statement::AssignLocal {

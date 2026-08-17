@@ -9,6 +9,14 @@ class Guard
     }
 }
 
+function record(string $message): void
+{
+    try {
+        echo $message;
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
 function main(): void throws Doria\Std\Io\IoError
 {
     let $guard = new Guard();
@@ -17,6 +25,6 @@ function main(): void throws Doria\Std\Io\IoError
     if (true) {
         panic("stop before cleanup");
     } finally {
-        echo "must not run\n";
+        record("must not run\n");
     }
 }
