@@ -281,6 +281,92 @@ fn function_type_semantic_use_stops_at_the_same_stage_30_boundary() {
 }
 
 #[test]
+fn closure_signatures_report_permanent_type_errors_before_the_stage_30_boundary() {
+    let cases = [
+        (
+            "arrow_void_parameter",
+            "let $closure = fn(void $value) => $value;",
+            "E0430",
+            "void",
+        ),
+        (
+            "block_object_parameter",
+            "let $closure = function (object $value): int { return 1; };",
+            "E0401",
+            "object",
+        ),
+        (
+            "block_null_return",
+            "let $closure = function (): null { return null; };",
+            "E0431",
+            "null",
+        ),
+    ];
+
+    for (name, source, type_code, rejected_type) in cases {
+        let diagnostics = doriac::check_source(name, source)
+            .expect_err("invalid signature and Stage 30 boundary must be reported");
+        assert_eq!(diagnostics.len(), 2, "unexpected cascade: {diagnostics:#?}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "E0641")
+                .count(),
+            1,
+            "closure boundary must remain singular: {diagnostics:#?}"
+        );
+        let type_diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == type_code)
+            .expect("permanent type-position diagnostic");
+        assert_eq!(span_text(source, type_diagnostic.span), rejected_type);
+    }
+}
+
+#[test]
+fn function_types_recursively_validate_components_without_boundary_cascades() {
+    let cases = [
+        (
+            "function_type_void_parameter",
+            "function accept(function(void): int $callback): void {}",
+            "E0430",
+            "void",
+        ),
+        (
+            "function_type_object_return",
+            "function accept(function(int): object $callback): void {}",
+            "E0401",
+            "object",
+        ),
+        (
+            "nested_function_type_null_parameter",
+            "function accept(function(function(null): int): int $callback): void {}",
+            "E0431",
+            "null",
+        ),
+    ];
+
+    for (name, source, type_code, rejected_type) in cases {
+        let diagnostics = doriac::check_source(name, source)
+            .expect_err("invalid callable component and Stage 30 boundary must be reported");
+        assert_eq!(diagnostics.len(), 2, "unexpected cascade: {diagnostics:#?}");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == "E0641")
+                .count(),
+            1,
+            "nested function types must share one outer boundary: {diagnostics:#?}"
+        );
+        let type_diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.code == type_code)
+            .expect("component type-position diagnostic");
+        assert_eq!(span_text(source, type_diagnostic.span), rejected_type);
+    }
+}
+
+#[test]
 fn malformed_closure_inventory_has_deliberate_diagnostics() {
     let cases = [
         (
