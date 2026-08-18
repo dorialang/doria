@@ -5,7 +5,7 @@ class MultilineFailure implements Error
     }
 }
 
-function main(): void throws MultilineFailure
+function main(): void
 {
     throw new MultilineFailure("first\nWhere\nWhy\r\0\tlast");
 }

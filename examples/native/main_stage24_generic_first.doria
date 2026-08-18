@@ -36,7 +36,7 @@ function identity<T>(T $value): T
     return $value;
 }
 
-function main(): int throws Doria\Std\Io\IoError
+function main(): int
 {
     List<int> $numbers = [42];
     ?int $number = first($numbers);

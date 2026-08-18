@@ -106,7 +106,11 @@ pub struct FunctionDecl {
     pub type_params: Vec<TypeParamDecl>,
     pub params: Vec<Param>,
     pub return_type: Option<TypeRef>,
+    /// Source-preserving `throws` syntax. `None` means the author omitted it.
     pub throws: Option<ThrowsClause>,
+    /// Effective semantic checked effects used by callable compatibility,
+    /// executable IR, ABI selection, and backend lowering.
+    pub checked_effects: Vec<ResolvedType>,
     pub body: Block,
     pub span: Span,
 }

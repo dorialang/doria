@@ -56,7 +56,7 @@ function describeFallback(?mixed $value): void throws Doria\Std\Io\IoError
     describeNullable($value ?? new Token("fallback"));
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $token = new Token("borrowed");
     describe($token);

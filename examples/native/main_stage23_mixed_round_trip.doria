@@ -53,7 +53,7 @@ function movePayload(take mixed $value): void throws Doria\Std\Io\IoError
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     describe(42);
     describe("hello");

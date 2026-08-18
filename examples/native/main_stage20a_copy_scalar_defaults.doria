@@ -54,7 +54,7 @@ function ratio(float32 $value = 1.5): float32
     return $value;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $defaults = new Defaults();
     let $zero = new Counter();

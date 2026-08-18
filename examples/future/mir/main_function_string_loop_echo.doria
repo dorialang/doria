@@ -3,7 +3,7 @@ function mark(string $value): void throws Doria\Std\Io\IoError
     echo $value;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     foreach (0..<3 as $i) {
         mark(".");

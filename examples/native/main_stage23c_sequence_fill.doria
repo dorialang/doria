@@ -15,7 +15,7 @@ function inspectWords(List<string> $words): void throws Doria\Std\Io\IoError
     echo "{$words->count}:{$words[1]}\n";
 }
 
-function main(): int throws Doria\Std\Io\IoError
+function main(): int
 {
     bool[] $flags = [true; runtimeCount()];
     int[] $numbers = [42; 2];

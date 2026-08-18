@@ -19,7 +19,7 @@ function greet(string $name, int $year): string
     return "Hello, {$name}! Welcome to {$year}.";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $message = greet("newcomer", 2026);
     echo "{$message}\n";
@@ -69,7 +69,7 @@ runtime access-check cost.
 - **One word, one meaning.** `use` imports. `uses` composes traits. `with` captures in closures. No keyword in Doria ever has two jobs.
 - **A standard library with one voice.** Type-specific operations live on companions such as `String::startsWith`, while cross-domain capabilities use fully worded free functions such as `read_line`. Each operation has one canonical spelling.
 - **Unicode text with explicit units.** `$text->length` counts what a reader sees as graphemes, `$text->byteLength` reports UTF-8 storage, and String search, slicing, casing, splitting, and padding use deterministic Unicode rules on every native backend.
-- **Honest defaults.** Booleans print as `true` and `false`. Integer overflow is an error, not a wraparound. Format strings are checked at compile time. Errors are declared with `throws` and handled with `try`/`catch` — the compiler makes sure of it.
+- **Honest defaults.** Booleans print as `true` and `false`. Integer overflow is an error, not a wraparound. Format strings are checked at compile time. Reusable callables declare checked errors with `throws`; the selected program entrypoint infers what escapes it. `try`/`catch` handling remains statically checked.
 - **Small language, sharp edges filed off.** Where a familiar construct is a known footgun, Doria deliberately does the safer thing instead.
 - **Purpose-shaped collections.** Insertion-ordered dictionaries and sets sit
   beside ascending sorted variants, a min-first priority queue, and one deque

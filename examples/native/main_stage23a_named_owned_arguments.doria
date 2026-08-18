@@ -173,7 +173,7 @@ function borrowNullableMixed(int $marker, ?mixed $value): void throws Doria\Std\
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     borrowToken(token: makeToken("class-borrow"), marker: marker("class-borrow"));
     echo "after class borrow\n";

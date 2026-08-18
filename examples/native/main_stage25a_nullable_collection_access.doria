@@ -16,7 +16,7 @@ function maybeWrite(
     return $owner?->acquireWritableAccess();
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $listOwner = new WritableSharedReference<List<int>>([1, 2, 3]);
     ?WritableSharedReference<List<int>> $missingListOwner = null;

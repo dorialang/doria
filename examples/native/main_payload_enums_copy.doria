@@ -47,7 +47,7 @@ function describe(?Coordinate $value = Coordinate::Origin): string
     return "point";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     Coordinate $point = Coordinate::Point(
         y: mark("y", 22),

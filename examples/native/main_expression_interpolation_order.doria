@@ -12,7 +12,7 @@ function right(): int throws Doria\Std\Io\IoError
     return 22;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     echo "={left() + right()}";
 }

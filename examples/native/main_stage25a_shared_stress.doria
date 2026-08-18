@@ -11,7 +11,7 @@ class Counter
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $owner = new WritableSharedReference(new Counter());
     writable List<WritableSharedReference<Counter>> $owners = [];

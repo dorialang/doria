@@ -35,7 +35,7 @@ function makeExpiredWeak(): WeakReference<Document> throws Doria\Std\Io\IoError
     return $weak;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $weak = makeExpiredWeak();
     if ($weak->acquire() == null) {

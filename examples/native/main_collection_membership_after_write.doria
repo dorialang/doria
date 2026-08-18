@@ -1,4 +1,4 @@
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     // A membership query builds a lookup index over the entries. A positional
     // write changes an entry underneath it, so the index has to stop being

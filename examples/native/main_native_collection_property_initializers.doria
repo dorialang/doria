@@ -70,7 +70,7 @@ class DropHolder
     List<DropToken> $values = [new DropToken("first"), new DropToken("second")];
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $implicit = new ImplicitCollections();
     let $explicit = new ExplicitCollections("explicit");

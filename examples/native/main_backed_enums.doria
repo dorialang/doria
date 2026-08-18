@@ -10,7 +10,7 @@ enum Transport: string
     case Rail = "rail";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     Priority $priority = Priority::High;
     Transport $transport = Transport::Rail;

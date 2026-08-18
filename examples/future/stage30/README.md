@@ -101,7 +101,7 @@ function makeReader(
 ## Collection pipeline
 
 ```doria
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     List<int> $scores = [65, 72, 88];
 

@@ -3,7 +3,7 @@
 //
 // The iteration count arrives as an argument so one test constant drives every
 // fixture in this directory.
-function main(List<string> $args): void throws Doria\Std\Io\IoError
+function main(List<string> $args): void
 {
     let $n = Int::parse($args[0]) ?? 0;
     writable Dictionary<string, int> $values = [];

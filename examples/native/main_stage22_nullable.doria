@@ -59,7 +59,7 @@ function inspectLabel(Label $label): bool throws Doria\Std\Io\IoError
     return true;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $number = maybeInt(true);
     let $missingNumber = maybeInt(false);

@@ -16,7 +16,7 @@ class CleanupMarker
     }
 }
 
-function main(): void throws CleanupFailure
+function main(): void
 {
     let $marker = new CleanupMarker();
     throw new CleanupFailure("cleanup completed");

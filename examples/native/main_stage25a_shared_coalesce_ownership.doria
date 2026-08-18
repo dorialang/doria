@@ -38,7 +38,7 @@ function inspect(SharedReference<Node> $node): void throws Doria\Std\Io\IoError
     echo "inspect {$node->name}\n";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $owner = shared new Node("Existing");
     let $weak = $owner->createWeakReference();

@@ -1,5 +1,5 @@
 // String interpolation in a loop body, building a fresh string every pass.
-function main(List<string> $args): void throws Doria\Std\Io\IoError
+function main(List<string> $args): void
 {
     let $n = Int::parse($args[0]) ?? 0;
     let writable $lengths = 0;

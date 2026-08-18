@@ -4,7 +4,7 @@ class Ratios
     static float32 $narrow = 1.25;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     // Reading a float element out of a collection must produce a well-formed
     // float operand in every position it can appear: bound to a local, inside

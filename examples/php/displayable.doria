@@ -6,7 +6,7 @@ class Label implements Displayable
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $label = new Label();
 

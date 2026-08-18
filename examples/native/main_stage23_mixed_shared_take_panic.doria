@@ -18,7 +18,7 @@ function consume(take Token $token): void throws Doria\Std\Io\IoError
     echo "consumed\n";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     // `mixed $borrowed = $items[0]` clones the box, sharing the payload owner with the
     // element still in the collection. Taking that class payload out by `take` would

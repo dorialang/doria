@@ -29,7 +29,7 @@ function consume(take LoadResult $result): void throws Doria\Std\Io\IoError
     echo "consume\n";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     LoadResult $result = load();
     consume($result);

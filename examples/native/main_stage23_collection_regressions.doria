@@ -79,7 +79,7 @@ class CollectionEvaluationOrder
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     writable List<List<int>> $matrix = [[1]];
     $matrix[0]->add(2);

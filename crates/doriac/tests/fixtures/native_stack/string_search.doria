@@ -1,6 +1,6 @@
 // String::indexOf in a loop body. It returns `?int` through an out-parameter
 // slot, so it carries the same scratch allocation the dictionary path does.
-function main(List<string> $args): void throws Doria\Std\Io\IoError
+function main(List<string> $args): void
 {
     let $n = Int::parse($args[0]) ?? 0;
     let $haystack = "the quick brown fox jumps over the lazy dog";

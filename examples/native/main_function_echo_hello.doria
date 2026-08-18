@@ -8,7 +8,7 @@ function subject(): void throws Doria\Std\Io\IoError
     echo "Doria!";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     hello();
     subject();

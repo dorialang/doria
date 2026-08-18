@@ -8,7 +8,7 @@ function grade(int $score): string
     };
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     echo "{grade(95)} {grade(84)} {grade(73)} {grade(20)}\n";
 }

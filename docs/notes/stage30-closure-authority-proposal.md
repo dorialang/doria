@@ -50,9 +50,12 @@ Each recommendation below is independent unless its consequences say otherwise.
 - Decision 0120 accepts explicit `with` lists for arrows and block closures,
   fixes readonly/writable/taking capture spellings, prohibits implicit local
   capture, and assigns the remaining closure model to Stage 30.
-- Decision 0119 requires every callable to carry a checked-effect set and fixes
-  subset-effect substitution, checked status/out-slot transport, cleanup, and
-  non-unwinding panic separation.
+- Decision 0119 requires every callable to carry an effective checked-effect set
+  and fixes subset-effect substitution, checked status/out-slot transport,
+  cleanup, and non-unwinding panic separation. Reusable callables declare that
+  set explicitly; a clause-free selected program entrypoint infers its exact
+  uncovered set. This entrypoint exception does not grant general named-callable
+  or closure effect inference beyond the Stage 30 questions below.
 - Decisions 0081, 0083, 0089, and 0090 fix Move/Copy transfer, reverse
   destruction, non-lexical borrows, returned-borrow provenance, and definite
   construction.
@@ -1382,7 +1385,7 @@ function applyText(
     return $callback($text);
 }
 
-function main(): void throws ParseError
+function main(): void
 {
     let $minimum = 10;
     let writable $calls = 0;

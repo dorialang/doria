@@ -1,5 +1,5 @@
 // List indexing in a loop body.
-function main(List<string> $args): void throws Doria\Std\Io\IoError
+function main(List<string> $args): void
 {
     let $n = Int::parse($args[0]) ?? 0;
     writable List<int> $values = [];

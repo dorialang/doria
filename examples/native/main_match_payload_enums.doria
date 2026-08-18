@@ -14,7 +14,7 @@ function describe(Delivery $delivery): string
     };
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     echo describe(Delivery::Queued) . "\n";
     let writable $delivery = Delivery::Sent("A-17");

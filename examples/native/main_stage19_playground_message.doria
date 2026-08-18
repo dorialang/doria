@@ -18,7 +18,7 @@ function deliver(take Message $message): void throws Doria\Std\Io\IoError
     echo $message->text . "\n";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $message = new Message("Welcome to Doria");
     deliver($message);

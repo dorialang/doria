@@ -1759,11 +1759,9 @@ fn collect_function_signature(
         parameter_owns,
         method_class: None,
         receiver_mode: None,
-        checked_effects: semantic_info
-            .callable_checked_effects
-            .get(&function.span.start)
-            .into_iter()
-            .flatten()
+        checked_effects: function
+            .checked_effects
+            .iter()
             .filter_map(
                 |effect| match substitute_resolved_type(effect, substitutions) {
                     ResolvedType::Error => Some(mir::CheckedEffect::Any),

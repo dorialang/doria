@@ -25,9 +25,11 @@ function loadUser(int $id): User throws UserNotFound, DatabaseError
 }
 ```
 
-Thrown errors are checked by the compiler:
+Thrown errors are checked by the compiler. Decision 0119's accepted 2026-08-18
+amendment adds one entrypoint exception to this early direction:
 
-- a function may only throw errors declared in its `throws` clause unless they are caught internally
+- an ordinary reusable function may only allow errors declared in its `throws` clause to escape
+- a clause-free selected `main` infers its exact escaping effects instead
 - a caller must catch the error or include it in its own `throws` clause
 - runtime panic or fatal-error behavior is separate from checked `throw`/`throws`
 
@@ -62,9 +64,10 @@ function renderProfile(int $id): string
 ## Implementation status
 
 Decision 0119 supplies the complete grammar, semantic, representation, and
-three-slice implementation contract. Stage 29 Slice 1 implements checking,
-AST/HIR, and the shared pre-MIR execution boundary. Checked-error execution,
-runtime transport, and I/O migration remain in Slices 2 and 3.
+three-slice implementation contract. All three Stage 29 slices are complete.
+Its inferred-main corrective amendment preserves explicit contracts on reusable
+callables while letting the selected entrypoint infer its effective checked
+effects without synthesizing source syntax.
 
 ## Unified diagnostic amendment
 

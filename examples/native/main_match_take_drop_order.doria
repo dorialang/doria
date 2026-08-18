@@ -39,7 +39,7 @@ function takeSingle(): void throws Doria\Std\Io\IoError
     echo "selected acquired\n";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     ignorePair();
     takeSingle();

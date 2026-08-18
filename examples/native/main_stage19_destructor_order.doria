@@ -102,7 +102,7 @@ function scenario(): void throws Doria\Std\Io\IoError
     return;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     scenario();
 }

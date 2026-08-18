@@ -10,7 +10,7 @@ function load(): void throws StorageError
     throw new StorageError("storage unavailable");
 }
 
-function main(): void throws StorageError
+function main(): void
 {
     load();
 }

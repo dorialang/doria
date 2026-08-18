@@ -52,7 +52,7 @@ function makeExpiredParent(): WritableWeakReference<Parent> throws Doria\Std\Io\
     return $externalWeak;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $parent = makeExpiredParent();
     if ($parent->acquire() == null) {

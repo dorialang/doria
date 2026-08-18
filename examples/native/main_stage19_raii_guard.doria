@@ -25,7 +25,7 @@ function run_screen(): void throws Doria\Std\Io\IoError
     return;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     run_screen();
 }

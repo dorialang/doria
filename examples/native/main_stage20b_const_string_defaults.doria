@@ -43,7 +43,7 @@ function stringThenScalar(string $label = "items", int $count = 2): string
     return $label . ":" . $count;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $defaultGreeter = new Greeter();
     let $explicitGreeter = new Greeter("hello");

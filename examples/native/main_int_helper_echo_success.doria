@@ -5,7 +5,7 @@ function answer(): int throws Doria\Std\Io\IoError
     return 42;
 }
 
-function main(): int throws Doria\Std\Io\IoError
+function main(): int
 {
     let $answer = answer();
 

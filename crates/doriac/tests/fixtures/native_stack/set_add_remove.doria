@@ -1,6 +1,6 @@
 // Set::add and Set::remove in a loop body. Each iteration adds a value the set
 // does not hold and removes it again, so both calls report a change.
-function main(List<string> $args): void throws Doria\Std\Io\IoError
+function main(List<string> $args): void
 {
     let $n = Int::parse($args[0]) ?? 0;
     writable Set<int> $values = Set::from([]);

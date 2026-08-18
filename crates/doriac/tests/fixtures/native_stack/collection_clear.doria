@@ -1,6 +1,6 @@
 // Repeated clear/refill across the original collection families. Scalar clear
 // takes the direct runtime-reset path and must not grow the native stack.
-function main(List<string> $args): void throws Doria\Std\Io\IoError
+function main(List<string> $args): void
 {
     let $n = Int::parse($args[0]) ?? 0;
     writable List<int> $list = [];

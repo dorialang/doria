@@ -24,7 +24,7 @@ function consume(take Lookup $lookup): string
     };
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     echo consume(Lookup::Found(new Record("found"))) . "\n";
     echo consume(Lookup::Missing) . "\n";

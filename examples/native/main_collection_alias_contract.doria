@@ -1,4 +1,4 @@
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     writable bool[] $flags = [true; 64];
 

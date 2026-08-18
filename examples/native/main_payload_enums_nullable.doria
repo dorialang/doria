@@ -12,7 +12,7 @@ function maybe(bool $present): ?Coordinate
     return null;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     ?Coordinate $missing = maybe(false);
     ?Coordinate $first = maybe(true);

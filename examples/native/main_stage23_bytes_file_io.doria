@@ -22,7 +22,7 @@ function trueGuard(): bool throws Doria\Std\Io\IoError
     return true;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     uint8[] $firstArray = [0, 128, 255];
     Bytes $first = Bytes::fromArray($firstArray);

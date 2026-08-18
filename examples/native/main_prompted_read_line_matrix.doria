@@ -4,7 +4,7 @@ function observedPrompt(): string throws Doria\Std\Io\IoError
     return "Side: ";
 }
 
-function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
+function main(): void
 {
     let $name = read_line("Name: ");
     if ($name != null) { echo "<{$name}>\n"; }

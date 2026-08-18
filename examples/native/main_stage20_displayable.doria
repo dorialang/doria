@@ -14,7 +14,7 @@ class Label implements Displayable
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $left = new Label("L");
     let $right = new Label("R");

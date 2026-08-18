@@ -35,7 +35,7 @@ function inspect(WritableSharedReference<Counter> $counter): void throws Doria\S
     echo "{$first->current()}:{$second->value}\n";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $counter = new WritableSharedReference(new Counter());
     let $second = $counter->share();

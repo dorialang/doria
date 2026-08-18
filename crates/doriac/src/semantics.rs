@@ -88,8 +88,13 @@ pub struct SemanticInfo {
     /// Flow facts at checked source uses, consumed by MIR lowering so
     /// statically selected nullable paths stay selected after lowering.
     pub(crate) flow_facts: crate::narrowing::FactsByUse,
-    /// Declared, source-ordered checked effects for each callable declaration.
-    pub callable_checked_effects: HashMap<usize, Vec<ResolvedType>>,
+    /// Effective, source-ordered checked effects for each callable declaration.
+    ///
+    /// Ordinary callables receive this set from their written `throws` clause.
+    /// The selected clause-free program entrypoint receives it from the checked
+    /// effects that escape its body. Source syntax remains in the AST/HIR
+    /// `throws` field and is never synthesized for inferred effects.
+    pub callable_effective_checked_effects: HashMap<usize, Vec<ResolvedType>>,
     /// Exact checked effects produced at each source operation.
     pub(crate) checked_effect_sites: crate::checked_effects::EffectSiteMap,
     /// Resolved owned Error type transferred by each `throw` statement.
@@ -390,7 +395,7 @@ pub fn analyze_program_for_ide_with_source<'source>(
             parameter_defaults: checker.parameter_defaults,
             return_borrows,
             flow_facts: checker.flow_facts,
-            callable_checked_effects: checker.callable_checked_effects,
+            callable_effective_checked_effects: checker.callable_effective_checked_effects,
             checked_effect_sites: checker.checked_effect_sites,
             throw_error_types: checker.throw_error_types,
             try_uncovered_effects: checker.try_uncovered_effects,
@@ -1057,7 +1062,7 @@ struct Checker<'program> {
     finalizer_boundaries: Vec<FinalizerBoundary>,
     effect_scopes: Vec<CheckedEffectSet>,
     class_initializer_effects: HashMap<String, CheckedEffectSet>,
-    callable_checked_effects: HashMap<usize, Vec<ResolvedType>>,
+    callable_effective_checked_effects: HashMap<usize, Vec<ResolvedType>>,
     checked_effect_sites: crate::checked_effects::EffectSiteMap,
     throw_error_types: HashMap<(usize, usize), ResolvedType>,
     try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
@@ -1586,7 +1591,7 @@ impl<'program> Checker<'program> {
             finalizer_boundaries: Vec::new(),
             effect_scopes: Vec::new(),
             class_initializer_effects: HashMap::new(),
-            callable_checked_effects: HashMap::new(),
+            callable_effective_checked_effects: HashMap::new(),
             checked_effect_sites: HashMap::new(),
             throw_error_types: HashMap::new(),
             try_uncovered_effects: HashMap::new(),
@@ -1610,12 +1615,37 @@ impl<'program> Checker<'program> {
         self.infer_return_borrow_signatures();
         self.infer_unannotated_move_return_signatures();
 
+        // A clause-free selected entrypoint infers its public checked-effect
+        // contract from the body. Check it once to establish that contract,
+        // then check it again with the contract available to recursive calls,
+        // catches, and every later source caller. The first pass uses the same
+        // operation-precise checker; only its provisional diagnostics are
+        // discarded.
+        let inferred_entrypoint = self.program.items.iter().find_map(|item| match item {
+            Item::Function(function)
+                if function.throws.is_none() && self.is_accepted_program_entrypoint(function) =>
+            {
+                Some(function.clone())
+            }
+            _ => None,
+        });
+        if let Some(entrypoint) = inferred_entrypoint.as_ref() {
+            let diagnostics_before_inference = self.diagnostics.len();
+            self.check_function(entrypoint, None);
+            self.diagnostics.truncate(diagnostics_before_inference);
+            self.check_function(entrypoint, None);
+        }
+
         let mut scopes = ScopeStack::new();
         for item in &self.program.items {
             match item {
                 Item::Statement(statement) => {
                     self.check_statement(statement, &mut scopes, None, None, None, 0);
                 }
+                Item::Function(function)
+                    if inferred_entrypoint
+                        .as_ref()
+                        .is_some_and(|entrypoint| entrypoint.span == function.span) => {}
                 Item::Function(function) => self.check_function(function, None),
                 Item::Constant(constant) => {
                     self.check_constant_initializer(&constant.initializer, None)
@@ -2651,7 +2681,7 @@ impl<'program> Checker<'program> {
         let params = self.resolve_param_infos(function, declaring_class);
         let return_ty = self.resolve_function_return_type(function, declaring_class);
         let checked_effects = self.resolve_throws_clause(function, declaring_class);
-        self.callable_checked_effects.insert(
+        self.callable_effective_checked_effects.insert(
             function.span.start,
             checked_effects
                 .iter()
@@ -4398,9 +4428,84 @@ impl<'program> Checker<'program> {
         );
         self.check_missing_final_return(function, &return_context);
         let body_effects = self.effect_scopes.pop().expect("callable effect scope");
-        self.check_callable_effect_contract(function, &signature.checked_effects, &body_effects);
+        if function.throws.is_none() && self.is_accepted_program_entrypoint(function) {
+            self.set_inferred_entrypoint_effects(function, &body_effects);
+        } else {
+            self.check_callable_effect_contract(
+                function,
+                &signature.checked_effects,
+                &body_effects,
+            );
+        }
         self.type_parameter_scopes.pop();
         self.current_callable = previous_callable;
+    }
+
+    fn is_accepted_program_entrypoint(&self, function: &FunctionDecl) -> bool {
+        let Some(signature) = self.function_signatures.get(&function.span.start) else {
+            return false;
+        };
+        if function.name != "main"
+            || !function.type_params.is_empty()
+            || self
+                .functions
+                .get("main")
+                .is_none_or(|entry| entry.declaration != function.span.start)
+            || !matches!(
+                self.types.kind(signature.return_ty),
+                TypeKind::Integer(IntegerType::Int64) | TypeKind::Void
+            )
+        {
+            return false;
+        }
+
+        match (function.params.as_slice(), signature.params.as_slice()) {
+            ([], []) => true,
+            ([source], [resolved]) if !source.take && !source.writable => {
+                matches!(
+                    self.types.kind(resolved.ty),
+                    TypeKind::List(element)
+                        if matches!(self.types.kind(*element), TypeKind::String)
+                )
+            }
+            _ => false,
+        }
+    }
+
+    fn set_inferred_entrypoint_effects(
+        &mut self,
+        function: &FunctionDecl,
+        observed: &CheckedEffectSet,
+    ) {
+        let effects = observed.ordered.clone();
+        let resolved = effects
+            .iter()
+            .map(|effect| self.types.resolved(*effect))
+            .collect::<Vec<_>>();
+        self.callable_effective_checked_effects
+            .insert(function.span.start, resolved.clone());
+        if let Some(signature) = self.function_signatures.get_mut(&function.span.start) {
+            signature.checked_effects = effects.clone();
+        }
+        if let Some(signature) = self.functions.get_mut(&function.name) {
+            if signature.declaration == function.span.start {
+                signature.checked_effects = effects;
+            }
+        }
+
+        // Recursive entrypoint calls were resolved before the first inference
+        // pass completed. Refresh those exact sites so ownership, MIR lowering,
+        // and catch routing see the same effective contract as later callers.
+        for (span, target) in &self.call_targets {
+            if matches!(target, CallableTarget::Function { name } if name == &function.name) {
+                let site = self.checked_effect_sites.entry(*span).or_default();
+                for effect in &resolved {
+                    if !site.contains(effect) {
+                        site.push(effect.clone());
+                    }
+                }
+            }
+        }
     }
 
     fn check_callable_effect_contract(

@@ -13,7 +13,7 @@ class Token
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     {
         let $outer = new Token("outer");

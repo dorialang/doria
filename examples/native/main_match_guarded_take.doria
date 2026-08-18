@@ -30,7 +30,7 @@ function consume(take QueueResult $result): string
     };
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     echo consume(QueueResult::Item(new Task("alpha", true))) . "\n";
     echo consume(QueueResult::Item(new Task("beta", false))) . "\n";
