@@ -180,6 +180,32 @@ fn lexes_checked_error_direction_keywords() {
 }
 
 #[test]
+fn lexes_closure_vocabulary_without_splitting_nearby_identifiers() {
+    let kinds =
+        token_kinds("fn with function functionality withdraw fnord => take writable $value, ()");
+
+    assert_eq!(
+        kinds,
+        vec![
+            TokenKind::Fn,
+            TokenKind::With,
+            TokenKind::Function,
+            TokenKind::Identifier("functionality".to_string()),
+            TokenKind::Identifier("withdraw".to_string()),
+            TokenKind::Identifier("fnord".to_string()),
+            TokenKind::FatArrow,
+            TokenKind::Take,
+            TokenKind::Writable,
+            TokenKind::Variable("value".to_string()),
+            TokenKind::Comma,
+            TokenKind::LeftParen,
+            TokenKind::RightParen,
+            TokenKind::Eof,
+        ]
+    );
+}
+
+#[test]
 fn lexes_boolean_word_operators() {
     let kinds = token_kinds("not and or xor");
     assert!(matches!(kinds[0], TokenKind::Not));

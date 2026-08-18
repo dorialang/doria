@@ -23,8 +23,8 @@ use crate::symbols::{
     ReceiverMode, ReturnBorrow, ScopeStack, StaticPropertyInfo, TypeParamInfo,
 };
 use crate::types::{
-    resolved_type_complexity, ClassType, ResolvedType, SharedHandleKind, TypeId, TypeKind, TypeRef,
-    TypeRegistry,
+    resolved_type_complexity, ClassType, FunctionTypeRef, ResolvedType, SharedHandleKind, TypeId,
+    TypeKind, TypeRef, TypeRegistry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1062,6 +1062,7 @@ struct Checker<'program> {
     throw_error_types: HashMap<(usize, usize), ResolvedType>,
     try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
     catch_error_types: HashMap<(usize, usize), ResolvedType>,
+    function_type_boundary_suppression: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1590,6 +1591,7 @@ impl<'program> Checker<'program> {
             throw_error_types: HashMap::new(),
             try_uncovered_effects: HashMap::new(),
             catch_error_types: HashMap::new(),
+            function_type_boundary_suppression: 0,
         }
     }
 
@@ -6351,6 +6353,10 @@ impl<'program> Checker<'program> {
         allow_range_expr: bool,
     ) {
         match expr {
+            Expr::Closure(closure) => {
+                self.validate_closure_signature(closure, method_context);
+                self.report_stage_30_closure_boundary("closure", closure.span);
+            }
             Expr::Variable { name, span } => {
                 if scopes.lookup(name).is_none() {
                     self.undeclared_variable(name, *span);
@@ -6708,6 +6714,72 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+    }
+
+    fn report_stage_30_closure_boundary(&mut self, surface: &str, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::unsupported_stage(
+                "E0641",
+                format!(
+                    "{surface} syntax is accepted Doria; closure checking and execution land in Stage 30"
+                ),
+                span,
+            )
+            .with_title("Closure Semantics Await Stage 30")
+            .with_explanation(
+                "The compiler preserves this syntax now so valid Doria can be edited and inspected before closure semantics land.",
+            )
+            .with_help("keep the closure source as written; it is valid Doria syntax and does not need rewriting"),
+        );
+    }
+
+    fn validate_closure_signature(
+        &mut self,
+        closure: &ClosureExpression,
+        method_context: Option<&MethodContext>,
+    ) {
+        let declaring_class = method_context.map(|context| context.class_name.as_str());
+        self.function_type_boundary_suppression += 1;
+        for parameter in &closure.parameters {
+            self.resolve_type_ref_in_position(
+                &parameter.ty,
+                parameter.type_span,
+                TypePosition::Value,
+                declaring_class,
+            );
+        }
+        if let Some(return_type) = &closure.return_type {
+            self.resolve_type_ref_in_position(
+                &return_type.ty,
+                return_type.type_span,
+                TypePosition::Return,
+                declaring_class,
+            );
+        }
+        self.function_type_boundary_suppression -= 1;
+    }
+
+    fn validate_function_type_signature(
+        &mut self,
+        function: &FunctionTypeRef,
+        declaring_class: Option<&str>,
+    ) {
+        self.function_type_boundary_suppression += 1;
+        for parameter in &function.parameters {
+            self.resolve_type_ref_in_position(
+                &parameter.ty,
+                parameter.span,
+                TypePosition::Value,
+                declaring_class,
+            );
+        }
+        self.resolve_type_ref_in_position(
+            &function.return_type,
+            function.return_type_span,
+            TypePosition::Return,
+            declaring_class,
+        );
+        self.function_type_boundary_suppression -= 1;
     }
 
     fn check_match_expression(
@@ -12276,6 +12348,14 @@ impl<'program> Checker<'program> {
         position: TypePosition,
         declaring_class: Option<&str>,
     ) -> TypeId {
+        if let Some(function) = &ty.function {
+            let report_boundary = self.function_type_boundary_suppression == 0;
+            self.validate_function_type_signature(function, declaring_class);
+            if report_boundary {
+                self.report_stage_30_closure_boundary("function type", function.span);
+            }
+            return self.types.unknown();
+        }
         if ty.has_value_arguments() {
             for argument in ty.type_arguments() {
                 self.resolve_type_ref_in_position(
@@ -13709,6 +13789,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> TypeId {
         match expr {
+            Expr::Closure(_) => self.types.unknown(),
             Expr::String { .. } | Expr::InterpolatedString { .. } => {
                 self.types.intern(TypeKind::String)
             }

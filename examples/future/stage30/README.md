@@ -1,9 +1,11 @@
 # Stage 30 closure examples
 
-These snippets are accepted Stage 30 target-state documentation. They are not
-registered as `.doria` examples or native parity fixtures and do not claim
-current parsing or execution support. Stage 30 remains blocked until Stage 29
-completes.
+These snippets are accepted Stage 30 target-state documentation. Their closure
+grammar is parseable and mirrored in
+`crates/doriac/tests/fixtures/accepted_syntax/closures.doria`. They are parser
+fixtures, not executable examples or native parity fixtures: semantic checking
+stops at the catalogued E0641 boundary until Stage 30 implements closure
+semantics.
 
 The inventory covers:
 
@@ -14,10 +16,10 @@ The inventory covers:
 - Ownership transfer into a returned closure.
 - Accepted `List<T>` closure algorithms with captured and no-capture callbacks.
 
-Keeping these examples in this document is deliberate. Repository `.doria`
-examples are required to parse under the two-clocks rule, while this authority
-task explicitly does not implement Stage 30 grammar. The snippets move into
-checked source fixtures when that grammar lands.
+Keeping these examples in this document is deliberate. The accepted syntax now
+has checked source fixtures, but these complete Stage 30 examples must not be
+registered as runnable programs until their capture, typing, ownership, and
+execution semantics land.
 
 ## No capture
 

@@ -301,9 +301,10 @@ Runner** and non-blocking; the accepted performance standard is unchanged.
   status-70 entry handling, generalized private runtime-outcome transport, and
   interpreter/Cranelift/LLVM/PHP parity.
 
-Stage 29 is complete. The pre-Stage-30 closure grammar slice is next. Decision
-0120 remains accepted and awaiting grammar and Stage 30 implementation; Stage 30
-is not implemented and remains blocked until the grammar slice completes.
+Stage 29 is complete. The pre-Stage-30 closure grammar slice is complete:
+Decision 0120's accepted closure forms and function-type spelling now parse into
+source-preserving AST nodes. Stage 30 closure semantics and execution are not
+implemented; accepted closure syntax stops at the catalogued E0641 boundary.
 
 ## Explicit Exclusions
 
@@ -348,6 +349,6 @@ remain unchanged.
   separate.
 - E0472 owned-property move-in, replacement, and move-out remains a separate
   unimplemented authority and implementation beat.
-- The pre-Stage-30 closure grammar slice is next; Stage 30 closure semantics,
+- The pre-Stage-30 closure grammar slice is complete. Stage 30 closure semantics,
   Stage 31 namespaces, Stage 34 inheritance, Stage 35 interfaces, Stage 36a
   streams, and Stage 41 PHP-library conversion remain separate.

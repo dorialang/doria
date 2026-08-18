@@ -4,7 +4,7 @@
 - **Accepted:** 2026-08-15
 - **Date:** 2026-08-15
 - **Implementation status:** Authority accepted; the pre-Stage-30 grammar slice
-  is scheduled after Stage 29; Stage 30 remains blocked until both complete
+  is complete; Stage 30 is next and remains unimplemented
 - **Scope:** Closure capture spelling, ownership modes, diagnostics, Stage 30
   boundaries, and backend-independent behavior
 - **Amends:** D10 and the Stage 30 plan; preserves Decision 0119's callable-effect
@@ -198,12 +198,12 @@ separately.
 ## Pre-Stage-30 Grammar Slice
 
 The repository's two-clocks rule requires accepted syntax to parse before its
-semantic execution stage. A bounded grammar slice therefore runs after Stage 29
-and before Stage 30. It owns `fn` and anonymous-function expression tokens and
-productions, explicit parameter and return syntax, `with` capture-list syntax,
+semantic execution stage. The bounded grammar slice is complete: it owns `fn`
+and anonymous-function expression tokens and productions, explicit parameter
+and return syntax, `function(T): R` type syntax, `with` capture-list syntax,
 capture-mode syntax, source-preserving AST nodes, parser recovery, and
-accepted-syntax regression tests. Parsed closures stop at one stage-named Stage
-30 unsupported-feature boundary until semantic implementation lands.
+accepted-syntax regression tests. Parsed closures stop at the catalogued `E0641`
+Stage 30 unsupported-development boundary until semantic implementation lands.
 
 This grammar slice does not perform free-variable discovery, capture validation,
 mode checking, HIR/MIR lowering, ownership analysis, closure calls, environment
@@ -295,4 +295,5 @@ code; performance and escape work.
   `with` must be corrected; no-capture arrows remain unchanged.
 - LSP, VS Code, IntelliJ, all execution backends, async work, self-hosting, and
   performance work must consume this decision when their owning stages begin.
-- Stage 29 remains active and Stage 30 remains blocked until it completes.
+- The pre-Stage-30 grammar slice is complete. Stage 30 is next but remains
+  unimplemented.

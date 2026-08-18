@@ -41,6 +41,14 @@ function check_closure_capture_authority(string $root): array
     $pipelinePath = 'docs/notes/current-pipeline.md';
     $auditPath = 'docs/notes/plan-open-questions-audit.md';
     $examplesPath = 'examples/future/stage30/README.md';
+    $lexerPath = 'crates/doriac/src/lexer.rs';
+    $astPath = 'crates/doriac/src/ast.rs';
+    $typesPath = 'crates/doriac/src/types.rs';
+    $parserPath = 'crates/doriac/src/parser.rs';
+    $semanticsPath = 'crates/doriac/src/semantics.rs';
+    $cataloguePath = 'crates/doria-diagnostic-catalogue/src/lib.rs';
+    $testsPath = 'crates/doriac/tests/pre_stage30_closure_grammar_tests.rs';
+    $fixturePath = 'crates/doriac/tests/fixtures/accepted_syntax/closures.doria';
 
     $decision = $read($decisionPath);
     $plan = $read($planPath);
@@ -48,6 +56,14 @@ function check_closure_capture_authority(string $root): array
     $pipeline = $read($pipelinePath);
     $audit = $read($auditPath);
     $examples = $read($examplesPath);
+    $lexer = $read($lexerPath);
+    $ast = $read($astPath);
+    $types = $read($typesPath);
+    $parser = $read($parserPath);
+    $semantics = $read($semanticsPath);
+    $catalogue = $read($cataloguePath);
+    $tests = $read($testsPath);
+    $fixture = $read($fixturePath);
 
     $require($decisionPath, $decision, [
         '# Decision 0120: Explicit Closure Capture Lists',
@@ -66,11 +82,13 @@ function check_closure_capture_authority(string $root): array
         'Closure Must Capture `$minimum`',
         '## Pre-Stage-30 Grammar Slice',
         'two-clocks rule requires accepted syntax to parse',
-        'owns `fn` and anonymous-function expression tokens and',
+        'anonymous-function expression tokens and productions',
         'source-preserving AST nodes',
         'accepted-syntax regression tests',
-        'Parsed closures stop at one stage-named Stage',
+        'Parsed closures stop at the catalogued `E0641`',
         'This grammar slice does not perform free-variable discovery',
+        'pre-Stage-30 grammar slice is complete',
+        'Stage 30 is next and remains unimplemented',
         'Stage 30 consumes the source-preserving closure AST',
         'Decision 0119 owns source-ordered checked-effect sets',
         'effect inference. Stage 30 must integrate closure bodies',
@@ -88,11 +106,11 @@ function check_closure_capture_authority(string $root): array
         'A closure with no surrounding-local dependency omits `with`',
         'Changing an arrow into a block closure preserves its capture list and ownership modes',
         'Decision 0120: explicit closure capture lists',
-        '**Pre-Stage-30 Grammar Slice — Closure accepted syntax — Next.**',
-        'Scheduled immediately after completed Stage 29 and before Stage 30',
-        'Successfully parsed closures stop at one stage-named Stage 30 unsupported-feature boundary',
-        'This slice does not perform free-variable discovery',
-        'Stage 30 remains blocked until the pre-Stage-30 grammar slice completes',
+        '**Pre-Stage-30 Grammar Slice — Closure accepted syntax — Complete.**',
+        'authoritative `function(T): R` type syntax',
+        'catalogued `E0641` Stage 30 boundary',
+        'No free-variable discovery',
+        '**Stage 30 — Closures — Next; Not Implemented.**',
         'A missing capture receives a capture-specific diagnostic',
         'Closure callable types preserve Stage 29',
         '`List<T>` `map`, `filter`, and `reduce` use this same closure model',
@@ -112,6 +130,9 @@ function check_closure_capture_authority(string $root): array
         '`with (take $value)` transfers ownership',
         '`use` is not a closure-capture alias',
         'A closure that uses no enclosing local',
+        'This accepted surface is parseable and preserved in the source AST',
+        'types use `function(int): int`',
+        'catalogued `E0641` Stage 30 development boundary',
         '`$this` capture remains a bounded Stage 30',
     ]);
 
@@ -122,23 +143,25 @@ function check_closure_capture_authority(string $root): array
         'Stage 29 Slice 2 — Complete',
         'Corrective Beat: Native Collection Property Initializers — Complete',
         'Stage 29 Slice 3 — Complete',
-        'Stage 30 — Blocked Until The Pre-Stage-30 Grammar Slice Completes; Not Implemented',
+        'Stage 30 — Next, Not Implemented',
         'Decision 0120 — Accepted; Stage 30 Authority Only',
-        'Pre-Stage-30 Grammar Slice — Next',
+        'Pre-Stage-30 Grammar Slice — Complete',
     ]);
 
     $require($auditPath, $audit, [
         'decision 0120 requires explicit `with` capture lists',
-        'pre-Stage-30 grammar slice is next and owns accepted lexer/parser/AST syntax',
+        'pre-Stage-30 grammar slice is complete and owns accepted lexer/parser/AST syntax',
         'No accepted authority grants those',
         'decision 0120 deliberately adds no public method',
     ]);
 
     $require($examplesPath, $examples, [
-        'These snippets are accepted Stage 30 target-state documentation. They are not',
-        'registered as `.doria` examples or native parity fixtures',
-        'Repository `.doria`',
-        'examples are required to parse under the two-clocks rule',
+    'These snippets are accepted Stage 30 target-state documentation.',
+    'They are parser',
+    'fixtures, not executable examples or native parity fixtures',
+    'crates/doriac/tests/fixtures/accepted_syntax/closures.doria',
+    'semantic checking',
+    'stops at the catalogued E0641 boundary',
         'let $double = fn(int $value) => $value * 2;',
         'fn(int $score) with ($minimum) =>',
         'function (int $score): bool with ($minimum) {',
@@ -160,8 +183,66 @@ function check_closure_capture_authority(string $root): array
         }
     }
 
-    $grammarPosition = strpos($plan, '**Pre-Stage-30 Grammar Slice — Closure accepted syntax — Next.**');
-    $stage30Position = strpos($plan, '**Stage 30 — Closures.**');
+    $require($lexerPath, $lexer, [
+        'Fn,',
+        'With,',
+        '"fn" => TokenKind::Fn',
+        '"with" => TokenKind::With',
+    ]);
+    $require($astPath, $ast, [
+        'pub struct ClosureExpression',
+        'pub enum ClosureForm',
+        'pub struct ClosureCaptureClause',
+        'pub enum ClosureCaptureMode',
+        'pub enum ClosureBody',
+        'Closure(Box<ClosureExpression>)',
+    ]);
+    $require($typesPath, $types, [
+        'pub struct FunctionTypeRef',
+        'pub struct FunctionTypeParameterRef',
+        'function({parameters}): {}',
+    ]);
+    $require($parserPath, $parser, [
+        'fn parse_arrow_closure',
+        'fn parse_anonymous_block_closure',
+        'fn parse_closure_capture_clause',
+        'fn parse_function_type_ref',
+        'Doria closure captures use `with`, not PHP closure `use`',
+        'a closure without captures omits the `with` clause',
+        'Doria closure captures do not use PHP reference `&` syntax',
+    ]);
+    $require($semanticsPath, $semantics, [
+        'report_stage_30_closure_boundary',
+        'Diagnostic::unsupported_stage(',
+        '"E0641"',
+        'Closure Semantics Await Stage 30',
+    ]);
+    $require($cataloguePath, $catalogue, ['"E0641"']);
+    $require($testsPath, $tests, [
+        'capture_ast_preserves_modes_duplicates_order_and_exact_spans',
+        'semantic_and_ide_paths_emit_one_structured_stage_30_boundary',
+        'malformed_closure_inventory_has_deliberate_diagnostics',
+        'closure_recovery_does_not_cascade_into_following_syntax',
+        'cli_ast_and_check_keep_the_parser_semantic_boundary_visible',
+    ]);
+    $require($fixturePath, $fixture, [
+        'fn(int $value) => $value * 2',
+        'with (writable $count, take $message, $minimum, $minimum)',
+        'function (int $value): bool',
+        'function(int, string): bool',
+        'function(): void',
+    ]);
+
+    foreach ([$planPath => $plan, $pipelinePath => $pipeline, $auditPath => $audit] as $path => $contents) {
+        $forbid($path, $contents, [
+            'Pre-Stage-30 Grammar Slice — Next',
+            'Stage 30 — Blocked Until The Pre-Stage-30 Grammar Slice Completes',
+            'pre-Stage-30 grammar slice is next',
+        ]);
+    }
+
+    $grammarPosition = strpos($plan, '**Pre-Stage-30 Grammar Slice — Closure accepted syntax — Complete.**');
+    $stage30Position = strpos($plan, '**Stage 30 — Closures — Next; Not Implemented.**');
     if ($grammarPosition === false || $stage30Position === false || $grammarPosition >= $stage30Position) {
         $failures[] = "{$planPath}: the accepted-syntax grammar slice must precede Stage 30";
     }

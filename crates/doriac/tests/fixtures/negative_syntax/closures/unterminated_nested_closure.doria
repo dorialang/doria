@@ -1,0 +1,2 @@
+let $closure = fn(int $outer) => function (int $inner): int {
+    return $outer + $inner;

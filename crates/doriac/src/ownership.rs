@@ -2790,6 +2790,7 @@ impl Checker<'_> {
                 }
             }
             Expr::Identifier { .. }
+            | Expr::Closure(_)
             | Expr::String { .. }
             | Expr::Int { .. }
             | Expr::Float { .. }
@@ -4281,6 +4282,7 @@ fn expr_uses_variable(expr: &Expr, name: &str) -> bool {
                     .is_some_and(|finally| statements_use_variable(&finally.block.statements, name))
         }
         Expr::This { .. }
+        | Expr::Closure(_)
         | Expr::Identifier { .. }
         | Expr::String { .. }
         | Expr::Int { .. }

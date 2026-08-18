@@ -1,0 +1,2 @@
+let $closure = fn(int $value) with () => $value;
+let $recovered = 1;
