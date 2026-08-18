@@ -7,6 +7,11 @@ fixtures, not executable examples or native parity fixtures: semantic checking
 stops at the catalogued E0641 boundary until Stage 30 implements closure
 semantics.
 
+The [Stage 30 Closure Authority Proposal](../../../docs/notes/stage30-closure-authority-proposal.md)
+is **In Review**. It records recommendations for project-owner rulings but does not
+change accepted language semantics. **Stage 30 is not implemented**; Decision
+0120 and the E0641 boundary remain authoritative.
+
 The inventory covers:
 
 - No-capture arrow and block closures.

@@ -11,6 +11,7 @@ require_once __DIR__ . '/check_grouped_local_declarations.php';
 require_once __DIR__ . '/check_performance_foundation.php';
 require_once __DIR__ . '/check_benchmark_revision.php';
 require_once __DIR__ . '/check_closure_capture_authority.php';
+require_once __DIR__ . '/check_stage30_closure_proposal.php';
 
 $root = dirname(__DIR__);
 $failures = check_stream_io_completeness($root);
@@ -18,6 +19,7 @@ array_push($failures, ...check_grouped_local_declarations($root));
 array_push($failures, ...check_performance_foundation($root));
 array_push($failures, ...check_benchmark_revision($root));
 array_push($failures, ...check_closure_capture_authority($root));
+array_push($failures, ...check_stage30_closure_proposal($root));
 
 // Keys are "path:line:number". Keep this empty unless the repository contains
 // a verified decision-shaped token that is not a citation. Every entry requires
