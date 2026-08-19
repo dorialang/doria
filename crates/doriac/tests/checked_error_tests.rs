@@ -853,6 +853,33 @@ function main(): void
 }
 
 #[test]
+fn inferred_main_diagnostics_remain_in_source_order() {
+    let source = r#"
+function earlier(): void
+{
+    int $value = "not an integer";
+}
+function main(): void
+{
+    int $value = "also not an integer";
+}
+"#;
+
+    let diagnostics = doriac::check_source("inferred_main_order.doria", source)
+        .expect_err("both invalid declarations should be diagnosed");
+    let assignment_diagnostics = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0403")
+        .collect::<Vec<_>>();
+
+    assert_eq!(assignment_diagnostics.len(), 2);
+    assert!(
+        assignment_diagnostics[0].span.start < assignment_diagnostics[1].span.start,
+        "the ordinary source-order pass must be the only pass that publishes diagnostics"
+    );
+}
+
+#[test]
 fn explicit_main_contract_remains_checked_and_ordinary_callables_remain_explicit() {
     let failure = error_class("Failure");
     doriac::check_source(

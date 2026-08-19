@@ -1616,11 +1616,9 @@ impl<'program> Checker<'program> {
         self.infer_unannotated_move_return_signatures();
 
         // A clause-free selected entrypoint infers its public checked-effect
-        // contract from the body. Check it once to establish that contract,
-        // then check it again with the contract available to recursive calls,
-        // catches, and every later source caller. The first pass uses the same
-        // operation-precise checker; only its provisional diagnostics are
-        // discarded.
+        // contract from the body. Check it provisionally to establish that
+        // contract before the source-order pass reaches recursive calls and
+        // earlier callers. Only the source-order pass publishes diagnostics.
         let inferred_entrypoint = self.program.items.iter().find_map(|item| match item {
             Item::Function(function)
                 if function.throws.is_none() && self.is_accepted_program_entrypoint(function) =>
@@ -1633,7 +1631,6 @@ impl<'program> Checker<'program> {
             let diagnostics_before_inference = self.diagnostics.len();
             self.check_function(entrypoint, None);
             self.diagnostics.truncate(diagnostics_before_inference);
-            self.check_function(entrypoint, None);
         }
 
         let mut scopes = ScopeStack::new();
@@ -1642,10 +1639,6 @@ impl<'program> Checker<'program> {
                 Item::Statement(statement) => {
                     self.check_statement(statement, &mut scopes, None, None, None, 0);
                 }
-                Item::Function(function)
-                    if inferred_entrypoint
-                        .as_ref()
-                        .is_some_and(|entrypoint| entrypoint.span == function.span) => {}
                 Item::Function(function) => self.check_function(function, None),
                 Item::Constant(constant) => {
                     self.check_constant_initializer(&constant.initializer, None)
