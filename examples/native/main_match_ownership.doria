@@ -27,7 +27,7 @@ function describe(LoadResult $result): string
     return "{$label}:{$stillUsable}";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     LoadResult $loaded = LoadResult::Loaded(new Document("guide"));
     echo describe($loaded) . "\n";

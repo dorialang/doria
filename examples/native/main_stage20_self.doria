@@ -43,7 +43,7 @@ class Message
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     echo Counter::next();
     echo ":";

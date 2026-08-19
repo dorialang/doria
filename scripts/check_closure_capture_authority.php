@@ -170,7 +170,7 @@ function check_closure_capture_authority(string $root): array
         'function(): string',
         'with ($bonus)',
         'fn(string $label) =>',
-        'Doria\Std\Io\IoError',
+        'function main(): void',
         'Closure Must Capture',
         'between an arrow\'s',
         'ordinary moved-value diagnostic',

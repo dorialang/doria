@@ -40,7 +40,7 @@ function keepAlive(): WritableWeakReference<Node> throws Doria\Std\Io\IoError
     return $weak;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $weak = keepAlive();
     if ($weak->acquire() == null) {

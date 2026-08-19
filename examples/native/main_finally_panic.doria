@@ -17,7 +17,7 @@ function record(string $message): void
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $guard = new Guard();
     echo "before\n";

@@ -1,6 +1,6 @@
 // List::pop in a loop body. It returns `?T`, so its lowering allocates the
 // same kind of nullable out-parameter slot the dictionary path uses.
-function main(List<string> $args): void throws Doria\Std\Io\IoError
+function main(List<string> $args): void
 {
     let $n = Int::parse($args[0]) ?? 0;
     writable List<int> $values = [];

@@ -33,7 +33,7 @@ class Person
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let writable $person = new Person();
 

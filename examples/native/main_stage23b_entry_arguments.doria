@@ -1,4 +1,4 @@
-function main(List<string> $args): int throws Doria\Std\Io\IoError
+function main(List<string> $args): int
 {
     // `$args->count` is how many arguments the user passed: the executable
     // path is not element 0 (decision 0099).

@@ -4,7 +4,7 @@ enum Coordinate
     case Point(int $x, int $y);
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     writable Coordinate[] $fixed = [Coordinate::Origin, Coordinate::Point(1, 2)];
     $fixed[0] = Coordinate::Point(20, 22);

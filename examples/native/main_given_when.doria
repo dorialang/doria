@@ -4,7 +4,7 @@ function skippedCondition(): bool throws Doria\Std\Io\IoError
     return true;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     string $label = given {
         let $prepared = "ready";

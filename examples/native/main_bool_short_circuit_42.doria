@@ -10,7 +10,7 @@ function right(): bool throws Doria\Std\Io\IoError
     return true;
 }
 
-function main(): int throws Doria\Std\Io\IoError
+function main(): int
 {
     bool $value = left() and right();
 

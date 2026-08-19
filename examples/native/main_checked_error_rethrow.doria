@@ -20,7 +20,7 @@ function relay(): void throws Failure, Doria\Std\Io\IoError
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     try {
         relay();

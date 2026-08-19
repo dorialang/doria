@@ -27,7 +27,7 @@ function consume(take Error $error): void throws Doria\Std\Io\IoError
     echo "consumed {$error->message}\n";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     Error $error = makeFailure("value");
     inspect($error);

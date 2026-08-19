@@ -83,9 +83,14 @@ fn apply_function_checked_error_semantics(
     function: &mut hir::FunctionDecl,
     semantic_info: &crate::semantics::SemanticInfo,
 ) {
+    function.checked_effects = semantic_info
+        .callable_effective_checked_effects
+        .get(&function.span.start)
+        .cloned()
+        .unwrap_or_default();
     if let Some(throws) = &mut function.throws {
         if let Some(effects) = semantic_info
-            .callable_checked_effects
+            .callable_effective_checked_effects
             .get(&function.span.start)
         {
             for (entry, effect) in throws.entries.iter_mut().zip(effects) {
@@ -348,6 +353,7 @@ fn lower_function(
                 .collect(),
             span: throws.span,
         }),
+        checked_effects: Vec::new(),
         body: lower_block(&function.body, class_name),
         span: function.span,
     }

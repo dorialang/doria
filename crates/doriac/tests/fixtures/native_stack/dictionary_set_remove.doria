@@ -1,7 +1,7 @@
 // Dictionary::set and Dictionary::remove in a loop body. Both lower through
 // scratch slots of their own, so both grew the frame on every pass before the
 // entry-block fix.
-function main(List<string> $args): void throws Doria\Std\Io\IoError
+function main(List<string> $args): void
 {
     let $n = Int::parse($args[0]) ?? 0;
     writable Dictionary<int, int> $values = [];

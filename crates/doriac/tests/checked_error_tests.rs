@@ -660,6 +660,285 @@ function caller(): int throws Failure
 }
 
 #[test]
+fn selected_main_infers_exact_uncovered_effects_without_changing_source_syntax() {
+    let source = format!(
+        r#"
+{}
+{}
+function failFirst(): void throws FirstError {{ throw new FirstError("first"); }}
+function failSecond<T>(T $value): void throws SecondError {{ throw new SecondError("second"); }}
+function main(): void
+{{
+    failFirst();
+    try {{ failSecond(42); }} catch (SecondError) {{ echo "caught"; }}
+    failSecond("again");
+}}
+"#,
+        error_class("FirstError"),
+        error_class("SecondError")
+    );
+
+    let parsed = doriac::parse_source("inferred_main.doria", &source)
+        .expect("clause-free main should parse");
+    let parsed_main = parsed.items.iter().find_map(|item| match item {
+        doriac::ast::Item::Function(function) if function.name == "main" => Some(function),
+        _ => None,
+    });
+    assert!(
+        parsed_main.is_some_and(|function| function.throws.is_none()),
+        "inference must not synthesize source syntax"
+    );
+
+    let hir = doriac::lower_source("inferred_main.doria", &source)
+        .expect("clause-free main should lower");
+    let main = hir.items.iter().find_map(|item| match item {
+        hir::Item::Function(function) if function.name == "main" => Some(function),
+        _ => None,
+    });
+    let main = main.expect("main should exist in HIR");
+    assert!(main.throws.is_none(), "HIR must preserve source omission");
+    let effect_names = main
+        .checked_effects
+        .iter()
+        .map(|effect| match effect {
+            doriac::types::ResolvedType::Class(class) => class.name.as_str(),
+            other => panic!("expected concrete error class, got {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        effect_names,
+        ["FirstError", "Doria\\Std\\Io\\IoError", "SecondError"]
+    );
+
+    let mir = doriac::lower_source_to_mir("inferred_main.doria", &source)
+        .expect("inferred effects should lower to MIR");
+    let main = &mir.functions[mir.entry.0];
+    let mir_effect_names = main
+        .checked_effects
+        .iter()
+        .map(|effect| match effect {
+            doriac::mir::CheckedEffect::Concrete(id) => {
+                mir.error_descriptors[id.0].type_name.as_str()
+            }
+            doriac::mir::CheckedEffect::Any => "Error",
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mir_effect_names,
+        ["FirstError", "Doria\\Std\\Io\\IoError", "SecondError"]
+    );
+}
+
+#[test]
+fn selected_main_inference_covers_direct_io_entry_shapes_and_construction() {
+    fn main_effect_names(source: &str) -> Vec<String> {
+        let hir = doriac::lower_source("inferred_main_surface.doria", source)
+            .expect("accepted clause-free main should lower");
+        hir.items
+            .iter()
+            .find_map(|item| match item {
+                hir::Item::Function(function) if function.name == "main" => Some(
+                    function
+                        .checked_effects
+                        .iter()
+                        .map(|effect| match effect {
+                            doriac::types::ResolvedType::Class(class) => class.name.clone(),
+                            other => panic!("expected concrete error class, got {other:?}"),
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .expect("main should exist in HIR")
+    }
+
+    assert_eq!(
+        main_effect_names(r#"function main(): void { echo "hello"; }"#),
+        ["Doria\\Std\\Io\\IoError"]
+    );
+    assert_eq!(
+        main_effect_names(
+            r#"function main(List<string> $args): int { echo $args->count; return 0; }"#,
+        ),
+        ["Doria\\Std\\Io\\IoError"]
+    );
+
+    let failure = error_class("Failure");
+    assert_eq!(
+        main_effect_names(&format!(
+            r#"
+{failure}
+function main(): void {{ throw new Failure("direct"); }}
+"#
+        )),
+        ["Failure"]
+    );
+    assert_eq!(
+        main_effect_names(&format!(
+            r#"
+{failure}
+class Application
+{{
+    function __construct() throws Failure {{ throw new Failure("construct"); }}
+}}
+function main(): void {{ let $application = new Application(); }}
+"#
+        )),
+        ["Failure"]
+    );
+}
+
+#[test]
+fn selected_main_inference_covers_entry_shapes_and_nested_catch_subtraction() {
+    for source in [
+        r#"
+function main(): void
+{
+    try { echo "handled"; } catch (Doria\Std\Io\IoError) {}
+}
+"#,
+        r#"
+function main(List<string> $args): int
+{
+    try {
+        if ($args->count > 0) { echo $args[0]; }
+    } catch (Doria\Std\Io\IoError) {}
+    return 0;
+}
+"#,
+    ] {
+        let hir = doriac::lower_source("handled_main.doria", source)
+            .expect("accepted main shape should infer after nested handling");
+        let main = hir.items.iter().find_map(|item| match item {
+            hir::Item::Function(function) if function.name == "main" => Some(function),
+            _ => None,
+        });
+        assert!(
+            main.is_some_and(|function| function.checked_effects.is_empty()),
+            "fully handled effects must not select the checked-result ABI"
+        );
+        let mir = doriac::lower_source_to_mir("handled_main.doria", source)
+            .expect("nonthrowing inferred main should reach MIR");
+        assert!(mir.functions[mir.entry.0].checked_effects.is_empty());
+    }
+}
+
+#[test]
+fn inferred_main_contract_is_available_to_recursive_and_source_calls() {
+    let source = format!(
+        r#"
+{}
+function caller(): void {{ main(); }}
+function main(): void
+{{
+    try {{ main(); }} catch (Failure) {{}}
+    throw new Failure("escape");
+}}
+"#,
+        error_class("Failure")
+    );
+    let diagnostics = doriac::check_source("recursive_main.doria", source)
+        .expect_err("an ordinary caller must declare main's inferred effect");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0631")
+            .count(),
+        1,
+        "the inferred contract must be established before checking source callers"
+    );
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0631" && diagnostic.message.contains("`caller`")
+    }));
+}
+
+#[test]
+fn inferred_main_diagnostics_remain_in_source_order() {
+    let source = r#"
+function earlier(): void
+{
+    int $value = "not an integer";
+}
+function main(): void
+{
+    int $value = "also not an integer";
+}
+"#;
+
+    let diagnostics = doriac::check_source("inferred_main_order.doria", source)
+        .expect_err("both invalid declarations should be diagnosed");
+    let assignment_diagnostics = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0403")
+        .collect::<Vec<_>>();
+
+    assert_eq!(assignment_diagnostics.len(), 2);
+    assert!(
+        assignment_diagnostics[0].span.start < assignment_diagnostics[1].span.start,
+        "the ordinary source-order pass must be the only pass that publishes diagnostics"
+    );
+}
+
+#[test]
+fn explicit_main_contract_remains_checked_and_ordinary_callables_remain_explicit() {
+    let failure = error_class("Failure");
+    doriac::check_source(
+        "explicit_main.doria",
+        format!(
+            r#"
+{failure}
+function fail(): void throws Failure {{ throw new Failure("failure"); }}
+function main(): void throws Failure {{ fail(); }}
+"#
+        ),
+    )
+    .expect("an explicit complete main contract remains valid");
+
+    for source in [
+        format!(
+            r#"
+{failure}
+function fail(): void throws Failure {{ throw new Failure("failure"); }}
+function main(): void throws Doria\Std\Io\IoError {{ fail(); }}
+"#
+        ),
+        format!(
+            r#"
+{failure}
+function helper(): void {{ throw new Failure("failure"); }}
+function main(): void {{}}
+"#
+        ),
+        format!(
+            r#"
+{failure}
+class Worker {{ function main(): void {{ throw new Failure("failure"); }} }}
+function main(): void {{}}
+"#
+        ),
+    ] {
+        assert_code(&source, "E0631");
+    }
+}
+
+#[test]
+fn inferred_main_diagnostics_are_not_duplicated_by_contract_discovery() {
+    let diagnostics = doriac::check_source(
+        "invalid_main.doria",
+        "function main(): void { echo $missing; }",
+    )
+    .expect_err("invalid main should be rejected");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0101")
+            .count(),
+        1,
+        "the inference pass must not duplicate user diagnostics"
+    );
+}
+
+#[test]
 fn constructors_and_property_initializers_share_one_declared_effect_contract() {
     let source = format!(
         r#"

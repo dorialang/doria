@@ -3068,8 +3068,13 @@ fn emit_function(
     output.push('\n');
     writeln(output, indent, "{");
     let is_entry = !is_method && function.name == "main";
-    let body_indent = if is_entry { indent + 2 } else { indent + 1 };
-    if is_entry {
+    let checked_entry = is_entry && !function.checked_effects.is_empty();
+    let body_indent = if checked_entry {
+        indent + 2
+    } else {
+        indent + 1
+    };
+    if checked_entry {
         writeln(output, indent + 1, "try");
         writeln(output, indent + 1, "{");
     }
@@ -3113,7 +3118,7 @@ fn emit_function(
         emit_statement(statement, output, body_indent, &mut scopes);
     }
     scopes.pop();
-    if is_entry {
+    if checked_entry {
         writeln(output, indent + 1, "}");
         writeln(output, indent + 1, "catch (__DoriaCheckedError $error)");
         writeln(output, indent + 1, "{");

@@ -13,7 +13,7 @@ function consume(take Bytes $contents): int
     return $contents->length;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     Bytes $contents = makeBytes();
     echo "{inspect($contents)}:";

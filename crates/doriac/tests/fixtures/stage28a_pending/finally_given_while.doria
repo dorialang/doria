@@ -6,7 +6,7 @@ function record(string $message): void
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     given {
         true;

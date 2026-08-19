@@ -44,7 +44,7 @@ class Parser
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let writable $parser = Parser::create("Doria");
     let $ast = $parser->parse();

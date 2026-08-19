@@ -19,7 +19,7 @@ function expired(): WritableWeakReference<Node>
     return $node->createWeakReference();
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $root = new WritableSharedReference(new Node("root"));
     let $weak = $root->createWeakReference();

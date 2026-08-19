@@ -1259,12 +1259,18 @@ catches after `Error`, and catches proven unable to match a protected effect are
 unreachable. Catch bodies are independent: sibling catches do not handle an
 error raised by another catch. An error may not escape `finally`.
 
-Every callable carries a semantic checked-effect set. Direct throws and resolved
-function, method, static, constructor, and property-initializer calls contribute
-effects. Catches remove only effects they cover; every remaining error must be
-declared by the enclosing callable. Nonthrowing and narrower effect sets may be
-used where a wider set is accepted, never the reverse. Stage 30 callable types
-must preserve this law while owning closure effect syntax.
+Every callable carries an effective semantic checked-effect set. Direct throws
+and resolved function, method, static, constructor, property-initializer, and
+compiler-known built-in calls contribute effects. Catches remove only effects
+they cover. Ordinary reusable functions, methods, constructors, and generic
+specializations must declare every remaining error. When the selected top-level
+`main` omits `throws`, its exact remaining set is inferred instead; source calls
+to `main` observe that effective contract. Source syntax remains separate, so
+the AST does not gain a synthetic clause or invented span. A written `main
+throws` remains accepted and incomplete explicit clauses still produce E0631.
+Nonthrowing and narrower effect sets may be used where a wider set is accepted,
+never the reverse. Stage 30 callable types must preserve this law while owning
+closure effect syntax.
 
 Checked propagation performs deterministic cleanup through the existing
 structured finalizer regions, but never rolls back completed side effects. A
@@ -1544,6 +1550,20 @@ Lifecycle methods cannot be invoked directly as ordinary instance or static meth
 For declared non-`void` return types, no reachable path may fall through the function body. `return` may occur anywhere in nested control flow. A path ending in `panic()` or a proven non-terminating `while (true)` loop without a reachable `break` is diverging and does not require a return. A loop with a reachable exit must lead to a return or another diverging path. Missing-return diagnostics are produced by path-sensitive source control-flow analysis before MIR lowering.
 
 The program entrypoint may be `main(): int` or `main(): void`. `main(): int` returns an explicit process status. `main(): void` may fall through or use `return;` and maps normal completion to successful status `0`. Returning a value from `main(): void` is the same semantic error as returning a value from any other `void` function.
+
+The selected top-level entrypoint may omit `throws`. In that form the compiler
+infers the exact checked effects that escape its body after local catch
+subtraction. An empty set uses the ordinary nonthrowing entry ABI; a nonempty set
+uses the existing checked-result ABI and R1000/status-70 process boundary. Class
+and static methods merely named `main` are ordinary methods and still require
+explicit contracts. Explicit `main throws ...` remains accepted and checked.
+
+```doria
+function main(): void
+{
+    echo "Hello, Doria!\n";
+}
+```
 
 `main` may also take command-line arguments through an optional parameter: `main(List<string> $args): int` (and the `: void` variant), per decision 0099. `$args` is populated by the entry glue at process start; `$args->count` is the argument count and there is no separate `argc`, so `main(string[] $argv, int $argc)` is rejected.
 

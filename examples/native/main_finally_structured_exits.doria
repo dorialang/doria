@@ -16,7 +16,7 @@ function choose(): int throws Doria\Std\Io\IoError
     return 0;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     echo "value {choose()}\n";
     let writable $index = 0;

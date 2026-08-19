@@ -1,6 +1,6 @@
 function left(): bool throws Doria\Std\Io\IoError { echo "L"; return false; }
 function right(): bool throws Doria\Std\Io\IoError { echo "R"; return true; }
-function main(): int throws Doria\Std\Io\IoError
+function main(): int
 {
     bool $value = left() xor right();
     if ($value) { return 42; }

@@ -28,7 +28,7 @@ class Message
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $formal = new Message(true, "Doria");
     let $casual = new Message(false, "Andrew");

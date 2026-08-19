@@ -3,8 +3,8 @@ Panic[P1312]: Dictionary Key Was Not Found
 Where
 examples/native/main_stage26_nullable_dictionary_missing_panic.doria · line 1 · main
 
-  1      function main(): void throws Doria\Std\Io\IoError
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  1      function main(): void
+         ^^^^^^^^^^^^^^^^^^^^^
          Missing Dictionary Key
   2      {
          ^

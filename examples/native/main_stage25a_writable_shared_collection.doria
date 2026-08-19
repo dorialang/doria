@@ -13,7 +13,7 @@ function inspect(WritableSharedReference<List<int>> $values): void throws Doria\
     echo "{$access[0]}:{$access->count}:{$access[1]}\n";
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $values = new WritableSharedReference([1, 2, 3]);
     update($values);

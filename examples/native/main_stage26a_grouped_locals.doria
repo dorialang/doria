@@ -17,7 +17,7 @@ class Token
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $first, $second = number();
     let writable $third, $fourth = number();

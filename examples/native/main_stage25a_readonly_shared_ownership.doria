@@ -50,7 +50,7 @@ function makeTemporaryWeak(): WeakReference<Node>
     return makeStrong("temporary")->createWeakReference();
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let writable $current = shared new Node("old current");
     $current = shared new Node("current");

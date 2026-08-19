@@ -3372,3 +3372,31 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         String::from_utf8_lossy(&run.stderr)
     );
 }
+
+#[test]
+fn php_entry_boundary_uses_main_effective_checked_effects() {
+    let nonthrowing =
+        doriac::compile_source_to_php("nonthrowing-main.doria", "function main(): void {}")
+            .expect("clause-free nonthrowing main should compile");
+    assert!(!nonthrowing.contains("catch (__DoriaCheckedError"));
+
+    let inferred = doriac::compile_source_to_php(
+        "inferred-main.doria",
+        r#"
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function main(): void
+{
+    throw new Failure("inferred");
+}
+"#,
+    )
+    .expect("clause-free throwing main should compile through the checked boundary");
+    assert!(inferred.contains("catch (__DoriaCheckedError"));
+    assert!(inferred.contains("__doria_report_unhandled_error($error);"));
+}

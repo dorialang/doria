@@ -51,7 +51,7 @@ function atLeast<T implements Comparable<T>>(T $left, T $right): bool
     return $left >= $right;
 }
 
-function main(): int throws Doria\Std\Io\IoError
+function main(): int
 {
     writable History<int> $numbers = new History<int>();
     $numbers->push(42);

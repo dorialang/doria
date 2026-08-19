@@ -1,4 +1,4 @@
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     writable uint8[] $source = [0, 128, 255];
     writable Bytes $bytes = Bytes::fromArray($source);

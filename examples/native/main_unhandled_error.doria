@@ -5,7 +5,7 @@ class Stage29Failure implements Error
     }
 }
 
-function main(): void throws Stage29Failure
+function main(): void
 {
     throw new Stage29Failure("unhandled user error");
 }

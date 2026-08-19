@@ -27,7 +27,7 @@ function middle(int $first, int $second = 20, int $third = 30, int $fourth = 40)
     return $first + $second + $third + $fourth;
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     // Free function: fully named, reordered, and mixed positional-then-named.
     describe(name: "Ada", age: 36, city: "London");

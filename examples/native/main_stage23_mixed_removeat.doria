@@ -18,7 +18,7 @@ class Token
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     // removeAt on a List<mixed> must move the element out, not leave a shared copy.
     writable List<mixed> $items = [new Token("a"), new Token("b"), new Token("c")];

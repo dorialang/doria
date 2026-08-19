@@ -44,7 +44,7 @@ class Worker
     }
 }
 
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     let $worker = new Worker();
     let $token = $worker->relay($worker->make("owned"));
