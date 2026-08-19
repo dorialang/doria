@@ -111,8 +111,9 @@ and HIR preserve whether `throws` was actually written and never synthesize a
 clause or source span. Empty means nonthrowing. A nonthrowing or narrower
 callable fits a position accepting a wider set; a wider set does not fit a
 narrower one. Future overrides may preserve or narrow effects, never widen
-them. Stage 30 must carry the same law into callable and closure types, but owns
-closure effect syntax and inference policy.
+them. Decision 0121 carries the same law into structural function and closure
+types: function types write `throws`, semantic identity uses normalized effect
+sets, and closure bodies infer their effects after local catch subtraction.
 
 ## Sources And Boundaries Of Effects
 
@@ -341,9 +342,10 @@ Runner** and non-blocking; the accepted performance standard is unchanged.
   interpreter/Cranelift/LLVM/PHP parity.
 
 Stage 29 is complete. The pre-Stage-30 closure grammar slice is complete:
-Decision 0120's accepted closure forms and function-type spelling now parse into
-source-preserving AST nodes. Stage 30 closure semantics and execution are not
-implemented; accepted closure syntax stops at the catalogued E0641 boundary.
+Decision 0120's base closure forms and function-type spelling now parse into
+source-preserving AST nodes. Decision 0121 accepts complete closure effect and
+function-type authority. Stage 30a is next; closure semantics and execution are
+not implemented, and accepted closure syntax stops at E0641.
 
 ## Explicit Exclusions
 
@@ -386,7 +388,8 @@ remain unchanged.
   payload and reuses its finalizer-region routing.
 - Decision 0117's ordinary namespace dependency is relaxed only for the exact
   compiler-known `Doria\Std\Io` identities before Stage 31. No short alias exists.
-- Stage 30 closure work must carry checked-effect sets and the subset law.
+- Decision 0121 requires every Stage 30 closure slice to preserve checked-effect
+  sets and the subset law.
 - Canonical examples and onboarding no longer write `throws` solely to allow
   checked work at `main`; explicit entrypoint contracts remain compatible.
 - I/O documentation that says "panic until Stage 29" is obsolete: ordinary I/O

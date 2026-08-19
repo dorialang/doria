@@ -73,14 +73,13 @@ function check_inferred_main_effects(string $root): array
     foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
         $require($path, $contents, [
             'Corrective Beat: Inferred Main Checked Effects — Complete',
-            'Stage 30 — Next, Not Implemented',
+            'Stage 30a Callable Grammar Completion — Next',
+            'Stage 30 — Not Implemented',
         ]);
     }
     $require($proposalPath, $proposal, [
-        '**In Review.**',
-        'a clause-free selected program entrypoint infers its exact',
-        'Stage 30 is not',
-        'implemented',
+        '**Superseded By Accepted Decision 0121.**',
+        'Stage 30a Callable Grammar Completion is next',
     ]);
     $require($compatibilityPath, $compatibility, [
         'function main(): void throws Doria\Std\Io\IoError',

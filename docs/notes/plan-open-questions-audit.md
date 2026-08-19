@@ -71,7 +71,8 @@ and top-level entry rules. Decision 0118 accepts schema 2 and the dependency,
 lockfile, workspace, cache, and offline model. This authority does not begin
 implementation: Stage 31 remains scheduled in two slices, Stage 33 remains
 scheduled in three slices. Stage 29 is complete under decision 0119; the
-pre-Stage-30 closure grammar slice is complete and Stage 30 is next.
+pre-Stage-30 closure grammar slice is complete, Decision 0121 is accepted, and
+Stage 30a Callable Grammar Completion is next.
 
 ## Proposed deliverable path
 `docs/notes/plan-open-questions-audit.md` (this file), under "supporting context" per `docs/information-architecture.md`. Not a decision record — every item is a stop-and-ask for Andrew.

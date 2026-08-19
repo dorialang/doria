@@ -4,7 +4,8 @@
 - **Accepted:** 2026-08-15
 - **Date:** 2026-08-15
 - **Implementation status:** Authority accepted; the pre-Stage-30 grammar slice
-  is complete; Stage 30 is next and remains unimplemented
+  is complete; Decision 0121 settles the remaining Stage 30 model; Stage 30a is
+  next and Stage 30 remains unimplemented
 - **Scope:** Closure capture spelling, ownership modes, diagnostics, Stage 30
   boundaries, and backend-independent behavior
 - **Amends:** D10 and the Stage 30 plan; preserves Decision 0119's callable-effect
@@ -180,10 +181,9 @@ structured-exit rules. Closure values remain Move types.
 ## Callable Effects
 
 Decision 0119 owns source-ordered checked-effect sets on callable signatures and
-subset-effect substitution. Stage 29 does not own closure syntax or closure
-effect inference. Stage 30 must integrate closure bodies and closure callable
-types with that same effect-set model rather than inventing another effect path.
-The exact inference and annotation mechanics remain a bounded Stage 30 question.
+subset-effect substitution. Decision 0121 applies that model to closure function
+types: function types write `throws`, closure bodies infer effects after local
+catch subtraction, and closure expressions do not gain effect annotations.
 
 ## Collection Algorithms
 
@@ -225,30 +225,28 @@ task-group closures, cross-task captures, `Sendable`, `Shareable`, and concurren
 writable capture. Stage 35 owns general interface conformance and any erased
 interface interaction needed by closure types. Stage 41 owns the PHP bridge.
 
-## Deferred Stage 30 Questions
+## Stage 30 Elaboration
 
-Stage 30 must settle `$this` independently: whether it is an implicit receiver,
-whether it appears in a capture list, how readonly/writable receiver access is
-represented, whether a closure may outlive its receiver, and whether take-like
-receiver ownership is supported. This record does not invent `with ($this)`, does
-not claim automatic `$this` capture, and does not claim `$this` never requires
-capture.
-
-Stage 30 also settles the complete mode-validation algorithm, closure effect
-inference and annotation, environment ABI, and any useful implementation slicing.
-Those questions may not reopen explicit capture for ordinary local bindings.
+Decision 0121 settles the questions this record deliberately left bounded.
+`$this` is explicit through `with ($this)` or `with (writable $this)`; taking the
+borrowed receiver is rejected. That record also owns mode validation, inferred
+closure effects, the two-word runtime carrier, lifetime and escape rules, and the
+Stage 30a through Stage 30h implementation sequence. None of those elaborations
+reopens explicit capture for ordinary local bindings.
 
 ## Performance
 
 Explicit syntax adds no runtime cost compared with compiler-discovered capture.
-The compiler builds only the environment required by listed captures; capture
-order and layout are private. No-capture closures use a zero-environment
-representation. Readonly and writable captures use borrow-compatible entries;
-taking captures store owned values and cleanup obligations. No hidden clone,
-share, or runtime reflection occurs, and closure existence alone does not require
-a general heap allocation. Stage 30 and Stage 35a must prove executable behavior;
-escape analysis may stack-allocate or eliminate nonescaping environments. This
-record does not promise that every closure is allocation-free.
+The compiler builds only the environment required by listed captures. Logical
+capture order is source order; Decision 0121 permits private physical field
+reordering while preserving logical acquisition and destruction. No-capture
+closures use a zero-environment representation. Readonly and writable captures
+use borrow-compatible entries; taking captures store owned values and cleanup
+obligations. No hidden clone, share, or runtime reflection occurs, and closure
+existence alone does not require heap allocation. Stage 30 and Stage 35a must
+prove executable behavior; escape analysis may stack-allocate or eliminate
+nonescaping environments. This record does not promise that every closure is
+allocation-free.
 
 ## PHP Compatibility
 
@@ -271,8 +269,8 @@ Rust bootstrap representation does not define the language model.
 - Source review and refactoring expose all local environmental dependencies.
 - Stage 30 diagnostics can distinguish missing capture from missing name.
 - No-capture closures remain concise.
-- Remaining `$this`, effect-inference, ABI, and optimization questions stay
-  bounded without weakening explicit local capture.
+- Decision 0121 settles `$this`, effect inference, ABI, and implementation
+  sequencing without weakening explicit local capture.
 
 ## Affected Components
 
@@ -295,5 +293,5 @@ code; performance and escape work.
   `with` must be corrected; no-capture arrows remain unchanged.
 - LSP, VS Code, IntelliJ, all execution backends, async work, self-hosting, and
   performance work must consume this decision when their owning stages begin.
-- The pre-Stage-30 grammar slice is complete. Stage 30 is next but remains
-  unimplemented.
+- The pre-Stage-30 grammar slice is complete. Decision 0121 is accepted; Stage
+  30a is next and Stage 30 remains unimplemented.

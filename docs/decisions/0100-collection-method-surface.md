@@ -99,7 +99,7 @@ through the Stage 22 flow model. Naming follows the §9.1 charter.
 | `contains(T): bool` | readonly | value membership |
 | `first: ?T` / `last: ?T` | readonly properties | safe end borrows; `null` if empty |
 | `count` / `isEmpty` | readonly properties | live size / emptiness |
-| `map` / `filter` / `reduce` | — | **deferred to Stage 30** (require closures) |
+| `map` / `filter` / `reduce` | — | **deferred to Stage 30g**; exact `List<T>` contracts are finalized by Decision 0121 |
 
 ### `Dictionary<K, V>`
 
@@ -237,9 +237,9 @@ with the runtime representation (0092).
   and the missing-element contract are fixed, not improvised.
 - The whole 0092 family has a coherent surface, so the sorted variants,
   `PriorityQueue`, and `Deque` slot in without a second design pass.
-- `map`/`filter`/`reduce` are named but scheduled at Stage 30 with closures; until
-  then a call to them parses and yields a stage-named unsupported diagnostic under
-  the two-clocks rule.
+- `map`/`filter`/`reduce` belong only to `List<T>` and are scheduled at Stage 30g
+  under Decision 0121; until then a call yields a stage-named unsupported
+  diagnostic under the two-clocks rule.
 - The `void`-mutator choice and 0088's fluent-API conventions are explicitly
   reconciled: built-in collections are not fluent, user types may be.
 
@@ -248,8 +248,9 @@ with the runtime representation (0092).
 The default `List`/`Dictionary`/`Set` surface (minus `map`/`filter`/`reduce`) and
 `T[]` land at Stage 23 (the collections-runtime slice). `SortedDictionary`,
 `SortedSet`, `PriorityQueue`, and `Deque` land with their types, at or after Stage
-23 per the collections-runtime rollout. `map`/`filter`/`reduce` land at Stage 30
-with closures. Nothing here changes the type inventory or naming (0092).
+23 per the collections-runtime rollout. `List<T>` alone receives
+`map`/`filter`/`reduce` at Stage 30g under Decision 0121. Nothing here changes the
+type inventory or naming (0092).
 
 ## Affected components
 

@@ -91,7 +91,7 @@ $require($decisionPath, $decision, [
     'destructors may not declare',
     'order is preserved for HIR',
     'checking uses a normalized semantic set',
-    'must carry the same law',
+    'Decision 0121 carries the same law',
     '`throw expression;` is a statement',
     'transfers that ownership',
     'Rethrow is `throw $error;`',
@@ -117,7 +117,7 @@ $require($decisionPath, $decision, [
     'Pending Available',
     'Runner** and non-blocking',
     'pre-Stage-30 closure grammar slice is complete',
-    'accepted closure syntax stops at the catalogued E0641 boundary',
+    'accepted closure syntax stops at E0641',
 ]);
 
 foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
@@ -129,7 +129,8 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Corrective Beat: Native Collection Property Initializers — Complete',
         'Stage 29 Slice 3 — Complete',
         'Pre-Stage-30 Grammar Slice — Complete',
-        'Stage 30 — Next, Not Implemented',
+        'Stage 30a Callable Grammar Completion — Next',
+        'Stage 30 — Not Implemented',
         'Stage 26b — Complete',
         'Measurement Status: Pending Available Runner',
     ]);
