@@ -434,8 +434,11 @@ privately while preserving logical acquisition and destruction.
 
 Stage 30g adds `map`, Copy-only preserving `filter`, and writable-accumulator
 `reduce` to `List<T>` only. Their callbacks are nonescaping, process elements in
-insertion order, and propagate the callback's checked effects. Other collection
-families receive no Stage 30 higher-order algorithms.
+insertion order, and propagate the callback's checked effects. A
+readonly-repeatable callback is borrowed readonly. A writable-repeatable callback
+is borrowed exclusively and requires writable access to the function value;
+invocation mode never silently widens a readonly function-value borrow. Other
+collection families receive no Stage 30 higher-order algorithms.
 
 ### Current compiler support
 

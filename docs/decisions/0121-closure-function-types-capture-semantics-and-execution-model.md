@@ -361,17 +361,30 @@ and reference identity are unobservable.
 
 ### 16. `List<T>` Algorithms
 
-Stage 30g adds higher-order algorithms only to `List<T>`. The following `I` and
+Stage 30g adds higher-order algorithms only to `List<T>`. The following
 `effects(...)` notation describes compiler-internal contracts and is not Doria
-source syntax.
+source syntax. Each algorithm has two compiler-known callback-mode
+specializations. These are not user-declared overloads:
+
+- a readonly-repeatable callback is passed as a readonly function-value borrow;
+- a writable-repeatable callback is passed as an exclusive function-value
+  borrow and therefore requires writable access to the callback value.
+
+The compiler selects the least-capable specialization that satisfies the
+callback's inferred minimum invocation mode. A readonly callback never requires
+an exclusive borrow merely because readonly invocation can substitute for a
+writable expectation. A writable callback can never pass through the readonly
+specialization. Once callbacks remain rejected.
 
 #### `map`
 
 ```text
-map<U>(function I(T): U transform): List<U> effects(transform)
+map<U>(function(T): U transform): List<U> effects(transform)
+map<U>(writable function writable(T): U transform): List<U> effects(transform)
 ```
 
-The callback is readonly- or writable-repeatable, never once, and nonescaping.
+The callback is readonly- or writable-repeatable and nonescaping. The leading
+parameter mode and invocation mode remain coupled as defined above.
 The readonly receiver remains unchanged. Elements are lent readonly in insertion
 order, including Move elements. Each owned or Copy result moves into a new list.
 On checked failure, produced results and the partial list are destroyed, the
@@ -380,10 +393,12 @@ source remains unchanged, and the callback error propagates.
 #### `filter`
 
 ```text
-filter(function I(T): bool predicate): List<T> effects(predicate) where T: Copy
+filter(function(T): bool predicate): List<T> effects(predicate) where T: Copy
+filter(writable function writable(T): bool predicate): List<T> effects(predicate) where T: Copy
 ```
 
-The callback is readonly- or writable-repeatable, never once, and nonescaping.
+The callback is readonly- or writable-repeatable and nonescaping, using the
+matching readonly or exclusive function-value borrow.
 The readonly receiver remains unchanged. Elements are tested in insertion order
 and selected Copy values enter a new ordered list. Move-element preserving
 filter waits for `Cloneable`; Stage 30 adds no consuming filter or borrowed view.
@@ -391,14 +406,16 @@ filter waits for `Cloneable`; Stage 30 adds no consuming filter or borrowed view
 #### `reduce`
 
 ```text
-reduce<A>(take A initial, function I(writable A, T): void reducer): A effects(reducer)
+reduce<A>(take A initial, function(writable A, T): void reducer): A effects(reducer)
+reduce<A>(take A initial, writable function writable(writable A, T): void reducer): A effects(reducer)
 ```
 
 `reduce` owns the initial accumulator. For each element in insertion order it
 lends the accumulator writably and the element readonly, then ends the writable
 borrow before the next iteration. The callback may be readonly- or
-writable-repeatable with respect to its own environment, is never once, and is
-nonescaping. Empty input returns the initial accumulator unchanged. Copy and Move
+writable-repeatable with respect to its own environment and is nonescaping.
+Writable-repeatable reducers are borrowed exclusively; once reducers are
+rejected. Empty input returns the initial accumulator unchanged. Copy and Move
 accumulators are supported. On checked failure, the borrow ends, the owned
 accumulator is destroyed exactly once, the source remains unchanged, and the
 error propagates.
@@ -562,6 +579,7 @@ executing components.
   effects, callable invocation fixtures, parser-backed LSP tests, VS Code and
   IntelliJ grammar changes, and shared editor fixtures. This task does not make
   those changes.
-- Future website closure guides, function-type and capture references,
-  `List<T>` algorithm pages, playground fixtures, and release locks remain
-  implementation work. This task does not update the website.
+- The website's versioned closure guides, `List<T>` API contract, target-state
+  collection matrix, writable-callback fixture, tests, and release lock are
+  synchronized in this authority beat. Stage 30h still owns activation against
+  executing compiler support rather than changing the accepted public contract.

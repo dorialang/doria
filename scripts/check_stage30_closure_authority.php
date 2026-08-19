@@ -81,7 +81,11 @@ function check_stage30_closure_authority(string $root): array
         'Descriptors are lean',
         'Stage 30g adds higher-order algorithms only to `List<T>`',
         'where T: Copy',
-        'function I(writable A, T): void reducer',
+        'map<U>(function(T): U transform): List<U> effects(transform)',
+        'map<U>(writable function writable(T): U transform): List<U> effects(transform)',
+        'filter(writable function writable(T): bool predicate): List<T> effects(predicate) where T: Copy',
+        'reduce<A>(take A initial, writable function writable(writable A, T): void reducer): A effects(reducer)',
+        'A writable callback can never pass through the readonly',
         'Stage 30a - Callable Grammar Completion',
         'E0641 retires by route',
         'Measurement Status: Pending Available Runner',
@@ -90,6 +94,8 @@ function check_stage30_closure_authority(string $root): array
 
     $forbid($decisionPath, $decision, [
         'function take(): Payload',
+        'function I(T)',
+        'function I(writable A, T)',
         'Stage 30 — Complete',
         'Stage 30 is implemented',
     ]);
@@ -157,8 +163,9 @@ function check_stage30_closure_authority(string $root): array
         '`List<T>` alone receives',
     ]);
     $require($stdlibPath, $stdlib, [
-        'Copy-only preserving `filter`',
-        'writable-accumulator `reduce`',
+        '`filter(function(T): bool $predicate): List<T>`',
+        '`reduce<A>(take A $initial, function(writable A, T): void $reducer): A`',
+        'writable function writable(...)` callback through an exclusive function-value borrow',
         'No other collection family receives them in Stage 30',
     ]);
     $require($examplesPath, $examples, [
