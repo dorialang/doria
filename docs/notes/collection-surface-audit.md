@@ -157,7 +157,11 @@ E0522, which is a good, specific diagnostic.
 | `isSupersetOf(S)`       | n/a  | n/a        | new | n/a        | new  | n/a | n/a   | n/a |
 | `clear()`               | new  | new        | new | new        | new  | new | new   | n/a |
 | `Type::from(src)`       | n/a  | n/a        | yes | yes        | yes  | yes | yes   | n/a |
-| `map`/`filter`/`reduce` | S30  | S30        | S30 | S30        | S30  | S30 | S30   | S30 |
+| `map`/`filter`/`reduce` | S30g | —          | —   | —          | —    | —   | —     | —   |
+
+Decision 0121 supersedes the audit's former broad Stage 30 row. Stage 30 adds
+these higher-order algorithms only to `List<T>`; other collection families need
+their own result-shape, order, ownership, and entry-model authority.
 
 Everything not listed falls to the E0521 catch-all.
 

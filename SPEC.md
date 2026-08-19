@@ -388,15 +388,66 @@ between arrow and block bodies preserves the capture list and its ownership
 modes. Own parameters and locals, top-level functions, constants, statics, type
 names, and enum cases do not require capture.
 
-This accepted surface is parseable and preserved in the source AST. Function
-types use `function(int): int` in type position, contain parameter types without
-parameter names, and use `function(): void` for a zero-parameter void form.
-Closure expressions and function-type semantic use currently emit the single
-catalogued `E0641` Stage 30 development boundary. Stage 30 owns semantic capture
-diagnostics, callable compatibility and effects, borrow-bound escape checking,
-HIR/MIR lowering, and execution. `$this` capture remains a bounded Stage 30
-design question; this specification does not invent `with ($this)` or assign it
-automatic behavior.
+### Accepted Stage 30 closure semantics
+
+Decision 0121 accepts structural Move-only function values. Their structural
+types preserve parameter ownership, invocation mode, return type, nullability,
+monomorphized identities, and checked effects:
+
+```doria
+function(int): int
+function(writable Counter): void
+function(take Payload): string
+function writable(int): int
+function once(): Payload
+function(string): Record throws ParseError, StorageError
+```
+
+Default invocation is readonly and repeatable. `writable` invocation requires
+exclusive access to the function value. `once` invocation consumes it.
+`function take()` is not Doria: `take` remains the ownership-transfer mode for a
+value, parameter, or capture. Closure bodies infer invocation mode and checked
+effects; closure expressions do not write their own `throws` clause.
+
+Any expression with a callable semantic type may be invoked in postfix position.
+The callee evaluates once, arguments evaluate left to right, and structural
+calls are positional with no named or default arguments. Named-function,
+static-method, bound-method, and constructor references are deferred; a wrapper
+closure adapts an existing callable.
+
+Lexical capture is validated by stable binding identity. A binding used by a
+nested closure must pass explicitly through every intermediate closure.
+Captures acquire at closure creation in written order and owned captures are
+destroyed in reverse logical order. Borrow-capturing closures cannot escape
+beyond their owners; no-capture and take-only environments may escape.
+
+Method-local closures capture the receiver explicitly. `with ($this)` borrows a
+readonly receiver and `with (writable $this)` borrows it exclusively. Doria
+rejects `with (take $this)`. PHP's implicit receiver capture does not define this
+behavior.
+
+The runtime model is a two-word descriptor/environment carrier. No-capture
+closures have a null environment and allocate no environment. Descriptors are
+lean compiler-private records, not reflective function signatures. Logical
+capture order remains source order; physical environment fields may reorder
+privately while preserving logical acquisition and destruction.
+
+Stage 30g adds `map`, Copy-only preserving `filter`, and writable-accumulator
+`reduce` to `List<T>` only. Their callbacks are nonescaping, process elements in
+insertion order, and propagate the callback's checked effects. A
+readonly-repeatable callback is borrowed readonly. A writable-repeatable callback
+is borrowed exclusively and requires writable access to the function value;
+invocation mode never silently widens a readonly function-value borrow. Other
+collection families receive no Stage 30 higher-order algorithms.
+
+### Current compiler support
+
+The compiler currently parses the base `fn` and anonymous-function grammar,
+explicit `with` lists, and `function(T): R` type syntax into the source AST. It
+does not yet parse Stage 30a's invocation-mode, parameter-ownership, function-type
+effect, or arbitrary callable-value invocation additions. Closure semantic use
+still emits the catalogued `E0641` development boundary, and no closure executes.
+Stage 30a Callable Grammar Completion is next; Stage 30 remains not implemented.
 
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.
 

@@ -5,7 +5,8 @@
 - **Date:** 2026-08-14
 - **Implementation status:** Scheduled for Stage 31 and Stage 33; not implemented
 - **Current pipeline:** Stage 29 — Checked errors end-to-end — Complete;
-  pre-Stage-30 closure grammar — Complete; Stage 30 semantics — Next
+  pre-Stage-30 closure grammar — Complete; Decision 0121 authority — Accepted;
+  Stage 30a callable grammar completion — Next
 - **Scope:** Package source discovery, file layout, compilation inputs, package
   visibility, and the Baton-to-compiler boundary
 - **Amends:** Decision 0028

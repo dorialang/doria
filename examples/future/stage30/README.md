@@ -7,10 +7,10 @@ fixtures, not executable examples or native parity fixtures: semantic checking
 stops at the catalogued E0641 boundary until Stage 30 implements closure
 semantics.
 
-The [Stage 30 Closure Authority Proposal](../../../docs/notes/stage30-closure-authority-proposal.md)
-is **In Review**. It records recommendations for project-owner rulings but does not
-change accepted language semantics. **Stage 30 is not implemented**; Decision
-0120 and the E0641 boundary remain authoritative.
+[Decision 0121](../../../docs/decisions/0121-closure-function-types-capture-semantics-and-execution-model.md)
+accepts the complete closure model and elaborates Decision 0120's explicit
+capture lists. **Stage 30 is not implemented**; Stage 30a Callable Grammar
+Completion is next, and E0641 remains the compiler boundary.
 
 The inventory covers:
 
@@ -175,6 +175,7 @@ echo $payload->value;
 
 A readonly capture is borrow-bound and may not escape its owner. The future
 diagnostic should recommend a taking capture when ownership transfer is the
-correct solution. No concrete escape fixture is fixed here because the exact
-callable-effect annotation and `$this` capture rules remain bounded Stage 30
-questions.
+correct solution. Decision 0121 also requires explicit `with ($this)` or
+`with (writable $this)`, rejects taking `$this`, infers closure effects from the
+body, and adds no closure-expression effect annotation. Those semantics remain
+unimplemented behind E0641.

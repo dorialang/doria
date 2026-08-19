@@ -154,8 +154,8 @@ future pass does not re-propose them as oversights.
 | Fluent mutators                                       | Unchanged from 0100: mutators return `void`; userland fluency is Decision 0088's capability                                                                                                      |
 | `List::from`, `Dictionary::from`, `T[]::from`         | **Withdrawn from 0100, not implemented** — see below                                                                                                                                             |
 
-`map` / `filter` / `reduce` are unchanged — named, and scheduled at Stage 30
-with closures.
+Decision 0121 finalizes `map` / `filter` / `reduce` for `List<T>` only at Stage
+30g. The other collection families do not receive those methods in Stage 30.
 
 **`::from` on the literal-constructible types is withdrawn.** 0100 states that
 `::from` is "also available as the equivalent explicit form" for `List`,
@@ -237,7 +237,10 @@ incomplete checks against this, not against a peer language.
 | `union` / `intersect` / `difference` | —    | —    | yes | —     | yes  | —   | —     |
 | `clear`                              | yes  | yes  | yes | yes   | yes  | yes | yes   |
 | `::from`                             | —    | —    | yes | yes   | yes  | yes | yes   |
-| `map` / `filter` / `reduce`          | S30  | S30  | S30 | S30   | S30  | S30 | S30   |
+| `map` / `filter` / `reduce`          | S30g | —    | —   | —     | —    | —   | —     |
+
+The higher-order row is amended by Decision 0121. `List<T>` alone receives
+these algorithms in Stage 30; every other family requires separate authority.
 
 `T[]` carries `length`, indexing, `foreach`, and `contains`; it is built by
 literal only. `List` and `Dictionary` are likewise literal-only. `Bytes`
@@ -401,8 +404,9 @@ and the language-server sweep in `dorialang/doria-language-server`.
   routed to E0559.
 - **Decision 0113 — Complete.** All four implementation slices are complete.
 - **Stage 27 — Complete.** Both Stage 28 slices and both Stage 28a slices are
-  also complete. Stage 29 is complete, the pre-Stage-30 closure grammar slice
-  is next, and pending controlled performance measurement remains non-blocking.
+  also complete. Stage 29 and the pre-Stage-30 closure grammar slice are
+  complete. Decision 0121 is accepted, Stage 30a is next, and pending controlled
+  performance measurement remains non-blocking.
 
 ### Slice 2 performance impact
 

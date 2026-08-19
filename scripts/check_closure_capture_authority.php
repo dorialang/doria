@@ -88,11 +88,11 @@ function check_closure_capture_authority(string $root): array
         'Parsed closures stop at the catalogued `E0641`',
         'This grammar slice does not perform free-variable discovery',
         'pre-Stage-30 grammar slice is complete',
-        'Stage 30 is next and remains unimplemented',
+        'Decision 0121 settles the remaining Stage 30 model',
         'Stage 30 consumes the source-preserving closure AST',
         'Decision 0119 owns source-ordered checked-effect sets',
-        'effect inference. Stage 30 must integrate closure bodies',
-        'Stage 30 must settle `$this` independently',
+        'Decision 0121 applies that model to closure function',
+        'Decision 0121 settles the questions this record deliberately left bounded',
         'The later structured-concurrency stage owns async closures',
         'The audit found no accepted grant of',
         'runtime reflection occurs',
@@ -110,11 +110,11 @@ function check_closure_capture_authority(string $root): array
         'authoritative `function(T): R` type syntax',
         'catalogued `E0641` Stage 30 boundary',
         'No free-variable discovery',
-        '**Stage 30 — Closures — Next; Not Implemented.**',
-        'A missing capture receives a capture-specific diagnostic',
-        'Closure callable types preserve Stage 29',
-        '`List<T>` `map`, `filter`, and `reduce` use this same closure model',
-        'No automatic-capture exception exists for Copy values',
+        '**Stage 30 Closure Authority — Accepted; Stage 30 — Not Implemented.**',
+        'Missing, duplicate, wrong-mode, unused, moved, and insufficient-lifetime captures',
+        'Function types preserve checked effects',
+        '`List<T>` alone receives `map`, Copy-only preserving `filter`, and writable-accumulator `reduce`',
+        'Copy/Move values have no implicit exception',
     ]);
     $forbid($planPath, $plan, [
         'auto-capturing arrow functions',
@@ -130,10 +130,11 @@ function check_closure_capture_authority(string $root): array
         '`with (take $value)` transfers ownership',
         '`use` is not a closure-capture alias',
         'A closure that uses no enclosing local',
-        'This accepted surface is parseable and preserved in the source AST',
-        'types use `function(int): int`',
-        'catalogued `E0641` Stage 30 development boundary',
-        '`$this` capture remains a bounded Stage 30',
+        'The compiler currently parses the base `fn` and anonymous-function grammar',
+        'function(int): int',
+        'catalogued `E0641` development boundary',
+        '`with ($this)` borrows a',
+        '`with (writable $this)` borrows it exclusively',
     ]);
 
     $require($pipelinePath, $pipeline, [
@@ -143,8 +144,10 @@ function check_closure_capture_authority(string $root): array
         'Stage 29 Slice 2 — Complete',
         'Corrective Beat: Native Collection Property Initializers — Complete',
         'Stage 29 Slice 3 — Complete',
-        'Stage 30 — Next, Not Implemented',
-        'Decision 0120 — Accepted; Stage 30 Authority Only',
+        'Stage 30a Callable Grammar Completion — Next',
+        'Stage 30 — Not Implemented',
+        'Decision 0120 — Accepted; Explicit Capture-List Foundation',
+        'Decision 0121 — Accepted; Stage 30 Closure Authority',
         'Pre-Stage-30 Grammar Slice — Complete',
     ]);
 
@@ -175,6 +178,7 @@ function check_closure_capture_authority(string $root): array
         'between an arrow\'s',
         'ordinary moved-value diagnostic',
         'readonly capture is borrow-bound',
+        'Decision 0121',
     ]);
 
     foreach (['Andrew', 'Lucy', 'Maya', 'Masiye'] as $personalName) {
@@ -242,7 +246,7 @@ function check_closure_capture_authority(string $root): array
     }
 
     $grammarPosition = strpos($plan, '**Pre-Stage-30 Grammar Slice — Closure accepted syntax — Complete.**');
-    $stage30Position = strpos($plan, '**Stage 30 — Closures — Next; Not Implemented.**');
+    $stage30Position = strpos($plan, '**Stage 30 Closure Authority — Accepted; Stage 30 — Not Implemented.**');
     if ($grammarPosition === false || $stage30Position === false || $grammarPosition >= $stage30Position) {
         $failures[] = "{$planPath}: the accepted-syntax grammar slice must precede Stage 30";
     }
