@@ -3280,10 +3280,8 @@ fn lower_foreach_statement(
         return result;
     }
 
-    let (collection_expr, projection) = dictionary_foreach_projection(&foreach.iterable).map_or(
-        (&foreach.iterable, CollectionForeachProjection::Main),
-        |value| value,
-    );
+    let (collection_expr, projection) = dictionary_foreach_projection(&foreach.iterable)
+        .unwrap_or((&foreach.iterable, CollectionForeachProjection::Main));
     context.push_scope();
     materialize_nested_collection_places(collection_expr, false, context)?;
     let (collection, collection_type) = match lower_collection_local(collection_expr, context) {
