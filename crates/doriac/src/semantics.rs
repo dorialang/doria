@@ -3838,6 +3838,11 @@ impl<'program> Checker<'program> {
     }
 
     fn resolve_type_ref_for_return_inference(&mut self, ty: &TypeRef) -> TypeId {
+        if let Some(grouped) = &ty.grouped {
+            let mut inner = grouped.inner.clone();
+            inner.nullable |= ty.nullable;
+            return self.resolve_type_ref_for_return_inference(&inner);
+        }
         if ty.nullable {
             let mut inner = ty.clone();
             inner.nullable = false;
@@ -12456,6 +12461,11 @@ impl<'program> Checker<'program> {
         position: TypePosition,
         declaring_class: Option<&str>,
     ) -> TypeId {
+        if let Some(grouped) = &ty.grouped {
+            let mut inner = grouped.inner.clone();
+            inner.nullable |= ty.nullable;
+            return self.resolve_type_ref_in_position(&inner, span, position, declaring_class);
+        }
         if let Some(function) = &ty.function {
             let report_boundary = self.function_type_boundary_suppression == 0;
             self.validate_function_type_signature(function, declaring_class);

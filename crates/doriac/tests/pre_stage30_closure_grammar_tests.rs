@@ -367,6 +367,25 @@ fn stage30a_grouped_types_preserve_authored_parentheses_and_composition() {
 }
 
 #[test]
+fn grouped_types_preserve_inner_and_outer_nullability_during_semantic_resolution() {
+    let source = r#"
+class Payload {}
+
+function inspect((?Payload) $inner, ?(Payload) $outer): void
+{
+}
+
+function main(): void
+{
+    inspect(null, null);
+}
+"#;
+
+    doriac::check_source("grouped_nullability.doria", source)
+        .expect("grouping must be semantically transparent to nullability");
+}
+
+#[test]
 fn stage30a_callable_postfix_ast_is_distinct_and_chains_with_exact_spans() {
     let source = r#"function main(): void
 {

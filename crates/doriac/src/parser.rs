@@ -15,6 +15,13 @@ pub struct Parser {
     diagnostics: Vec<Diagnostic>,
 }
 
+#[derive(Clone, Copy)]
+struct ParserCheckpoint {
+    current: usize,
+    pending_type_argument_close: Option<Span>,
+    diagnostics_len: usize,
+}
+
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         Self {
@@ -45,6 +52,20 @@ impl Parser {
         } else {
             Err(self.diagnostics)
         }
+    }
+
+    fn checkpoint(&self) -> ParserCheckpoint {
+        ParserCheckpoint {
+            current: self.current,
+            pending_type_argument_close: self.pending_type_argument_close,
+            diagnostics_len: self.diagnostics.len(),
+        }
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: ParserCheckpoint) {
+        self.current = checkpoint.current;
+        self.pending_type_argument_close = checkpoint.pending_type_argument_close;
+        self.diagnostics.truncate(checkpoint.diagnostics_len);
     }
 
     fn parse_namespace(&mut self) -> Option<NamespaceDecl> {
@@ -1044,9 +1065,7 @@ impl Parser {
         }
 
         if self.can_start_typed_decl() {
-            let checkpoint = self.current;
-            let diagnostics_checkpoint = self.diagnostics.len();
-            let pending_type_argument_close_checkpoint = self.pending_type_argument_close;
+            let checkpoint = self.checkpoint();
             let start = self.peek().span.start;
             let writable = self.match_kind(&TokenKind::Writable);
             if let Some(ty) = self.parse_type_ref() {
@@ -1076,9 +1095,7 @@ impl Parser {
                     }));
                 }
             }
-            self.current = checkpoint;
-            self.pending_type_argument_close = pending_type_argument_close_checkpoint;
-            self.diagnostics.truncate(diagnostics_checkpoint);
+            self.restore_checkpoint(checkpoint);
         }
 
         let expr = self.parse_expression()?;
@@ -1296,17 +1313,13 @@ impl Parser {
             return None;
         }
 
-        let current = self.current;
-        let pending_type_argument_close = self.pending_type_argument_close;
-        let diagnostic_count = self.diagnostics.len();
+        let checkpoint = self.checkpoint();
         let start = self.peek().span.start;
         let parsed = self.parse_type_ref();
         let end = self.previous().span.end;
         let followed_by_binding = matches!(self.peek().kind, TokenKind::Variable(_));
 
-        self.current = current;
-        self.pending_type_argument_close = pending_type_argument_close;
-        self.diagnostics.truncate(diagnostic_count);
+        self.restore_checkpoint(checkpoint);
 
         (parsed.is_some() && followed_by_binding).then(|| Span::new(start, end))
     }
@@ -2379,7 +2392,7 @@ impl Parser {
             self.current = enum_case_checkpoint;
         }
 
-        let checkpoint = self.current;
+        let checkpoint = self.checkpoint();
         if self.can_start_match_type_binding() {
             if let Some(ty) = self.parse_type_ref() {
                 if let Some((name, binding_span)) = self.consume_variable() {
@@ -2389,12 +2402,14 @@ impl Parser {
                             name,
                             span: binding_span,
                         },
-                        span: Span::new(self.tokens[checkpoint].span.start, binding_span.end),
+                        span: Span::new(
+                            self.tokens[checkpoint.current].span.start,
+                            binding_span.end,
+                        ),
                     });
                 }
             }
-            self.current = checkpoint;
-            self.pending_type_argument_close = None;
+            self.restore_checkpoint(checkpoint);
         }
 
         self.parse_expression().map(MatchPattern::Expression)
