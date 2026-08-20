@@ -2791,6 +2791,7 @@ impl Checker<'_> {
             }
             Expr::Identifier { .. }
             | Expr::Closure(_)
+            | Expr::CallableCall { .. }
             | Expr::String { .. }
             | Expr::Int { .. }
             | Expr::Float { .. }
@@ -4283,6 +4284,7 @@ fn expr_uses_variable(expr: &Expr, name: &str) -> bool {
         }
         Expr::This { .. }
         | Expr::Closure(_)
+        | Expr::CallableCall { .. }
         | Expr::Identifier { .. }
         | Expr::String { .. }
         | Expr::Int { .. }

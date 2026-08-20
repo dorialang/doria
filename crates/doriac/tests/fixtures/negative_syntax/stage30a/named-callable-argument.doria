@@ -1,0 +1,8 @@
+function main(): void
+{
+    $callback(value: 42);
+}
+
+function later(): void
+{
+}

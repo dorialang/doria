@@ -1,0 +1,7 @@
+function rejected((int, string) $value): void
+{
+}
+
+function later(): void
+{
+}

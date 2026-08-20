@@ -326,6 +326,28 @@ function main(): void throws Doria\Std\Io\IoError { echo choose(); }
 }
 
 #[test]
+fn match_true_accepts_grouped_expression_patterns_without_type_probe_diagnostics() {
+    let output = interpret(
+        r#"
+function condition(): bool { return true; }
+function main(): void throws Doria\Std\Io\IoError
+{
+    let $enabled = true;
+    echo match (true) {
+        (condition()) => "call",
+        default => "missing",
+    };
+    echo match (true) {
+        ($enabled) => " variable",
+        default => " missing",
+    };
+}
+"#,
+    );
+    assert_eq!(output.stdout, b"call variable");
+}
+
+#[test]
 fn arm_results_share_one_strict_type_with_nullable_unification() {
     doriac::check_source(
         "stage28.doria",

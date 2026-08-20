@@ -3838,6 +3838,11 @@ impl<'program> Checker<'program> {
     }
 
     fn resolve_type_ref_for_return_inference(&mut self, ty: &TypeRef) -> TypeId {
+        if let Some(grouped) = &ty.grouped {
+            let mut inner = grouped.inner.clone();
+            inner.nullable |= ty.nullable;
+            return self.resolve_type_ref_for_return_inference(&inner);
+        }
         if ty.nullable {
             let mut inner = ty.clone();
             inner.nullable = false;
@@ -6455,6 +6460,9 @@ impl<'program> Checker<'program> {
                 self.validate_closure_signature(closure, method_context);
                 self.report_stage_30_closure_boundary("closure", closure.span);
             }
+            Expr::CallableCall { span, .. } => {
+                self.report_stage_30_closure_boundary("callable-value invocation", *span);
+            }
             Expr::Variable { name, span } => {
                 if scopes.lookup(name).is_none() {
                     self.undeclared_variable(name, *span);
@@ -6815,6 +6823,13 @@ impl<'program> Checker<'program> {
     }
 
     fn report_stage_30_closure_boundary(&mut self, surface: &str, span: Span) {
+        if self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0641")
+        {
+            return;
+        }
         self.diagnostics.push(
             Diagnostic::unsupported_stage(
                 "E0641",
@@ -12446,6 +12461,11 @@ impl<'program> Checker<'program> {
         position: TypePosition,
         declaring_class: Option<&str>,
     ) -> TypeId {
+        if let Some(grouped) = &ty.grouped {
+            let mut inner = grouped.inner.clone();
+            inner.nullable |= ty.nullable;
+            return self.resolve_type_ref_in_position(&inner, span, position, declaring_class);
+        }
         if let Some(function) = &ty.function {
             let report_boundary = self.function_type_boundary_suppression == 0;
             self.validate_function_type_signature(function, declaring_class);
@@ -13887,7 +13907,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> TypeId {
         match expr {
-            Expr::Closure(_) => self.types.unknown(),
+            Expr::Closure(_) | Expr::CallableCall { .. } => self.types.unknown(),
             Expr::String { .. } | Expr::InterpolatedString { .. } => {
                 self.types.intern(TypeKind::String)
             }

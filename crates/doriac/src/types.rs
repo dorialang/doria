@@ -17,6 +17,9 @@ pub struct TypeRef {
     /// Source-preserving syntax for the accepted `function(T): R` type form.
     /// Semantic callable compatibility remains a Stage 30 concern.
     pub function: Option<Box<FunctionTypeRef>>,
+    /// Authored parentheses around a type. Grouping is transparent to semantic
+    /// type resolution, but its delimiters remain available to tooling.
+    pub grouped: Option<Box<GroupedTypeRef>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,16 +31,61 @@ pub enum TypeArgumentRef {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionTypeRef {
     pub keyword_span: Span,
+    pub invocation_mode: FunctionInvocationMode,
+    pub invocation_modifier_span: Option<Span>,
+    pub parameter_list_open_span: Span,
+    pub parameter_list_close_span: Span,
     pub parameter_list_span: Span,
     pub parameters: Vec<FunctionTypeParameterRef>,
+    pub colon_span: Span,
     pub return_type: Box<TypeRef>,
     pub return_type_span: Span,
+    pub throws_clause: Option<FunctionTypeThrowsRef>,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionTypeParameterRef {
+    pub ownership_mode: FunctionTypeParameterMode,
+    pub ownership_modifier_span: Option<Span>,
     pub ty: TypeRef,
+    pub type_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionInvocationMode {
+    Readonly,
+    Writable,
+    Once,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FunctionTypeParameterMode {
+    Readonly,
+    Writable,
+    Take,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionTypeThrowsRef {
+    pub keyword_span: Span,
+    pub entries: Vec<FunctionTypeEffectRef>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionTypeEffectRef {
+    pub ty: TypeRef,
+    pub type_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupedTypeRef {
+    pub open_span: Span,
+    pub inner: TypeRef,
+    pub close_span: Span,
     pub span: Span,
 }
 
@@ -48,6 +96,7 @@ impl TypeRef {
             arguments: Vec::new(),
             nullable: false,
             function: None,
+            grouped: None,
         }
     }
 
@@ -57,6 +106,7 @@ impl TypeRef {
             arguments: args.into_iter().map(TypeArgumentRef::Type).collect(),
             nullable: false,
             function: None,
+            grouped: None,
         }
     }
 
@@ -69,6 +119,7 @@ impl TypeRef {
             arguments,
             nullable: false,
             function: None,
+            grouped: None,
         }
     }
 
@@ -78,6 +129,22 @@ impl TypeRef {
             arguments: Vec::new(),
             nullable: false,
             function: Some(Box::new(function)),
+            grouped: None,
+        }
+    }
+
+    pub fn grouped(inner: TypeRef, open_span: Span, close_span: Span) -> Self {
+        Self {
+            name: inner.name.clone(),
+            arguments: inner.arguments.clone(),
+            nullable: false,
+            function: inner.function.clone(),
+            grouped: Some(Box::new(GroupedTypeRef {
+                open_span,
+                close_span,
+                span: open_span.merge(close_span),
+                inner,
+            })),
         }
     }
 
@@ -116,6 +183,15 @@ impl TypeRef {
     }
 
     pub fn resolve_self_in(&self, self_type: &TypeRef) -> Self {
+        if let Some(grouped) = &self.grouped {
+            let mut resolved = TypeRef::grouped(
+                grouped.inner.resolve_self_in(self_type),
+                grouped.open_span,
+                grouped.close_span,
+            );
+            resolved.nullable = self.nullable;
+            return resolved;
+        }
         if self.name == "self" {
             let mut resolved = self_type.clone();
             resolved.nullable |= self.nullable;
@@ -138,24 +214,51 @@ impl TypeRef {
             function: self.function.as_ref().map(|function| {
                 Box::new(FunctionTypeRef {
                     keyword_span: function.keyword_span,
+                    invocation_mode: function.invocation_mode,
+                    invocation_modifier_span: function.invocation_modifier_span,
+                    parameter_list_open_span: function.parameter_list_open_span,
+                    parameter_list_close_span: function.parameter_list_close_span,
                     parameter_list_span: function.parameter_list_span,
                     parameters: function
                         .parameters
                         .iter()
                         .map(|parameter| FunctionTypeParameterRef {
+                            ownership_mode: parameter.ownership_mode,
+                            ownership_modifier_span: parameter.ownership_modifier_span,
                             ty: parameter.ty.resolve_self_in(self_type),
+                            type_span: parameter.type_span,
                             span: parameter.span,
                         })
                         .collect(),
+                    colon_span: function.colon_span,
                     return_type: Box::new(function.return_type.resolve_self_in(self_type)),
                     return_type_span: function.return_type_span,
+                    throws_clause: function.throws_clause.as_ref().map(|clause| {
+                        FunctionTypeThrowsRef {
+                            keyword_span: clause.keyword_span,
+                            entries: clause
+                                .entries
+                                .iter()
+                                .map(|entry| FunctionTypeEffectRef {
+                                    ty: entry.ty.resolve_self_in(self_type),
+                                    type_span: entry.type_span,
+                                    span: entry.span,
+                                })
+                                .collect(),
+                            span: clause.span,
+                        }
+                    }),
                     span: function.span,
                 })
             }),
+            grouped: None,
         }
     }
 
     pub fn as_class_name(&self) -> Option<&str> {
+        if let Some(grouped) = &self.grouped {
+            return grouped.inner.as_class_name();
+        }
         if self.function.is_some() {
             return None;
         }
@@ -180,18 +283,43 @@ impl fmt::Display for TypeRef {
         if self.nullable {
             write!(formatter, "?")?;
         }
+        if let Some(grouped) = &self.grouped {
+            return write!(formatter, "({})", grouped.inner);
+        }
         if let Some(function) = &self.function {
             let parameters = function
                 .parameters
                 .iter()
-                .map(|parameter| parameter.ty.to_string())
+                .map(|parameter| {
+                    let prefix = match parameter.ownership_mode {
+                        FunctionTypeParameterMode::Readonly => "",
+                        FunctionTypeParameterMode::Writable => "writable ",
+                        FunctionTypeParameterMode::Take => "take ",
+                    };
+                    format!("{prefix}{}", parameter.ty)
+                })
                 .collect::<Vec<_>>()
                 .join(", ");
-            return write!(
+            let invocation = match function.invocation_mode {
+                FunctionInvocationMode::Readonly => "",
+                FunctionInvocationMode::Writable => " writable",
+                FunctionInvocationMode::Once => " once",
+            };
+            write!(
                 formatter,
-                "function({parameters}): {}",
+                "function{invocation}({parameters}): {}",
                 function.return_type
-            );
+            )?;
+            if let Some(clause) = &function.throws_clause {
+                let effects = clause
+                    .entries
+                    .iter()
+                    .map(|entry| entry.ty.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(formatter, " throws {effects}")?;
+            }
+            return Ok(());
         }
         if self.name == "[]" && self.arguments.len() == 1 {
             if let TypeArgumentRef::Type(element) = &self.arguments[0] {

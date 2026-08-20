@@ -1,0 +1,7 @@
+function rejected(function(): void throws $callback): void
+{
+}
+
+function later(): void
+{
+}

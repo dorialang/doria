@@ -344,7 +344,8 @@ Runner** and non-blocking; the accepted performance standard is unchanged.
 Stage 29 is complete. The pre-Stage-30 closure grammar slice is complete:
 Decision 0120's base closure forms and function-type spelling now parse into
 source-preserving AST nodes. Decision 0121 accepts complete closure effect and
-function-type authority. Stage 30a is next; closure semantics and execution are
+function-type authority. Stage 30a grammar is complete; Stage 30b semantic
+function types and captures is next, while closure execution remains
 not implemented, and accepted closure syntax stops at E0641.
 
 ## Explicit Exclusions

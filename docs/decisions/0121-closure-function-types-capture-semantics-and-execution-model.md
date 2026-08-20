@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-19
 - **Date:** 2026-08-19
-- **Implementation Status:** Authority Accepted; Stage 30a Next; Stage 30 Not Implemented
+- **Implementation Status:** Authority Accepted; Stage 30a Implemented; Stage 30b Next; Stage 30 Not Complete
 - **Scope:** Function types, closure invocation, capture validation, ownership,
   lifetime, representation, backend behavior, diagnostics, and Stage 30
   `List<T>` algorithms
@@ -22,9 +22,30 @@ left function-type capabilities, `$this`, free-variable validation, escape,
 runtime representation, execution, and collection callback contracts for Stage
 30. Decision 0119 independently fixed checked-effect sets and checked-call ABI.
 
-This record closes those authority questions before implementation. It does not
-implement Stage 30. The compiler continues to stop semantic closure use at
-E0641, and Stage 30a Callable Grammar Completion is the next work unit.
+This record closes those authority questions before implementation. Stage 30a
+now implements the accepted callable grammar while semantic closure use still
+stops at E0641. Stage 30b Semantic Function Types And Captures is next; Stage 30
+remains in progress and is not complete.
+
+## Accepted Amendment: Parenthesized Type Grouping
+
+**Accepted: 2026-08-20**
+
+Doria accepts `(Type)` as source-preserving type grouping. Grouping makes nested
+function-type boundaries and ownership of following checked-effect clauses
+explicit:
+
+```doria
+function((function(): int throws FirstError), string): void
+function(): (function(): int) throws Failure
+function(): (function(): int throws InnerError) throws OuterError
+```
+
+The authored opening parenthesis, inner type, closing parenthesis, and whole
+group span remain in parsed type syntax. Grouping has the semantics of its inner
+type. It is not a tuple, product, union, runtime wrapper, or nominal type, and
+`(int, string)` is rejected. Stage 30a implements this grammar clarification;
+semantic function types and checked-effect compatibility remain Stage 30b work.
 
 ## Decision
 
@@ -472,10 +493,10 @@ Stage 30h - Cross-Repository Closure
 
 - **Authority Acceptance:** this record, synchronized authority, and guardrails;
   no compiler execution change.
-- **Stage 30a:** parameter ownership in function types, writable/once modes,
+- **Stage 30a — Complete:** parameter ownership in function types, writable/once modes,
   function-type effects, arbitrary postfix invocation, AST/recovery/fixtures,
   coordinated editor tooling; E0641 remains.
-- **Stage 30b:** semantic function types, compatibility, binding identities,
+- **Stage 30b — Next:** semantic function types, compatibility, binding identities,
   capture discovery/validation, `$this`, fixes, and inferred modes/effects; no
   HIR/MIR.
 - **Stage 30c:** acquisition, lifetime/escape, Move behavior, once consumption,
@@ -575,10 +596,10 @@ executing components.
   structural function-type `throws` sets.
 - Decision 0113's broad all-collection Stage 30 row is superseded; only `List<T>`
   receives these algorithms.
-- Stage 30a must coordinate the compiler pin, `once`, function-type ownership and
-  effects, callable invocation fixtures, parser-backed LSP tests, VS Code and
-  IntelliJ grammar changes, and shared editor fixtures. This task does not make
-  those changes.
+- Stage 30a coordinates the compiler pin, `once`, function-type ownership and
+  effects, grouping, callable invocation fixtures, parser-backed LSP tests, VS
+  Code and IntelliJ grammar changes, and shared editor fixtures. It adds no
+  closure semantics or execution route.
 - The website's versioned closure guides, `List<T>` API contract, target-state
   collection matrix, writable-callback fixture, tests, and release lock are
   synchronized in this authority beat. Stage 30h still owns activation against

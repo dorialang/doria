@@ -3,13 +3,23 @@ use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::lexer::{Lexer, StringQuoteKind, Token, TokenKind};
 use crate::source::{SourceFile, Span};
 use crate::string_literal::{decode_escape, interpolation_close};
-use crate::types::{FunctionTypeParameterRef, FunctionTypeRef, TypeRef};
+use crate::types::{
+    FunctionInvocationMode, FunctionTypeEffectRef, FunctionTypeParameterMode,
+    FunctionTypeParameterRef, FunctionTypeRef, FunctionTypeThrowsRef, TypeRef,
+};
 
 pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
     pending_type_argument_close: Option<Span>,
     diagnostics: Vec<Diagnostic>,
+}
+
+#[derive(Clone, Copy)]
+struct ParserCheckpoint {
+    current: usize,
+    pending_type_argument_close: Option<Span>,
+    diagnostics_len: usize,
 }
 
 impl Parser {
@@ -42,6 +52,20 @@ impl Parser {
         } else {
             Err(self.diagnostics)
         }
+    }
+
+    fn checkpoint(&self) -> ParserCheckpoint {
+        ParserCheckpoint {
+            current: self.current,
+            pending_type_argument_close: self.pending_type_argument_close,
+            diagnostics_len: self.diagnostics.len(),
+        }
+    }
+
+    fn restore_checkpoint(&mut self, checkpoint: ParserCheckpoint) {
+        self.current = checkpoint.current;
+        self.pending_type_argument_close = checkpoint.pending_type_argument_close;
+        self.diagnostics.truncate(checkpoint.diagnostics_len);
     }
 
     fn parse_namespace(&mut self) -> Option<NamespaceDecl> {
@@ -1041,9 +1065,7 @@ impl Parser {
         }
 
         if self.can_start_typed_decl() {
-            let checkpoint = self.current;
-            let diagnostics_checkpoint = self.diagnostics.len();
-            let pending_type_argument_close_checkpoint = self.pending_type_argument_close;
+            let checkpoint = self.checkpoint();
             let start = self.peek().span.start;
             let writable = self.match_kind(&TokenKind::Writable);
             if let Some(ty) = self.parse_type_ref() {
@@ -1073,9 +1095,7 @@ impl Parser {
                     }));
                 }
             }
-            self.current = checkpoint;
-            self.pending_type_argument_close = pending_type_argument_close_checkpoint;
-            self.diagnostics.truncate(diagnostics_checkpoint);
+            self.restore_checkpoint(checkpoint);
         }
 
         let expr = self.parse_expression()?;
@@ -1293,17 +1313,13 @@ impl Parser {
             return None;
         }
 
-        let current = self.current;
-        let pending_type_argument_close = self.pending_type_argument_close;
-        let diagnostic_count = self.diagnostics.len();
+        let checkpoint = self.checkpoint();
         let start = self.peek().span.start;
         let parsed = self.parse_type_ref();
         let end = self.previous().span.end;
         let followed_by_binding = matches!(self.peek().kind, TokenKind::Variable(_));
 
-        self.current = current;
-        self.pending_type_argument_close = pending_type_argument_close;
-        self.diagnostics.truncate(diagnostic_count);
+        self.restore_checkpoint(checkpoint);
 
         (parsed.is_some() && followed_by_binding).then(|| Span::new(start, end))
     }
@@ -2016,21 +2032,39 @@ impl Parser {
             }
 
             if self.match_kind(&TokenKind::LeftParen) {
+                let open_span = self.previous().span;
+                let callee_span = expr.span();
                 let args = self.parse_argument_list_after_open()?;
+                let close_span = self.previous().span;
                 match expr {
                     Expr::Identifier { name, span } => {
-                        let end = self.previous().span.end;
                         expr = Expr::FunctionCall {
                             name,
                             args,
-                            span: Span::new(span.start, end),
+                            span: Span::new(span.start, close_span.end),
                         };
                     }
-                    _ => {
-                        self.error(
-                            "only named function calls are supported in this position",
-                            expr.span(),
-                        );
+                    callee => {
+                        if let Some(named) = args.iter().find_map(|argument| argument.name.as_ref())
+                        {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "P0001",
+                                    "callable-value invocation uses positional arguments because structural function types contain no parameter names",
+                                    named.span,
+                                )
+                                .with_title("Callable Value Argument Cannot Be Named")
+                                .with_help("remove the argument name and pass the value positionally"),
+                            );
+                        }
+                        expr = Expr::CallableCall {
+                            callee: Box::new(callee),
+                            open_span,
+                            args,
+                            close_span,
+                            argument_list_span: open_span.merge(close_span),
+                            span: callee_span.merge(close_span),
+                        };
                     }
                 }
                 continue;
@@ -2358,7 +2392,7 @@ impl Parser {
             self.current = enum_case_checkpoint;
         }
 
-        let checkpoint = self.current;
+        let checkpoint = self.checkpoint();
         if self.can_start_match_type_binding() {
             if let Some(ty) = self.parse_type_ref() {
                 if let Some((name, binding_span)) = self.consume_variable() {
@@ -2368,39 +2402,21 @@ impl Parser {
                             name,
                             span: binding_span,
                         },
-                        span: Span::new(self.tokens[checkpoint].span.start, binding_span.end),
+                        span: Span::new(
+                            self.tokens[checkpoint.current].span.start,
+                            binding_span.end,
+                        ),
                     });
                 }
             }
-            self.current = checkpoint;
-            self.pending_type_argument_close = None;
+            self.restore_checkpoint(checkpoint);
         }
 
         self.parse_expression().map(MatchPattern::Expression)
     }
 
     fn can_start_match_type_binding(&self) -> bool {
-        matches!(
-            self.peek().kind,
-            TokenKind::Question
-                | TokenKind::Void
-                | TokenKind::IntType
-                | TokenKind::Int8Type
-                | TokenKind::Int16Type
-                | TokenKind::Int32Type
-                | TokenKind::Int64Type
-                | TokenKind::UInt8Type
-                | TokenKind::UInt16Type
-                | TokenKind::UInt32Type
-                | TokenKind::UInt64Type
-                | TokenKind::FloatType
-                | TokenKind::Float32Type
-                | TokenKind::Float64Type
-                | TokenKind::StringType
-                | TokenKind::BoolType
-                | TokenKind::Identifier(_)
-                | TokenKind::SelfType
-        )
+        self.can_start_type_ref()
     }
 
     fn parse_scoped_access(
@@ -2634,6 +2650,12 @@ impl Parser {
             | Expr::New { args, .. } => args
                 .iter()
                 .any(|arg| Self::contains_bare_identifier(&arg.value)),
+            Expr::CallableCall { callee, args, .. } => {
+                Self::contains_bare_identifier(callee)
+                    || args
+                        .iter()
+                        .any(|arg| Self::contains_bare_identifier(&arg.value))
+            }
             Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
                 Self::contains_bare_identifier(expr)
             }
@@ -2920,7 +2942,62 @@ impl Parser {
         }
     }
 
-    fn parse_function_type_ref(&mut self, keyword_span: Span, nullable: bool) -> Option<TypeRef> {
+    fn parse_function_type_ref(&mut self, keyword_span: Span) -> Option<TypeRef> {
+        let mut invocation_mode = FunctionInvocationMode::Readonly;
+        let mut invocation_modifier_span = None;
+        if matches!(
+            self.peek().kind,
+            TokenKind::Writable | TokenKind::Once | TokenKind::Take | TokenKind::Readonly
+        ) {
+            let modifier = self.advance().clone();
+            invocation_modifier_span = Some(modifier.span);
+            invocation_mode = match modifier.kind {
+                TokenKind::Writable => FunctionInvocationMode::Writable,
+                TokenKind::Once => FunctionInvocationMode::Once,
+                TokenKind::Take => {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "P0001",
+                            "`take` transfers a function value; `once` describes consuming invocation",
+                            modifier.span,
+                        )
+                        .with_title("Function Invocation Mode Uses `Once`")
+                        .with_help("replace `take` with `once`")
+                        .with_fix(modifier.span, "once"),
+                    );
+                    FunctionInvocationMode::Once
+                }
+                TokenKind::Readonly => {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "P0001",
+                            "readonly invocation is the unmodified `function(...)` form",
+                            modifier.span,
+                        )
+                        .with_title("Readonly Function Mode Is Implicit")
+                        .with_help("omit `readonly`")
+                        .with_fix(modifier.span, ""),
+                    );
+                    FunctionInvocationMode::Readonly
+                }
+                _ => unreachable!("function invocation modifier lookahead is exact"),
+            };
+        }
+        while matches!(
+            self.peek().kind,
+            TokenKind::Writable | TokenKind::Once | TokenKind::Take | TokenKind::Readonly
+        ) {
+            let modifier = self.advance().clone();
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "a function type accepts at most one invocation modifier",
+                    modifier.span,
+                )
+                .with_title("Function Invocation Mode Is Duplicated")
+                .with_help("keep exactly one of the default readonly form, `writable`, or `once`"),
+            );
+        }
         let open_span = self
             .expect(TokenKind::LeftParen, "expected `(` after `function` type")?
             .span;
@@ -2928,20 +3005,111 @@ impl Parser {
         if !self.check(&TokenKind::RightParen) {
             loop {
                 let start = self.peek().span.start;
-                let ty = self.parse_type_ref_inner()?;
-                let span = Span::new(start, self.previous().span.end);
-                if let Some((_name, name_span)) = self.consume_variable() {
+                let mut ownership_mode = FunctionTypeParameterMode::Readonly;
+                let mut ownership_modifier_span = None;
+                if matches!(
+                    self.peek().kind,
+                    TokenKind::Writable | TokenKind::Take | TokenKind::Readonly
+                ) {
+                    let modifier = self.advance().clone();
+                    ownership_modifier_span = Some(modifier.span);
+                    ownership_mode = match modifier.kind {
+                        TokenKind::Writable => FunctionTypeParameterMode::Writable,
+                        TokenKind::Take => FunctionTypeParameterMode::Take,
+                        TokenKind::Readonly => {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "P0001",
+                                    "readonly function-type parameters use a bare type",
+                                    modifier.span,
+                                )
+                                .with_title("Readonly Parameter Mode Is Implicit")
+                                .with_help("omit `readonly`")
+                                .with_fix(modifier.span, ""),
+                            );
+                            FunctionTypeParameterMode::Readonly
+                        }
+                        _ => unreachable!("parameter ownership modifier lookahead is exact"),
+                    };
+                }
+                while matches!(
+                    self.peek().kind,
+                    TokenKind::Writable | TokenKind::Take | TokenKind::Readonly
+                ) {
+                    let modifier = self.advance().clone();
+                    let duplicate = matches!(
+                        (ownership_mode, &modifier.kind),
+                        (FunctionTypeParameterMode::Writable, TokenKind::Writable)
+                            | (FunctionTypeParameterMode::Take, TokenKind::Take)
+                            | (FunctionTypeParameterMode::Readonly, TokenKind::Readonly)
+                    );
+                    let (title, message) = if duplicate {
+                        (
+                            "Function Type Parameter Mode Is Duplicated",
+                            "a function-type parameter cannot repeat its ownership modifier",
+                        )
+                    } else {
+                        (
+                            "Function Type Parameter Modes Conflict",
+                            "`take` and `writable` cannot describe the same function-type parameter",
+                        )
+                    };
+                    self.diagnostics.push(
+                        Diagnostic::new("P0001", message, modifier.span)
+                            .with_title(title)
+                            .with_help("keep one ownership mode on the parameter"),
+                    );
+                }
+                if self.check(&TokenKind::RightParen) || self.check(&TokenKind::Comma) {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "P0001",
-                            "function-type parameters contain types, not parameter names",
-                            name_span,
+                            "a function-type parameter ownership modifier must be followed by a type",
+                            ownership_modifier_span.unwrap_or(self.peek().span),
                         )
-                        .with_title("Function Type Parameter Has A Name")
-                        .with_help("remove the variable name from the function type"),
+                        .with_title("Function Type Parameter Type Is Missing"),
                     );
+                    parameters.push(FunctionTypeParameterRef {
+                        ownership_mode,
+                        ownership_modifier_span,
+                        ty: TypeRef::unknown(),
+                        type_span: Span::new(self.peek().span.start, self.peek().span.start),
+                        span: Span::new(start, self.peek().span.start),
+                    });
+                } else {
+                    let type_start = self.peek().span.start;
+                    let ty = self.parse_type_ref_inner()?;
+                    let type_span = Span::new(type_start, self.previous().span.end);
+                    if ty
+                        .function
+                        .as_ref()
+                        .is_some_and(|nested| nested.throws_clause.is_some())
+                        && ty.grouped.is_none()
+                    {
+                        self.report_ambiguous_nested_function_effects(
+                            ty.function.as_ref().unwrap().span,
+                        );
+                    }
+                    let span = Span::new(start, type_span.end);
+                    if let Some((_name, name_span)) = self.consume_variable() {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "P0001",
+                                "function-type parameters contain types, not parameter names",
+                                name_span,
+                            )
+                            .with_title("Function Type Parameter Has A Name")
+                            .with_help("remove the variable name from the function type"),
+                        );
+                    }
+                    parameters.push(FunctionTypeParameterRef {
+                        ownership_mode,
+                        ownership_modifier_span,
+                        ty,
+                        type_span,
+                        span,
+                    });
                 }
-                parameters.push(FunctionTypeParameterRef { ty, span });
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }
@@ -2960,95 +3128,224 @@ impl Parser {
             TokenKind::Colon,
             "expected `:` before function-type return type",
         )?;
+        let colon_span = self.previous().span;
         let return_start = self.peek().span.start;
         let return_type = self.parse_type_ref_inner()?;
         let return_type_span = Span::new(return_start, self.previous().span.end);
-        let span = Span::new(keyword_span.start, return_type_span.end);
-        let mut ty = TypeRef::function(FunctionTypeRef {
+        if return_type
+            .function
+            .as_ref()
+            .is_some_and(|nested| nested.throws_clause.is_some())
+            && return_type.grouped.is_none()
+        {
+            self.report_ambiguous_nested_function_effects(
+                return_type.function.as_ref().unwrap().span,
+            );
+        }
+        let throws_clause = self.parse_function_type_throws_clause()?;
+        let end = throws_clause
+            .as_ref()
+            .map(|clause| clause.span.end)
+            .unwrap_or(return_type_span.end);
+        let span = Span::new(keyword_span.start, end);
+        Some(TypeRef::function(FunctionTypeRef {
             keyword_span,
+            invocation_mode,
+            invocation_modifier_span,
+            parameter_list_open_span: open_span,
+            parameter_list_close_span: close_span,
             parameter_list_span: open_span.merge(close_span),
             parameters,
+            colon_span,
             return_type: Box::new(return_type),
             return_type_span,
+            throws_clause,
             span,
-        });
-        ty.nullable = nullable;
-        Some(ty)
+        }))
+    }
+
+    fn parse_function_type_throws_clause(&mut self) -> Option<Option<FunctionTypeThrowsRef>> {
+        if !self.match_kind(&TokenKind::Throws) {
+            return Some(None);
+        }
+        let keyword_span = self.previous().span;
+        let mut entries = Vec::new();
+        if !self.can_start_type_ref() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "a function-type `throws` clause requires at least one effect type",
+                    self.peek().span,
+                )
+                .with_title("Function Type Effect Is Missing"),
+            );
+            return Some(Some(FunctionTypeThrowsRef {
+                keyword_span,
+                entries,
+                span: keyword_span,
+            }));
+        }
+        loop {
+            let start = self.peek().span.start;
+            let ty = self.parse_type_ref_inner()?;
+            let type_span = Span::new(start, self.previous().span.end);
+            entries.push(FunctionTypeEffectRef {
+                ty,
+                type_span,
+                span: type_span,
+            });
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+            if !self.can_start_type_ref() {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "a trailing comma in a function-type `throws` clause must be followed by an effect type",
+                        self.previous().span,
+                    )
+                    .with_title("Function Type Effect Is Missing"),
+                );
+                break;
+            }
+        }
+        let end = entries
+            .last()
+            .map(|entry| entry.span.end)
+            .unwrap_or(keyword_span.end);
+        Some(Some(FunctionTypeThrowsRef {
+            keyword_span,
+            entries,
+            span: Span::new(keyword_span.start, end),
+        }))
+    }
+
+    fn report_ambiguous_nested_function_effects(&mut self, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "P0001",
+                "a nested throwing function type must be grouped so its effect list has an explicit boundary",
+                span,
+            )
+            .with_title("Nested Function Type Effects Need Grouping")
+            .with_help("wrap the nested function type in parentheses"),
+        );
     }
 
     fn parse_type_ref_inner(&mut self) -> Option<TypeRef> {
         let nullable = self.match_kind(&TokenKind::Question);
         let token = self.advance().clone();
-        if matches!(token.kind, TokenKind::Function) {
-            return self.parse_function_type_ref(token.span, nullable);
-        }
-        let name = match token.kind {
-            TokenKind::Void => "void".to_string(),
-            TokenKind::IntType => "int".to_string(),
-            TokenKind::Int8Type => "int8".to_string(),
-            TokenKind::Int16Type => "int16".to_string(),
-            TokenKind::Int32Type => "int32".to_string(),
-            TokenKind::Int64Type => "int64".to_string(),
-            TokenKind::UInt8Type => "uint8".to_string(),
-            TokenKind::UInt16Type => "uint16".to_string(),
-            TokenKind::UInt32Type => "uint32".to_string(),
-            TokenKind::UInt64Type => "uint64".to_string(),
-            TokenKind::FloatType => "float".to_string(),
-            TokenKind::Float32Type => "float32".to_string(),
-            TokenKind::Float64Type => "float64".to_string(),
-            TokenKind::StringType => "string".to_string(),
-            TokenKind::BoolType => "bool".to_string(),
-            TokenKind::Null => "null".to_string(),
-            TokenKind::Object => "object".to_string(),
-            TokenKind::Resource => "resource".to_string(),
-            TokenKind::SelfType => "self".to_string(),
-            TokenKind::Identifier(name) => self.finish_qualified_name(
-                name,
-                "expected type-name segment after namespace separator",
-            )?,
-            other => {
-                self.error(
-                    format!("expected type name, found `{}`", token_name(&other)),
-                    self.previous().span,
+        let mut ty = if matches!(token.kind, TokenKind::Function) {
+            self.parse_function_type_ref(token.span)?
+        } else if matches!(token.kind, TokenKind::LeftParen) {
+            if self.check(&TokenKind::RightParen) {
+                let close_span = self.advance().span;
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "a type grouping must contain exactly one type",
+                        token.span.merge(close_span),
+                    )
+                    .with_title("Type Group Is Empty")
+                    .with_help("write one type between the parentheses"),
                 );
-                return None;
-            }
-        };
-
-        let mut arguments = Vec::new();
-        if self.match_kind(&TokenKind::Less) {
-            loop {
-                let negative = self.match_kind(&TokenKind::Minus);
-                if let TokenKind::IntLiteral(value) = self.peek().kind.clone() {
-                    self.advance();
-                    arguments.push(crate::types::TypeArgumentRef::Value(if negative {
-                        format!("-{value}")
-                    } else {
-                        value
-                    }));
-                } else {
-                    if negative {
-                        self.error(
-                            "expected integer compile-time value after `-`",
-                            self.peek().span,
-                        );
-                        return None;
+                TypeRef::grouped(TypeRef::unknown(), token.span, close_span)
+            } else {
+                let inner = self.parse_type_ref_inner()?;
+                if self.match_kind(&TokenKind::Comma) {
+                    let comma_span = self.previous().span;
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "P0001",
+                            "parenthesized type grouping contains one type; Doria does not define tuple types here",
+                            comma_span,
+                        )
+                        .with_title("Tuple Type Is Not Supported")
+                        .with_help("use a named class or another explicit aggregate type"),
+                    );
+                    while !self.check(&TokenKind::RightParen) && !self.is_at_end() {
+                        if self.parse_type_ref_inner().is_none() {
+                            break;
+                        }
+                        if !self.match_kind(&TokenKind::Comma) {
+                            break;
+                        }
                     }
-                    arguments.push(crate::types::TypeArgumentRef::Type(
-                        self.parse_type_ref_inner()?,
-                    ));
                 }
-                if !self.match_kind(&TokenKind::Comma) {
-                    break;
-                }
+                let close_span = self
+                    .expect(TokenKind::RightParen, "expected `)` after grouped type")?
+                    .span;
+                TypeRef::grouped(inner, token.span, close_span)
             }
-            self.expect_type_argument_close()?;
-        }
-
-        let mut ty = if arguments.is_empty() {
-            TypeRef::named(name)
         } else {
-            TypeRef::generic_with_arguments(name, arguments)
+            let name = match token.kind {
+                TokenKind::Void => "void".to_string(),
+                TokenKind::IntType => "int".to_string(),
+                TokenKind::Int8Type => "int8".to_string(),
+                TokenKind::Int16Type => "int16".to_string(),
+                TokenKind::Int32Type => "int32".to_string(),
+                TokenKind::Int64Type => "int64".to_string(),
+                TokenKind::UInt8Type => "uint8".to_string(),
+                TokenKind::UInt16Type => "uint16".to_string(),
+                TokenKind::UInt32Type => "uint32".to_string(),
+                TokenKind::UInt64Type => "uint64".to_string(),
+                TokenKind::FloatType => "float".to_string(),
+                TokenKind::Float32Type => "float32".to_string(),
+                TokenKind::Float64Type => "float64".to_string(),
+                TokenKind::StringType => "string".to_string(),
+                TokenKind::BoolType => "bool".to_string(),
+                TokenKind::Null => "null".to_string(),
+                TokenKind::Object => "object".to_string(),
+                TokenKind::Resource => "resource".to_string(),
+                TokenKind::SelfType => "self".to_string(),
+                TokenKind::Identifier(name) => self.finish_qualified_name(
+                    name,
+                    "expected type-name segment after namespace separator",
+                )?,
+                other => {
+                    self.error(
+                        format!("expected type name, found `{}`", token_name(&other)),
+                        self.previous().span,
+                    );
+                    return None;
+                }
+            };
+
+            let mut arguments = Vec::new();
+            if self.match_kind(&TokenKind::Less) {
+                loop {
+                    let negative = self.match_kind(&TokenKind::Minus);
+                    if let TokenKind::IntLiteral(value) = self.peek().kind.clone() {
+                        self.advance();
+                        arguments.push(crate::types::TypeArgumentRef::Value(if negative {
+                            format!("-{value}")
+                        } else {
+                            value
+                        }));
+                    } else {
+                        if negative {
+                            self.error(
+                                "expected integer compile-time value after `-`",
+                                self.peek().span,
+                            );
+                            return None;
+                        }
+                        arguments.push(crate::types::TypeArgumentRef::Type(
+                            self.parse_type_ref_inner()?,
+                        ));
+                    }
+                    if !self.match_kind(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect_type_argument_close()?;
+            }
+
+            if arguments.is_empty() {
+                TypeRef::named(name)
+            } else {
+                TypeRef::generic_with_arguments(name, arguments)
+            }
         };
 
         while self.pending_type_argument_close.is_none() && self.match_kind(&TokenKind::LeftBracket)
@@ -3060,7 +3357,10 @@ impl Parser {
             ty = TypeRef::array_of(ty);
         }
 
-        Some(if nullable { ty.nullable() } else { ty })
+        if nullable {
+            ty = ty.nullable();
+        }
+        Some(ty)
     }
 
     fn expect_type_argument_close(&mut self) -> Option<()> {
@@ -3151,10 +3451,14 @@ impl Parser {
     }
 
     fn can_start_typed_decl(&self) -> bool {
+        self.check(&TokenKind::Writable) || self.can_start_type_ref()
+    }
+
+    fn can_start_type_ref(&self) -> bool {
         matches!(
             self.peek().kind,
-            TokenKind::Writable
-                | TokenKind::Question
+            TokenKind::Question
+                | TokenKind::LeftParen
                 | TokenKind::Void
                 | TokenKind::IntType
                 | TokenKind::Int8Type
@@ -3338,6 +3642,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Let => "let",
         TokenKind::With => "with",
         TokenKind::Take => "take",
+        TokenKind::Once => "once",
         TokenKind::Writable => "writable",
         TokenKind::Readonly => "readonly",
         TokenKind::Return => "return",

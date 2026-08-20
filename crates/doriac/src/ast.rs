@@ -546,6 +546,14 @@ pub enum Expr {
         args: Vec<Argument>,
         span: Span,
     },
+    CallableCall {
+        callee: Box<Expr>,
+        open_span: Span,
+        args: Vec<Argument>,
+        close_span: Span,
+        argument_list_span: Span,
+        span: Span,
+    },
     StaticCall {
         qualifier: StaticQualifier,
         qualifier_span: Span,
@@ -749,6 +757,7 @@ impl Expr {
             | Expr::MethodCall { span, .. }
             | Expr::IsType { span, .. }
             | Expr::FunctionCall { span, .. }
+            | Expr::CallableCall { span, .. }
             | Expr::StaticCall { span, .. }
             | Expr::StaticMember { span, .. }
             | Expr::New { span, .. }
