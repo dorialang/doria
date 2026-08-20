@@ -3564,9 +3564,10 @@ impl Parser {
     }
 
     fn advance(&mut self) -> &Token {
-        if !self.is_at_end() {
-            self.current += 1;
+        if self.is_at_end() {
+            return self.peek();
         }
+        self.current += 1;
         self.previous()
     }
 

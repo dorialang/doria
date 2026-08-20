@@ -796,9 +796,13 @@ fn rejects_malformed_string_interpolation() {
 
 #[test]
 fn rejects_truncated_collections_without_recursive_eof_parsing() {
-    for source in ["[", "f.unction ma { ec ;void { ec ; [\n"] {
+    for source in [
+        "[",
+        "f.unction ma { ec ;void { ec ; [\n",
+        "function mainfuncti(",
+    ] {
         let diagnostics = doriac::parse_source("fuzz-regression.doria", source)
-            .expect_err("truncated collection input must produce a diagnostic");
+            .expect_err("truncated input must produce a diagnostic");
         assert!(!diagnostics.is_empty());
     }
 }
