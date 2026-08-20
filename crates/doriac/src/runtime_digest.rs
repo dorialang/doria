@@ -50,10 +50,14 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     let bit_length = (bytes.len() as u64).wrapping_mul(8);
     padded.extend_from_slice(&bit_length.to_be_bytes());
 
-    for chunk in padded.chunks_exact(64) {
+    let (chunks, remainder) = padded.as_chunks::<64>();
+    debug_assert!(remainder.is_empty());
+    for chunk in chunks {
         let mut schedule = [0u32; 64];
-        for (index, word) in chunk.chunks_exact(4).enumerate() {
-            schedule[index] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+        let (words, remainder) = chunk.as_chunks::<4>();
+        debug_assert!(remainder.is_empty());
+        for (index, word) in words.iter().enumerate() {
+            schedule[index] = u32::from_be_bytes(*word);
         }
         for index in 16..64 {
             let previous = schedule[index - 15];
@@ -95,8 +99,27 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
     }
 
     let mut digest = [0u8; 32];
-    for (chunk, word) in digest.chunks_exact_mut(4).zip(state) {
+    let (chunks, remainder) = digest.as_chunks_mut::<4>();
+    debug_assert!(remainder.is_empty());
+    for (chunk, word) in chunks.iter_mut().zip(state) {
         chunk.copy_from_slice(&word.to_be_bytes());
     }
     digest
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sha256_hex;
+
+    #[test]
+    fn sha256_matches_known_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
 }
