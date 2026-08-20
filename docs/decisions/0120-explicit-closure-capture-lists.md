@@ -3,9 +3,9 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-15
 - **Date:** 2026-08-15
-- **Implementation status:** Authority accepted; the pre-Stage-30 grammar slice
-  is complete; Decision 0121 settles the remaining Stage 30 model; Stage 30a is
-  next and Stage 30 remains unimplemented
+- **Implementation status:** Authority accepted; the pre-Stage-30 grammar slice,
+  Stage 30a, and Stage 30b semantic capture validation are complete; Stage 30c
+  is next and Stage 30 remains incomplete
 - **Scope:** Closure capture spelling, ownership modes, diagnostics, Stage 30
   boundaries, and backend-independent behavior
 - **Amends:** D10 and the Stage 30 plan; preserves Decision 0119's callable-effect
@@ -202,14 +202,14 @@ semantic execution stage. The bounded grammar slice is complete: it owns `fn`
 and anonymous-function expression tokens and productions, explicit parameter
 and return syntax, `function(T): R` type syntax, `with` capture-list syntax,
 capture-mode syntax, source-preserving AST nodes, parser recovery, and
-accepted-syntax regression tests. Parsed closures stop at the catalogued `E0641`
-Stage 30 unsupported-development boundary until semantic implementation lands.
+accepted-syntax regression tests. Stage 30b now validates free variables,
+capture modes, `$this`, inferred invocation modes, and checked effects. Valid
+closure execution routes retain the narrower catalogued `E0641` boundary.
 
-This grammar slice does not perform free-variable discovery, capture validation,
-mode checking, HIR/MIR lowering, ownership analysis, closure calls, environment
-construction, collection algorithms, or backend execution. Documentation-only
-snippets remain outside the checked `.doria` example inventory until the grammar
-slice lands; afterward they become parser fixtures without claiming execution.
+No capture acquisition, lifetime/escape enforcement, HIR/MIR lowering,
+environment construction, collection algorithm, or backend execution is part of
+the grammar foundation or Stage 30b. Documentation snippets remain semantic
+fixtures without claiming execution.
 
 ## Stage 30 Ownership
 

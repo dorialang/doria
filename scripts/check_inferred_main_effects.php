@@ -74,13 +74,15 @@ function check_inferred_main_effects(string $root): array
         $require($path, $contents, [
             'Corrective Beat: Inferred Main Checked Effects — Complete',
             'Stage 30a Callable Grammar Completion — Complete',
-            'Stage 30b Semantic Function Types And Captures — Next',
+            'Stage 30b Semantic Function Types And Captures — Complete',
+            'Stage 30c Ownership, Lifetime, And Escape — Next',
             'Stage 30 — In Progress, Not Complete',
         ]);
     }
     $require($proposalPath, $proposal, [
         '**Superseded By Accepted Decision 0121.**',
-        'Stage 30a Callable Grammar Completion is complete',
+        'Stage 30a Callable Grammar Completion and Stage 30b',
+        'Semantic Function Types And Captures are complete',
     ]);
     $require($compatibilityPath, $compatibility, [
         'function main(): void throws Doria\Std\Io\IoError',

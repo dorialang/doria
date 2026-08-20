@@ -1350,6 +1350,7 @@ fn intern_resolved_collection_types(
         // Stage 25a Slice 1 lands the surface and type model only; shared handles
         // have no MIR representation until the runtime slices.
         ResolvedType::TypeParameter(_)
+        | ResolvedType::Function(_)
         | ResolvedType::Void
         | ResolvedType::Null
         | ResolvedType::Unsupported => return None,
@@ -5432,7 +5433,10 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
                 | mir::Type::NullablePayloadEnum(_)) => Some(already),
             },
-            ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
+            ResolvedType::Function(_)
+            | ResolvedType::Void
+            | ResolvedType::Null
+            | ResolvedType::Unsupported => None,
         }
     }
 

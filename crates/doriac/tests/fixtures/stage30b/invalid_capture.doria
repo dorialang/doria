@@ -1,0 +1,5 @@
+function main(): void
+{
+    let $minimum = 2;
+    let $predicate = fn(int $value) => $value >= $minimum;
+}

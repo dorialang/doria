@@ -3,15 +3,113 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::MemberAccess;
 use crate::numeric::IntegerValue;
 use crate::source::Span;
-use crate::types::{TypeId, TypeRef};
+use crate::types::{ResolvedType, TypeId, TypeRef};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BindingId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ClosureId {
+    pub start: usize,
+    pub end: usize,
+}
+
+impl ClosureId {
+    pub const fn from_span(span: Span) -> Self {
+        Self {
+            start: span.start,
+            end: span.end,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LexicalOwner {
+    TopLevel,
+    Callable(usize),
+    Closure(ClosureId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingKind {
+    FunctionParameter,
+    MethodParameter,
+    ClosureParameter,
+    Local,
+    GroupedLocal,
+    ForeachKey,
+    ForeachValue,
+    MatchBinding,
+    CatchBinding,
+    GivenBinding,
+    LoopBinding,
+    ClosureCapture,
+    MethodReceiver,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BindingOwnership {
+    Owned,
+    ReadonlyBorrow,
+    WritableBorrow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindingDeclaration {
+    pub id: BindingId,
+    pub name: String,
+    /// Source declaration location. Synthetic identities such as the method
+    /// receiver deliberately have no invented source declaration span.
+    pub span: Option<Span>,
+    pub kind: BindingKind,
+    pub writable: bool,
+    pub ownership: BindingOwnership,
+    pub owner: LexicalOwner,
+    pub source_type: Option<ResolvedType>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BindingResolution {
+    pub declarations_by_id: HashMap<BindingId, BindingDeclaration>,
+    pub uses_by_span: HashMap<(usize, usize), BindingId>,
+    pub declaration_by_span: HashMap<(usize, usize), BindingId>,
+    pub closure_owners: HashMap<ClosureId, LexicalOwner>,
+    pub lexical_parents: HashMap<LexicalOwner, LexicalOwner>,
+}
 
 #[derive(Debug, Clone)]
 pub struct Binding {
+    pub id: BindingId,
+    pub kind: BindingKind,
+    pub ownership: BindingOwnership,
+    pub owner: LexicalOwner,
     pub writable: bool,
     pub ty: TypeId,
     pub declared_ty: TypeId,
     pub int_constant: Option<IntegerValue>,
     pub string_constant: Option<String>,
+}
+
+impl Binding {
+    pub fn unresolved(
+        writable: bool,
+        ty: TypeId,
+        declared_ty: TypeId,
+        int_constant: Option<IntegerValue>,
+        string_constant: Option<String>,
+    ) -> Self {
+        Self {
+            id: BindingId(usize::MAX),
+            kind: BindingKind::Local,
+            ownership: BindingOwnership::Owned,
+            owner: LexicalOwner::TopLevel,
+            writable,
+            ty,
+            declared_ty,
+            int_constant,
+            string_constant,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

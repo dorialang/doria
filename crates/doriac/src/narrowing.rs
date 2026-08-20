@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ast::{
-    Argument, Block, ElseBranch, Expr, ForIncrement, ForInitializer, FunctionDecl, Item, Param,
-    Program, Stmt,
+    Argument, Block, ClosureBody, ElseBranch, Expr, ForIncrement, ForInitializer, FunctionDecl,
+    Item, Param, Program, Stmt,
 };
 use crate::builtins::Builtin;
 use crate::control_flow::{build_function_cfg, Node, NodeAction};
@@ -44,6 +44,7 @@ struct Resolution {
     current_class: Option<String>,
     nullability: NullabilityCatalog,
     member_classes: MemberClassCatalog,
+    closure_bodies: Vec<(Block, Span)>,
 }
 
 #[derive(Default)]
@@ -601,9 +602,22 @@ fn analyze_body(
         &catalog.nullability,
         &catalog.member_classes,
     );
+    analyze_resolved_body(body, span, &resolution, facts, catalog);
+    for (closure_body, closure_span) in &resolution.closure_bodies {
+        analyze_resolved_body(closure_body, *closure_span, &resolution, facts, catalog);
+    }
+}
+
+fn analyze_resolved_body(
+    body: &Block,
+    span: Span,
+    resolution: &Resolution,
+    facts: &mut FactsByUse,
+    catalog: &FlowCatalog,
+) {
     let graph = build_function_cfg(body, span);
     let analysis = NarrowingAnalysis {
-        resolution: &resolution,
+        resolution,
         mutations: &catalog.mutations,
         nullability: &catalog.nullability,
     };
@@ -617,7 +631,7 @@ fn analyze_body(
         collect_action_facts(
             &graph.nodes[node_id.0].action,
             input,
-            &resolution,
+            resolution,
             &catalog.mutations,
             facts,
         );
@@ -1109,9 +1123,14 @@ fn kill_mutated_call_arguments(
                 }
             }
         }
+        Expr::CallableCall { callee, args, .. } => {
+            kill_mutated_call_arguments(callee, state, resolution, mutations);
+            kill_calls_in_arguments(args, state, resolution, mutations);
+            let modes = callable_parameter_modes(callee, resolution);
+            kill_arguments_for_modes(args, modes.as_ref(), state, resolution);
+        }
         Expr::Variable { .. }
         | Expr::Closure(_)
-        | Expr::CallableCall { .. }
         | Expr::This { .. }
         | Expr::Identifier { .. }
         | Expr::String { .. }
@@ -1705,9 +1724,15 @@ fn collect_expr(
             }
             incoming
         }
+        Expr::CallableCall { callee, args, .. } => {
+            let mut state = collect_expr(callee, state, resolution, mutations, facts);
+            state = collect_expr_sequence(args, &state, resolution, mutations, facts);
+            let modes = callable_parameter_modes(callee, resolution);
+            kill_arguments_for_modes(args, modes.as_ref(), &mut state, resolution);
+            state
+        }
         Expr::This { .. }
         | Expr::Closure(_)
-        | Expr::CallableCall { .. }
         | Expr::Identifier { .. }
         | Expr::String { .. }
         | Expr::Int { .. }
@@ -1762,6 +1787,43 @@ fn variable_binding(expr: &Expr, resolution: &Resolution) -> Option<BindingId> {
         return None;
     };
     resolution.uses.get(&(span.start, span.end)).copied()
+}
+
+fn callable_parameter_modes(expr: &Expr, resolution: &Resolution) -> Option<ParamModes> {
+    let function = match ungroup(expr) {
+        Expr::Variable { .. } => {
+            let binding = variable_binding(expr, resolution)?;
+            function_type_ref(resolution.declaration_types.get(&binding)?.as_ref()?)?
+        }
+        Expr::Closure(closure) => {
+            return Some(ParamModes {
+                names: Vec::new(),
+                mutable: closure
+                    .parameters
+                    .iter()
+                    .map(|parameter| parameter.writable || parameter.take)
+                    .collect(),
+            });
+        }
+        _ => return None,
+    };
+    Some(ParamModes {
+        names: Vec::new(),
+        mutable: function
+            .parameters
+            .iter()
+            .map(|parameter| {
+                parameter.ownership_mode != crate::types::FunctionTypeParameterMode::Readonly
+            })
+            .collect(),
+    })
+}
+
+fn function_type_ref(ty: &TypeRef) -> Option<&crate::types::FunctionTypeRef> {
+    if let Some(grouped) = &ty.grouped {
+        return function_type_ref(&grouped.inner);
+    }
+    ty.function.as_deref()
 }
 
 fn apply_match_pattern_fact(
@@ -2114,6 +2176,63 @@ impl Resolver {
                     self.resolve_expr(&argument.value);
                 }
             }
+            Expr::CallableCall { callee, args, .. } => {
+                self.resolve_expr(callee);
+                for argument in args {
+                    self.resolve_expr(&argument.value);
+                }
+            }
+            Expr::Closure(closure) => {
+                let captured = closure
+                    .captures
+                    .iter()
+                    .flat_map(|clause| &clause.captures)
+                    .filter_map(|capture| {
+                        self.scopes
+                            .iter()
+                            .rev()
+                            .find_map(|scope| scope.get(&capture.name))
+                            .copied()
+                            .map(|binding| {
+                                (
+                                    capture.name.clone(),
+                                    capture.name_span.start,
+                                    self.resolution
+                                        .declaration_types
+                                        .get(&binding)
+                                        .cloned()
+                                        .flatten(),
+                                    self.resolution.declaration_classes.get(&binding).cloned(),
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>();
+
+                self.scopes.push(HashMap::new());
+                for (name, span_start, ty, class) in captured {
+                    let binding = self.declare(&name, span_start, ty);
+                    if let Some(class) = class {
+                        self.resolution.declaration_classes.insert(binding, class);
+                    }
+                }
+                for parameter in &closure.parameters {
+                    self.declare(
+                        &parameter.name,
+                        parameter.name_span.start,
+                        Some(parameter.ty.clone()),
+                    );
+                }
+                match &closure.body {
+                    ClosureBody::Expression { expression, .. } => self.resolve_expr(expression),
+                    ClosureBody::Block(block) => {
+                        self.resolve_statements(&block.statements);
+                        self.resolution
+                            .closure_bodies
+                            .push((block.clone(), closure.span));
+                    }
+                }
+                self.scopes.pop();
+            }
             Expr::InterpolatedString { parts, .. } => {
                 for part in parts {
                     if let crate::ast::InterpolatedStringPart::Expr(expr) = part {
@@ -2197,8 +2316,6 @@ impl Resolver {
                 }
             }
             Expr::This { .. }
-            | Expr::Closure(_)
-            | Expr::CallableCall { .. }
             | Expr::Identifier { .. }
             | Expr::String { .. }
             | Expr::Int { .. }

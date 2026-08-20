@@ -559,7 +559,7 @@ fn stage30a_malformed_forms_have_deliberate_diagnostics_and_recover() {
 }
 
 #[test]
-fn stage30a_callable_syntax_shares_one_e0641_without_hir_lowering() {
+fn stage30b_reports_each_closure_execution_boundary_without_hir_lowering() {
     let source = r#"function main(): void
 {
     let $callback = fn(int $value) => $value;
@@ -573,8 +573,8 @@ fn stage30a_callable_syntax_shares_one_e0641_without_hir_lowering() {
             .iter()
             .filter(|diagnostic| diagnostic.code == "E0641")
             .count(),
-        1,
-        "deferred Stage 30 surfaces must share one boundary: {diagnostics:#?}"
+        2,
+        "closure construction and later invocation are distinct execution boundaries: {diagnostics:#?}"
     );
     assert!(diagnostics
         .iter()
@@ -585,14 +585,14 @@ fn stage30a_callable_syntax_shares_one_e0641_without_hir_lowering() {
 }
 
 #[test]
-fn isolated_callable_invocation_emits_one_e0641_without_callee_cascades() {
+fn isolated_callable_invocation_reports_the_undeclared_callee_without_cascades() {
     let source = "function main(): void { $callback(42); }";
     let diagnostics = doriac::check_source("isolated_callable.doria", source)
-        .expect_err("callable semantics remain deferred");
+        .expect_err("an undeclared callable must be rejected precisely");
 
     assert_eq!(diagnostics.len(), 1, "unexpected cascade: {diagnostics:#?}");
-    assert_eq!(diagnostics[0].code, "E0641");
-    assert!(diagnostics[0].message.contains("callable-value invocation"));
+    assert_eq!(diagnostics[0].code, "E0101");
+    assert!(diagnostics[0].message.contains("callback"));
 }
 
 #[test]
@@ -635,8 +635,8 @@ fn semantic_and_ide_paths_emit_one_structured_stage_30_boundary() {
         DiagnosticKind::UnsupportedDevelopmentSurface
     );
     assert!(diagnostic.development_only);
-    assert_eq!(diagnostic.title, "Closure Semantics Await Stage 30");
-    assert!(diagnostic.message.contains("accepted Doria"));
+    assert_eq!(diagnostic.title, "Closure Execution Is Not Yet Available");
+    assert!(diagnostic.message.contains("valid Doria"));
 
     let (_, analysis) = doriac::analyze_source_for_ide("closure_boundary.doria", source)
         .expect("IDE parsing should succeed");
@@ -668,18 +668,10 @@ fn semantic_and_ide_paths_emit_one_structured_stage_30_boundary() {
 }
 
 #[test]
-fn function_type_semantic_use_stops_at_the_same_stage_30_boundary() {
+fn function_type_semantic_use_no_longer_hits_the_execution_boundary() {
     let source = "function accept(function(int): int $callback): void {}";
-    let diagnostics = doriac::check_source("function_type_boundary.doria", source)
-        .expect_err("function-type semantics remain a Stage 30 boundary");
-
-    assert_eq!(diagnostics.len(), 1, "unexpected cascade: {diagnostics:#?}");
-    assert_eq!(diagnostics[0].code, "E0641");
-    assert_eq!(
-        diagnostics[0].kind,
-        DiagnosticKind::UnsupportedDevelopmentSurface
-    );
-    assert!(diagnostics[0].message.contains("function type syntax"));
+    doriac::check_source("function_type_boundary.doria", source)
+        .expect("type-only structural function syntax has semantic identity in Stage 30b");
 }
 
 #[test]
@@ -707,16 +699,11 @@ fn closure_signatures_report_permanent_type_errors_before_the_stage_30_boundary(
 
     for (name, source, type_code, rejected_type) in cases {
         let diagnostics = doriac::check_source(name, source)
-            .expect_err("invalid signature and Stage 30 boundary must be reported");
-        assert_eq!(diagnostics.len(), 2, "unexpected cascade: {diagnostics:#?}");
-        assert_eq!(
-            diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.code == "E0641")
-                .count(),
-            1,
-            "closure boundary must remain singular: {diagnostics:#?}"
-        );
+            .expect_err("invalid closure signatures must be reported precisely");
+        assert_eq!(diagnostics.len(), 1, "unexpected cascade: {diagnostics:#?}");
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "E0641"));
         let type_diagnostic = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == type_code)
@@ -750,16 +737,11 @@ fn function_types_recursively_validate_components_without_boundary_cascades() {
 
     for (name, source, type_code, rejected_type) in cases {
         let diagnostics = doriac::check_source(name, source)
-            .expect_err("invalid callable component and Stage 30 boundary must be reported");
-        assert_eq!(diagnostics.len(), 2, "unexpected cascade: {diagnostics:#?}");
-        assert_eq!(
-            diagnostics
-                .iter()
-                .filter(|diagnostic| diagnostic.code == "E0641")
-                .count(),
-            1,
-            "nested function types must share one outer boundary: {diagnostics:#?}"
-        );
+            .expect_err("invalid callable components must be reported precisely");
+        assert_eq!(diagnostics.len(), 1, "unexpected cascade: {diagnostics:#?}");
+        assert!(diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "E0641"));
         let type_diagnostic = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.code == type_code)

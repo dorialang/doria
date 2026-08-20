@@ -85,10 +85,10 @@ function check_closure_capture_authority(string $root): array
         'anonymous-function expression tokens and productions',
         'source-preserving AST nodes',
         'accepted-syntax regression tests',
-        'Parsed closures stop at the catalogued `E0641`',
-        'This grammar slice does not perform free-variable discovery',
+        'narrower catalogued `E0641` boundary',
+        'Stage 30b now validates free variables',
         'pre-Stage-30 grammar slice is complete',
-        'Decision 0121 settles the remaining Stage 30 model',
+        'Decision 0121 settles the questions this record deliberately left bounded',
         'Stage 30 consumes the source-preserving closure AST',
         'Decision 0119 owns source-ordered checked-effect sets',
         'Decision 0121 applies that model to closure function',
@@ -130,9 +130,9 @@ function check_closure_capture_authority(string $root): array
         '`with (take $value)` transfers ownership',
         '`use` is not a closure-capture alias',
         'A closure that uses no enclosing local',
-        'The compiler parses the base `fn` and anonymous-function grammar',
+        'The compiler resolves readonly/writable/once structural function types',
         'function(int): int',
-        'catalogued `E0641` development boundary',
+        'catalogued `E0641` execution boundary',
         '`with ($this)` borrows a',
         '`with (writable $this)` borrows it exclusively',
     ]);
@@ -145,7 +145,8 @@ function check_closure_capture_authority(string $root): array
         'Corrective Beat: Native Collection Property Initializers — Complete',
         'Stage 29 Slice 3 — Complete',
         'Stage 30a Callable Grammar Completion — Complete',
-        'Stage 30b Semantic Function Types And Captures — Next',
+        'Stage 30b Semantic Function Types And Captures — Complete',
+        'Stage 30c Ownership, Lifetime, And Escape — Next',
         'Stage 30 — In Progress, Not Complete',
         'Decision 0120 — Accepted; Explicit Capture-List Foundation',
         'Decision 0121 — Accepted; Stage 30 Closure Authority',
@@ -160,12 +161,11 @@ function check_closure_capture_authority(string $root): array
     ]);
 
     $require($examplesPath, $examples, [
-    'These snippets are accepted Stage 30 target-state documentation.',
-    'They are parser',
-    'fixtures, not executable examples or native parity fixtures',
-    'crates/doriac/tests/fixtures/accepted_syntax/closures.doria',
-    'semantic checking',
-    'stops at the catalogued E0641 boundary',
+        'These snippets are accepted Stage 30 target-state documentation.',
+        'Stage 30b semantics are checked',
+        'not executable examples',
+        'native parity fixtures',
+        'catalogued E0641 execution boundary',
         'let $double = fn(int $value) => $value * 2;',
         'fn(int $score) with ($minimum) =>',
         'function (int $score): bool with ($minimum) {',
@@ -217,10 +217,12 @@ function check_closure_capture_authority(string $root): array
         'Doria closure captures do not use PHP reference `&` syntax',
     ]);
     $require($semanticsPath, $semantics, [
-        'report_stage_30_closure_boundary',
+        'report_stage_30_execution_boundary',
         'Diagnostic::unsupported_stage(',
         '"E0641"',
-        'Closure Semantics Await Stage 30',
+        'Closure Execution Is Not Yet Available',
+        'fn check_closure_expression(',
+        'source_binding_id: BindingId',
     ]);
     $require($cataloguePath, $catalogue, ['"E0641"']);
     $require($testsPath, $tests, [

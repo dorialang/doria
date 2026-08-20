@@ -1,0 +1,15 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function accept(
+    function(int): int $readonly,
+    function writable(writable string): void $writable,
+    function once(take string): string $once,
+    function((function(): int), string): void throws Failure $nested
+): void
+{
+}

@@ -1764,20 +1764,22 @@ impl Parser {
 
     fn parse_foreach_binding(&mut self) -> Option<ForeachBinding> {
         let writable = self.match_kind(&TokenKind::Writable);
-        if let Some((name, _span)) = self.consume_variable() {
+        if let Some((name, span)) = self.consume_variable() {
             return Some(ForeachBinding {
                 writable,
                 ty: None,
                 name,
+                span,
             });
         }
 
         let ty = self.parse_type_ref()?;
-        let (name, _span) = self.expect_variable("expected foreach binding variable")?;
+        let (name, span) = self.expect_variable("expected foreach binding variable")?;
         Some(ForeachBinding {
             writable,
             ty: Some(ty),
             name,
+            span,
         })
     }
 
