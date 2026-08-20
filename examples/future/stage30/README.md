@@ -9,8 +9,12 @@ semantics.
 
 [Decision 0121](../../../docs/decisions/0121-closure-function-types-capture-semantics-and-execution-model.md)
 accepts the complete closure model and elaborates Decision 0120's explicit
-capture lists. **Stage 30 is not implemented**; Stage 30a Callable Grammar
-Completion is next, and E0641 remains the compiler boundary.
+capture lists. **Stage 30a Callable Grammar Completion is complete**: structural
+function-type modes, ownership, effects, type grouping, and postfix callable
+syntax are parseable and source-preserved. Stage 30b semantic function types and
+captures is next. Stage 30 is in progress and not complete, and E0641 remains the
+compiler boundary. E0641 remains the compiler boundary until the corresponding
+semantic and execution routes land.
 
 The inventory covers:
 

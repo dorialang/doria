@@ -3,6 +3,7 @@ use std::process::Command;
 use doriac::ast::{ClosureBody, ClosureCaptureMode, ClosureForm, Expr, Item, Stmt};
 use doriac::diagnostics::{DiagnosticFormat, DiagnosticKind, RenderOptions};
 use doriac::source::Span;
+use doriac::types::{FunctionInvocationMode, FunctionTypeParameterMode};
 
 fn span_text(source: &str, span: Span) -> &str {
     &source[span.start..span.end]
@@ -204,6 +205,388 @@ fn accepted_function_types_preserve_types_and_spans_without_parameter_names() {
         function.return_type.as_ref().unwrap().to_string(),
         "function(function(int): string): void"
     );
+}
+
+#[test]
+fn stage30a_function_types_preserve_modes_effects_grouping_and_exact_spans() {
+    let source = r#"function accept(
+    function(int): int $readonlyCallback,
+    writable function writable(writable Counter): void $writableCallback,
+    take function once(take Payload): Payload $factory,
+    function(string): Record throws ParseError, StorageError $parser,
+    function((function(): int throws FirstError), string): void $nested
+): function(): (function(): int throws InnerError) throws OuterError
+{
+}
+"#;
+    let program = doriac::parse_source("stage30a_types.doria", source)
+        .expect("Stage 30a function types should parse");
+    let Item::Function(function) = &program.items[0] else {
+        panic!("expected function declaration");
+    };
+
+    let readonly = function.params[0].ty.function.as_ref().unwrap();
+    assert_eq!(readonly.invocation_mode, FunctionInvocationMode::Readonly);
+    assert!(readonly.invocation_modifier_span.is_none());
+    assert_eq!(span_text(source, readonly.keyword_span), "function");
+    assert_eq!(span_text(source, readonly.parameter_list_open_span), "(");
+    assert_eq!(span_text(source, readonly.parameter_list_close_span), ")");
+    assert_eq!(span_text(source, readonly.parameter_list_span), "(int)");
+    assert_eq!(span_text(source, readonly.parameters[0].type_span), "int");
+    assert_eq!(span_text(source, readonly.colon_span), ":");
+    assert_eq!(span_text(source, readonly.return_type_span), "int");
+
+    let writable = function.params[1].ty.function.as_ref().unwrap();
+    assert_eq!(writable.invocation_mode, FunctionInvocationMode::Writable);
+    assert_eq!(
+        span_text(source, writable.invocation_modifier_span.unwrap()),
+        "writable"
+    );
+    assert_eq!(
+        writable.parameters[0].ownership_mode,
+        FunctionTypeParameterMode::Writable
+    );
+    assert_eq!(
+        span_text(
+            source,
+            writable.parameters[0].ownership_modifier_span.unwrap()
+        ),
+        "writable"
+    );
+    assert_eq!(
+        span_text(source, writable.parameters[0].span),
+        "writable Counter"
+    );
+
+    let once = function.params[2].ty.function.as_ref().unwrap();
+    assert_eq!(once.invocation_mode, FunctionInvocationMode::Once);
+    assert_eq!(
+        once.parameters[0].ownership_mode,
+        FunctionTypeParameterMode::Take
+    );
+    assert_eq!(
+        function.params[2].ty.to_string(),
+        "function once(take Payload): Payload"
+    );
+
+    let parser = function.params[3].ty.function.as_ref().unwrap();
+    let effects = parser.throws_clause.as_ref().unwrap();
+    assert_eq!(span_text(source, effects.keyword_span), "throws");
+    assert_eq!(
+        span_text(source, effects.entries[0].type_span),
+        "ParseError"
+    );
+    assert_eq!(
+        span_text(source, effects.entries[1].type_span),
+        "StorageError"
+    );
+    assert_eq!(
+        span_text(source, effects.span),
+        "throws ParseError, StorageError"
+    );
+    assert_eq!(
+        function.params[3].ty.to_string(),
+        "function(string): Record throws ParseError, StorageError"
+    );
+
+    let nested = function.params[4].ty.function.as_ref().unwrap();
+    let grouped = nested.parameters[0].ty.grouped.as_ref().unwrap();
+    assert_eq!(span_text(source, grouped.open_span), "(");
+    assert_eq!(span_text(source, grouped.close_span), ")");
+    assert_eq!(
+        span_text(source, grouped.span),
+        "(function(): int throws FirstError)"
+    );
+
+    let outer = function
+        .return_type
+        .as_ref()
+        .unwrap()
+        .function
+        .as_ref()
+        .unwrap();
+    let grouped_return = outer.return_type.grouped.as_ref().unwrap();
+    assert!(grouped_return
+        .inner
+        .function
+        .as_ref()
+        .unwrap()
+        .throws_clause
+        .is_some());
+    assert_eq!(
+        span_text(source, outer.throws_clause.as_ref().unwrap().span),
+        "throws OuterError"
+    );
+    assert_eq!(
+        function.return_type.as_ref().unwrap().to_string(),
+        "function(): (function(): int throws InnerError) throws OuterError"
+    );
+}
+
+#[test]
+fn stage30a_grouped_types_preserve_authored_parentheses_and_composition() {
+    let source = r#"function grouped(
+    (int) $integer,
+    ((List<string>)) $labels,
+    (?Payload) $payload,
+    ?(function writable(int): int) $callback,
+    ?function(int): int $nullableReadonly,
+    ?function once(): Payload $nullableOnce,
+    List<function once(): Payload> $factories,
+    (function(int): string)[] $arrayCallbacks
+): void
+{
+}
+"#;
+    let program = doriac::parse_source("grouped_types.doria", source)
+        .expect("grouping should compose in existing type positions");
+    let Item::Function(function) = &program.items[0] else {
+        panic!("expected function declaration");
+    };
+
+    assert_eq!(function.params[0].ty.to_string(), "(int)");
+    assert_eq!(function.params[1].ty.to_string(), "((List<string>))");
+    assert_eq!(function.params[2].ty.to_string(), "(?Payload)");
+    assert_eq!(
+        function.params[3].ty.to_string(),
+        "?(function writable(int): int)"
+    );
+    assert_eq!(function.params[4].ty.to_string(), "?function(int): int");
+    assert_eq!(
+        function.params[5].ty.to_string(),
+        "?function once(): Payload"
+    );
+    assert_eq!(
+        function.params[6].ty.to_string(),
+        "List<function once(): Payload>"
+    );
+    assert_eq!(
+        function.params[7].ty.to_string(),
+        "(function(int): string)[]"
+    );
+}
+
+#[test]
+fn stage30a_callable_postfix_ast_is_distinct_and_chains_with_exact_spans() {
+    let source = r#"function main(): void
+{
+    $callback(1);
+    factory()(2);
+    ($factory())(3)[0];
+    $callbacks[0](4)->result;
+    (fn(int $value) => $value)(5);
+    (function (int $value): int { return $value; })(6);
+    named(value: 7);
+    $object->method(value: 8);
+    Type::make(value: 9);
+}
+"#;
+    let program = doriac::parse_source("callable_postfix.doria", source)
+        .expect("callable postfix syntax should parse");
+    let Item::Function(main) = &program.items[0] else {
+        panic!("expected main function");
+    };
+
+    let Stmt::Expr {
+        expr:
+            Expr::CallableCall {
+                callee,
+                open_span,
+                args,
+                close_span,
+                argument_list_span,
+                span,
+            },
+        ..
+    } = &main.body.statements[0]
+    else {
+        panic!("variable invocation must be a callable call");
+    };
+    assert_eq!(span_text(source, callee.span()), "$callback");
+    assert_eq!(span_text(source, *open_span), "(");
+    assert_eq!(span_text(source, args[0].span), "1");
+    assert_eq!(span_text(source, *close_span), ")");
+    assert_eq!(span_text(source, *argument_list_span), "(1)");
+    assert_eq!(span_text(source, *span), "$callback(1)");
+
+    assert!(matches!(
+        &main.body.statements[1],
+        Stmt::Expr {
+            expr: Expr::CallableCall { callee, .. },
+            ..
+        } if matches!(callee.as_ref(), Expr::FunctionCall { name, .. } if name == "factory")
+    ));
+    assert!(matches!(
+        &main.body.statements[2],
+        Stmt::Expr {
+            expr: Expr::Index { collection, .. },
+            ..
+        } if matches!(collection.as_ref(), Expr::CallableCall { .. })
+    ));
+    assert!(matches!(
+        &main.body.statements[3],
+        Stmt::Expr {
+            expr: Expr::PropertyAccess { object, .. },
+            ..
+        } if matches!(object.as_ref(), Expr::CallableCall { .. })
+    ));
+    assert!(matches!(
+        &main.body.statements[4],
+        Stmt::Expr {
+            expr: Expr::CallableCall { callee, .. },
+            ..
+        } if matches!(callee.as_ref(), Expr::Grouped { expr, .. } if matches!(expr.as_ref(), Expr::Closure(_)))
+    ));
+    assert!(matches!(
+        &main.body.statements[6],
+        Stmt::Expr {
+            expr: Expr::FunctionCall { name, args, .. },
+            ..
+        } if name == "named" && args[0].name.as_ref().is_some_and(|name| name.text == "value")
+    ));
+    assert!(matches!(
+        &main.body.statements[7],
+        Stmt::Expr {
+            expr: Expr::MethodCall { method, args, .. },
+            ..
+        } if method == "method" && args[0].name.is_some()
+    ));
+    assert!(matches!(
+        &main.body.statements[8],
+        Stmt::Expr {
+            expr: Expr::StaticCall { method, args, .. },
+            ..
+        } if method == "make" && args[0].name.is_some()
+    ));
+}
+
+#[test]
+fn stage30a_malformed_forms_have_deliberate_diagnostics_and_recover() {
+    let cases = [
+        (
+            "function take(): Payload",
+            "Function Invocation Mode Uses `Once`",
+        ),
+        (
+            "function readonly(int): int",
+            "Readonly Function Mode Is Implicit",
+        ),
+        (
+            "function writable once(int): int",
+            "Function Invocation Mode Is Duplicated",
+        ),
+        (
+            "function(take take Payload): void",
+            "Function Type Parameter Mode Is Duplicated",
+        ),
+        (
+            "function(take writable Payload): void",
+            "Function Type Parameter Modes Conflict",
+        ),
+        (
+            "function(readonly Payload): void",
+            "Readonly Parameter Mode Is Implicit",
+        ),
+        (
+            "function(writable): void",
+            "Function Type Parameter Type Is Missing",
+        ),
+        ("function(): void throws", "Function Type Effect Is Missing"),
+        (
+            "function(): void throws FirstError,",
+            "Function Type Effect Is Missing",
+        ),
+        ("(int, string)", "Tuple Type Is Not Supported"),
+        ("()", "Type Group Is Empty"),
+    ];
+
+    for (ty, title) in cases {
+        let source =
+            format!("function rejected({ty} $value): void {{}} function later(): void {{}}");
+        let diagnostics = doriac::parse_source("malformed_stage30a.doria", source)
+            .expect_err("malformed Stage 30a syntax should be rejected");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.title == title),
+            "{ty} should report {title:?}, got {diagnostics:#?}"
+        );
+        assert!(
+            diagnostics.len() <= 3,
+            "{ty} caused a parser cascade: {diagnostics:#?}"
+        );
+    }
+
+    for ty in [
+        "function(function(): int throws FirstError, string): void",
+        "function(): function(): int throws Failure",
+    ] {
+        let source = format!("function rejected({ty} $value): void {{}}");
+        let diagnostics = doriac::parse_source("ambiguous_effects.doria", source)
+            .expect_err("ambiguous nested effects require grouping");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.title == "Nested Function Type Effects Need Grouping"));
+    }
+
+    let source = "function main(): void { $callback(value: 42); }";
+    let diagnostics = doriac::parse_source("named_callable_arg.doria", source)
+        .expect_err("explicit callable-value named arguments are invalid");
+    assert_eq!(diagnostics.len(), 1, "unexpected cascade: {diagnostics:#?}");
+    assert_eq!(
+        diagnostics[0].title,
+        "Callable Value Argument Cannot Be Named"
+    );
+}
+
+#[test]
+fn stage30a_callable_syntax_shares_one_e0641_without_hir_lowering() {
+    let source = r#"function main(): void
+{
+    let $callback = fn(int $value) => $value;
+    $callback(42);
+}
+"#;
+    let diagnostics = doriac::check_source("stage30a_boundary.doria", source)
+        .expect_err("callable semantics remain deferred");
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0641")
+            .count(),
+        1,
+        "deferred Stage 30 surfaces must share one boundary: {diagnostics:#?}"
+    );
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.code == "E0641"));
+    let lowering = doriac::lower_source("stage30a_boundary.doria", source)
+        .expect_err("Stage 30a syntax must not enter HIR lowering");
+    assert!(lowering.iter().all(|diagnostic| diagnostic.code == "E0641"));
+}
+
+#[test]
+fn isolated_callable_invocation_emits_one_e0641_without_callee_cascades() {
+    let source = "function main(): void { $callback(42); }";
+    let diagnostics = doriac::check_source("isolated_callable.doria", source)
+        .expect_err("callable semantics remain deferred");
+
+    assert_eq!(diagnostics.len(), 1, "unexpected cascade: {diagnostics:#?}");
+    assert_eq!(diagnostics[0].code, "E0641");
+    assert!(diagnostics[0].message.contains("callable-value invocation"));
+}
+
+#[test]
+fn stage30a_accepted_fixture_is_parser_only_and_source_preserving() {
+    let source = include_str!("fixtures/accepted_syntax/stage30a_callable_grammar.doria");
+    let program = doriac::parse_source("stage30a_callable_grammar.doria", source)
+        .expect("accepted Stage 30a fixture should parse");
+    let ast = format!("{program:#?}");
+
+    assert!(ast.contains("invocation_mode: Once"));
+    assert!(ast.contains("FunctionTypeThrowsRef"));
+    assert!(ast.contains("GroupedTypeRef"));
+    assert!(ast.contains("CallableCall"));
 }
 
 #[test]

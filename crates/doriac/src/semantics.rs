@@ -6455,6 +6455,9 @@ impl<'program> Checker<'program> {
                 self.validate_closure_signature(closure, method_context);
                 self.report_stage_30_closure_boundary("closure", closure.span);
             }
+            Expr::CallableCall { span, .. } => {
+                self.report_stage_30_closure_boundary("callable-value invocation", *span);
+            }
             Expr::Variable { name, span } => {
                 if scopes.lookup(name).is_none() {
                     self.undeclared_variable(name, *span);
@@ -6815,6 +6818,13 @@ impl<'program> Checker<'program> {
     }
 
     fn report_stage_30_closure_boundary(&mut self, surface: &str, span: Span) {
+        if self
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0641")
+        {
+            return;
+        }
         self.diagnostics.push(
             Diagnostic::unsupported_stage(
                 "E0641",
@@ -13887,7 +13897,7 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> TypeId {
         match expr {
-            Expr::Closure(_) => self.types.unknown(),
+            Expr::Closure(_) | Expr::CallableCall { .. } => self.types.unknown(),
             Expr::String { .. } | Expr::InterpolatedString { .. } => {
                 self.types.intern(TypeKind::String)
             }

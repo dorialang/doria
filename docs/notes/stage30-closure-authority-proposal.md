@@ -31,8 +31,9 @@ diagnostic, and performance direction on 2026-08-19, with these amendments:
   than moving it into and out of every call.
 
 The accepted record also fixes the dependency-ordered Stage 30a through Stage
-30h implementation slices. Stage 30a Callable Grammar Completion is next. Stage
-30 is not implemented, and E0641 remains the current compiler boundary.
+30h implementation slices. Stage 30a Callable Grammar Completion is complete,
+Stage 30b Semantic Function Types And Captures is next, Stage 30 is in progress
+and not complete, and E0641 remains the current compiler boundary.
 
 ## Historical Scope
 

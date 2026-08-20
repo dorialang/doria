@@ -180,6 +180,32 @@ fn lexes_checked_error_direction_keywords() {
 }
 
 #[test]
+fn lexes_once_as_an_exact_keyword_without_leaking_into_nearby_text() {
+    let kinds = token_kinds(
+        r#"once onceOnly once_more once1 $once "once"
+// once
+"#,
+    );
+
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| matches!(kind, TokenKind::Once))
+            .count(),
+        1
+    );
+    assert!(matches!(kinds[0], TokenKind::Once));
+    assert!(matches!(&kinds[1], TokenKind::Identifier(name) if name == "onceOnly"));
+    assert!(matches!(&kinds[2], TokenKind::Identifier(name) if name == "once_more"));
+    assert!(matches!(&kinds[3], TokenKind::Identifier(name) if name == "once1"));
+    assert!(matches!(&kinds[4], TokenKind::Variable(name) if name == "once"));
+    assert!(matches!(
+        &kinds[5],
+        TokenKind::StringLiteral { value, .. } if value == "once"
+    ));
+}
+
+#[test]
 fn lexes_closure_vocabulary_without_splitting_nearby_identifiers() {
     let kinds =
         token_kinds("fn with function functionality withdraw fnord => take writable $value, ()");

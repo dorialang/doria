@@ -665,6 +665,9 @@ fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Ex
         ast::Expr::Closure(_) => {
             unreachable!("closure expressions must stop at the Stage 30 semantic boundary")
         }
+        ast::Expr::CallableCall { .. } => {
+            unreachable!("callable-value invocation must stop at the Stage 30 semantic boundary")
+        }
         ast::Expr::Variable { name, span } => hir::Expr::Variable {
             name: name.clone(),
             span: *span,

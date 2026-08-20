@@ -442,12 +442,19 @@ collection families receive no Stage 30 higher-order algorithms.
 
 ### Current compiler support
 
-The compiler currently parses the base `fn` and anonymous-function grammar,
-explicit `with` lists, and `function(T): R` type syntax into the source AST. It
-does not yet parse Stage 30a's invocation-mode, parameter-ownership, function-type
-effect, or arbitrary callable-value invocation additions. Closure semantic use
-still emits the catalogued `E0641` development boundary, and no closure executes.
-Stage 30a Callable Grammar Completion is next; Stage 30 remains not implemented.
+The compiler parses the base `fn` and anonymous-function grammar, explicit
+`with` lists, readonly/writable/once structural function types, parameter
+ownership, function-type `throws`, source-preserving parenthesized type grouping,
+and arbitrary postfix callable-value invocation into the source AST. Grouping
+does not create a tuple type. Closure and callable semantic use still emits the
+catalogued `E0641` development boundary, and no closure executes.
+
+```text
+Stage 30a Callable Grammar Completion - Complete
+Stage 30b Semantic Function Types And Captures - Next
+Stage 30 - In Progress, Not Complete
+E0641 - Active
+```
 
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.
 

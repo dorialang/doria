@@ -622,6 +622,7 @@ fn inspect_expr(
         }
         Expr::Variable { .. }
         | Expr::Closure(_)
+        | Expr::CallableCall { .. }
         | Expr::Identifier { .. }
         | Expr::String { .. }
         | Expr::Int { .. }

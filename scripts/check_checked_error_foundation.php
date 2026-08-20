@@ -129,8 +129,9 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Corrective Beat: Native Collection Property Initializers — Complete',
         'Stage 29 Slice 3 — Complete',
         'Pre-Stage-30 Grammar Slice — Complete',
-        'Stage 30a Callable Grammar Completion — Next',
-        'Stage 30 — Not Implemented',
+        'Stage 30a Callable Grammar Completion — Complete',
+        'Stage 30b Semantic Function Types And Captures — Next',
+        'Stage 30 — In Progress, Not Complete',
         'Stage 26b — Complete',
         'Measurement Status: Pending Available Runner',
     ]);

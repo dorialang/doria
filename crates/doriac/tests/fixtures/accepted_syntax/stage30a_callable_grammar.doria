@@ -1,0 +1,49 @@
+class ParseError implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+class StorageError implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+class Payload
+{
+    function __construct(string $value)
+    {
+    }
+}
+
+function acceptTypes(
+    function(int): int $readonlyCallback,
+    writable function writable(int): int $writableCallback,
+    take function once(): Payload $factory,
+    function(string): int throws ParseError, StorageError $parser,
+    function(
+        (function(): int throws ParseError),
+        string
+    ): void $nested,
+): function(): (function(): int) throws StorageError
+{
+    return fn() => fn() => 1;
+}
+
+function main(): void
+{
+    let $identity = fn(int $value) => $value;
+    let $factory = fn() => $identity;
+
+    $identity(1);
+    $factory()(2);
+    ($factory())(3);
+
+    List<function(int): int> $callbacks = [$identity];
+    $callbacks;
+
+    (fn(int $value) => $value)(5);
+}

@@ -110,7 +110,7 @@ function check_closure_capture_authority(string $root): array
         'authoritative `function(T): R` type syntax',
         'catalogued `E0641` Stage 30 boundary',
         'No free-variable discovery',
-        '**Stage 30 Closure Authority — Accepted; Stage 30 — Not Implemented.**',
+        '**Stage 30 Closure Authority — Accepted; Stage 30 — In Progress, Not Complete.**',
         'Missing, duplicate, wrong-mode, unused, moved, and insufficient-lifetime captures',
         'Function types preserve checked effects',
         '`List<T>` alone receives `map`, Copy-only preserving `filter`, and writable-accumulator `reduce`',
@@ -130,7 +130,7 @@ function check_closure_capture_authority(string $root): array
         '`with (take $value)` transfers ownership',
         '`use` is not a closure-capture alias',
         'A closure that uses no enclosing local',
-        'The compiler currently parses the base `fn` and anonymous-function grammar',
+        'The compiler parses the base `fn` and anonymous-function grammar',
         'function(int): int',
         'catalogued `E0641` development boundary',
         '`with ($this)` borrows a',
@@ -144,8 +144,9 @@ function check_closure_capture_authority(string $root): array
         'Stage 29 Slice 2 — Complete',
         'Corrective Beat: Native Collection Property Initializers — Complete',
         'Stage 29 Slice 3 — Complete',
-        'Stage 30a Callable Grammar Completion — Next',
-        'Stage 30 — Not Implemented',
+        'Stage 30a Callable Grammar Completion — Complete',
+        'Stage 30b Semantic Function Types And Captures — Next',
+        'Stage 30 — In Progress, Not Complete',
         'Decision 0120 — Accepted; Explicit Capture-List Foundation',
         'Decision 0121 — Accepted; Stage 30 Closure Authority',
         'Pre-Stage-30 Grammar Slice — Complete',
@@ -204,7 +205,7 @@ function check_closure_capture_authority(string $root): array
     $require($typesPath, $types, [
         'pub struct FunctionTypeRef',
         'pub struct FunctionTypeParameterRef',
-        'function({parameters}): {}',
+        'function{invocation}({parameters}): {}',
     ]);
     $require($parserPath, $parser, [
         'fn parse_arrow_closure',
@@ -246,7 +247,7 @@ function check_closure_capture_authority(string $root): array
     }
 
     $grammarPosition = strpos($plan, '**Pre-Stage-30 Grammar Slice — Closure accepted syntax — Complete.**');
-    $stage30Position = strpos($plan, '**Stage 30 Closure Authority — Accepted; Stage 30 — Not Implemented.**');
+    $stage30Position = strpos($plan, '**Stage 30 Closure Authority — Accepted; Stage 30 — In Progress, Not Complete.**');
     if ($grammarPosition === false || $stage30Position === false || $grammarPosition >= $stage30Position) {
         $failures[] = "{$planPath}: the accepted-syntax grammar slice must precede Stage 30";
     }

@@ -1,0 +1,9 @@
+function rejected(
+    function(function(): int throws FirstError, string): void $callback
+): void
+{
+}
+
+function later(): void
+{
+}

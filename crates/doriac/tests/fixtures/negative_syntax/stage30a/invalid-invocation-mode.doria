@@ -1,0 +1,7 @@
+function rejected(function take(): Payload $callback): void
+{
+}
+
+function later(): void
+{
+}
