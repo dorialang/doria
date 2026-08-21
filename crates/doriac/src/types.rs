@@ -53,14 +53,14 @@ pub struct FunctionTypeParameterRef {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FunctionInvocationMode {
     Readonly,
     Writable,
     Once,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FunctionTypeParameterMode {
     Readonly,
     Writable,
@@ -347,6 +347,34 @@ impl fmt::Display for TypeRef {
 pub struct TypeId(usize);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticFunctionParameter<T> {
+    pub ownership_mode: FunctionTypeParameterMode,
+    pub ty: T,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SemanticFunctionType<T> {
+    pub invocation_mode: FunctionInvocationMode,
+    pub parameters: Vec<SemanticFunctionParameter<T>>,
+    pub return_type: T,
+    /// Canonical set order used for semantic identity. Source-facing metadata
+    /// separately preserves authored or first-origin order.
+    pub checked_effects: Vec<T>,
+    pub return_borrow: Option<FunctionReturnBorrow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FunctionReturnBorrow {
+    pub source: FunctionBorrowSource,
+    pub writable: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FunctionBorrowSource {
+    Parameter(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ClassType<T> {
     pub name: String,
     pub arguments: Vec<T>,
@@ -477,6 +505,7 @@ pub enum TypeKind {
     Heterogeneous,
     EmptyCollection,
     TypeParameter(String),
+    Function(SemanticFunctionType<TypeId>),
     Enum(EnumType),
     Class(ClassType<TypeId>),
     List(TypeId),
@@ -501,6 +530,7 @@ pub enum ResolvedType {
     Mixed,
     Error,
     TypeParameter(String),
+    Function(Box<SemanticFunctionType<ResolvedType>>),
     Enum(EnumType),
     Nullable(Box<ResolvedType>),
     Class(ClassType<ResolvedType>),
@@ -535,6 +565,19 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
                 .iter()
                 .map(resolved_type_complexity)
                 .sum::<usize>()
+        }
+        ResolvedType::Function(function) => {
+            1 + function
+                .parameters
+                .iter()
+                .map(|parameter| resolved_type_complexity(&parameter.ty))
+                .sum::<usize>()
+                + resolved_type_complexity(&function.return_type)
+                + function
+                    .checked_effects
+                    .iter()
+                    .map(resolved_type_complexity)
+                    .sum::<usize>()
         }
         ResolvedType::Integer(_)
         | ResolvedType::Float(_)
@@ -605,6 +648,7 @@ impl TypeRegistry {
             TypeKind::Heterogeneous => "heterogeneous".to_string(),
             TypeKind::EmptyCollection => "[]".to_string(),
             TypeKind::TypeParameter(name) => name.clone(),
+            TypeKind::Function(function) => self.display_function(function),
             TypeKind::Enum(enum_type) => enum_type.name.clone(),
             TypeKind::Class(class) => {
                 if class.arguments.is_empty() {
@@ -649,6 +693,43 @@ impl TypeRegistry {
         }
     }
 
+    fn display_function(&self, function: &SemanticFunctionType<TypeId>) -> String {
+        let invocation = match function.invocation_mode {
+            FunctionInvocationMode::Readonly => "",
+            FunctionInvocationMode::Writable => " writable",
+            FunctionInvocationMode::Once => " once",
+        };
+        let parameters = function
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let ownership = match parameter.ownership_mode {
+                    FunctionTypeParameterMode::Readonly => "",
+                    FunctionTypeParameterMode::Writable => "writable ",
+                    FunctionTypeParameterMode::Take => "take ",
+                };
+                format!("{ownership}{}", self.display(parameter.ty))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut display = format!(
+            "function{invocation}({parameters}): {}",
+            self.display(function.return_type)
+        );
+        if !function.checked_effects.is_empty() {
+            display.push_str(" throws ");
+            display.push_str(
+                &function
+                    .checked_effects
+                    .iter()
+                    .map(|effect| self.display(*effect))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+        }
+        display
+    }
+
     pub fn resolved(&self, id: TypeId) -> ResolvedType {
         match self.kind(id) {
             TypeKind::Void => ResolvedType::Void,
@@ -661,6 +742,26 @@ impl TypeRegistry {
             TypeKind::Mixed => ResolvedType::Mixed,
             TypeKind::Error => ResolvedType::Error,
             TypeKind::TypeParameter(name) => ResolvedType::TypeParameter(name.clone()),
+            TypeKind::Function(function) => {
+                ResolvedType::Function(Box::new(SemanticFunctionType {
+                    invocation_mode: function.invocation_mode,
+                    parameters: function
+                        .parameters
+                        .iter()
+                        .map(|parameter| SemanticFunctionParameter {
+                            ownership_mode: parameter.ownership_mode,
+                            ty: self.resolved(parameter.ty),
+                        })
+                        .collect(),
+                    return_type: self.resolved(function.return_type),
+                    checked_effects: function
+                        .checked_effects
+                        .iter()
+                        .map(|effect| self.resolved(*effect))
+                        .collect(),
+                    return_borrow: function.return_borrow,
+                }))
+            }
             TypeKind::Enum(enum_type) => ResolvedType::Enum(enum_type.clone()),
             TypeKind::Nullable(inner) => ResolvedType::Nullable(Box::new(self.resolved(*inner))),
             TypeKind::Class(class) => ResolvedType::Class(ClassType::new(
@@ -712,6 +813,29 @@ impl TypeRegistry {
             ResolvedType::Mixed => TypeKind::Mixed,
             ResolvedType::Error => TypeKind::Error,
             ResolvedType::TypeParameter(name) => TypeKind::TypeParameter(name.clone()),
+            ResolvedType::Function(function) => {
+                let parameters = function
+                    .parameters
+                    .iter()
+                    .map(|parameter| SemanticFunctionParameter {
+                        ownership_mode: parameter.ownership_mode,
+                        ty: self.intern_resolved(&parameter.ty),
+                    })
+                    .collect();
+                let return_type = self.intern_resolved(&function.return_type);
+                let checked_effects = function
+                    .checked_effects
+                    .iter()
+                    .map(|effect| self.intern_resolved(effect))
+                    .collect();
+                TypeKind::Function(SemanticFunctionType {
+                    invocation_mode: function.invocation_mode,
+                    parameters,
+                    return_type,
+                    checked_effects,
+                    return_borrow: function.return_borrow,
+                })
+            }
             ResolvedType::Enum(ty) => TypeKind::Enum(ty.clone()),
             ResolvedType::Nullable(inner) => {
                 let inner = self.intern_resolved(inner);

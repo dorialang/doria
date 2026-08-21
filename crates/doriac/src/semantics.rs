@@ -18,13 +18,16 @@ use crate::format_string::{self, FormatConversion, FormatPiece};
 use crate::numeric::{parse_decimal_magnitude, FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::Span;
 use crate::symbols::{
-    Binding, BorrowSource, BuiltinInterface, ClassInfo, ConstantInfo, FunctionInfo,
+    Binding, BindingDeclaration, BindingId, BindingKind, BindingOwnership, BindingResolution,
+    BorrowSource, BuiltinInterface, ClassInfo, ClosureId, ConstantInfo, FunctionInfo, LexicalOwner,
     MemberDeclaration, MemberKind, MethodInfo, ParamInfo, PropertyInfo, PropertyInitState,
     ReceiverMode, ReturnBorrow, ScopeStack, StaticPropertyInfo, TypeParamInfo,
 };
 use crate::types::{
-    resolved_type_complexity, ClassType, FunctionTypeRef, ResolvedType, SharedHandleKind, TypeId,
-    TypeKind, TypeRef, TypeRegistry,
+    resolved_type_complexity, ClassType, FunctionBorrowSource, FunctionInvocationMode,
+    FunctionReturnBorrow, FunctionTypeParameterMode, FunctionTypeRef, ResolvedType,
+    SemanticFunctionParameter, SemanticFunctionType, SharedHandleKind, TypeId, TypeKind, TypeRef,
+    TypeRegistry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +106,65 @@ pub struct SemanticInfo {
     pub try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
     /// Resolved catch type for each catch clause.
     pub catch_error_types: HashMap<(usize, usize), ResolvedType>,
+    /// Canonical structural function types resolved from authored type syntax.
+    pub function_types_by_span: HashMap<(usize, usize), FunctionTypeSemanticInfo>,
+    /// Stable lexical binding declarations and source-use resolutions.
+    pub binding_resolution: BindingResolution,
+    /// Fully checked closure plans keyed by stable source-derived identity.
+    pub closures: HashMap<ClosureId, ClosureSemanticInfo>,
+    /// Semantically checked indirect-call plans, still blocked from execution.
+    pub callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionTypeSemanticInfo {
+    pub ty: ResolvedType,
+    pub authored_checked_effects: Vec<ResolvedType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CaptureRequirement {
+    Readonly,
+    Writable,
+    Take,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureSemanticInfo {
+    pub source_binding_id: BindingId,
+    pub environment_binding_id: BindingId,
+    pub mode: ClosureCaptureMode,
+    pub declaration_span: Span,
+    pub first_use_span: Option<Span>,
+    pub use_spans: Vec<Span>,
+    pub source_type: ResolvedType,
+    pub required_capability: CaptureRequirement,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureSemanticInfo {
+    pub closure_id: ClosureId,
+    pub function_type: ResolvedType,
+    pub captures: Vec<CaptureSemanticInfo>,
+    pub inferred_invocation_mode: FunctionInvocationMode,
+    pub inferred_checked_effects: Vec<ResolvedType>,
+    pub inferred_return_type: ResolvedType,
+    pub execution_boundary_span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallableValueTargetKind {
+    Value,
+    Property,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallableValueCallInfo {
+    pub function_type: ResolvedType,
+    pub invocation_mode: FunctionInvocationMode,
+    pub return_type: ResolvedType,
+    pub checked_effects: Vec<ResolvedType>,
+    pub target_kind: CallableValueTargetKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -146,6 +208,10 @@ impl ClassSemanticInfo {
     pub fn implements(&self, interface: BuiltinInterface) -> bool {
         self.builtin_interfaces.contains(&interface)
     }
+}
+
+fn contains_comment(text: &str) -> bool {
+    text.contains("//") || text.contains("/*") || text.contains('#')
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,6 +302,94 @@ fn statement_span(statement: &Stmt) -> Span {
         Stmt::For(statement) => statement.span,
         Stmt::Foreach(statement) => statement.span,
         Stmt::Increment(statement) => statement.span,
+    }
+}
+
+fn closure_local_declarations(body: &ClosureBody) -> HashMap<String, Span> {
+    let mut declarations = HashMap::new();
+    if let ClosureBody::Block(block) = body {
+        for statement in &block.statements {
+            if let Stmt::VarDecl(declaration) = statement {
+                for binding in &declaration.bindings {
+                    declarations
+                        .entry(binding.name.clone())
+                        .or_insert(binding.span);
+                }
+            }
+        }
+    }
+    declarations
+}
+
+fn collect_return_expression_spans(block: &Block, returns: &mut Vec<Option<Span>>) {
+    for statement in &block.statements {
+        match statement {
+            Stmt::Return { expr, .. } => returns.push(expr.as_ref().map(Expr::span)),
+            Stmt::Block(block) => collect_return_expression_spans(block, returns),
+            Stmt::If(statement) => {
+                collect_return_expression_spans(&statement.then_block, returns);
+                if let Some(branch) = &statement.else_branch {
+                    collect_else_return_spans(branch, returns);
+                }
+                if let Some(finally) = &statement.finally {
+                    collect_return_expression_spans(&finally.block, returns);
+                }
+            }
+            Stmt::While(statement) => {
+                collect_return_expression_spans(&statement.body, returns);
+                if let Some(finally) = &statement.finally {
+                    collect_return_expression_spans(&finally.block, returns);
+                }
+            }
+            Stmt::DoWhile(statement) => {
+                collect_return_expression_spans(&statement.body, returns);
+                if let Some(finally) = &statement.finally {
+                    collect_return_expression_spans(&finally.block, returns);
+                }
+            }
+            Stmt::For(statement) => collect_return_expression_spans(&statement.body, returns),
+            Stmt::Foreach(statement) => collect_return_expression_spans(&statement.body, returns),
+            Stmt::Try(statement) => {
+                collect_return_expression_spans(&statement.body, returns);
+                for catch in &statement.catches {
+                    collect_return_expression_spans(&catch.body, returns);
+                }
+                if let Some(finally) = &statement.finally {
+                    collect_return_expression_spans(&finally.body, returns);
+                }
+            }
+            Stmt::VarDecl(_)
+            | Stmt::Assignment(_)
+            | Stmt::Echo { .. }
+            | Stmt::Throw(_)
+            | Stmt::Break { .. }
+            | Stmt::Continue { .. }
+            | Stmt::Increment(_)
+            | Stmt::Expr { .. } => {}
+        }
+    }
+}
+
+fn collect_else_return_spans(branch: &ElseBranch, returns: &mut Vec<Option<Span>>) {
+    match branch {
+        ElseBranch::Block(block) => collect_return_expression_spans(block, returns),
+        ElseBranch::If(statement) => {
+            collect_return_expression_spans(&statement.then_block, returns);
+            if let Some(branch) = &statement.else_branch {
+                collect_else_return_spans(branch, returns);
+            }
+            if let Some(finally) = &statement.finally {
+                collect_return_expression_spans(&finally.block, returns);
+            }
+        }
+    }
+}
+
+fn expression_contains_closure(expr: &Expr) -> bool {
+    match expr {
+        Expr::Closure(_) => true,
+        Expr::Grouped { expr, .. } => expression_contains_closure(expr),
+        _ => false,
     }
 }
 
@@ -400,6 +554,10 @@ pub fn analyze_program_for_ide_with_source<'source>(
             throw_error_types: checker.throw_error_types,
             try_uncovered_effects: checker.try_uncovered_effects,
             catch_error_types: checker.catch_error_types,
+            function_types_by_span: checker.function_types_by_span,
+            binding_resolution: checker.binding_resolution,
+            closures: checker.closures,
+            callable_value_calls: checker.callable_value_calls,
         },
         diagnostics: checker.diagnostics,
     }
@@ -1067,7 +1225,56 @@ struct Checker<'program> {
     throw_error_types: HashMap<(usize, usize), ResolvedType>,
     try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
     catch_error_types: HashMap<(usize, usize), ResolvedType>,
-    function_type_boundary_suppression: usize,
+    function_types_by_span: HashMap<(usize, usize), FunctionTypeSemanticInfo>,
+    binding_resolution: BindingResolution,
+    binding_ids: HashMap<(usize, usize, BindingKind, LexicalOwner, String), BindingId>,
+    next_binding_id: usize,
+    current_lexical_owner: LexicalOwner,
+    closures: HashMap<ClosureId, ClosureSemanticInfo>,
+    closure_types: HashMap<(usize, usize), TypeId>,
+    callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
+    active_closures: Vec<ActiveClosure>,
+    initializing_bindings: Vec<HashMap<String, Span>>,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveClosure {
+    id: ClosureId,
+    captures: Vec<CaptureDraft>,
+    capture_by_environment: HashMap<BindingId, usize>,
+    missing: HashMap<BindingId, MissingCaptureDraft>,
+}
+
+#[derive(Debug, Clone)]
+struct CaptureDraft {
+    source_binding_id: BindingId,
+    environment_binding_id: BindingId,
+    mode: ClosureCaptureMode,
+    declaration_span: Span,
+    first_use_span: Option<Span>,
+    use_spans: Vec<Span>,
+    source_type: TypeId,
+    required_capability: CaptureRequirement,
+}
+
+#[derive(Debug, Clone)]
+struct MissingCaptureDraft {
+    source_binding_id: BindingId,
+    first_use_span: Span,
+    use_spans: Vec<Span>,
+    required_capability: CaptureRequirement,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FunctionTypeMismatch {
+    Nullability,
+    Arity,
+    ParameterOwnership(usize),
+    ParameterType(usize),
+    ReturnType,
+    InvocationMode,
+    CheckedEffects,
+    ReturnBorrow,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1275,6 +1482,7 @@ fn semantic_type_capabilities(
             equality: true,
         },
         TypeKind::Void
+        | TypeKind::Function(_)
         | TypeKind::Mixed
         | TypeKind::TypedArray(_)
         | TypeKind::Unknown
@@ -1324,6 +1532,9 @@ fn semantic_layout_shape(
         | TypeKind::PriorityQueue(_)
         | TypeKind::Deque(_)
         | TypeKind::SharedHandle(_, _) => Some(scalar(POINTER)),
+        // Function values have semantic identity in Stage 30b, but no runtime
+        // representation until executable closure lowering lands.
+        TypeKind::Function(_) => None,
         TypeKind::Enum(enum_type) => enum_layouts.get(&enum_type.id).map(|layout| LayoutShape {
             size: layout.size,
             align: layout.align,
@@ -1596,7 +1807,16 @@ impl<'program> Checker<'program> {
             throw_error_types: HashMap::new(),
             try_uncovered_effects: HashMap::new(),
             catch_error_types: HashMap::new(),
-            function_type_boundary_suppression: 0,
+            function_types_by_span: HashMap::new(),
+            binding_resolution: BindingResolution::default(),
+            binding_ids: HashMap::new(),
+            next_binding_id: 0,
+            current_lexical_owner: LexicalOwner::TopLevel,
+            closures: HashMap::new(),
+            closure_types: HashMap::new(),
+            callable_value_calls: HashMap::new(),
+            active_closures: Vec::new(),
+            initializing_bindings: Vec::new(),
         }
     }
 
@@ -3068,13 +3288,7 @@ impl<'program> Checker<'program> {
                 for param in &signature.params {
                     let _ = scopes.declare(
                         param.name.clone(),
-                        Binding {
-                            writable: param.writable,
-                            ty: param.ty,
-                            declared_ty: param.ty,
-                            int_constant: None,
-                            string_constant: None,
-                        },
+                        Binding::unresolved(param.writable, param.ty, param.ty, None, None),
                     );
                 }
                 let method_context = declaring_class.as_ref().map(|class_name| MethodContext {
@@ -3408,13 +3622,7 @@ impl<'program> Checker<'program> {
         for param in params {
             let _ = scopes.declare(
                 param.name.clone(),
-                Binding {
-                    writable: false,
-                    ty: param.ty,
-                    declared_ty: param.ty,
-                    int_constant: None,
-                    string_constant: None,
-                },
+                Binding::unresolved(false, param.ty, param.ty, None, None),
             );
         }
 
@@ -3460,13 +3668,7 @@ impl<'program> Checker<'program> {
                 for binding in &decl.bindings {
                     let _ = scopes.declare(
                         binding.name.clone(),
-                        Binding {
-                            writable: decl.writable,
-                            ty,
-                            declared_ty: ty,
-                            int_constant: None,
-                            string_constant: None,
-                        },
+                        Binding::unresolved(decl.writable, ty, ty, None, None),
                     );
                 }
                 None
@@ -3593,13 +3795,7 @@ impl<'program> Checker<'program> {
                 for binding in &decl.bindings {
                     let _ = scopes.declare(
                         binding.name.clone(),
-                        Binding {
-                            writable: decl.writable,
-                            ty,
-                            declared_ty: ty,
-                            int_constant: None,
-                            string_constant: None,
-                        },
+                        Binding::unresolved(decl.writable, ty, ty, None, None),
                     );
                 }
             }
@@ -3663,13 +3859,7 @@ impl<'program> Checker<'program> {
                 .unwrap_or(inferred_key);
             let _ = scopes.declare(
                 key.name.clone(),
-                Binding {
-                    writable: false,
-                    ty,
-                    declared_ty: ty,
-                    int_constant: None,
-                    string_constant: None,
-                },
+                Binding::unresolved(false, ty, ty, None, None),
             );
         }
 
@@ -3681,13 +3871,7 @@ impl<'program> Checker<'program> {
             .unwrap_or(inferred_value);
         let _ = scopes.declare(
             foreach.value.name.clone(),
-            Binding {
-                writable: false,
-                ty: value_ty,
-                declared_ty: value_ty,
-                int_constant: None,
-                string_constant: None,
-            },
+            Binding::unresolved(false, value_ty, value_ty, None, None),
         );
 
         let inferred = self.infer_move_return_from_statements(
@@ -4235,9 +4419,49 @@ impl<'program> Checker<'program> {
         &mut self,
         scopes: &mut ScopeStack,
         name: String,
-        binding: Binding,
+        mut binding: Binding,
         span: Span,
+        kind: BindingKind,
+        ownership: BindingOwnership,
     ) {
+        let key = (
+            span.start,
+            span.end,
+            kind,
+            self.current_lexical_owner,
+            name.clone(),
+        );
+        let id = if let Some(id) = self.binding_ids.get(&key) {
+            *id
+        } else {
+            let id = BindingId(self.next_binding_id);
+            self.next_binding_id += 1;
+            self.binding_ids.insert(key, id);
+            id
+        };
+        binding.id = id;
+        binding.kind = kind;
+        binding.ownership = ownership;
+        binding.owner = self.current_lexical_owner;
+        let source_span = (kind != BindingKind::MethodReceiver).then_some(span);
+        self.binding_resolution.declarations_by_id.insert(
+            id,
+            BindingDeclaration {
+                id,
+                name: name.clone(),
+                span: source_span,
+                kind,
+                writable: binding.writable,
+                ownership,
+                owner: self.current_lexical_owner,
+                source_type: Some(self.types.resolved(binding.declared_ty)),
+            },
+        );
+        if let Some(source_span) = source_span {
+            self.binding_resolution
+                .declaration_by_span
+                .insert((source_span.start, source_span.end), id);
+        }
         if !scopes.declare(name.clone(), binding) {
             self.diagnostics.push(Diagnostic::new(
                 "E0103",
@@ -4309,10 +4533,38 @@ impl<'program> Checker<'program> {
 
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
         let previous_callable = self.current_callable.replace(function.span.start);
+        let previous_owner = std::mem::replace(
+            &mut self.current_lexical_owner,
+            LexicalOwner::Callable(function.span.start),
+        );
+        self.binding_resolution
+            .lexical_parents
+            .insert(self.current_lexical_owner, previous_owner);
         self.type_parameter_scopes
             .push(type_parameter_scope(&function.type_params));
         let mut scopes = ScopeStack::new();
         let signature = self.current_function_signature(function);
+        if let Some(context) = method_context.as_ref().filter(|_| !function.is_static) {
+            let receiver_ty = self.symbolic_class_type(&context.class_name);
+            self.declare_binding(
+                &mut scopes,
+                "this".to_string(),
+                Binding::unresolved(
+                    context.receiver_mode.is_some_and(ReceiverMode::is_writable),
+                    receiver_ty,
+                    receiver_ty,
+                    None,
+                    None,
+                ),
+                Span::new(function.span.start, function.span.start),
+                BindingKind::MethodReceiver,
+                if context.receiver_mode.is_some_and(ReceiverMode::is_writable) {
+                    BindingOwnership::WritableBorrow
+                } else {
+                    BindingOwnership::ReadonlyBorrow
+                },
+            );
+        }
         if function.return_type.is_none()
             && LifecycleMethod::from_method_name(&function.name).is_none()
             && function.throws.is_some()
@@ -4399,14 +4651,20 @@ impl<'program> Checker<'program> {
             self.declare_binding(
                 &mut scopes,
                 param.name.clone(),
-                Binding {
-                    writable: param.writable,
-                    ty,
-                    declared_ty: ty,
-                    int_constant: None,
-                    string_constant: None,
-                },
+                Binding::unresolved(param.writable, ty, ty, None, None),
                 param.span,
+                if method_context.is_some() {
+                    BindingKind::MethodParameter
+                } else {
+                    BindingKind::FunctionParameter
+                },
+                if param.take {
+                    BindingOwnership::Owned
+                } else if param.writable {
+                    BindingOwnership::WritableBorrow
+                } else {
+                    BindingOwnership::ReadonlyBorrow
+                },
             );
         }
         let mut constructor_init_context = method_context.as_ref().and_then(|context| {
@@ -4437,6 +4695,7 @@ impl<'program> Checker<'program> {
         }
         self.type_parameter_scopes.pop();
         self.current_callable = previous_callable;
+        self.current_lexical_owner = previous_owner;
     }
 
     fn is_accepted_program_entrypoint(&self, function: &FunctionDecl) -> bool {
@@ -5206,14 +5465,10 @@ impl<'program> Checker<'program> {
                     self.declare_binding(
                         &mut loop_scopes,
                         key.name.clone(),
-                        Binding {
-                            writable: false,
-                            ty,
-                            declared_ty: ty,
-                            int_constant: None,
-                            string_constant: None,
-                        },
-                        foreach.span,
+                        Binding::unresolved(false, ty, ty, None, None),
+                        key.span,
+                        BindingKind::ForeachKey,
+                        BindingOwnership::ReadonlyBorrow,
                     );
                 }
                 let value_ty = if range_iterable {
@@ -5270,20 +5525,26 @@ impl<'program> Checker<'program> {
                 self.declare_binding(
                     &mut loop_scopes,
                     foreach.value.name.clone(),
-                    Binding {
-                        writable: foreach.value.writable
+                    Binding::unresolved(
+                        foreach.value.writable
                             && dictionary_projection.is_none()
                             && !range_iterable
                             && !matches!(
                                 self.types.kind(iterable_ty),
                                 TypeKind::Set(_) | TypeKind::SortedSet(_)
                             ),
-                        ty: value_ty,
-                        declared_ty: value_ty,
-                        int_constant: None,
-                        string_constant: None,
+                        value_ty,
+                        value_ty,
+                        None,
+                        None,
+                    ),
+                    foreach.value.span,
+                    BindingKind::ForeachValue,
+                    if foreach.value.writable {
+                        BindingOwnership::WritableBorrow
+                    } else {
+                        BindingOwnership::ReadonlyBorrow
                     },
-                    foreach.span,
                 );
                 let mut loop_constructor_init_context = constructor_init_context
                     .as_deref()
@@ -5464,14 +5725,10 @@ impl<'program> Checker<'program> {
                 self.declare_binding(
                     &mut catch_scopes,
                     binding.name.clone(),
-                    Binding {
-                        writable: false,
-                        ty: catch_type,
-                        declared_ty: catch_type,
-                        int_constant: None,
-                        string_constant: None,
-                    },
+                    Binding::unresolved(false, catch_type, catch_type, None, None),
                     binding.span,
+                    BindingKind::CatchBinding,
+                    BindingOwnership::Owned,
                 );
             }
             let mut catch_constructor =
@@ -5528,6 +5785,16 @@ impl<'program> Checker<'program> {
         scopes: &mut ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
+        self.check_local_declaration_with_kind(decl, scopes, method_context, None);
+    }
+
+    fn check_local_declaration_with_kind(
+        &mut self,
+        decl: &VarDecl,
+        scopes: &mut ScopeStack,
+        method_context: Option<&MethodContext>,
+        kind: Option<BindingKind>,
+    ) {
         let diagnostics_before = self.diagnostics.len();
         let explicit_ty = decl
             .ty
@@ -5536,8 +5803,15 @@ impl<'program> Checker<'program> {
         if let Some(target_ty) = explicit_ty {
             self.record_expected_expression_type(&decl.initializer, target_ty);
         }
+        self.initializing_bindings.push(
+            decl.bindings
+                .iter()
+                .map(|binding| (binding.name.clone(), binding.span))
+                .collect(),
+        );
         self.check_expr(&decl.initializer, scopes, method_context);
         let value_ty = self.infer_expr_type(&decl.initializer, scopes, method_context);
+        self.initializing_bindings.pop();
         if self.is_void_type(value_ty) {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -5668,14 +5942,16 @@ impl<'program> Checker<'program> {
             self.declare_binding(
                 scopes,
                 binding.name.clone(),
-                Binding {
-                    writable: decl.writable,
-                    ty,
-                    declared_ty: ty,
-                    int_constant,
-                    string_constant: string_constant.clone(),
-                },
+                Binding::unresolved(decl.writable, ty, ty, int_constant, string_constant.clone()),
                 binding.span,
+                kind.unwrap_or({
+                    if decl.bindings.len() > 1 {
+                        BindingKind::GroupedLocal
+                    } else {
+                        BindingKind::Local
+                    }
+                }),
+                BindingOwnership::Owned,
             );
         }
     }
@@ -5689,7 +5965,12 @@ impl<'program> Checker<'program> {
     ) {
         match initializer {
             ForInitializer::VarDecl(decl) => {
-                self.check_local_declaration(decl, scopes, method_context);
+                self.check_local_declaration_with_kind(
+                    decl,
+                    scopes,
+                    method_context,
+                    Some(BindingKind::LoopBinding),
+                );
             }
             ForInitializer::Assignment(assignment) => {
                 if let Some(target) = self.check_writable_place(
@@ -6006,7 +6287,12 @@ impl<'program> Checker<'program> {
                             .with_help("move this declaration before the first bool predicate"),
                         );
                     }
-                    self.check_local_declaration(declaration, scopes, method_context);
+                    self.check_local_declaration_with_kind(
+                        declaration,
+                        scopes,
+                        method_context,
+                        Some(BindingKind::GivenBinding),
+                    );
                 }
                 Stmt::Expr { expr, span } => {
                     self.check_expr(expr, scopes, method_context);
@@ -6263,6 +6549,7 @@ impl<'program> Checker<'program> {
         if self.is_expr_assignable(expected, expr, scopes, method_context)
             || self.is_assignable(expected, value)
         {
+            self.check_closure_return_capture(expr, expected, scopes);
             return;
         }
 
@@ -6325,6 +6612,50 @@ impl<'program> Checker<'program> {
             ),
             span,
         ));
+    }
+
+    fn check_closure_return_capture(&mut self, expr: &Expr, expected: TypeId, scopes: &ScopeStack) {
+        if self.active_closures.is_empty() || !self.type_is_move_type(expected) {
+            return;
+        }
+        let Some(binding) = self.expression_root_binding(expr, scopes) else {
+            return;
+        };
+        let Some(active) = self.active_closures.last() else {
+            return;
+        };
+        let Some(index) = active.capture_by_environment.get(&binding.id).copied() else {
+            return;
+        };
+        let mode = active.captures[index].mode;
+        if mode == ClosureCaptureMode::Take {
+            self.record_binding_use(&binding, expr.span(), CaptureRequirement::Take);
+            return;
+        }
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0653",
+                "a closure cannot return a borrow rooted in its captured environment",
+                expr.span(),
+            )
+            .with_title("Captured Environment Borrow Cannot Be Returned")
+            .with_help(
+                "capture the owned value with `take`, or return a value created inside the closure",
+            ),
+        );
+    }
+
+    fn expression_root_binding(&self, expr: &Expr, scopes: &ScopeStack) -> Option<Binding> {
+        match expr {
+            Expr::Grouped { expr, .. } => self.expression_root_binding(expr, scopes),
+            Expr::Variable { name, .. } => scopes.lookup(name).cloned(),
+            Expr::This { .. } => scopes.lookup("this").cloned(),
+            Expr::PropertyAccess { object, .. }
+            | Expr::Index {
+                collection: object, ..
+            } => self.expression_root_binding(object, scopes),
+            _ => None,
+        }
     }
 
     fn is_void_type(&self, ty: TypeId) -> bool {
@@ -6457,27 +6788,43 @@ impl<'program> Checker<'program> {
     ) {
         match expr {
             Expr::Closure(closure) => {
-                self.validate_closure_signature(closure, method_context);
-                self.report_stage_30_closure_boundary("closure", closure.span);
+                self.check_closure_expression(closure, scopes, method_context);
             }
-            Expr::CallableCall { span, .. } => {
-                self.report_stage_30_closure_boundary("callable-value invocation", *span);
+            Expr::CallableCall {
+                callee, args, span, ..
+            } => {
+                self.check_callable_value_call(callee, args, *span, scopes, method_context);
             }
             Expr::Variable { name, span } => {
-                if scopes.lookup(name).is_none() {
+                if let Some(binding) = scopes.lookup(name) {
+                    self.record_binding_use(binding, *span, CaptureRequirement::Readonly);
+                } else {
                     self.undeclared_variable(name, *span);
                 }
             }
             Expr::This { span } => {
-                if !method_context
-                    .map(|context| context.this_available)
-                    .unwrap_or(false)
-                {
+                if !self.active_closures.is_empty() {
+                    if let Some(binding) = scopes.lookup("this") {
+                        self.record_binding_use(binding, *span, CaptureRequirement::Readonly);
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0644",
+                                "this closure has no enclosing method receiver to capture",
+                                *span,
+                            )
+                            .with_title("Closure Has No `$this` Receiver")
+                            .with_help("Use `$this` only in a closure nested inside an instance method, and list it in `with (...)`."),
+                        );
+                    }
+                } else if !method_context.is_some_and(|context| context.this_available) {
                     self.diagnostics.push(Diagnostic::new(
                         "E0102",
                         "`$this` is only available inside methods",
                         *span,
                     ));
+                } else if let Some(binding) = scopes.lookup("this") {
+                    self.record_binding_use(binding, *span, CaptureRequirement::Readonly);
                 }
             }
             Expr::InterpolatedString { parts, .. } => {
@@ -6593,6 +6940,18 @@ impl<'program> Checker<'program> {
                     *member_span,
                     *argument_list_span,
                     args,
+                    scopes,
+                    method_context,
+                ) {
+                    return;
+                }
+                if self.check_callable_property_call(
+                    object,
+                    method,
+                    args,
+                    *null_safe,
+                    *member_span,
+                    *span,
                     scopes,
                     method_context,
                 ) {
@@ -6822,11 +7181,45 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn report_stage_30_closure_boundary(&mut self, surface: &str, span: Span) {
+    fn record_binding_use(
+        &mut self,
+        binding: &Binding,
+        span: Span,
+        requirement: CaptureRequirement,
+    ) {
+        self.binding_resolution
+            .uses_by_span
+            .insert((span.start, span.end), binding.id);
+        let Some(active) = self.active_closures.last_mut() else {
+            return;
+        };
+        if binding.owner == LexicalOwner::Closure(active.id) {
+            if let Some(index) = active.capture_by_environment.get(&binding.id).copied() {
+                let capture = &mut active.captures[index];
+                capture.first_use_span.get_or_insert(span);
+                capture.use_spans.push(span);
+                capture.required_capability = capture.required_capability.max(requirement);
+            }
+            return;
+        }
+        let missing = active
+            .missing
+            .entry(binding.id)
+            .or_insert_with(|| MissingCaptureDraft {
+                source_binding_id: binding.id,
+                first_use_span: span,
+                use_spans: Vec::new(),
+                required_capability: requirement,
+            });
+        missing.use_spans.push(span);
+        missing.required_capability = missing.required_capability.max(requirement);
+    }
+
+    fn report_stage_30_execution_boundary(&mut self, surface: &str, span: Span) {
         if self
             .diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "E0641")
+            .any(|diagnostic| diagnostic.code == "E0641" && diagnostic.span == span)
         {
             return;
         }
@@ -6834,65 +7227,1174 @@ impl<'program> Checker<'program> {
             Diagnostic::unsupported_stage(
                 "E0641",
                 format!(
-                    "{surface} syntax is accepted Doria; closure checking and execution land in Stage 30"
+                    "{surface} is valid Doria, but checked function values cannot execute yet"
                 ),
                 span,
             )
-            .with_title("Closure Semantics Await Stage 30")
+            .with_title("Closure Execution Is Not Yet Available")
             .with_explanation(
-                "The compiler preserves this syntax now so valid Doria can be edited and inspected before closure semantics land.",
+                "Semantic function types, captures, invocation requirements, and checked effects were validated. Ownership and lifetime enforcement precede executable HIR and MIR support.",
             )
-            .with_help("keep the closure source as written; it is valid Doria syntax and does not need rewriting"),
+            .with_help("Keep the source as written; no rewrite is required."),
         );
     }
 
-    fn validate_closure_signature(
+    fn check_callable_value_call(
         &mut self,
-        closure: &ClosureExpression,
+        callee: &Expr,
+        args: &[Argument],
+        span: Span,
+        scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
-    ) {
-        let declaring_class = method_context.map(|context| context.class_name.as_str());
-        self.function_type_boundary_suppression += 1;
-        for parameter in &closure.parameters {
-            self.resolve_type_ref_in_position(
-                &parameter.ty,
-                parameter.type_span,
-                TypePosition::Value,
-                declaring_class,
+    ) -> TypeId {
+        let diagnostics_start = self.diagnostics.len();
+        self.check_expr(callee, scopes, method_context);
+        for argument in args {
+            self.check_expr(&argument.value, scopes, method_context);
+        }
+        let callee_ty = self.infer_expr_type(callee, scopes, method_context);
+        self.check_callable_signature(
+            callee,
+            callee_ty,
+            args,
+            span,
+            CallableValueTargetKind::Value,
+            diagnostics_start,
+            scopes,
+            method_context,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_callable_property_call(
+        &mut self,
+        object: &Expr,
+        member: &str,
+        args: &[Argument],
+        null_safe: bool,
+        member_span: Span,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let diagnostics_start = self.diagnostics.len();
+        let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
+            return false;
+        };
+        let Some(class) = self.classes.get(&class_type.name) else {
+            return false;
+        };
+        if class.methods.contains_key(member) {
+            return false;
+        }
+        let Some(property) = class.properties.get(member).cloned() else {
+            return false;
+        };
+        let property = self.specialize_property_for_class(&property, &class_type);
+        if self.non_null_function_type(property.ty).is_none() {
+            return false;
+        }
+        let property_expr = Expr::PropertyAccess {
+            object: Box::new(object.clone()),
+            property: member.to_string(),
+            member_span,
+            null_safe: false,
+            span: object.span().merge(member_span),
+        };
+        if null_safe {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0652",
+                    "null-safe member-call syntax cannot invoke a callable property",
+                    span,
+                )
+                .with_title("Callable Property Has No Null-Safe Call Form")
+                .with_help("narrow the receiver and callable property, then invoke it with ordinary `->` syntax"),
+            );
+            return true;
+        }
+        self.lookup_property(object, member, span, scopes, method_context);
+        self.check_callable_signature(
+            &property_expr,
+            property.ty,
+            args,
+            span,
+            CallableValueTargetKind::Property,
+            diagnostics_start,
+            scopes,
+            method_context,
+        );
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_callable_signature(
+        &mut self,
+        callee: &Expr,
+        callee_ty: TypeId,
+        args: &[Argument],
+        span: Span,
+        target_kind: CallableValueTargetKind,
+        diagnostics_start: usize,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        let function = match self.types.kind(callee_ty).clone() {
+            TypeKind::Function(function) => function,
+            TypeKind::Nullable(inner)
+                if matches!(self.types.kind(inner), TypeKind::Function(_)) =>
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0650",
+                        "nullable function value cannot be invoked before narrowing",
+                        callee.span(),
+                    )
+                    .with_title("Nullable Callable Must Be Narrowed")
+                    .with_help("prove the value is non-null before invoking it"),
+                );
+                return self.types.unknown();
+            }
+            TypeKind::Unknown => return self.types.unknown(),
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0649",
+                        format!(
+                            "value of type `{}` is not callable",
+                            self.types.display(callee_ty)
+                        ),
+                        callee.span(),
+                    )
+                    .with_title("Value Is Not Callable")
+                    .with_help("invoke a value whose semantic type is `function(...): ReturnType`"),
+                );
+                return self.types.unknown();
+            }
+        };
+
+        for argument in args {
+            if let Some(name) = &argument.name {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0652",
+                        "function values accept positional arguments only",
+                        name.span,
+                    )
+                    .with_title("Callable Argument Cannot Be Named")
+                    .with_help("remove the argument name and preserve argument order"),
+                );
+            }
+        }
+
+        if args.len() != function.parameters.len() {
+            self.report_argument_count_mismatch(
+                "function value",
+                function.parameters.len(),
+                function.parameters.len(),
+                args.len(),
+                span,
+            );
+        } else {
+            for (index, (argument, parameter)) in args.iter().zip(&function.parameters).enumerate()
+            {
+                let actual = self.infer_expr_type(&argument.value, scopes, method_context);
+                if !self.is_expr_assignable(parameter.ty, &argument.value, scopes, method_context)
+                    && !self.is_assignable(parameter.ty, actual)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0408",
+                            format!(
+                                "argument {} of function value expects `{}`, got `{}`",
+                                index + 1,
+                                self.types.display(parameter.ty),
+                                self.types.display(actual)
+                            ),
+                            argument.value.span(),
+                        )
+                        .with_title("Callable Argument Type Mismatch"),
+                    );
+                    continue;
+                }
+                match parameter.ownership_mode {
+                    FunctionTypeParameterMode::Readonly => {}
+                    FunctionTypeParameterMode::Writable => {
+                        self.record_capture_requirement_for_expr(
+                            &argument.value,
+                            scopes,
+                            CaptureRequirement::Writable,
+                        );
+                        if !self.is_writable_object_path(&argument.value, scopes, method_context) {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "E0651",
+                                    format!("argument {} requires writable access", index + 1),
+                                    argument.value.span(),
+                                )
+                                .with_title("Writable Callable Argument Requires Writable Access"),
+                            );
+                        }
+                    }
+                    FunctionTypeParameterMode::Take => {
+                        if self.type_is_move_type(actual) {
+                            self.record_capture_requirement_for_expr(
+                                &argument.value,
+                                scopes,
+                                CaptureRequirement::Take,
+                            );
+                            if !self.expression_provides_owned_value(&argument.value, scopes) {
+                                self.diagnostics.push(
+                                    Diagnostic::new(
+                                        "E0645",
+                                        format!("argument {} requires an owned value", index + 1),
+                                        argument.value.span(),
+                                    )
+                                    .with_title("Taking Callable Argument Requires Ownership"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let requirement = match function.invocation_mode {
+            FunctionInvocationMode::Readonly => CaptureRequirement::Readonly,
+            FunctionInvocationMode::Writable => CaptureRequirement::Writable,
+            FunctionInvocationMode::Once => CaptureRequirement::Take,
+        };
+        self.record_capture_requirement_for_expr(callee, scopes, requirement);
+        if function.invocation_mode != FunctionInvocationMode::Readonly
+            && !self.callable_access_is_sufficient(
+                callee,
+                function.invocation_mode,
+                scopes,
+                method_context,
+            )
+        {
+            let access = match function.invocation_mode {
+                FunctionInvocationMode::Readonly => "readonly",
+                FunctionInvocationMode::Writable => "writable",
+                FunctionInvocationMode::Once => "owned",
+            };
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0651",
+                    format!("this function value requires {access} invocation access"),
+                    callee.span(),
+                )
+                .with_title("Callable Invocation Requires Stronger Access")
+                .with_help(format!("invoke it through a {access} callable place")),
             );
         }
-        if let Some(return_type) = &closure.return_type {
+
+        self.record_checked_effects(function.checked_effects.iter().copied(), span);
+        let resolved_function = self.types.resolved(callee_ty);
+        self.callable_value_calls.insert(
+            (span.start, span.end),
+            CallableValueCallInfo {
+                function_type: resolved_function,
+                invocation_mode: function.invocation_mode,
+                return_type: self.types.resolved(function.return_type),
+                checked_effects: function
+                    .checked_effects
+                    .iter()
+                    .map(|effect| self.types.resolved(*effect))
+                    .collect(),
+                target_kind,
+            },
+        );
+        if !self.diagnostics[diagnostics_start..]
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.severity == crate::diagnostics::DiagnosticSeverity::Error
+                    && diagnostic.code != "E0641"
+            })
+            && !expression_contains_closure(callee)
+        {
+            self.report_stage_30_execution_boundary("this function-value call", span);
+        }
+        function.return_type
+    }
+
+    fn expression_provides_owned_value(&self, expr: &Expr, scopes: &ScopeStack) -> bool {
+        match expr {
+            Expr::Grouped { expr, .. } => self.expression_provides_owned_value(expr, scopes),
+            Expr::Variable { name, .. } => scopes
+                .lookup(name)
+                .is_some_and(|binding| binding.ownership == BindingOwnership::Owned),
+            Expr::This { .. } | Expr::PropertyAccess { .. } | Expr::Index { .. } => false,
+            _ => true,
+        }
+    }
+
+    fn callable_access_is_sufficient(
+        &mut self,
+        callee: &Expr,
+        mode: FunctionInvocationMode,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        match mode {
+            FunctionInvocationMode::Readonly => true,
+            FunctionInvocationMode::Writable => {
+                self.is_writable_object_path(callee, scopes, method_context)
+                    || matches!(callee, Expr::Closure(_) | Expr::CallableCall { .. })
+            }
+            FunctionInvocationMode::Once => self.expression_provides_owned_value(callee, scopes),
+        }
+    }
+
+    fn check_closure_expression(
+        &mut self,
+        closure: &ClosureExpression,
+        outer_scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        let key = (closure.span.start, closure.span.end);
+        let diagnostics_start = self.diagnostics.len();
+        let closure_id = ClosureId::from_span(closure.span);
+        let previous_owner = std::mem::replace(
+            &mut self.current_lexical_owner,
+            LexicalOwner::Closure(closure_id),
+        );
+        self.binding_resolution
+            .closure_owners
+            .insert(closure_id, previous_owner);
+        self.binding_resolution
+            .lexical_parents
+            .insert(LexicalOwner::Closure(closure_id), previous_owner);
+
+        let declaring_class = method_context.map(|context| context.class_name.as_str());
+        let parameter_names = closure
+            .parameters
+            .iter()
+            .map(|parameter| parameter.name.as_str())
+            .collect::<HashSet<_>>();
+        let own_locals = closure_local_declarations(&closure.body);
+        let mut closure_scopes = outer_scopes.clone();
+        closure_scopes.push();
+        let mut captures = Vec::new();
+        let mut capture_by_environment = HashMap::new();
+        let mut seen_sources = HashMap::<BindingId, Span>::new();
+
+        if let Some(clause) = &closure.captures {
+            for capture in &clause.captures {
+                if parameter_names.contains(capture.name.as_str())
+                    || own_locals.contains_key(capture.name.as_str())
+                {
+                    let related = closure
+                        .parameters
+                        .iter()
+                        .find(|parameter| parameter.name == capture.name)
+                        .map(|parameter| parameter.name_span)
+                        .or_else(|| own_locals.get(capture.name.as_str()).copied());
+                    let mut diagnostic = Diagnostic::new(
+                        "E0644",
+                        format!(
+                            "`${}` belongs to this closure and cannot be captured from an enclosing scope",
+                            capture.name
+                        ),
+                        capture.span,
+                    )
+                    .with_title("Closure Cannot Capture Its Own Binding");
+                    if let Some(related) = related {
+                        diagnostic =
+                            diagnostic.with_related(related, "the inner binding is declared here");
+                    }
+                    self.diagnostics.push(diagnostic);
+                    continue;
+                }
+
+                let source = outer_scopes.lookup(&capture.name).cloned();
+                let Some(source) = source else {
+                    if let Some(initializer) = self
+                        .initializing_bindings
+                        .last()
+                        .and_then(|bindings| bindings.get(&capture.name))
+                        .copied()
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0647",
+                                format!(
+                                    "closure initializer cannot capture `${}` before that binding exists",
+                                    capture.name
+                                ),
+                                capture.span,
+                            )
+                            .with_title("Closure Cannot Capture Its Initializing Binding")
+                            .with_related(initializer, "this binding is still being initialized")
+                            .with_help("Use a named function for recursion; recursive closure syntax is not available."),
+                        );
+                    } else {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0644",
+                                format!("`${}` is not an enclosing lexical binding", capture.name),
+                                capture.span,
+                            )
+                            .with_title("Capture Does Not Name An Enclosing Binding")
+                            .with_help("Capture a parameter or local declared in an enclosing lexical scope."),
+                        );
+                    }
+                    continue;
+                };
+                if let Some(first) = seen_sources.insert(source.id, capture.span) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0643",
+                            format!("`${}` is captured more than once", capture.name),
+                            capture.span,
+                        )
+                        .with_title("Duplicate Closure Capture")
+                        .with_related(first, "the first capture entry is here")
+                        .with_help("Keep exactly one capture entry for this binding."),
+                    );
+                    continue;
+                }
+                if source.kind == BindingKind::MethodReceiver
+                    && capture.mode == ClosureCaptureMode::Take
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new("E0644", "`$this` cannot be captured with `take`", capture.span)
+                            .with_title("Method Receiver Cannot Be Taken")
+                            .with_help("Capture `$this` readonly, or use `writable $this` in a writable method."),
+                    );
+                    continue;
+                }
+                if capture.mode == ClosureCaptureMode::Writable && !source.writable {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0645",
+                            format!(
+                                "readonly binding `${}` cannot provide a writable capture",
+                                capture.name
+                            ),
+                            capture.span,
+                        )
+                        .with_title("Writable Capture Requires Writable Source")
+                        .with_related(
+                            self.binding_resolution
+                                .declarations_by_id
+                                .get(&source.id)
+                                .and_then(|declaration| declaration.span)
+                                .unwrap_or(capture.span),
+                            "the source binding is readonly here",
+                        ),
+                    );
+                    continue;
+                }
+                if capture.mode == ClosureCaptureMode::Take
+                    && self.type_is_move_type(source.ty)
+                    && source.ownership != BindingOwnership::Owned
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0645",
+                            format!(
+                                "borrowed move value `${}` cannot be taken into a closure",
+                                capture.name
+                            ),
+                            capture.span,
+                        )
+                        .with_title("Taking Capture Requires Ownership")
+                        .with_help("Take an owned local, or capture this borrowed value readonly."),
+                    );
+                    continue;
+                }
+
+                // A nested closure captures through its immediate parent
+                // environment. Recording that use here preserves the lineage
+                // instead of letting an inner closure point into a grandparent
+                // frame by name.
+                self.record_binding_use(
+                    &source,
+                    capture.span,
+                    match capture.mode {
+                        ClosureCaptureMode::Readonly => CaptureRequirement::Readonly,
+                        ClosureCaptureMode::Writable => CaptureRequirement::Writable,
+                        ClosureCaptureMode::Take => CaptureRequirement::Take,
+                    },
+                );
+
+                let ownership = match capture.mode {
+                    ClosureCaptureMode::Readonly => BindingOwnership::ReadonlyBorrow,
+                    ClosureCaptureMode::Writable => BindingOwnership::WritableBorrow,
+                    ClosureCaptureMode::Take => BindingOwnership::Owned,
+                };
+                self.declare_binding(
+                    &mut closure_scopes,
+                    capture.name.clone(),
+                    Binding::unresolved(
+                        capture.mode != ClosureCaptureMode::Readonly,
+                        source.ty,
+                        source.declared_ty,
+                        source.int_constant,
+                        source.string_constant.clone(),
+                    ),
+                    capture.span,
+                    BindingKind::ClosureCapture,
+                    ownership,
+                );
+                let environment = closure_scopes
+                    .lookup(&capture.name)
+                    .expect("declared closure capture")
+                    .id;
+                let index = captures.len();
+                capture_by_environment.insert(environment, index);
+                captures.push(CaptureDraft {
+                    source_binding_id: source.id,
+                    environment_binding_id: environment,
+                    mode: capture.mode,
+                    declaration_span: capture.span,
+                    first_use_span: None,
+                    use_spans: Vec::new(),
+                    source_type: source.ty,
+                    required_capability: CaptureRequirement::Readonly,
+                });
+            }
+        }
+
+        let parameters = closure
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let ty = self.resolve_type_ref_in_position(
+                    &parameter.ty,
+                    parameter.type_span,
+                    TypePosition::Value,
+                    declaring_class,
+                );
+                let ownership_mode = if parameter.take {
+                    FunctionTypeParameterMode::Take
+                } else if parameter.writable {
+                    FunctionTypeParameterMode::Writable
+                } else {
+                    FunctionTypeParameterMode::Readonly
+                };
+                self.declare_binding(
+                    &mut closure_scopes,
+                    parameter.name.clone(),
+                    Binding::unresolved(parameter.writable, ty, ty, None, None),
+                    parameter.name_span,
+                    BindingKind::ClosureParameter,
+                    match ownership_mode {
+                        FunctionTypeParameterMode::Readonly => BindingOwnership::ReadonlyBorrow,
+                        FunctionTypeParameterMode::Writable => BindingOwnership::WritableBorrow,
+                        FunctionTypeParameterMode::Take => BindingOwnership::Owned,
+                    },
+                );
+                SemanticFunctionParameter { ownership_mode, ty }
+            })
+            .collect::<Vec<_>>();
+
+        self.active_closures.push(ActiveClosure {
+            id: closure_id,
+            captures,
+            capture_by_environment,
+            missing: HashMap::new(),
+        });
+        let receiver_capture = closure_scopes.lookup("this").cloned().filter(|binding| {
+            binding.owner == LexicalOwner::Closure(closure_id)
+                && binding.kind == BindingKind::ClosureCapture
+        });
+        let closure_method_context = method_context.map(|context| MethodContext {
+            class_name: context.class_name.clone(),
+            receiver_mode: receiver_capture.as_ref().map(|binding| {
+                if binding.writable {
+                    ReceiverMode::Writable
+                } else {
+                    ReceiverMode::Readonly
+                }
+            }),
+            this_available: receiver_capture.is_some(),
+        });
+        let closure_method_context = closure_method_context.as_ref();
+
+        let expected_function = self
+            .contextual_expression_types
+            .get(&key)
+            .copied()
+            .and_then(|expected| self.non_null_function_type(expected).cloned());
+        let written_return = closure.return_type.as_ref().map(|return_type| {
             self.resolve_type_ref_in_position(
                 &return_type.ty,
                 return_type.type_span,
                 TypePosition::Return,
                 declaring_class,
+            )
+        });
+        let expected_return = written_return.or_else(|| {
+            expected_function
+                .as_ref()
+                .map(|function| function.return_type)
+        });
+
+        self.effect_scopes.push(CheckedEffectSet::default());
+        let inferred_return = match &closure.body {
+            ClosureBody::Expression { expression, .. } => {
+                if let Some(expected) = expected_return {
+                    self.record_expected_expression_type(expression, expected);
+                }
+                self.check_expr(expression, &closure_scopes, closure_method_context);
+                let inferred =
+                    self.infer_expr_type(expression, &closure_scopes, closure_method_context);
+                if let Some(expected) = expected_return {
+                    if !self.is_expr_assignable(
+                        expected,
+                        expression,
+                        &closure_scopes,
+                        closure_method_context,
+                    ) && !self.is_assignable(expected, inferred)
+                    {
+                        self.report_closure_return_mismatch(expected, inferred, expression.span());
+                    }
+                    expected
+                } else {
+                    inferred
+                }
+            }
+            ClosureBody::Block(block) => {
+                let return_context = ReturnContext {
+                    name: format!("closure at {}", closure.span.start),
+                    expected: expected_return,
+                    lifecycle: None,
+                    is_method: false,
+                };
+                self.check_block(
+                    block,
+                    &mut closure_scopes,
+                    closure_method_context,
+                    None,
+                    Some(&return_context),
+                    0,
+                );
+                let inferred = expected_return.unwrap_or_else(|| {
+                    self.infer_closure_block_return_type(block)
+                        .unwrap_or_else(|| self.types.intern(TypeKind::Void))
+                });
+                if !self.is_void_type(inferred)
+                    && crate::return_analysis::analyze_block_with_given(
+                        block,
+                        closure.span,
+                        &self.given_preludes,
+                    )
+                    .fallthrough_reachable
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0406",
+                            format!(
+                                "closure must return a value of type `{}` on every path",
+                                self.types.display(inferred)
+                            ),
+                            closure.span,
+                        )
+                        .with_title("Closure Must Return On Every Path"),
+                    );
+                }
+                inferred
+            }
+        };
+        let inferred_effects = self.effect_scopes.pop().expect("closure effect scope");
+        let mut active = self.active_closures.pop().expect("active closure");
+
+        let invocation_mode = active
+            .captures
+            .iter()
+            .map(|capture| capture.required_capability)
+            .max()
+            .map_or(
+                FunctionInvocationMode::Readonly,
+                |requirement| match requirement {
+                    CaptureRequirement::Readonly => FunctionInvocationMode::Readonly,
+                    CaptureRequirement::Writable => FunctionInvocationMode::Writable,
+                    CaptureRequirement::Take => FunctionInvocationMode::Once,
+                },
             );
+        self.validate_capture_requirements(closure, &mut active);
+        self.report_missing_captures(closure, &active);
+        self.report_unused_captures(closure, &active);
+
+        let mut normalized_effects = inferred_effects.ordered.clone();
+        normalized_effects.sort_by_key(|effect| self.types.display(*effect));
+        normalized_effects.dedup();
+        let return_borrow =
+            self.infer_closure_return_borrow(closure, &closure_scopes, closure_method_context);
+        let semantic = SemanticFunctionType {
+            invocation_mode,
+            parameters,
+            return_type: inferred_return,
+            checked_effects: normalized_effects,
+            return_borrow,
+        };
+        let ty = self.types.intern(TypeKind::Function(semantic.clone()));
+        self.closure_types.insert(key, ty);
+
+        let capture_info = active
+            .captures
+            .into_iter()
+            .map(|capture| CaptureSemanticInfo {
+                source_binding_id: capture.source_binding_id,
+                environment_binding_id: capture.environment_binding_id,
+                mode: capture.mode,
+                declaration_span: capture.declaration_span,
+                first_use_span: capture.first_use_span,
+                use_spans: capture.use_spans,
+                source_type: self.types.resolved(capture.source_type),
+                required_capability: capture.required_capability,
+            })
+            .collect();
+        self.closures.insert(
+            closure_id,
+            ClosureSemanticInfo {
+                closure_id,
+                function_type: self.types.resolved(ty),
+                captures: capture_info,
+                inferred_invocation_mode: invocation_mode,
+                inferred_checked_effects: inferred_effects
+                    .ordered
+                    .iter()
+                    .map(|effect| self.types.resolved(*effect))
+                    .collect(),
+                inferred_return_type: self.types.resolved(inferred_return),
+                execution_boundary_span: closure.span,
+            },
+        );
+
+        self.current_lexical_owner = previous_owner;
+        if !self.diagnostics[diagnostics_start..]
+            .iter()
+            .any(|diagnostic| {
+                diagnostic.severity == crate::diagnostics::DiagnosticSeverity::Error
+                    && diagnostic.code != "E0641"
+            })
+        {
+            self.report_stage_30_execution_boundary("this closure", closure.span);
         }
-        self.function_type_boundary_suppression -= 1;
+        ty
     }
 
-    fn validate_function_type_signature(
+    fn infer_closure_return_borrow(
+        &mut self,
+        closure: &ClosureExpression,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> Option<FunctionReturnBorrow> {
+        let body = match &closure.body {
+            ClosureBody::Expression { expression, .. } => Block {
+                statements: vec![Stmt::Return {
+                    expr: Some((**expression).clone()),
+                    span: expression.span(),
+                }],
+                span: closure.span,
+            },
+            ClosureBody::Block(block) => block.clone(),
+        };
+        let parameters = closure
+            .parameters
+            .iter()
+            .map(|parameter| Param {
+                promoted_access: None,
+                take: parameter.take,
+                take_span: parameter.take_span,
+                writable: parameter.writable,
+                writable_span: parameter.writable_span,
+                ownership_modifier_insert: parameter.type_span,
+                ty: parameter.ty.clone(),
+                name: parameter.name.clone(),
+                default: None,
+                span: parameter.span,
+            })
+            .collect();
+        let mut seen_type_parameters = HashSet::new();
+        let type_params = self
+            .type_parameter_scopes
+            .iter()
+            .flat_map(|scope| scope.iter())
+            .filter(|(name, _)| seen_type_parameters.insert((*name).clone()))
+            .map(|(name, constraints)| TypeParamDecl {
+                name: name.clone(),
+                constraints: constraints.clone(),
+                default_type: None,
+                span: closure.span,
+            })
+            .collect();
+        let function = FunctionDecl {
+            access: MemberAccess::External,
+            writable_this: false,
+            writable_span: None,
+            is_static: true,
+            static_span: None,
+            name: "<closure>".to_string(),
+            type_params,
+            params: parameters,
+            return_type: closure
+                .return_type
+                .as_ref()
+                .map(|return_type| return_type.ty.clone()),
+            throws: None,
+            body,
+            span: closure.span,
+        };
+        let borrow =
+            crate::ownership::function_return_borrow_in_context(&function, &[], &mut |call| {
+                self.call_return_borrow(call, scopes, method_context)
+            })?;
+        match borrow.source {
+            BorrowSource::Parameter(index) => Some(FunctionReturnBorrow {
+                source: FunctionBorrowSource::Parameter(index),
+                writable: borrow.writable,
+            }),
+            BorrowSource::Receiver => None,
+        }
+    }
+
+    fn validate_capture_requirements(
+        &mut self,
+        _closure: &ClosureExpression,
+        active: &mut ActiveClosure,
+    ) {
+        for capture in &active.captures {
+            let sufficient = match capture.required_capability {
+                CaptureRequirement::Readonly => true,
+                CaptureRequirement::Writable => matches!(
+                    capture.mode,
+                    ClosureCaptureMode::Writable | ClosureCaptureMode::Take
+                ),
+                CaptureRequirement::Take => capture.mode == ClosureCaptureMode::Take,
+            };
+            if sufficient || capture.first_use_span.is_none() {
+                continue;
+            }
+            let declaration = self
+                .binding_resolution
+                .declarations_by_id
+                .get(&capture.source_binding_id);
+            let name = declaration.map_or("value", |declaration| declaration.name.as_str());
+            let needed = match capture.required_capability {
+                CaptureRequirement::Readonly => "readonly",
+                CaptureRequirement::Writable => "writable",
+                CaptureRequirement::Take => "take",
+            };
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0645",
+                    format!("closure use of `${name}` requires a {needed} capture"),
+                    capture.first_use_span.unwrap_or(capture.declaration_span),
+                )
+                .with_title("Closure Capture Mode Is Too Weak")
+                .with_related(
+                    capture.declaration_span,
+                    "this capture mode is declared here",
+                )
+                .with_help(match capture.required_capability {
+                    CaptureRequirement::Readonly => "capture the binding as written".to_string(),
+                    CaptureRequirement::Writable => {
+                        format!("write `with (writable ${name})` when the source is writable")
+                    }
+                    CaptureRequirement::Take => {
+                        format!("write `with (take ${name})` only when ownership should transfer")
+                    }
+                }),
+            );
+        }
+    }
+
+    fn report_missing_captures(&mut self, closure: &ClosureExpression, active: &ActiveClosure) {
+        let mut missing = active.missing.values().collect::<Vec<_>>();
+        missing.sort_by_key(|entry| entry.first_use_span.start);
+        let safe_insertions = missing
+            .iter()
+            .filter_map(|entry| {
+                let declaration = self
+                    .binding_resolution
+                    .declarations_by_id
+                    .get(&entry.source_binding_id)?;
+                let mode = match entry.required_capability {
+                    CaptureRequirement::Readonly => "",
+                    CaptureRequirement::Writable if declaration.writable => "writable ",
+                    CaptureRequirement::Writable | CaptureRequirement::Take => return None,
+                };
+                Some(format!("{mode}${}", declaration.name))
+            })
+            .collect::<Vec<_>>();
+
+        for (index, entry) in missing.into_iter().enumerate() {
+            let Some(declaration) = self
+                .binding_resolution
+                .declarations_by_id
+                .get(&entry.source_binding_id)
+                .cloned()
+            else {
+                continue;
+            };
+            let mut diagnostic = Diagnostic::new(
+                "E0642",
+                format!("closure must capture `${}`", declaration.name),
+                entry.first_use_span,
+            )
+            .with_title(format!("Closure Must Capture `${}`", declaration.name))
+            .with_cause(format!(
+                "closure:{}:{}:binding:{}",
+                closure.span.start, closure.span.end, declaration.id.0
+            ))
+            .with_help(
+                "list every enclosing binding used by the closure in its `with (...)` clause",
+            );
+            if let Some(declaration_span) = declaration.span {
+                diagnostic = diagnostic
+                    .with_related(declaration_span, "the enclosing binding is declared here");
+            }
+            if index == 0 && safe_insertions.len() == active.missing.len() {
+                let joined = safe_insertions.join(", ");
+                diagnostic = if let Some(clause) = &closure.captures {
+                    if let Some(edit) = self.safe_capture_extension_edit(clause, &joined) {
+                        diagnostic.with_structured_fix(
+                            "Add Missing Closure Captures",
+                            FixApplicability::MachineApplicable,
+                            vec![edit],
+                        )
+                    } else {
+                        diagnostic
+                    }
+                } else {
+                    let insertion = closure
+                        .return_type
+                        .as_ref()
+                        .map_or(closure.parameter_list_span.end, |return_type| {
+                            return_type.span.end
+                        });
+                    diagnostic.with_structured_fix(
+                        "Add Missing Closure Captures",
+                        FixApplicability::MachineApplicable,
+                        vec![FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: Span::new(insertion, insertion),
+                            replacement: format!(" with ({joined})"),
+                        }],
+                    )
+                };
+            }
+            self.diagnostics.push(diagnostic);
+        }
+    }
+
+    fn report_unused_captures(&mut self, closure: &ClosureExpression, active: &ActiveClosure) {
+        let Some(clause) = &closure.captures else {
+            return;
+        };
+        for capture in active
+            .captures
+            .iter()
+            .filter(|capture| capture.first_use_span.is_none())
+        {
+            let declaration = self
+                .binding_resolution
+                .declarations_by_id
+                .get(&capture.source_binding_id);
+            let name = declaration.map_or("value", |declaration| declaration.name.as_str());
+            let mut diagnostic = Diagnostic::new(
+                "E0646",
+                format!("closure captures `${name}` but never uses it"),
+                capture.declaration_span,
+            )
+            .with_severity(crate::diagnostics::DiagnosticSeverity::Warning)
+            .with_title("Unused Closure Capture")
+            .with_help("remove the unused capture entry");
+            if let Some(removal) = self.safe_capture_removal_span(clause, capture.declaration_span)
+            {
+                diagnostic = diagnostic.with_fix(removal, "");
+            }
+            self.diagnostics.push(diagnostic);
+        }
+    }
+
+    fn safe_capture_removal_span(
+        &self,
+        clause: &ClosureCaptureClause,
+        capture_span: Span,
+    ) -> Option<Span> {
+        let clause_text = self.source_text?.get(clause.span.start..clause.span.end)?;
+        if contains_comment(clause_text) {
+            return None;
+        }
+        if clause.captures.len() == 1 {
+            return Some(clause.span);
+        }
+        let index = clause
+            .captures
+            .iter()
+            .position(|capture| capture.span == capture_span)?;
+        let removal = if let Some(next) = clause.captures.get(index + 1) {
+            Span::new(capture_span.start, next.span.start)
+        } else {
+            let previous = clause.captures.get(index.checked_sub(1)?)?;
+            Span::new(previous.span.end, capture_span.end)
+        };
+        let text = self.source_text?.get(removal.start..removal.end)?;
+        (!contains_comment(text)).then_some(removal)
+    }
+
+    fn safe_capture_extension_edit(
+        &self,
+        clause: &ClosureCaptureClause,
+        insertion: &str,
+    ) -> Option<FixEdit> {
+        let last = clause.captures.last()?;
+        let tail = self
+            .source_text?
+            .get(last.span.end..clause.close_span.start)?;
+        if contains_comment(tail) {
+            return None;
+        }
+        let offset = if tail.contains(',') {
+            last.span.end
+        } else {
+            clause.close_span.start
+        };
+        Some(FixEdit {
+            source: DiagnosticSource::Current,
+            span: Span::new(offset, offset),
+            replacement: format!(", {insertion}"),
+        })
+    }
+
+    fn resolve_function_type_ref(
         &mut self,
         function: &FunctionTypeRef,
         declaring_class: Option<&str>,
-    ) {
-        self.function_type_boundary_suppression += 1;
-        for parameter in &function.parameters {
-            self.resolve_type_ref_in_position(
-                &parameter.ty,
-                parameter.span,
-                TypePosition::Value,
-                declaring_class,
-            );
-        }
-        self.resolve_type_ref_in_position(
+    ) -> TypeId {
+        let parameters = function
+            .parameters
+            .iter()
+            .map(|parameter| SemanticFunctionParameter {
+                ownership_mode: parameter.ownership_mode,
+                ty: self.resolve_type_ref_in_position(
+                    &parameter.ty,
+                    parameter.type_span,
+                    TypePosition::Value,
+                    declaring_class,
+                ),
+            })
+            .collect::<Vec<_>>();
+        let return_type = self.resolve_type_ref_in_position(
             &function.return_type,
             function.return_type_span,
             TypePosition::Return,
             declaring_class,
         );
-        self.function_type_boundary_suppression -= 1;
+
+        let mut authored_checked_effects = Vec::new();
+        let mut checked_effects = Vec::new();
+        let mut saw_error = false;
+        if let Some(clause) = &function.throws_clause {
+            for entry in &clause.entries {
+                if entry.ty.nullable {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0619",
+                            format!("throws type `{}` cannot be nullable", entry.ty),
+                            entry.span,
+                        )
+                        .with_title("Throws Type Cannot Be Nullable"),
+                    );
+                    continue;
+                }
+                let effect = self.resolve_type_ref_in_position(
+                    &entry.ty,
+                    entry.type_span,
+                    TypePosition::Value,
+                    declaring_class,
+                );
+                if self.is_unknown_type(effect) {
+                    continue;
+                }
+                if !self.type_implements_error(effect) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0618",
+                            format!(
+                                "throws type `{}` does not implement `Error`",
+                                self.types.display(effect)
+                            ),
+                            entry.span,
+                        )
+                        .with_title("Throws Type Must Implement Error"),
+                    );
+                    continue;
+                }
+                if authored_checked_effects.contains(&effect) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0620",
+                            format!("duplicate throws entry `{}`", self.types.display(effect)),
+                            entry.span,
+                        )
+                        .with_title("Duplicate Throws Entry"),
+                    );
+                    continue;
+                }
+                if saw_error
+                    || (matches!(self.types.kind(effect), TypeKind::Error)
+                        && !authored_checked_effects.is_empty())
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0621",
+                            "`Error` already covers every concrete checked error in this throws list",
+                            entry.span,
+                        )
+                        .with_title("Error Already Covers This Throws Entry"),
+                    );
+                    continue;
+                }
+                saw_error = matches!(self.types.kind(effect), TypeKind::Error);
+                authored_checked_effects.push(effect);
+                checked_effects.push(effect);
+            }
+        }
+        checked_effects.sort_by_key(|effect| self.types.display(*effect));
+        checked_effects.dedup();
+
+        let borrowed_parameters = parameters
+            .iter()
+            .enumerate()
+            .filter(|(_, parameter)| {
+                parameter.ownership_mode != FunctionTypeParameterMode::Take
+                    && parameter.ty == return_type
+                    && self.type_is_move_type(parameter.ty)
+            })
+            .map(|(index, parameter)| (index, parameter.ownership_mode))
+            .collect::<Vec<_>>();
+        let return_borrow = match borrowed_parameters.as_slice() {
+            [(index, mode)] => Some(FunctionReturnBorrow {
+                source: FunctionBorrowSource::Parameter(*index),
+                writable: *mode == FunctionTypeParameterMode::Writable,
+            }),
+            _ => None,
+        };
+        let semantic = SemanticFunctionType {
+            invocation_mode: function.invocation_mode,
+            parameters,
+            return_type,
+            checked_effects,
+            return_borrow,
+        };
+        let ty = self.types.intern(TypeKind::Function(semantic));
+        self.function_types_by_span.insert(
+            (function.span.start, function.span.end),
+            FunctionTypeSemanticInfo {
+                ty: self.types.resolved(ty),
+                authored_checked_effects: authored_checked_effects
+                    .into_iter()
+                    .map(|effect| self.types.resolved(effect))
+                    .collect(),
+            },
+        );
+        ty
     }
 
     fn check_match_expression(
@@ -7233,6 +8735,156 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn non_null_function_type(&self, ty: TypeId) -> Option<&SemanticFunctionType<TypeId>> {
+        match self.types.kind(ty) {
+            TypeKind::Function(function) => Some(function),
+            TypeKind::Nullable(inner) => match self.types.kind(*inner) {
+                TypeKind::Function(function) => Some(function),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn function_type_compatibility(
+        &self,
+        expected: &SemanticFunctionType<TypeId>,
+        actual: &SemanticFunctionType<TypeId>,
+    ) -> Result<(), FunctionTypeMismatch> {
+        if expected.parameters.len() != actual.parameters.len() {
+            return Err(FunctionTypeMismatch::Arity);
+        }
+        for (index, (expected, actual)) in expected
+            .parameters
+            .iter()
+            .zip(&actual.parameters)
+            .enumerate()
+        {
+            if expected.ownership_mode != actual.ownership_mode {
+                return Err(FunctionTypeMismatch::ParameterOwnership(index));
+            }
+            if expected.ty != actual.ty {
+                return Err(FunctionTypeMismatch::ParameterType(index));
+            }
+        }
+        if expected.return_type != actual.return_type {
+            return Err(FunctionTypeMismatch::ReturnType);
+        }
+        let capability = |mode| match mode {
+            FunctionInvocationMode::Readonly => 0,
+            FunctionInvocationMode::Writable => 1,
+            FunctionInvocationMode::Once => 2,
+        };
+        if capability(actual.invocation_mode) > capability(expected.invocation_mode) {
+            return Err(FunctionTypeMismatch::InvocationMode);
+        }
+        if actual
+            .checked_effects
+            .iter()
+            .any(|effect| !expected.checked_effects.contains(effect))
+        {
+            return Err(FunctionTypeMismatch::CheckedEffects);
+        }
+        if expected.return_borrow != actual.return_borrow {
+            return Err(FunctionTypeMismatch::ReturnBorrow);
+        }
+        Ok(())
+    }
+
+    fn report_function_type_mismatch(
+        &mut self,
+        expected: &SemanticFunctionType<TypeId>,
+        actual: &SemanticFunctionType<TypeId>,
+        mismatch: FunctionTypeMismatch,
+        span: Span,
+    ) {
+        let expected_ty = self.types.intern(TypeKind::Function(expected.clone()));
+        let actual_ty = self.types.intern(TypeKind::Function(actual.clone()));
+        let detail = match mismatch {
+            FunctionTypeMismatch::Nullability => {
+                "a nullable callable cannot satisfy a non-null function type".to_string()
+            }
+            FunctionTypeMismatch::Arity => "parameter count differs".to_string(),
+            FunctionTypeMismatch::ParameterOwnership(index) => {
+                format!("parameter {} has a different ownership mode", index + 1)
+            }
+            FunctionTypeMismatch::ParameterType(index) => {
+                format!("parameter {} has a different type", index + 1)
+            }
+            FunctionTypeMismatch::ReturnType => "return types differ".to_string(),
+            FunctionTypeMismatch::InvocationMode => {
+                "the callable requires stronger invocation access".to_string()
+            }
+            FunctionTypeMismatch::CheckedEffects => {
+                "the callable may raise checked errors outside the expected set".to_string()
+            }
+            FunctionTypeMismatch::ReturnBorrow => "return-borrow provenance differs".to_string(),
+        };
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0648",
+                format!(
+                    "function value `{}` is not compatible with expected type `{}`: {detail}",
+                    self.types.display(actual_ty),
+                    self.types.display(expected_ty)
+                ),
+                span,
+            )
+            .with_title("Function Type Mismatch")
+            .with_help("use a function value with the exact parameter ownership and value types, a compatible invocation mode, and no additional checked effects"),
+        );
+    }
+
+    fn report_closure_return_mismatch(&mut self, expected: TypeId, actual: TypeId, span: Span) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0648",
+                format!(
+                    "closure returns `{}` but its expected return type is `{}`",
+                    self.types.display(actual),
+                    self.types.display(expected)
+                ),
+                span,
+            )
+            .with_title("Closure Return Type Mismatch"),
+        );
+    }
+
+    fn infer_closure_block_return_type(&mut self, block: &Block) -> Option<TypeId> {
+        let mut return_spans = Vec::new();
+        collect_return_expression_spans(block, &mut return_spans);
+        let mut inferred = None;
+        for span in return_spans.into_iter().flatten() {
+            let Some(ty) = self.expression_types.get(&(span.start, span.end)).cloned() else {
+                continue;
+            };
+            let ty = self.types.intern_resolved(&ty);
+            match inferred {
+                None => inferred = Some(ty),
+                Some(previous) if previous == ty => {}
+                Some(previous) => {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0648",
+                            format!(
+                                "closure return paths produce both `{}` and `{}`",
+                                self.types.display(previous),
+                                self.types.display(ty)
+                            ),
+                            span,
+                        )
+                        .with_title("Closure Return Types Do Not Agree")
+                        .with_help(
+                            "return one exact semantic type from every value-returning path",
+                        ),
+                    );
+                    return Some(self.types.unknown());
+                }
+            }
+        }
+        inferred
+    }
+
     fn check_when_expression(
         &mut self,
         expr: &Expr,
@@ -7553,14 +9205,14 @@ impl<'program> Checker<'program> {
                         self.declare_binding(
                             scopes,
                             binding.name.clone(),
-                            Binding {
-                                writable: false,
-                                ty: field.ty,
-                                declared_ty: field.ty,
-                                int_constant: None,
-                                string_constant: None,
-                            },
+                            Binding::unresolved(false, field.ty, field.ty, None, None),
                             binding.span,
+                            BindingKind::MatchBinding,
+                            if borrowed {
+                                BindingOwnership::ReadonlyBorrow
+                            } else {
+                                BindingOwnership::Owned
+                            },
                         );
                         self.expression_types.insert(
                             (binding.span.start, binding.span.end),
@@ -7633,14 +9285,14 @@ impl<'program> Checker<'program> {
                 self.declare_binding(
                     scopes,
                     binding.name.clone(),
-                    Binding {
-                        writable: false,
-                        ty: pattern_ty,
-                        declared_ty: pattern_ty,
-                        int_constant: None,
-                        string_constant: None,
-                    },
+                    Binding::unresolved(false, pattern_ty, pattern_ty, None, None),
                     binding.span,
+                    BindingKind::MatchBinding,
+                    if !consuming && self.type_is_move_type(pattern_ty) {
+                        BindingOwnership::ReadonlyBorrow
+                    } else {
+                        BindingOwnership::Owned
+                    },
                 );
                 self.expression_types
                     .insert((binding.span.start, binding.span.end), resolved.clone());
@@ -8509,6 +10161,19 @@ impl<'program> Checker<'program> {
             self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
         let left_kind = self.types.kind(left_ty).clone();
         let right_kind = self.types.kind(right_ty).clone();
+        if matches!(left_kind, TypeKind::Function(_)) || matches!(right_kind, TypeKind::Function(_))
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0420",
+                    "function values cannot be compared for equality",
+                    span,
+                )
+                .with_title("Function Values Have No Equality")
+                .with_help("compare explicit application state instead of callable identity"),
+            );
+            return;
+        }
         if self.constrained_equality_operands(left_ty, right_ty) {
             return;
         }
@@ -8962,6 +10627,17 @@ impl<'program> Checker<'program> {
             TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
                 self.type_contains_mixed(*key) || self.type_contains_mixed(*value)
             }
+            TypeKind::Function(function) => {
+                function
+                    .parameters
+                    .iter()
+                    .any(|parameter| self.type_contains_mixed(parameter.ty))
+                    || self.type_contains_mixed(function.return_type)
+                    || function
+                        .checked_effects
+                        .iter()
+                        .any(|effect| self.type_contains_mixed(*effect))
+            }
             _ => false,
         }
     }
@@ -8975,6 +10651,7 @@ impl<'program> Checker<'program> {
                 .find(|definition| definition.id == enum_type.id)
                 .is_some_and(|definition| !definition.capabilities.copy),
             TypeKind::Class(_)
+            | TypeKind::Function(_)
             | TypeKind::Error
             | TypeKind::SharedHandle(_, _)
             | TypeKind::TypeParameter(_)
@@ -9012,6 +10689,17 @@ impl<'program> Checker<'program> {
                 .arguments
                 .iter()
                 .any(|argument| self.type_is_symbolic(*argument)),
+            TypeKind::Function(function) => {
+                function
+                    .parameters
+                    .iter()
+                    .any(|parameter| self.type_is_symbolic(parameter.ty))
+                    || self.type_is_symbolic(function.return_type)
+                    || function
+                        .checked_effects
+                        .iter()
+                        .any(|effect| self.type_is_symbolic(*effect))
+            }
             _ => false,
         }
     }
@@ -9091,6 +10779,27 @@ impl<'program> Checker<'program> {
             TypeKind::SharedHandle(kind, payload) => {
                 let payload = self.substitute_type_id(payload, substitutions);
                 self.types.intern(TypeKind::SharedHandle(kind, payload))
+            }
+            TypeKind::Function(function) => {
+                let function = SemanticFunctionType {
+                    invocation_mode: function.invocation_mode,
+                    parameters: function
+                        .parameters
+                        .into_iter()
+                        .map(|parameter| SemanticFunctionParameter {
+                            ownership_mode: parameter.ownership_mode,
+                            ty: self.substitute_type_id(parameter.ty, substitutions),
+                        })
+                        .collect(),
+                    return_type: self.substitute_type_id(function.return_type, substitutions),
+                    checked_effects: function
+                        .checked_effects
+                        .into_iter()
+                        .map(|effect| self.substitute_type_id(effect, substitutions))
+                        .collect(),
+                    return_borrow: function.return_borrow,
+                };
+                self.types.intern(TypeKind::Function(function))
             }
             TypeKind::Class(class) => {
                 let arguments = class
@@ -9325,8 +11034,9 @@ impl<'program> Checker<'program> {
                 method_context,
                 constructor_init_context,
             ),
-            Expr::Variable { name, span } => match scopes.lookup(name) {
+            Expr::Variable { name, span } => match scopes.lookup(name).cloned() {
                 Some(binding) => {
+                    self.record_binding_use(&binding, *span, CaptureRequirement::Writable);
                     if !binding.writable {
                         self.diagnostics.push(
                             Diagnostic::new(
@@ -9381,6 +11091,11 @@ impl<'program> Checker<'program> {
                     return None;
                 }
                 self.check_expr(object, scopes, method_context);
+                self.record_capture_requirement_for_expr(
+                    object,
+                    scopes,
+                    CaptureRequirement::Writable,
+                );
                 self.check_mixed_operation(object, "property write", scopes, method_context);
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
                 if matches!(self.types.kind(object_ty), TypeKind::Enum(_)) {
@@ -9487,6 +11202,11 @@ impl<'program> Checker<'program> {
                 self.check_expr(index, scopes, method_context);
                 self.check_collection_index(collection, index, *span, scopes, method_context);
                 let (_, value) = self.collection_index_types(collection, scopes, method_context)?;
+                self.record_capture_requirement_for_expr(
+                    collection,
+                    scopes,
+                    CaptureRequirement::Writable,
+                );
                 if !self.is_writable_object_path(collection, scopes, method_context) {
                     self.diagnostics.push(Diagnostic::new(
                         "E0201",
@@ -9525,6 +11245,34 @@ impl<'program> Checker<'program> {
                 ));
                 None
             }
+        }
+    }
+
+    fn record_capture_requirement_for_expr(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        requirement: CaptureRequirement,
+    ) {
+        match expr {
+            Expr::Grouped { expr, .. } => {
+                self.record_capture_requirement_for_expr(expr, scopes, requirement)
+            }
+            Expr::Variable { name, span } => {
+                if let Some(binding) = scopes.lookup(name).cloned() {
+                    self.record_binding_use(&binding, *span, requirement);
+                }
+            }
+            Expr::This { span } => {
+                if let Some(binding) = scopes.lookup("this").cloned() {
+                    self.record_binding_use(&binding, *span, requirement);
+                }
+            }
+            Expr::PropertyAccess { object, .. }
+            | Expr::Index {
+                collection: object, ..
+            } => self.record_capture_requirement_for_expr(object, scopes, requirement),
+            _ => {}
         }
     }
 
@@ -10090,15 +11838,17 @@ impl<'program> Checker<'program> {
         if method_info
             .receiver_mode
             .is_some_and(ReceiverMode::is_writable)
-            && !self.is_writable_object_path(object, scopes, method_context)
         {
-            self.diagnostics.push(Diagnostic::new(
-                "E0203",
-                format!(
-                    "cannot call writable method `{class_name}::{method}` through readonly value"
-                ),
-                span,
-            ));
+            self.record_capture_requirement_for_expr(object, scopes, CaptureRequirement::Writable);
+            if !self.is_writable_object_path(object, scopes, method_context) {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0203",
+                    format!(
+                        "cannot call writable method `{class_name}::{method}` through readonly value"
+                    ),
+                    span,
+                ));
+            }
         }
 
         let method_info = self.specialize_method_for_class(&method_info, &class_type);
@@ -11668,6 +13418,34 @@ impl<'program> Checker<'program> {
                     self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
                 }
             }
+            (TypeKind::Function(pattern), TypeKind::Function(actual))
+                if pattern.invocation_mode == actual.invocation_mode
+                    && pattern.parameters.len() == actual.parameters.len()
+                    && pattern.parameters.iter().zip(&actual.parameters).all(
+                        |(pattern, actual)| pattern.ownership_mode == actual.ownership_mode,
+                    )
+                    && pattern.checked_effects.len() == actual.checked_effects.len() =>
+            {
+                for (pattern, actual) in pattern.parameters.into_iter().zip(actual.parameters) {
+                    self.infer_type_parameter_bindings(
+                        callee, pattern.ty, actual.ty, span, bindings,
+                    );
+                }
+                self.infer_type_parameter_bindings(
+                    callee,
+                    pattern.return_type,
+                    actual.return_type,
+                    span,
+                    bindings,
+                );
+                for (pattern, actual) in pattern
+                    .checked_effects
+                    .into_iter()
+                    .zip(actual.checked_effects)
+                {
+                    self.infer_type_parameter_bindings(callee, pattern, actual, span, bindings);
+                }
+            }
             _ => {}
         }
     }
@@ -11730,6 +13508,27 @@ impl<'program> Checker<'program> {
             TypeKind::SharedHandle(kind, payload) => {
                 let payload = self.substitute_type(payload, bindings);
                 self.types.intern(TypeKind::SharedHandle(kind, payload))
+            }
+            TypeKind::Function(function) => {
+                let function = SemanticFunctionType {
+                    invocation_mode: function.invocation_mode,
+                    parameters: function
+                        .parameters
+                        .into_iter()
+                        .map(|parameter| SemanticFunctionParameter {
+                            ownership_mode: parameter.ownership_mode,
+                            ty: self.substitute_type(parameter.ty, bindings),
+                        })
+                        .collect(),
+                    return_type: self.substitute_type(function.return_type, bindings),
+                    checked_effects: function
+                        .checked_effects
+                        .into_iter()
+                        .map(|effect| self.substitute_type(effect, bindings))
+                        .collect(),
+                    return_borrow: function.return_borrow,
+                };
+                self.types.intern(TypeKind::Function(function))
             }
             TypeKind::Class(class) => {
                 let arguments = class
@@ -11896,6 +13695,11 @@ impl<'program> Checker<'program> {
         if self.is_expr_assignable(param.ty, arg, scopes, method_context)
             || self.is_assignable(param.ty, got)
         {
+            if param.take {
+                self.record_capture_requirement_for_expr(arg, scopes, CaptureRequirement::Take);
+            } else if param.writable {
+                self.record_capture_requirement_for_expr(arg, scopes, CaptureRequirement::Writable);
+            }
             if param.writable
                 && (parameter_is_class_like
                     || matches!(self.types.kind(param.ty), TypeKind::Mixed)
@@ -12467,12 +14271,12 @@ impl<'program> Checker<'program> {
             return self.resolve_type_ref_in_position(&inner, span, position, declaring_class);
         }
         if let Some(function) = &ty.function {
-            let report_boundary = self.function_type_boundary_suppression == 0;
-            self.validate_function_type_signature(function, declaring_class);
-            if report_boundary {
-                self.report_stage_30_closure_boundary("function type", function.span);
-            }
-            return self.types.unknown();
+            let function = self.resolve_function_type_ref(function, declaring_class);
+            return if ty.nullable {
+                self.types.intern(TypeKind::Nullable(function))
+            } else {
+                function
+            };
         }
         if ty.has_value_arguments() {
             for argument in ty.type_arguments() {
@@ -12517,6 +14321,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::Error
                 | TypeKind::Enum(_)
                 | TypeKind::TypeParameter(_)
+                | TypeKind::Function(_)
                 | TypeKind::Class(_)
                 | TypeKind::SharedHandle(_, _)
                 | TypeKind::Bytes
@@ -13346,6 +15151,22 @@ impl<'program> Checker<'program> {
         span: Span,
         destination: AssignmentDestination,
     ) {
+        let expected_function = self.non_null_function_type(target).cloned();
+        let actual_function = self.non_null_function_type(value).cloned();
+        if let (Some(expected), Some(actual)) = (expected_function, actual_function) {
+            let mismatch = if matches!(self.types.kind(target), TypeKind::Function(_))
+                && matches!(self.types.kind(value), TypeKind::Nullable(_))
+            {
+                Some(FunctionTypeMismatch::Nullability)
+            } else {
+                self.function_type_compatibility(&expected, &actual).err()
+            };
+            if let Some(mismatch) = mismatch {
+                self.report_function_type_mismatch(&expected, &actual, mismatch, span);
+                return;
+            }
+        }
+
         let target_name = self.types.display(target);
         let value_name = self.types.display(value);
         let message = match destination {
@@ -13830,6 +15651,9 @@ impl<'program> Checker<'program> {
                 | TypeKind::Deque(_),
             ) => true,
             (TypeKind::Class(target), TypeKind::Class(value)) => target == value,
+            (TypeKind::Function(target), TypeKind::Function(value)) => {
+                self.function_type_compatibility(&target, &value).is_ok()
+            }
             (TypeKind::Error, TypeKind::Class(value)) => self
                 .classes
                 .get(&value.name)
@@ -13907,7 +15731,17 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> TypeId {
         match expr {
-            Expr::Closure(_) | Expr::CallableCall { .. } => self.types.unknown(),
+            Expr::Closure(closure) => self
+                .closure_types
+                .get(&(closure.span.start, closure.span.end))
+                .copied()
+                .unwrap_or_else(|| self.types.unknown()),
+            Expr::CallableCall { span, .. } => self
+                .callable_value_calls
+                .get(&(span.start, span.end))
+                .map(|call| call.return_type.clone())
+                .map(|ty| self.types.intern_resolved(&ty))
+                .unwrap_or_else(|| self.types.unknown()),
             Expr::String { .. } | Expr::InterpolatedString { .. } => {
                 self.types.intern(TypeKind::String)
             }
@@ -14087,6 +15921,9 @@ impl<'program> Checker<'program> {
                 span,
                 ..
             } => {
+                if let Some(call) = self.callable_value_calls.get(&(span.start, span.end)) {
+                    return self.types.intern_resolved(&call.return_type.clone());
+                }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
                 if let Some((kind, payload)) = self.shared_handle_type(object_ty, *null_safe) {
                     if let Some(result) =
@@ -14863,6 +16700,15 @@ impl<'program> Checker<'program> {
             TypeKind::Class(class) => {
                 for argument in class.arguments {
                     self.check_specialized_shared_payloads(argument, span);
+                }
+            }
+            TypeKind::Function(function) => {
+                for parameter in function.parameters {
+                    self.check_specialized_shared_payloads(parameter.ty, span);
+                }
+                self.check_specialized_shared_payloads(function.return_type, span);
+                for effect in function.checked_effects {
+                    self.check_specialized_shared_payloads(effect, span);
                 }
             }
             TypeKind::SharedHandle(kind, payload) => {
@@ -15655,14 +17501,17 @@ impl<'program> Checker<'program> {
                 AssignmentDestination::Type,
             );
         }
-        if mutating && !self.is_writable_object_path(object, scopes, method_context) {
-            self.diagnostics.push(Diagnostic::new(
-                "E0201",
-                format!(
-                    "cannot call mutating collection method `{method}` through a readonly value"
-                ),
-                object.span(),
-            ));
+        if mutating {
+            self.record_capture_requirement_for_expr(object, scopes, CaptureRequirement::Writable);
+            if !self.is_writable_object_path(object, scopes, method_context) {
+                self.diagnostics.push(Diagnostic::new(
+                    "E0201",
+                    format!(
+                        "cannot call mutating collection method `{method}` through a readonly value"
+                    ),
+                    object.span(),
+                ));
+            }
         }
         true
     }

@@ -49,12 +49,14 @@ function check_stage30_closure_authority(string $root): array
     $parserPath = 'crates/doriac/src/parser.rs';
     $astPath = 'crates/doriac/src/ast.rs';
     $typesPath = 'crates/doriac/src/types.rs';
+    $symbolsPath = 'crates/doriac/src/symbols.rs';
     $loweringPath = 'crates/doriac/src/lowering.rs';
     $hirPath = 'crates/doriac/src/hir.rs';
     $mirPath = 'crates/doriac/src/mir.rs';
     $acceptedFixturePath = 'crates/doriac/tests/fixtures/accepted_syntax/stage30a_callable_grammar.doria';
     $rejectedFixturePath = 'crates/doriac/tests/fixtures/negative_syntax/stage30a/README.md';
     $semanticsPath = 'crates/doriac/src/semantics.rs';
+    $stage30bTestsPath = 'crates/doriac/tests/stage30b_semantics_tests.rs';
 
     $decision = $read($decisionPath);
     $proposal = $read($proposalPath);
@@ -70,18 +72,20 @@ function check_stage30_closure_authority(string $root): array
     $parser = $read($parserPath);
     $ast = $read($astPath);
     $types = $read($typesPath);
+    $symbols = $read($symbolsPath);
     $lowering = $read($loweringPath);
     $hir = $read($hirPath);
     $mir = $read($mirPath);
     $acceptedFixture = $read($acceptedFixturePath);
     $rejectedFixture = $read($rejectedFixturePath);
     $semantics = $read($semanticsPath);
+    $stage30bTests = $read($stage30bTestsPath);
 
     $require($decisionPath, $decision, [
         '# Decision 0121: Closure Function Types, Capture Semantics, And Execution Model',
         '**Status:** Accepted',
         '**Accepted:** 2026-08-19',
-        '**Implementation Status:** Authority Accepted; Stage 30a Implemented; Stage 30b Next; Stage 30 Not Complete',
+        '**Implementation Status:** Authority Accepted; Stage 30a And Stage 30b Implemented; Stage 30c Next; Stage 30 Not Complete',
         '**Elaborates:** Decision 0120',
         'function writable(int): int',
         'function once(): Payload',
@@ -109,7 +113,8 @@ function check_stage30_closure_authority(string $root): array
         '**Accepted: 2026-08-20**',
         'It is not a tuple',
         'Stage 30a — Complete',
-        'Stage 30b — Next',
+        'Stage 30b — Complete',
+        'Stage 30c - Ownership, Lifetime, And Escape',
         'E0641 retires by route',
         'Measurement Status: Pending Available Runner',
         '## Invalidated elsewhere',
@@ -126,9 +131,9 @@ function check_stage30_closure_authority(string $root): array
     $require($proposalPath, $proposal, [
         '**Superseded By Accepted Decision 0121.**',
         'It is not normative authority',
-        'Stage 30a Callable Grammar Completion is complete',
-        'Stage 30b Semantic Function Types And Captures is next',
-        'E0641 remains the current compiler boundary',
+        'Stage 30a Callable Grammar Completion and Stage 30b',
+        'Semantic Function Types And Captures are complete',
+        'E0641 remains only on valid execution routes',
     ]);
     $forbid($proposalPath, $proposal, [
         '**In Review.**',
@@ -138,7 +143,7 @@ function check_stage30_closure_authority(string $root): array
     $require($capturePath, $capture, [
         '# Decision 0120: Explicit Closure Capture Lists',
         '**Status:** Accepted',
-        'Decision 0121 settles the remaining Stage 30 model',
+        'Decision 0121 settles the questions this record deliberately left bounded',
         'reopens explicit capture for ordinary local bindings',
     ]);
     $require($effectsPath, $effects, [
@@ -149,8 +154,8 @@ function check_stage30_closure_authority(string $root): array
     $require($planPath, $plan, [
         'Decision 0121: closure function types, capture semantics, and execution model',
         '**Stage 30 Closure Authority — Accepted; Stage 30 — In Progress, Not Complete.**',
-        '**Stage 30b Semantic Function Types And Captures — Next**',
-        'Stage 30b Semantic Function Types And Captures',
+        'Stage 30b Semantic Function Types And Captures — Complete',
+        'Stage 30c Ownership, Lifetime, And Escape — Next',
         'Stage 30h Cross-Repository Closure',
         '`function take()` is rejected',
         '`List<T>` alone receives `map`, Copy-only preserving `filter`, and writable-accumulator `reduce`',
@@ -161,9 +166,10 @@ function check_stage30_closure_authority(string $root): array
     $require($pipelinePath, $pipeline, [
         'Decision 0121 accepts the complete Stage 30 closure authority',
         'Stage 30a Callable Grammar Completion — Complete',
-        'Stage 30b Semantic Function Types And Captures — Next',
+        'Stage 30b Semantic Function Types And Captures — Complete',
+        'Stage 30c Ownership, Lifetime, And Escape — Next',
         'Stage 30 — In Progress, Not Complete',
-        'E0641 remains active',
+        'E0641 is narrowed to valid execution routes',
     ]);
     $forbid($pipelinePath, $pipeline, [
         'Stage 30 Closure Authority Proposal — In Review',
@@ -179,9 +185,9 @@ function check_stage30_closure_authority(string $root): array
         'with (writable $this)',
         '### Current compiler support',
         'readonly/writable/once structural function types',
-        'source-preserving parenthesized type grouping',
-        'arbitrary postfix callable-value invocation',
-        '`E0641` development boundary',
+        'grouping remains transparent',
+        'callable-value calls',
+        '`E0641` execution boundary',
         'Stage 30 - In Progress, Not Complete',
     ]);
 
@@ -197,11 +203,10 @@ function check_stage30_closure_authority(string $root): array
     ]);
     $require($examplesPath, $examples, [
         '[Decision 0121]',
-        'Stage 30a Callable Grammar',
-        'Stage 30 is in progress and not complete',
-        'Stage 30a Callable Grammar Completion is complete',
-        'Stage 30b semantic function types and',
-        'E0641 remains the compiler boundary',
+        'Stages 30a and 30b are complete',
+        'Stage 30 remains in progress and not complete',
+        'Stage 30b semantics are checked',
+        'E0641 execution boundary',
     ]);
 
     $require($lexerPath, $lexer, [
@@ -213,6 +218,18 @@ function check_stage30_closure_authority(string $root): array
         'pub enum FunctionTypeParameterMode',
         'pub struct FunctionTypeThrowsRef',
         'pub struct GroupedTypeRef',
+        'pub struct SemanticFunctionParameter<T>',
+        'pub struct SemanticFunctionType<T>',
+        'pub checked_effects: Vec<T>',
+        'Function(SemanticFunctionType<TypeId>)',
+        'Function(Box<SemanticFunctionType<ResolvedType>>)',
+    ]);
+    $require($symbolsPath, $symbols, [
+        'pub struct BindingId',
+        'pub struct ClosureId',
+        'pub struct BindingResolution',
+        'pub declarations_by_id: HashMap<BindingId, BindingDeclaration>',
+        'pub uses_by_span: HashMap<(usize, usize), BindingId>',
     ]);
     $require($astPath, $ast, ['CallableCall {']);
     $require($parserPath, $parser, [
@@ -243,8 +260,18 @@ function check_stage30_closure_authority(string $root): array
 
     $require($semanticsPath, $semantics, [
         '"E0641"',
-        'Closure Semantics Await Stage 30',
+        'Closure Execution Is Not Yet Available',
         'diagnostic.code == "E0641"',
+        'fn check_closure_expression(',
+        'fn function_type_compatibility(',
+        'pub struct CallableValueCallInfo',
+        'source_binding_id: BindingId',
+    ]);
+    $require($stage30bTestsPath, $stage30bTests, [
+        'semantic_function_types_preserve_structure_effects_and_nested_types',
+        'capture_plans_use_stable_binding_identity_and_infer_minimum_access',
+        'nullable_callable_narrowing_works_for_functions_locals_and_closure_roots',
+        'function_types_flow_through_properties_collections_and_generic_inference',
     ]);
 
     return $failures;

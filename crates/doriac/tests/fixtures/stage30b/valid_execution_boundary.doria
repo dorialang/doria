@@ -1,0 +1,5 @@
+function main(): void
+{
+    let $double = fn(int $value) => $value * 2;
+    int $answer = $double(21);
+}

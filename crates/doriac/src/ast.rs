@@ -395,6 +395,7 @@ pub struct ForeachBinding {
     pub writable: bool,
     pub ty: Option<TypeRef>,
     pub name: String,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]

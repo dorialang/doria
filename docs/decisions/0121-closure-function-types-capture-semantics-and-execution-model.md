@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-19
 - **Date:** 2026-08-19
-- **Implementation Status:** Authority Accepted; Stage 30a Implemented; Stage 30b Next; Stage 30 Not Complete
+- **Implementation Status:** Authority Accepted; Stage 30a And Stage 30b Implemented; Stage 30c Next; Stage 30 Not Complete
 - **Scope:** Function types, closure invocation, capture validation, ownership,
   lifetime, representation, backend behavior, diagnostics, and Stage 30
   `List<T>` algorithms
@@ -23,9 +23,12 @@ runtime representation, execution, and collection callback contracts for Stage
 30. Decision 0119 independently fixed checked-effect sets and checked-call ABI.
 
 This record closes those authority questions before implementation. Stage 30a
-now implements the accepted callable grammar while semantic closure use still
-stops at E0641. Stage 30b Semantic Function Types And Captures is next; Stage 30
-remains in progress and is not complete.
+implements the accepted callable grammar. Stage 30b implements canonical
+semantic function types, stable binding and closure identities, capture and
+`$this` validation, inferred closure modes/effects, and semantic callable-value
+calls. Valid execution routes still stop at the narrowed E0641 boundary. Stage
+30c Ownership, Lifetime, And Escape is next; Stage 30 remains in progress and is
+not complete.
 
 ## Accepted Amendment: Parenthesized Type Grouping
 
@@ -496,9 +499,9 @@ Stage 30h - Cross-Repository Closure
 - **Stage 30a — Complete:** parameter ownership in function types, writable/once modes,
   function-type effects, arbitrary postfix invocation, AST/recovery/fixtures,
   coordinated editor tooling; E0641 remains.
-- **Stage 30b — Next:** semantic function types, compatibility, binding identities,
-  capture discovery/validation, `$this`, fixes, and inferred modes/effects; no
-  HIR/MIR.
+- **Stage 30b — Complete:** semantic function types, compatibility, binding
+  identities, capture discovery/validation, `$this`, fixes, inferred
+  modes/effects, and semantic callable calls; no HIR/MIR.
 - **Stage 30c:** acquisition, lifetime/escape, Move behavior, once consumption,
   storage matrix, and logical drop plans.
 - **Stage 30d:** closure HIR/MIR, carrier/descriptors/environments, indirect and

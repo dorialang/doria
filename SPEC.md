@@ -442,18 +442,24 @@ collection families receive no Stage 30 higher-order algorithms.
 
 ### Current compiler support
 
-The compiler parses the base `fn` and anonymous-function grammar, explicit
-`with` lists, readonly/writable/once structural function types, parameter
-ownership, function-type `throws`, source-preserving parenthesized type grouping,
-and arbitrary postfix callable-value invocation into the source AST. Grouping
-does not create a tuple type. Closure and callable semantic use still emits the
-catalogued `E0641` development boundary, and no closure executes.
+The compiler resolves readonly/writable/once structural function types into
+canonical semantic identities, including parameter ownership, return-borrow
+provenance, and normalized checked effects. It checks closure bodies, explicit
+capture lists, `$this` capture, inferred invocation modes and effects, nullable
+callable narrowing, callable-value calls, and callable properties. Source type
+grouping remains transparent and does not create a tuple type.
+
+No closure executes yet. A semantically valid closure construction or
+function-value call stops at the catalogued `E0641` execution boundary. Capture
+acquisition, move-state changes, lifetime and escape checks remain Stage 30c;
+HIR, MIR, and interpreter execution remain Stage 30d.
 
 ```text
 Stage 30a Callable Grammar Completion - Complete
-Stage 30b Semantic Function Types And Captures - Next
+Stage 30b Semantic Function Types And Captures - Complete
+Stage 30c Ownership, Lifetime, And Escape - Next
 Stage 30 - In Progress, Not Complete
-E0641 - Active
+E0641 - Narrowed Execution Boundary
 ```
 
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.

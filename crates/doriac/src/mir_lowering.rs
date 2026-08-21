@@ -1350,6 +1350,7 @@ fn intern_resolved_collection_types(
         // Stage 25a Slice 1 lands the surface and type model only; shared handles
         // have no MIR representation until the runtime slices.
         ResolvedType::TypeParameter(_)
+        | ResolvedType::Function(_)
         | ResolvedType::Void
         | ResolvedType::Null
         | ResolvedType::Unsupported => return None,
@@ -3279,10 +3280,8 @@ fn lower_foreach_statement(
         return result;
     }
 
-    let (collection_expr, projection) = dictionary_foreach_projection(&foreach.iterable).map_or(
-        (&foreach.iterable, CollectionForeachProjection::Main),
-        |value| value,
-    );
+    let (collection_expr, projection) = dictionary_foreach_projection(&foreach.iterable)
+        .unwrap_or((&foreach.iterable, CollectionForeachProjection::Main));
     context.push_scope();
     materialize_nested_collection_places(collection_expr, false, context)?;
     let (collection, collection_type) = match lower_collection_local(collection_expr, context) {
@@ -5432,7 +5431,10 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
                 | mir::Type::NullablePayloadEnum(_)) => Some(already),
             },
-            ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
+            ResolvedType::Function(_)
+            | ResolvedType::Void
+            | ResolvedType::Null
+            | ResolvedType::Unsupported => None,
         }
     }
 

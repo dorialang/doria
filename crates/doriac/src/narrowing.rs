@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use crate::ast::{
-    Argument, Block, ElseBranch, Expr, ForIncrement, ForInitializer, FunctionDecl, Item, Param,
-    Program, Stmt,
+    Argument, Block, ClosureBody, ElseBranch, Expr, ForIncrement, ForInitializer, FunctionDecl,
+    Item, Param, Program, Stmt,
 };
 use crate::builtins::Builtin;
 use crate::control_flow::{build_function_cfg, Node, NodeAction};
@@ -40,10 +40,12 @@ struct Resolution {
     uses: HashMap<(usize, usize), BindingId>,
     declarations: HashMap<usize, BindingId>,
     declaration_types: HashMap<BindingId, Option<TypeRef>>,
+    declaration_callable_modes: HashMap<BindingId, ParamModes>,
     declaration_classes: HashMap<BindingId, String>,
     current_class: Option<String>,
     nullability: NullabilityCatalog,
     member_classes: MemberClassCatalog,
+    closure_bodies: Vec<(Block, Span)>,
 }
 
 #[derive(Default)]
@@ -601,9 +603,22 @@ fn analyze_body(
         &catalog.nullability,
         &catalog.member_classes,
     );
+    analyze_resolved_body(body, span, &resolution, facts, catalog);
+    for (closure_body, closure_span) in &resolution.closure_bodies {
+        analyze_resolved_body(closure_body, *closure_span, &resolution, facts, catalog);
+    }
+}
+
+fn analyze_resolved_body(
+    body: &Block,
+    span: Span,
+    resolution: &Resolution,
+    facts: &mut FactsByUse,
+    catalog: &FlowCatalog,
+) {
     let graph = build_function_cfg(body, span);
     let analysis = NarrowingAnalysis {
-        resolution: &resolution,
+        resolution,
         mutations: &catalog.mutations,
         nullability: &catalog.nullability,
     };
@@ -617,7 +632,7 @@ fn analyze_body(
         collect_action_facts(
             &graph.nodes[node_id.0].action,
             input,
-            &resolution,
+            resolution,
             &catalog.mutations,
             facts,
         );
@@ -1109,9 +1124,14 @@ fn kill_mutated_call_arguments(
                 }
             }
         }
+        Expr::CallableCall { callee, args, .. } => {
+            kill_mutated_call_arguments(callee, state, resolution, mutations);
+            kill_calls_in_arguments(args, state, resolution, mutations);
+            let modes = callable_parameter_modes(callee, args.len(), resolution);
+            kill_arguments_for_modes(args, Some(&modes), state, resolution);
+        }
         Expr::Variable { .. }
         | Expr::Closure(_)
-        | Expr::CallableCall { .. }
         | Expr::This { .. }
         | Expr::Identifier { .. }
         | Expr::String { .. }
@@ -1705,9 +1725,15 @@ fn collect_expr(
             }
             incoming
         }
+        Expr::CallableCall { callee, args, .. } => {
+            let mut state = collect_expr(callee, state, resolution, mutations, facts);
+            state = collect_expr_sequence(args, &state, resolution, mutations, facts);
+            let modes = callable_parameter_modes(callee, args.len(), resolution);
+            kill_arguments_for_modes(args, Some(&modes), &mut state, resolution);
+            state
+        }
         Expr::This { .. }
         | Expr::Closure(_)
-        | Expr::CallableCall { .. }
         | Expr::Identifier { .. }
         | Expr::String { .. }
         | Expr::Int { .. }
@@ -1762,6 +1788,95 @@ fn variable_binding(expr: &Expr, resolution: &Resolution) -> Option<BindingId> {
         return None;
     };
     resolution.uses.get(&(span.start, span.end)).copied()
+}
+
+fn callable_parameter_modes(expr: &Expr, arity: usize, resolution: &Resolution) -> ParamModes {
+    let function = match ungroup(expr) {
+        Expr::Variable { .. } => {
+            let Some(binding) = variable_binding(expr, resolution) else {
+                return unknown_callable_modes(arity);
+            };
+            if let Some(modes) = resolution.declaration_callable_modes.get(&binding) {
+                return modes.clone();
+            }
+            let Some(function) = resolution
+                .declaration_types
+                .get(&binding)
+                .and_then(Option::as_ref)
+                .and_then(function_type_ref)
+            else {
+                return unknown_callable_modes(arity);
+            };
+            function
+        }
+        Expr::Closure(closure) => {
+            return closure_parameter_modes(closure);
+        }
+        _ => return unknown_callable_modes(arity),
+    };
+    ParamModes {
+        names: Vec::new(),
+        mutable: function
+            .parameters
+            .iter()
+            .map(|parameter| {
+                parameter.ownership_mode != crate::types::FunctionTypeParameterMode::Readonly
+            })
+            .collect(),
+    }
+}
+
+fn closure_parameter_modes(closure: &crate::ast::ClosureExpression) -> ParamModes {
+    ParamModes {
+        names: Vec::new(),
+        mutable: closure
+            .parameters
+            .iter()
+            .map(|parameter| parameter.writable || parameter.take)
+            .collect(),
+    }
+}
+
+fn unknown_callable_modes(arity: usize) -> ParamModes {
+    ParamModes {
+        names: Vec::new(),
+        mutable: vec![true; arity],
+    }
+}
+
+fn inferred_callable_parameter_modes(expr: &Expr, resolution: &Resolution) -> Option<ParamModes> {
+    match ungroup(expr) {
+        Expr::Closure(closure) => Some(closure_parameter_modes(closure)),
+        Expr::Variable { .. } => variable_binding(expr, resolution)
+            .and_then(|binding| resolution.declaration_callable_modes.get(&binding).cloned())
+            .or_else(|| {
+                let binding = variable_binding(expr, resolution)?;
+                let function = resolution
+                    .declaration_types
+                    .get(&binding)
+                    .and_then(Option::as_ref)
+                    .and_then(function_type_ref)?;
+                Some(ParamModes {
+                    names: Vec::new(),
+                    mutable: function
+                        .parameters
+                        .iter()
+                        .map(|parameter| {
+                            parameter.ownership_mode
+                                != crate::types::FunctionTypeParameterMode::Readonly
+                        })
+                        .collect(),
+                })
+            }),
+        _ => None,
+    }
+}
+
+fn function_type_ref(ty: &TypeRef) -> Option<&crate::types::FunctionTypeRef> {
+    if let Some(grouped) = &ty.grouped {
+        return function_type_ref(&grouped.inner);
+    }
+    ty.function.as_deref()
 }
 
 fn apply_match_pattern_fact(
@@ -1940,6 +2055,8 @@ impl Resolver {
             Stmt::VarDecl(declaration) => {
                 self.resolve_expr(&declaration.initializer);
                 let inferred_class = self.resolved_expr_class(&declaration.initializer);
+                let inferred_callable =
+                    inferred_callable_parameter_modes(&declaration.initializer, &self.resolution);
                 for declaration_binding in &declaration.bindings {
                     let binding = self.declare(
                         &declaration_binding.name,
@@ -1950,6 +2067,11 @@ impl Resolver {
                         if let Some(class) = inferred_class.clone() {
                             self.resolution.declaration_classes.insert(binding, class);
                         }
+                    }
+                    if let Some(modes) = inferred_callable.clone() {
+                        self.resolution
+                            .declaration_callable_modes
+                            .insert(binding, modes);
                     }
                 }
             }
@@ -2030,6 +2152,10 @@ impl Resolver {
                         ForInitializer::VarDecl(declaration) => {
                             self.resolve_expr(&declaration.initializer);
                             let inferred_class = self.resolved_expr_class(&declaration.initializer);
+                            let inferred_callable = inferred_callable_parameter_modes(
+                                &declaration.initializer,
+                                &self.resolution,
+                            );
                             for declaration_binding in &declaration.bindings {
                                 let binding = self.declare(
                                     &declaration_binding.name,
@@ -2040,6 +2166,11 @@ impl Resolver {
                                     if let Some(class) = inferred_class.clone() {
                                         self.resolution.declaration_classes.insert(binding, class);
                                     }
+                                }
+                                if let Some(modes) = inferred_callable.clone() {
+                                    self.resolution
+                                        .declaration_callable_modes
+                                        .insert(binding, modes);
                                 }
                             }
                         }
@@ -2113,6 +2244,84 @@ impl Resolver {
                 for argument in args {
                     self.resolve_expr(&argument.value);
                 }
+            }
+            Expr::CallableCall { callee, args, .. } => {
+                self.resolve_expr(callee);
+                for argument in args {
+                    self.resolve_expr(&argument.value);
+                }
+            }
+            Expr::Closure(closure) => {
+                let captured = closure
+                    .captures
+                    .iter()
+                    .flat_map(|clause| &clause.captures)
+                    .filter_map(|capture| {
+                        self.scopes
+                            .iter()
+                            .rev()
+                            .find_map(|scope| scope.get(&capture.name))
+                            .copied()
+                            .map(|binding| {
+                                (
+                                    capture.name.clone(),
+                                    capture.name_span.start,
+                                    self.resolution
+                                        .declaration_types
+                                        .get(&binding)
+                                        .cloned()
+                                        .flatten(),
+                                    self.resolution.declaration_classes.get(&binding).cloned(),
+                                    self.resolution
+                                        .declaration_callable_modes
+                                        .get(&binding)
+                                        .cloned(),
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>();
+
+                self.scopes.push(HashMap::new());
+                for (name, span_start, ty, class, callable_modes) in captured {
+                    let binding = self.declare(&name, span_start, ty);
+                    if let Some(class) = class {
+                        self.resolution.declaration_classes.insert(binding, class);
+                    }
+                    if let Some(modes) = callable_modes {
+                        self.resolution
+                            .declaration_callable_modes
+                            .insert(binding, modes);
+                    }
+                }
+                for parameter in &closure.parameters {
+                    self.declare(
+                        &parameter.name,
+                        parameter.name_span.start,
+                        Some(parameter.ty.clone()),
+                    );
+                }
+                match &closure.body {
+                    ClosureBody::Expression { expression, .. } => {
+                        self.resolve_expr(expression);
+                        self.resolution.closure_bodies.push((
+                            Block {
+                                statements: vec![Stmt::Return {
+                                    expr: Some((**expression).clone()),
+                                    span: closure.span,
+                                }],
+                                span: closure.span,
+                            },
+                            closure.span,
+                        ));
+                    }
+                    ClosureBody::Block(block) => {
+                        self.resolve_statements(&block.statements);
+                        self.resolution
+                            .closure_bodies
+                            .push((block.clone(), closure.span));
+                    }
+                }
+                self.scopes.pop();
             }
             Expr::InterpolatedString { parts, .. } => {
                 for part in parts {
@@ -2197,8 +2406,6 @@ impl Resolver {
                 }
             }
             Expr::This { .. }
-            | Expr::Closure(_)
-            | Expr::CallableCall { .. }
             | Expr::Identifier { .. }
             | Expr::String { .. }
             | Expr::Int { .. }

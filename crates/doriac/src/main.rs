@@ -155,11 +155,7 @@ fn version_command(args: &[OsString]) -> Result<ExitCode, String> {
     match args.as_slice() {
         [] => println!("doriac {}", doriac::TOOLCHAIN_VERSION),
         [option] if option == "--json" => {
-            let target = format!(
-                "{}-{}",
-                normalized_platform(std::env::consts::OS),
-                normalized_architecture(std::env::consts::ARCH)
-            );
+            let target = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
             // Which backends this binary was compiled with. Tooling that
             // orchestrates doriac (the benchmark harness, editors) reads this
             // to decide up front whether a build can serve `--release`,
@@ -192,23 +188,6 @@ fn version_command(args: &[OsString]) -> Result<ExitCode, String> {
     }
 
     Ok(ExitCode::SUCCESS)
-}
-
-fn normalized_platform(platform: &str) -> &str {
-    match platform {
-        "macos" => "macos",
-        "windows" => "windows",
-        "linux" => "linux",
-        other => other,
-    }
-}
-
-fn normalized_architecture(architecture: &str) -> &str {
-    match architecture {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        other => other,
-    }
 }
 
 fn utf8_cli_arguments(args: &[OsString]) -> Result<Vec<String>, String> {
