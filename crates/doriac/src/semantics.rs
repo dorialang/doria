@@ -308,258 +308,17 @@ fn statement_span(statement: &Stmt) -> Span {
 fn closure_local_declarations(body: &ClosureBody) -> HashMap<String, Span> {
     let mut declarations = HashMap::new();
     if let ClosureBody::Block(block) = body {
-        collect_block_declarations(block, &mut declarations);
-    }
-    declarations
-}
-
-fn collect_block_declarations(block: &Block, declarations: &mut HashMap<String, Span>) {
-    for statement in &block.statements {
-        match statement {
-            Stmt::Block(block) => collect_block_declarations(block, declarations),
-            Stmt::VarDecl(declaration) => {
+        for statement in &block.statements {
+            if let Stmt::VarDecl(declaration) = statement {
                 for binding in &declaration.bindings {
                     declarations
                         .entry(binding.name.clone())
                         .or_insert(binding.span);
                 }
-                collect_expression_declarations(&declaration.initializer, declarations);
-            }
-            Stmt::Assignment(assignment) => {
-                collect_expression_declarations(&assignment.target, declarations);
-                collect_expression_declarations(&assignment.value, declarations);
-            }
-            Stmt::Echo { expr, .. }
-            | Stmt::Expr { expr, .. }
-            | Stmt::Return {
-                expr: Some(expr), ..
-            } => collect_expression_declarations(expr, declarations),
-            Stmt::Return { expr: None, .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
-            Stmt::Throw(statement) => {
-                collect_expression_declarations(&statement.expr, declarations)
-            }
-            Stmt::Try(statement) => {
-                collect_block_declarations(&statement.body, declarations);
-                for catch in &statement.catches {
-                    if let Some(binding) = &catch.binding {
-                        declarations
-                            .entry(binding.name.clone())
-                            .or_insert(binding.span);
-                    }
-                    collect_block_declarations(&catch.body, declarations);
-                }
-                if let Some(finally) = &statement.finally {
-                    collect_block_declarations(&finally.body, declarations);
-                }
-            }
-            Stmt::If(statement) => {
-                if let Some(given) = &statement.given {
-                    collect_block_declarations(&given.block, declarations);
-                }
-                collect_expression_declarations(&statement.condition, declarations);
-                collect_block_declarations(&statement.then_block, declarations);
-                if let Some(branch) = &statement.else_branch {
-                    collect_else_declarations(branch, declarations);
-                }
-                if let Some(finally) = &statement.finally {
-                    collect_block_declarations(&finally.block, declarations);
-                }
-            }
-            Stmt::While(statement) => {
-                if let Some(given) = &statement.given {
-                    collect_block_declarations(&given.block, declarations);
-                }
-                collect_expression_declarations(&statement.condition, declarations);
-                collect_block_declarations(&statement.body, declarations);
-                if let Some(finally) = &statement.finally {
-                    collect_block_declarations(&finally.block, declarations);
-                }
-            }
-            Stmt::DoWhile(statement) => {
-                collect_block_declarations(&statement.body, declarations);
-                collect_expression_declarations(&statement.condition, declarations);
-                if let Some(finally) = &statement.finally {
-                    collect_block_declarations(&finally.block, declarations);
-                }
-            }
-            Stmt::For(statement) => {
-                if let Some(initializer) = &statement.initializer {
-                    match initializer {
-                        ForInitializer::VarDecl(declaration) => {
-                            for binding in &declaration.bindings {
-                                declarations
-                                    .entry(binding.name.clone())
-                                    .or_insert(binding.span);
-                            }
-                            collect_expression_declarations(&declaration.initializer, declarations);
-                        }
-                        ForInitializer::Assignment(assignment) => {
-                            collect_expression_declarations(&assignment.target, declarations);
-                            collect_expression_declarations(&assignment.value, declarations);
-                        }
-                    }
-                }
-                if let Some(condition) = &statement.condition {
-                    collect_expression_declarations(condition, declarations);
-                }
-                collect_block_declarations(&statement.body, declarations);
-            }
-            Stmt::Foreach(statement) => {
-                if let Some(key) = &statement.key {
-                    declarations
-                        .entry(key.name.clone())
-                        .or_insert(statement.span);
-                }
-                declarations
-                    .entry(statement.value.name.clone())
-                    .or_insert(statement.span);
-                collect_expression_declarations(&statement.iterable, declarations);
-                collect_block_declarations(&statement.body, declarations);
-            }
-            Stmt::Increment(statement) => {
-                collect_expression_declarations(&statement.target, declarations)
             }
         }
     }
-}
-
-fn collect_else_declarations(branch: &ElseBranch, declarations: &mut HashMap<String, Span>) {
-    match branch {
-        ElseBranch::Block(block) => collect_block_declarations(block, declarations),
-        ElseBranch::If(statement) => {
-            if let Some(given) = &statement.given {
-                collect_block_declarations(&given.block, declarations);
-            }
-            collect_expression_declarations(&statement.condition, declarations);
-            collect_block_declarations(&statement.then_block, declarations);
-            if let Some(branch) = &statement.else_branch {
-                collect_else_declarations(branch, declarations);
-            }
-            if let Some(finally) = &statement.finally {
-                collect_block_declarations(&finally.block, declarations);
-            }
-        }
-    }
-}
-
-fn collect_expression_declarations(expr: &Expr, declarations: &mut HashMap<String, Span>) {
-    match expr {
-        Expr::Closure(_) => {}
-        Expr::Match {
-            scrutinee, arms, ..
-        } => {
-            collect_expression_declarations(scrutinee, declarations);
-            for arm in arms {
-                match &arm.pattern {
-                    MatchPattern::EnumCase {
-                        bindings: Some(bindings),
-                        ..
-                    } => {
-                        for binding in bindings {
-                            declarations
-                                .entry(binding.name.clone())
-                                .or_insert(binding.span);
-                        }
-                    }
-                    MatchPattern::TypeBinding { binding, .. } => {
-                        declarations
-                            .entry(binding.name.clone())
-                            .or_insert(binding.span);
-                    }
-                    MatchPattern::Expression(pattern) => {
-                        collect_expression_declarations(pattern, declarations)
-                    }
-                    MatchPattern::Default { .. } | MatchPattern::EnumCase { .. } => {}
-                }
-                if let Some(guard) = &arm.guard {
-                    collect_expression_declarations(&guard.condition, declarations);
-                }
-                collect_expression_declarations(&arm.value, declarations);
-            }
-        }
-        Expr::When(when) => {
-            if let Some(given) = &when.given {
-                collect_block_declarations(&given.block, declarations);
-            }
-            for branch in &when.branches {
-                if let Some(condition) = &branch.condition {
-                    collect_expression_declarations(condition, declarations);
-                }
-                collect_block_declarations(&branch.block, declarations);
-            }
-            if let Some(finally) = &when.finally {
-                collect_block_declarations(&finally.block, declarations);
-            }
-        }
-        Expr::Array { elements, .. } => {
-            for element in elements {
-                if let Some(key) = &element.key {
-                    collect_expression_declarations(key, declarations);
-                }
-                collect_expression_declarations(&element.value, declarations);
-            }
-        }
-        Expr::ArrayRepeat { value, count, .. }
-        | Expr::Binary {
-            left: value,
-            right: count,
-            ..
-        }
-        | Expr::Range {
-            start: value,
-            end: count,
-            ..
-        } => {
-            collect_expression_declarations(value, declarations);
-            collect_expression_declarations(count, declarations);
-        }
-        Expr::Index {
-            collection, index, ..
-        } => {
-            collect_expression_declarations(collection, declarations);
-            collect_expression_declarations(index, declarations);
-        }
-        Expr::PropertyAccess { object, .. } | Expr::MethodCall { object, .. } => {
-            collect_expression_declarations(object, declarations);
-            if let Expr::MethodCall { args, .. } = expr {
-                for argument in args {
-                    collect_expression_declarations(&argument.value, declarations);
-                }
-            }
-        }
-        Expr::IsType { expr, .. } | Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
-            collect_expression_declarations(expr, declarations)
-        }
-        Expr::FunctionCall { args, .. }
-        | Expr::StaticCall { args, .. }
-        | Expr::New { args, .. } => {
-            for argument in args {
-                collect_expression_declarations(&argument.value, declarations);
-            }
-        }
-        Expr::CallableCall { callee, args, .. } => {
-            collect_expression_declarations(callee, declarations);
-            for argument in args {
-                collect_expression_declarations(&argument.value, declarations);
-            }
-        }
-        Expr::InterpolatedString { parts, .. } => {
-            for part in parts {
-                if let InterpolatedStringPart::Expr(expr) = part {
-                    collect_expression_declarations(expr, declarations);
-                }
-            }
-        }
-        Expr::Variable { .. }
-        | Expr::This { .. }
-        | Expr::Identifier { .. }
-        | Expr::String { .. }
-        | Expr::Int { .. }
-        | Expr::Float { .. }
-        | Expr::Bool { .. }
-        | Expr::Null { .. }
-        | Expr::StaticMember { .. } => {}
-    }
+    declarations
 }
 
 fn collect_return_expression_spans(block: &Block, returns: &mut Vec<Option<Span>>) {
@@ -7678,22 +7437,22 @@ impl<'program> Checker<'program> {
                         }
                     }
                     FunctionTypeParameterMode::Take => {
-                        self.record_capture_requirement_for_expr(
-                            &argument.value,
-                            scopes,
-                            CaptureRequirement::Take,
-                        );
-                        if self.type_is_move_type(actual)
-                            && !self.expression_provides_owned_value(&argument.value, scopes)
-                        {
-                            self.diagnostics.push(
-                                Diagnostic::new(
-                                    "E0645",
-                                    format!("argument {} requires an owned value", index + 1),
-                                    argument.value.span(),
-                                )
-                                .with_title("Taking Callable Argument Requires Ownership"),
+                        if self.type_is_move_type(actual) {
+                            self.record_capture_requirement_for_expr(
+                                &argument.value,
+                                scopes,
+                                CaptureRequirement::Take,
                             );
+                            if !self.expression_provides_owned_value(&argument.value, scopes) {
+                                self.diagnostics.push(
+                                    Diagnostic::new(
+                                        "E0645",
+                                        format!("argument {} requires an owned value", index + 1),
+                                        argument.value.span(),
+                                    )
+                                    .with_title("Taking Callable Argument Requires Ownership"),
+                                );
+                            }
                         }
                     }
                 }
@@ -11443,6 +11202,11 @@ impl<'program> Checker<'program> {
                 self.check_expr(index, scopes, method_context);
                 self.check_collection_index(collection, index, *span, scopes, method_context);
                 let (_, value) = self.collection_index_types(collection, scopes, method_context)?;
+                self.record_capture_requirement_for_expr(
+                    collection,
+                    scopes,
+                    CaptureRequirement::Writable,
+                );
                 if !self.is_writable_object_path(collection, scopes, method_context) {
                     self.diagnostics.push(Diagnostic::new(
                         "E0201",

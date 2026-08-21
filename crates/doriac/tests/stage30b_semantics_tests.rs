@@ -848,3 +848,177 @@ function main(): void
             ))
         )));
 }
+
+#[test]
+fn indexed_capture_mutation_requires_writable_invocation_access() {
+    let source = r#"
+function main(): void
+{
+    let writable $items = [1, 2];
+    let $mutate = function (): void with (writable $items) {
+        $items[0] += 1;
+        $items[1]++;
+    };
+}
+"#;
+    let analysis = analyze(source);
+    assert!(
+        permanent_errors(&analysis.diagnostics).is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    let closure = analysis.info.closures.values().next().unwrap();
+    assert_eq!(
+        closure.inferred_invocation_mode,
+        FunctionInvocationMode::Writable
+    );
+    assert_eq!(
+        closure.captures[0].required_capability,
+        CaptureRequirement::Writable
+    );
+}
+
+#[test]
+fn taking_copy_arguments_preserves_readonly_capture_access() {
+    let source = r#"
+function main(): void
+{
+    let $value = 1;
+    function(take int): int $consume = fn(take int $input) => $input;
+    let $operation = fn() with ($value, $consume) => $consume($value);
+}
+"#;
+    let analysis = analyze(source);
+    assert!(
+        permanent_errors(&analysis.diagnostics).is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    assert!(analysis
+        .info
+        .closures
+        .values()
+        .all(|closure| { closure.inferred_invocation_mode == FunctionInvocationMode::Readonly }));
+    assert!(analysis.info.closures.values().any(|closure| {
+        closure.captures.iter().any(|capture| {
+            matches!(capture.source_type, ResolvedType::Integer(_))
+                && capture.required_capability == CaptureRequirement::Readonly
+        })
+    }));
+}
+
+#[test]
+fn captures_conflict_only_with_bindings_in_the_closure_scope() {
+    let source = r#"
+class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+
+enum Number
+{
+    case Value(int $value);
+}
+
+function main(): void
+{
+    let $value = 9;
+    let $items = [1];
+    let $operation = function (): int with ($value, $items) {
+        {
+            let $value = 1;
+        }
+        foreach ($items as int $value) {}
+        try {
+            throw new Failure("handled");
+        } catch (Failure $value) {}
+        int $matched = match (Number::Value(2)) {
+            Number::Value($value) => $value
+        };
+        return $value + $matched;
+    };
+}
+"#;
+    let analysis = analyze(source);
+    assert!(
+        permanent_errors(&analysis.diagnostics).is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+
+    let same_scope = analyze(
+        r#"
+function main(): void
+{
+    let $value = 1;
+    let $invalid = function (): int with ($value) {
+        let $value = 2;
+        return $value;
+    };
+}
+"#,
+    );
+    diagnostic(&same_scope.diagnostics, "E0644");
+}
+
+#[test]
+fn arrow_closures_receive_short_circuit_narrowing_facts() {
+    let source = r#"
+class Box
+{
+    bool $ready = true;
+}
+
+function main(): void
+{
+    let $andPredicate = fn(?Box $box) => $box != null && $box->ready;
+    let $orPredicate = fn(?Box $box) => $box == null || $box->ready;
+}
+"#;
+    let analysis = analyze(source);
+    assert!(
+        permanent_errors(&analysis.diagnostics).is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn inferred_callable_modes_invalidate_narrowing_for_direct_and_aliased_calls() {
+    let source = r#"
+class Box
+{
+    bool $ready = true;
+}
+
+function main(): void
+{
+    writable ?Box $direct = new Box();
+    writable ?Box $aliased = new Box();
+    let $mutator = function (writable ?Box $value): void {
+        $value = null;
+    };
+    let $alias = $mutator;
+
+    if ($direct != null) {
+        $mutator($direct);
+        echo "{$direct->ready}";
+    }
+    if ($aliased != null) {
+        $alias($aliased);
+        echo "{$aliased->ready}";
+    }
+}
+"#;
+    let analysis = analyze(source);
+    assert_eq!(
+        analysis
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0506")
+            .count(),
+        2,
+        "{:#?}",
+        analysis.diagnostics
+    );
+}
