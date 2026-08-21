@@ -49,7 +49,12 @@ Construction follows the same rule: every property must be initialized on every
 normal constructor path before the new object can be observed. Readonly
 properties are initialized exactly once, writable properties may be changed
 after their first initialization, and a branch that ends in a fatal panic does
-not produce a partially initialized object.
+not produce a partially initialized object. A constructor may traverse a
+definitely initialized writable property and mutate the owned child normally;
+it does not thereby gain a generally writable `$this`. Independently owned
+values may initialize owning properties or replace initialized writable owning
+properties, with the replacement acquired before the previous value is
+destroyed.
 
 Bare `{ ... }` blocks provide an explicit shorter lifetime boundary when a value
 or access guard should be cleaned up before the surrounding function continues.

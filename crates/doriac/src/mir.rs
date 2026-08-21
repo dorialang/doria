@@ -787,6 +787,9 @@ impl Rvalue {
     }
 
     pub fn borrows_move_value(&self) -> bool {
+        if self.is_null_value() {
+            return false;
+        }
         match self {
             Self::Class(value) => value.borrows_class_value(),
             Self::NullableClass(value) => value.borrows_class_value(),
@@ -813,6 +816,28 @@ impl Rvalue {
             | Self::NullableScalar(_)
             | Self::NullableString(_) => false,
         }
+    }
+
+    pub const fn is_null_value(&self) -> bool {
+        matches!(
+            self,
+            Self::NullableClass(NullableClassExpression::Null(_))
+                | Self::NullableCollection(NullableCollectionExpression::Null(_))
+                | Self::NullableSharedReference(NullableSharedReferenceExpression::Null(_))
+                | Self::NullableWeakReference(NullableWeakReferenceExpression::Null(_))
+                | Self::NullableWritableSharedReference(
+                    NullableWritableSharedReferenceExpression::Null(_)
+                )
+                | Self::NullableWritableWeakReference(
+                    NullableWritableWeakReferenceExpression::Null(_)
+                )
+                | Self::NullableSharedReferenceAccess(
+                    NullableSharedReferenceAccessExpression::Null { .. }
+                )
+                | Self::NullableMixed(NullableMixedExpression::Null)
+                | Self::NullableError(NullableErrorExpression::Null)
+                | Self::NullablePayloadEnum(NullablePayloadEnumExpression::Null(_))
+        )
     }
 
     pub const fn transferred_owned_local(&self) -> Option<LocalId> {
@@ -3504,6 +3529,8 @@ pub enum Statement {
         object: LocalId,
         property: PropertyId,
         value: Rvalue,
+        kind: PropertyWriteKind,
+        span: Span,
     },
     AssignStatic {
         target: StaticId,
@@ -3583,6 +3610,13 @@ pub enum Statement {
         ty: PayloadEnumType,
         nullable: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyWriteKind {
+    Initialize,
+    Replace,
+    InitializeOrReplace,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6125,10 +6159,12 @@ impl fmt::Display for Statement {
                 object,
                 property,
                 value,
+                kind,
+                ..
             } => write!(
                 formatter,
-                "local{}->property{} = {value}",
-                object.0, property.index
+                "{kind:?} local{}->property{} = {value}",
+                object.0, property.index,
             ),
             Statement::AssignStatic { target, value } => {
                 write!(formatter, "static{} = {value}", target.0)

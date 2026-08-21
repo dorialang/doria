@@ -1404,6 +1404,8 @@ fn validate_statement(
             object,
             property,
             value,
+            kind,
+            ..
         } => {
             let object = local_in(function, *object)?;
             let mir::Type::Class(class) = object.ty else {
@@ -1434,7 +1436,24 @@ fn validate_statement(
             }
             let constructor_receiver = class_in(program, class)?.constructor == Some(function.id)
                 && function.params.first() == Some(&object.id);
-            if !constructor_receiver && !property_definition.writable {
+            if matches!(kind, mir::PropertyWriteKind::Initialize) && !constructor_receiver {
+                return Err(malformed_mir(format!(
+                    "property{} initialization does not target the direct constructor receiver",
+                    property.index
+                )));
+            }
+            if matches!(kind, mir::PropertyWriteKind::InitializeOrReplace)
+                && (!constructor_receiver || !property_definition.writable)
+            {
+                return Err(malformed_mir(format!(
+                    "property{} conditional initialization must target a writable property on the direct constructor receiver",
+                    property.index
+                )));
+            }
+            if !matches!(kind, mir::PropertyWriteKind::Initialize)
+                && !property_definition.writable
+                && !constructor_receiver
+            {
                 return Err(malformed_mir(format!(
                     "assignment mutates readonly property{} outside its constructor initializer",
                     property.index
@@ -1461,17 +1480,9 @@ fn validate_statement(
                     expression,
                     &format!("assignment to property{}", property.index),
                 )?;
-            } else if matches!(
-                property_definition.ty,
-                mir::Type::Mixed | mir::Type::NullableMixed
-            ) && value.mixed_ownership() == mir::MixedOwnership::None
-                && !matches!(
-                    value,
-                    mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Null)
-                )
-            {
+            } else if property_definition.ty.has_move_ownership() && value.borrows_move_value() {
                 return Err(malformed_mir(format!(
-                    "assignment to property{} stores a borrowed mixed value",
+                    "assignment to property{} stores a borrowed move value",
                     property.index
                 )));
             }
@@ -9908,6 +9919,42 @@ fn validate_constructor_body_initializer(
                 Self::MaybeInitialized
             }
         }
+
+        fn after_write(
+            self,
+            kind: mir::PropertyWriteKind,
+            writable: bool,
+            constructor: &mir::Function,
+            property: crate::class_layout::PropertyId,
+        ) -> Result<Self, BackendError> {
+            match (kind, self) {
+                (mir::PropertyWriteKind::Initialize, Self::Uninitialized) => {
+                    Ok(Self::Initialized)
+                }
+                (mir::PropertyWriteKind::Initialize, _) => Err(malformed_mir(format!(
+                    "constructor {} initializes property{} more than once on one path",
+                    constructor.name, property.index
+                ))),
+                (mir::PropertyWriteKind::Replace, Self::Initialized) if writable => {
+                    Ok(Self::Initialized)
+                }
+                (mir::PropertyWriteKind::Replace, _) => Err(malformed_mir(format!(
+                    "constructor {} replaces property{} before it is definitely initialized or while it is readonly",
+                    constructor.name, property.index
+                ))),
+                (mir::PropertyWriteKind::InitializeOrReplace, Self::MaybeInitialized)
+                    if writable =>
+                {
+                    Ok(Self::Initialized)
+                }
+                (mir::PropertyWriteKind::InitializeOrReplace, _) => {
+                    Err(malformed_mir(format!(
+                        "constructor {} conditionally initializes property{} without a maybe-initialized writable obligation",
+                        constructor.name, property.index
+                    )))
+                }
+            }
+        }
     }
 
     let (reachable, _) = reachable_blocks_and_predecessors(constructor, true)?;
@@ -9922,27 +9969,16 @@ fn validate_constructor_body_initializer(
         let block = block_in(constructor, block_id)?;
         let mut state = inputs[block_id.0].expect("queued constructor block has input state");
         for statement in &block.statements {
-            if matches!(
-                statement,
-                mir::Statement::AssignProperty {
-                    object,
-                    property: assigned,
-                    ..
-                } if *object == receiver && *assigned == property
-            ) {
-                state = if writable {
-                    State::Initialized
-                } else {
-                    match state {
-                        State::Uninitialized => State::Initialized,
-                        State::Initialized | State::MaybeInitialized => {
-                            return Err(malformed_mir(format!(
-                                "constructor {} initializes readonly property{} more than once on one path",
-                                constructor.name, property.index
-                            )));
-                        }
-                    }
-                };
+            if let mir::Statement::AssignProperty {
+                object,
+                property: assigned,
+                kind,
+                ..
+            } = statement
+            {
+                if *object == receiver && *assigned == property {
+                    state = state.after_write(*kind, writable, constructor, property)?;
+                }
             }
         }
         outputs[block_id.0] = Some(state);
@@ -9987,15 +10023,16 @@ fn validate_constructor_body_initializer(
                     constructor.name, property.index
                 )));
             }
-            if matches!(
-                statement,
-                mir::Statement::AssignProperty {
-                    object,
-                    property: assigned,
-                    ..
-                } if *object == receiver && *assigned == property
-            ) {
-                state = State::Initialized;
+            if let mir::Statement::AssignProperty {
+                object,
+                property: assigned,
+                kind,
+                ..
+            } = statement
+            {
+                if *object == receiver && *assigned == property {
+                    state = state.after_write(*kind, writable, constructor, property)?;
+                }
             }
         }
         if state != State::Initialized

@@ -13,6 +13,7 @@ require_once __DIR__ . '/check_benchmark_revision.php';
 require_once __DIR__ . '/check_closure_capture_authority.php';
 require_once __DIR__ . '/check_stage30_closure_authority.php';
 require_once __DIR__ . '/check_inferred_main_effects.php';
+require_once __DIR__ . '/check_constructor_owned_property_writes.php';
 
 $root = dirname(__DIR__);
 $failures = check_stream_io_completeness($root);
@@ -22,6 +23,7 @@ array_push($failures, ...check_benchmark_revision($root));
 array_push($failures, ...check_closure_capture_authority($root));
 array_push($failures, ...check_stage30_closure_authority($root));
 array_push($failures, ...check_inferred_main_effects($root));
+array_push($failures, ...check_constructor_owned_property_writes($root));
 
 // Keys are "path:line:number". Keep this empty unless the repository contains
 // a verified decision-shaped token that is not a citation. Every entry requires

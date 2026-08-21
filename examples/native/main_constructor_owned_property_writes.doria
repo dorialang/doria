@@ -1,0 +1,75 @@
+class Window
+{
+    writable string $title;
+
+    function __construct(string $initialTitle)
+    {
+        $this->title = $initialTitle;
+    }
+}
+
+class Layer
+{
+    writable Window $window = new Window("");
+}
+
+class InitializedApplication
+{
+    internal writable Layer $layer = new Layer();
+
+    function __construct(string $initialTitle)
+    {
+        $this->layer->window->title = $initialTitle;
+    }
+
+    function title(): string
+    {
+        return $this->layer->window->title;
+    }
+}
+
+class OwnedApplication
+{
+    internal writable Window $window;
+
+    function __construct(string $initialTitle)
+    {
+        $this->window = new Window($initialTitle);
+    }
+
+    writable function reset(string $title): void
+    {
+        $this->window = new Window($title);
+    }
+
+    function title(): string
+    {
+        return $this->window->title;
+    }
+}
+
+class NullableCollectionOwner
+{
+    writable ?List<int> $items = [1];
+
+    writable function reset(): void
+    {
+        $this->items = [2];
+    }
+
+}
+
+function main(): void
+{
+    let $initialized = new InitializedApplication("Doria");
+    echo "nested {$initialized->title()}\n";
+
+    let writable $owned = new OwnedApplication("Ready");
+    echo "owned {$owned->title()}\n";
+    $owned->reset("Reset");
+    echo "replaced {$owned->title()}\n";
+
+    let writable $collections = new NullableCollectionOwner();
+    $collections->reset();
+    echo "collection replaced\n";
+}

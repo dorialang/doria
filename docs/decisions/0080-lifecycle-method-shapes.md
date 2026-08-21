@@ -37,12 +37,12 @@ Constructor access remains exactly the existing narrow model:
 - direct simple assignment may initialize an uninitialized readonly property of the declaring class exactly once;
 - property initializers and promoted parameters count as already initialized;
 - compound assignment does not receive readonly init access;
-- nested object paths do not receive readonly init access;
+- nested object paths do not receive readonly init access, but Decision 0122 permits traversal through a definitely initialized writable property into ordinary writable child access;
 - writable methods cannot be called through `$this` merely because execution is in a constructor;
 - readonly init access is unavailable inside repeatable bodies;
 - writable properties retain their normal mutation rules.
 
-This protocol access does not classify `$this` as writable. The compiler represents construction as its own checking context rather than using the ordinary writable-method flag. Stage 19 drop elaboration and Stage 21 definite initialization formalize construction and destruction further without changing these source-level rules.
+This protocol access does not classify `$this` as writable. The compiler represents construction as its own checking context rather than using the ordinary writable-method flag. Decision 0122 names that context `ConstructionRoot`: it preserves direct initialization while allowing an initialized writable intermediate to supply ordinary writable access to its owned child. Stage 19 drop elaboration and Stage 21 definite initialization formalize construction and destruction without changing the lifecycle boundary.
 
 ### Diagnostics and fixes
 

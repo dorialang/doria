@@ -263,3 +263,6 @@ examples/native/main_checked_error_rethrow.doria
 examples/native/main_checked_error_values.doria
 examples/native/main_checked_error_success_values.doria
 examples/native/main_native_collection_property_initializers.doria
+examples/native/main_constructor_owned_property_writes.doria
+examples/native/main_constructor_checked_property_replacement.doria
+examples/native/main_constructor_property_write_order.doria

@@ -2057,67 +2057,79 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 object,
                 property,
                 value,
+                kind,
+                ..
             } => {
                 let property_ty = property_definition(self.program, *property)?.ty;
                 let value = self.lower_rvalue(value)?;
                 let address = self.lower_property_address(*object, *property)?;
-                let old_error = matches!(property_ty, mir::Type::Error | mir::Type::NullableError)
-                    .then(|| {
-                        build(self.builder.build_load(
-                            error_carrier_type(self.context),
-                            address,
-                            "property.old.error",
-                        ))
-                        .map(BasicValueEnum::into_struct_value)
-                    })
-                    .transpose()?;
-                let old = match property_ty {
-                    mir::Type::String
-                    | mir::Type::Class(_)
-                    | mir::Type::NullableClass(_)
-                    | mir::Type::Collection(_)
-                    | mir::Type::NullableCollection(_)
-                    | mir::Type::Mixed
-                    | mir::Type::NullableMixed
-                    | mir::Type::SharedReference(_)
-                    | mir::Type::WeakReference(_)
-                    | mir::Type::NullableSharedReference(_)
-                    | mir::Type::NullableWeakReference(_)
-                    | mir::Type::WritableSharedReference(_)
-                    | mir::Type::WritableWeakReference(_)
-                    | mir::Type::NullableWritableSharedReference(_)
-                    | mir::Type::NullableWritableWeakReference(_)
-                    | mir::Type::ReadonlySharedReferenceAccess(_)
-                    | mir::Type::WritableSharedReferenceAccess(_)
-                    | mir::Type::NullableReadonlySharedReferenceAccess(_)
-                    | mir::Type::NullableWritableSharedReferenceAccess(_) => Some(
-                        build(self.builder.build_load(
-                            self.context.ptr_type(AddressSpace::default()),
-                            address,
-                            "property.old",
-                        ))?
-                        .into_pointer_value(),
-                    ),
-                    mir::Type::NullableString => {
-                        let value = build(self.builder.build_load(
-                            llvm_type(self.context, self.target_data, property_ty),
-                            address,
-                            "property.old",
-                        ))?
-                        .into_struct_value();
-                        Some(self.nullable_parts(value)?.1.into_pointer_value())
+                let replaces = !matches!(kind, mir::PropertyWriteKind::Initialize);
+                let old_error = (replaces
+                    && matches!(property_ty, mir::Type::Error | mir::Type::NullableError))
+                .then(|| {
+                    build(self.builder.build_load(
+                        error_carrier_type(self.context),
+                        address,
+                        "property.old.error",
+                    ))
+                    .map(BasicValueEnum::into_struct_value)
+                })
+                .transpose()?;
+                let old = if replaces {
+                    match property_ty {
+                        mir::Type::String
+                        | mir::Type::Class(_)
+                        | mir::Type::NullableClass(_)
+                        | mir::Type::Collection(_)
+                        | mir::Type::NullableCollection(_)
+                        | mir::Type::Mixed
+                        | mir::Type::NullableMixed
+                        | mir::Type::SharedReference(_)
+                        | mir::Type::WeakReference(_)
+                        | mir::Type::NullableSharedReference(_)
+                        | mir::Type::NullableWeakReference(_)
+                        | mir::Type::WritableSharedReference(_)
+                        | mir::Type::WritableWeakReference(_)
+                        | mir::Type::NullableWritableSharedReference(_)
+                        | mir::Type::NullableWritableWeakReference(_)
+                        | mir::Type::ReadonlySharedReferenceAccess(_)
+                        | mir::Type::WritableSharedReferenceAccess(_)
+                        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                        | mir::Type::NullableWritableSharedReferenceAccess(_) => Some(
+                            build(self.builder.build_load(
+                                self.context.ptr_type(AddressSpace::default()),
+                                address,
+                                "property.old",
+                            ))?
+                            .into_pointer_value(),
+                        ),
+                        mir::Type::NullableString => {
+                            let value = build(self.builder.build_load(
+                                llvm_type(self.context, self.target_data, property_ty),
+                                address,
+                                "property.old",
+                            ))?
+                            .into_struct_value();
+                            Some(self.nullable_parts(value)?.1.into_pointer_value())
+                        }
+                        mir::Type::PayloadEnum(payload)
+                        | mir::Type::NullablePayloadEnum(payload) => {
+                            let nullable = matches!(property_ty, mir::Type::NullablePayloadEnum(_));
+                            let old = self.entry_payload_alloca(
+                                payload,
+                                nullable,
+                                "property.payload.old",
+                            )?;
+                            self.copy_payload_bytes(old, address, payload, nullable)?;
+                            Some(old)
+                        }
+                        mir::Type::Scalar(_)
+                        | mir::Type::NullableScalar(_)
+                        | mir::Type::Error
+                        | mir::Type::NullableError => None,
                     }
-                    mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
-                        let nullable = matches!(property_ty, mir::Type::NullablePayloadEnum(_));
-                        let old =
-                            self.entry_payload_alloca(payload, nullable, "property.payload.old")?;
-                        self.copy_payload_bytes(old, address, payload, nullable)?;
-                        Some(old)
-                    }
-                    mir::Type::Scalar(_)
-                    | mir::Type::NullableScalar(_)
-                    | mir::Type::Error
-                    | mir::Type::NullableError => None,
+                } else {
+                    None
                 };
                 if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
                     property_ty
@@ -2138,7 +2150,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     (mir::Type::Class(class) | mir::Type::NullableClass(class), Some(value)) => {
                         self.drop_class_value_checked(value, class)?;
                     }
-                    (mir::Type::Collection(collection), Some(value)) => {
+                    (
+                        mir::Type::Collection(collection)
+                        | mir::Type::NullableCollection(collection),
+                        Some(value),
+                    ) => {
                         self.drop_collection_value(value, collection)?;
                     }
                     (mir::Type::Mixed | mir::Type::NullableMixed, Some(value)) => {

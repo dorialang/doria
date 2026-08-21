@@ -1239,11 +1239,6 @@ fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), Backen
                             )?;
                         } else if let Some(initializer) = &property.initializer {
                             validate_expr(initializer, semantic_info)?;
-                            if let Some((span, feature)) =
-                                unsupported_php_property_default(initializer, semantic_info)
-                            {
-                                return Err(unsupported_constant_shape(span, feature));
-                            }
                         }
                     }
                     ClassMember::Method(method) => validate_function(method, semantic_info, true)?,
@@ -2034,10 +2029,10 @@ fn emit_arguments(arguments: &[Argument], scopes: &PhpNameScopes) -> String {
         .join(", ")
 }
 
-// Instance initializers are currently emitted in PHP property-default syntax.
-// Keep that syntax boundary as an allow-list so executable Doria expressions
-// cannot reach a PHP constant-expression context unnoticed.
-fn unsupported_php_property_default(
+// PHP property defaults accept only constant expressions. Doria instance
+// initializers are executable and run before the constructor body, so anything
+// outside that subset is emitted as the first statement in the constructor.
+fn requires_php_runtime_property_initializer(
     expr: &Expr,
     semantic_info: &SemanticInfo,
 ) -> Option<(Span, &'static str)> {
@@ -2072,8 +2067,10 @@ fn unsupported_php_property_default(
             element
                 .key
                 .as_ref()
-                .and_then(|key| unsupported_php_property_default(key, semantic_info))
-                .or_else(|| unsupported_php_property_default(&element.value, semantic_info))
+                .and_then(|key| requires_php_runtime_property_initializer(key, semantic_info))
+                .or_else(|| {
+                    requires_php_runtime_property_initializer(&element.value, semantic_info)
+                })
         }),
         Expr::ArrayRepeat { span, .. } => {
             Some((*span, "sequence fill instance property initializers"))
@@ -2099,7 +2096,7 @@ fn unsupported_php_property_default(
             "object construction in instance property initializers",
         )),
         Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } => {
-            unsupported_php_property_default(expr, semantic_info)
+            requires_php_runtime_property_initializer(expr, semantic_info)
         }
         Expr::Binary {
             op:
@@ -2115,8 +2112,10 @@ fn unsupported_php_property_default(
             *span,
             "instance property initializers that require runtime helper calls",
         )),
-        Expr::Binary { left, right, .. } => unsupported_php_property_default(left, semantic_info)
-            .or_else(|| unsupported_php_property_default(right, semantic_info)),
+        Expr::Binary { left, right, .. } => {
+            requires_php_runtime_property_initializer(left, semantic_info)
+                .or_else(|| requires_php_runtime_property_initializer(right, semantic_info))
+        }
         Expr::Range { span, .. } => {
             Some((*span, "range expressions in instance property initializers"))
         }
@@ -2615,10 +2614,11 @@ fn emit_class(
         .filter_map(|member| match member {
             ClassMember::Property(property)
                 if !property.is_static
-                    && property
-                        .initializer
-                        .as_ref()
-                        .is_some_and(|value| is_payload_enum_expression(value, semantic_info)) =>
+                    && property.initializer.as_ref().is_some_and(|value| {
+                        is_payload_enum_expression(value, semantic_info)
+                            || requires_php_runtime_property_initializer(value, semantic_info)
+                                .is_some()
+                    }) =>
             {
                 Some((
                     property.name.as_str(),
@@ -2848,7 +2848,7 @@ fn emit_property(
     output.push_str(" $");
     output.push_str(&property.name);
     if let Some(initializer) = &property.initializer {
-        let payload_initializer = if property.is_static {
+        let runtime_initializer = if property.is_static {
             matches!(
                 evaluation
                     .values
@@ -2861,11 +2861,12 @@ fn emit_property(
             )
         } else {
             is_payload_enum_expression(initializer, semantic_info)
+                || requires_php_runtime_property_initializer(initializer, semantic_info).is_some()
         };
-        if !payload_initializer {
+        if !runtime_initializer {
             output.push_str(" = ");
         }
-        if property.is_static && !payload_initializer {
+        if property.is_static && !runtime_initializer {
             output.push_str(&emit_const_value(
                 evaluated_value(
                     evaluation,
@@ -2876,7 +2877,7 @@ fn emit_property(
                 ),
                 evaluation,
             ));
-        } else if !payload_initializer {
+        } else if !runtime_initializer {
             output.push_str(&emit_expr(initializer, &shared_scopes.expression_scope()));
         }
     }

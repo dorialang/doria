@@ -6179,7 +6179,11 @@ impl ScalarPlace {
         }
     }
 
-    fn assignment(self, value: mir::ValueExpression) -> mir::Statement {
+    fn assignment(
+        self,
+        value: mir::ValueExpression,
+        property_write: Option<(mir::PropertyWriteKind, Span)>,
+    ) -> mir::Statement {
         match self {
             Self::Local(target) => mir::Statement::AssignLocal {
                 target,
@@ -6189,11 +6193,17 @@ impl ScalarPlace {
                 target,
                 value: mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Value(value)),
             },
-            Self::Property { object, property } => mir::Statement::AssignProperty {
-                object,
-                property,
-                value: mir::Rvalue::Value(value),
-            },
+            Self::Property { object, property } => {
+                let (kind, span) = property_write
+                    .expect("property scalar assignment requires semantic write info");
+                mir::Statement::AssignProperty {
+                    object,
+                    property,
+                    value: mir::Rvalue::Value(value),
+                    kind,
+                    span,
+                }
+            }
             Self::Static(target) => mir::Statement::AssignStatic {
                 target,
                 value: mir::Rvalue::Value(value),
@@ -6213,6 +6223,31 @@ fn unparenthesized_place(expr: &hir::Expr) -> &hir::Expr {
         hir::Expr::Grouped { expr, .. } => unparenthesized_place(expr),
         _ => expr,
     }
+}
+
+fn semantic_property_write(
+    expr: &hir::Expr,
+    context: &LoweringContext,
+) -> DiagnosticResult<(mir::PropertyWriteKind, Span)> {
+    let span = unparenthesized_place(expr).span();
+    let Some(info) = context
+        .semantic_info
+        .property_writes
+        .get(&(span.start, span.end))
+    else {
+        return Err(vec![unsupported(
+            span,
+            "checked property write has no semantic initialize/replace classification",
+        )]);
+    };
+    let kind = match info.kind {
+        crate::semantics::PropertyWriteKind::Initialize => mir::PropertyWriteKind::Initialize,
+        crate::semantics::PropertyWriteKind::Replace => mir::PropertyWriteKind::Replace,
+        crate::semantics::PropertyWriteKind::InitializeOrReplace => {
+            mir::PropertyWriteKind::InitializeOrReplace
+        }
+    };
+    Ok((kind, span))
 }
 
 fn lower_scalar_place(
@@ -6296,6 +6331,9 @@ fn lower_assignment(
     materialize_nested_collection_places(&assignment.value, false, context)?;
     if assignment.op != hir::AssignOp::Assign {
         let (place, scalar_type) = lower_scalar_place(&assignment.target, context)?;
+        let property_write = matches!(place, ScalarPlace::Property { .. })
+            .then(|| semantic_property_write(&assignment.target, context))
+            .transpose()?;
         let value = lower_compound_value(
             place.operand(),
             scalar_type,
@@ -6304,7 +6342,7 @@ fn lower_assignment(
             assignment.span,
             context,
         )?;
-        context.push_statement(place.assignment(value));
+        context.push_statement(place.assignment(value, property_write));
         return Ok(());
     }
 
@@ -6327,6 +6365,8 @@ fn lower_assignment(
                 object,
                 property,
                 value,
+                kind: semantic_property_write(target, context)?.0,
+                span: target.span(),
             });
             return Ok(());
         }
@@ -6385,7 +6425,12 @@ fn lower_increment(
     materialize_nested_collection_places(&increment.target, true, context)?;
     let (place, scalar_type) = lower_scalar_place(&increment.target, context)?;
     let value = lower_increment_value(place.operand(), scalar_type, &increment.op, increment.span)?;
-    context.push_statement(place.assignment(value));
+    let property_write = if matches!(&place, ScalarPlace::Property { .. }) {
+        Some(semantic_property_write(&increment.target, context)?)
+    } else {
+        None
+    };
+    context.push_statement(place.assignment(value, property_write));
     Ok(())
 }
 
@@ -18386,10 +18431,14 @@ fn lower_property_place(
         _ => match context.expression_type(object)? {
             mir::Type::Class(class) => {
                 let value = lower_class_expression(object, class, false, context)?;
+                let writable = context
+                    .semantic_info
+                    .writable_object_paths
+                    .contains(&(object.span().start, object.span().end));
                 let owner = if value.owned_temporary_class().is_some() {
                     context.declare_owned_temp(mir::Type::Class(class))
                 } else {
-                    context.declare_borrowed_temp(mir::Type::Class(class), false)
+                    context.declare_borrowed_temp(mir::Type::Class(class), writable)
                 };
                 context.push_statement(mir::Statement::AssignLocal {
                     target: owner,

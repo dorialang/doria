@@ -1,0 +1,35 @@
+class Token
+{
+    string $name;
+
+    function __construct(string $label)
+    {
+        $this->name = $label;
+    }
+
+    function __destruct()
+    {
+        try { echo "drop {$this->name}\n"; }
+        catch (Doria\Std\Io\IoError $error) {}
+    }
+}
+
+class Holder
+{
+    writable Token $token;
+
+    function __construct(bool $seeded)
+    {
+        if ($seeded) {
+            $this->token = new Token("old");
+        }
+        $this->token = new Token("new");
+    }
+}
+
+function main(): void
+{
+    let $first = new Holder(true);
+    let $second = new Holder(false);
+    echo "ready\n";
+}

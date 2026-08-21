@@ -332,7 +332,8 @@ Runner** and non-blocking; the accepted performance standard is unchanged.
 - **Corrective beat - Complete:** concrete specialized instance-property and
   payload-enum storage types are interned before callable lowering. This closes
   the native collection-property initializer N1101 ordering defect without
-  changing checked-error semantics or absorbing E0472 owned-property transfer.
+  changing checked-error semantics or absorbing the then-pending owned-property
+  transfer correction later accepted by Decision 0122.
 - **Corrective beat - Complete:** a clause-free selected `main` infers its exact
   uncovered checked effects. Source omission remains visible in AST/HIR while
   the effective set drives source callers, MIR, ABI selection, all backends, and
@@ -396,8 +397,8 @@ remain unchanged.
 - I/O documentation that says "panic until Stage 29" is obsolete: ordinary I/O
   failures are checked errors, while allocation failure and fatal panic remain
   separate.
-- E0472 owned-property move-in, replacement, and move-out remains a separate
-  unimplemented authority and implementation beat.
+- Decision 0122 implements owned-property move-in and writable replacement.
+  E0472 remains reachable only for the separate move-out boundary.
 - The pre-Stage-30 closure grammar slice is complete. Stage 30 closure semantics,
   Stage 31 namespaces, Stage 34 inheritance, Stage 35 interfaces, Stage 36a
   streams, and Stage 41 PHP-library conversion remain separate.

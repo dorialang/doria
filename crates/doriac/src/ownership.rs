@@ -1608,30 +1608,24 @@ impl Checker<'_> {
                         );
                         return Flow::fallthrough();
                     }
-                    let mixed_property = self
-                        .assignment_property_info(&assignment.target, scopes)
-                        .is_some_and(|property| property.mixed);
-                    if self.expr_returns_borrow(&assignment.value, scopes) {
+                    let property = self.assignment_property_info(&assignment.target, scopes);
+                    let owning_property = property
+                        .as_ref()
+                        .is_some_and(|property| property.move_type || property.mixed);
+                    let borrowed_value = self.expr_returns_borrow(&assignment.value, scopes);
+                    if borrowed_value && owning_property {
                         self.diagnostics.push(
                             Diagnostic::new(
                                 "E0478",
                                 "borrowed result cannot be stored in an owning property",
                                 assignment.value.span(),
                             )
-                            .with_help(
-                                "assign an independently owned value to the property instead",
-                            ),
-                        );
-                    } else if self.expr_is_move_value(&assignment.value, scopes) && !mixed_property
-                    {
-                        self.diagnostics.push(
-                            Diagnostic::new(
-                                "E0472",
-                                "direct moves into owned properties are not supported",
-                                assignment.span,
+                            .with_title("Owning Property Needs An Owned Value")
+                            .with_explanation(
+                                "The property owns its stored value, but this expression provides only a borrow.",
                             )
                             .with_help(
-                                "keep the owned class value in a local until writable-path move rules are specified",
+                                "move an owned local or `take` parameter, construct a fresh value, or return an owned value from a helper",
                             ),
                         );
                     }
@@ -1639,7 +1633,7 @@ impl Checker<'_> {
                         &assignment.target,
                         &assignment.value,
                         scopes,
-                        if mixed_property {
+                        if owning_property && !borrowed_value {
                             UseMode::Give
                         } else {
                             UseMode::Read
@@ -2484,19 +2478,40 @@ impl Checker<'_> {
                         self.check_active_borrow_conflict(&place, mode, *span);
                     }
                 }
-                if mode == UseMode::Give && self.expr_is_non_transferable_property(expr, scopes) {
-                    self.diagnostics.push(
-                        Diagnostic::new(
-                            "E0472",
-                            "direct moves out of owned properties are not supported",
-                            *span,
-                        )
-                        .with_help(
-                            "use the property without transferring it until writable-path move rules are specified",
-                        ),
-                    );
+                if mode == UseMode::Give {
+                    let source = self.assignment_place_key(expr, scopes);
+                    let overlaps_destination = source
+                        .as_ref()
+                        .is_some_and(|source| self.active_assignment_targets.contains(source));
+                    if overlaps_destination {
+                        let source = source.expect("overlapping assignment source");
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0471",
+                                format!(
+                                    "property source `{source}` overlaps assignment destination `{source}`"
+                                ),
+                                *span,
+                            )
+                            .with_title("Property Transfer Overlaps Its Destination")
+                            .with_help(
+                                "move an independently owned value into the property instead",
+                            ),
+                        );
+                    } else if self.expr_is_non_transferable_property(expr, scopes) {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0472",
+                                "direct moves out of owned properties are not supported",
+                                *span,
+                            )
+                            .with_help(
+                                "use the property without transferring it; moving out requires a separate take-and-replace operation",
+                            ),
+                        );
+                    }
                 }
-                let assignment_root = (mode == UseMode::Read
+                let assignment_root = (matches!(mode, UseMode::Read | UseMode::Give)
                     && self
                         .assignment_place_key(expr, scopes)
                         .is_some_and(|target| self.active_assignment_targets.contains(&target)))

@@ -62,8 +62,11 @@ assignment after a partial merge safely establishes definite initialization.
 
 Construction access applies only to the direct `$this` of the declaring
 `__construct`. It does not make `$this` writable and does not permit compound
-readonly initialization, nested paths, aliases, helper-mediated initialization,
-or writable method calls. Static writes remain ordinary mutation.
+readonly initialization, aliases, helper-mediated initialization, or writable
+method calls on direct `$this`. Decision 0122 permits that construction root to
+traverse a definitely initialized writable property; the child then follows
+ordinary writable-path rules. This does not grant initialization privilege to a
+nested readonly property. Static writes remain ordinary mutation.
 
 Readonly initialization is rejected inside `while`, `for`, and `foreach`
 bodies because those bodies may repeat. A writable assignment in a
@@ -133,6 +136,10 @@ Construction is path-sensitive and native-safe without runtime initialization
 checks. Decision 0083's temporary gate is historical. Decision 0089's ordinary
 borrow rules remain unchanged: construction access neither widens `$this` nor
 emits dynamic guards.
+
+Decision 0122 extends this same lattice to classify direct property writes as
+initialization, replacement, or conditional initialization/replacement. Nested
+mutation reads but does not initialize its parent property.
 
 The executable conditional-construction fixture is compared through the MIR
 interpreter, Cranelift fast profile, and LLVM release profile, including exact

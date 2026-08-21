@@ -50,6 +50,7 @@ The accepted project-tool name is Baton. Baton is the planned user-facing projec
 - Do not treat generated PHP as a semantic oracle. It is backend output, not the definition of Doria.
 - Do not silently import behavior from PHP, Rust, JavaScript, C, C++, or any backend/runtime ecosystem.
 - If implementation hits a language-design fork not explicitly settled by `SPEC.md`, `docs/decisions/`, or the current task prompt, stop and ask Andrew.
+- A permanent language rejection must cite accepted language authority. An accepted-but-unimplemented feature must be described as an implementation boundary, not as invalid Doria. Never promote an early stage's temporary soundness fence into a language rule merely because the required analysis had not landed yet.
 - When stopping for a design decision, report the question, viable options, tradeoffs, affected files, and a recommendation clearly marked as a recommendation.
 - Do not implement a workaround that makes the current backend pass while leaving Doria semantics ambiguous.
 - Prefer clear unsupported-feature diagnostics over permissive behavior that may become wrong.
@@ -255,6 +256,8 @@ These are identity, not scope deferral. They do not become available later, and 
 - Treat `self` as reserved compiler vocabulary denoting the declaring class, in scope and type positions. `parent::member()` is the parent-implementation spelling; its full semantics land with inheritance.
 - Enforce one member namespace per class across constants, static/instance properties, and static/instance methods. Do not use punctuation or call syntax to select among conflicting declarations.
 - A constructor write to a writable static is ordinary mutation, not constructor init access. Constructor init access governs `$this` and the instance under construction only.
+- Direct constructor `$this` is a construction root, not a writable receiver. It may initialize a direct uninitialized property and may traverse a definitely initialized writable property into ordinary writable child access. Every intermediate must be initialized, non-null, and writable; nested readonly properties receive no constructor-only initialization privilege.
+- Independently owned values may initialize owning instance properties and replace initialized writable owning properties. Replacement acquires the new value before destroying the old one. Moving a value out of a property remains a separate object-invariant problem; do not combine move-in and move-out as one unsupported surface.
 - A readonly static with a const-evaluable initializer is itself const-evaluable and may seed another static. Static initialization ordering resolves through the constant-evaluation dependency graph; cycles are rejected with the chain shown.
 - `Displayable` is a compiler-known nominal contract requiring explicit `implements Displayable` and exactly `function toString(): string`. Do not accept structural conformance or general interfaces early. Concrete classes dispatch `toString()` through ordinary method lowering; interface values and general dispatch land with interfaces.
 - Lifecycle methods are compiler-invoked protocol points, not ordinary methods. Their legal shapes are an allowlist; unspecified modifier combinations on magic names are rejected by default, and they are never callable directly.

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::ast::{
     AssignOp, ClassDecl, ClassMember, Expr, ForIncrement, ForInitializer, InterpolatedStringPart,
     Item, Program, Stmt,
@@ -7,7 +9,14 @@ use crate::control_flow::{
 };
 use crate::dataflow::{solve_forward, ForwardAnalysis};
 use crate::diagnostics::Diagnostic;
+use crate::semantics::PropertyWriteKind;
 use crate::source::Span;
+
+#[derive(Debug, Default)]
+pub(crate) struct Analysis {
+    pub diagnostics: Vec<Diagnostic>,
+    pub property_writes: HashMap<(usize, usize), PropertyWriteKind>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InitState {
@@ -110,8 +119,8 @@ pub(crate) fn check_program(
     given_preludes: &GivenSemanticInfoMap,
     checked_effect_sites: &crate::checked_effects::EffectSiteMap,
     catch_error_types: &crate::checked_effects::CatchTypeMap,
-) -> Vec<Diagnostic> {
-    let mut diagnostics = Vec::new();
+) -> Analysis {
+    let mut analysis = Analysis::default();
     for class in program.items.iter().filter_map(|item| match item {
         Item::Class(class) => Some(class),
         _ => None,
@@ -121,10 +130,10 @@ pub(crate) fn check_program(
             given_preludes,
             checked_effect_sites,
             catch_error_types,
-            &mut diagnostics,
+            &mut analysis,
         );
     }
-    diagnostics
+    analysis
 }
 
 fn check_class(
@@ -132,7 +141,7 @@ fn check_class(
     given_preludes: &GivenSemanticInfoMap,
     checked_effect_sites: &crate::checked_effects::EffectSiteMap,
     catch_error_types: &crate::checked_effects::CatchTypeMap,
-    diagnostics: &mut Vec<Diagnostic>,
+    analysis: &mut Analysis,
 ) {
     let mut properties = class
         .members
@@ -183,7 +192,7 @@ fn check_class(
             &entry,
             class.span,
             "implicit constructor",
-            diagnostics,
+            &mut analysis.diagnostics,
         );
         return;
     };
@@ -207,7 +216,7 @@ fn check_class(
         if !state.reachable {
             continue;
         }
-        inspect_action(class, &properties, state, node, diagnostics);
+        inspect_action(class, &properties, state, node, analysis);
         match node.kind {
             NodeKind::ReturnExit => report_incomplete_exit(
                 class,
@@ -215,7 +224,7 @@ fn check_class(
                 state,
                 node.span,
                 "explicit return",
-                diagnostics,
+                &mut analysis.diagnostics,
             ),
             NodeKind::FallthroughExit => report_incomplete_exit(
                 class,
@@ -223,7 +232,7 @@ fn check_class(
                 state,
                 constructor.body.span,
                 "constructor fallthrough",
-                diagnostics,
+                &mut analysis.diagnostics,
             ),
             _ => {}
         }
@@ -273,13 +282,13 @@ fn inspect_action(
     properties: &[Property],
     input: &State,
     node: &Node,
-    diagnostics: &mut Vec<Diagnostic>,
+    analysis: &mut Analysis,
 ) {
     let mut state = input.clone();
     match &node.action {
         NodeAction::None | NodeAction::Assume { .. } => {}
         NodeAction::Expression(expression) => {
-            inspect_expr(class, properties, &state, expression, diagnostics)
+            inspect_expr(class, properties, &state, expression, analysis)
         }
         NodeAction::Statement(statement) => inspect_statement(
             class,
@@ -287,7 +296,7 @@ fn inspect_action(
             &mut state,
             statement,
             node.repeatable,
-            diagnostics,
+            analysis,
         ),
         NodeAction::ForInitializer(initializer) => match initializer {
             ForInitializer::VarDecl(declaration) => inspect_expr(
@@ -295,16 +304,11 @@ fn inspect_action(
                 properties,
                 &state,
                 &declaration.initializer,
-                diagnostics,
+                analysis,
             ),
-            ForInitializer::Assignment(assignment) => inspect_assignment(
-                class,
-                properties,
-                &mut state,
-                assignment,
-                false,
-                diagnostics,
-            ),
+            ForInitializer::Assignment(assignment) => {
+                inspect_assignment(class, properties, &mut state, assignment, false, analysis)
+            }
         },
         NodeAction::ForIncrement(increment) => match increment {
             ForIncrement::Increment(increment) => inspect_increment(
@@ -314,10 +318,10 @@ fn inspect_action(
                 &increment.target,
                 increment.span,
                 true,
-                diagnostics,
+                analysis,
             ),
             ForIncrement::Assignment(assignment) => {
-                inspect_assignment(class, properties, &mut state, assignment, true, diagnostics)
+                inspect_assignment(class, properties, &mut state, assignment, true, analysis)
             }
         },
     }
@@ -329,40 +333,29 @@ fn inspect_statement(
     state: &mut State,
     statement: &Stmt,
     repeatable: bool,
-    diagnostics: &mut Vec<Diagnostic>,
+    analysis: &mut Analysis,
 ) {
     match statement {
         Stmt::Block(block) => {
             for statement in &block.statements {
-                inspect_statement(class, properties, state, statement, repeatable, diagnostics);
+                inspect_statement(class, properties, state, statement, repeatable, analysis);
             }
         }
-        Stmt::VarDecl(declaration) => inspect_expr(
-            class,
-            properties,
-            state,
-            &declaration.initializer,
-            diagnostics,
-        ),
-        Stmt::Assignment(assignment) => inspect_assignment(
-            class,
-            properties,
-            state,
-            assignment,
-            repeatable,
-            diagnostics,
-        ),
+        Stmt::VarDecl(declaration) => {
+            inspect_expr(class, properties, state, &declaration.initializer, analysis)
+        }
+        Stmt::Assignment(assignment) => {
+            inspect_assignment(class, properties, state, assignment, repeatable, analysis)
+        }
         Stmt::Echo { expr, .. } | Stmt::Expr { expr, .. } => {
-            inspect_expr(class, properties, state, expr, diagnostics)
+            inspect_expr(class, properties, state, expr, analysis)
         }
         Stmt::Return { expr, .. } => {
             if let Some(expr) = expr {
-                inspect_expr(class, properties, state, expr, diagnostics);
+                inspect_expr(class, properties, state, expr, analysis);
             }
         }
-        Stmt::Throw(statement) => {
-            inspect_expr(class, properties, state, &statement.expr, diagnostics)
-        }
+        Stmt::Throw(statement) => inspect_expr(class, properties, state, &statement.expr, analysis),
         Stmt::Increment(increment) => inspect_increment(
             class,
             properties,
@@ -370,7 +363,7 @@ fn inspect_statement(
             &increment.target,
             increment.span,
             repeatable,
-            diagnostics,
+            analysis,
         ),
         Stmt::If(_)
         | Stmt::Try(_)
@@ -389,9 +382,9 @@ fn inspect_assignment(
     state: &mut State,
     assignment: &crate::ast::Assignment,
     repeatable: bool,
-    diagnostics: &mut Vec<Diagnostic>,
+    analysis: &mut Analysis,
 ) {
-    inspect_expr(class, properties, state, &assignment.value, diagnostics);
+    inspect_expr(class, properties, state, &assignment.value, analysis);
     if let Some((property, span)) = direct_this_property(&assignment.target) {
         apply_assignment(
             class,
@@ -403,10 +396,10 @@ fn inspect_assignment(
                 span,
                 repeatable,
             },
-            diagnostics,
+            analysis,
         );
     } else {
-        inspect_expr(class, properties, state, &assignment.target, diagnostics);
+        inspect_expr(class, properties, state, &assignment.target, analysis);
     }
 }
 
@@ -417,7 +410,7 @@ fn inspect_increment(
     target: &Expr,
     span: Span,
     repeatable: bool,
-    diagnostics: &mut Vec<Diagnostic>,
+    analysis: &mut Analysis,
 ) {
     if let Some((property, property_span)) = direct_this_property(target) {
         apply_assignment(
@@ -430,11 +423,11 @@ fn inspect_increment(
                 span: property_span,
                 repeatable,
             },
-            diagnostics,
+            analysis,
         );
     } else {
         let _ = span;
-        inspect_expr(class, properties, state, target, diagnostics);
+        inspect_expr(class, properties, state, target, analysis);
     }
 }
 
@@ -443,16 +436,34 @@ fn apply_assignment(
     properties: &[Property],
     state: &mut State,
     site: AssignmentSite<'_>,
-    diagnostics: &mut Vec<Diagnostic>,
+    analysis: &mut Analysis,
 ) {
     let Some(index) = property_index(properties, site.property) else {
         return;
     };
     let property = &properties[index];
     if !matches!(site.operation, AssignOp::Assign) {
-        observe_property(class, properties, state, index, site.span, diagnostics);
+        analysis
+            .property_writes
+            .insert((site.span.start, site.span.end), PropertyWriteKind::Replace);
+        observe_property(
+            class,
+            properties,
+            state,
+            index,
+            site.span,
+            &mut analysis.diagnostics,
+        );
         return;
     }
+    let write_kind = match state.properties[index] {
+        InitState::Uninitialized => PropertyWriteKind::Initialize,
+        InitState::Initialized => PropertyWriteKind::Replace,
+        InitState::MaybeInitialized => PropertyWriteKind::InitializeOrReplace,
+    };
+    analysis
+        .property_writes
+        .insert((site.span.start, site.span.end), write_kind);
     if property.writable {
         state.properties[index] = InitState::Initialized;
         return;
@@ -462,7 +473,7 @@ fn apply_assignment(
     }
     match state.properties[index] {
         InitState::Uninitialized => state.properties[index] = InitState::Initialized,
-        InitState::Initialized => diagnostics.push(Diagnostic::new(
+        InitState::Initialized => analysis.diagnostics.push(Diagnostic::new(
             "E0412",
             format!(
                 "readonly property `{}::{}` is already initialized on this constructor path",
@@ -470,7 +481,7 @@ fn apply_assignment(
             ),
             site.span,
         )),
-        InitState::MaybeInitialized => diagnostics.push(
+        InitState::MaybeInitialized => analysis.diagnostics.push(
             Diagnostic::new(
                 "E0502",
                 format!(
@@ -489,10 +500,12 @@ fn inspect_expr(
     properties: &[Property],
     state: &State,
     expression: &Expr,
-    diagnostics: &mut Vec<Diagnostic>,
+    analysis: &mut Analysis,
 ) {
     match expression {
-        Expr::This { span } => report_incomplete_this(class, properties, state, *span, diagnostics),
+        Expr::This { span } => {
+            report_incomplete_this(class, properties, state, *span, &mut analysis.diagnostics)
+        }
         Expr::PropertyAccess {
             object,
             property,
@@ -500,72 +513,79 @@ fn inspect_expr(
             ..
         } if is_this(object) => {
             if let Some(index) = property_index(properties, property) {
-                observe_property(class, properties, state, index, *span, diagnostics);
+                observe_property(
+                    class,
+                    properties,
+                    state,
+                    index,
+                    *span,
+                    &mut analysis.diagnostics,
+                );
             }
         }
         Expr::PropertyAccess { object, .. }
         | Expr::Grouped { expr: object, .. }
         | Expr::Unary { expr: object, .. } => {
-            inspect_expr(class, properties, state, object, diagnostics)
+            inspect_expr(class, properties, state, object, analysis)
         }
         Expr::MethodCall {
             object, args, span, ..
         } => {
             if is_this(object) {
-                report_incomplete_this(class, properties, state, *span, diagnostics);
+                report_incomplete_this(class, properties, state, *span, &mut analysis.diagnostics);
             } else {
-                inspect_expr(class, properties, state, object, diagnostics);
+                inspect_expr(class, properties, state, object, analysis);
             }
             for argument in args {
-                inspect_expr(class, properties, state, &argument.value, diagnostics);
+                inspect_expr(class, properties, state, &argument.value, analysis);
             }
         }
         Expr::FunctionCall { args, .. }
         | Expr::StaticCall { args, .. }
         | Expr::New { args, .. } => {
             for argument in args {
-                inspect_expr(class, properties, state, &argument.value, diagnostics);
+                inspect_expr(class, properties, state, &argument.value, analysis);
             }
         }
         Expr::InterpolatedString { parts, .. } => {
             for part in parts {
                 if let InterpolatedStringPart::Expr(expression) = part {
-                    inspect_expr(class, properties, state, expression, diagnostics);
+                    inspect_expr(class, properties, state, expression, analysis);
                 }
             }
         }
         Expr::Array { elements, .. } => {
             for element in elements {
                 if let Some(key) = &element.key {
-                    inspect_expr(class, properties, state, key, diagnostics);
+                    inspect_expr(class, properties, state, key, analysis);
                 }
-                inspect_expr(class, properties, state, &element.value, diagnostics);
+                inspect_expr(class, properties, state, &element.value, analysis);
             }
         }
         Expr::ArrayRepeat { value, count, .. } => {
-            inspect_expr(class, properties, state, value, diagnostics);
-            inspect_expr(class, properties, state, count, diagnostics);
+            inspect_expr(class, properties, state, value, analysis);
+            inspect_expr(class, properties, state, count, analysis);
         }
         Expr::Index {
             collection, index, ..
         } => {
-            inspect_expr(class, properties, state, collection, diagnostics);
-            inspect_expr(class, properties, state, index, diagnostics);
+            inspect_expr(class, properties, state, collection, analysis);
+            inspect_expr(class, properties, state, index, analysis);
         }
-        Expr::IsType { expr, .. } => inspect_expr(class, properties, state, expr, diagnostics),
+        Expr::IsType { expr, .. } => inspect_expr(class, properties, state, expr, analysis),
         Expr::Binary {
             left,
             op: crate::ast::BinaryOp::And,
             ..
         } if constant_bool(left) == Some(false) => {
-            inspect_expr(class, properties, state, left, diagnostics)
+            inspect_expr(class, properties, state, left, analysis)
         }
         Expr::Binary {
             left,
             op: crate::ast::BinaryOp::Or,
             ..
         } if constant_bool(left) == Some(true) => {
-            inspect_expr(class, properties, state, left, diagnostics)
+            inspect_expr(class, properties, state, left, analysis)
         }
         Expr::Binary { left, right, .. }
         | Expr::Range {
@@ -573,26 +593,19 @@ fn inspect_expr(
             end: right,
             ..
         } => {
-            inspect_expr(class, properties, state, left, diagnostics);
-            inspect_expr(class, properties, state, right, diagnostics);
+            inspect_expr(class, properties, state, left, analysis);
+            inspect_expr(class, properties, state, right, analysis);
         }
         Expr::When(when) => {
             let mut nested = state.clone();
             if let Some(given) = &when.given {
                 for statement in &given.block.statements {
-                    inspect_statement(
-                        class,
-                        properties,
-                        &mut nested,
-                        statement,
-                        false,
-                        diagnostics,
-                    );
+                    inspect_statement(class, properties, &mut nested, statement, false, analysis);
                 }
             }
             for branch in &when.branches {
                 if let Some(condition) = &branch.condition {
-                    inspect_expr(class, properties, &nested, condition, diagnostics);
+                    inspect_expr(class, properties, &nested, condition, analysis);
                 }
                 let mut branch_state = nested.clone();
                 for statement in &branch.block.statements {
@@ -602,7 +615,7 @@ fn inspect_expr(
                         &mut branch_state,
                         statement,
                         false,
-                        diagnostics,
+                        analysis,
                     );
                 }
             }
@@ -615,7 +628,7 @@ fn inspect_expr(
                         &mut final_state,
                         statement,
                         false,
-                        diagnostics,
+                        analysis,
                     );
                 }
             }

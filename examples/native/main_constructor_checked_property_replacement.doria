@@ -1,0 +1,62 @@
+class ReplacementError implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+class Resource
+{
+    string $name;
+
+    function __construct(string $label)
+    {
+        $this->name = $label;
+    }
+
+    function __destruct()
+    {
+        try { echo "drop {$this->name}\n"; }
+        catch (Doria\Std\Io\IoError $error) {}
+    }
+}
+
+function makeResource(bool $fail): Resource throws ReplacementError
+{
+    if ($fail) {
+        throw new ReplacementError("replacement failed");
+    }
+    return new Resource("new");
+}
+
+class Holder
+{
+    writable Resource $current = new Resource("old");
+
+    writable function replace(bool $fail): void throws ReplacementError
+    {
+        $this->current = makeResource($fail);
+    }
+
+    function name(): string
+    {
+        return $this->current->name;
+    }
+}
+
+function main(): void
+{
+    let writable $holder = new Holder();
+    try {
+        $holder->replace(true);
+    } catch (ReplacementError $error) {
+        echo "kept {$holder->name()}\n";
+    }
+
+    try {
+        $holder->replace(false);
+    } catch (ReplacementError $error) {
+        echo "unexpected\n";
+    }
+    echo "installed {$holder->name()}\n";
+}
