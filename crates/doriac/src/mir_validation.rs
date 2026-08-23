@@ -9920,6 +9920,12 @@ fn validate_constructor_body_initializer(
             }
         }
 
+        fn transfer_write(self) -> Self {
+            // Fixpoint transfer records the write without judging its kind;
+            // the converged validation pass below applies the strict rule.
+            Self::Initialized
+        }
+
         fn after_write(
             self,
             kind: mir::PropertyWriteKind,
@@ -9972,12 +9978,11 @@ fn validate_constructor_body_initializer(
             if let mir::Statement::AssignProperty {
                 object,
                 property: assigned,
-                kind,
                 ..
             } = statement
             {
                 if *object == receiver && *assigned == property {
-                    state = state.after_write(*kind, writable, constructor, property)?;
+                    state = state.transfer_write();
                 }
             }
         }

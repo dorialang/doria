@@ -4530,6 +4530,37 @@ function main(): void
 }
 
 #[test]
+fn constructor_property_validation_waits_for_uneven_cfg_joins_to_converge() {
+    let source = r#"
+class Token {}
+
+class Holder
+{
+    writable Token $token;
+
+    function __construct(bool $outer, bool $inner)
+    {
+        if ($outer) {
+            if ($inner) {
+                $this->token = new Token();
+            }
+        }
+        $this->token = new Token();
+    }
+}
+
+function main(): void
+{
+    let $holder = new Holder(true, true);
+}
+"#;
+    let program = doriac::lower_source_to_mir("uneven-constructor-join.doria", source)
+        .expect("valid constructor writes should lower");
+    doriac::mir_validation::validate_program(&program)
+        .expect("strict property-write validation should use converged input states");
+}
+
+#[test]
 fn shared_validator_rejects_property_assignments_that_transfer_the_receiver() {
     let mut program = class_program();
     let property = PropertyId {

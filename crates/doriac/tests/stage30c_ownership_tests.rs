@@ -389,6 +389,32 @@ function invalid(int $left, int $right): function(): int
 }
 
 #[test]
+fn returned_closure_locals_preserve_borrow_provenance_through_move_chains() {
+    let analysis = analyze(
+        r#"
+function bind(int $value): function(): int
+{
+    let $callback = fn() with ($value) => $value;
+    let $alias = $callback;
+    return $alias;
+}
+
+function main(): void
+{
+    let $root = 1;
+    let $callback = bind($root);
+    List<function(): int> $callbacks = [$callback];
+}
+"#,
+    );
+    let escape = diagnostic(&analysis.diagnostics, "E0658");
+    assert_eq!(
+        escape.title,
+        "Borrow-Bound Closure Cannot Enter Owned Storage"
+    );
+}
+
+#[test]
 fn invalid_ownership_suppresses_runtime_boundary_but_valid_closure_keeps_it() {
     let invalid = analyze(
         r#"

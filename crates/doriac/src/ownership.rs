@@ -150,16 +150,177 @@ fn writable_shared_constructor_signature() -> Signature {
     }
 }
 
-fn direct_returned_closure_provenance(
+fn returned_closure_provenance(
     function: &ast::FunctionDecl,
     closures: &HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
     binding_resolution: &BindingResolution,
 ) -> Option<ReturnedClosureProvenance> {
+    fn merge(
+        current: ReturnedClosureProvenance,
+        incoming: ReturnedClosureProvenance,
+    ) -> ReturnedClosureProvenance {
+        match (current, incoming) {
+            (ReturnedClosureProvenance::Invalid, _) | (_, ReturnedClosureProvenance::Invalid) => {
+                ReturnedClosureProvenance::Invalid
+            }
+            (ReturnedClosureProvenance::Owned, ReturnedClosureProvenance::Owned) => {
+                ReturnedClosureProvenance::Owned
+            }
+            (ReturnedClosureProvenance::Owned, ReturnedClosureProvenance::Borrowed(borrow))
+            | (ReturnedClosureProvenance::Borrowed(borrow), ReturnedClosureProvenance::Owned) => {
+                ReturnedClosureProvenance::Borrowed(borrow)
+            }
+            (
+                ReturnedClosureProvenance::Borrowed(current),
+                ReturnedClosureProvenance::Borrowed(incoming),
+            ) if current.source == incoming.source => {
+                ReturnedClosureProvenance::Borrowed(ReturnBorrow {
+                    source: current.source,
+                    writable: current.writable && incoming.writable,
+                })
+            }
+            (ReturnedClosureProvenance::Borrowed(_), ReturnedClosureProvenance::Borrowed(_)) => {
+                ReturnedClosureProvenance::Invalid
+            }
+        }
+    }
+
+    fn record_declaration(
+        declaration: &ast::VarDecl,
+        binding_resolution: &BindingResolution,
+        sources: &mut HashMap<BindingId, Vec<Expr>>,
+    ) {
+        for binding in &declaration.bindings {
+            if let Some(id) = binding_resolution
+                .declaration_by_span
+                .get(&(binding.span.start, binding.span.end))
+            {
+                sources
+                    .entry(*id)
+                    .or_default()
+                    .push(declaration.initializer.clone());
+            }
+        }
+    }
+
+    fn record_assignment(
+        assignment: &ast::Assignment,
+        binding_resolution: &BindingResolution,
+        sources: &mut HashMap<BindingId, Vec<Expr>>,
+    ) {
+        if assignment.op != AssignOp::Assign {
+            return;
+        }
+        let Expr::Variable { span, .. } = ungroup_expr(&assignment.target) else {
+            return;
+        };
+        if let Some(id) = binding_resolution.uses_by_span.get(&(span.start, span.end)) {
+            sources
+                .entry(*id)
+                .or_default()
+                .push(assignment.value.clone());
+        }
+    }
+
+    fn collect_sources(
+        block: &ast::Block,
+        binding_resolution: &BindingResolution,
+        sources: &mut HashMap<BindingId, Vec<Expr>>,
+    ) {
+        for statement in &block.statements {
+            match statement {
+                Stmt::VarDecl(declaration) => {
+                    record_declaration(declaration, binding_resolution, sources)
+                }
+                Stmt::Assignment(assignment) => {
+                    record_assignment(assignment, binding_resolution, sources)
+                }
+                Stmt::Block(block) => collect_sources(block, binding_resolution, sources),
+                Stmt::If(statement) => {
+                    if let Some(given) = &statement.given {
+                        collect_sources(&given.block, binding_resolution, sources);
+                    }
+                    collect_sources(&statement.then_block, binding_resolution, sources);
+                    if let Some(branch) = &statement.else_branch {
+                        match branch {
+                            ast::ElseBranch::If(statement) => collect_sources(
+                                &ast::Block {
+                                    statements: vec![Stmt::If((**statement).clone())],
+                                    span: statement.span,
+                                },
+                                binding_resolution,
+                                sources,
+                            ),
+                            ast::ElseBranch::Block(block) => {
+                                collect_sources(block, binding_resolution, sources)
+                            }
+                        }
+                    }
+                    if let Some(finally) = &statement.finally {
+                        collect_sources(&finally.block, binding_resolution, sources);
+                    }
+                }
+                Stmt::While(statement) => {
+                    if let Some(given) = &statement.given {
+                        collect_sources(&given.block, binding_resolution, sources);
+                    }
+                    collect_sources(&statement.body, binding_resolution, sources);
+                    if let Some(finally) = &statement.finally {
+                        collect_sources(&finally.block, binding_resolution, sources);
+                    }
+                }
+                Stmt::DoWhile(statement) => {
+                    collect_sources(&statement.body, binding_resolution, sources);
+                    if let Some(finally) = &statement.finally {
+                        collect_sources(&finally.block, binding_resolution, sources);
+                    }
+                }
+                Stmt::For(statement) => {
+                    if let Some(initializer) = &statement.initializer {
+                        match initializer {
+                            ast::ForInitializer::VarDecl(declaration) => {
+                                record_declaration(declaration, binding_resolution, sources)
+                            }
+                            ast::ForInitializer::Assignment(assignment) => {
+                                record_assignment(assignment, binding_resolution, sources)
+                            }
+                        }
+                    }
+                    collect_sources(&statement.body, binding_resolution, sources);
+                    if let Some(ast::ForIncrement::Assignment(assignment)) = &statement.increment {
+                        record_assignment(assignment, binding_resolution, sources);
+                    }
+                }
+                Stmt::Foreach(statement) => {
+                    collect_sources(&statement.body, binding_resolution, sources)
+                }
+                Stmt::Try(statement) => {
+                    collect_sources(&statement.body, binding_resolution, sources);
+                    for catch in &statement.catches {
+                        collect_sources(&catch.body, binding_resolution, sources);
+                    }
+                    if let Some(finally) = &statement.finally {
+                        collect_sources(&finally.body, binding_resolution, sources);
+                    }
+                }
+                Stmt::Echo { .. }
+                | Stmt::Return { .. }
+                | Stmt::Throw(_)
+                | Stmt::Increment(_)
+                | Stmt::Expr { .. }
+                | Stmt::Break { .. }
+                | Stmt::Continue { .. } => {}
+            }
+        }
+    }
+
     fn from_expr(
         expr: &Expr,
         function: &ast::FunctionDecl,
         closures: &HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
         binding_resolution: &BindingResolution,
+        sources: &HashMap<BindingId, Vec<Expr>>,
+        visiting: &mut HashSet<BindingId>,
     ) -> Option<ReturnedClosureProvenance> {
         match ungroup_expr(expr) {
             Expr::Closure(closure) => {
@@ -207,6 +368,28 @@ fn direct_returned_closure_provenance(
                     ReturnedClosureProvenance::Borrowed,
                 ))
             }
+            Expr::Variable { span, .. } => {
+                let id = *binding_resolution
+                    .uses_by_span
+                    .get(&(span.start, span.end))?;
+                if !visiting.insert(id) {
+                    return Some(ReturnedClosureProvenance::Invalid);
+                }
+                let mut found = None;
+                for source in sources.get(&id)? {
+                    let candidate = from_expr(
+                        source,
+                        function,
+                        closures,
+                        binding_resolution,
+                        sources,
+                        visiting,
+                    )?;
+                    found = Some(found.map_or(candidate, |current| merge(current, candidate)));
+                }
+                visiting.remove(&id);
+                found
+            }
             _ => None,
         }
     }
@@ -216,6 +399,7 @@ fn direct_returned_closure_provenance(
         function: &ast::FunctionDecl,
         closures: &HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
         binding_resolution: &BindingResolution,
+        sources: &HashMap<BindingId, Vec<Expr>>,
         found: &mut Option<ReturnedClosureProvenance>,
     ) {
         for statement in &block.statements {
@@ -223,25 +407,33 @@ fn direct_returned_closure_provenance(
                 Stmt::Return {
                     expr: Some(expr), ..
                 } => {
-                    let Some(candidate) = from_expr(expr, function, closures, binding_resolution)
-                    else {
+                    let Some(candidate) = from_expr(
+                        expr,
+                        function,
+                        closures,
+                        binding_resolution,
+                        sources,
+                        &mut HashSet::new(),
+                    ) else {
                         continue;
                     };
-                    *found = Some(match *found {
-                        None => candidate,
-                        Some(existing) if existing == candidate => existing,
-                        Some(_) => ReturnedClosureProvenance::Invalid,
-                    });
+                    *found = Some(found.map_or(candidate, |current| merge(current, candidate)));
                 }
-                Stmt::Block(block) => {
-                    visit_block(block, function, closures, binding_resolution, found)
-                }
+                Stmt::Block(block) => visit_block(
+                    block,
+                    function,
+                    closures,
+                    binding_resolution,
+                    sources,
+                    found,
+                ),
                 Stmt::If(statement) => {
                     visit_block(
                         &statement.then_block,
                         function,
                         closures,
                         binding_resolution,
+                        sources,
                         found,
                     );
                     if let Some(branch) = &statement.else_branch {
@@ -254,11 +446,17 @@ fn direct_returned_closure_provenance(
                                 function,
                                 closures,
                                 binding_resolution,
+                                sources,
                                 found,
                             ),
-                            ast::ElseBranch::Block(block) => {
-                                visit_block(block, function, closures, binding_resolution, found)
-                            }
+                            ast::ElseBranch::Block(block) => visit_block(
+                                block,
+                                function,
+                                closures,
+                                binding_resolution,
+                                sources,
+                                found,
+                            ),
                         }
                     }
                 }
@@ -267,6 +465,7 @@ fn direct_returned_closure_provenance(
                     function,
                     closures,
                     binding_resolution,
+                    sources,
                     found,
                 ),
                 Stmt::DoWhile(statement) => visit_block(
@@ -274,6 +473,7 @@ fn direct_returned_closure_provenance(
                     function,
                     closures,
                     binding_resolution,
+                    sources,
                     found,
                 ),
                 Stmt::For(statement) => visit_block(
@@ -281,6 +481,7 @@ fn direct_returned_closure_provenance(
                     function,
                     closures,
                     binding_resolution,
+                    sources,
                     found,
                 ),
                 Stmt::Foreach(statement) => visit_block(
@@ -288,6 +489,7 @@ fn direct_returned_closure_provenance(
                     function,
                     closures,
                     binding_resolution,
+                    sources,
                     found,
                 ),
                 Stmt::Try(statement) => {
@@ -296,13 +498,28 @@ fn direct_returned_closure_provenance(
                         function,
                         closures,
                         binding_resolution,
+                        sources,
                         found,
                     );
                     for catch in &statement.catches {
-                        visit_block(&catch.body, function, closures, binding_resolution, found);
+                        visit_block(
+                            &catch.body,
+                            function,
+                            closures,
+                            binding_resolution,
+                            sources,
+                            found,
+                        );
                     }
                     if let Some(finally) = &statement.finally {
-                        visit_block(&finally.body, function, closures, binding_resolution, found);
+                        visit_block(
+                            &finally.body,
+                            function,
+                            closures,
+                            binding_resolution,
+                            sources,
+                            found,
+                        );
                     }
                 }
                 Stmt::VarDecl(_)
@@ -318,12 +535,15 @@ fn direct_returned_closure_provenance(
         }
     }
 
+    let mut sources = HashMap::new();
+    collect_sources(&function.body, binding_resolution, &mut sources);
     let mut found = None;
     visit_block(
         &function.body,
         function,
         closures,
         binding_resolution,
+        &sources,
         &mut found,
     );
     found
@@ -769,7 +989,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     &[],
                 );
                 if let Some(ReturnedClosureProvenance::Borrowed(borrow)) =
-                    direct_returned_closure_provenance(function, closures, binding_resolution)
+                    returned_closure_provenance(function, closures, binding_resolution)
                 {
                     function_signature.return_borrow = Some(borrow);
                 }
@@ -824,11 +1044,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                 &class.type_params,
                             );
                             if let Some(ReturnedClosureProvenance::Borrowed(borrow)) =
-                                direct_returned_closure_provenance(
-                                    method,
-                                    closures,
-                                    binding_resolution,
-                                )
+                                returned_closure_provenance(method, closures, binding_resolution)
                             {
                                 method_signature.return_borrow = Some(borrow);
                             }
