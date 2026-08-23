@@ -314,6 +314,17 @@ fn validate_closure_metadata(program: &mir::Program) -> Result<(), BackendError>
         }
         if let Some(layout) = descriptor.environment_layout {
             closure_environment_layout_in(program, layout)?;
+            if descriptor.environment_placement == mir::ClosureEnvironmentPlacement::None {
+                return Err(malformed_mir(format!(
+                    "closure descriptor#{} has an environment without native placement",
+                    descriptor.id.0
+                )));
+            }
+        } else if descriptor.environment_placement != mir::ClosureEnvironmentPlacement::None {
+            return Err(malformed_mir(format!(
+                "closure descriptor#{} has native environment placement without a layout",
+                descriptor.id.0
+            )));
         }
         if descriptor.source_span.start > descriptor.source_span.end
             || descriptor.source_span.end > program.source.text.len()
@@ -706,6 +717,37 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     if let mir::ReturnType::Value(ty) = function.return_type {
         validate_type(program, ty)?;
     }
+    if let Some(return_borrow) = function.return_borrow {
+        let source_index = match return_borrow.source {
+            mir::BorrowSource::Receiver => {
+                if function.receiver_mode.is_none() {
+                    return Err(malformed_mir(format!(
+                        "function {} has a receiver return borrow without a receiver",
+                        function.name
+                    )));
+                }
+                0
+            }
+            mir::BorrowSource::Parameter(index) => {
+                index
+                    + usize::from(function.receiver_mode.is_some())
+                    + usize::from(function.closure.is_some())
+            }
+        };
+        let source = *function.params.get(source_index).ok_or_else(|| {
+            malformed_mir(format!(
+                "function {} return-borrow source parameter does not exist",
+                function.name
+            ))
+        })?;
+        let source = local_in(function, source)?;
+        if source.owned || (return_borrow.writable && !source.writable) {
+            return Err(malformed_mir(format!(
+                "function {} has an invalid return-borrow source",
+                function.name
+            )));
+        }
+    }
     for (index, local) in function.locals.iter().enumerate() {
         if local.id != mir::LocalId(index) {
             return Err(malformed_mir(format!(
@@ -734,6 +776,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
                 || descriptor.function_type != closure.function_type
                 || descriptor.environment_layout != closure.environment_layout
                 || function.return_type != function_type.return_type
+                || function.return_borrow != function_type.return_borrow
                 || function.checked_effects != function_type.checked_effects
                 || function.params.len() != function_type.parameters.len() + 1
                 || function.params.first() != Some(&closure.hidden_environment)
@@ -6408,6 +6451,15 @@ fn infer_function_return_borrow(
             mir::Terminator::Return(mir::Rvalue::NullableMixed(expression)) => Some(
                 infer_nullable_mixed_expression_return_borrow(program, function, expression)?,
             ),
+            mir::Terminator::Return(mir::Rvalue::Function(expression)) => Some(
+                infer_function_expression_return_borrow(program, function, expression)?,
+            ),
+            mir::Terminator::Return(mir::Rvalue::NullableFunction(
+                mir::NullableFunctionExpression::Null { .. },
+            )) => None,
+            mir::Terminator::Return(mir::Rvalue::NullableFunction(expression)) => Some(
+                infer_nullable_function_expression_return_borrow(program, function, expression)?,
+            ),
             _ => continue,
         };
         let Some(candidate) = candidate else {
@@ -6428,6 +6480,168 @@ fn infer_function_return_borrow(
         }
     }
     Ok(inferred.flatten())
+}
+
+fn infer_function_expression_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::FunctionExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    match expression {
+        mir::FunctionExpression::Create { captures, .. } => {
+            let mut inferred = None;
+            for capture in captures {
+                let mir::ClosureCaptureOperand::BorrowLocal { local, writable } = capture else {
+                    continue;
+                };
+                let candidate =
+                    infer_local_return_borrow(program, function, *local)?.map(|borrow| {
+                        mir::ReturnBorrow {
+                            writable: borrow.writable && *writable,
+                            ..borrow
+                        }
+                    });
+                merge_function_value_borrow(&mut inferred, candidate, "closure construction")?;
+            }
+            Ok(inferred.flatten())
+        }
+        mir::FunctionExpression::Local { local, .. } => {
+            infer_function_local_return_borrow(program, function, *local)
+        }
+        mir::FunctionExpression::Call {
+            function: callee,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => infer_borrowed_rvalue_source(program, function, *callee, args, *return_borrow),
+        mir::FunctionExpression::AssumePresent { value, .. } => {
+            infer_nullable_function_expression_return_borrow(program, function, value)
+        }
+        mir::FunctionExpression::Property { object, .. } => {
+            infer_local_return_borrow(program, function, *object)
+        }
+        mir::FunctionExpression::CollectionIndex { collection, .. } => {
+            infer_local_return_borrow(program, function, *collection)
+        }
+        mir::FunctionExpression::Call {
+            return_borrow: None,
+            ..
+        } => Ok(None),
+    }
+}
+
+fn infer_nullable_function_expression_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    expression: &mir::NullableFunctionExpression,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    match expression {
+        mir::NullableFunctionExpression::Null { .. } => Ok(None),
+        mir::NullableFunctionExpression::Present(value) => {
+            infer_function_expression_return_borrow(program, function, value)
+        }
+        mir::NullableFunctionExpression::Local { local, .. } => {
+            infer_function_local_return_borrow(program, function, *local)
+        }
+        mir::NullableFunctionExpression::Call {
+            function: callee,
+            args,
+            return_borrow: Some(return_borrow),
+            ..
+        } => infer_borrowed_rvalue_source(program, function, *callee, args, *return_borrow),
+        mir::NullableFunctionExpression::Property { object, .. } => {
+            infer_local_return_borrow(program, function, *object)
+        }
+        mir::NullableFunctionExpression::DictionaryGet { collection, .. }
+        | mir::NullableFunctionExpression::CollectionIndex { collection, .. } => {
+            infer_local_return_borrow(program, function, *collection)
+        }
+        mir::NullableFunctionExpression::Call {
+            return_borrow: None,
+            ..
+        } => Ok(None),
+    }
+}
+
+fn infer_function_local_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    local: mir::LocalId,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    fn visit(
+        program: &mir::Program,
+        function: &mir::Function,
+        local: mir::LocalId,
+        visiting: &mut HashSet<mir::LocalId>,
+    ) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+        if !visiting.insert(local) {
+            return Err(malformed_mir(format!(
+                "function-value local{} has a recursive assignment",
+                local.0
+            )));
+        }
+        let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
+        let mut inferred = None;
+        for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
+            for statement in &block.statements {
+                let mir::Statement::AssignLocal { target, value } = statement else {
+                    continue;
+                };
+                if *target != local {
+                    continue;
+                }
+                let candidate = match value {
+                    mir::Rvalue::Function(mir::FunctionExpression::Local {
+                        local: source, ..
+                    }) => visit(program, function, *source, visiting)?,
+                    mir::Rvalue::Function(expression) => {
+                        infer_function_expression_return_borrow(program, function, expression)?
+                    }
+                    mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Null {
+                        ..
+                    }) => None,
+                    mir::Rvalue::NullableFunction(expression) => {
+                        infer_nullable_function_expression_return_borrow(
+                            program, function, expression,
+                        )?
+                    }
+                    _ => continue,
+                };
+                merge_function_value_borrow(
+                    &mut inferred,
+                    candidate,
+                    &format!("function-value local{}", local.0),
+                )?;
+            }
+        }
+        visiting.remove(&local);
+        Ok(inferred.flatten())
+    }
+
+    visit(program, function, local, &mut HashSet::new())
+}
+
+fn merge_function_value_borrow(
+    inferred: &mut Option<Option<mir::ReturnBorrow>>,
+    candidate: Option<mir::ReturnBorrow>,
+    source: &str,
+) -> Result<(), BackendError> {
+    match (*inferred, candidate) {
+        (None, candidate) => *inferred = Some(candidate),
+        (Some(Some(existing)), Some(candidate)) if existing.source == candidate.source => {
+            *inferred = Some(Some(mir::ReturnBorrow {
+                writable: existing.writable && candidate.writable,
+                ..existing
+            }));
+        }
+        (Some(None), None) => {}
+        _ => {
+            return Err(malformed_mir(format!(
+                "{source} mixes owned and borrow-bound function values"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn infer_nullable_expression_return_borrow(

@@ -1,0 +1,21 @@
+class Guard
+{
+    function __construct(int $value)
+    {
+    }
+
+    function __destruct()
+    {
+        try {
+            echo "dropped\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
+    }
+}
+
+function main(): void
+{
+    let $guard = new Guard(42);
+    let $unused = fn() with (take $guard) => $guard->value;
+    panic("boom");
+}

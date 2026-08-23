@@ -1,0 +1,22 @@
+class Runner
+{
+    writable function(): int $callback = fn() => 1;
+
+    writable function replace(take function(): int $callback): void
+    {
+        $this->callback = $callback;
+    }
+
+    function run(): int
+    {
+        return $this->callback();
+    }
+}
+
+function main(): void
+{
+    let writable $runner = new Runner();
+    echo "{$runner->run()} ";
+    $runner->replace(fn() => 42);
+    echo "{$runner->run()}\n";
+}

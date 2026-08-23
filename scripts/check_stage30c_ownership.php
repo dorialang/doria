@@ -60,13 +60,14 @@ function check_stage30c_ownership(string $root): array
         $require($path, $contents, [
             'Stage 30c Ownership, Lifetime, And Escape — Complete',
             'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
-            'Stage 30e Native Execution — Next',
+            'Stage 30e Native Execution — Complete',
+            'Stage 30f PHP Compatibility — Next',
             'Stage 30 — In Progress, Not Complete',
         ]);
         $forbid($path, $contents, ['Stage 30c Ownership, Lifetime, And Escape — Next']);
     }
     $require($decisionPath, $decision, [
-        'Stages 30a Through 30d Implemented',
+        'Stages 30a Through 30e Implemented',
         'acquisition at closure creation in authored order',
         'non-lexical readonly/writable leases',
         'Stage 30d — Complete',
@@ -74,10 +75,11 @@ function check_stage30c_ownership(string $root): array
     $require($specPath, $spec, [
         'Stage 30c Ownership, Lifetime, And Escape - Complete',
         'Stage 30d Closure HIR/MIR And Interpreter Oracle - Complete',
-        'Stage 30e Native Execution - Next',
-        'E0641 - Native/PHP Target Boundary',
+        'Stage 30e Native Execution - Complete',
+        'Stage 30f PHP Compatibility - Next',
+        'E0641 - PHP Target Boundary',
     ]);
-    $require($auditPath, $audit, ['Native Stage 30e; PHP Stage 30f']);
+    $require($auditPath, $audit, ['PHP Stage 30f']);
 
     $require($ownershipPath, $ownership, [
         'pub enum ClosureBorrowRoot',

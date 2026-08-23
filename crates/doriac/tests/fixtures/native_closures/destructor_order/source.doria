@@ -1,0 +1,22 @@
+class Guard
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        try {
+            echo $this->name . "\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
+    }
+}
+
+function main(): void
+{
+    let $first = new Guard("A");
+    let $second = new Guard("B");
+    let $unused = fn() with (take $first, take $second) => $first->name . $second->name;
+    echo "body\n";
+}

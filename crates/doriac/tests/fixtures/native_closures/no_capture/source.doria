@@ -1,0 +1,8 @@
+function main(): void
+{
+    let $arrow = fn(int $value) => $value * 2;
+    let $block = function (int $value): int {
+        return $value + 1;
+    };
+    echo "{$arrow(20)} {$block(41)}\n";
+}

@@ -1,0 +1,12 @@
+function maybe(): ?function(): int
+{
+    return fn() => 42;
+}
+
+function main(): void
+{
+    let $callback = maybe();
+    if ($callback != null) {
+        echo "{$callback()}\n";
+    }
+}

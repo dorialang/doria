@@ -6,8 +6,8 @@
 - **Implementation status:** Authority accepted; the pre-Stage-30 grammar slice,
   Stage 30a, Stage 30b semantic capture validation, and Stage 30c ownership,
   lifetime, and escape checking are complete; Stage 30d closure HIR/MIR and
-  debug-interpreter execution are complete; Stage 30e is next and Stage 30
-  remains incomplete
+  debug-interpreter execution are complete; Stage 30e native execution is
+  complete; Stage 30f is next and Stage 30 remains incomplete
 - **Scope:** Closure capture spelling, ownership modes, diagnostics, Stage 30
   boundaries, and backend-independent behavior
 - **Amends:** D10 and the Stage 30 plan; preserves Decision 0119's callable-effect
@@ -210,13 +210,14 @@ closure source passes target-neutral checking. Stage 30c acquires captures,
 tracks closure Move state and capture leases, validates escape and storage, and
 records logical release plans. Stage 30d lowers closures and callable-value calls
 to explicit HIR/MIR, validates the structural function carrier and environment,
-and executes them through the debug interpreter. `E0641` now remains only at the
-native Stage 30e and PHP Stage 30f target boundaries.
+and executes them through the debug interpreter. Stage 30e executes the same
+validated MIR through Cranelift and LLVM. `E0641` now remains only at the PHP
+Stage 30f target boundary.
 
-No collection algorithm, native closure execution, or PHP closure lowering is
-part of the grammar foundation or Stage 30d. Documentation snippets are not
-native/PHP parity fixtures merely because the debug interpreter can execute
-their accepted surface.
+No collection algorithm, native closure execution, or PHP closure lowering was
+part of the grammar foundation or Stage 30d. Stage 30e has a separate durable
+native parity manifest; documentation snippets remain distinct from executable
+fixtures.
 
 ## Stage 30 Ownership
 

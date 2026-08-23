@@ -1,0 +1,19 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function main(): void
+{
+    let $message = "failed";
+    let $fail = function (): int with (take $message) {
+        throw new Failure($message);
+    };
+    try {
+        $fail();
+    } catch (Failure $error) {
+        echo "caught once\n";
+    }
+}

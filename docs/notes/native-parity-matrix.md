@@ -4,6 +4,15 @@ Documentation role: working note.
 
 Source of truth for sequencing remains `docs/doria-end-to-end-plan.md`. The durable executable manifest is `crates/doriac/tests/fixtures/native_parity_examples.txt`. The differential test reads that manifest, executes each finite source through the MIR interpreter, Cranelift fast profile, and LLVM release profile, and compares exact stdout bytes, stderr bytes, and process status.
 
+Stage 30e adds the focused closure manifest at
+`crates/doriac/tests/fixtures/native_closures/manifest.txt`. Its fixtures declare
+their native profiles and compare closure output, failure status, ownership, and
+cleanup against the interpreter oracle. The matrix covers no-capture, borrowed,
+writable, and taking captures; once returns; nested factories; nullable and
+checked function values; caller-rooted returned closures; properties;
+collections; payload enums; generic specialization; destruction order; and
+panic-without-cleanup.
+
 `Covered` means the interpreter, Cranelift, and LLVM consume the same validated MIR and the behavior has focused or manifest-driven triple differential coverage.
 
 This matrix is semantic and correctness authority, not a performance table. The
@@ -67,6 +76,7 @@ three execution paths.
 | Standalone lexical blocks | Covered | Covered | Covered | Covered | Nested scopes and shared-access boundaries clean up on fallthrough and every structured exit; panic remains abort-only. |
 | Traditional `for` | Covered | Covered | Covered | Covered | `continue` reaches the increment block. |
 | Grouped local declarations | Covered | Covered | Covered | Covered | One canonical MIR initializer evaluates once; ordered independent Copy bindings, string retains, and typed nullable-move `null` agree exactly. |
+| Stage 30e closure execution | Covered | Covered | Covered | Covered | Shared two-word carriers, static descriptors, stack/heap environments, indirect and checked calls, nullable values, storage, and exact cleanup use one validated MIR model. |
 | Stage 27 unit enums | Covered | Covered | Covered | Covered | Nominal inline case tags construct, copy, compare, return, pass, and occupy supported value positions without an enum allocation API. |
 | Stage 27 backed enums | Covered | Covered | Covered | Covered | `int` and static-string backing projections agree exactly while runtime equality remains case identity. |
 | Stage 27 nullable enums | Covered | Covered | Covered | Covered | Presence is separate from tag zero across locals, parameters, returns, coalescing, and narrowing. |

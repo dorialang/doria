@@ -13,6 +13,72 @@ fn assert_object(source: &str) {
     assert!(!object.is_empty());
 }
 
+fn object_contains(object: &[u8], symbol: &str) -> bool {
+    object
+        .windows(symbol.len())
+        .any(|window| window == symbol.as_bytes())
+}
+
+#[test]
+fn closure_objects_use_static_descriptors_and_escape_selected_environments() {
+    let local = doriac::lower_source_to_mir(
+        "cranelift-local-closure.doria",
+        r#"
+function main(): void
+{
+    let $value = 42;
+    let $callback = fn() with ($value) => $value;
+    echo "{$callback()}\n";
+}
+"#,
+    )
+    .expect("nonescaping closure should lower");
+    let local_object = doriac::codegen_cranelift::lower_mir_to_object(&local)
+        .expect("nonescaping closure should lower to an object");
+    assert!(object_contains(
+        &local_object,
+        "__doria_closure_descriptor_0"
+    ));
+    assert!(object_contains(
+        &local_object,
+        "__doria_drop_closure_environment_0"
+    ));
+    assert!(!object_contains(
+        &local_object,
+        "dr_v1_closure_environment_allocate"
+    ));
+
+    let escaping = doriac::lower_source_to_mir(
+        "cranelift-escaping-closure.doria",
+        r#"
+function bind(string $value): function(): string
+{
+    return fn() with (take $value) => $value;
+}
+
+function main(): void
+{
+    let $callback = bind("owned");
+    echo $callback() . "\n";
+}
+"#,
+    )
+    .expect("escaping closure should lower");
+    let escaping_object = doriac::codegen_cranelift::lower_mir_to_object(&escaping)
+        .expect("escaping closure should lower to an object");
+    assert!(object_contains(
+        &escaping_object,
+        "dr_v1_closure_environment_allocate"
+    ));
+    assert!(object_contains(
+        &escaping_object,
+        "dr_v1_closure_environment_free"
+    ));
+    for forbidden in ["closure_retain", "closure_release", "closure_registry"] {
+        assert!(!object_contains(&escaping_object, forbidden));
+    }
+}
+
 #[test]
 fn lowers_literal_return_main_to_object() {
     assert_object("function main(): int\n{\n    return 42;\n}\n");
@@ -343,6 +409,7 @@ fn rejects_mixed_width_float_binary_operands() {
         params: Vec::new(),
         parameter_modes: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: Vec::new(),
         blocks: vec![BasicBlock {
@@ -401,6 +468,7 @@ fn void_program() -> Program {
             params: Vec::new(),
             parameter_modes: Vec::new(),
             return_type: ReturnType::Void,
+            return_borrow: None,
             checked_effects: Vec::new(),
             locals: Vec::new(),
             blocks: vec![BasicBlock {

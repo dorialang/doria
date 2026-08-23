@@ -1,0 +1,18 @@
+enum Marker
+{
+    case Ready;
+}
+
+function main(): void
+{
+    let $integer = fn() => 20;
+    let $fraction = fn() => 1.5;
+    let $predicate = fn() => true;
+    let $marker = fn() => Marker::Ready;
+    let writable $answer = 2;
+
+    $answer += $integer();
+    if ($fraction() + 0.5 == 2.0 && $predicate() && $marker() == Marker::Ready) {
+        echo "{$answer}\n";
+    }
+}

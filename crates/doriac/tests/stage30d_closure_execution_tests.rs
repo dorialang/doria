@@ -340,19 +340,33 @@ function main(): void
 "#;
 
     assert_eq!(debug(source), "exit_status: 0\nstdout: 42\n\n");
+
+    let program = doriac::lower_source_to_mir("stage30d.doria", source)
+        .expect("borrow-bound closure source should lower to MIR");
+    let reader = program
+        .functions
+        .iter()
+        .find(|function| function.name == "reader")
+        .expect("reader function should exist");
+    assert_eq!(
+        reader.return_borrow,
+        Some(doriac::mir::ReturnBorrow {
+            source: doriac::mir::BorrowSource::Parameter(0),
+            writable: false,
+        })
+    );
 }
 
 #[test]
-fn executable_closures_stop_only_at_native_and_php_boundaries() {
+fn executable_closures_reach_native_while_php_retains_its_boundary() {
     let source = "function main(): void { let $callback = fn() => 1; echo \"{$callback()}\\n\"; }";
 
-    let native = target_error(source, BackendTarget::Native);
-    assert_eq!(native.code, "E0641");
-    assert_eq!(
-        native.title,
-        "Closure Native Execution Is Not Yet Available"
-    );
-    assert!(native.message.contains("Stage 30e"));
+    let native = doriac::compile_source("stage30e.doria", source, BackendTarget::Native)
+        .expect("executable closures should lower through the native target");
+    assert!(matches!(
+        native,
+        doriac::backend::BackendOutput::Executable { .. }
+    ));
 
     let php = target_error(source, BackendTarget::Php);
     assert_eq!(php.code, "E0641");

@@ -269,6 +269,7 @@ pub struct Function {
     pub params: Vec<LocalId>,
     pub parameter_modes: Vec<FunctionParameterMode>,
     pub return_type: ReturnType,
+    pub return_borrow: Option<ReturnBorrow>,
     pub checked_effects: Vec<CheckedEffect>,
     pub locals: Vec<Local>,
     pub blocks: Vec<BasicBlock>,
@@ -285,6 +286,7 @@ impl PartialEq for Function {
             && self.params == other.params
             && self.parameter_modes == other.parameter_modes
             && self.return_type == other.return_type
+            && self.return_borrow == other.return_borrow
             && self.checked_effects == other.checked_effects
             && self.locals == other.locals
             && self.blocks == other.blocks
@@ -331,9 +333,17 @@ pub struct ClosureDescriptor {
     pub function_type: FunctionTypeId,
     pub entry_function: FunctionId,
     pub environment_layout: Option<ClosureEnvironmentLayoutId>,
+    pub environment_placement: ClosureEnvironmentPlacement,
     pub invocation_mode: FunctionInvocationMode,
     pub source_span: Span,
     pub debug_identity: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClosureEnvironmentPlacement {
+    None,
+    Stack,
+    Heap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

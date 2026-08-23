@@ -1,0 +1,10 @@
+function apply(function(int): int $callback, int $value): int
+{
+    return $callback($value);
+}
+
+function main(): void
+{
+    let $double = fn(int $value) => $value * 2;
+    echo "{apply($double, 21)}\n";
+}

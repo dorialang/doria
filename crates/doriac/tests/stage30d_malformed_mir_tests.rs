@@ -44,6 +44,14 @@ fn checked_program() -> mir::Program {
         .expect("valid checked closure should lower")
 }
 
+fn no_capture_program() -> mir::Program {
+    doriac::lower_source_to_mir(
+        "stage30e-malformed-placement.doria",
+        "function main(): void { let $callback = fn() => 42; echo \"{$callback()}\\n\"; }",
+    )
+    .expect("valid no-capture closure should lower")
+}
+
 fn assert_malformed(program: &mir::Program, expected: &str) {
     let error = doriac::mir_validation::validate_program(program)
         .expect_err("malformed closure MIR must stop before backend execution");
@@ -161,6 +169,25 @@ fn rejects_malformed_environment_layouts_and_release_plans() {
     assert_malformed(
         &raw_environment_field,
         "cannot contain a raw environment handle",
+    );
+}
+
+#[test]
+fn rejects_malformed_native_environment_placement() {
+    let mut missing_placement = capturing_program();
+    missing_placement.closure_descriptors[0].environment_placement =
+        mir::ClosureEnvironmentPlacement::None;
+    assert_malformed(
+        &missing_placement,
+        "has an environment without native placement",
+    );
+
+    let mut invented_placement = no_capture_program();
+    invented_placement.closure_descriptors[0].environment_placement =
+        mir::ClosureEnvironmentPlacement::Stack;
+    assert_malformed(
+        &invented_placement,
+        "has native environment placement without a layout",
     );
 }
 

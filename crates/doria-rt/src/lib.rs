@@ -1255,6 +1255,62 @@ pub unsafe extern "C" fn dr_v1_class_free(payload: *mut u8) {
     }
 }
 
+/// Allocates zeroed, aligned storage for one escaping closure environment.
+///
+/// The word immediately before the returned address is compiler-private
+/// allocator bookkeeping. Generated closure drop glue must release the address
+/// exactly once with `dr_v1_closure_environment_free`.
+///
+/// # Safety
+///
+/// `current_frame` must be null or a valid generated frame chain. `byte_alignment`
+/// must be a nonzero power of two.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_closure_environment_allocate(
+    current_frame: *const DrStackFrameV2,
+    byte_length: usize,
+    byte_alignment: usize,
+) -> *mut u8 {
+    if byte_alignment == 0 || !byte_alignment.is_power_of_two() {
+        panic_catalogued(current_frame, b"P1206");
+    }
+    let header = mem::size_of::<*mut u8>();
+    let Some(allocation_size) = byte_length
+        .max(1)
+        .checked_add(byte_alignment - 1)
+        .and_then(|size| size.checked_add(header))
+    else {
+        panic_catalogued(current_frame, b"P1206");
+    };
+    let allocation = allocate(allocation_size);
+    if allocation.is_null() {
+        panic_catalogued(current_frame, b"P1206");
+    }
+    let start = allocation.add(header);
+    let environment = start
+        .add(byte_alignment - 1)
+        .map_addr(|address| address & !(byte_alignment - 1));
+    environment.sub(header).cast::<*mut u8>().write(allocation);
+    ptr::write_bytes(environment, 0, byte_length.max(1));
+    environment
+}
+
+/// Releases storage returned by `dr_v1_closure_environment_allocate`.
+///
+/// # Safety
+///
+/// `environment` must be null or a live environment address returned by the
+/// matching allocator. A live address may be passed exactly once.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v1_closure_environment_free(environment: *mut u8) {
+    if environment.is_null() {
+        return;
+    }
+    let header = mem::size_of::<*mut u8>();
+    let allocation = environment.sub(header).cast::<*mut u8>().read();
+    deallocate(allocation);
+}
+
 /// Creates the first strong reference for an already-constructed class payload.
 ///
 /// # Safety
@@ -4153,6 +4209,22 @@ mod tests {
 
     fn shared_payload_drops() -> usize {
         SHARED_PAYLOAD_DROPS.get()
+    }
+
+    #[test]
+    fn closure_environment_allocation_is_zeroed_aligned_and_null_safe_to_free() {
+        unsafe {
+            for alignment in [1, 2, 4, 8, 16, 32] {
+                let environment = dr_v1_closure_environment_allocate(ptr::null(), 37, alignment);
+                assert!(!environment.is_null());
+                assert_eq!(environment.addr() % alignment, 0);
+                assert!(core::slice::from_raw_parts(environment, 37)
+                    .iter()
+                    .all(|byte| *byte == 0));
+                dr_v1_closure_environment_free(environment);
+            }
+            dr_v1_closure_environment_free(ptr::null_mut());
+        }
     }
 
     #[test]

@@ -1825,6 +1825,7 @@ fn shared_validator_rejects_mixed_width_float_binary_operands() {
         params: Vec::new(),
         parameter_modes: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: Vec::new(),
         blocks: vec![BasicBlock {
@@ -1945,6 +1946,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
         params: Vec::new(),
         parameter_modes: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![Local {
             id: LocalId(0),
@@ -2863,6 +2865,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
             params: vec![LocalId(0)],
             parameter_modes: vec![FunctionParameterMode::Readonly],
             return_type: ReturnType::Value(Type::String),
+            return_borrow: None,
             checked_effects: Vec::new(),
             locals: vec![parameter],
             blocks: vec![BasicBlock {
@@ -2962,6 +2965,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
         params: vec![],
         parameter_modes: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(1))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(1))],
         blocks: vec![BasicBlock {
@@ -3014,6 +3018,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -3092,6 +3097,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0)), borrowed_child],
         blocks: vec![BasicBlock {
@@ -3146,6 +3152,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![borrowed, class_local(1, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3190,6 +3197,7 @@ fn shared_validator_enforces_writable_class_argument_rules() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![parameter],
         blocks: vec![BasicBlock {
@@ -3274,6 +3282,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::String),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3298,6 +3307,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![
             Local {
@@ -3391,6 +3401,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Bool)),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3414,6 +3425,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3433,6 +3445,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3488,6 +3501,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![
             borrowed,
@@ -3517,6 +3531,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::String),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3589,6 +3604,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![
             class_local(0, ClassId(0)),
@@ -3691,6 +3707,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(IntegerType::Int64))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![writable],
         blocks: vec![BasicBlock {
@@ -3844,6 +3861,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -4014,6 +4032,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Class(ClassId(1))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(1))],
         blocks: vec![BasicBlock {
@@ -4087,6 +4106,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -4374,6 +4394,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![receiver, condition],
         blocks: vec![
@@ -4747,6 +4768,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::String),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![parameter],
         blocks: vec![BasicBlock {
@@ -4943,6 +4965,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(99))],
         blocks: vec![BasicBlock {
@@ -4967,6 +4990,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         params: vec![],
         parameter_modes: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(99))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![],
         blocks: vec![BasicBlock {
@@ -4997,6 +5021,7 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![receiver],
         blocks: vec![BasicBlock {
@@ -5060,6 +5085,7 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![borrowed],
         blocks: vec![BasicBlock {
@@ -5102,6 +5128,7 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -5132,6 +5159,7 @@ fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -5193,6 +5221,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -5219,6 +5248,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -5274,6 +5304,7 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0)), class_local(1, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -5385,6 +5416,7 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
         params: vec![],
         parameter_modes: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -5502,6 +5534,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -5603,6 +5636,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::SharedReference(ClassId(1))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![Local {
             id: LocalId(0),
@@ -5684,6 +5718,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::NullableSharedReference(ClassId(1))),
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![Local {
             id: LocalId(0),
@@ -5758,6 +5793,7 @@ fn valid_void_program() -> Program {
             params: Vec::new(),
             parameter_modes: Vec::new(),
             return_type: ReturnType::Void,
+            return_borrow: None,
             checked_effects: Vec::new(),
             locals: Vec::new(),
             blocks: vec![BasicBlock {
@@ -5855,6 +5891,7 @@ fn class_new_program() -> Program {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -5925,6 +5962,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
             FunctionParameterMode::Readonly,
         ],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -5947,6 +5985,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
+        return_borrow: None,
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(1))],
         blocks: vec![BasicBlock {

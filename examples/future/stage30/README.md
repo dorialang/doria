@@ -2,19 +2,20 @@
 
 These snippets are accepted Stage 30 target-state documentation. Their closure
 grammar, semantic types, captures, ownership, lifetime, and escape behavior are
-checked. Stage 30d-supported closure forms lower through closure-aware HIR/MIR
-and execute with `--target debug`, but this directory also documents later
-Stage 30 surfaces and is not a native, PHP, or runnable-example manifest.
+checked. Stage 30e-supported closure forms lower through closure-aware HIR/MIR
+and execute through debug and both native profiles, but this directory also
+documents later Stage 30 surfaces and is not a native, PHP, or runnable-example manifest.
 
 [Decision 0121](../../../docs/decisions/0121-closure-function-types-capture-semantics-and-execution-model.md)
 accepts the complete closure model and elaborates Decision 0120's explicit
-capture lists. **Stages 30a through 30d are complete**: structural function
+capture lists. **Stages 30a through 30e are complete**: structural function
 types have semantic identity; captures, closure bodies, inferred modes/effects,
 callable-value calls, capture acquisition, Move state, leases, and escape are
 checked; explicit closure/callable-call HIR, structural function MIR, indirect
-calls, environment cleanup, and the debug-interpreter oracle are implemented.
-Stage 30e native execution is next. Stage 30 remains in progress and not
-complete, and E0641 remains only at the native and PHP target boundaries.
+calls, environment cleanup, the debug-interpreter oracle, and Cranelift/LLVM
+native execution are implemented. Stage 30f PHP compatibility is next. Stage 30
+remains in progress and not complete, and E0641 remains only at the PHP target
+boundary.
 
 The inventory covers:
 
@@ -26,9 +27,9 @@ The inventory covers:
 - Accepted `List<T>` closure algorithms with captured and no-capture callbacks.
 
 Keeping these examples in this document is deliberate. The accepted syntax has
-checked source fixtures and Stage 30d has a separate durable debug-interpreter
-manifest. Complete target-state examples must not be registered as native/PHP
-runnable programs before their owning slices land.
+checked source fixtures; Stage 30d has a durable debug-interpreter manifest and
+Stage 30e has a separate native parity manifest. Complete target-state examples
+must not be registered as runnable programs before their owning slices land.
 
 ## No capture
 
@@ -183,5 +184,6 @@ correct solution. Decision 0121 also requires explicit `with ($this)` or
 `with (writable $this)`, rejects taking `$this`, infers closure effects from the
 body, and adds no closure-expression effect annotation. Stages 30b and 30c check
 those semantics plus capture acquisition, lifetime, and escape. Stage 30d
-executes the supported closure surface through the debug interpreter; native and
-PHP execution remain behind their target-specific E0641 boundaries.
+executes the supported closure surface through the debug interpreter; Stage 30e
+executes it through Cranelift and LLVM. PHP remains behind the Stage 30f E0641
+boundary.

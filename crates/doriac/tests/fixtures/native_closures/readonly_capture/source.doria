@@ -1,0 +1,15 @@
+class Box
+{
+    function __construct(int $value)
+    {
+    }
+}
+
+function main(): void
+{
+    let $base = 40;
+    let $label = "answer";
+    let $box = new Box(2);
+    let $read = fn() with ($base, $label, $box) => "{$label} {$base + $box->value}";
+    echo $read() . "\n";
+}

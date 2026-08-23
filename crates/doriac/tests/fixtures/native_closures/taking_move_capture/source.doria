@@ -1,0 +1,8 @@
+function main(): void
+{
+    let $message = "moved";
+    let $consume = function (): string with (take $message) {
+        return $message;
+    };
+    echo $consume() . "\n";
+}

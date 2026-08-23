@@ -15,6 +15,79 @@ fn assert_object(source: &str) {
 }
 
 #[test]
+fn closure_ir_keeps_descriptors_static_and_environment_allocations_escape_selected() {
+    let local = doriac::lower_source_to_mir(
+        "llvm-local-closure.doria",
+        r#"
+function main(): void
+{
+    let $value = 42;
+    let $callback = fn() with ($value) => $value;
+    echo "{$callback()}\n";
+}
+"#,
+    )
+    .expect("nonescaping closure should lower");
+    let local_ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&local)
+        .expect("nonescaping closure should lower to LLVM IR");
+    assert!(
+        local_ir.contains("@__doria_closure_descriptor_0 = internal constant { ptr, ptr }"),
+        "closure descriptor is not immutable two-word data:\n{local_ir}"
+    );
+    assert!(
+        local_ir.contains("@__doria_drop_closure_environment_0"),
+        "closure descriptor has no generated drop identity:\n{local_ir}"
+    );
+    assert!(
+        local_ir.contains("closure.environment.0 = alloca"),
+        "nonescaping closure has no stack environment:\n{local_ir}"
+    );
+    assert!(
+        !local_ir.contains("dr_v1_closure_environment_allocate"),
+        "nonescaping closure unexpectedly uses heap allocation:\n{local_ir}"
+    );
+    assert!(
+        scan_alloca_placement(&local_ir).escaped.is_empty(),
+        "closure storage escaped the LLVM entry block:\n{local_ir}"
+    );
+
+    let escaping = doriac::lower_source_to_mir(
+        "llvm-escaping-closure.doria",
+        r#"
+function bind(string $value): function(): string
+{
+    return fn() with (take $value) => $value;
+}
+
+function main(): void
+{
+    let $callback = bind("owned");
+    echo $callback() . "\n";
+}
+"#,
+    )
+    .expect("escaping closure should lower");
+    let escaping_ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&escaping)
+        .expect("escaping closure should lower to LLVM IR");
+    for required in [
+        "dr_v1_closure_environment_allocate",
+        "dr_v1_closure_environment_free",
+        "closure.call",
+    ] {
+        assert!(
+            escaping_ir.contains(required),
+            "escaping closure IR is missing {required}:\n{escaping_ir}"
+        );
+    }
+    for forbidden in ["closure_retain", "closure_release", "closure_registry"] {
+        assert!(
+            !escaping_ir.contains(forbidden),
+            "ordinary closure ownership gained {forbidden}:\n{escaping_ir}"
+        );
+    }
+}
+
+#[test]
 fn checked_error_ir_uses_status_out_slots_static_metadata_and_entry_scratch() {
     let source = include_str!("../../../examples/native/main_checked_error_catch.doria");
     let program = doriac::lower_source_to_mir("llvm-checked-errors.doria", source)
@@ -535,6 +608,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 params: Vec::new(),
                 parameter_modes: Vec::new(),
                 return_type: ReturnType::Void,
+                return_borrow: None,
                 checked_effects: Vec::new(),
                 locals: Vec::new(),
                 blocks: vec![BasicBlock {
@@ -554,6 +628,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 params: Vec::new(),
                 parameter_modes: Vec::new(),
                 return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
+                return_borrow: None,
                 checked_effects: Vec::new(),
                 locals: Vec::new(),
                 blocks: vec![BasicBlock {

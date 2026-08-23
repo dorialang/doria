@@ -83,6 +83,7 @@ pub struct ClosureOwnershipInfo {
 pub(crate) struct OwnershipAnalysis {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) closures: HashMap<ClosureId, ClosureOwnershipInfo>,
+    pub(crate) return_borrows: HashMap<usize, ReturnBorrow>,
 }
 
 #[derive(Debug, Clone)]
@@ -976,6 +977,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
     let mut properties = HashMap::new();
     let mut static_properties = HashMap::new();
 
+    let mut resolved_return_borrows = return_borrows.clone();
     for item in &program.items {
         match item {
             Item::Function(function) => {
@@ -992,6 +994,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     returned_closure_provenance(function, closures, binding_resolution)
                 {
                     function_signature.return_borrow = Some(borrow);
+                    resolved_return_borrows.insert(function.span.start, borrow);
                 }
                 signatures.insert(function.name.clone(), function_signature);
             }
@@ -1047,6 +1050,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                 returned_closure_provenance(method, closures, binding_resolution)
                             {
                                 method_signature.return_borrow = Some(borrow);
+                                resolved_return_borrows.insert(method.span.start, borrow);
                             }
                             methods.insert(
                                 (class.name.clone(), method.name.clone()),
@@ -1144,7 +1148,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         properties,
         static_properties,
         inferred_move_returns: inferred_move_returns.clone(),
-        return_borrows: return_borrows.clone(),
+        return_borrows: resolved_return_borrows,
         resolved_types,
         given_preludes,
         checked_effect_sites,
@@ -1273,6 +1277,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
     OwnershipAnalysis {
         diagnostics: checker.diagnostics,
         closures: checker.closure_ownership,
+        return_borrows: checker.return_borrows,
     }
 }
 
@@ -2161,9 +2166,14 @@ impl Checker<'_> {
                 };
                 let borrowed_initializer =
                     self.expr_returns_borrow(&decl.initializer, scopes) || borrowed_function_value;
+                let borrowed_carrier = if function_type.is_some() {
+                    borrowed_function_value
+                } else {
+                    borrowed_initializer
+                };
                 let borrowed_mixed_index = borrowed_initializer
                     && self.expr_is_mixed_collection_index(&decl.initializer, scopes);
-                let borrow_root = borrowed_initializer
+                let borrow_root = borrowed_carrier
                     .then(|| self.borrow_root_key(&decl.initializer, scopes))
                     .flatten();
                 let initializer_moves = self.expr_is_move_value(&decl.initializer, scopes);
@@ -2180,12 +2190,12 @@ impl Checker<'_> {
                         self.receiver_class.as_deref(),
                     )
                 });
-                let borrowed_owning_value = borrowed_initializer
+                let borrowed_owning_value = borrowed_carrier
                     && !borrowed_mixed_index
                     && (initializer_moves || class.is_some() || mixed || declared_move_type);
                 let invalid_borrow = borrowed_owning_value && borrow_root.is_none();
                 let explicit_owning_borrow =
-                    borrowed_initializer && declared_move_type && function_type.is_none();
+                    borrowed_carrier && declared_move_type && function_type.is_none();
                 if explicit_owning_borrow {
                     self.diagnostics.push(
                         Diagnostic::new(
@@ -2291,6 +2301,9 @@ impl Checker<'_> {
                                 collection: collection.clone(),
                                 mixed,
                                 borrowed_place: borrowed_owning_value,
+                                // New and returned closures own their carriers even when their
+                                // environments contain leases. Only an alias of an existing
+                                // borrowed callback borrows the carrier itself.
                                 borrow_root: borrow_root.clone(),
                                 writable: decl.writable,
                                 state: if function_type.is_some() && index > 0 {
@@ -2319,7 +2332,15 @@ impl Checker<'_> {
                     return Flow::fallthrough();
                 }
                 if let Expr::Variable { name, span } = &assignment.target {
+                    let value_is_function = self
+                        .resolved_type(&assignment.value)
+                        .and_then(non_null_function_type)
+                        .is_some()
+                        || self
+                            .function_value_from_expr(&assignment.value, scopes)
+                            .is_some();
                     if self.expr_returns_borrow(&assignment.value, scopes)
+                        && !value_is_function
                         && scopes.get(name).is_some()
                     {
                         self.diagnostics.push(
@@ -2340,13 +2361,6 @@ impl Checker<'_> {
                     let target_is_function = target
                         .as_ref()
                         .is_some_and(|binding| binding.function_type.is_some());
-                    let value_is_function = self
-                        .resolved_type(&assignment.value)
-                        .and_then(non_null_function_type)
-                        .is_some()
-                        || self
-                            .function_value_from_expr(&assignment.value, scopes)
-                            .is_some();
                     let function_assignment = target_is_function || value_is_function;
                     let class_assignment = value_class.is_some()
                         && target
@@ -3669,7 +3683,11 @@ impl Checker<'_> {
                             root_key: self
                                 .borrow_root_key(expr, scopes)
                                 .unwrap_or_else(|| "temporary".to_string()),
-                            access: BorrowAccess::Readonly,
+                            access: if self.function_result_borrow_is_writable(expr, scopes) {
+                                BorrowAccess::Writable
+                            } else {
+                                BorrowAccess::Readonly
+                            },
                             capture_span: expr.span(),
                             source_depth: self.function_borrow_source_depth(expr, scopes),
                         })
@@ -3685,6 +3703,35 @@ impl Checker<'_> {
                         take_parameter_insertion: None,
                     }
                 }),
+        }
+    }
+
+    fn function_result_borrow_is_writable(&self, expr: &Expr, scopes: &Scopes) -> bool {
+        match ungroup_expr(expr) {
+            Expr::FunctionCall { name, .. } => self
+                .signatures
+                .get(name)
+                .and_then(|signature| signature.return_borrow)
+                .is_some_and(|borrow| borrow.writable),
+            Expr::MethodCall { object, method, .. } => self
+                .expr_class(object, scopes)
+                .and_then(|class| self.methods.get(&(class, method.clone())))
+                .and_then(|signature| signature.return_borrow)
+                .is_some_and(|borrow| borrow.writable),
+            Expr::StaticCall {
+                qualifier, method, ..
+            } => self
+                .qualifier_class(qualifier)
+                .and_then(|class| self.methods.get(&(class, method.clone())))
+                .and_then(|signature| signature.return_borrow)
+                .is_some_and(|borrow| borrow.writable),
+            Expr::CallableCall { span, .. } => self
+                .callable_value_calls
+                .get(&(span.start, span.end))
+                .and_then(|call| non_null_function_type(&call.function_type))
+                .and_then(|function| function.return_borrow)
+                .is_some_and(|borrow| borrow.writable),
+            _ => false,
         }
     }
 

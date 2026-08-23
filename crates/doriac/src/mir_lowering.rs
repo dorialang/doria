@@ -426,7 +426,8 @@ fn build_closure_plans(
             .closure_ownership
             .get(&expression.closure_id)
             .expect("checked closure has ownership metadata");
-        let resolved = substitute_resolved_type(&semantic.function_type, context.substitutions);
+        let resolved =
+            substitute_resolved_type(&semantic.execution_function_type, context.substitutions);
         let mir::Type::Function(function_type) =
             intern_resolved_collection_types(&resolved, context.class_ids, context.registry)
                 .ok_or_else(|| {
@@ -524,6 +525,17 @@ fn build_closure_plans(
             function_type,
             entry_function: function_id,
             environment_layout,
+            environment_placement: match (environment_layout, ownership.escape) {
+                (None, _) => mir::ClosureEnvironmentPlacement::None,
+                (Some(_), crate::ownership::ClosureEscapeClassification::Local) => {
+                    mir::ClosureEnvironmentPlacement::Stack
+                }
+                (
+                    Some(_),
+                    crate::ownership::ClosureEscapeClassification::Owned
+                    | crate::ownership::ClosureEscapeClassification::ReturnedBorrow,
+                ) => mir::ClosureEnvironmentPlacement::Heap,
+            },
             invocation_mode: function_definition.invocation_mode,
             source_span: expression.span,
             debug_identity,
@@ -2826,6 +2838,7 @@ fn lower_function(
             .chain(signature.parameter_modes.iter().copied())
             .collect(),
         return_type: signature.return_type,
+        return_borrow: signature.return_borrow,
         checked_effects: signature.checked_effects,
         locals,
         blocks,
@@ -2968,6 +2981,7 @@ fn lower_closure_function(
         .chain(definition.parameters.iter().map(|parameter| parameter.mode))
         .collect(),
         return_type: definition.return_type,
+        return_borrow: definition.return_borrow,
         checked_effects: definition.checked_effects,
         locals,
         blocks,
@@ -11712,12 +11726,10 @@ fn lower_condition(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
-    if let hir::Expr::CallableCall(call) = expr {
-        let (local, ty, _) = materialize_indirect_call(call, false, context)?
-            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a condition")])?;
-        if ty != mir::Type::Scalar(mir::ScalarType::Bool) {
+    if let Some((local, ty)) = materialize_callable_scalar_result(expr, context)? {
+        if ty != mir::ScalarType::Bool {
             return Err(vec![unsupported(
-                call.span,
+                expr.span(),
                 "callable does not return bool",
             )]);
         }
@@ -12724,15 +12736,7 @@ fn lower_value_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ValueExpression> {
-    if let hir::Expr::CallableCall(call) = expr {
-        let (local, ty, _) = materialize_indirect_call(call, false, context)?
-            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a scalar")])?;
-        let mir::Type::Scalar(scalar) = ty else {
-            return Err(vec![unsupported(
-                call.span,
-                "callable does not return a scalar",
-            )]);
-        };
+    if let Some((local, scalar)) = materialize_callable_scalar_result(expr, context)? {
         return Ok(value_expression_from_operand(
             scalar,
             mir::Operand::Local(local),
@@ -12784,11 +12788,41 @@ fn lower_value_expression(
     }
 }
 
+fn materialize_callable_scalar_result(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::ScalarType)>> {
+    let hir::Expr::CallableCall(call) = expr else {
+        return Ok(None);
+    };
+    let (local, ty, _) = materialize_indirect_call(call, false, context)?
+        .ok_or_else(|| vec![unsupported(call.span, "void callable used as a scalar")])?;
+    let mir::Type::Scalar(scalar) = ty else {
+        return Err(vec![unsupported(
+            call.span,
+            "callable does not return a scalar",
+        )]);
+    };
+    Ok(Some((local, scalar)))
+}
+
 fn lower_enum_expression(
     expr: &hir::Expr,
     enum_id: crate::enums::EnumId,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::EnumExpression> {
+    if let Some((local, scalar)) = materialize_callable_scalar_result(expr, context)? {
+        if scalar != mir::ScalarType::Enum(enum_id) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "callable returns another enum type",
+            )]);
+        }
+        return Ok(mir::EnumExpression::Use {
+            enum_id,
+            operand: mir::Operand::Local(local),
+        });
+    }
     if let Some(mir::Rvalue::Value(mir::ValueExpression::Enum(value))) = materialize_checked_rvalue(
         expr,
         mir::Type::Scalar(mir::ScalarType::Enum(enum_id)),
@@ -20530,6 +20564,18 @@ fn lower_float_expression(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::FloatExpression> {
     let result_ty = context.float_type(expr)?;
+    if let Some((local, scalar)) = materialize_callable_scalar_result(expr, context)? {
+        if scalar != mir::ScalarType::Float(result_ty) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "callable returns another float type",
+            )]);
+        }
+        return Ok(mir::FloatExpression::Use {
+            ty: result_ty,
+            operand: mir::Operand::Local(local),
+        });
+    }
     if let Some(mir::Rvalue::Value(mir::ValueExpression::Float(value))) =
         materialize_checked_rvalue(
             expr,
@@ -20797,6 +20843,18 @@ fn lower_integer_expression(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::IntegerExpression> {
     let result_ty = context.integer_type(expr)?;
+    if let Some((local, scalar)) = materialize_callable_scalar_result(expr, context)? {
+        if scalar != mir::ScalarType::Integer(result_ty) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "callable returns another integer type",
+            )]);
+        }
+        return Ok(mir::IntegerExpression::use_operand(
+            result_ty,
+            mir::Operand::Local(local),
+        ));
+    }
     if let Some(mir::Rvalue::Value(mir::ValueExpression::Integer(value))) =
         materialize_checked_rvalue(
             expr,
