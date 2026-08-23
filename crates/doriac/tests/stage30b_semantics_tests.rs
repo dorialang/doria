@@ -683,8 +683,8 @@ fn nested_capture_lineage_and_control_flow_uses_resolve_by_binding() {
 function main(): void
 {
     let $base = 10;
-    let $outer = fn(int $left) with ($base) =>
-        function (int $right): int with ($left, $base) {
+    let $outer = fn(int $left) with (take $base) =>
+        function (int $right): int with (take $left, take $base) {
             if ($right > 0) {
                 return $left + $right + $base;
             }
@@ -811,23 +811,23 @@ fn function_types_flow_through_properties_collections_and_generic_inference() {
     let source = r#"
 class Holder<T>
 {
-    T $value;
-    function __construct(take T $input) { $this->value = $input; }
+    function __construct(take T $value) {}
 }
 
 class Callbacks
 {
-    function(int): int $transform;
+    function(int): int $transform = fn(int $value) => $value;
     List<function(int): int> $steps = [];
 }
 
-function identity<T>(T $value): T { return $value; }
+function identity<T>(take T $value): T { return $value; }
 
 function main(): void
 {
     let $callback = fn(int $value) => $value + 1;
     let $holder = new Holder<function(int): int>($callback);
-    function(int): int $same = identity($callback);
+    let $identityInput = fn(int $value) => $value;
+    function(int): int $same = identity($identityInput);
     List<function(int): int> $steps = [$same];
 }
 "#;

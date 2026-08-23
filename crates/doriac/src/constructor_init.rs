@@ -633,8 +633,23 @@ fn inspect_expr(
                 }
             }
         }
+        Expr::Closure(closure) => {
+            if let Some(capture) = closure.captures.as_ref().and_then(|clause| {
+                clause
+                    .captures
+                    .iter()
+                    .find(|capture| capture.name == "this")
+            }) {
+                report_incomplete_this(
+                    class,
+                    properties,
+                    state,
+                    capture.span,
+                    &mut analysis.diagnostics,
+                );
+            }
+        }
         Expr::Variable { .. }
-        | Expr::Closure(_)
         | Expr::CallableCall { .. }
         | Expr::Identifier { .. }
         | Expr::String { .. }

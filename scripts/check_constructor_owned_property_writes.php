@@ -88,7 +88,8 @@ function check_constructor_owned_property_writes(string $root): array
         $require($path, $contents, [
             'Stage 30b Semantic Function Types And Captures — Complete',
             'Constructor Writable-Path And Owned-Property Corrective Beat — Complete',
-            'Stage 30c Ownership, Lifetime, And Escape — Next',
+            'Stage 30c Ownership, Lifetime, And Escape — Complete',
+            'Stage 30d Closure HIR/MIR And Interpreter Oracle — Next',
             'Stage 30 — In Progress, Not Complete',
         ]);
     }

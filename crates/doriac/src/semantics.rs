@@ -114,6 +114,9 @@ pub struct SemanticInfo {
     pub closures: HashMap<ClosureId, ClosureSemanticInfo>,
     /// Semantically checked indirect-call plans, still blocked from execution.
     pub callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
+    /// Backend-independent capture acquisition, provenance, escape, and
+    /// invocation-consumption plans proven by Stage 30c.
+    pub closure_ownership: HashMap<ClosureId, crate::ownership::ClosureOwnershipInfo>,
     /// Backend-independent classification of each checked instance-property write.
     pub property_writes: HashMap<(usize, usize), PropertyWriteSemanticInfo>,
     /// Object-path expressions proven to carry ordinary writable access.
@@ -494,56 +497,57 @@ pub fn analyze_program_for_ide_with_source<'source>(
     let mut checker = Checker::new(program, const_evaluation, source_text);
     checker.diagnostics.extend(const_diagnostics);
     checker.check();
-    if checker.diagnostics.is_empty() {
-        let constructor_analysis = crate::constructor_init::check_program(
-            program,
-            &checker.given_preludes,
-            &checker.checked_effect_sites,
-            &checker.catch_error_types,
-        );
-        for (span, kind) in constructor_analysis.property_writes {
-            if let Some(write) = checker.property_writes.get_mut(&span) {
-                write.kind = kind;
-            }
+    let constructor_analysis = crate::constructor_init::check_program(
+        program,
+        &checker.given_preludes,
+        &checker.checked_effect_sites,
+        &checker.catch_error_types,
+    );
+    for (span, kind) in constructor_analysis.property_writes {
+        if let Some(write) = checker.property_writes.get_mut(&span) {
+            write.kind = kind;
         }
-        checker.diagnostics.extend(constructor_analysis.diagnostics);
     }
-    if checker.diagnostics.is_empty() {
-        let inferred_move_returns = checker
-            .function_signatures
-            .iter()
-            .filter_map(|(span_start, signature)| {
-                checker
-                    .type_is_move_type(signature.return_ty)
-                    .then_some(*span_start)
-            })
-            .collect();
-        let return_borrows = checker
-            .function_signatures
-            .iter()
-            .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
-            .collect();
-        let move_enum_names = checker
-            .enums
-            .values()
-            .filter(|definition| !definition.capabilities.copy)
-            .map(|definition| definition.name.clone())
-            .collect();
-        let ownership_diagnostics = crate::ownership::check_program_with_inferred_move_returns(
-            program,
-            &crate::ownership::OwnershipAnalysisContext {
-                inferred_move_returns: &inferred_move_returns,
-                return_borrows: &return_borrows,
-                resolved_types: &checker.expression_types,
-                flow_facts: &checker.flow_facts,
-                move_enum_names: &move_enum_names,
-                given_preludes: &checker.given_preludes,
-                checked_effect_sites: &checker.checked_effect_sites,
-                catch_error_types: &checker.catch_error_types,
-            },
-        );
-        checker.diagnostics.extend(ownership_diagnostics);
-    }
+    checker.diagnostics.extend(constructor_analysis.diagnostics);
+    let inferred_move_returns = checker
+        .function_signatures
+        .iter()
+        .filter_map(|(span_start, signature)| {
+            checker
+                .type_is_move_type(signature.return_ty)
+                .then_some(*span_start)
+        })
+        .collect();
+    let return_borrows = checker
+        .function_signatures
+        .iter()
+        .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
+        .collect();
+    let move_enum_names = checker
+        .enums
+        .values()
+        .filter(|definition| !definition.capabilities.copy)
+        .map(|definition| definition.name.clone())
+        .collect();
+    let ownership_analysis = crate::ownership::check_program_with_inferred_move_returns(
+        program,
+        &crate::ownership::OwnershipAnalysisContext {
+            inferred_move_returns: &inferred_move_returns,
+            return_borrows: &return_borrows,
+            resolved_types: &checker.expression_types,
+            flow_facts: &checker.flow_facts,
+            move_enum_names: &move_enum_names,
+            given_preludes: &checker.given_preludes,
+            checked_effect_sites: &checker.checked_effect_sites,
+            catch_error_types: &checker.catch_error_types,
+            binding_resolution: &checker.binding_resolution,
+            closures: &checker.closures,
+            callable_value_calls: &checker.callable_value_calls,
+        },
+    );
+    let closure_ownership = ownership_analysis.closures;
+    checker.diagnostics.extend(ownership_analysis.diagnostics);
+    emit_stage_30_boundaries(&mut checker);
     let return_borrows = checker
         .function_signatures
         .iter()
@@ -581,11 +585,60 @@ pub fn analyze_program_for_ide_with_source<'source>(
             binding_resolution: checker.binding_resolution,
             closures: checker.closures,
             callable_value_calls: checker.callable_value_calls,
+            closure_ownership,
             property_writes: checker.property_writes,
             writable_object_paths: checker.writable_object_paths,
         },
         diagnostics: checker.diagnostics,
     }
+}
+
+fn emit_stage_30_boundaries(checker: &mut Checker<'_>) {
+    checker
+        .stage_30_boundary_candidates
+        .sort_by_key(|candidate| (candidate.span.start, candidate.span.end));
+    for candidate in std::mem::take(&mut checker.stage_30_boundary_candidates) {
+        let closure_cause = candidate
+            .closure_id
+            .map(|id| format!("closure:{}:{}", id.start, id.end));
+        let has_precise_error = checker.diagnostics.iter().any(|diagnostic| {
+            if diagnostic.severity != crate::diagnostics::DiagnosticSeverity::Error
+                || diagnostic.code == "E0641"
+            {
+                return false;
+            }
+            let same_cause = closure_cause.as_ref().is_some_and(|cause| {
+                diagnostic
+                    .cause_id
+                    .as_deref()
+                    .is_some_and(|diagnostic_cause| diagnostic_cause.starts_with(cause))
+            });
+            same_cause
+                || (diagnostic.span.start >= candidate.span.start
+                    && diagnostic.span.end <= candidate.span.end)
+        });
+        if has_precise_error {
+            continue;
+        }
+        checker.diagnostics.push(
+            Diagnostic::unsupported_stage(
+                "E0641",
+                format!(
+                    "{} is valid Doria, but checked function values cannot execute yet",
+                    candidate.surface
+                ),
+                candidate.span,
+            )
+            .with_title("Closure Execution Is Not Yet Available")
+            .with_explanation(
+                "Function typing, capture acquisition, ownership, lifetime, escape, and invocation-consumption checks succeeded. Executable HIR, MIR, and interpreter support lands in Stage 30d.",
+            )
+            .with_help("Keep the source as written; no rewrite is required."),
+        );
+    }
+    checker
+        .diagnostics
+        .sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.span.end));
 }
 
 fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo> {
@@ -1258,10 +1311,18 @@ struct Checker<'program> {
     closures: HashMap<ClosureId, ClosureSemanticInfo>,
     closure_types: HashMap<(usize, usize), TypeId>,
     callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
+    stage_30_boundary_candidates: Vec<Stage30BoundaryCandidate>,
     property_writes: HashMap<(usize, usize), PropertyWriteSemanticInfo>,
     writable_object_paths: HashSet<(usize, usize)>,
     active_closures: Vec<ActiveClosure>,
     initializing_bindings: Vec<HashMap<String, Span>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stage30BoundaryCandidate {
+    surface: String,
+    span: Span,
+    closure_id: Option<ClosureId>,
 }
 
 #[derive(Debug, Clone)]
@@ -1866,6 +1927,7 @@ impl<'program> Checker<'program> {
             closures: HashMap::new(),
             closure_types: HashMap::new(),
             callable_value_calls: HashMap::new(),
+            stage_30_boundary_candidates: Vec::new(),
             property_writes: HashMap::new(),
             writable_object_paths: HashSet::new(),
             active_closures: Vec::new(),
@@ -7278,28 +7340,25 @@ impl<'program> Checker<'program> {
         missing.required_capability = missing.required_capability.max(requirement);
     }
 
-    fn report_stage_30_execution_boundary(&mut self, surface: &str, span: Span) {
+    fn record_stage_30_execution_boundary(
+        &mut self,
+        surface: &str,
+        span: Span,
+        closure_id: Option<ClosureId>,
+    ) {
         if self
-            .diagnostics
+            .stage_30_boundary_candidates
             .iter()
-            .any(|diagnostic| diagnostic.code == "E0641" && diagnostic.span == span)
+            .any(|candidate| candidate.span == span)
         {
             return;
         }
-        self.diagnostics.push(
-            Diagnostic::unsupported_stage(
-                "E0641",
-                format!(
-                    "{surface} is valid Doria, but checked function values cannot execute yet"
-                ),
+        self.stage_30_boundary_candidates
+            .push(Stage30BoundaryCandidate {
+                surface: surface.to_string(),
                 span,
-            )
-            .with_title("Closure Execution Is Not Yet Available")
-            .with_explanation(
-                "Semantic function types, captures, invocation requirements, and checked effects were validated. Ownership and lifetime enforcement precede executable HIR and MIR support.",
-            )
-            .with_help("Keep the source as written; no rewrite is required."),
-        );
+                closure_id,
+            });
     }
 
     fn check_callable_value_call(
@@ -7576,7 +7635,7 @@ impl<'program> Checker<'program> {
             })
             && !expression_contains_closure(callee)
         {
-            self.report_stage_30_execution_boundary("this function-value call", span);
+            self.record_stage_30_execution_boundary("this function-value call", span, None);
         }
         function.return_type
     }
@@ -8037,7 +8096,7 @@ impl<'program> Checker<'program> {
                     && diagnostic.code != "E0641"
             })
         {
-            self.report_stage_30_execution_boundary("this closure", closure.span);
+            self.record_stage_30_execution_boundary("this closure", closure.span, Some(closure_id));
         }
         ty
     }

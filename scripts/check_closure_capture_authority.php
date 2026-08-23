@@ -146,7 +146,8 @@ function check_closure_capture_authority(string $root): array
         'Stage 29 Slice 3 — Complete',
         'Stage 30a Callable Grammar Completion — Complete',
         'Stage 30b Semantic Function Types And Captures — Complete',
-        'Stage 30c Ownership, Lifetime, And Escape — Next',
+        'Stage 30c Ownership, Lifetime, And Escape — Complete',
+        'Stage 30d Closure HIR/MIR And Interpreter Oracle — Next',
         'Stage 30 — In Progress, Not Complete',
         'Decision 0120 — Accepted; Explicit Capture-List Foundation',
         'Decision 0121 — Accepted; Stage 30 Closure Authority',
@@ -162,7 +163,7 @@ function check_closure_capture_authority(string $root): array
 
     $require($examplesPath, $examples, [
         'These snippets are accepted Stage 30 target-state documentation.',
-        'Stage 30b semantics are checked',
+        'Stages 30b and 30c check',
         'not executable examples',
         'native parity fixtures',
         'catalogued E0641 execution boundary',
@@ -217,7 +218,7 @@ function check_closure_capture_authority(string $root): array
         'Doria closure captures do not use PHP reference `&` syntax',
     ]);
     $require($semanticsPath, $semantics, [
-        'report_stage_30_execution_boundary',
+        'record_stage_30_execution_boundary',
         'Diagnostic::unsupported_stage(',
         '"E0641"',
         'Closure Execution Is Not Yet Available',
