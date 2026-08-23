@@ -4054,6 +4054,8 @@ fn shared_validator_invalidates_promoted_class_aliases_after_property_replacemen
                 constructor: None,
                 args: vec![],
             }),
+            kind: mir::PropertyWriteKind::Replace,
+            span: Default::default(),
         },
         Statement::CallVoid {
             span: Default::default(),
@@ -4321,6 +4323,8 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
                     object: LocalId(0),
                     property,
                     value: Rvalue::String(StringExpression::Literal("ready".to_string())),
+                    kind: mir::PropertyWriteKind::Initialize,
+                    span: Default::default(),
                 }],
                 terminator: Terminator::Jump(BlockId(3)),
             },
@@ -4350,6 +4354,8 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
             object: LocalId(0),
             property,
             value: Rvalue::String(StringExpression::Literal("fallback".to_string())),
+            kind: mir::PropertyWriteKind::Initialize,
+            span: Default::default(),
         });
     doriac::mir_validation::validate_program(&program)
         .expect("mutually exclusive readonly initialization paths are valid");
@@ -4361,6 +4367,8 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
             object: LocalId(0),
             property,
             value: Rvalue::String(StringExpression::Literal("twice".to_string())),
+            kind: mir::PropertyWriteKind::Initialize,
+            span: Default::default(),
         });
     let error = doriac::mir_validation::validate_program(&duplicate)
         .expect_err("readonly initialization twice on one path must be rejected");
@@ -4389,11 +4397,167 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
             object: LocalId(0),
             property,
             value: Rvalue::String(StringExpression::Literal("unreachable".to_string())),
+            kind: mir::PropertyWriteKind::Initialize,
+            span: Default::default(),
         }],
         terminator: Terminator::ReturnVoid,
     });
     doriac::mir_validation::validate_program(&unreachable_write)
         .expect("an unreachable write neither establishes nor invalidates initialization");
+}
+
+#[test]
+fn shared_validator_enforces_property_write_kinds_independently_of_lowering() {
+    let source = r#"
+class Token {}
+
+class Holder
+{
+    writable Token $token;
+
+    function __construct(bool $seeded)
+    {
+        if ($seeded) {
+            $this->token = new Token();
+        }
+        $this->token = new Token();
+    }
+}
+
+function main(): void
+{
+    let $holder = new Holder(true);
+}
+"#;
+    let valid = doriac::lower_source_to_mir("property-write-kinds.doria", source)
+        .expect("valid constructor writes should lower");
+    doriac::mir_validation::validate_program(&valid)
+        .expect("lowering should emit a valid conditional initialization plan");
+
+    let mutate_kind = |program: &mut Program, index: usize, replacement: mir::PropertyWriteKind| {
+        let constructor = program
+            .functions
+            .iter_mut()
+            .find(|function| function.name == "Holder::__construct")
+            .expect("Holder constructor should exist");
+        let statement = constructor
+            .blocks
+            .iter_mut()
+            .flat_map(|block| &mut block.statements)
+            .filter(|statement| matches!(statement, Statement::AssignProperty { .. }))
+            .nth(index)
+            .expect("constructor property write should exist");
+        let Statement::AssignProperty { kind, .. } = statement else {
+            unreachable!()
+        };
+        *kind = replacement;
+    };
+
+    let mut replace_before_initialization = valid.clone();
+    mutate_kind(
+        &mut replace_before_initialization,
+        0,
+        mir::PropertyWriteKind::Replace,
+    );
+    assert_malformed(
+        &replace_before_initialization,
+        "replaces property0 before it is definitely initialized",
+    );
+
+    let mut initialize_from_maybe_initialized = valid.clone();
+    mutate_kind(
+        &mut initialize_from_maybe_initialized,
+        1,
+        mir::PropertyWriteKind::Initialize,
+    );
+    assert_malformed(
+        &initialize_from_maybe_initialized,
+        "initializes property0 more than once",
+    );
+
+    let mut conditional_write_without_merge = valid.clone();
+    mutate_kind(
+        &mut conditional_write_without_merge,
+        0,
+        mir::PropertyWriteKind::InitializeOrReplace,
+    );
+    assert_malformed(
+        &conditional_write_without_merge,
+        "without a maybe-initialized writable obligation",
+    );
+
+    let mut replace_from_maybe_initialized = valid;
+    mutate_kind(
+        &mut replace_from_maybe_initialized,
+        1,
+        mir::PropertyWriteKind::Replace,
+    );
+    assert_malformed(
+        &replace_from_maybe_initialized,
+        "replaces property0 before it is definitely initialized",
+    );
+
+    let mut outside_constructor = class_program();
+    let property = PropertyId {
+        class: ClassId(0),
+        index: 0,
+    };
+    outside_constructor.classes[0].properties.push(Property {
+        id: property,
+        name: "text".to_string(),
+        ty: Type::String,
+        writable: true,
+        promoted: false,
+    });
+    outside_constructor.classes[0].layout =
+        compute_class_layout(ClassId(0), [(property, FieldType::String)], 8);
+    let mut receiver = class_local(0, ClassId(0));
+    receiver.writable = true;
+    outside_constructor.functions[0].locals.push(receiver);
+    outside_constructor.functions[0].blocks[0]
+        .statements
+        .push(Statement::AssignProperty {
+            object: LocalId(0),
+            property,
+            value: Rvalue::String(StringExpression::Literal("invalid".to_string())),
+            kind: mir::PropertyWriteKind::Initialize,
+            span: Default::default(),
+        });
+    assert_malformed(
+        &outside_constructor,
+        "initialization does not target the direct constructor receiver",
+    );
+}
+
+#[test]
+fn constructor_property_validation_waits_for_uneven_cfg_joins_to_converge() {
+    let source = r#"
+class Token {}
+
+class Holder
+{
+    writable Token $token;
+
+    function __construct(bool $outer, bool $inner)
+    {
+        if ($outer) {
+            if ($inner) {
+                $this->token = new Token();
+            }
+        }
+        $this->token = new Token();
+    }
+}
+
+function main(): void
+{
+    let $holder = new Holder(true, true);
+}
+"#;
+    let program = doriac::lower_source_to_mir("uneven-constructor-join.doria", source)
+        .expect("valid constructor writes should lower");
+    doriac::mir_validation::validate_program(&program)
+        .expect("strict property-write validation should use converged input states");
 }
 
 #[test]
@@ -4426,6 +4590,8 @@ fn shared_validator_rejects_property_assignments_that_transfer_the_receiver() {
                 local: LocalId(0),
                 transfer: true,
             }),
+            kind: mir::PropertyWriteKind::Replace,
+            span: Default::default(),
         });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -4479,6 +4645,8 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
                 object: LocalId(0),
                 property: other,
             }),
+            kind: mir::PropertyWriteKind::Replace,
+            span: Default::default(),
         });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -4564,6 +4732,8 @@ fn shared_validator_enforces_property_and_receiver_mutability() {
                 object: LocalId(0),
                 property,
                 value: Rvalue::String(StringExpression::Literal("changed".to_string())),
+                kind: mir::PropertyWriteKind::Replace,
+                span: Default::default(),
             });
 
         let error = doriac::mir_validation::validate_program(&program)
@@ -4593,6 +4763,8 @@ fn shared_validator_enforces_property_and_receiver_mutability() {
             object: LocalId(0),
             property,
             value: Rvalue::String(StringExpression::Local(LocalId(1))),
+            kind: mir::PropertyWriteKind::Replace,
+            span: Default::default(),
         });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -5166,6 +5338,8 @@ fn shared_validator_requires_owned_nullable_class_property_values() {
                 local: LocalId(1),
                 transfer: false,
             })),
+            kind: mir::PropertyWriteKind::Replace,
+            span: Default::default(),
         });
 
     let error = doriac::mir_validation::validate_program(&program)

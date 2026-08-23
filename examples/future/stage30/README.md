@@ -1,17 +1,17 @@
 # Stage 30 closure examples
 
 These snippets are accepted Stage 30 target-state documentation. Their closure
-grammar and Stage 30b semantics are checked, but they are not executable examples
-or native parity fixtures. Valid closure construction and invocation stop at the
-catalogued E0641 execution boundary.
+grammar, semantic types, captures, ownership, lifetime, and escape behavior are
+checked, but they are not executable examples or native parity fixtures.
+Valid closure construction and invocation stop at the catalogued E0641 execution boundary.
 
 [Decision 0121](../../../docs/decisions/0121-closure-function-types-capture-semantics-and-execution-model.md)
 accepts the complete closure model and elaborates Decision 0120's explicit
-capture lists. **Stages 30a and 30b are complete**: structural function types
-have semantic identity; captures, closure bodies, inferred modes/effects, and
-callable-value calls are checked. Stage 30c ownership, lifetime, and escape is
-next. Stage 30 remains in progress and not complete, and E0641 remains only as
-the execution boundary until the HIR/MIR route lands.
+capture lists. **Stages 30a through 30c are complete**: structural function
+types have semantic identity; captures, closure bodies, inferred modes/effects,
+callable-value calls, capture acquisition, Move state, leases, and escape are
+checked. Stage 30d closure HIR/MIR and the interpreter oracle are next.
+Stage 30 remains in progress and not complete, and E0641 remains only as the execution boundary until that route lands.
 
 The inventory covers:
 
@@ -178,6 +178,6 @@ A readonly capture is borrow-bound and may not escape its owner. The future
 diagnostic should recommend a taking capture when ownership transfer is the
 correct solution. Decision 0121 also requires explicit `with ($this)` or
 `with (writable $this)`, rejects taking `$this`, infers closure effects from the
-body, and adds no closure-expression effect annotation. Stage 30b checks those
-semantics. Capture acquisition, lifetime/escape enforcement, and execution
-remain in later slices behind E0641.
+body, and adds no closure-expression effect annotation. Stages 30b and 30c check
+those semantics plus capture acquisition, lifetime, and escape. Execution
+remains in later slices behind E0641.

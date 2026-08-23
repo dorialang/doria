@@ -85,7 +85,7 @@ function check_stage30_closure_authority(string $root): array
         '# Decision 0121: Closure Function Types, Capture Semantics, And Execution Model',
         '**Status:** Accepted',
         '**Accepted:** 2026-08-19',
-        '**Implementation Status:** Authority Accepted; Stage 30a And Stage 30b Implemented; Stage 30c Next; Stage 30 Not Complete',
+        '**Implementation Status:** Authority Accepted; Stages 30a Through 30c Implemented; Stage 30d Next; Stage 30 Not Complete',
         '**Elaborates:** Decision 0120',
         'function writable(int): int',
         'function once(): Payload',
@@ -155,7 +155,8 @@ function check_stage30_closure_authority(string $root): array
         'Decision 0121: closure function types, capture semantics, and execution model',
         '**Stage 30 Closure Authority — Accepted; Stage 30 — In Progress, Not Complete.**',
         'Stage 30b Semantic Function Types And Captures — Complete',
-        'Stage 30c Ownership, Lifetime, And Escape — Next',
+        'Stage 30c Ownership, Lifetime, And Escape — Complete',
+        'Stage 30d Closure HIR/MIR And Interpreter Oracle — Next',
         'Stage 30h Cross-Repository Closure',
         '`function take()` is rejected',
         '`List<T>` alone receives `map`, Copy-only preserving `filter`, and writable-accumulator `reduce`',
@@ -167,9 +168,10 @@ function check_stage30_closure_authority(string $root): array
         'Decision 0121 accepts the complete Stage 30 closure authority',
         'Stage 30a Callable Grammar Completion — Complete',
         'Stage 30b Semantic Function Types And Captures — Complete',
-        'Stage 30c Ownership, Lifetime, And Escape — Next',
+        'Stage 30c Ownership, Lifetime, And Escape — Complete',
+        'Stage 30d Closure HIR/MIR And Interpreter Oracle — Next',
         'Stage 30 — In Progress, Not Complete',
-        'E0641 is narrowed to valid execution routes',
+        'E0641 remains only as the HIR/MIR/runtime execution boundary',
     ]);
     $forbid($pipelinePath, $pipeline, [
         'Stage 30 Closure Authority Proposal — In Review',
@@ -203,9 +205,9 @@ function check_stage30_closure_authority(string $root): array
     ]);
     $require($examplesPath, $examples, [
         '[Decision 0121]',
-        'Stages 30a and 30b are complete',
+        'Stages 30a through 30c are complete',
         'Stage 30 remains in progress and not complete',
-        'Stage 30b semantics are checked',
+        'Stages 30b and 30c check',
         'E0641 execution boundary',
     ]);
 

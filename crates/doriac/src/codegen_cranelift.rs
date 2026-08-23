@@ -2224,73 +2224,81 @@ fn lower_statement(
             object,
             property,
             value,
+            kind,
+            ..
         } => {
             let property_definition = property_definition(resources.program, *property)?;
             let value = lower_rvalue(builder, value, resources)?;
             let address = lower_property_address(builder, *object, *property, resources)?;
             let pointer_type = resources.module.target_config().pointer_type();
-            let old_error = matches!(
-                property_definition.ty,
-                mir::Type::Error | mir::Type::NullableError
-            )
+            let replaces = !matches!(kind, mir::PropertyWriteKind::Initialize);
+            let old_error = (replaces
+                && matches!(
+                    property_definition.ty,
+                    mir::Type::Error | mir::Type::NullableError
+                ))
             .then(|| {
                 load_lowered_from_address(builder, property_definition.ty, address, pointer_type)
             });
-            let old_value = match property_definition.ty {
-                mir::Type::String
-                | mir::Type::Mixed
-                | mir::Type::Class(_)
-                | mir::Type::NullableClass(_)
-                | mir::Type::NullableMixed
-                | mir::Type::SharedReference(_)
-                | mir::Type::WeakReference(_)
-                | mir::Type::NullableSharedReference(_)
-                | mir::Type::NullableWeakReference(_)
-                | mir::Type::WritableSharedReference(_)
-                | mir::Type::WritableWeakReference(_)
-                | mir::Type::NullableWritableSharedReference(_)
-                | mir::Type::NullableWritableWeakReference(_)
-                | mir::Type::ReadonlySharedReferenceAccess(_)
-                | mir::Type::WritableSharedReferenceAccess(_)
-                | mir::Type::NullableReadonlySharedReferenceAccess(_)
-                | mir::Type::NullableWritableSharedReferenceAccess(_)
-                | mir::Type::Collection(_)
-                | mir::Type::NullableCollection(_) => Some(
-                    load_lowered_from_address(
-                        builder,
-                        property_definition.ty,
-                        address,
-                        pointer_type,
-                    )
-                    .single()?,
-                ),
-                mir::Type::NullableString => Some(
-                    load_lowered_from_address(
-                        builder,
-                        property_definition.ty,
-                        address,
-                        pointer_type,
-                    )
-                    .nullable()?
-                    .1,
-                ),
-                mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
-                    let nullable =
-                        matches!(property_definition.ty, mir::Type::NullablePayloadEnum(_));
-                    let old = create_payload_storage(builder, payload, nullable, resources);
-                    copy_inline_bytes(
-                        builder,
-                        old,
-                        address,
-                        payload.storage_size(nullable),
-                        pointer_type,
-                    );
-                    Some(old)
+            let old_value = if replaces {
+                match property_definition.ty {
+                    mir::Type::String
+                    | mir::Type::Mixed
+                    | mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::NullableMixed
+                    | mir::Type::SharedReference(_)
+                    | mir::Type::WeakReference(_)
+                    | mir::Type::NullableSharedReference(_)
+                    | mir::Type::NullableWeakReference(_)
+                    | mir::Type::WritableSharedReference(_)
+                    | mir::Type::WritableWeakReference(_)
+                    | mir::Type::NullableWritableSharedReference(_)
+                    | mir::Type::NullableWritableWeakReference(_)
+                    | mir::Type::ReadonlySharedReferenceAccess(_)
+                    | mir::Type::WritableSharedReferenceAccess(_)
+                    | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                    | mir::Type::NullableWritableSharedReferenceAccess(_)
+                    | mir::Type::Collection(_)
+                    | mir::Type::NullableCollection(_) => Some(
+                        load_lowered_from_address(
+                            builder,
+                            property_definition.ty,
+                            address,
+                            pointer_type,
+                        )
+                        .single()?,
+                    ),
+                    mir::Type::NullableString => Some(
+                        load_lowered_from_address(
+                            builder,
+                            property_definition.ty,
+                            address,
+                            pointer_type,
+                        )
+                        .nullable()?
+                        .1,
+                    ),
+                    mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
+                        let nullable =
+                            matches!(property_definition.ty, mir::Type::NullablePayloadEnum(_));
+                        let old = create_payload_storage(builder, payload, nullable, resources);
+                        copy_inline_bytes(
+                            builder,
+                            old,
+                            address,
+                            payload.storage_size(nullable),
+                            pointer_type,
+                        );
+                        Some(old)
+                    }
+                    mir::Type::Scalar(_)
+                    | mir::Type::NullableScalar(_)
+                    | mir::Type::Error
+                    | mir::Type::NullableError => None,
                 }
-                mir::Type::Scalar(_)
-                | mir::Type::NullableScalar(_)
-                | mir::Type::Error
-                | mir::Type::NullableError => None,
+            } else {
+                None
             };
             store_lowered_to_address(
                 builder,
@@ -2306,7 +2314,10 @@ fn lower_statement(
                 (mir::Type::Class(class) | mir::Type::NullableClass(class), Some(old_value)) => {
                     lower_drop_class_value_checked(builder, old_value, class, resources)?;
                 }
-                (mir::Type::Collection(collection), Some(old_value)) => {
+                (
+                    mir::Type::Collection(collection) | mir::Type::NullableCollection(collection),
+                    Some(old_value),
+                ) => {
                     lower_drop_collection_value(builder, old_value, collection, resources)?;
                 }
                 (

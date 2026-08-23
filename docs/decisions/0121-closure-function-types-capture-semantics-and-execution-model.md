@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-19
 - **Date:** 2026-08-19
-- **Implementation Status:** Authority Accepted; Stage 30a And Stage 30b Implemented; Stage 30c Next; Stage 30 Not Complete
+- **Implementation Status:** Authority Accepted; Stages 30a Through 30c Implemented; Stage 30d Next; Stage 30 Not Complete
 - **Scope:** Function types, closure invocation, capture validation, ownership,
   lifetime, representation, backend behavior, diagnostics, and Stage 30
   `List<T>` algorithms
@@ -26,9 +26,21 @@ This record closes those authority questions before implementation. Stage 30a
 implements the accepted callable grammar. Stage 30b implements canonical
 semantic function types, stable binding and closure identities, capture and
 `$this` validation, inferred closure modes/effects, and semantic callable-value
-calls. Valid execution routes still stop at the narrowed E0641 boundary. Stage
-30c Ownership, Lifetime, And Escape is next; Stage 30 remains in progress and is
-not complete.
+calls. Stage 30c implements creation-time capture acquisition, Move-only
+function values, non-lexical capture leases, path-sensitive invocation
+consumption, escape and storage enforcement, returned-borrow roots, nested
+environment provenance, and reverse logical release plans. Valid execution
+routes still stop at the narrowed E0641 boundary. Stage 30d Closure HIR/MIR And
+Interpreter Oracle is next; Stage 30 remains in progress and is not complete.
+
+```text
+Stage 30a Callable Grammar Completion — Complete
+Stage 30b Semantic Function Types And Captures — Complete
+Stage 30c Ownership, Lifetime, And Escape — Complete
+Stage 30d Closure HIR/MIR And Interpreter Oracle — Next
+Stage 30 — In Progress, Not Complete
+E0641 — HIR/MIR/Runtime Execution Boundary
+```
 
 ## Accepted Amendment: Parenthesized Type Grouping
 
@@ -502,8 +514,10 @@ Stage 30h - Cross-Repository Closure
 - **Stage 30b — Complete:** semantic function types, compatibility, binding
   identities, capture discovery/validation, `$this`, fixes, inferred
   modes/effects, and semantic callable calls; no HIR/MIR.
-- **Stage 30c:** acquisition, lifetime/escape, Move behavior, once consumption,
-  storage matrix, and logical drop plans.
+- **Stage 30c — Complete:** acquisition at closure creation in authored order,
+  non-lexical readonly/writable leases, Move behavior, once consumption,
+  nonescaping callback enforcement, storage/escape and one-root return checks,
+  nested provenance, and reverse logical drop plans; no HIR/MIR or execution.
 - **Stage 30d:** closure HIR/MIR, carrier/descriptors/environments, indirect and
   checked calls, MIR validation/cleanup, and interpreter oracle.
 - **Stage 30e:** runtime substrate, Cranelift, LLVM, malformed-MIR and ownership

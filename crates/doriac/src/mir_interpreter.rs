@@ -833,6 +833,7 @@ enum EvaluationTask {
     AssignProperty {
         object: mir::LocalId,
         property: crate::class_layout::PropertyId,
+        kind: mir::PropertyWriteKind,
     },
     DropClass(mir::LocalId),
     DropShared(mir::LocalId),
@@ -1737,11 +1738,15 @@ impl Interpreter<'_> {
                 object,
                 property,
                 value,
+                kind,
+                ..
             } => {
                 let frame = self.current_frame_mut()?;
-                frame
-                    .tasks
-                    .push(EvaluationTask::AssignProperty { object, property });
+                frame.tasks.push(EvaluationTask::AssignProperty {
+                    object,
+                    property,
+                    kind,
+                });
                 frame.tasks.push(EvaluationTask::Rvalue(value));
             }
             mir::Statement::AssignStatic { target, value } => {
@@ -5486,9 +5491,13 @@ impl Interpreter<'_> {
                 })?;
                 *slot = value;
             }
-            EvaluationTask::AssignProperty { object, property } => {
+            EvaluationTask::AssignProperty {
+                object,
+                property,
+                kind,
+            } => {
                 let value = self.pop_local_value()?;
-                if let Some(old) = self.assign_property(object, property, value)? {
+                if let Some(old) = self.assign_property(object, property, value, kind)? {
                     self.queue_value_drops(old)?;
                 }
             }
@@ -11816,6 +11825,7 @@ impl Interpreter<'_> {
         object: mir::LocalId,
         property: crate::class_layout::PropertyId,
         value: LocalValue,
+        kind: mir::PropertyWriteKind,
     ) -> Result<Option<LocalValue>, InterpreterError> {
         let object_id = match read_local(&self.current_frame()?.locals, object)? {
             LocalValue::Class { object, .. } => *object,
@@ -11845,6 +11855,19 @@ impl Interpreter<'_> {
             .ok_or_else(|| {
                 InterpreterError::new(format!("MIR property{} does not exist", property.index))
             })?;
+        match (kind, slot.is_some()) {
+            (mir::PropertyWriteKind::Initialize, true) => {
+                return Err(InterpreterError::new(
+                    "MIR property initialization targets initialized storage",
+                ));
+            }
+            (mir::PropertyWriteKind::Replace, false) => {
+                return Err(InterpreterError::new(
+                    "MIR property replacement targets uninitialized storage",
+                ));
+            }
+            _ => {}
+        }
         Ok(slot.replace(value))
     }
 

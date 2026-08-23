@@ -38,9 +38,9 @@ A readonly binding may be moved from. A move ends the binding's ownership; it do
 
 Reinitializing a moved-from binding is a new assignment and therefore a mutation. It requires `writable`, just like any other reassignment.
 
-### Invalid and deferred moves
+### Invalid and property moves
 
-Self-moves such as `$value = $value` and overlapping source/destination moves are rejected. Direct moves into or out of nested owned properties remain unsupported until their interaction with writable paths and aliasing is explicitly specified. Stage 19 diagnoses these forms rather than improvising semantics.
+Self-moves such as `$value = $value` and overlapping source/destination moves are rejected. Decision 0122 accepts independently owned values moving into owning instance properties and replacing initialized writable owning properties. Moving out remains separate because Doria has no accepted property-hole or atomic take-and-replace operation. Stage 19's former combined prohibition is historical.
 
 ### Temporary native-eligibility soundness gate
 
@@ -83,3 +83,6 @@ Decision 0081 remains authoritative for panic: panic performs no cleanup. Stage 
 The Stage 19 acceptance criterion remains exactly: `AC: destructor-order example; use-after-move diagnostic snapshots; RAII resource-guard example; leak CI clean.` Explanatory resource-guard and diagnostic details belong in roadmap prose, not inside that criterion.
 
 Decision 0090 removed the temporary native-eligibility gate rather than normalizing it into permanent behavior.
+
+Decision 0122 likewise removes the temporary move-in and replacement fence
+without weakening move-out, overlap, or writable-path invariants.

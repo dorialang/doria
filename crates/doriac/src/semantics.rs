@@ -114,6 +114,28 @@ pub struct SemanticInfo {
     pub closures: HashMap<ClosureId, ClosureSemanticInfo>,
     /// Semantically checked indirect-call plans, still blocked from execution.
     pub callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
+    /// Backend-independent capture acquisition, provenance, escape, and
+    /// invocation-consumption plans proven by Stage 30c.
+    pub closure_ownership: HashMap<ClosureId, crate::ownership::ClosureOwnershipInfo>,
+    /// Backend-independent classification of each checked instance-property write.
+    pub property_writes: HashMap<(usize, usize), PropertyWriteSemanticInfo>,
+    /// Object-path expressions proven to carry ordinary writable access.
+    pub(crate) writable_object_paths: HashSet<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PropertyWriteKind {
+    Initialize,
+    Replace,
+    InitializeOrReplace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyWriteSemanticInfo {
+    pub kind: PropertyWriteKind,
+    pub class_name: String,
+    pub property_name: String,
+    pub constructor_context: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -475,52 +497,57 @@ pub fn analyze_program_for_ide_with_source<'source>(
     let mut checker = Checker::new(program, const_evaluation, source_text);
     checker.diagnostics.extend(const_diagnostics);
     checker.check();
-    if checker.diagnostics.is_empty() {
-        checker
-            .diagnostics
-            .extend(crate::constructor_init::check_program(
-                program,
-                &checker.given_preludes,
-                &checker.checked_effect_sites,
-                &checker.catch_error_types,
-            ));
+    let constructor_analysis = crate::constructor_init::check_program(
+        program,
+        &checker.given_preludes,
+        &checker.checked_effect_sites,
+        &checker.catch_error_types,
+    );
+    for (span, kind) in constructor_analysis.property_writes {
+        if let Some(write) = checker.property_writes.get_mut(&span) {
+            write.kind = kind;
+        }
     }
-    if checker.diagnostics.is_empty() {
-        let inferred_move_returns = checker
-            .function_signatures
-            .iter()
-            .filter_map(|(span_start, signature)| {
-                checker
-                    .type_is_move_type(signature.return_ty)
-                    .then_some(*span_start)
-            })
-            .collect();
-        let return_borrows = checker
-            .function_signatures
-            .iter()
-            .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
-            .collect();
-        let move_enum_names = checker
-            .enums
-            .values()
-            .filter(|definition| !definition.capabilities.copy)
-            .map(|definition| definition.name.clone())
-            .collect();
-        let ownership_diagnostics = crate::ownership::check_program_with_inferred_move_returns(
-            program,
-            &crate::ownership::OwnershipAnalysisContext {
-                inferred_move_returns: &inferred_move_returns,
-                return_borrows: &return_borrows,
-                resolved_types: &checker.expression_types,
-                flow_facts: &checker.flow_facts,
-                move_enum_names: &move_enum_names,
-                given_preludes: &checker.given_preludes,
-                checked_effect_sites: &checker.checked_effect_sites,
-                catch_error_types: &checker.catch_error_types,
-            },
-        );
-        checker.diagnostics.extend(ownership_diagnostics);
-    }
+    checker.diagnostics.extend(constructor_analysis.diagnostics);
+    let inferred_move_returns = checker
+        .function_signatures
+        .iter()
+        .filter_map(|(span_start, signature)| {
+            checker
+                .type_is_move_type(signature.return_ty)
+                .then_some(*span_start)
+        })
+        .collect();
+    let return_borrows = checker
+        .function_signatures
+        .iter()
+        .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
+        .collect();
+    let move_enum_names = checker
+        .enums
+        .values()
+        .filter(|definition| !definition.capabilities.copy)
+        .map(|definition| definition.name.clone())
+        .collect();
+    let ownership_analysis = crate::ownership::check_program_with_inferred_move_returns(
+        program,
+        &crate::ownership::OwnershipAnalysisContext {
+            inferred_move_returns: &inferred_move_returns,
+            return_borrows: &return_borrows,
+            resolved_types: &checker.expression_types,
+            flow_facts: &checker.flow_facts,
+            move_enum_names: &move_enum_names,
+            given_preludes: &checker.given_preludes,
+            checked_effect_sites: &checker.checked_effect_sites,
+            catch_error_types: &checker.catch_error_types,
+            binding_resolution: &checker.binding_resolution,
+            closures: &checker.closures,
+            callable_value_calls: &checker.callable_value_calls,
+        },
+    );
+    let closure_ownership = ownership_analysis.closures;
+    checker.diagnostics.extend(ownership_analysis.diagnostics);
+    emit_stage_30_boundaries(&mut checker);
     let return_borrows = checker
         .function_signatures
         .iter()
@@ -558,9 +585,60 @@ pub fn analyze_program_for_ide_with_source<'source>(
             binding_resolution: checker.binding_resolution,
             closures: checker.closures,
             callable_value_calls: checker.callable_value_calls,
+            closure_ownership,
+            property_writes: checker.property_writes,
+            writable_object_paths: checker.writable_object_paths,
         },
         diagnostics: checker.diagnostics,
     }
+}
+
+fn emit_stage_30_boundaries(checker: &mut Checker<'_>) {
+    checker
+        .stage_30_boundary_candidates
+        .sort_by_key(|candidate| (candidate.span.start, candidate.span.end));
+    for candidate in std::mem::take(&mut checker.stage_30_boundary_candidates) {
+        let closure_cause = candidate
+            .closure_id
+            .map(|id| format!("closure:{}:{}", id.start, id.end));
+        let has_precise_error = checker.diagnostics.iter().any(|diagnostic| {
+            if diagnostic.severity != crate::diagnostics::DiagnosticSeverity::Error
+                || diagnostic.code == "E0641"
+            {
+                return false;
+            }
+            let same_cause = closure_cause.as_ref().is_some_and(|cause| {
+                diagnostic
+                    .cause_id
+                    .as_deref()
+                    .is_some_and(|diagnostic_cause| diagnostic_cause.starts_with(cause))
+            });
+            same_cause
+                || (diagnostic.span.start >= candidate.span.start
+                    && diagnostic.span.end <= candidate.span.end)
+        });
+        if has_precise_error {
+            continue;
+        }
+        checker.diagnostics.push(
+            Diagnostic::unsupported_stage(
+                "E0641",
+                format!(
+                    "{} is valid Doria, but checked function values cannot execute yet",
+                    candidate.surface
+                ),
+                candidate.span,
+            )
+            .with_title("Closure Execution Is Not Yet Available")
+            .with_explanation(
+                "Function typing, capture acquisition, ownership, lifetime, escape, and invocation-consumption checks succeeded. Executable HIR, MIR, and interpreter support lands in Stage 30d.",
+            )
+            .with_help("Keep the source as written; no rewrite is required."),
+        );
+    }
+    checker
+        .diagnostics
+        .sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.span.end));
 }
 
 fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo> {
@@ -1233,8 +1311,18 @@ struct Checker<'program> {
     closures: HashMap<ClosureId, ClosureSemanticInfo>,
     closure_types: HashMap<(usize, usize), TypeId>,
     callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
+    stage_30_boundary_candidates: Vec<Stage30BoundaryCandidate>,
+    property_writes: HashMap<(usize, usize), PropertyWriteSemanticInfo>,
+    writable_object_paths: HashSet<(usize, usize)>,
     active_closures: Vec<ActiveClosure>,
     initializing_bindings: Vec<HashMap<String, Span>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Stage30BoundaryCandidate {
+    surface: String,
+    span: Span,
+    closure_id: Option<ClosureId>,
 }
 
 #[derive(Debug, Clone)]
@@ -1580,11 +1668,35 @@ fn checked_layout_align(value: u32, alignment: u32) -> Option<u32> {
         .map(|sum| sum & !(alignment - 1))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiverAccess {
+    Unavailable,
+    Readonly,
+    Writable,
+    ConstructionRoot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObjectPathAccess {
+    Readonly,
+    Writable,
+    ConstructionRoot,
+}
+
+impl ReceiverAccess {
+    fn is_available(self) -> bool {
+        self != Self::Unavailable
+    }
+
+    fn is_writable(self) -> bool {
+        self == Self::Writable
+    }
+}
+
 #[derive(Debug, Clone)]
 struct MethodContext {
     class_name: String,
-    receiver_mode: Option<ReceiverMode>,
-    this_available: bool,
+    receiver_access: ReceiverAccess,
 }
 
 fn type_parameter_scope(params: &[TypeParamDecl]) -> HashMap<String, Vec<TypeRef>> {
@@ -1815,6 +1927,9 @@ impl<'program> Checker<'program> {
             closures: HashMap::new(),
             closure_types: HashMap::new(),
             callable_value_calls: HashMap::new(),
+            stage_30_boundary_candidates: Vec::new(),
+            property_writes: HashMap::new(),
+            writable_object_paths: HashSet::new(),
             active_closures: Vec::new(),
             initializing_bindings: Vec::new(),
         }
@@ -3293,12 +3408,15 @@ impl<'program> Checker<'program> {
                 }
                 let method_context = declaring_class.as_ref().map(|class_name| MethodContext {
                     class_name: class_name.clone(),
-                    receiver_mode: (!function.is_static).then_some(if function.writable_this {
-                        ReceiverMode::Writable
+                    receiver_access: if function.is_static {
+                        ReceiverAccess::Unavailable
+                    } else if function.name == "__construct" {
+                        ReceiverAccess::ConstructionRoot
+                    } else if function.writable_this {
+                        ReceiverAccess::Writable
                     } else {
-                        ReceiverMode::Readonly
-                    }),
-                    this_available: !function.is_static,
+                        ReceiverAccess::Readonly
+                    },
                 });
                 let enclosing_type_params = declaring_class
                     .as_ref()
@@ -3582,12 +3700,13 @@ impl<'program> Checker<'program> {
         };
         let method_context = MethodContext {
             class_name: class_name.to_string(),
-            receiver_mode: Some(if method.writable_this {
-                ReceiverMode::Writable
+            receiver_access: if method.name == "__construct" {
+                ReceiverAccess::ConstructionRoot
+            } else if method.writable_this {
+                ReceiverAccess::Writable
             } else {
-                ReceiverMode::Readonly
-            }),
-            this_available: true,
+                ReceiverAccess::Readonly
+            },
         };
         let inferred = self.infer_unannotated_move_return_type(
             method,
@@ -4151,14 +4270,15 @@ impl<'program> Checker<'program> {
                 method,
                 Some(MethodContext {
                     class_name: class_decl.name.clone(),
-                    receiver_mode: (!method.is_static).then_some(
-                        if method.writable_this && lifecycle.is_none() {
-                            ReceiverMode::Writable
-                        } else {
-                            ReceiverMode::Readonly
-                        },
-                    ),
-                    this_available: !method.is_static,
+                    receiver_access: if method.is_static {
+                        ReceiverAccess::Unavailable
+                    } else if method.name == "__construct" {
+                        ReceiverAccess::ConstructionRoot
+                    } else if method.writable_this && lifecycle.is_none() {
+                        ReceiverAccess::Writable
+                    } else {
+                        ReceiverAccess::Readonly
+                    },
                 }),
             );
         }
@@ -4184,8 +4304,7 @@ impl<'program> Checker<'program> {
         let scopes = ScopeStack::new();
         let context = class_name.map(|class_name| MethodContext {
             class_name: class_name.to_string(),
-            receiver_mode: None,
-            this_available: false,
+            receiver_access: ReceiverAccess::Unavailable,
         });
         self.effect_scopes.push(CheckedEffectSet::default());
         self.check_expr(initializer, &scopes, context.as_ref());
@@ -4213,8 +4332,7 @@ impl<'program> Checker<'program> {
         let scopes = ScopeStack::new();
         let initializer_context = MethodContext {
             class_name: class_name.to_string(),
-            receiver_mode: None,
-            this_available: false,
+            receiver_access: ReceiverAccess::Unavailable,
         };
         let target_ty = self
             .classes
@@ -4550,7 +4668,7 @@ impl<'program> Checker<'program> {
                 &mut scopes,
                 "this".to_string(),
                 Binding::unresolved(
-                    context.receiver_mode.is_some_and(ReceiverMode::is_writable),
+                    context.receiver_access.is_writable(),
                     receiver_ty,
                     receiver_ty,
                     None,
@@ -4558,7 +4676,7 @@ impl<'program> Checker<'program> {
                 ),
                 Span::new(function.span.start, function.span.start),
                 BindingKind::MethodReceiver,
-                if context.receiver_mode.is_some_and(ReceiverMode::is_writable) {
+                if context.receiver_access.is_writable() {
                     BindingOwnership::WritableBorrow
                 } else {
                     BindingOwnership::ReadonlyBorrow
@@ -4624,8 +4742,7 @@ impl<'program> Checker<'program> {
             if let Some(default) = &param.default {
                 let default_context = method_context.as_ref().map(|context| MethodContext {
                     class_name: context.class_name.clone(),
-                    receiver_mode: context.receiver_mode,
-                    this_available: false,
+                    receiver_access: ReceiverAccess::Unavailable,
                 });
                 let default_context = default_context.as_ref();
 
@@ -6817,7 +6934,9 @@ impl<'program> Checker<'program> {
                             .with_help("Use `$this` only in a closure nested inside an instance method, and list it in `with (...)`."),
                         );
                     }
-                } else if !method_context.is_some_and(|context| context.this_available) {
+                } else if !method_context
+                    .is_some_and(|context| context.receiver_access.is_available())
+                {
                     self.diagnostics.push(Diagnostic::new(
                         "E0102",
                         "`$this` is only available inside methods",
@@ -6874,8 +6993,14 @@ impl<'program> Checker<'program> {
                 if let Some((kind, _)) = self.shared_handle_type(object_ty, *null_safe) {
                     if kind == SharedHandleKind::SharedReference && property == "referencedValue" {
                         // The compiler-known readonly projection; nothing to look up.
-                    } else if !Self::shared_handle_forwards(kind) {
-                        self.reject_shared_handle_member_access(kind, property, *span);
+                    } else if self.reject_nonforwarding_shared_handle_member_access(
+                        object,
+                        property,
+                        *null_safe,
+                        *span,
+                        scopes,
+                        method_context,
+                    ) {
                     } else {
                         self.lookup_property(object, property, *span, scopes, method_context);
                     }
@@ -7215,28 +7340,25 @@ impl<'program> Checker<'program> {
         missing.required_capability = missing.required_capability.max(requirement);
     }
 
-    fn report_stage_30_execution_boundary(&mut self, surface: &str, span: Span) {
+    fn record_stage_30_execution_boundary(
+        &mut self,
+        surface: &str,
+        span: Span,
+        closure_id: Option<ClosureId>,
+    ) {
         if self
-            .diagnostics
+            .stage_30_boundary_candidates
             .iter()
-            .any(|diagnostic| diagnostic.code == "E0641" && diagnostic.span == span)
+            .any(|candidate| candidate.span == span)
         {
             return;
         }
-        self.diagnostics.push(
-            Diagnostic::unsupported_stage(
-                "E0641",
-                format!(
-                    "{surface} is valid Doria, but checked function values cannot execute yet"
-                ),
+        self.stage_30_boundary_candidates
+            .push(Stage30BoundaryCandidate {
+                surface: surface.to_string(),
                 span,
-            )
-            .with_title("Closure Execution Is Not Yet Available")
-            .with_explanation(
-                "Semantic function types, captures, invocation requirements, and checked effects were validated. Ownership and lifetime enforcement precede executable HIR and MIR support.",
-            )
-            .with_help("Keep the source as written; no rewrite is required."),
-        );
+                closure_id,
+            });
     }
 
     fn check_callable_value_call(
@@ -7473,20 +7595,39 @@ impl<'program> Checker<'program> {
                 method_context,
             )
         {
-            let access = match function.invocation_mode {
-                FunctionInvocationMode::Readonly => "readonly",
-                FunctionInvocationMode::Writable => "writable",
-                FunctionInvocationMode::Once => "owned",
-            };
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0651",
-                    format!("this function value requires {access} invocation access"),
-                    callee.span(),
+            if function.invocation_mode == FunctionInvocationMode::Once
+                && matches!(
+                    Self::ungroup_expr(callee),
+                    Expr::PropertyAccess { .. } | Expr::Index { .. }
                 )
-                .with_title("Callable Invocation Requires Stronger Access")
-                .with_help(format!("invoke it through a {access} callable place")),
-            );
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0660",
+                        "once function cannot be consumed from a property or aggregate slot",
+                        callee.span(),
+                    )
+                    .with_title("Once Function Cannot Be Consumed From Stored Place")
+                    .with_help(
+                        "first obtain an owned local through an ownership-transferring operation",
+                    ),
+                );
+            } else {
+                let access = match function.invocation_mode {
+                    FunctionInvocationMode::Readonly => "readonly",
+                    FunctionInvocationMode::Writable => "writable",
+                    FunctionInvocationMode::Once => "owned",
+                };
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0651",
+                        format!("this function value requires {access} invocation access"),
+                        callee.span(),
+                    )
+                    .with_title("Callable Invocation Requires Stronger Access")
+                    .with_help(format!("invoke it through a {access} callable place")),
+                );
+            }
         }
 
         self.record_checked_effects(function.checked_effects.iter().copied(), span);
@@ -7513,7 +7654,7 @@ impl<'program> Checker<'program> {
             })
             && !expression_contains_closure(callee)
         {
-            self.report_stage_30_execution_boundary("this function-value call", span);
+            self.record_stage_30_execution_boundary("this function-value call", span, None);
         }
         function.return_type
     }
@@ -7802,14 +7943,16 @@ impl<'program> Checker<'program> {
         });
         let closure_method_context = method_context.map(|context| MethodContext {
             class_name: context.class_name.clone(),
-            receiver_mode: receiver_capture.as_ref().map(|binding| {
-                if binding.writable {
-                    ReceiverMode::Writable
-                } else {
-                    ReceiverMode::Readonly
-                }
-            }),
-            this_available: receiver_capture.is_some(),
+            receiver_access: receiver_capture.as_ref().map_or(
+                ReceiverAccess::Unavailable,
+                |binding| {
+                    if binding.writable {
+                        ReceiverAccess::Writable
+                    } else {
+                        ReceiverAccess::Readonly
+                    }
+                },
+            ),
         });
         let closure_method_context = closure_method_context.as_ref();
 
@@ -7972,7 +8115,7 @@ impl<'program> Checker<'program> {
                     && diagnostic.code != "E0641"
             })
         {
-            self.report_stage_30_execution_boundary("this closure", closure.span);
+            self.record_stage_30_execution_boundary("this closure", closure.span, Some(closure_id));
         }
         ty
     }
@@ -11091,12 +11234,29 @@ impl<'program> Checker<'program> {
                     return None;
                 }
                 self.check_expr(object, scopes, method_context);
+                self.check_nullable_member_access(
+                    object,
+                    false,
+                    "property write",
+                    scopes,
+                    method_context,
+                );
                 self.record_capture_requirement_for_expr(
                     object,
                     scopes,
                     CaptureRequirement::Writable,
                 );
                 self.check_mixed_operation(object, "property write", scopes, method_context);
+                if self.reject_nonforwarding_shared_handle_member_access(
+                    object,
+                    property,
+                    false,
+                    *span,
+                    scopes,
+                    method_context,
+                ) {
+                    return None;
+                }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
                 if matches!(self.types.kind(object_ty), TypeKind::Enum(_)) {
                     self.diagnostics.push(
@@ -11121,6 +11281,10 @@ impl<'program> Checker<'program> {
                 if let Some((class_name, property_info)) =
                     self.lookup_property(object, property, *span, scopes, method_context)
                 {
+                    let constructor_context = Self::is_direct_this(object)
+                        && constructor_init_context
+                            .as_deref()
+                            .is_some_and(|context| context.class_name == class_name);
                     let constructor_init_decision = if Self::is_direct_this(object) {
                         self.check_constructor_init_assignment(
                             &class_name,
@@ -11181,6 +11345,25 @@ impl<'program> Checker<'program> {
                                 )),
                             );
                         }
+                    }
+                    if !matches!(constructor_init_decision, ConstructorInitDecision::Rejected) {
+                        let kind = if constructor_context
+                            && matches!(op, AssignOp::Assign)
+                            && property_info.init_state == PropertyInitState::Uninitialized
+                        {
+                            PropertyWriteKind::Initialize
+                        } else {
+                            PropertyWriteKind::Replace
+                        };
+                        self.property_writes.insert(
+                            (target.span().start, target.span().end),
+                            PropertyWriteSemanticInfo {
+                                kind,
+                                class_name: class_name.clone(),
+                                property_name: property.clone(),
+                                constructor_context,
+                            },
+                        );
                     }
                     Some(AssignmentTarget {
                         ty: property_info.ty,
@@ -11753,8 +11936,14 @@ impl<'program> Checker<'program> {
                 }
                 return;
             }
-            if !Self::shared_handle_forwards(kind) {
-                self.reject_shared_handle_member_access(kind, method, span);
+            if self.reject_nonforwarding_shared_handle_member_access(
+                object,
+                method,
+                null_safe,
+                span,
+                scopes,
+                method_context,
+            ) {
                 return;
             }
             // Falls through: the payload class resolves the member transparently.
@@ -13792,65 +13981,101 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
+        let writable =
+            self.object_path_access(expr, scopes, method_context) == ObjectPathAccess::Writable;
+        if writable {
+            self.writable_object_paths
+                .insert((expr.span().start, expr.span().end));
+        }
+        writable
+    }
+
+    fn object_path_access(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> ObjectPathAccess {
         let ty = self.infer_expr_type(expr, scopes, method_context);
         if let TypeKind::SharedHandle(kind, _) = self.types.kind(ty) {
-            return *kind == SharedHandleKind::WritableSharedReferenceAccess;
+            return if *kind == SharedHandleKind::WritableSharedReferenceAccess {
+                ObjectPathAccess::Writable
+            } else {
+                ObjectPathAccess::Readonly
+            };
         }
-        match expr {
-            Expr::Grouped { expr, .. } => {
-                self.is_writable_object_path(expr, scopes, method_context)
+        let access = match expr {
+            Expr::Grouped { expr, .. } => self.object_path_access(expr, scopes, method_context),
+            Expr::New { .. } => ObjectPathAccess::Writable,
+            Expr::Variable { name, .. } => {
+                scopes
+                    .lookup(name)
+                    .map_or(ObjectPathAccess::Readonly, |binding| {
+                        if binding.writable {
+                            ObjectPathAccess::Writable
+                        } else {
+                            ObjectPathAccess::Readonly
+                        }
+                    })
             }
-            Expr::New { .. } => true,
-            Expr::Variable { name, .. } => scopes
-                .lookup(name)
-                .map(|binding| binding.writable)
-                .unwrap_or(false),
-            Expr::This { .. } => method_context
-                .map(|context| {
-                    context.this_available
-                        && context.receiver_mode.is_some_and(ReceiverMode::is_writable)
-                })
-                .unwrap_or(false),
+            Expr::This { .. } => match method_context.map(|context| context.receiver_access) {
+                Some(ReceiverAccess::Writable) => ObjectPathAccess::Writable,
+                Some(ReceiverAccess::ConstructionRoot) => ObjectPathAccess::ConstructionRoot,
+                _ => ObjectPathAccess::Readonly,
+            },
             Expr::PropertyAccess {
                 null_safe: true, ..
-            } => false,
+            } => ObjectPathAccess::Readonly,
             Expr::PropertyAccess {
                 object, property, ..
             } => {
                 if !Self::is_property_write_object_path(object) {
-                    return false;
+                    return ObjectPathAccess::Readonly;
                 }
-                if !self.is_writable_object_path(object, scopes, method_context) {
-                    return false;
+                let parent_access = self.object_path_access(object, scopes, method_context);
+                if parent_access == ObjectPathAccess::Readonly {
+                    return ObjectPathAccess::Readonly;
                 }
                 let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
-                    return false;
+                    return ObjectPathAccess::Readonly;
                 };
-                self.classes
+                if self
+                    .classes
                     .get(&class_name)
                     .and_then(|class_info| class_info.properties.get(property))
                     .map(|property| property.writable)
                     .unwrap_or(false)
+                {
+                    ObjectPathAccess::Writable
+                } else {
+                    ObjectPathAccess::Readonly
+                }
             }
             Expr::Index { collection, .. } => {
-                self.is_writable_object_path(collection, scopes, method_context)
+                self.object_path_access(collection, scopes, method_context)
             }
             Expr::FunctionCall {
                 name, args, span, ..
-            } => self.functions.get(name).cloned().is_some_and(|function| {
-                let return_ty = self.generic_call_result_type(*span, function.return_ty);
-                self.call_result_is_writable(
-                    CallSite {
-                        return_ty,
-                        return_borrow: function.return_borrow,
-                        params: &function.params,
-                        args,
-                    },
-                    None,
-                    scopes,
-                    method_context,
-                )
-            }),
+            } => {
+                if self.functions.get(name).cloned().is_some_and(|function| {
+                    let return_ty = self.generic_call_result_type(*span, function.return_ty);
+                    self.call_result_is_writable(
+                        CallSite {
+                            return_ty,
+                            return_borrow: function.return_borrow,
+                            params: &function.params,
+                            args,
+                        },
+                        None,
+                        scopes,
+                        method_context,
+                    )
+                }) {
+                    ObjectPathAccess::Writable
+                } else {
+                    ObjectPathAccess::Readonly
+                }
+            }
             Expr::MethodCall {
                 object,
                 method,
@@ -13859,7 +14084,7 @@ impl<'program> Checker<'program> {
                 ..
             } => {
                 let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
-                    return false;
+                    return ObjectPathAccess::Readonly;
                 };
                 let Some(method_info) = self
                     .classes
@@ -13867,11 +14092,11 @@ impl<'program> Checker<'program> {
                     .and_then(|class_info| class_info.methods.get(method))
                     .cloned()
                 else {
-                    return false;
+                    return ObjectPathAccess::Readonly;
                 };
                 let method_info = self.specialize_method_for_class(&method_info, &class_type);
                 let return_ty = self.generic_call_result_type(*span, method_info.return_ty);
-                self.call_result_is_writable(
+                if self.call_result_is_writable(
                     CallSite {
                         return_ty,
                         return_borrow: method_info.return_borrow,
@@ -13881,7 +14106,11 @@ impl<'program> Checker<'program> {
                     Some(object),
                     scopes,
                     method_context,
-                )
+                ) {
+                    ObjectPathAccess::Writable
+                } else {
+                    ObjectPathAccess::Readonly
+                }
             }
             Expr::StaticCall {
                 qualifier,
@@ -13902,10 +14131,10 @@ impl<'program> Checker<'program> {
                     .and_then(|class| class.methods.get(method))
                     .cloned()
                 else {
-                    return false;
+                    return ObjectPathAccess::Readonly;
                 };
                 let return_ty = self.generic_call_result_type(*span, method_info.return_ty);
-                self.call_result_is_writable(
+                if self.call_result_is_writable(
                     CallSite {
                         return_ty,
                         return_borrow: method_info.return_borrow,
@@ -13915,10 +14144,19 @@ impl<'program> Checker<'program> {
                     None,
                     scopes,
                     method_context,
-                )
+                ) {
+                    ObjectPathAccess::Writable
+                } else {
+                    ObjectPathAccess::Readonly
+                }
             }
-            _ => false,
+            _ => ObjectPathAccess::Readonly,
+        };
+        if access == ObjectPathAccess::Writable {
+            self.writable_object_paths
+                .insert((expr.span().start, expr.span().end));
         }
+        access
     }
 
     fn writable_mixed_requires_semantic_check(
@@ -15818,34 +16056,7 @@ impl<'program> Checker<'program> {
                 let Some(binding) = scopes.lookup(name) else {
                     return self.types.unknown();
                 };
-                match self.flow_facts.get(&(span.start, span.end)).cloned() {
-                    Some(crate::narrowing::Fact::NonNull) => {
-                        match self.types.kind(binding.declared_ty) {
-                            TypeKind::Nullable(inner) => *inner,
-                            _ => binding.ty,
-                        }
-                    }
-                    Some(crate::narrowing::Fact::Null) => {
-                        if matches!(self.types.kind(binding.declared_ty), TypeKind::Nullable(_)) {
-                            binding.declared_ty
-                        } else {
-                            self.types.intern(TypeKind::Null)
-                        }
-                    }
-                    Some(crate::narrowing::Fact::Exact(ty)) => {
-                        let tested = self.resolve_type_ref_with_class(
-                            &ty,
-                            *span,
-                            method_context.map(|context| context.class_name.as_str()),
-                        );
-                        if self.exact_type_test_can_match(binding.declared_ty, tested) {
-                            tested
-                        } else {
-                            binding.ty
-                        }
-                    }
-                    None => binding.ty,
-                }
+                self.flow_narrowed_type(binding.declared_ty, binding.ty, *span, method_context)
             }
             Expr::Identifier { name, .. } => {
                 let key = crate::const_eval::ConstKey::TopLevel(name.clone());
@@ -15854,7 +16065,7 @@ impl<'program> Checker<'program> {
                     .unwrap_or_else(|| self.types.unknown())
             }
             Expr::This { .. } => method_context
-                .filter(|context| context.this_available)
+                .filter(|context| context.receiver_access.is_available())
                 .map(|context| context.class_name.clone())
                 .map(|class_name| self.symbolic_class_type(&class_name))
                 .unwrap_or_else(|| self.types.unknown()),
@@ -15902,7 +16113,7 @@ impl<'program> Checker<'program> {
                             .ty
                     })
                     .unwrap_or_else(|| self.types.unknown());
-                if *null_safe
+                let result = if *null_safe
                     && !matches!(self.types.kind(result), TypeKind::Void | TypeKind::Unknown)
                 {
                     if matches!(self.types.kind(result), TypeKind::Nullable(_)) {
@@ -15912,7 +16123,8 @@ impl<'program> Checker<'program> {
                     }
                 } else {
                     result
-                }
+                };
+                result
             }
             Expr::MethodCall {
                 object,
@@ -16501,6 +16713,29 @@ impl<'program> Checker<'program> {
     /// family deliberately does not: access must be acquired first.
     fn shared_handle_forwards(kind: SharedHandleKind) -> bool {
         kind.forwards_payload()
+    }
+
+    /// Reject payload member access through handles that require an explicit
+    /// access object. Every read, call, and mutation target uses this gate so a
+    /// failed lookup cannot silently bypass record 0106's access protocol.
+    fn reject_nonforwarding_shared_handle_member_access(
+        &mut self,
+        object: &Expr,
+        member: &str,
+        null_safe: bool,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let object_ty = self.infer_expr_type(object, scopes, method_context);
+        let Some((kind, _)) = self.shared_handle_type(object_ty, null_safe) else {
+            return false;
+        };
+        if Self::shared_handle_forwards(kind) {
+            return false;
+        }
+        self.reject_shared_handle_member_access(kind, member, span);
+        true
     }
 
     /// Diagnostic for member access on a handle that does not forward.
@@ -18036,6 +18271,41 @@ impl<'program> Checker<'program> {
     ) -> Option<String> {
         self.expr_class_type(expr, scopes, method_context)
             .map(|class| class.name)
+    }
+
+    fn flow_narrowed_type(
+        &mut self,
+        declared_ty: TypeId,
+        fallback_ty: TypeId,
+        span: Span,
+        method_context: Option<&MethodContext>,
+    ) -> TypeId {
+        match self.flow_facts.get(&(span.start, span.end)).cloned() {
+            Some(crate::narrowing::Fact::NonNull) => match self.types.kind(declared_ty) {
+                TypeKind::Nullable(inner) => *inner,
+                _ => fallback_ty,
+            },
+            Some(crate::narrowing::Fact::Null) => {
+                if matches!(self.types.kind(declared_ty), TypeKind::Nullable(_)) {
+                    declared_ty
+                } else {
+                    self.types.intern(TypeKind::Null)
+                }
+            }
+            Some(crate::narrowing::Fact::Exact(ty)) => {
+                let tested = self.resolve_type_ref_with_class(
+                    &ty,
+                    span,
+                    method_context.map(|context| context.class_name.as_str()),
+                );
+                if self.exact_type_test_can_match(declared_ty, tested) {
+                    tested
+                } else {
+                    fallback_ty
+                }
+            }
+            None => fallback_ty,
+        }
     }
 
     fn check_nullable_member_access(

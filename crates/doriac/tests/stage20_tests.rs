@@ -546,8 +546,9 @@ function main(): void throws Doria\Std\Io\IoError
 }
 
 #[test]
-fn owned_property_replacement_remains_behind_the_writable_path_move_boundary() {
-    assert_diagnostic(
+fn owned_property_replacement_accepts_an_independently_owned_take_parameter() {
+    doriac::check_source(
+        "owned-property-replacement.doria",
         r#"
 class Token {}
 
@@ -561,8 +562,8 @@ class Box
     }
 }
 "#,
-        "E0472",
-    );
+    )
+    .expect("a writable owning property should accept an independently owned replacement");
 }
 
 #[test]

@@ -2758,7 +2758,7 @@ fn php_backend_rejects_class_constant_named_class_case_insensitively() {
 }
 
 #[test]
-fn php_backend_rejects_instance_initializers_that_read_static_properties() {
+fn php_backend_moves_runtime_static_property_initializers_into_the_constructor() {
     let source = r#"
 class Counter
 {
@@ -2768,18 +2768,14 @@ class Counter
 "#;
     doriac::check_source("static-read-in-property.doria", source)
         .expect("the Doria initializer is valid independently of PHP restrictions");
-    let diagnostics = doriac::compile_source_to_php("static-read-in-property.doria", source)
-        .expect_err("PHP cannot emit a static property read in an instance default");
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "B2001"
-            && diagnostic
-                .message
-                .contains("instance property initializers that read static properties")
-    }));
+    let php = doriac::compile_source_to_php("static-read-in-property.doria", source)
+        .expect("runtime Doria initializers should lower into the PHP constructor");
+    assert!(php.contains("public int $value;"));
+    assert!(php.contains("$this->value = Counter::$seed;"));
 }
 
 #[test]
-fn php_backend_rejects_static_calls_in_instance_property_defaults() {
+fn php_backend_moves_static_calls_in_instance_initializers_before_constructor_body() {
     let source = r#"
 class Factory
 {
@@ -2789,18 +2785,14 @@ class Factory
 "#;
     doriac::check_source("static-call-in-property.doria", source)
         .expect("Doria property initializers may call declaring-class static methods");
-    let diagnostics = doriac::compile_source_to_php("static-call-in-property.doria", source)
-        .expect_err("PHP cannot emit a static call in an instance property default");
-    assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "B2001"
-            && diagnostic
-                .message
-                .contains("instance property initializers that call static methods")
-    }));
+    let php = doriac::compile_source_to_php("static-call-in-property.doria", source)
+        .expect("runtime Doria initializers should lower into the PHP constructor");
+    assert!(php.contains("public int $value;"));
+    assert!(php.contains("$this->value = Factory::seed();"));
 }
 
 #[test]
-fn php_backend_rejects_executable_instance_property_defaults() {
+fn php_backend_moves_executable_instance_initializers_into_generated_constructors() {
     let cases = [
         (
             "function-call-in-property.doria",
@@ -2808,7 +2800,7 @@ fn php_backend_rejects_executable_instance_property_defaults() {
 function seed(): int { return 42; }
 class Counter { int $value = seed(); }
 "#,
-            "instance property initializers that call functions",
+            "$this->value = seed();",
         ),
         (
             "construction-in-property.doria",
@@ -2816,19 +2808,52 @@ class Counter { int $value = seed(); }
 class Person {}
 class Office { Person $manager = new Person(); }
 "#,
-            "object construction in instance property initializers",
+            "$this->manager = new Person();",
         ),
     ];
 
-    for (path, source, expected_message) in cases {
+    for (path, source, expected_output) in cases {
         doriac::check_source(path, source)
             .expect("executable property defaults are valid Doria independently of PHP");
-        let diagnostics = doriac::compile_source_to_php(path, source)
-            .expect_err("PHP property defaults cannot execute calls or construction");
-        assert!(diagnostics.iter().any(|diagnostic| {
-            diagnostic.code == "B2001" && diagnostic.message.contains(expected_message)
-        }));
+        let php = doriac::compile_source_to_php(path, source)
+            .expect("the PHP backend should lower executable defaults into a constructor");
+        assert!(php.contains(expected_output), "generated PHP:\n{php}");
     }
+}
+
+#[test]
+fn php_backend_executes_constructor_rooted_and_owned_property_writes() {
+    let source =
+        include_str!("../../../examples/native/main_constructor_owned_property_writes.doria");
+    let php = doriac::compile_source_to_php("constructor-owned-property.doria", source)
+        .expect("constructor-rooted and owned property writes should lower to PHP");
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated constructor property PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout,
+        include_bytes!("fixtures/native_io/main_constructor_owned_property_writes/expected_stdout")
+    );
 }
 
 #[test]

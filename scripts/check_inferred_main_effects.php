@@ -75,7 +75,8 @@ function check_inferred_main_effects(string $root): array
             'Corrective Beat: Inferred Main Checked Effects — Complete',
             'Stage 30a Callable Grammar Completion — Complete',
             'Stage 30b Semantic Function Types And Captures — Complete',
-            'Stage 30c Ownership, Lifetime, And Escape — Next',
+            'Stage 30c Ownership, Lifetime, And Escape — Complete',
+            'Stage 30d Closure HIR/MIR And Interpreter Oracle — Next',
             'Stage 30 — In Progress, Not Complete',
         ]);
     }

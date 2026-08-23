@@ -102,6 +102,9 @@ Semantics:
 - Object, list, dictionary, and set initializers must not be shared accidentally between instances.
 - Initializers run before the constructor body.
 - Constructor-promoted properties are initialized from constructor arguments.
+- A constructor may traverse an initializer-initialized writable property and
+  mutate the owned child under ordinary writable-path rules.
+- An independently owned value may directly initialize an owning property.
 ```
 
 Example:
@@ -157,6 +160,14 @@ Constructor init access must account for property initializers:
 - The constructor must not assign it again unless Doria later adds an explicit override mechanism.
 - A readonly property without an initializer may be assigned exactly once through constructor init access.
 ```
+
+Direct constructor `$this` is a construction root rather than a writable
+receiver. An initializer-initialized writable property may supply ordinary
+writable access to its owned child, but a readonly intermediate blocks that
+path and a nested readonly property receives no constructor initialization
+privilege. An initialized writable owning property may be replaced after the
+new owned value has been acquired; checked failure leaves the old value in
+place.
 
 ---
 
@@ -436,6 +447,10 @@ Settled:
 - Doria should allow richer attribute expressions than PHP.
 - Instance property initializers should run per object construction, not be shared across instances.
 - PHP backend limitations must not restrict Doria syntax.
+- Constructor-rooted writable paths follow Decision 0122 rather than PHP's
+  object model.
+- Owned property initialization and writable replacement are accepted Doria;
+  general property move-out remains separate.
 ```
 
 Open:

@@ -339,15 +339,19 @@ class Person
 }
 ```
 
-To assign to a property, both the object path and the property must be writable, unless a constructor is initializing an uninitialized readonly property through constructor init access.
+To assign to a property, both the object path and the property must be writable, unless a constructor is directly initializing an uninitialized property through constructor init access.
 
-Constructor init access is narrower than writable `$this`. Inside `__construct`, a direct simple assignment such as `$this->id = $id;` may initialize an uninitialized readonly property of the declaring class exactly once on each reachable path. Property initializers and constructor-promoted parameters count as already initialized. Readonly init access does not permit compound assignments, nested writes such as `$this->child->name = "Lucy";`, calls to writable methods through `$this`, or initialization from repeatable bodies such as `foreach`. Writable properties must be initialized before observation or normal constructor completion; later ordinary writable mutation remains legal. Branches merge only normally continuing paths, panic-terminated paths produce no object, and every property must be definitely initialized at each fallthrough or explicit-return completion. An incomplete `$this` cannot be exposed to another call or ordinary instance method.
+Constructor init access is narrower than writable `$this`. Inside `__construct`, a direct simple assignment such as `$this->id = $id;` may initialize an uninitialized property of the declaring class exactly once on each reachable path. Property initializers and constructor-promoted parameters count as already initialized. Direct readonly init access does not permit compound assignment, nested readonly initialization, calls to writable methods through direct `$this`, or initialization from repeatable bodies such as `foreach`.
+
+Direct constructor `$this` is a construction root. It may traverse through a definitely initialized, non-null, writable property and then perform ordinary mutation on the owned child. Every further intermediate must satisfy the same ordinary initialization and writable-path rules. Thus `$this->window->title = "Lucy";`, `$this->state->counter += 1;`, nested writable method calls, collection mutation, and indexed mutation are valid when the path grants writable access; a readonly or maybe-uninitialized intermediate remains an error. This traversal does not make `$this` generally writable and does not give constructor initialization privilege to a nested readonly property.
+
+Writable properties must be initialized before observation or normal constructor completion; later ordinary writable mutation remains legal. Branches merge only normally continuing paths, panic-terminated paths produce no object, and every property must be definitely initialized at each fallthrough or explicit-return completion. An incomplete `$this` cannot be exposed to another call or ordinary instance method.
 
 The access `__construct` has to the instance under construction is granted by the construction protocol itself and is never declared. Explicit `writable` on `__construct` or `__destruct` is a compile error with a machine-applicable fix that removes `writable`. This removes a spelling, not an access rule: it does not make `$this` writable and does not widen constructor init access beyond the narrow rules above plus normal mutation of writable properties. Lifecycle methods are compiler-invoked protocol points, not ordinary methods. Stages 19 and 21 formalize construction natively through drop elaboration and definite initialization without changing these source-level rules.
 
 Function parameters are readonly by default and become writable only with `writable`. A `take` parameter gives the callee ownership of a class move value; the call site remains unmarked, and the caller cannot use that value afterward. `take` and `writable` are mutually exclusive. Copy-type arguments retain their ordinary Copy behavior.
 
-Readonly controls mutation, not ownership transfer: a readonly class binding may be moved from. Assigning a new owner to that moved-from binding is mutation and therefore requires `writable`. Direct moves into or out of nested owned properties remain unsupported until writable-path move rules are specified.
+Readonly controls mutation, not ownership transfer: a readonly class binding may be moved from. Assigning a new owner to that moved-from binding is mutation and therefore requires `writable`. An independently owned value may initialize an owning instance property or replace an initialized writable owning property. Replacement evaluates and acquires the new value before destroying the old value; checked failure leaves the old property unchanged. Borrowed values, self-moves, and overlapping transfers are rejected. Moving a value out of a property remains separate because Doria has no accepted property-hole or take-and-replace operation.
 
 Every parameter in Doria source has an explicit type. This applies to all function-like parameter lists: free functions, methods, constructors, anonymous functions, arrow functions, interface requirements, trait requirements, property hook setters, and future callback-style declarations. Doria does not infer omitted parameter types in any context.
 
@@ -450,16 +454,20 @@ callable narrowing, callable-value calls, and callable properties. Source type
 grouping remains transparent and does not create a tuple type.
 
 No closure executes yet. A semantically valid closure construction or
-function-value call stops at the catalogued `E0641` execution boundary. Capture
-acquisition, move-state changes, lifetime and escape checks remain Stage 30c;
-HIR, MIR, and interpreter execution remain Stage 30d.
+function-value call stops at the catalogued `E0641` execution boundary. Stage
+30c acquires captures at closure creation, treats every function value as Move,
+tracks readonly and writable capture leases to their last use, consumes `once`
+calls path-sensitively, rejects invalid escape and storage, validates returned
+borrow roots, and records reverse logical release plans. HIR, MIR, environments,
+indirect calls, and interpreter execution remain Stage 30d.
 
 ```text
 Stage 30a Callable Grammar Completion - Complete
 Stage 30b Semantic Function Types And Captures - Complete
-Stage 30c Ownership, Lifetime, And Escape - Next
+Stage 30c Ownership, Lifetime, And Escape - Complete
+Stage 30d Closure HIR/MIR And Interpreter Oracle - Next
 Stage 30 - In Progress, Not Complete
-E0641 - Narrowed Execution Boundary
+E0641 - HIR/MIR/Runtime Execution Boundary
 ```
 
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.
@@ -1548,7 +1556,7 @@ function __construct(
 }
 ```
 
-Constructor init access is supported for direct initialization of uninitialized readonly properties inside constructor bodies:
+Constructor init access supports direct initialization of uninitialized properties inside constructor bodies:
 
 ```doria
 class Person
@@ -1562,7 +1570,45 @@ class Person
 }
 ```
 
-This does not make `$this` writable. The constructor cannot assign the same readonly property twice on one reachable path, cannot reassign a readonly property that already has an initializer or is promoted from a constructor parameter, cannot use compound assignment for init access, and cannot use init access for nested object paths. Conditional readonly initialization is valid when every normally continuing branch initializes the property exactly once. A readonly property initialized on only some incoming paths cannot be repaired after the merge with an unconditional assignment.
+This does not make `$this` writable. The constructor cannot assign the same readonly property twice on one reachable path, cannot reassign a readonly property that already has an initializer or is promoted from a constructor parameter, cannot use compound assignment for direct readonly init access, and cannot use constructor privilege to initialize a nested readonly property. Conditional readonly initialization is valid when every normally continuing branch initializes the property exactly once. A readonly property initialized on only some incoming paths cannot be repaired after the merge with an unconditional assignment.
+
+A definitely initialized writable intermediate supplies ordinary writable access
+to its owned child:
+
+```doria
+class Window
+{
+    writable string $title = "";
+}
+
+class Application
+{
+    internal writable Window $window = new Window();
+
+    function __construct(string $initialTitle)
+    {
+        $this->window->title = $initialTitle;
+    }
+}
+```
+
+An owned value may also directly initialize an owning property:
+
+```doria
+class Application
+{
+    internal writable Window $window;
+
+    function __construct(string $initialTitle)
+    {
+        $this->window = new Window($initialTitle);
+    }
+}
+```
+
+An initialized writable owning property may later be replaced from a fresh or
+otherwise independently owned value. The new value is acquired before the old
+value is destroyed. General move-out from a property remains unavailable.
 
 Doria should support richer instance property initializers than PHP:
 
