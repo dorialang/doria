@@ -1,4 +1,6 @@
-use doriac::diagnostics::{Diagnostic, DiagnosticFormat, DiagnosticSeverity, RenderOptions};
+use doriac::diagnostics::{
+    Diagnostic, DiagnosticFormat, DiagnosticSeverity, FixApplicability, RenderOptions,
+};
 use doriac::ownership::{
     CaptureAcquisitionKind, ClosureEscapeClassification, ClosureValueProvenance,
     InvocationConsumption,
@@ -25,6 +27,71 @@ fn diagnostic<'a>(diagnostics: &'a [Diagnostic], code: &str) -> &'a Diagnostic {
         .iter()
         .find(|diagnostic| diagnostic.code == code)
         .unwrap_or_else(|| panic!("expected {code}, got {diagnostics:#?}"))
+}
+
+fn apply_current_source_fix(source: &str, diagnostic: &Diagnostic) -> String {
+    let mut edits = diagnostic
+        .fixes
+        .first()
+        .expect("diagnostic should carry a structured fix")
+        .edits
+        .clone();
+    edits.sort_by_key(|edit| std::cmp::Reverse((edit.span.start, edit.span.end)));
+    let mut rewritten = source.to_string();
+    for edit in edits {
+        rewritten.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+    }
+    rewritten
+}
+
+#[test]
+fn ownership_transfer_fixes_are_review_only_and_preserve_trivia() {
+    let capture_source = r#"
+function main(): void
+{
+    let $value = 1;
+    let $borrowed = fn() with (/* keep capture */ $value) => $value;
+    List<function(): int> $items = [$borrowed];
+}
+"#;
+    let capture = analyze(capture_source);
+    let escape = diagnostic(&capture.diagnostics, "E0658");
+    assert_eq!(escape.fixes.len(), 1, "{escape:#?}");
+    assert_eq!(
+        escape.fixes[0].applicability,
+        FixApplicability::RequiresReview
+    );
+    let rewritten = apply_current_source_fix(capture_source, escape);
+    assert!(rewritten.contains("/* keep capture */ take $value"));
+
+    let parameter_source = r#"
+class Store
+{
+    writable function(): int $callback = fn() => 0;
+    writable function retain(/* keep parameter */ function(): int $input): void
+    {
+        $this->callback = $input;
+    }
+}
+"#;
+    let parameter = analyze(parameter_source);
+    let retention = diagnostic(&parameter.diagnostics, "E0657");
+    assert_eq!(retention.fixes.len(), 1, "{retention:#?}");
+    assert_eq!(
+        retention.fixes[0].applicability,
+        FixApplicability::RequiresReview
+    );
+    let rewritten = apply_current_source_fix(parameter_source, retention);
+    assert!(rewritten.contains("/* keep parameter */ take function(): int $input"));
+
+    for fix in escape.fixes.iter().chain(&retention.fixes) {
+        assert_ne!(fix.applicability, FixApplicability::MachineApplicable);
+        assert!(fix.edits.iter().all(|edit| {
+            !edit.replacement.contains("clone")
+                && !edit.replacement.contains("SharedReference")
+                && !edit.replacement.contains("lifetime")
+        }));
+    }
 }
 
 #[test]

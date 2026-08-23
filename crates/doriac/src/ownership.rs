@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::{self, Argument, AssignOp, BinaryOp, ClassMember, Expr, Item, Stmt};
 use crate::builtins::Builtin;
-use crate::diagnostics::Diagnostic;
+use crate::diagnostics::{Diagnostic, DiagnosticSource, FixApplicability, FixEdit};
 use crate::narrowing::{Fact, FactsByUse};
 use crate::source::Span;
 use crate::symbols::{
@@ -376,6 +376,7 @@ struct FunctionValueState {
     provenance: ClosureValueProvenance,
     leases: Vec<ClosureLease>,
     nonescaping_parameter: bool,
+    take_parameter_insertion: Option<Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -1679,6 +1680,7 @@ impl Checker<'_> {
         &self,
         id: Option<BindingId>,
         ownership: BindingOwnership,
+        take_parameter_insertion: Option<Span>,
     ) -> Option<FunctionValueState> {
         self.canonical_function_type(id)
             .map(|_| FunctionValueState {
@@ -1692,6 +1694,7 @@ impl Checker<'_> {
                 },
                 leases: Vec::new(),
                 nonescaping_parameter: ownership != BindingOwnership::Owned,
+                take_parameter_insertion,
             })
     }
 
@@ -1807,7 +1810,11 @@ impl Checker<'_> {
             } else {
                 BindingOwnership::ReadonlyBorrow
             };
-            let function_value = self.parameter_function_value(canonical_id, ownership);
+            let function_value = self.parameter_function_value(
+                canonical_id,
+                ownership,
+                (!param.take && !param.writable).then_some(param.ownership_modifier_insert),
+            );
             scopes.declare(
                 param.name.clone(),
                 Binding {
@@ -3012,6 +3019,7 @@ impl Checker<'_> {
                     } else {
                         BindingOwnership::ReadonlyBorrow
                     },
+                    None,
                 ),
                 scope_depth: scopes.lexical_depth(),
             },
@@ -3414,6 +3422,7 @@ impl Checker<'_> {
                 provenance,
                 leases,
                 nonescaping_parameter: false,
+                take_parameter_insertion: None,
             },
         );
     }
@@ -3457,6 +3466,7 @@ impl Checker<'_> {
                         }),
                         leases,
                         nonescaping_parameter: false,
+                        take_parameter_insertion: None,
                     }
                 }),
         }
@@ -3582,8 +3592,7 @@ impl Checker<'_> {
         else {
             return true;
         };
-        self.diagnostics.push(self.with_function_value_cause(
-            Diagnostic::new(
+        let diagnostic = Diagnostic::new(
                 "E0658",
                 "closure cannot remain usable after its captured value leaves scope",
                 span,
@@ -3591,24 +3600,25 @@ impl Checker<'_> {
             .with_title("Closure Cannot Outlive Captured Value")
             .with_primary_label("Closure Escapes To A Longer-Lived Binding Here")
             .with_related(lease.capture_span, "Captured Value Is Borrowed Here")
-            .with_help("keep the closure inside the captured value's scope or capture an owned value with `take`"),
-            value,
-        ));
+            .with_help("keep the closure inside the captured value's scope or capture an owned value with `take`");
+        let diagnostic = self.with_taking_capture_fix(diagnostic, value);
+        self.diagnostics
+            .push(self.with_function_value_cause(diagnostic, value));
         false
     }
 
     fn validate_returned_function_value(&mut self, value: &FunctionValueState, span: Span) -> bool {
         if value.nonescaping_parameter {
-            self.diagnostics.push(self.with_function_value_cause(
-                Diagnostic::new(
+            let diagnostic = Diagnostic::new(
                     "E0657",
                     "nonescaping callback parameter cannot be returned",
                     span,
                 )
                 .with_title("Nonescaping Callback Cannot Be Retained")
-                .with_help("accept the callback through a `take function(...)` parameter when ownership must leave the call"),
-                value,
-            ));
+                .with_help("accept the callback through a `take function(...)` parameter when ownership must leave the call");
+            let diagnostic = self.with_take_parameter_fix(diagnostic, value);
+            self.diagnostics
+                .push(self.with_function_value_cause(diagnostic, value));
             return false;
         }
         let ClosureValueProvenance::BorrowBound(roots) = &value.provenance else {
@@ -3693,6 +3703,82 @@ impl Checker<'_> {
         }
     }
 
+    fn with_taking_capture_fix(
+        &self,
+        diagnostic: Diagnostic,
+        value: &FunctionValueState,
+    ) -> Diagnostic {
+        let Some(ownership) = value
+            .closure_id
+            .and_then(|closure_id| self.closure_ownership.get(&closure_id))
+        else {
+            return diagnostic;
+        };
+        if !matches!(ownership.provenance, ClosureValueProvenance::BorrowBound(_)) {
+            return diagnostic;
+        }
+
+        let mut edits = Vec::new();
+        for acquisition in &ownership.acquisitions {
+            if acquisition.roots.is_empty() {
+                continue;
+            }
+            if acquisition.kind != CaptureAcquisitionKind::ReadonlyLease {
+                return diagnostic;
+            }
+            let Some(source) = self
+                .binding_resolution
+                .declarations_by_id
+                .get(&acquisition.source_binding_id)
+            else {
+                return diagnostic;
+            };
+            if source.kind == BindingKind::MethodReceiver
+                || ((resolved_type_is_move_type(&acquisition.source_type, &self.move_enum_names)
+                    || resolved_type_requires_conservative_move(&acquisition.source_type))
+                    && source.ownership != BindingOwnership::Owned)
+            {
+                return diagnostic;
+            }
+            edits.push(FixEdit {
+                source: DiagnosticSource::Current,
+                span: Span::new(
+                    acquisition.capture_span.start,
+                    acquisition.capture_span.start,
+                ),
+                replacement: "take ".to_string(),
+            });
+        }
+        if edits.is_empty() {
+            diagnostic
+        } else {
+            diagnostic.with_structured_fix(
+                "Capture Borrowed Values With Ownership",
+                FixApplicability::RequiresReview,
+                edits,
+            )
+        }
+    }
+
+    fn with_take_parameter_fix(
+        &self,
+        diagnostic: Diagnostic,
+        value: &FunctionValueState,
+    ) -> Diagnostic {
+        let Some(insertion) = value.take_parameter_insertion else {
+            return diagnostic;
+        };
+        diagnostic.with_structured_fix(
+            "Accept Callback With Ownership",
+            FixApplicability::RequiresReview,
+            vec![FixEdit {
+                source: DiagnosticSource::Current,
+                span: insertion,
+                replacement: "take ".to_string(),
+            }],
+        )
+    }
+
     fn validate_owned_function_storage(
         &mut self,
         value: &FunctionValueState,
@@ -3700,29 +3786,29 @@ impl Checker<'_> {
         destination: &str,
     ) -> bool {
         if value.nonescaping_parameter {
-            self.diagnostics.push(self.with_function_value_cause(
-                Diagnostic::new(
+            let diagnostic = Diagnostic::new(
                     "E0657",
                     format!("nonescaping callback parameter cannot be stored in {destination}"),
                     span,
                 )
                 .with_title("Nonescaping Callback Cannot Be Retained")
-                .with_help("accept the callback through a `take function(...)` parameter when retention is intended"),
-                value,
-            ));
+                .with_help("accept the callback through a `take function(...)` parameter when retention is intended");
+            let diagnostic = self.with_take_parameter_fix(diagnostic, value);
+            self.diagnostics
+                .push(self.with_function_value_cause(diagnostic, value));
             return false;
         }
         if matches!(value.provenance, ClosureValueProvenance::BorrowBound(_)) {
-            self.diagnostics.push(self.with_function_value_cause(
-                Diagnostic::new(
+            let diagnostic = Diagnostic::new(
                     "E0658",
                     format!("borrow-bound closure cannot be stored in {destination}"),
                     span,
                 )
                 .with_title("Borrow-Bound Closure Cannot Enter Owned Storage")
-                .with_help("capture independently owned values with `take`, or keep the closure in a lifetime-safe local"),
-                value,
-            ));
+                .with_help("capture independently owned values with `take`, or keep the closure in a lifetime-safe local");
+            let diagnostic = self.with_taking_capture_fix(diagnostic, value);
+            self.diagnostics
+                .push(self.with_function_value_cause(diagnostic, value));
             return false;
         }
         self.mark_closure_escape(value, ClosureEscapeClassification::Owned);
@@ -3824,28 +3910,33 @@ impl Checker<'_> {
                 }) {
                     return;
                 }
+                let nonescaping_value = (mode == UseMode::Give)
+                    .then(|| {
+                        scopes
+                            .get(name)
+                            .and_then(|binding| binding.function_value.as_ref())
+                            .filter(|value| value.nonescaping_parameter)
+                            .cloned()
+                    })
+                    .flatten();
+                if let Some(value) = nonescaping_value {
+                    let diagnostic = Diagnostic::new(
+                        "E0657",
+                        format!("nonescaping callback `${name}` cannot transfer ownership"),
+                        *span,
+                    )
+                    .with_title("Nonescaping Callback Cannot Be Retained")
+                    .with_help(
+                        "declare the parameter with `take` when ownership must leave the call",
+                    );
+                    let diagnostic = self.with_take_parameter_fix(diagnostic, &value);
+                    self.diagnostics
+                        .push(self.with_function_value_cause(diagnostic, &value));
+                    return;
+                }
                 let Some(binding) = scopes.get_mut(name) else {
                     return;
                 };
-                if mode == UseMode::Give
-                    && binding
-                        .function_value
-                        .as_ref()
-                        .is_some_and(|value| value.nonescaping_parameter)
-                {
-                    self.diagnostics.push(
-                        Diagnostic::new(
-                            "E0657",
-                            format!("nonescaping callback `${name}` cannot transfer ownership"),
-                            *span,
-                        )
-                        .with_title("Nonescaping Callback Cannot Be Retained")
-                        .with_help(
-                            "declare the parameter with `take` when ownership must leave the call",
-                        ),
-                    );
-                    return;
-                }
                 if mode == UseMode::Write && !binding.writable {
                     let diagnostic = if binding.function_type.is_some() {
                         Diagnostic::new(
@@ -4555,6 +4646,7 @@ impl Checker<'_> {
                     } else {
                         BindingOwnership::Owned
                     },
+                    None,
                 ),
                 scope_depth: scopes.lexical_depth(),
             },
@@ -4658,7 +4750,14 @@ impl Checker<'_> {
                         State::Borrowed
                     },
                     function_type: non_null_function_type(source_type).cloned(),
-                    function_value: self.parameter_function_value(canonical_id, ownership),
+                    function_value: self.parameter_function_value(
+                        canonical_id,
+                        ownership,
+                        (!parameter.take && !parameter.writable).then_some(Span::new(
+                            parameter.type_span.start,
+                            parameter.type_span.start,
+                        )),
+                    ),
                     scope_depth: scopes.lexical_depth(),
                 },
             );
