@@ -75,7 +75,7 @@ function check_constructor_owned_property_writes(string $root): array
         'Stale Restriction Now Provably Safe',
         'Historical Diagnostic',
         'E0472 move-in route',
-        'E0641 closure execution boundary',
+        'E0641 closure target boundary',
         'Collection `Cloneable` boundaries',
     ]);
     $require($specPath, $spec, [
@@ -89,7 +89,8 @@ function check_constructor_owned_property_writes(string $root): array
             'Stage 30b Semantic Function Types And Captures — Complete',
             'Constructor Writable-Path And Owned-Property Corrective Beat — Complete',
             'Stage 30c Ownership, Lifetime, And Escape — Complete',
-            'Stage 30d Closure HIR/MIR And Interpreter Oracle — Next',
+            'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
+            'Stage 30e Native Execution — Next',
             'Stage 30 — In Progress, Not Complete',
         ]);
     }

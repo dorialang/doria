@@ -13,6 +13,7 @@ use crate::enums::{
 use crate::format_string::FormatPiece;
 use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 use crate::source::{SourceFile, Span};
+use crate::symbols::{BindingId, ClosureId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FunctionId(pub usize);
@@ -38,6 +39,18 @@ pub struct ErrorDescriptorId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ErrorOriginId(pub usize);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FunctionTypeId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClosureDescriptorId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ClosureEnvironmentLayoutId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ClosureEnvironmentFieldId(pub usize);
+
 #[derive(Debug, Clone)]
 pub struct Program {
     pub source: SourceFile,
@@ -47,6 +60,9 @@ pub struct Program {
     pub statics: Vec<StaticProperty>,
     pub error_descriptors: Vec<ErrorDescriptor>,
     pub error_origins: Vec<ErrorOrigin>,
+    pub function_types: Vec<FunctionType>,
+    pub closure_descriptors: Vec<ClosureDescriptor>,
+    pub closure_environment_layouts: Vec<ClosureEnvironmentLayout>,
     pub functions: Vec<Function>,
     pub entry: FunctionId,
 }
@@ -59,6 +75,9 @@ impl PartialEq for Program {
             && self.statics == other.statics
             && self.error_descriptors == other.error_descriptors
             && self.error_origins == other.error_origins
+            && self.function_types == other.function_types
+            && self.closure_descriptors == other.closure_descriptors
+            && self.closure_environment_layouts == other.closure_environment_layouts
             && self.functions == other.functions
             && self.entry == other.entry
     }
@@ -246,7 +265,9 @@ pub struct Function {
     pub source_span: Span,
     pub method: Option<MethodIdentity>,
     pub receiver_mode: Option<ReceiverMode>,
+    pub closure: Option<ClosureFunction>,
     pub params: Vec<LocalId>,
+    pub parameter_modes: Vec<FunctionParameterMode>,
     pub return_type: ReturnType,
     pub checked_effects: Vec<CheckedEffect>,
     pub locals: Vec<Local>,
@@ -260,7 +281,9 @@ impl PartialEq for Function {
             && self.name == other.name
             && self.method == other.method
             && self.receiver_mode == other.receiver_mode
+            && self.closure == other.closure
             && self.params == other.params
+            && self.parameter_modes == other.parameter_modes
             && self.return_type == other.return_type
             && self.checked_effects == other.checked_effects
             && self.locals == other.locals
@@ -270,6 +293,90 @@ impl PartialEq for Function {
 }
 
 impl Eq for Function {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FunctionInvocationMode {
+    Readonly,
+    Writable,
+    Once,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FunctionParameterMode {
+    Readonly,
+    Writable,
+    Take,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FunctionParameter {
+    pub mode: FunctionParameterMode,
+    pub ty: Type,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FunctionType {
+    pub id: FunctionTypeId,
+    pub invocation_mode: FunctionInvocationMode,
+    pub parameters: Vec<FunctionParameter>,
+    pub return_type: ReturnType,
+    pub checked_effects: Vec<CheckedEffect>,
+    pub return_borrow: Option<ReturnBorrow>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureDescriptor {
+    pub id: ClosureDescriptorId,
+    pub source_closure: ClosureId,
+    pub function_type: FunctionTypeId,
+    pub entry_function: FunctionId,
+    pub environment_layout: Option<ClosureEnvironmentLayoutId>,
+    pub invocation_mode: FunctionInvocationMode,
+    pub source_span: Span,
+    pub debug_identity: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClosureEnvironmentStorage {
+    ReadonlyBorrow,
+    WritableBorrow,
+    Owned,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClosureCaptureAcquisition {
+    ReadonlyBorrow,
+    WritableBorrow,
+    Copy,
+    Move,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureEnvironmentField {
+    pub id: ClosureEnvironmentFieldId,
+    pub logical_index: usize,
+    pub physical_index: usize,
+    pub ty: Type,
+    pub storage: ClosureEnvironmentStorage,
+    pub source_binding: BindingId,
+    pub environment_binding: BindingId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureEnvironmentLayout {
+    pub id: ClosureEnvironmentLayoutId,
+    pub fields: Vec<ClosureEnvironmentField>,
+    pub logical_release_order: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClosureFunction {
+    pub descriptor: ClosureDescriptorId,
+    pub function_type: FunctionTypeId,
+    pub environment_layout: Option<ClosureEnvironmentLayoutId>,
+    pub hidden_environment: LocalId,
+    pub capture_locals: Vec<(ClosureEnvironmentFieldId, LocalId)>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodIdentity {
@@ -285,19 +392,19 @@ pub enum ReceiverMode {
     UnsupportedConsuming,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ReturnBorrow {
     pub source: BorrowSource,
     pub writable: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BorrowSource {
     Receiver,
     Parameter(usize),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReturnType {
     Value(Type),
     Void,
@@ -369,6 +476,9 @@ pub enum Type {
     NullableCollection(CollectionTypeId),
     PayloadEnum(PayloadEnumType),
     NullablePayloadEnum(PayloadEnumType),
+    Function(FunctionTypeId),
+    NullableFunction(FunctionTypeId),
+    ClosureEnvironment(Option<ClosureEnvironmentLayoutId>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -447,6 +557,8 @@ impl Type {
                     capabilities: EnumCapabilities { copy: false, .. },
                     ..
                 })
+                | Self::Function(_)
+                | Self::NullableFunction(_)
         )
     }
 
@@ -564,6 +676,114 @@ pub struct StringIntrinsicCall {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClosureCaptureOperand {
+    BorrowLocal { local: LocalId, writable: bool },
+    CopyValue(Rvalue),
+    MoveValue(Rvalue),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FunctionExpression {
+    Create {
+        function_type: FunctionTypeId,
+        descriptor: ClosureDescriptorId,
+        captures: Vec<ClosureCaptureOperand>,
+        span: Span,
+    },
+    Local {
+        function_type: FunctionTypeId,
+        local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        function_type: FunctionTypeId,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Call {
+        function_type: FunctionTypeId,
+        function: FunctionId,
+        return_borrow: Option<ReturnBorrow>,
+        args: Vec<Rvalue>,
+    },
+    CollectionIndex {
+        function_type: FunctionTypeId,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        positional: bool,
+        remove: bool,
+    },
+    AssumePresent {
+        function_type: FunctionTypeId,
+        value: Box<NullableFunctionExpression>,
+    },
+}
+
+impl FunctionExpression {
+    pub const fn function_type(&self) -> FunctionTypeId {
+        match self {
+            Self::Create { function_type, .. }
+            | Self::Local { function_type, .. }
+            | Self::Property { function_type, .. }
+            | Self::Call { function_type, .. }
+            | Self::CollectionIndex { function_type, .. }
+            | Self::AssumePresent { function_type, .. } => *function_type,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NullableFunctionExpression {
+    Null {
+        function_type: FunctionTypeId,
+    },
+    Present(FunctionExpression),
+    Local {
+        function_type: FunctionTypeId,
+        local: LocalId,
+        transfer: bool,
+    },
+    Property {
+        function_type: FunctionTypeId,
+        object: LocalId,
+        property: PropertyId,
+    },
+    Call {
+        function_type: FunctionTypeId,
+        function: FunctionId,
+        return_borrow: Option<ReturnBorrow>,
+        args: Vec<Rvalue>,
+    },
+    DictionaryGet {
+        function_type: FunctionTypeId,
+        collection: LocalId,
+        key: Box<Rvalue>,
+        access: NullableCollectionAccess,
+    },
+    CollectionIndex {
+        function_type: FunctionTypeId,
+        collection: LocalId,
+        index: Box<Rvalue>,
+        positional: bool,
+        remove: bool,
+    },
+}
+
+impl NullableFunctionExpression {
+    pub const fn function_type(&self) -> FunctionTypeId {
+        match self {
+            Self::Null { function_type }
+            | Self::Local { function_type, .. }
+            | Self::Property { function_type, .. }
+            | Self::Call { function_type, .. } => *function_type,
+            Self::DictionaryGet { function_type, .. }
+            | Self::CollectionIndex { function_type, .. } => *function_type,
+            Self::Present(value) => value.function_type(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Rvalue {
     Value(ValueExpression),
     String(StringExpression),
@@ -589,6 +809,8 @@ pub enum Rvalue {
     NullableCollection(NullableCollectionExpression),
     PayloadEnum(PayloadEnumExpression),
     NullablePayloadEnum(NullablePayloadEnumExpression),
+    Function(FunctionExpression),
+    NullableFunction(NullableFunctionExpression),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -632,6 +854,8 @@ impl Rvalue {
             Self::NullableCollection(value) => Type::NullableCollection(value.collection()),
             Self::PayloadEnum(value) => Type::PayloadEnum(value.ty()),
             Self::NullablePayloadEnum(value) => Type::NullablePayloadEnum(value.ty()),
+            Self::Function(value) => Type::Function(value.function_type()),
+            Self::NullableFunction(value) => Type::NullableFunction(value.function_type()),
         }
     }
 
@@ -639,7 +863,10 @@ impl Rvalue {
         match self {
             Self::Class(value) => value.owned_temporary_class(),
             Self::NullableClass(value) => value.owned_temporary_class(),
-            Self::Collection(_) | Self::NullableCollection(_) => None,
+            Self::Collection(_)
+            | Self::NullableCollection(_)
+            | Self::Function(_)
+            | Self::NullableFunction(_) => None,
             Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -688,7 +915,9 @@ impl Rvalue {
             | Self::SharedReferenceAccess(_)
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
-            | Self::NullablePayloadEnum(_) => None,
+            | Self::NullablePayloadEnum(_)
+            | Self::Function(_)
+            | Self::NullableFunction(_) => None,
         }
     }
 
@@ -745,7 +974,9 @@ impl Rvalue {
             | Self::Collection(_)
             | Self::NullableCollection(_)
             | Self::PayloadEnum(_)
-            | Self::NullablePayloadEnum(_) => None,
+            | Self::NullablePayloadEnum(_)
+            | Self::Function(_)
+            | Self::NullableFunction(_) => None,
         }
     }
 
@@ -782,7 +1013,9 @@ impl Rvalue {
             | Self::SharedReferenceAccess(_)
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
-            | Self::NullablePayloadEnum(_) => false,
+            | Self::NullablePayloadEnum(_)
+            | Self::Function(_)
+            | Self::NullableFunction(_) => false,
         }
     }
 
@@ -811,6 +1044,8 @@ impl Rvalue {
             Self::NullableError(value) => value.is_borrowed(),
             Self::PayloadEnum(value) => !value.owned_temporary(),
             Self::NullablePayloadEnum(value) => !value.owned_temporary(),
+            Self::Function(value) => function_expression_is_borrowed(value),
+            Self::NullableFunction(value) => nullable_function_expression_is_borrowed(value),
             Self::Value(_)
             | Self::String(_)
             | Self::NullableScalar(_)
@@ -837,6 +1072,7 @@ impl Rvalue {
                 | Self::NullableMixed(NullableMixedExpression::Null)
                 | Self::NullableError(NullableErrorExpression::Null)
                 | Self::NullablePayloadEnum(NullablePayloadEnumExpression::Null(_))
+                | Self::NullableFunction(NullableFunctionExpression::Null { .. })
         )
     }
 
@@ -962,6 +1198,16 @@ impl Rvalue {
                 mode: PayloadEnumUseMode::Move,
                 ..
             }) => Some(*local),
+            Self::Function(FunctionExpression::Local {
+                local,
+                transfer: true,
+                ..
+            })
+            | Self::NullableFunction(NullableFunctionExpression::Local {
+                local,
+                transfer: true,
+                ..
+            }) => Some(*local),
             Self::Value(_)
             | Self::String(_)
             | Self::Mixed(_)
@@ -985,7 +1231,9 @@ impl Rvalue {
             | Self::SharedReferenceAccess(_)
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
-            | Self::NullablePayloadEnum(_) => None,
+            | Self::NullablePayloadEnum(_)
+            | Self::Function(_)
+            | Self::NullableFunction(_) => None,
         }
     }
 
@@ -1014,8 +1262,39 @@ impl Rvalue {
             | Self::SharedReferenceAccess(_)
             | Self::NullableSharedReferenceAccess(_)
             | Self::PayloadEnum(_)
-            | Self::NullablePayloadEnum(_) => MixedOwnership::None,
+            | Self::NullablePayloadEnum(_)
+            | Self::Function(_)
+            | Self::NullableFunction(_) => MixedOwnership::None,
         }
+    }
+}
+
+pub(crate) fn function_expression_is_borrowed(value: &FunctionExpression) -> bool {
+    match value {
+        FunctionExpression::Create { .. } | FunctionExpression::Call { .. } => false,
+        FunctionExpression::Local { transfer, .. } => !transfer,
+        FunctionExpression::Property { .. } => true,
+        FunctionExpression::CollectionIndex { remove, .. } => !remove,
+        FunctionExpression::AssumePresent { value, .. } => {
+            nullable_function_expression_is_borrowed(value)
+        }
+    }
+}
+
+fn nullable_function_expression_is_borrowed(value: &NullableFunctionExpression) -> bool {
+    match value {
+        NullableFunctionExpression::Null { .. } | NullableFunctionExpression::Call { .. } => false,
+        NullableFunctionExpression::Present(value) => function_expression_is_borrowed(value),
+        NullableFunctionExpression::Local { transfer, .. } => !transfer,
+        NullableFunctionExpression::Property { .. } => true,
+        NullableFunctionExpression::DictionaryGet { access, .. } => !matches!(
+            access,
+            NullableCollectionAccess::Remove
+                | NullableCollectionAccess::Pop
+                | NullableCollectionAccess::PopFront
+                | NullableCollectionAccess::PopBack
+        ),
+        NullableFunctionExpression::CollectionIndex { remove, .. } => !remove,
     }
 }
 
@@ -3383,6 +3662,7 @@ pub enum BoolExpression {
     NullableMixedIsPresent(Box<NullableMixedExpression>),
     NullableErrorIsPresent(Box<NullableErrorExpression>),
     NullablePayloadEnumIsPresent(Box<NullablePayloadEnumExpression>),
+    NullableFunctionIsPresent(Box<NullableFunctionExpression>),
     PayloadEnumCompare {
         op: CompareOp,
         left: Box<PayloadEnumExpression>,
@@ -3458,6 +3738,13 @@ pub enum BoolBinaryOp {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
+    /// Makes closure environment fields available through ordinary local IDs
+    /// in a synthetic closure function. The interpreter binds these locals to
+    /// stable places; no values are copied by this statement.
+    BindClosureEnvironment {
+        environment: LocalId,
+        bindings: Vec<(ClosureEnvironmentFieldId, LocalId)>,
+    },
     AssignLocal {
         target: LocalId,
         value: Rvalue,
@@ -3608,6 +3895,11 @@ pub enum Statement {
     DropPayloadEnum {
         local: LocalId,
         ty: PayloadEnumType,
+        nullable: bool,
+    },
+    DropFunction {
+        local: LocalId,
+        function_type: FunctionTypeId,
         nullable: bool,
     },
 }
@@ -3798,6 +4090,26 @@ pub enum Terminator {
         failure: BlockId,
         span: Span,
     },
+    IndirectCall {
+        callee: FunctionExpression,
+        function_type: FunctionTypeId,
+        invocation_mode: FunctionInvocationMode,
+        args: Vec<Rvalue>,
+        result: Option<LocalId>,
+        continuation: BlockId,
+        span: Span,
+    },
+    CheckedIndirectCall {
+        callee: FunctionExpression,
+        function_type: FunctionTypeId,
+        invocation_mode: FunctionInvocationMode,
+        args: Vec<Rvalue>,
+        result: Option<LocalId>,
+        error: LocalId,
+        success: BlockId,
+        failure: BlockId,
+        span: Span,
+    },
     CheckedConstruct {
         class: ClassId,
         properties: Vec<PropertyValue>,
@@ -3857,6 +4169,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
             rvalue_class_temporary_capacity(index) + rvalue_class_temporary_capacity(value)
         }
         Statement::EchoStringLiteral(_)
+        | Statement::BindClosureEnvironment { .. }
         | Statement::BindPayloadEnumFields { .. }
         | Statement::MatchResultPlan { .. }
         | Statement::ControlFlowPlan(_)
@@ -3874,6 +4187,7 @@ fn statement_class_temporary_capacity(statement: &Statement) -> usize {
         | Statement::DropPayloadEnum { .. }
         | Statement::CollectionClear { .. }
         | Statement::DropCollection { .. }
+        | Statement::DropFunction { .. }
         | Statement::WriteStreamBytes { .. } => 0,
         Statement::EchoString(value) | Statement::WriteStderr(value) => {
             string_class_temporary_capacity(value)
@@ -3903,6 +4217,14 @@ fn terminator_class_temporary_capacity(terminator: &Terminator) -> usize {
         Terminator::Branch { condition, .. } => bool_class_temporary_capacity(condition),
         Terminator::CheckedCall { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        Terminator::IndirectCall { callee, args, .. }
+        | Terminator::CheckedIndirectCall { callee, args, .. } => {
+            function_class_temporary_capacity(callee)
+                + args
+                    .iter()
+                    .map(rvalue_class_temporary_capacity)
+                    .sum::<usize>()
         }
         Terminator::CheckedConstruct {
             properties, args, ..
@@ -4066,7 +4388,46 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
             Rvalue::NullablePayloadEnum(value) => {
                 nullable_payload_enum_class_temporary_capacity(value)
             }
+            Rvalue::Function(value) => function_class_temporary_capacity(value),
+            Rvalue::NullableFunction(value) => nullable_function_class_temporary_capacity(value),
         }
+}
+
+fn function_class_temporary_capacity(value: &FunctionExpression) -> usize {
+    match value {
+        FunctionExpression::Create { captures, .. } => captures
+            .iter()
+            .map(|capture| match capture {
+                ClosureCaptureOperand::BorrowLocal { .. } => 0,
+                ClosureCaptureOperand::CopyValue(value)
+                | ClosureCaptureOperand::MoveValue(value) => rvalue_class_temporary_capacity(value),
+            })
+            .sum(),
+        FunctionExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        FunctionExpression::CollectionIndex { index, .. } => rvalue_class_temporary_capacity(index),
+        FunctionExpression::AssumePresent { value, .. } => {
+            nullable_function_class_temporary_capacity(value)
+        }
+        FunctionExpression::Local { .. } | FunctionExpression::Property { .. } => 0,
+    }
+}
+
+fn nullable_function_class_temporary_capacity(value: &NullableFunctionExpression) -> usize {
+    match value {
+        NullableFunctionExpression::Present(value) => function_class_temporary_capacity(value),
+        NullableFunctionExpression::Call { args, .. } => {
+            args.iter().map(rvalue_class_temporary_capacity).sum()
+        }
+        NullableFunctionExpression::DictionaryGet { key, .. }
+        | NullableFunctionExpression::CollectionIndex { index: key, .. } => {
+            rvalue_class_temporary_capacity(key)
+        }
+        NullableFunctionExpression::Null { .. }
+        | NullableFunctionExpression::Local { .. }
+        | NullableFunctionExpression::Property { .. } => 0,
+    }
 }
 
 fn payload_enum_class_temporary_capacity(value: &PayloadEnumExpression) -> usize {
@@ -4714,6 +5075,7 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
         BoolExpression::NullablePayloadEnumIsPresent(value) => {
             nullable_payload_enum_class_temporary_capacity(value)
         }
+        BoolExpression::NullableFunctionIsPresent(_) => 0,
         BoolExpression::PayloadEnumCompare { left, right, .. } => {
             payload_enum_class_temporary_capacity(left)
                 + payload_enum_class_temporary_capacity(right)
@@ -4753,6 +5115,27 @@ fn format_class_temporary_capacity(format: &FormatExpression) -> usize {
 
 impl fmt::Display for Program {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if !self.function_types.is_empty() {
+            writeln!(formatter, "function types:")?;
+            for function_type in &self.function_types {
+                writeln!(formatter, "    {function_type}")?;
+            }
+            writeln!(formatter)?;
+        }
+        if !self.closure_environment_layouts.is_empty() {
+            writeln!(formatter, "closure environments:")?;
+            for layout in &self.closure_environment_layouts {
+                writeln!(formatter, "    {layout}")?;
+            }
+            writeln!(formatter)?;
+        }
+        if !self.closure_descriptors.is_empty() {
+            writeln!(formatter, "closure descriptors:")?;
+            for descriptor in &self.closure_descriptors {
+                writeln!(formatter, "    {descriptor}")?;
+            }
+            writeln!(formatter)?;
+        }
         for (index, function) in self.functions.iter().enumerate() {
             if index > 0 {
                 writeln!(formatter)?;
@@ -4800,6 +5183,63 @@ impl fmt::Display for ReturnType {
             ReturnType::Value(ty) => write!(formatter, "{ty}"),
             ReturnType::Void => write!(formatter, "void"),
         }
+    }
+}
+
+impl fmt::Display for FunctionType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "function-type#{} {:?} function(",
+            self.id.0, self.invocation_mode
+        )?;
+        for (index, parameter) in self.parameters.iter().enumerate() {
+            if index > 0 {
+                write!(formatter, ", ")?;
+            }
+            write!(formatter, "{:?} {}", parameter.mode, parameter.ty)?;
+        }
+        write!(formatter, "): {}", self.return_type)?;
+        if !self.checked_effects.is_empty() {
+            write!(formatter, " throws {:?}", self.checked_effects)?;
+        }
+        if let Some(return_borrow) = self.return_borrow {
+            write!(formatter, " borrow {:?}", return_borrow)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for ClosureDescriptor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "descriptor#{} {} type#{} function{} environment {}",
+            self.id.0,
+            self.debug_identity,
+            self.function_type.0,
+            self.entry_function.0,
+            self.environment_layout
+                .map(|layout| format!("layout#{}", layout.0))
+                .unwrap_or_else(|| "none".to_string())
+        )
+    }
+}
+
+impl fmt::Display for ClosureEnvironmentLayout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "layout#{} fields [", self.id.0)?;
+        for (index, field) in self.fields.iter().enumerate() {
+            if index > 0 {
+                write!(formatter, ", ")?;
+            }
+            write!(
+                formatter,
+                "field#{} logical={} physical={} {:?} {}",
+                field.id.0, field.logical_index, field.physical_index, field.storage, field.ty
+            )?;
+        }
+        write!(formatter, "] release {:?}", self.logical_release_order)
     }
 }
 
@@ -4878,6 +5318,16 @@ impl fmt::Display for Type {
             Type::NullablePayloadEnum(ty) => {
                 write!(formatter, "?payload-enum#{}", ty.id.0)
             }
+            Type::Function(function_type) => {
+                write!(formatter, "function-type#{}", function_type.0)
+            }
+            Type::NullableFunction(function_type) => {
+                write!(formatter, "?function-type#{}", function_type.0)
+            }
+            Type::ClosureEnvironment(layout) => match layout {
+                Some(layout) => write!(formatter, "closure-environment#{}", layout.0),
+                None => formatter.write_str("closure-environment<empty>"),
+            },
         }
     }
 }
@@ -5070,6 +5520,122 @@ impl fmt::Display for Rvalue {
             Rvalue::NullablePayloadEnum(value) => {
                 write!(formatter, "?payload-enum#{}", value.ty().id.0)
             }
+            Rvalue::Function(value) => write!(formatter, "{value}"),
+            Rvalue::NullableFunction(value) => write!(formatter, "{value}"),
+        }
+    }
+}
+
+impl fmt::Display for FunctionExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Create {
+                descriptor,
+                captures,
+                ..
+            } => {
+                write!(formatter, "create closure descriptor#{} [", descriptor.0)?;
+                for (index, capture) in captures.iter().enumerate() {
+                    if index > 0 {
+                        write!(formatter, ", ")?;
+                    }
+                    match capture {
+                        ClosureCaptureOperand::BorrowLocal { local, writable } => write!(
+                            formatter,
+                            "{}borrow local{}",
+                            if *writable { "writable " } else { "readonly " },
+                            local.0
+                        )?,
+                        ClosureCaptureOperand::CopyValue(value) => {
+                            write!(formatter, "copy {value}")?
+                        }
+                        ClosureCaptureOperand::MoveValue(value) => {
+                            write!(formatter, "move {value}")?
+                        }
+                    }
+                }
+                formatter.write_str("]")
+            }
+            Self::Local {
+                local, transfer, ..
+            } => write!(
+                formatter,
+                "{} function local{}",
+                if *transfer { "move" } else { "borrow" },
+                local.0
+            ),
+            Self::Property {
+                object, property, ..
+            } => write!(
+                formatter,
+                "function local{}->property{}",
+                object.0, property.index
+            ),
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
+            Self::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            } => write!(
+                formatter,
+                "{}function local{}[{}{}]",
+                if *remove { "remove " } else { "borrow " },
+                collection.0,
+                if *positional { "offset " } else { "" },
+                index
+            ),
+            Self::AssumePresent { value, .. } => write!(formatter, "nonnull({value})"),
+        }
+    }
+}
+
+impl fmt::Display for NullableFunctionExpression {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null { .. } => formatter.write_str("null function"),
+            Self::Present(value) => write!(formatter, "present({value})"),
+            Self::Local {
+                local, transfer, ..
+            } => write!(
+                formatter,
+                "{} ?function local{}",
+                if *transfer { "move" } else { "borrow" },
+                local.0
+            ),
+            Self::Property {
+                object, property, ..
+            } => write!(
+                formatter,
+                "?function local{}->property{}",
+                object.0, property.index
+            ),
+            Self::Call { function, args, .. } => write_call(formatter, *function, args),
+            Self::DictionaryGet {
+                collection,
+                key,
+                access,
+                ..
+            } => write!(
+                formatter,
+                "?function {:?} local{}[{key}]",
+                access, collection.0
+            ),
+            Self::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            } => write!(
+                formatter,
+                "{}?function local{}[{}{}]",
+                if *remove { "remove " } else { "borrow " },
+                collection.0,
+                if *positional { "offset " } else { "" },
+                index
+            ),
         }
     }
 }
@@ -5855,6 +6421,7 @@ impl fmt::Display for BoolExpression {
             Self::NullablePayloadEnumIsPresent(value) => {
                 write!(formatter, "present(?payload-enum#{})", value.ty().id.0)
             }
+            Self::NullableFunctionIsPresent(value) => write!(formatter, "present({value})"),
             Self::PayloadEnumCompare { op, left, right } => {
                 write!(formatter, "{left:?} {op} {right:?}")
             }
@@ -6057,6 +6624,19 @@ impl fmt::Display for BoolBinaryOp {
 impl fmt::Display for Statement {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Statement::BindClosureEnvironment {
+                environment,
+                bindings,
+            } => write!(
+                formatter,
+                "bind closure-environment local{} [{}]",
+                environment.0,
+                bindings
+                    .iter()
+                    .map(|(field, local)| format!("field#{}=>local{}", field.0, local.0))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
             Statement::AssignLocal { target, value } => {
                 write!(formatter, "local{} = {value}", target.0)
             }
@@ -6257,6 +6837,17 @@ impl fmt::Display for Statement {
                 ty.id.0,
                 local.0
             ),
+            Statement::DropFunction {
+                local,
+                function_type,
+                nullable,
+            } => write!(
+                formatter,
+                "drop {}function-type#{} local{}",
+                if *nullable { "nullable " } else { "" },
+                function_type.0,
+                local.0
+            ),
         }
     }
 }
@@ -6353,6 +6944,46 @@ impl fmt::Display for Terminator {
                     failure.0
                 )
             }
+            Terminator::IndirectCall {
+                callee,
+                args,
+                result,
+                continuation,
+                ..
+            } => write!(
+                formatter,
+                "indirect {callee}({}) -> {}block{}",
+                args.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                result
+                    .map(|local| format!("local{}, ", local.0))
+                    .unwrap_or_default(),
+                continuation.0
+            ),
+            Terminator::CheckedIndirectCall {
+                callee,
+                args,
+                result,
+                error,
+                success,
+                failure,
+                ..
+            } => write!(
+                formatter,
+                "checked indirect {callee}({}) -> {}error local{}, block{}, block{}",
+                args.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                result
+                    .map(|local| format!("local{}, ", local.0))
+                    .unwrap_or_default(),
+                error.0,
+                success.0,
+                failure.0
+            ),
             Terminator::CheckedConstruct {
                 class,
                 constructor,

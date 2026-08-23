@@ -2,9 +2,10 @@ use crate::source::Span;
 use crate::types::{ResolvedType, TypeRef};
 
 pub use crate::ast::{
-    ArgumentName, AssignOp, BinaryOp, IncrementOp, IncrementPosition, MatchMode, MatchOrigin,
-    MemberAccess, UnaryOp,
+    ArgumentName, AssignOp, BinaryOp, ClosureCaptureMode, ClosureForm, IncrementOp,
+    IncrementPosition, MatchMode, MatchOrigin, MemberAccess, UnaryOp,
 };
+use crate::symbols::ClosureId;
 
 /// Current Doria IR implementation.
 ///
@@ -342,8 +343,54 @@ pub struct Argument {
     pub span: Span,
 }
 
+/// Backend-independent closure syntax. The checked capture, ownership, effect,
+/// and invocation plans are keyed by `closure_id` in `Program::semantic_info`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureExpression {
+    pub closure_id: ClosureId,
+    pub form: ClosureForm,
+    pub parameters: Vec<ClosureParameter>,
+    pub return_type: Option<TypeRef>,
+    pub captures: Vec<ClosureCapture>,
+    pub body: ClosureBody,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureParameter {
+    pub take: bool,
+    pub writable: bool,
+    pub ty: TypeRef,
+    pub name: String,
+    pub name_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClosureCapture {
+    pub mode: ClosureCaptureMode,
+    pub name: String,
+    pub name_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClosureBody {
+    Expression(Box<Expr>),
+    Block(Block),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallableCall {
+    pub callee: Box<Expr>,
+    pub args: Vec<Argument>,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
+    Closure(Box<ClosureExpression>),
+    CallableCall(Box<CallableCall>),
     Variable {
         name: String,
         span: Span,
@@ -538,6 +585,8 @@ pub struct ArrayElement {
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
+            Expr::Closure(closure) => closure.span,
+            Expr::CallableCall(call) => call.span,
             Expr::Variable { span, .. }
             | Expr::This { span }
             | Expr::Identifier { span, .. }

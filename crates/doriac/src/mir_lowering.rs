@@ -39,9 +39,21 @@ impl ClassIds {
 struct CollectionRegistry {
     ids: HashMap<(mir::CollectionKind, Option<mir::Type>, mir::Type), mir::CollectionTypeId>,
     types: Vec<mir::CollectionType>,
+    function_ids: HashMap<crate::types::SemanticFunctionType<ResolvedType>, mir::FunctionTypeId>,
+    function_types: Vec<mir::FunctionType>,
+    error_descriptor_ids: HashMap<ClassId, mir::ErrorDescriptorId>,
 }
 
 impl CollectionRegistry {
+    fn with_error_descriptors(
+        error_descriptor_ids: HashMap<ClassId, mir::ErrorDescriptorId>,
+    ) -> Self {
+        Self {
+            error_descriptor_ids,
+            ..Self::default()
+        }
+    }
+
     fn intern(
         &mut self,
         kind: mir::CollectionKind,
@@ -103,7 +115,7 @@ struct FunctionSignature {
     /// (decision 0098) resolves `name: value` against these.
     parameter_names: Vec<String>,
     parameter_defaults: Vec<Option<crate::const_eval::ConstValue>>,
-    parameter_transfers: Vec<bool>,
+    parameter_modes: Vec<mir::FunctionParameterMode>,
     parameter_owns: Vec<bool>,
     method_class: Option<ClassId>,
     receiver_mode: Option<mir::ReceiverMode>,
@@ -131,8 +143,403 @@ struct MethodInstanceKey {
 
 #[derive(Clone)]
 struct PropertyInitializer {
+    class: ClassId,
     expression: hir::Expr,
     type_substitutions: HashMap<String, ResolvedType>,
+    closure_plans: HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
+}
+
+#[derive(Clone)]
+struct ClosureLoweringPlan {
+    descriptor: mir::ClosureDescriptorId,
+    function: mir::FunctionId,
+    function_type: mir::FunctionTypeId,
+    environment_layout: Option<mir::ClosureEnvironmentLayoutId>,
+    expression: hir::ClosureExpression,
+}
+
+fn collect_closure_expressions<'a>(
+    block: Option<&hir::Block>,
+    expressions: impl IntoIterator<Item = &'a hir::Expr>,
+) -> Vec<hir::ClosureExpression> {
+    fn visit_block(block: &hir::Block, closures: &mut Vec<hir::ClosureExpression>) {
+        for statement in &block.statements {
+            visit_statement(statement, closures);
+        }
+    }
+
+    fn visit_statement(statement: &hir::Stmt, closures: &mut Vec<hir::ClosureExpression>) {
+        match statement {
+            hir::Stmt::Block(block) => visit_block(block, closures),
+            hir::Stmt::VarDecl(decl) => visit_expr(&decl.initializer, closures),
+            hir::Stmt::Assignment(assignment) => {
+                visit_expr(&assignment.target, closures);
+                visit_expr(&assignment.value, closures);
+            }
+            hir::Stmt::Echo { expr, .. }
+            | hir::Stmt::Throw(hir::ThrowStmt { expr, .. })
+            | hir::Stmt::Expr { expr, .. } => visit_expr(expr, closures),
+            hir::Stmt::Return { expr, .. } => {
+                if let Some(expr) = expr {
+                    visit_expr(expr, closures);
+                }
+            }
+            hir::Stmt::Try(statement) => {
+                visit_block(&statement.body, closures);
+                for clause in &statement.catches {
+                    visit_block(&clause.body, closures);
+                }
+                if let Some(finally) = &statement.finally {
+                    visit_block(&finally.body, closures);
+                }
+            }
+            hir::Stmt::If(statement) => {
+                if let Some(given) = &statement.given {
+                    visit_block(&given.block, closures);
+                }
+                visit_expr(&statement.condition, closures);
+                visit_block(&statement.then_block, closures);
+                if let Some(branch) = &statement.else_branch {
+                    visit_else(branch, closures);
+                }
+                if let Some(finally) = &statement.finally {
+                    visit_block(&finally.block, closures);
+                }
+            }
+            hir::Stmt::While(statement) => {
+                if let Some(given) = &statement.given {
+                    visit_block(&given.block, closures);
+                }
+                visit_expr(&statement.condition, closures);
+                visit_block(&statement.body, closures);
+                if let Some(finally) = &statement.finally {
+                    visit_block(&finally.block, closures);
+                }
+            }
+            hir::Stmt::DoWhile(statement) => {
+                visit_block(&statement.body, closures);
+                visit_expr(&statement.condition, closures);
+                if let Some(finally) = &statement.finally {
+                    visit_block(&finally.block, closures);
+                }
+            }
+            hir::Stmt::For(statement) => {
+                if let Some(initializer) = &statement.initializer {
+                    match initializer {
+                        hir::ForInitializer::VarDecl(decl) => {
+                            visit_expr(&decl.initializer, closures)
+                        }
+                        hir::ForInitializer::Assignment(assignment) => {
+                            visit_expr(&assignment.target, closures);
+                            visit_expr(&assignment.value, closures);
+                        }
+                    }
+                }
+                if let Some(condition) = &statement.condition {
+                    visit_expr(condition, closures);
+                }
+                if let Some(increment) = &statement.increment {
+                    match increment {
+                        hir::ForIncrement::Increment(increment) => {
+                            visit_expr(&increment.target, closures)
+                        }
+                        hir::ForIncrement::Assignment(assignment) => {
+                            visit_expr(&assignment.target, closures);
+                            visit_expr(&assignment.value, closures);
+                        }
+                    }
+                }
+                visit_block(&statement.body, closures);
+            }
+            hir::Stmt::Foreach(statement) => {
+                visit_expr(&statement.iterable, closures);
+                visit_block(&statement.body, closures);
+            }
+            hir::Stmt::Increment(increment) => visit_expr(&increment.target, closures),
+            hir::Stmt::Break { .. } | hir::Stmt::Continue { .. } => {}
+        }
+    }
+
+    fn visit_else(branch: &hir::ElseBranch, closures: &mut Vec<hir::ClosureExpression>) {
+        match branch {
+            hir::ElseBranch::If(statement) => {
+                if let Some(given) = &statement.given {
+                    visit_block(&given.block, closures);
+                }
+                visit_expr(&statement.condition, closures);
+                visit_block(&statement.then_block, closures);
+                if let Some(branch) = &statement.else_branch {
+                    visit_else(branch, closures);
+                }
+                if let Some(finally) = &statement.finally {
+                    visit_block(&finally.block, closures);
+                }
+            }
+            hir::ElseBranch::Block(block) => visit_block(block, closures),
+        }
+    }
+
+    fn visit_expr(expr: &hir::Expr, closures: &mut Vec<hir::ClosureExpression>) {
+        match expr {
+            hir::Expr::Closure(closure) => {
+                closures.push((**closure).clone());
+                match &closure.body {
+                    hir::ClosureBody::Expression(expr) => visit_expr(expr, closures),
+                    hir::ClosureBody::Block(block) => visit_block(block, closures),
+                }
+            }
+            hir::Expr::CallableCall(call) => {
+                visit_expr(&call.callee, closures);
+                for argument in &call.args {
+                    visit_expr(&argument.value, closures);
+                }
+            }
+            hir::Expr::InterpolatedString { parts, .. } => {
+                for part in parts {
+                    if let hir::InterpolatedStringPart::Expr(expr) = part {
+                        visit_expr(expr, closures);
+                    }
+                }
+            }
+            hir::Expr::Array { elements, .. } => {
+                for element in elements {
+                    if let Some(key) = &element.key {
+                        visit_expr(key, closures);
+                    }
+                    visit_expr(&element.value, closures);
+                }
+            }
+            hir::Expr::ArrayRepeat { value, count, .. }
+            | hir::Expr::Index {
+                collection: value,
+                index: count,
+                ..
+            }
+            | hir::Expr::Binary {
+                left: value,
+                right: count,
+                ..
+            }
+            | hir::Expr::Range {
+                start: value,
+                end: count,
+                ..
+            } => {
+                visit_expr(value, closures);
+                visit_expr(count, closures);
+            }
+            hir::Expr::PropertyAccess { object, .. }
+            | hir::Expr::IsType { expr: object, .. }
+            | hir::Expr::Grouped { expr: object, .. }
+            | hir::Expr::Unary { expr: object, .. } => visit_expr(object, closures),
+            hir::Expr::MethodCall { object, args, .. } => {
+                visit_expr(object, closures);
+                for argument in args {
+                    visit_expr(&argument.value, closures);
+                }
+            }
+            hir::Expr::FunctionCall { args, .. }
+            | hir::Expr::StaticCall { args, .. }
+            | hir::Expr::New { args, .. } => {
+                for argument in args {
+                    visit_expr(&argument.value, closures);
+                }
+            }
+            hir::Expr::Match {
+                scrutinee, arms, ..
+            } => {
+                visit_expr(scrutinee, closures);
+                for arm in arms {
+                    if let hir::MatchPattern::Expression(expr) = &arm.pattern {
+                        visit_expr(expr, closures);
+                    }
+                    if let Some(guard) = &arm.guard {
+                        visit_expr(&guard.condition, closures);
+                    }
+                    visit_expr(&arm.value, closures);
+                }
+            }
+            hir::Expr::When(when) => {
+                if let Some(given) = &when.given {
+                    visit_block(&given.block, closures);
+                }
+                for branch in &when.branches {
+                    if let Some(condition) = &branch.condition {
+                        visit_expr(condition, closures);
+                    }
+                    visit_block(&branch.block, closures);
+                }
+                if let Some(finally) = &when.finally {
+                    visit_block(&finally.block, closures);
+                }
+            }
+            hir::Expr::Variable { .. }
+            | hir::Expr::This { .. }
+            | hir::Expr::Identifier { .. }
+            | hir::Expr::String { .. }
+            | hir::Expr::Int { .. }
+            | hir::Expr::Float { .. }
+            | hir::Expr::Bool { .. }
+            | hir::Expr::Null { .. }
+            | hir::Expr::StaticMember { .. } => {}
+        }
+    }
+
+    let mut closures = Vec::new();
+    if let Some(block) = block {
+        visit_block(block, &mut closures);
+    }
+    for expression in expressions {
+        visit_expr(expression, &mut closures);
+    }
+    closures.sort_by_key(|closure| (closure.span.start, closure.span.end));
+    closures
+}
+
+struct ClosurePlanBuildContext<'a> {
+    containing_name: &'a str,
+    first_function_id: usize,
+    source: &'a crate::source::SourceFile,
+    semantic_info: &'a SemanticInfo,
+    substitutions: &'a HashMap<String, ResolvedType>,
+    class_ids: &'a ClassIds,
+    registry: &'a mut CollectionRegistry,
+    descriptors: &'a mut Vec<mir::ClosureDescriptor>,
+    layouts: &'a mut Vec<mir::ClosureEnvironmentLayout>,
+}
+
+fn build_closure_plans(
+    expressions: Vec<hir::ClosureExpression>,
+    context: &mut ClosurePlanBuildContext<'_>,
+) -> DiagnosticResult<HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>> {
+    use crate::ownership::CaptureAcquisitionKind;
+
+    let mut plans = HashMap::new();
+    for expression in expressions {
+        let semantic = context
+            .semantic_info
+            .closures
+            .get(&expression.closure_id)
+            .expect("checked closure has semantic metadata");
+        let ownership = context
+            .semantic_info
+            .closure_ownership
+            .get(&expression.closure_id)
+            .expect("checked closure has ownership metadata");
+        let resolved = substitute_resolved_type(&semantic.function_type, context.substitutions);
+        let mir::Type::Function(function_type) =
+            intern_resolved_collection_types(&resolved, context.class_ids, context.registry)
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "I3001",
+                        "checked closure function type has no concrete MIR representation",
+                        expression.span,
+                    )]
+                })?
+        else {
+            return Err(vec![Diagnostic::new(
+                "I3001",
+                "checked closure did not resolve to a MIR function type",
+                expression.span,
+            )]);
+        };
+
+        let environment_layout = if semantic.captures.is_empty() {
+            None
+        } else {
+            let id = mir::ClosureEnvironmentLayoutId(context.layouts.len());
+            let fields = semantic
+                .captures
+                .iter()
+                .enumerate()
+                .map(|(index, capture)| {
+                    let acquisition = ownership
+                        .acquisitions
+                        .iter()
+                        .find(|acquisition| {
+                            acquisition.environment_binding_id == capture.environment_binding_id
+                        })
+                        .expect("closure capture has ownership acquisition metadata");
+                    let resolved =
+                        substitute_resolved_type(&capture.source_type, context.substitutions);
+                    let ty = intern_resolved_collection_types(
+                        &resolved,
+                        context.class_ids,
+                        context.registry,
+                    )
+                    .ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "I3001",
+                            "checked closure capture has no concrete MIR representation",
+                            capture.declaration_span,
+                        )]
+                    })?;
+                    let storage = match acquisition.kind {
+                        CaptureAcquisitionKind::ReadonlyLease => {
+                            mir::ClosureEnvironmentStorage::ReadonlyBorrow
+                        }
+                        CaptureAcquisitionKind::WritableLease => {
+                            mir::ClosureEnvironmentStorage::WritableBorrow
+                        }
+                        CaptureAcquisitionKind::CopyIntoEnvironment
+                        | CaptureAcquisitionKind::MoveIntoEnvironment => {
+                            mir::ClosureEnvironmentStorage::Owned
+                        }
+                    };
+                    Ok(mir::ClosureEnvironmentField {
+                        id: mir::ClosureEnvironmentFieldId(index),
+                        logical_index: index,
+                        physical_index: index,
+                        ty,
+                        storage,
+                        source_binding: capture.source_binding_id,
+                        environment_binding: capture.environment_binding_id,
+                    })
+                })
+                .collect::<DiagnosticResult<Vec<_>>>()?;
+            context.layouts.push(mir::ClosureEnvironmentLayout {
+                id,
+                fields,
+                logical_release_order: ownership.release_order.clone(),
+            });
+            Some(id)
+        };
+
+        let descriptor = mir::ClosureDescriptorId(context.descriptors.len());
+        let function_id = mir::FunctionId(context.first_function_id + context.descriptors.len());
+        let (line, column) = context.source.line_col(expression.span.start);
+        let debug_identity = format!(
+            "closure at {}:{line}:{column} in {}",
+            context.source.path, context.containing_name
+        );
+        let function_definition = context
+            .registry
+            .function_types
+            .get(function_type.0)
+            .filter(|definition| definition.id == function_type)
+            .expect("interned closure function type exists");
+        context.descriptors.push(mir::ClosureDescriptor {
+            id: descriptor,
+            source_closure: expression.closure_id,
+            function_type,
+            entry_function: function_id,
+            environment_layout,
+            invocation_mode: function_definition.invocation_mode,
+            source_span: expression.span,
+            debug_identity,
+        });
+        plans.insert(
+            expression.closure_id,
+            ClosureLoweringPlan {
+                descriptor,
+                function: function_id,
+                function_type,
+                environment_layout,
+                expression,
+            },
+        );
+    }
+    Ok(plans)
 }
 
 #[derive(Clone, Copy)]
@@ -435,6 +842,17 @@ fn resolved_type_is_symbolic(ty: &crate::types::ResolvedType) -> bool {
     use crate::types::ResolvedType;
     match ty {
         ResolvedType::TypeParameter(_) => true,
+        ResolvedType::Function(function) => {
+            function
+                .parameters
+                .iter()
+                .any(|parameter| resolved_type_is_symbolic(&parameter.ty))
+                || resolved_type_is_symbolic(&function.return_type)
+                || function
+                    .checked_effects
+                    .iter()
+                    .any(resolved_type_is_symbolic)
+        }
         ResolvedType::Nullable(inner)
         | ResolvedType::TypedArray(inner)
         | ResolvedType::List(inner)
@@ -482,6 +900,26 @@ fn substitute_resolved_type(
         ),
         ResolvedType::Set(inner) => {
             ResolvedType::Set(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        ResolvedType::Function(function) => {
+            ResolvedType::Function(Box::new(crate::types::SemanticFunctionType {
+                invocation_mode: function.invocation_mode,
+                parameters: function
+                    .parameters
+                    .iter()
+                    .map(|parameter| crate::types::SemanticFunctionParameter {
+                        ownership_mode: parameter.ownership_mode,
+                        ty: substitute_resolved_type(&parameter.ty, substitutions),
+                    })
+                    .collect(),
+                return_type: substitute_resolved_type(&function.return_type, substitutions),
+                checked_effects: function
+                    .checked_effects
+                    .iter()
+                    .map(|effect| substitute_resolved_type(effect, substitutions))
+                    .collect(),
+                return_borrow: function.return_borrow,
+            }))
         }
         ResolvedType::SharedHandle(kind, payload) => ResolvedType::SharedHandle(
             *kind,
@@ -705,7 +1143,8 @@ fn lower_program_impl(
         .iter()
         .map(|origin| ((origin.span.start, origin.span.end), origin.id))
         .collect::<HashMap<_, _>>();
-    let mut collection_registry = CollectionRegistry::default();
+    let mut collection_registry =
+        CollectionRegistry::with_error_descriptors(error_descriptor_ids.clone());
     let mut static_ids = HashMap::new();
     let mut statics = Vec::new();
     for class_info in &program.semantic_info.classes {
@@ -815,8 +1254,10 @@ fn lower_program_impl(
                         (
                             property_id,
                             PropertyInitializer {
+                                class: class_info.id,
                                 expression: value,
                                 type_substitutions: substitutions.clone(),
+                                closure_plans: HashMap::new(),
                             },
                         )
                     })
@@ -982,6 +1423,64 @@ fn lower_program_impl(
         let _ = intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
     }
 
+    let source =
+        crate::source::SourceFile::new(program.source_path.clone(), program.source_text.clone());
+    let mut closure_descriptors = Vec::new();
+    let mut closure_environment_layouts = Vec::new();
+    let mut instance_closure_plans = Vec::with_capacity(instances.len());
+    for (instance, substitutions) in instances.iter().zip(&instance_substitutions) {
+        let declaration = declarations[instance.declaration];
+        let containing_name = inputs_method_name(
+            declaration.function,
+            declaration.class,
+            &program.semantic_info,
+        );
+        instance_closure_plans.push(build_closure_plans(
+            collect_closure_expressions(Some(&declaration.function.body), std::iter::empty()),
+            &mut ClosurePlanBuildContext {
+                containing_name: &containing_name,
+                first_function_id: instances.len(),
+                source: &source,
+                semantic_info: &program.semantic_info,
+                substitutions,
+                class_ids: &class_ids,
+                registry: &mut collection_registry,
+                descriptors: &mut closure_descriptors,
+                layouts: &mut closure_environment_layouts,
+            },
+        )?);
+    }
+
+    let mut property_initializers = property_initializers;
+    let mut property_ids = property_initializers.keys().copied().collect::<Vec<_>>();
+    property_ids.sort();
+    for property_id in property_ids {
+        let initializer = property_initializers
+            .get_mut(&property_id)
+            .expect("collected property initializer exists");
+        let class_name = program
+            .semantic_info
+            .classes
+            .get(initializer.class.0)
+            .map(|class| class.name.as_str())
+            .unwrap_or("class");
+        let containing_name = format!("{class_name}::property#{}", property_id.index);
+        initializer.closure_plans = build_closure_plans(
+            collect_closure_expressions(None, std::iter::once(&initializer.expression)),
+            &mut ClosurePlanBuildContext {
+                containing_name: &containing_name,
+                first_function_id: instances.len(),
+                source: &source,
+                semantic_info: &program.semantic_info,
+                substitutions: &initializer.type_substitutions,
+                class_ids: &class_ids,
+                registry: &mut collection_registry,
+                descriptors: &mut closure_descriptors,
+                layouts: &mut closure_environment_layouts,
+            },
+        )?;
+    }
+
     let entry = signatures
         .get(&FunctionInstanceKey {
             name: "main".to_string(),
@@ -990,10 +1489,11 @@ fn lower_program_impl(
         .expect("exactly one collected main signature")
         .id;
     let mut functions = Vec::with_capacity(instances.len());
-    for ((instance, signature), substitutions) in instances
+    for (((instance, signature), substitutions), closure_plans) in instances
         .iter()
         .zip(callable_signatures)
-        .zip(instance_substitutions)
+        .zip(&instance_substitutions)
+        .zip(&instance_closure_plans)
     {
         if !instance.arguments.is_empty() {
             if let Some(metrics) = metrics.as_deref_mut() {
@@ -1010,9 +1510,11 @@ fn lower_program_impl(
             static_ids: &static_ids,
             collection_registry: &collection_registry,
             enum_types: &class_ids.enum_types,
-            type_substitutions: &substitutions,
+            type_substitutions: substitutions,
             error_descriptor_ids: &error_descriptor_ids,
             error_origin_ids: &error_origin_ids,
+            closure_plans,
+            closure_environment_layouts: &closure_environment_layouts,
         };
         functions.push(lower_function(
             declaration.function,
@@ -1022,6 +1524,69 @@ fn lower_program_impl(
             declaration.receiver,
             metrics.as_deref_mut(),
         )?);
+    }
+
+    for ((instance, substitutions), closure_plans) in instances
+        .iter()
+        .zip(&instance_substitutions)
+        .zip(&instance_closure_plans)
+    {
+        let declaration = declarations[instance.declaration];
+        let mut ordered_plans = closure_plans.values().collect::<Vec<_>>();
+        ordered_plans.sort_by_key(|plan| plan.descriptor.0);
+        for plan in ordered_plans {
+            functions.push(lower_closure_function(
+                plan,
+                FunctionLoweringInputs {
+                    signatures: &signatures,
+                    method_signatures: &method_signatures,
+                    semantic_info: &program.semantic_info,
+                    property_initializers: &property_initializers,
+                    constructor_body_initializers: &constructor_body_initializers,
+                    static_ids: &static_ids,
+                    collection_registry: &collection_registry,
+                    enum_types: &class_ids.enum_types,
+                    type_substitutions: substitutions,
+                    error_descriptor_ids: &error_descriptor_ids,
+                    error_origin_ids: &error_origin_ids,
+                    closure_plans,
+                    closure_environment_layouts: &closure_environment_layouts,
+                },
+                declaration.class,
+                metrics.as_deref_mut(),
+            )?);
+        }
+    }
+    let mut property_ids = property_initializers.keys().copied().collect::<Vec<_>>();
+    property_ids.sort();
+    for property_id in property_ids {
+        let initializer = property_initializers
+            .get(&property_id)
+            .expect("collected property initializer exists");
+        let mut ordered_plans = initializer.closure_plans.values().collect::<Vec<_>>();
+        ordered_plans.sort_by_key(|plan| plan.descriptor.0);
+        for plan in ordered_plans {
+            functions.push(lower_closure_function(
+                plan,
+                FunctionLoweringInputs {
+                    signatures: &signatures,
+                    method_signatures: &method_signatures,
+                    semantic_info: &program.semantic_info,
+                    property_initializers: &property_initializers,
+                    constructor_body_initializers: &constructor_body_initializers,
+                    static_ids: &static_ids,
+                    collection_registry: &collection_registry,
+                    enum_types: &class_ids.enum_types,
+                    type_substitutions: &initializer.type_substitutions,
+                    error_descriptor_ids: &error_descriptor_ids,
+                    error_origin_ids: &error_origin_ids,
+                    closure_plans: &initializer.closure_plans,
+                    closure_environment_layouts: &closure_environment_layouts,
+                },
+                Some(initializer.class),
+                metrics.as_deref_mut(),
+            )?);
+        }
     }
     let classes = program
         .semantic_info
@@ -1146,17 +1711,22 @@ fn lower_program_impl(
         })
         .collect::<DiagnosticResult<Vec<_>>>()?;
 
+    let CollectionRegistry {
+        types: collection_types,
+        function_types,
+        ..
+    } = collection_registry;
     Ok(mir::Program {
-        source: crate::source::SourceFile::new(
-            program.source_path.clone(),
-            program.source_text.clone(),
-        ),
+        source,
         classes,
         enums,
-        collection_types: collection_registry.types,
+        collection_types,
         statics,
         error_descriptors,
         error_origins,
+        function_types,
+        closure_descriptors,
+        closure_environment_layouts,
         functions,
         entry,
     })
@@ -1219,6 +1789,86 @@ fn intern_resolved_collection_types(
         ResolvedType::Bytes => mir::Type::Collection(intern_bytes_type(collections)),
         ResolvedType::Mixed => mir::Type::Mixed,
         ResolvedType::Error => mir::Type::Error,
+        ResolvedType::Function(function) => {
+            if let Some(id) = collections.function_ids.get(function.as_ref()) {
+                mir::Type::Function(*id)
+            } else {
+                let parameters = function
+                    .parameters
+                    .iter()
+                    .map(|parameter| {
+                        Some(mir::FunctionParameter {
+                            mode: match parameter.ownership_mode {
+                                crate::types::FunctionTypeParameterMode::Readonly => {
+                                    mir::FunctionParameterMode::Readonly
+                                }
+                                crate::types::FunctionTypeParameterMode::Writable => {
+                                    mir::FunctionParameterMode::Writable
+                                }
+                                crate::types::FunctionTypeParameterMode::Take => {
+                                    mir::FunctionParameterMode::Take
+                                }
+                            },
+                            ty: intern_resolved_collection_types(
+                                &parameter.ty,
+                                class_ids,
+                                collections,
+                            )?,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let return_type = if function.return_type == ResolvedType::Void {
+                    mir::ReturnType::Void
+                } else {
+                    mir::ReturnType::Value(intern_resolved_collection_types(
+                        &function.return_type,
+                        class_ids,
+                        collections,
+                    )?)
+                };
+                let checked_effects = function
+                    .checked_effects
+                    .iter()
+                    .map(|effect| match effect {
+                        ResolvedType::Error => Some(mir::CheckedEffect::Any),
+                        ResolvedType::Class(class) => class_ids
+                            .get(class)
+                            .and_then(|class| collections.error_descriptor_ids.get(class))
+                            .copied()
+                            .map(mir::CheckedEffect::Concrete),
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                let id = mir::FunctionTypeId(collections.function_types.len());
+                collections.function_types.push(mir::FunctionType {
+                    id,
+                    invocation_mode: match function.invocation_mode {
+                        crate::types::FunctionInvocationMode::Readonly => {
+                            mir::FunctionInvocationMode::Readonly
+                        }
+                        crate::types::FunctionInvocationMode::Writable => {
+                            mir::FunctionInvocationMode::Writable
+                        }
+                        crate::types::FunctionInvocationMode::Once => {
+                            mir::FunctionInvocationMode::Once
+                        }
+                    },
+                    parameters,
+                    return_type,
+                    checked_effects,
+                    return_borrow: function.return_borrow.map(|borrow| mir::ReturnBorrow {
+                        source: match borrow.source {
+                            crate::types::FunctionBorrowSource::Parameter(index) => {
+                                mir::BorrowSource::Parameter(index)
+                            }
+                        },
+                        writable: borrow.writable,
+                    }),
+                });
+                collections.function_ids.insert((**function).clone(), id);
+                mir::Type::Function(id)
+            }
+        }
         ResolvedType::Enum(enum_type) => class_ids.mir_enum_type(enum_type.id),
         ResolvedType::Class(class) => mir::Type::Class(*class_ids.get(class)?),
         ResolvedType::SharedHandle(kind, payload) => match kind {
@@ -1330,6 +1980,7 @@ fn intern_resolved_collection_types(
                 }
                 mir::Type::Collection(collection) => mir::Type::NullableCollection(collection),
                 mir::Type::PayloadEnum(ty) => mir::Type::NullablePayloadEnum(ty),
+                mir::Type::Function(function_type) => mir::Type::NullableFunction(function_type),
                 mir::Type::NullableCollection(collection) => {
                     mir::Type::NullableCollection(collection)
                 }
@@ -1344,13 +1995,14 @@ fn intern_resolved_collection_types(
                 | mir::Type::NullableWritableWeakReference(_)
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
-                | mir::Type::NullablePayloadEnum(_) => return None,
+                | mir::Type::NullablePayloadEnum(_)
+                | mir::Type::NullableFunction(_)
+                | mir::Type::ClosureEnvironment(_) => return None,
             }
         }
         // Stage 25a Slice 1 lands the surface and type model only; shared handles
         // have no MIR representation until the runtime slices.
         ResolvedType::TypeParameter(_)
-        | ResolvedType::Function(_)
         | ResolvedType::Void
         | ResolvedType::Null
         | ResolvedType::Unsupported => return None,
@@ -1673,7 +2325,7 @@ fn collect_function_signature(
 
     let mut parameter_types = Vec::with_capacity(function.params.len());
     let mut parameter_defaults = Vec::with_capacity(function.params.len());
-    let mut parameter_transfers = Vec::with_capacity(function.params.len());
+    let mut parameter_modes = Vec::with_capacity(function.params.len());
     let mut parameter_owns = Vec::with_capacity(function.params.len());
     for (parameter_index, param) in function.params.iter().enumerate() {
         let parameter_type = if let Some(ty) = mir_type_ref_with_substitutions(
@@ -1693,23 +2345,7 @@ fn collect_function_signature(
                 ),
             )]);
         };
-        let transfer_capable = matches!(
-            parameter_type,
-            mir::Type::Class(_)
-                | mir::Type::Error
-                | mir::Type::NullableClass(_)
-                | mir::Type::Collection(_)
-                | mir::Type::Mixed
-                | mir::Type::NullableMixed
-                | mir::Type::SharedReference(_)
-                | mir::Type::WeakReference(_)
-                | mir::Type::NullableSharedReference(_)
-                | mir::Type::NullableWeakReference(_)
-        ) || matches!(
-            parameter_type,
-            mir::Type::PayloadEnum(ty) | mir::Type::NullablePayloadEnum(ty)
-                if !ty.capabilities.copy
-        );
+        let transfer_capable = parameter_type.has_move_ownership();
         let transfers = transfer_capable && param.take;
         let owns = transfers && param.promoted_access.is_none();
         let default = if param.default.is_some() {
@@ -1737,7 +2373,13 @@ fn collect_function_signature(
         };
         parameter_types.push(parameter_type);
         parameter_defaults.push(default);
-        parameter_transfers.push(transfers);
+        parameter_modes.push(if transfers {
+            mir::FunctionParameterMode::Take
+        } else if param.writable {
+            mir::FunctionParameterMode::Writable
+        } else {
+            mir::FunctionParameterMode::Readonly
+        });
         parameter_owns.push(owns);
     }
 
@@ -1756,7 +2398,7 @@ fn collect_function_signature(
             .map(|param| param.name.clone())
             .collect(),
         parameter_defaults,
-        parameter_transfers,
+        parameter_modes,
         parameter_owns,
         method_class: None,
         receiver_mode: None,
@@ -1817,6 +2459,48 @@ fn resolved_type_ref_with_substitutions(
     ty: &crate::types::TypeRef,
     substitutions: &HashMap<String, ResolvedType>,
 ) -> Option<ResolvedType> {
+    if let Some(grouped) = &ty.grouped {
+        let resolved = resolved_type_ref_with_substitutions(&grouped.inner, substitutions)?;
+        return Some(if ty.nullable {
+            nullable_of(resolved)
+        } else {
+            resolved
+        });
+    }
+    if let Some(function) = &ty.function {
+        let resolved = ResolvedType::Function(Box::new(crate::types::SemanticFunctionType {
+            invocation_mode: function.invocation_mode,
+            parameters: function
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    Some(crate::types::SemanticFunctionParameter {
+                        ownership_mode: parameter.ownership_mode,
+                        ty: resolved_type_ref_with_substitutions(&parameter.ty, substitutions)?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            return_type: resolved_type_ref_with_substitutions(
+                &function.return_type,
+                substitutions,
+            )?,
+            checked_effects: if let Some(clause) = &function.throws_clause {
+                clause
+                    .entries
+                    .iter()
+                    .map(|effect| resolved_type_ref_with_substitutions(&effect.ty, substitutions))
+                    .collect::<Option<Vec<_>>>()?
+            } else {
+                Vec::new()
+            },
+            return_borrow: None,
+        }));
+        return Some(if ty.nullable {
+            nullable_of(resolved)
+        } else {
+            resolved
+        });
+    }
     let mut plain = ty.clone();
     plain.nullable = false;
     let base = if plain.arguments.is_empty() {
@@ -2002,6 +2686,9 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
                 size: layout.size,
                 align: layout.align,
             }),
+        mir::Type::Function(_) => Some(FieldType::Function),
+        mir::Type::NullableFunction(_) => Some(FieldType::NullableFunction),
+        mir::Type::ClosureEnvironment(_) => None,
     }
 }
 
@@ -2050,6 +2737,8 @@ struct FunctionLoweringInputs<'a> {
     type_substitutions: &'a HashMap<String, crate::types::ResolvedType>,
     error_descriptor_ids: &'a HashMap<ClassId, mir::ErrorDescriptorId>,
     error_origin_ids: &'a HashMap<(usize, usize), mir::ErrorOriginId>,
+    closure_plans: &'a HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
+    closure_environment_layouts: &'a [mir::ClosureEnvironmentLayout],
 }
 
 fn lower_function(
@@ -2123,9 +2812,161 @@ fn lower_function(
                 mir::ReceiverMode::Readonly
             }
         }),
+        closure: None,
         params,
+        parameter_modes: receiver
+            .map(|_| {
+                if function.writable_this {
+                    mir::FunctionParameterMode::Writable
+                } else {
+                    mir::FunctionParameterMode::Readonly
+                }
+            })
+            .into_iter()
+            .chain(signature.parameter_modes.iter().copied())
+            .collect(),
         return_type: signature.return_type,
         checked_effects: signature.checked_effects,
+        locals,
+        blocks,
+        entry_block: mir::BlockId(0),
+    })
+}
+
+fn lower_closure_function(
+    plan: &ClosureLoweringPlan,
+    inputs: FunctionLoweringInputs<'_>,
+    current_class: Option<ClassId>,
+    metrics: Option<&mut StructuralMetrics>,
+) -> DiagnosticResult<mir::Function> {
+    let definition = inputs
+        .collection_registry
+        .function_types
+        .get(plan.function_type.0)
+        .filter(|definition| definition.id == plan.function_type)
+        .expect("closure plan references an interned function type")
+        .clone();
+    let mut context = LoweringContext::new(&inputs);
+    context.current_class = current_class;
+    context.return_borrow = definition.return_borrow;
+
+    let hidden_environment = context.declare_synthetic_local(
+        "_environment",
+        matches!(
+            definition.invocation_mode,
+            mir::FunctionInvocationMode::Writable
+        ),
+        mir::Type::ClosureEnvironment(plan.environment_layout),
+        matches!(
+            definition.invocation_mode,
+            mir::FunctionInvocationMode::Once
+        ),
+    );
+    let mut capture_locals = Vec::new();
+    if let Some(layout_id) = plan.environment_layout {
+        let layout = inputs
+            .closure_environment_layouts
+            .get(layout_id.0)
+            .filter(|layout| layout.id == layout_id)
+            .expect("closure environment layout exists");
+        let environment = inputs
+            .semantic_info
+            .closures
+            .get(&plan.expression.closure_id)
+            .expect("closure environment metadata exists");
+        for (field_index, capture) in environment.captures.iter().enumerate() {
+            let field = mir::ClosureEnvironmentFieldId(field_index);
+            let ty = layout
+                .fields
+                .get(field_index)
+                .filter(|definition| definition.id == field)
+                .expect("closure capture field exists")
+                .ty;
+            let name = inputs
+                .semantic_info
+                .binding_resolution
+                .declarations_by_id
+                .get(&capture.source_binding_id)
+                .map(|binding| binding.name.as_str())
+                .unwrap_or("_capture");
+            let writable = matches!(
+                capture.required_capability,
+                crate::semantics::CaptureRequirement::Writable
+            );
+            let local = context.declare_synthetic_named_local(name, writable, ty, false);
+            capture_locals.push((field, local));
+        }
+        context.push_statement(mir::Statement::BindClosureEnvironment {
+            environment: hidden_environment,
+            bindings: capture_locals.clone(),
+        });
+    }
+
+    let mut params = vec![hidden_environment];
+    for (parameter, definition) in plan
+        .expression
+        .parameters
+        .iter()
+        .zip(&definition.parameters)
+    {
+        params.push(context.declare_user_local_owned(
+            &parameter.name,
+            parameter.writable,
+            definition.ty,
+            matches!(definition.mode, mir::FunctionParameterMode::Take)
+                && definition.ty.has_move_ownership(),
+        ));
+    }
+
+    if !definition.checked_effects.is_empty() {
+        let error = context.declare_routed_error();
+        let propagation = context.create_block();
+        context.terminate_block(propagation, mir::Terminator::PropagateError { error });
+        context.push_error_target(ErrorTarget {
+            error,
+            destination: propagation,
+            finalizer_depth: 0,
+            cleanup_depth: 0,
+        });
+    }
+    match &plan.expression.body {
+        hir::ClosureBody::Expression(expression) => lower_function_return(
+            Some(expression),
+            plan.expression.span,
+            definition.return_type,
+            &mut context,
+        )?,
+        hir::ClosureBody::Block(block) => {
+            lower_function_body(block, "closure", definition.return_type, &mut context)?
+        }
+    }
+    if !definition.checked_effects.is_empty() {
+        context.pop_error_target();
+    }
+    let (locals, blocks) = context.finish(metrics);
+    Ok(mir::Function {
+        id: plan.function,
+        name: format!("__doria_closure_{}", plan.descriptor.0),
+        source_span: plan.expression.span,
+        method: None,
+        receiver_mode: None,
+        closure: Some(mir::ClosureFunction {
+            descriptor: plan.descriptor,
+            function_type: plan.function_type,
+            environment_layout: plan.environment_layout,
+            hidden_environment,
+            capture_locals,
+        }),
+        params,
+        parameter_modes: std::iter::once(match definition.invocation_mode {
+            mir::FunctionInvocationMode::Readonly => mir::FunctionParameterMode::Readonly,
+            mir::FunctionInvocationMode::Writable => mir::FunctionParameterMode::Writable,
+            mir::FunctionInvocationMode::Once => mir::FunctionParameterMode::Take,
+        })
+        .chain(definition.parameters.iter().map(|parameter| parameter.mode))
+        .collect(),
+        return_type: definition.return_type,
+        checked_effects: definition.checked_effects,
         locals,
         blocks,
         entry_block: mir::BlockId(0),
@@ -2509,6 +3350,10 @@ fn lower_expression_statement(
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if let hir::Expr::CallableCall(call) = expr {
+        let _ = materialize_indirect_call(call, false, context)?;
+        return Ok(());
+    }
     if let hir::Expr::FunctionCall {
         name,
         args,
@@ -3503,7 +4348,9 @@ fn lower_collection_foreach_in_scope(
             | mir::Type::Error
             | mir::Type::NullableError
             | mir::Type::PayloadEnum(_)
-            | mir::Type::NullablePayloadEnum(_) => {
+            | mir::Type::NullablePayloadEnum(_)
+            | mir::Type::Function(_)
+            | mir::Type::NullableFunction(_) => {
                 // Write back to the slot being iterated, matching the
                 // positional read above. Resolving by key here would search for
                 // the element again, and for a values-only pass there is no key
@@ -3528,6 +4375,9 @@ fn lower_collection_foreach_in_scope(
             | mir::Type::Mixed
             | mir::Type::Collection(_)
             | mir::Type::NullableCollection(_) => {}
+            mir::Type::ClosureEnvironment(_) => {
+                unreachable!("closure environments are not source collection elements")
+            }
             mir::Type::NullableMixed
             | mir::Type::NullableClass(_)
             | mir::Type::NullableSharedReference(_)
@@ -3757,6 +4607,27 @@ fn collection_value_rvalue(
                 mode: mir::PayloadEnumUseMode::Borrow,
             },
         )),
+        mir::Type::Function(function_type) => Ok(mir::Rvalue::Function(
+            mir::FunctionExpression::CollectionIndex {
+                function_type,
+                collection,
+                index: Box::new(index),
+                positional,
+                remove: false,
+            },
+        )),
+        mir::Type::NullableFunction(function_type) => Ok(mir::Rvalue::NullableFunction(
+            mir::NullableFunctionExpression::CollectionIndex {
+                function_type,
+                collection,
+                index: Box::new(index),
+                positional,
+                remove: false,
+            },
+        )),
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source collection elements")
+        }
         mir::Type::NullableMixed
         | mir::Type::NullableCollection(_)
         | mir::Type::NullableWritableSharedReference(_)
@@ -3812,6 +4683,20 @@ fn foreach_local_rvalue(local: mir::LocalId, ty: mir::Type) -> DiagnosticResult<
         mir::Type::NullableWeakReference(class) => Ok(mir::Rvalue::NullableWeakReference(
             mir::NullableWeakReferenceExpression::Local {
                 class,
+                local,
+                transfer: false,
+            },
+        )),
+        mir::Type::Function(function_type) => {
+            Ok(mir::Rvalue::Function(mir::FunctionExpression::Local {
+                function_type,
+                local,
+                transfer: false,
+            }))
+        }
+        mir::Type::NullableFunction(function_type) => Ok(mir::Rvalue::NullableFunction(
+            mir::NullableFunctionExpression::Local {
+                function_type,
                 local,
                 transfer: false,
             },
@@ -4159,6 +5044,7 @@ struct LoweringContext<'semantic> {
     type_substitutions: HashMap<String, crate::types::ResolvedType>,
     error_descriptor_ids: HashMap<ClassId, mir::ErrorDescriptorId>,
     error_origin_ids: HashMap<(usize, usize), mir::ErrorOriginId>,
+    closure_plans: HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
     current_class: Option<ClassId>,
     locals: Vec<mir::Local>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
@@ -4191,6 +5077,7 @@ enum DropObligation {
     Error(mir::LocalId),
     Collection(mir::LocalId, mir::CollectionTypeId),
     PayloadEnum(mir::LocalId, mir::PayloadEnumType, bool),
+    Function(mir::LocalId, mir::FunctionTypeId, bool),
 }
 
 fn user_local_type_owns_value(ty: mir::Type) -> bool {
@@ -4230,6 +5117,8 @@ fn user_local_type_owns_value(ty: mir::Type) -> bool {
                 },
                 ..
             })
+            | mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
     )
 }
 
@@ -4262,6 +5151,10 @@ fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropOb
         }
         mir::Type::PayloadEnum(ty) => DropObligation::PayloadEnum(local, ty, false),
         mir::Type::NullablePayloadEnum(ty) => DropObligation::PayloadEnum(local, ty, true),
+        mir::Type::Function(function_type) => DropObligation::Function(local, function_type, false),
+        mir::Type::NullableFunction(function_type) => {
+            DropObligation::Function(local, function_type, true)
+        }
         _ => unreachable!("only move locals may own native drop obligations"),
     }
 }
@@ -4280,6 +5173,7 @@ impl<'semantic> LoweringContext<'semantic> {
             type_substitutions: inputs.type_substitutions.clone(),
             error_descriptor_ids: inputs.error_descriptor_ids.clone(),
             error_origin_ids: inputs.error_origin_ids.clone(),
+            closure_plans: inputs.closure_plans.clone(),
             current_class: None,
             locals: Vec::new(),
             local_scopes: vec![HashMap::new()],
@@ -4557,6 +5451,13 @@ impl<'semantic> LoweringContext<'semantic> {
                         nullable,
                     }
                 }
+                DropObligation::Function(local, function_type, nullable) => {
+                    mir::Statement::DropFunction {
+                        local,
+                        function_type,
+                        nullable,
+                    }
+                }
             });
         }
     }
@@ -4728,6 +5629,41 @@ impl<'semantic> LoweringContext<'semantic> {
                 .expect("MIR lowering must have an ownership scope")
                 .push(obligation);
         }
+        id
+    }
+
+    fn declare_synthetic_local(
+        &mut self,
+        prefix: &str,
+        writable: bool,
+        ty: mir::Type,
+        owned: bool,
+    ) -> mir::LocalId {
+        let name = format!("{prefix}{}", self.temp_counter);
+        self.temp_counter += 1;
+        self.declare_synthetic_named_local(&name, writable, ty, owned)
+    }
+
+    fn declare_synthetic_named_local(
+        &mut self,
+        name: &str,
+        writable: bool,
+        ty: mir::Type,
+        owned: bool,
+    ) -> mir::LocalId {
+        let id = mir::LocalId(self.locals.len());
+        self.locals.push(mir::Local {
+            id,
+            name: name.to_string(),
+            ty,
+            writable,
+            owned,
+            synthetic: true,
+        });
+        self.local_scopes
+            .last_mut()
+            .expect("MIR lowering must have a local scope")
+            .insert(name.to_string(), id);
         id
     }
 
@@ -5264,6 +6200,12 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::String => Some(mir::Type::String),
             ResolvedType::Mixed => Some(mir::Type::Mixed),
             ResolvedType::Error => Some(mir::Type::Error),
+            ResolvedType::Function(function) => self
+                .collection_registry
+                .function_ids
+                .get(function.as_ref())
+                .copied()
+                .map(mir::Type::Function),
             ResolvedType::Enum(enum_type) => {
                 Some(self.enum_types.get(&enum_type.id).copied().map_or(
                     mir::Type::Scalar(mir::ScalarType::Enum(enum_type.id)),
@@ -5415,6 +6357,9 @@ impl<'semantic> LoweringContext<'semantic> {
                     Some(mir::Type::NullableCollection(collection))
                 }
                 mir::Type::PayloadEnum(ty) => Some(mir::Type::NullablePayloadEnum(ty)),
+                mir::Type::Function(function_type) => {
+                    Some(mir::Type::NullableFunction(function_type))
+                }
                 // `?(?X)` collapses to `?X`: a `?T` field substituted with a
                 // nullable argument is already nullable, not doubly-nullable.
                 already @ (mir::Type::NullableScalar(_)
@@ -5429,12 +6374,11 @@ impl<'semantic> LoweringContext<'semantic> {
                 | mir::Type::NullableWritableWeakReference(_)
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
-                | mir::Type::NullablePayloadEnum(_)) => Some(already),
+                | mir::Type::NullablePayloadEnum(_)
+                | mir::Type::NullableFunction(_)) => Some(already),
+                mir::Type::ClosureEnvironment(_) => None,
             },
-            ResolvedType::Function(_)
-            | ResolvedType::Void
-            | ResolvedType::Null
-            | ResolvedType::Unsupported => None,
+            ResolvedType::Void | ResolvedType::Null | ResolvedType::Unsupported => None,
         }
     }
 
@@ -5606,12 +6550,16 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
         mir::Terminator::CheckedCall {
             success, failure, ..
         }
+        | mir::Terminator::CheckedIndirectCall {
+            success, failure, ..
+        }
         | mir::Terminator::CheckedConstruct {
             success, failure, ..
         }
         | mir::Terminator::CheckedIo {
             success, failure, ..
         } => vec![*success, *failure],
+        mir::Terminator::IndirectCall { continuation, .. } => vec![*continuation],
         mir::Terminator::ErrorSwitch {
             cases,
             catch_all,
@@ -5916,6 +6864,25 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         });
         return Ok(());
     }
+    if let mir::Type::Function(function_type) = ty {
+        let value = lower_function_expression(&decl.initializer, function_type, true, context)?;
+        let local = context.declare_user_local_owned(name, decl.writable, ty, true);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::Function(value),
+        });
+        return Ok(());
+    }
+    if let mir::Type::NullableFunction(function_type) = ty {
+        let value =
+            lower_nullable_function_expression(&decl.initializer, function_type, true, context)?;
+        let local = context.declare_user_local_owned(name, decl.writable, ty, true);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value: mir::Rvalue::NullableFunction(value),
+        });
+        return Ok(());
+    }
 
     let mir::Type::Scalar(scalar_type) = ty else {
         unreachable!("non-scalar locals return through their typed lowering paths")
@@ -6024,7 +6991,10 @@ fn lower_grouped_var_decl(
         | mir::Type::Error
         | mir::Type::NullableError
         | mir::Type::PayloadEnum(_)
-        | mir::Type::NullablePayloadEnum(_) => {
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_)
+        | mir::Type::ClosureEnvironment(_) => {
             return Err(vec![Diagnostic::new(
                 "I2601",
                 "internal compiler consistency error: grouped move-value declaration reached MIR lowering",
@@ -6522,6 +7492,17 @@ fn lower_string_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::StringExpression> {
+    if let hir::Expr::CallableCall(call) = expr {
+        let (local, ty, _) = materialize_indirect_call(call, false, context)?
+            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a string")])?;
+        if ty != mir::Type::String {
+            return Err(vec![unsupported(
+                call.span,
+                "callable does not return string",
+            )]);
+        }
+        return Ok(mir::StringExpression::Local(local));
+    }
     if let Some(mir::Rvalue::String(value)) =
         materialize_checked_rvalue(expr, mir::Type::String, false, context)?
     {
@@ -8023,6 +9004,13 @@ fn lower_display_string_expression(
             expr.span(),
             "collection values do not have an implicit display representation",
         )]),
+        mir::Type::Function(_) | mir::Type::NullableFunction(_) => Err(vec![unsupported(
+            expr.span(),
+            "function values do not have an implicit display representation",
+        )]),
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source expressions")
+        }
         mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => Err(vec![unsupported(
             expr.span(),
             "payload enum values do not have an implicit display representation",
@@ -8212,6 +9200,34 @@ fn lower_call_args(
     lower_call_args_with_ownership(name, args, signature, span, context)
 }
 
+fn lower_call_argument(
+    argument: &hir::Expr,
+    expected: mir::Type,
+    mode: mir::FunctionParameterMode,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::Rvalue> {
+    match mode {
+        mir::FunctionParameterMode::Take => lower_rvalue_as_expected(argument, expected, context),
+        mir::FunctionParameterMode::Readonly => {
+            lower_rvalue_as_borrowed(argument, expected, context)
+        }
+        mir::FunctionParameterMode::Writable => {
+            // Writable move-owned arguments denote exclusive borrowed storage.
+            // Keep a local as a place when flow analysis knows its current
+            // nullable value; Copy arguments retain ordinary value semantics.
+            if expected.has_move_ownership() {
+                if let hir::Expr::Variable { name, span } = unparenthesized_place(argument) {
+                    let local = context.lookup_local(name, *span)?;
+                    if context.local_type(local) == expected {
+                        return Ok(local_rvalue(local, expected, false));
+                    }
+                }
+            }
+            lower_rvalue_as_borrowed(argument, expected, context)
+        }
+    }
+}
+
 fn lower_call_args_with_ownership(
     name: &str,
     args: &[hir::Argument],
@@ -8275,14 +9291,10 @@ fn lower_call_args_with_ownership(
             )]);
         };
         let expected = signature.parameter_types[param_index];
-        let transfers = signature.parameter_transfers[param_index];
+        let mode = signature.parameter_modes[param_index];
         let value = &arg.value;
         materialize_nested_collection_places(value, false, context)?;
-        let lowered = if transfers {
-            lower_rvalue_as_expected(value, expected, context)?
-        } else {
-            lower_rvalue_as_borrowed(value, expected, context)?
-        };
+        let lowered = lower_call_argument(value, expected, mode, context)?;
         if lowered.ty() != expected {
             return Err(vec![Diagnostic::new(
                 "I1301",
@@ -8304,10 +9316,18 @@ fn lower_call_args_with_ownership(
             || lowered.owned_temporary_shared().is_some()
             || lowered.mixed_ownership().has_shell();
         lowered_args[param_index] = Some(
-            if in_order || (!argument_evaluation_is_observable(value) && !owns_temporary) {
+            if mode == mir::FunctionParameterMode::Writable
+                || in_order
+                || (!argument_evaluation_is_observable(value) && !owns_temporary)
+            {
                 lowered
             } else {
-                hoist_argument_temporary(lowered, expected, transfers, context)
+                hoist_argument_temporary(
+                    lowered,
+                    expected,
+                    mode == mir::FunctionParameterMode::Take,
+                    context,
+                )
             },
         );
     }
@@ -8419,7 +9439,12 @@ fn hoist_argument_temporary(
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_)
         | mir::Type::PayloadEnum(_)
-        | mir::Type::NullablePayloadEnum(_) => context.declare_owned_temp(ty),
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_) => context.declare_owned_temp(ty),
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source arguments")
+        }
     };
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
@@ -8914,7 +9939,7 @@ fn string_intrinsic_signature(
         parameter_types: parameters,
         parameter_names: names.into_iter().map(str::to_string).collect(),
         parameter_defaults: defaults,
-        parameter_transfers: vec![false; count],
+        parameter_modes: vec![mir::FunctionParameterMode::Readonly; count],
         parameter_owns: vec![false; count],
         method_class: None,
         receiver_mode: None,
@@ -9269,6 +10294,23 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
                 place: mir::PayloadEnumPlace::Local(local),
                 mode: payload_enum_use_mode(ty, transfer),
             })
+        }
+        mir::Type::Function(function_type) => {
+            mir::Rvalue::Function(mir::FunctionExpression::Local {
+                function_type,
+                local,
+                transfer,
+            })
+        }
+        mir::Type::NullableFunction(function_type) => {
+            mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Local {
+                function_type,
+                local,
+                transfer,
+            })
+        }
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are compiler-private and cannot be source rvalues")
         }
     }
 }
@@ -10559,6 +11601,9 @@ fn reroute_condition_target(
         mir::Terminator::CheckedCall {
             success, failure, ..
         }
+        | mir::Terminator::CheckedIndirectCall {
+            success, failure, ..
+        }
         | mir::Terminator::CheckedConstruct {
             success, failure, ..
         }
@@ -10570,6 +11615,11 @@ fn reroute_condition_target(
             }
             if *failure == from {
                 *failure = to;
+            }
+        }
+        mir::Terminator::IndirectCall { continuation, .. } => {
+            if *continuation == from {
+                *continuation = to;
             }
         }
         mir::Terminator::ErrorSwitch {
@@ -10645,6 +11695,19 @@ fn lower_condition(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
+    if let hir::Expr::CallableCall(call) = expr {
+        let (local, ty, _) = materialize_indirect_call(call, false, context)?
+            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a condition")])?;
+        if ty != mir::Type::Scalar(mir::ScalarType::Bool) {
+            return Err(vec![unsupported(
+                call.span,
+                "callable does not return bool",
+            )]);
+        }
+        return Ok(mir::BoolExpression::Use {
+            operand: mir::Operand::Local(local),
+        });
+    }
     if let Some(mir::Rvalue::Value(mir::ValueExpression::Bool(value))) = materialize_checked_rvalue(
         expr,
         mir::Type::Scalar(mir::ScalarType::Bool),
@@ -11117,6 +12180,11 @@ fn lower_null_comparison(
                 lower_nullable_payload_enum_expression(value, ty, false, context)?,
             ))
         }
+        mir::Type::NullableFunction(function_type) => {
+            mir::BoolExpression::NullableFunctionIsPresent(Box::new(
+                lower_nullable_function_expression(value, function_type, false, context)?,
+            ))
+        }
         _ => {
             return Err(vec![unsupported(
                 value.span(),
@@ -11250,6 +12318,13 @@ fn lower_is_condition(
                 lower_nullable_payload_enum_expression(expr, ty, false, context)?,
             ))
         }
+        mir::Type::NullableFunction(function_type)
+            if tested_type == mir::Type::Function(function_type) =>
+        {
+            mir::BoolExpression::NullableFunctionIsPresent(Box::new(
+                lower_nullable_function_expression(expr, function_type, false, context)?,
+            ))
+        }
         mir::Type::PayloadEnum(ty) => {
             let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
             if tested_type == mir::Type::PayloadEnum(ty) {
@@ -11268,7 +12343,11 @@ fn lower_is_condition(
                 evaluate_then_false(present)
             }
         }
-        mir::Type::Scalar(_) | mir::Type::String | mir::Type::Class(_) | mir::Type::Error => {
+        mir::Type::Scalar(_)
+        | mir::Type::String
+        | mir::Type::Class(_)
+        | mir::Type::Error
+        | mir::Type::Function(_) => {
             let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
             if value_type == tested_type {
                 evaluated
@@ -11301,6 +12380,11 @@ fn lower_is_condition(
         mir::Type::NullableCollection(collection) => {
             evaluate_then_false(mir::BoolExpression::NullableCollectionIsPresent(Box::new(
                 lower_nullable_collection_expression(expr, collection, false, context)?,
+            )))
+        }
+        mir::Type::NullableFunction(function_type) => {
+            evaluate_then_false(mir::BoolExpression::NullableFunctionIsPresent(Box::new(
+                lower_nullable_function_expression(expr, function_type, false, context)?,
             )))
         }
         mir::Type::SharedReference(_)
@@ -11347,6 +12431,9 @@ fn lower_is_condition(
             } else {
                 mir::BoolExpression::Not(Box::new(value))
             }
+        }
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source values")
         }
     };
     Ok(result)
@@ -11570,6 +12657,28 @@ fn lower_concrete_is_presence(
                 lower_nullable_payload_enum_expression(expr, ty, false, context)?,
             )))
         }
+        mir::Type::Function(function_type) => {
+            lower_discarded_rvalue(
+                mir::Rvalue::Function(lower_function_expression(
+                    expr,
+                    function_type,
+                    false,
+                    context,
+                )?),
+                context,
+            );
+            Ok(mir::BoolExpression::Use {
+                operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+            })
+        }
+        mir::Type::NullableFunction(function_type) => {
+            Ok(mir::BoolExpression::NullableFunctionIsPresent(Box::new(
+                lower_nullable_function_expression(expr, function_type, false, context)?,
+            )))
+        }
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source values")
+        }
     }
 }
 
@@ -11598,6 +12707,20 @@ fn lower_value_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ValueExpression> {
+    if let hir::Expr::CallableCall(call) = expr {
+        let (local, ty, _) = materialize_indirect_call(call, false, context)?
+            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a scalar")])?;
+        let mir::Type::Scalar(scalar) = ty else {
+            return Err(vec![unsupported(
+                call.span,
+                "callable does not return a scalar",
+            )]);
+        };
+        return Ok(value_expression_from_operand(
+            scalar,
+            mir::Operand::Local(local),
+        ));
+    }
     if is_branching_expr(expr) {
         let expected = context.expression_type(expr)?;
         let mir::Rvalue::Value(value) = lower_branching_rvalue(expr, expected, false, context)?
@@ -12253,11 +13376,447 @@ fn lower_nullable_error_expression(
     }
 }
 
+fn lower_function_expression(
+    expr: &hir::Expr,
+    function_type: mir::FunctionTypeId,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::FunctionExpression> {
+    match expr {
+        hir::Expr::Closure(closure) => {
+            let plan = context
+                .closure_plans
+                .get(&closure.closure_id)
+                .cloned()
+                .expect("checked closure has a concrete lowering plan");
+            if plan.function_type != function_type {
+                return Err(vec![Diagnostic::new(
+                    "I3001",
+                    "closure expression does not match its concrete MIR function type",
+                    closure.span,
+                )]);
+            }
+            let semantic = context
+                .semantic_info
+                .closures
+                .get(&closure.closure_id)
+                .expect("checked closure has capture metadata");
+            let ownership = context
+                .semantic_info
+                .closure_ownership
+                .get(&closure.closure_id)
+                .expect("checked closure has ownership metadata");
+            let mut captures = Vec::with_capacity(ownership.acquisitions.len());
+            for acquisition in &ownership.acquisitions {
+                let binding = context
+                    .semantic_info
+                    .binding_resolution
+                    .declarations_by_id
+                    .get(&acquisition.source_binding_id)
+                    .expect("closure acquisition source binding exists");
+                let local = context.lookup_local(&binding.name, acquisition.capture_span)?;
+                let capture = semantic
+                    .captures
+                    .iter()
+                    .find(|capture| {
+                        capture.environment_binding_id == acquisition.environment_binding_id
+                    })
+                    .expect("closure acquisition matches a semantic capture");
+                let ty = context
+                    .mir_resolved_type(&substitute_resolved_type(
+                        &capture.source_type,
+                        &context.type_substitutions,
+                    ))
+                    .ok_or_else(|| {
+                        vec![Diagnostic::new(
+                            "I3001",
+                            "closure capture has no concrete MIR type",
+                            acquisition.capture_span,
+                        )]
+                    })?;
+                captures.push(match acquisition.kind {
+                    crate::ownership::CaptureAcquisitionKind::ReadonlyLease => {
+                        mir::ClosureCaptureOperand::BorrowLocal {
+                            local,
+                            writable: false,
+                        }
+                    }
+                    crate::ownership::CaptureAcquisitionKind::WritableLease => {
+                        mir::ClosureCaptureOperand::BorrowLocal {
+                            local,
+                            writable: true,
+                        }
+                    }
+                    crate::ownership::CaptureAcquisitionKind::CopyIntoEnvironment => {
+                        mir::ClosureCaptureOperand::CopyValue(local_rvalue(local, ty, false))
+                    }
+                    crate::ownership::CaptureAcquisitionKind::MoveIntoEnvironment => {
+                        mir::ClosureCaptureOperand::MoveValue(local_rvalue(local, ty, true))
+                    }
+                });
+            }
+            Ok(mir::FunctionExpression::Create {
+                function_type,
+                descriptor: plan.descriptor,
+                captures,
+                span: closure.span,
+            })
+        }
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            match context.local_type(local) {
+                mir::Type::Function(actual) if actual == function_type => {
+                    Ok(mir::FunctionExpression::Local {
+                        function_type,
+                        local,
+                        transfer,
+                    })
+                }
+                mir::Type::NullableFunction(actual) if actual == function_type => {
+                    Ok(mir::FunctionExpression::AssumePresent {
+                        function_type,
+                        value: Box::new(mir::NullableFunctionExpression::Local {
+                            function_type,
+                            local,
+                            transfer,
+                        }),
+                    })
+                }
+                _ => Err(vec![unsupported(*span, "local has another callable type")]),
+            }
+        }
+        hir::Expr::PropertyAccess { .. } => {
+            let (object, property) =
+                lower_property_operand(expr, mir::Type::Function(function_type), context)?;
+            Ok(mir::FunctionExpression::Property {
+                function_type,
+                object,
+                property,
+            })
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::Function(function_type),
+                context,
+            )?;
+            Ok(mir::FunctionExpression::CollectionIndex {
+                function_type,
+                collection,
+                index: Box::new(index),
+                positional: false,
+                remove: false,
+            })
+        }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Function(function_type)) {
+                return Err(vec![unsupported(
+                    *span,
+                    "function returns another callable type",
+                )]);
+            }
+            Ok(mir::FunctionExpression::Call {
+                function_type,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args: lower_call_args(name, args, signature, *span, context)?,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+        } => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Function(function_type)) {
+                return Err(vec![unsupported(
+                    *span,
+                    "method returns another callable type",
+                )]);
+            }
+            Ok(mir::FunctionExpression::Call {
+                function_type,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            if signature.return_type != mir::ReturnType::Value(mir::Type::Function(function_type)) {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method returns another callable type",
+                )]);
+            }
+            Ok(mir::FunctionExpression::Call {
+                function_type,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+            })
+        }
+        hir::Expr::CallableCall(call) => {
+            let (local, ty, transfer) = materialize_indirect_call(call, true, context)?
+                .ok_or_else(|| vec![unsupported(call.span, "callable returns void")])?;
+            if ty != mir::Type::Function(function_type) {
+                return Err(vec![unsupported(
+                    call.span,
+                    "callable returns another function type",
+                )]);
+            }
+            Ok(mir::FunctionExpression::Local {
+                function_type,
+                local,
+                transfer,
+            })
+        }
+        hir::Expr::Grouped { expr, .. } => {
+            lower_function_expression(expr, function_type, transfer, context)
+        }
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this function value has no executable MIR form",
+        )]),
+    }
+}
+
+fn lower_nullable_function_expression(
+    expr: &hir::Expr,
+    function_type: mir::FunctionTypeId,
+    transfer: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::NullableFunctionExpression> {
+    match expr {
+        hir::Expr::Null { .. } => Ok(mir::NullableFunctionExpression::Null { function_type }),
+        hir::Expr::Variable { name, span } => {
+            let local = context.lookup_local(name, *span)?;
+            match context.local_type(local) {
+                mir::Type::NullableFunction(actual) if actual == function_type => {
+                    Ok(mir::NullableFunctionExpression::Local {
+                        function_type,
+                        local,
+                        transfer,
+                    })
+                }
+                mir::Type::Function(actual) if actual == function_type => Ok(
+                    mir::NullableFunctionExpression::Present(mir::FunctionExpression::Local {
+                        function_type,
+                        local,
+                        transfer,
+                    }),
+                ),
+                _ => Err(vec![unsupported(
+                    *span,
+                    "local has another nullable callable type",
+                )]),
+            }
+        }
+        hir::Expr::PropertyAccess { .. } => {
+            let (object, property) =
+                lower_property_operand(expr, mir::Type::NullableFunction(function_type), context)?;
+            Ok(mir::NullableFunctionExpression::Property {
+                function_type,
+                object,
+                property,
+            })
+        }
+        hir::Expr::Index {
+            collection, index, ..
+        } => {
+            let (collection, index) = lower_collection_index_operand(
+                collection,
+                index,
+                mir::Type::NullableFunction(function_type),
+                context,
+            )?;
+            Ok(mir::NullableFunctionExpression::CollectionIndex {
+                function_type,
+                collection,
+                index: Box::new(index),
+                positional: false,
+                remove: false,
+            })
+        }
+        hir::Expr::Grouped { expr, .. } => {
+            lower_nullable_function_expression(expr, function_type, transfer, context)
+        }
+        _ if context.expression_type(expr)? == mir::Type::Function(function_type) => {
+            Ok(mir::NullableFunctionExpression::Present(
+                lower_function_expression(expr, function_type, transfer, context)?,
+            ))
+        }
+        _ => Err(vec![unsupported(
+            expr.span(),
+            "this nullable function value has no executable MIR form",
+        )]),
+    }
+}
+
+fn lower_indirect_arguments(
+    arguments: &[hir::Argument],
+    function_type: &mir::FunctionType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Vec<mir::Rvalue>> {
+    arguments
+        .iter()
+        .zip(&function_type.parameters)
+        .map(|(argument, parameter)| {
+            materialize_nested_collection_places(&argument.value, false, context)?;
+            lower_call_argument(&argument.value, parameter.ty, parameter.mode, context)
+        })
+        .collect()
+}
+
+fn materialize_indirect_call(
+    call: &hir::CallableCall,
+    consume_result: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    let info = context
+        .semantic_info
+        .callable_value_calls
+        .get(&(call.span.start, call.span.end))
+        .expect("checked callable-value call has semantic metadata");
+    let resolved = substitute_resolved_type(&info.function_type, &context.type_substitutions);
+    let mir::Type::Function(function_type) = context
+        .mir_resolved_type(&resolved)
+        .expect("checked callable-value call has a concrete MIR type")
+    else {
+        return Err(vec![Diagnostic::new(
+            "I3001",
+            "checked callable-value call did not resolve to a MIR function type",
+            call.span,
+        )]);
+    };
+    let definition = context
+        .collection_registry
+        .function_types
+        .get(function_type.0)
+        .filter(|definition| definition.id == function_type)
+        .expect("callable function type exists")
+        .clone();
+
+    materialize_nested_collection_places(&call.callee, false, context)?;
+    let callee = lower_function_expression(
+        &call.callee,
+        function_type,
+        matches!(
+            definition.invocation_mode,
+            mir::FunctionInvocationMode::Once
+        ),
+        context,
+    )?;
+    let callee_owned = !mir::function_expression_is_borrowed(&callee);
+    let callee_local =
+        context.declare_checked_call_slot(mir::Type::Function(function_type), callee_owned);
+    context.locals[callee_local.0].writable = matches!(
+        definition.invocation_mode,
+        mir::FunctionInvocationMode::Writable
+    );
+    context.push_statement(mir::Statement::AssignLocal {
+        target: callee_local,
+        value: mir::Rvalue::Function(callee),
+    });
+    if callee_owned
+        && !matches!(
+            definition.invocation_mode,
+            mir::FunctionInvocationMode::Once
+        )
+    {
+        context.track_statement_owned_local(callee_local, mir::Type::Function(function_type));
+    }
+    let callee = mir::FunctionExpression::Local {
+        function_type,
+        local: callee_local,
+        transfer: matches!(
+            definition.invocation_mode,
+            mir::FunctionInvocationMode::Once
+        ),
+    };
+    let args = lower_indirect_arguments(&call.args, &definition, context)?;
+    let result = match definition.return_type {
+        mir::ReturnType::Void => None,
+        mir::ReturnType::Value(ty) => {
+            // Return-borrow constrains captured provenance, not ownership of a
+            // newly returned function carrier and its environment.
+            let owned = user_local_type_owns_value(ty)
+                && (matches!(ty, mir::Type::Function(_) | mir::Type::NullableFunction(_))
+                    || definition.return_borrow.is_none());
+            Some((context.declare_checked_call_slot(ty, owned), ty, owned))
+        }
+    };
+
+    if definition.checked_effects.is_empty() {
+        let continuation = context.create_block();
+        context.terminate_current(mir::Terminator::IndirectCall {
+            callee,
+            function_type,
+            invocation_mode: definition.invocation_mode,
+            args,
+            result: result.map(|(local, _, _)| local),
+            continuation,
+            span: call.span,
+        });
+        context.current_block = Some(continuation);
+    } else {
+        let error = context.declare_checked_call_slot(mir::Type::Error, true);
+        let success = context.create_block();
+        let failure = context.create_block();
+        context.terminate_current(mir::Terminator::CheckedIndirectCall {
+            callee,
+            function_type,
+            invocation_mode: definition.invocation_mode,
+            args,
+            result: result.map(|(local, _, _)| local),
+            error,
+            success,
+            failure,
+            span: call.span,
+        });
+        let statement_temporaries = context.statement_owned_locals.clone();
+        context.current_block = Some(failure);
+        context.route_checked_error(error);
+        context.statement_owned_locals = statement_temporaries;
+        context.current_block = Some(success);
+    }
+    if let Some((local, ty, owned)) = result {
+        track_checked_result(local, ty, owned, context);
+        Ok(Some((local, ty, owned && consume_result)))
+    } else {
+        Ok(None)
+    }
+}
+
 fn lower_rvalue_as_expected(
     expr: &hir::Expr,
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
+    if let hir::Expr::CallableCall(call) = expr {
+        let (local, ty, transfer) = materialize_indirect_call(call, true, context)?
+            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a value")])?;
+        if ty != expected {
+            return Err(vec![unsupported(
+                call.span,
+                "callable result has another MIR type",
+            )]);
+        }
+        return Ok(local_rvalue(local, ty, transfer));
+    }
     if let Some(value) = materialize_checked_rvalue(expr, expected, true, context)? {
         return Ok(value);
     }
@@ -12354,6 +13913,17 @@ fn lower_rvalue_as_expected(
             lower_nullable_payload_enum_expression(expr, ty, true, context)
                 .map(mir::Rvalue::NullablePayloadEnum)
         }
+        mir::Type::Function(function_type) => {
+            lower_function_expression(expr, function_type, true, context).map(mir::Rvalue::Function)
+        }
+        mir::Type::NullableFunction(function_type) => {
+            lower_nullable_function_expression(expr, function_type, true, context)
+                .map(mir::Rvalue::NullableFunction)
+        }
+        mir::Type::ClosureEnvironment(_) => Err(vec![unsupported(
+            expr.span(),
+            "closure environments are not source-visible values",
+        )]),
     }
 }
 
@@ -12894,6 +14464,17 @@ fn lower_rvalue_as_borrowed(
     expected: mir::Type,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
+    if let hir::Expr::CallableCall(call) = expr {
+        let (local, ty, _) = materialize_indirect_call(call, false, context)?
+            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a value")])?;
+        if ty != expected {
+            return Err(vec![unsupported(
+                call.span,
+                "callable result has another MIR type",
+            )]);
+        }
+        return Ok(local_rvalue(local, ty, false));
+    }
     if let Some(value) = materialize_checked_rvalue(expr, expected, false, context)? {
         return Ok(value);
     }
@@ -12965,6 +14546,18 @@ fn lower_rvalue_as_borrowed(
             lower_nullable_payload_enum_expression(expr, ty, false, context)
                 .map(mir::Rvalue::NullablePayloadEnum)
         }
+        mir::Type::Function(function_type) => {
+            lower_function_expression(expr, function_type, false, context)
+                .map(mir::Rvalue::Function)
+        }
+        mir::Type::NullableFunction(function_type) => {
+            lower_nullable_function_expression(expr, function_type, false, context)
+                .map(mir::Rvalue::NullableFunction)
+        }
+        mir::Type::ClosureEnvironment(_) => Err(vec![unsupported(
+            expr.span(),
+            "closure environments are not source-visible values",
+        )]),
         mir::Type::Mixed => lower_mixed_expression(expr, false, context).map(mir::Rvalue::Mixed),
         mir::Type::NullableMixed => {
             lower_nullable_mixed_expression(expr, false, context).map(mir::Rvalue::NullableMixed)
@@ -13170,9 +14763,15 @@ fn lower_payload_enum_expression(
                     .map(|field| field.name.clone())
                     .collect(),
                 parameter_defaults: vec![None; parameter_types.len()],
-                parameter_transfers: parameter_types
+                parameter_modes: parameter_types
                     .iter()
-                    .map(|field| field.has_move_ownership())
+                    .map(|field| {
+                        if field.has_move_ownership() {
+                            mir::FunctionParameterMode::Take
+                        } else {
+                            mir::FunctionParameterMode::Readonly
+                        }
+                    })
                     .collect(),
                 parameter_owns: parameter_types
                     .iter()
@@ -13655,6 +15254,16 @@ fn lower_mixed_expression(
             "boxing nullable values into `mixed` lands after Stage 23 Slice 3",
             expr.span(),
         )]),
+        mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+            Err(vec![Diagnostic::unsupported_stage(
+                "M1101",
+                "boxing function values into `mixed` is not part of the Stage 30 closure runtime",
+                expr.span(),
+            )])
+        }
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source values")
+        }
     }
 }
 
@@ -13690,11 +15299,16 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         | mir::Type::NullableError
         | mir::Type::NullableCollection(_)
         | mir::Type::Collection(_)
-        | mir::Type::NullablePayloadEnum(_) => Err(vec![Diagnostic::unsupported_stage(
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_) => Err(vec![Diagnostic::unsupported_stage(
             "M1101",
             "only exact bool, integer, float, string, and concrete-class `is` tests unbox `mixed` in Stage 23 Slice 3",
             span,
         )]),
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments cannot be tested as source values")
+        }
     }
 }
 
@@ -14562,6 +16176,27 @@ fn collection_remove_at_rvalue(
                 mode: mir::PayloadEnumUseMode::Move,
             },
         )),
+        mir::Type::Function(function_type) => Ok(mir::Rvalue::Function(
+            mir::FunctionExpression::CollectionIndex {
+                function_type,
+                collection,
+                index: Box::new(index),
+                positional: false,
+                remove: true,
+            },
+        )),
+        mir::Type::NullableFunction(function_type) => Ok(mir::Rvalue::NullableFunction(
+            mir::NullableFunctionExpression::CollectionIndex {
+                function_type,
+                collection,
+                index: Box::new(index),
+                positional: false,
+                remove: true,
+            },
+        )),
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source collection elements")
+        }
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
@@ -14581,6 +16216,7 @@ fn materialize_nested_collection_places(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     match expr {
+        hir::Expr::Closure(_) | hir::Expr::CallableCall(_) => {}
         hir::Expr::Array { elements, .. } => {
             for element in elements {
                 if let Some(key) = &element.key {
@@ -15644,6 +17280,19 @@ fn nullable_collection_access_rvalue(
                 },
             ))
         }
+        mir::Type::Function(function_type) | mir::Type::NullableFunction(function_type) => {
+            Ok(mir::Rvalue::NullableFunction(
+                mir::NullableFunctionExpression::DictionaryGet {
+                    function_type,
+                    collection,
+                    key,
+                    access,
+                },
+            ))
+        }
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source collection elements")
+        }
         mir::Type::Collection(_) | mir::Type::NullableCollection(_) | mir::Type::NullableMixed => Err(vec![unsupported(
             object.span(),
             "discarding this nullable collection element type is not yet supported",
@@ -15681,7 +17330,12 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_)
         | mir::Type::PayloadEnum(_)
-        | mir::Type::NullablePayloadEnum(_) => true,
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_) => true,
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source values")
+        }
         _ => false,
     };
     let local = context.declare_return_temp(ty, owned);
@@ -15744,6 +17398,20 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
                 nullable: true,
             });
         }
+        mir::Type::Function(function_type) => {
+            context.push_statement(mir::Statement::DropFunction {
+                local,
+                function_type,
+                nullable: false,
+            });
+        }
+        mir::Type::NullableFunction(function_type) => {
+            context.push_statement(mir::Statement::DropFunction {
+                local,
+                function_type,
+                nullable: true,
+            });
+        }
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
         | mir::Type::NullableSharedReference(_)
@@ -15760,6 +17428,9 @@ fn lower_discarded_rvalue(value: mir::Rvalue, context: &mut LoweringContext) {
         | mir::Type::String
         | mir::Type::NullableScalar(_)
         | mir::Type::NullableString => {}
+        mir::Type::ClosureEnvironment(_) => {
+            unreachable!("closure environments are not source values")
+        }
     }
 }
 
@@ -18669,9 +20340,14 @@ fn lower_new_property_values(
                     &mut context.type_substitutions,
                     initializer.type_substitutions,
                 );
+                let caller_closure_plans = std::mem::replace(
+                    &mut context.closure_plans,
+                    initializer.closure_plans,
+                );
                 let source =
                     lower_rvalue_as_expected(&initializer.expression, property_type, context)
                         .map(|value| materialize_property_initializer(value, context));
+                context.closure_plans = caller_closure_plans;
                 context.type_substitutions = caller_substitutions;
                 return Ok(mir::PropertyValue {
                     property: property.id,
@@ -19566,6 +21242,10 @@ fn unsigned_integer_literal_magnitude(expr: &hir::Expr) -> Option<u128> {
 
 fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
     let detail = match expr {
+        hir::Expr::Closure(_) => "a closure value cannot be used as an integer expression",
+        hir::Expr::CallableCall(_) => {
+            "this callable result cannot be used as an integer expression in this lowering path"
+        }
         hir::Expr::String { .. } | hir::Expr::InterpolatedString { .. } => {
             "a string expression cannot be used as an integer expression"
         }

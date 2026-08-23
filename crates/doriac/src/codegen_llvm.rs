@@ -1646,6 +1646,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         debug_assert!(self.deferred_class_temporary_drops.is_empty());
         self.defer_class_temporary_drops = true;
         match statement {
+            mir::Statement::BindClosureEnvironment { .. } | mir::Statement::DropFunction { .. } => {
+                return Err(backend_failure(
+                    "closure MIR reached LLVM before the Stage 30e boundary",
+                ));
+            }
             mir::Statement::BindPayloadEnumFields {
                 source,
                 ty,
@@ -2127,6 +2132,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         | mir::Type::NullableScalar(_)
                         | mir::Type::Error
                         | mir::Type::NullableError => None,
+                        mir::Type::Function(_)
+                        | mir::Type::NullableFunction(_)
+                        | mir::Type::ClosureEnvironment(_) => {
+                            return Err(backend_failure(
+                                "function-valued property reached LLVM before Stage 30e",
+                            ));
+                        }
                     }
                 } else {
                     None
@@ -2450,6 +2462,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
     fn lower_terminator(&mut self, terminator: &mir::Terminator) -> Result<(), BackendError> {
         match terminator {
+            mir::Terminator::IndirectCall { .. } | mir::Terminator::CheckedIndirectCall { .. } => {
+                return Err(backend_failure(
+                    "indirect closure call reached LLVM before the Stage 30e boundary",
+                ));
+            }
             mir::Terminator::Return(expression) => {
                 debug_assert!(self.deferred_class_temporary_drops.is_empty());
                 self.defer_class_temporary_drops = true;
@@ -4248,6 +4265,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match ty {
+            mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
+            | mir::Type::ClosureEnvironment(_) => Err(backend_failure(
+                "function-value cleanup reached LLVM before Stage 30e",
+            )),
             mir::Type::Error | mir::Type::NullableError => {
                 let value = build(self.builder.build_load(
                     error_carrier_type(self.context),
@@ -4773,6 +4795,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         expression: &mir::Rvalue,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         match expression {
+            mir::Rvalue::Function(_) | mir::Rvalue::NullableFunction(_) => Err(backend_failure(
+                "function value reached LLVM before the Stage 30e boundary",
+            )),
             mir::Rvalue::Value(value) => self.lower_value_expression(value),
             mir::Rvalue::String(value) => Ok(self.lower_string_expression(value)?.into()),
             mir::Rvalue::NullableScalar(value) => {
@@ -5238,50 +5263,56 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     }
 
     fn collection_compare_kind(&self, ty: mir::Type) -> Result<IntValue<'ctx>, BackendError> {
-        let kind = match ty {
-            mir::Type::String => COLLECTION_COMPARE_STRING,
-            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)) => {
-                COLLECTION_COMPARE_FLOAT32
-            }
-            mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)) => {
-                COLLECTION_COMPARE_FLOAT64
-            }
-            mir::Type::Scalar(_)
-            | mir::Type::Class(_)
-            | mir::Type::Collection(_)
-            | mir::Type::Mixed
-            | mir::Type::SharedReference(_)
-            | mir::Type::WeakReference(_)
-            | mir::Type::NullableSharedReference(_)
-            | mir::Type::NullableWeakReference(_)
-            | mir::Type::WritableSharedReference(_)
-            | mir::Type::WritableWeakReference(_)
-            | mir::Type::NullableWritableSharedReference(_)
-            | mir::Type::NullableWritableWeakReference(_)
-            | mir::Type::ReadonlySharedReferenceAccess(_)
-            | mir::Type::WritableSharedReferenceAccess(_)
-            | mir::Type::NullableReadonlySharedReferenceAccess(_)
-            | mir::Type::NullableWritableSharedReferenceAccess(_) => COLLECTION_COMPARE_WORD,
-            mir::Type::NullableScalar(_)
-            | mir::Type::NullableString
-            | mir::Type::NullableClass(_)
-            | mir::Type::NullableCollection(_)
-            | mir::Type::NullableMixed => {
-                return Err(malformed_mir(
-                    "nullable collection elements are not supported by Stage 23 Slice 1",
-                ))
-            }
-            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
-                return Err(malformed_mir(
-                    "payload enum collection values require aggregate comparison",
-                ))
-            }
-            mir::Type::Error | mir::Type::NullableError => {
-                return Err(malformed_mir(
-                    "Error collection values require aggregate identity comparison",
-                ))
-            }
-        };
+        let kind =
+            match ty {
+                mir::Type::String => COLLECTION_COMPARE_STRING,
+                mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)) => {
+                    COLLECTION_COMPARE_FLOAT32
+                }
+                mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float64)) => {
+                    COLLECTION_COMPARE_FLOAT64
+                }
+                mir::Type::Scalar(_)
+                | mir::Type::Class(_)
+                | mir::Type::Collection(_)
+                | mir::Type::Mixed
+                | mir::Type::SharedReference(_)
+                | mir::Type::WeakReference(_)
+                | mir::Type::NullableSharedReference(_)
+                | mir::Type::NullableWeakReference(_)
+                | mir::Type::WritableSharedReference(_)
+                | mir::Type::WritableWeakReference(_)
+                | mir::Type::NullableWritableSharedReference(_)
+                | mir::Type::NullableWritableWeakReference(_)
+                | mir::Type::ReadonlySharedReferenceAccess(_)
+                | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_) => COLLECTION_COMPARE_WORD,
+                mir::Type::NullableScalar(_)
+                | mir::Type::NullableString
+                | mir::Type::NullableClass(_)
+                | mir::Type::NullableCollection(_)
+                | mir::Type::NullableMixed => {
+                    return Err(malformed_mir(
+                        "nullable collection elements are not supported by Stage 23 Slice 1",
+                    ))
+                }
+                mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
+                    return Err(malformed_mir(
+                        "payload enum collection values require aggregate comparison",
+                    ))
+                }
+                mir::Type::Error | mir::Type::NullableError => {
+                    return Err(malformed_mir(
+                        "Error collection values require aggregate identity comparison",
+                    ))
+                }
+                mir::Type::Function(_)
+                | mir::Type::NullableFunction(_)
+                | mir::Type::ClosureEnvironment(_) => return Err(malformed_mir(
+                    "function and closure-environment values do not support collection comparison",
+                )),
+            };
         Ok(self.context.i8_type().const_int(u64::from(kind), false))
     }
 
@@ -5356,6 +5387,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )),
             mir::Type::Error | mir::Type::NullableError => Err(malformed_mir(
                 "Error collection values require aggregate transport",
+            )),
+            mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
+            | mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
+                "function carriers require aggregate collection transport",
             )),
         }
     }
@@ -5447,6 +5483,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Type::Error | mir::Type::NullableError => {
                 return Err(malformed_mir(
                     "Error collection values require aggregate transport",
+                ))
+            }
+            mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
+            | mir::Type::ClosureEnvironment(_) => {
+                return Err(malformed_mir(
+                    "function carriers require aggregate collection transport",
                 ))
             }
         })
@@ -8231,6 +8274,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.drop_payload_enum_at(value.into_pointer_value(), payload, true)
             }
             mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
+            mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
+            | mir::Type::ClosureEnvironment(_) => Err(backend_failure(
+                "function-value cleanup reached LLVM before Stage 30e",
+            )),
         }
     }
 
@@ -12566,6 +12614,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.drop_payload_enum_at(address, payload, true)?;
                 }
                 mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {}
+                mir::Type::Function(_)
+                | mir::Type::NullableFunction(_)
+                | mir::Type::ClosureEnvironment(_) => {
+                    return Err(backend_failure(
+                        "function-valued property reached LLVM before Stage 30e",
+                    ));
+                }
             }
         }
         let _ = self.call_runtime(CLASS_FREE, &[pointer.into()], None, &[object.into()])?;
@@ -14348,6 +14403,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         else_block: BasicBlock<'ctx>,
     ) -> Result<(), BackendError> {
         match condition {
+            mir::BoolExpression::NullableFunctionIsPresent(_) => {
+                return Err(backend_failure(
+                    "nullable function test reached LLVM before the Stage 30e boundary",
+                ));
+            }
             mir::BoolExpression::PayloadEnumIsCase {
                 local,
                 ty,
@@ -15778,6 +15838,13 @@ fn collection_storage_type<'ctx>(
                 "payload enum collection values require aggregate storage",
             ))
         }
+        mir::Type::Function(_)
+        | mir::Type::NullableFunction(_)
+        | mir::Type::ClosureEnvironment(_) => {
+            return Err(malformed_mir(
+                "function carriers require aggregate collection storage",
+            ))
+        }
     })
 }
 
@@ -15883,6 +15950,13 @@ fn llvm_type<'ctx>(
         )
         .into(),
         mir::Type::Error | mir::Type::NullableError => error_carrier_type(context).into(),
+        mir::Type::Function(_) | mir::Type::NullableFunction(_) => nullable_type(
+            context,
+            target_data,
+            context.ptr_type(AddressSpace::default()).into(),
+        )
+        .into(),
+        mir::Type::ClosureEnvironment(_) => context.ptr_type(AddressSpace::default()).into(),
         mir::Type::String
         | mir::Type::Class(_)
         | mir::Type::NullableClass(_)

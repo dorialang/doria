@@ -889,11 +889,11 @@ function main(): void
 "#,
         ),
     ] {
-        let program = doriac::lower_source_to_mir(file, source)
-            .expect("coalesce call arguments should reach shared MIR ownership validation");
-        let error = doriac::mir_validation::validate_program(&program)
+        let diagnostics = doriac::lower_source_to_mir(file, source)
             .expect_err("a possible coalesce borrow must conflict with a later transfer");
-        assert!(error.message.contains("both borrows and transfers"));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "B0001" && diagnostic.message.contains("both borrows and transfers")
+        }));
     }
 }
 

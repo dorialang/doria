@@ -4938,8 +4938,12 @@ impl Checker<'_> {
                     ),
                     mixed: resolved_type_is_mixed(&capture.source_type),
                     borrowed_place: borrowed,
-                    borrow_root: borrowed
-                        .then(|| format!("closure:{}:{}", closure_id.start, closure_id.end)),
+                    borrow_root: borrowed.then(|| {
+                        format!(
+                            "closure:{}:{}:binding:{}",
+                            closure_id.start, closure_id.end, capture.environment_binding_id.0
+                        )
+                    }),
                     writable: capture.mode == ast::ClosureCaptureMode::Writable,
                     state: if borrowed {
                         State::Borrowed

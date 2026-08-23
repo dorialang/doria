@@ -59,23 +59,25 @@ function check_stage30c_ownership(string $root): array
     foreach ([$decisionPath => $decision, $planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
         $require($path, $contents, [
             'Stage 30c Ownership, Lifetime, And Escape — Complete',
-            'Stage 30d Closure HIR/MIR And Interpreter Oracle — Next',
+            'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
+            'Stage 30e Native Execution — Next',
             'Stage 30 — In Progress, Not Complete',
         ]);
         $forbid($path, $contents, ['Stage 30c Ownership, Lifetime, And Escape — Next']);
     }
     $require($decisionPath, $decision, [
-        'Stages 30a Through 30c Implemented',
+        'Stages 30a Through 30d Implemented',
         'acquisition at closure creation in authored order',
         'non-lexical readonly/writable leases',
-        'no HIR/MIR or execution',
+        'Stage 30d — Complete',
     ]);
     $require($specPath, $spec, [
         'Stage 30c Ownership, Lifetime, And Escape - Complete',
-        'Stage 30d Closure HIR/MIR And Interpreter Oracle - Next',
-        'E0641 - HIR/MIR/Runtime Execution Boundary',
+        'Stage 30d Closure HIR/MIR And Interpreter Oracle - Complete',
+        'Stage 30e Native Execution - Next',
+        'E0641 - Native/PHP Target Boundary',
     ]);
-    $require($auditPath, $audit, ['Stage 30d and later closure slices']);
+    $require($auditPath, $audit, ['Native Stage 30e; PHP Stage 30f']);
 
     $require($ownershipPath, $ownership, [
         'pub enum ClosureBorrowRoot',
@@ -89,8 +91,7 @@ function check_stage30c_ownership(string $root): array
     ]);
     $require($semanticsPath, $semantics, [
         'pub closure_ownership: HashMap<ClosureId, crate::ownership::ClosureOwnershipInfo>',
-        'stage_30_boundary_candidates',
-        'emit_stage_30_boundaries(&mut checker)',
+        'pub callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>',
     ]);
     $require($constructorPath, $constructor, ['Expr::Closure(closure)', 'report_incomplete_this(']);
     foreach (range(54, 63) as $suffix) {
@@ -104,7 +105,7 @@ function check_stage30c_ownership(string $root): array
         'returned_closures_require_owned_or_one_supported_borrow_root',
         'once_consumption_is_path_sensitive_across_branches_and_loops',
         'nested_function_capture_preserves_transitive_borrow_provenance',
-        'warnings_do_not_suppress_capture_acquisition_or_runtime_boundary',
+        'warnings_do_not_suppress_capture_acquisition_or_ownership_errors',
         'no_capture_closures_are_owned_move_values_with_empty_plans',
         'invalid_capture_plans_are_atomic_and_never_used_leases_end_early',
         'owned_callbacks_can_be_retained_but_borrowed_callbacks_and_receiver_cycles_cannot',
@@ -113,9 +114,8 @@ function check_stage30c_ownership(string $root): array
         'ownership_metadata_scales_deterministically_without_runtime_layout',
     ]);
 
-    foreach ([$hirPath => $hir, $mirPath => $mir] as $path => $contents) {
-        $forbid($path, $contents, ['ClosureExpression', 'CallableCall']);
-    }
+    $require($hirPath, $hir, ['ClosureExpression', 'CallableCall']);
+    $require($mirPath, $mir, ['ClosureDescriptor', 'ClosureEnvironmentLayout']);
 
     return $failures;
 }

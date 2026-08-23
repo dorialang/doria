@@ -1632,6 +1632,7 @@ fn unsupported_increment(increment: &IncrementStmt) -> BackendError {
 
 fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
     match expr {
+        Expr::Closure(_) | Expr::CallableCall(_) => Ok(()),
         Expr::Variable { .. }
         | Expr::This { .. }
         | Expr::Identifier { .. }
@@ -2040,6 +2041,7 @@ fn requires_php_runtime_property_initializer(
         return None;
     }
     match expr {
+        Expr::Closure(_) | Expr::CallableCall(_) => Some((expr.span(), "closure execution")),
         Expr::StaticMember {
             class_name,
             member,
@@ -3929,6 +3931,9 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
 
 fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
     match expr {
+        Expr::Closure(_) | Expr::CallableCall(_) => {
+            unreachable!("PHP closure routes stop at the Stage 30f target boundary")
+        }
         Expr::Variable { name, span } => {
             let value = format!("${}", scopes.php_name(name));
             if scopes.is_mixed_binding(name)

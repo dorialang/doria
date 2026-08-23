@@ -1,0 +1,8 @@
+function main(): void
+{
+    let $base = 10;
+    let $factory = fn(int $left) with (take $base) =>
+        fn(int $right) with (take $left, take $base) => $left + $right + $base;
+    let $answer = $factory(20);
+    echo "{$answer(12)}\n";
+}

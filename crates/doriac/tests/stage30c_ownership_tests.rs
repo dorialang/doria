@@ -415,7 +415,7 @@ function main(): void
 }
 
 #[test]
-fn invalid_ownership_suppresses_runtime_boundary_but_valid_closure_keeps_it() {
+fn target_neutral_analysis_reports_ownership_without_execution_boundaries() {
     let invalid = analyze(
         r#"
 class Payload {}
@@ -428,23 +428,13 @@ function main(): void
 "#,
     );
     diagnostic(&invalid.diagnostics, "E0655");
-    let invalid_closure_start = invalid
-        .info
-        .closures
-        .values()
-        .map(|closure| closure.closure_id.start)
-        .max()
-        .unwrap();
-    assert!(invalid.diagnostics.iter().all(|diagnostic| {
-        diagnostic.code != "E0641" || diagnostic.span.start != invalid_closure_start
-    }));
+    assert!(invalid
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.code != "E0641"));
 
     let valid = analyze("function main(): void { let $value = fn() => 1; }");
-    let boundary = diagnostic(&valid.diagnostics, "E0641");
-    assert!(boundary
-        .explanation
-        .as_deref()
-        .is_some_and(|text| text.contains("Stage 30d")));
+    assert!(valid.diagnostics.is_empty(), "{:#?}", valid.diagnostics);
 }
 
 #[test]
@@ -780,7 +770,7 @@ function main(): void
 }
 
 #[test]
-fn warnings_do_not_suppress_capture_acquisition_or_runtime_boundary() {
+fn warnings_do_not_suppress_capture_acquisition_or_ownership_errors() {
     let analysis = analyze(
         r#"
 class Payload {}
@@ -794,19 +784,17 @@ function main(): void
     );
     diagnostic(&analysis.diagnostics, "E0646");
     diagnostic(&analysis.diagnostics, "E0470");
-    diagnostic(&analysis.diagnostics, "E0641");
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.code != "E0641"));
 }
 
 #[test]
-fn direct_closure_invocation_has_one_runtime_boundary() {
+fn direct_closure_invocation_is_valid_in_target_neutral_analysis() {
     let analysis = analyze("function main(): void { (fn() => 1)(); }");
-    assert_eq!(
-        analysis
-            .diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code == "E0641")
-            .count(),
-        1,
+    assert!(
+        analysis.diagnostics.is_empty(),
         "{:#?}",
         analysis.diagnostics
     );

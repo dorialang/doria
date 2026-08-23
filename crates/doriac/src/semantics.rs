@@ -407,14 +407,6 @@ fn collect_else_return_spans(branch: &ElseBranch, returns: &mut Vec<Option<Span>
     }
 }
 
-fn expression_contains_closure(expr: &Expr) -> bool {
-    match expr {
-        Expr::Closure(_) => true,
-        Expr::Grouped { expr, .. } => expression_contains_closure(expr),
-        _ => false,
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchBindingSemanticInfo {
     pub name: String,
@@ -547,7 +539,6 @@ pub fn analyze_program_for_ide_with_source<'source>(
     );
     let closure_ownership = ownership_analysis.closures;
     checker.diagnostics.extend(ownership_analysis.diagnostics);
-    emit_stage_30_boundaries(&mut checker);
     let return_borrows = checker
         .function_signatures
         .iter()
@@ -591,54 +582,6 @@ pub fn analyze_program_for_ide_with_source<'source>(
         },
         diagnostics: checker.diagnostics,
     }
-}
-
-fn emit_stage_30_boundaries(checker: &mut Checker<'_>) {
-    checker
-        .stage_30_boundary_candidates
-        .sort_by_key(|candidate| (candidate.span.start, candidate.span.end));
-    for candidate in std::mem::take(&mut checker.stage_30_boundary_candidates) {
-        let closure_cause = candidate
-            .closure_id
-            .map(|id| format!("closure:{}:{}", id.start, id.end));
-        let has_precise_error = checker.diagnostics.iter().any(|diagnostic| {
-            if diagnostic.severity != crate::diagnostics::DiagnosticSeverity::Error
-                || diagnostic.code == "E0641"
-            {
-                return false;
-            }
-            let same_cause = closure_cause.as_ref().is_some_and(|cause| {
-                diagnostic
-                    .cause_id
-                    .as_deref()
-                    .is_some_and(|diagnostic_cause| diagnostic_cause.starts_with(cause))
-            });
-            same_cause
-                || (diagnostic.span.start >= candidate.span.start
-                    && diagnostic.span.end <= candidate.span.end)
-        });
-        if has_precise_error {
-            continue;
-        }
-        checker.diagnostics.push(
-            Diagnostic::unsupported_stage(
-                "E0641",
-                format!(
-                    "{} is valid Doria, but checked function values cannot execute yet",
-                    candidate.surface
-                ),
-                candidate.span,
-            )
-            .with_title("Closure Execution Is Not Yet Available")
-            .with_explanation(
-                "Function typing, capture acquisition, ownership, lifetime, escape, and invocation-consumption checks succeeded. Executable HIR, MIR, and interpreter support lands in Stage 30d.",
-            )
-            .with_help("Keep the source as written; no rewrite is required."),
-        );
-    }
-    checker
-        .diagnostics
-        .sort_by_key(|diagnostic| (diagnostic.span.start, diagnostic.span.end));
 }
 
 fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo> {
@@ -1311,18 +1254,10 @@ struct Checker<'program> {
     closures: HashMap<ClosureId, ClosureSemanticInfo>,
     closure_types: HashMap<(usize, usize), TypeId>,
     callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
-    stage_30_boundary_candidates: Vec<Stage30BoundaryCandidate>,
     property_writes: HashMap<(usize, usize), PropertyWriteSemanticInfo>,
     writable_object_paths: HashSet<(usize, usize)>,
     active_closures: Vec<ActiveClosure>,
     initializing_bindings: Vec<HashMap<String, Span>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Stage30BoundaryCandidate {
-    surface: String,
-    span: Span,
-    closure_id: Option<ClosureId>,
 }
 
 #[derive(Debug, Clone)]
@@ -1927,7 +1862,6 @@ impl<'program> Checker<'program> {
             closures: HashMap::new(),
             closure_types: HashMap::new(),
             callable_value_calls: HashMap::new(),
-            stage_30_boundary_candidates: Vec::new(),
             property_writes: HashMap::new(),
             writable_object_paths: HashSet::new(),
             active_closures: Vec::new(),
@@ -7340,27 +7274,6 @@ impl<'program> Checker<'program> {
         missing.required_capability = missing.required_capability.max(requirement);
     }
 
-    fn record_stage_30_execution_boundary(
-        &mut self,
-        surface: &str,
-        span: Span,
-        closure_id: Option<ClosureId>,
-    ) {
-        if self
-            .stage_30_boundary_candidates
-            .iter()
-            .any(|candidate| candidate.span == span)
-        {
-            return;
-        }
-        self.stage_30_boundary_candidates
-            .push(Stage30BoundaryCandidate {
-                surface: surface.to_string(),
-                span,
-                closure_id,
-            });
-    }
-
     fn check_callable_value_call(
         &mut self,
         callee: &Expr,
@@ -7369,7 +7282,6 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
-        let diagnostics_start = self.diagnostics.len();
         self.check_expr(callee, scopes, method_context);
         for argument in args {
             self.check_expr(&argument.value, scopes, method_context);
@@ -7381,7 +7293,6 @@ impl<'program> Checker<'program> {
             args,
             span,
             CallableValueTargetKind::Value,
-            diagnostics_start,
             scopes,
             method_context,
         )
@@ -7399,7 +7310,6 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> bool {
-        let diagnostics_start = self.diagnostics.len();
         let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
             return false;
         };
@@ -7442,7 +7352,6 @@ impl<'program> Checker<'program> {
             args,
             span,
             CallableValueTargetKind::Property,
-            diagnostics_start,
             scopes,
             method_context,
         );
@@ -7457,7 +7366,6 @@ impl<'program> Checker<'program> {
         args: &[Argument],
         span: Span,
         target_kind: CallableValueTargetKind,
-        diagnostics_start: usize,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
@@ -7646,16 +7554,6 @@ impl<'program> Checker<'program> {
                 target_kind,
             },
         );
-        if !self.diagnostics[diagnostics_start..]
-            .iter()
-            .any(|diagnostic| {
-                diagnostic.severity == crate::diagnostics::DiagnosticSeverity::Error
-                    && diagnostic.code != "E0641"
-            })
-            && !expression_contains_closure(callee)
-        {
-            self.record_stage_30_execution_boundary("this function-value call", span, None);
-        }
         function.return_type
     }
 
@@ -7694,7 +7592,6 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> TypeId {
         let key = (closure.span.start, closure.span.end);
-        let diagnostics_start = self.diagnostics.len();
         let closure_id = ClosureId::from_span(closure.span);
         let previous_owner = std::mem::replace(
             &mut self.current_lexical_owner,
@@ -8108,15 +8005,6 @@ impl<'program> Checker<'program> {
         );
 
         self.current_lexical_owner = previous_owner;
-        if !self.diagnostics[diagnostics_start..]
-            .iter()
-            .any(|diagnostic| {
-                diagnostic.severity == crate::diagnostics::DiagnosticSeverity::Error
-                    && diagnostic.code != "E0641"
-            })
-        {
-            self.record_stage_30_execution_boundary("this closure", closure.span, Some(closure_id));
-        }
         ty
     }
 
@@ -10304,6 +10192,16 @@ impl<'program> Checker<'program> {
             self.infer_contextual_binary_operand_types(left, right, scopes, method_context);
         let left_kind = self.types.kind(left_ty).clone();
         let right_kind = self.types.kind(right_ty).clone();
+        if self.is_supported_nullable_equality(
+            left,
+            left_ty,
+            right,
+            right_ty,
+            scopes,
+            method_context,
+        ) {
+            return;
+        }
         if matches!(left_kind, TypeKind::Function(_)) || matches!(right_kind, TypeKind::Function(_))
         {
             self.diagnostics.push(
@@ -10439,15 +10337,7 @@ impl<'program> Checker<'program> {
             }
             _ => {}
         }
-        if self.is_supported_nullable_equality(
-            left,
-            left_ty,
-            right,
-            right_ty,
-            scopes,
-            method_context,
-        ) || self.is_equality_compatible(left_ty, right_ty)
-        {
+        if self.is_equality_compatible(left_ty, right_ty) {
             return;
         }
 

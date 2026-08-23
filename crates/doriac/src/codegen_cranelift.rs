@@ -336,6 +336,11 @@ fn append_type_abi_params(params: &mut Vec<AbiParam>, ty: mir::Type, pointer_typ
             params.push(AbiParam::new(pointer_type));
             params.push(AbiParam::new(pointer_type));
         }
+        mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+            params.push(AbiParam::new(pointer_type));
+            params.push(AbiParam::new(pointer_type));
+        }
+        mir::Type::ClosureEnvironment(_) => params.push(AbiParam::new(pointer_type)),
         mir::Type::NullableScalar(ty) => {
             params.push(AbiParam::new(pointer_type));
             params.push(scalar_abi_param(ty));
@@ -742,7 +747,9 @@ fn define_function(
                 mir::Type::NullableScalar(_)
                 | mir::Type::NullableString
                 | mir::Type::Error
-                | mir::Type::NullableError => {
+                | mir::Type::NullableError
+                | mir::Type::Function(_)
+                | mir::Type::NullableFunction(_) => {
                     let pointer_bytes = u32::from(module.target_config().pointer_bytes());
                     Some(builder.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
@@ -756,6 +763,13 @@ fn define_function(
                         StackSlotKind::ExplicitSlot,
                         ty.storage_size(nullable),
                         ty.align.trailing_zeros() as u8,
+                    )))
+                }
+                mir::Type::ClosureEnvironment(_) => {
+                    Some(builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        u32::from(module.target_config().pointer_bytes()),
+                        module.target_config().pointer_bytes().trailing_zeros() as u8,
                     )))
                 }
             })
@@ -1099,11 +1113,14 @@ fn initialize_locals(
             | mir::Type::NullableReadonlySharedReferenceAccess(_)
             | mir::Type::NullableWritableSharedReferenceAccess(_)
             | mir::Type::Collection(_)
-            | mir::Type::NullableCollection(_) => builder.ins().iconst(pointer_type, 0),
+            | mir::Type::NullableCollection(_)
+            | mir::Type::ClosureEnvironment(_) => builder.ins().iconst(pointer_type, 0),
             mir::Type::NullableScalar(_)
             | mir::Type::NullableString
             | mir::Type::Error
-            | mir::Type::NullableError => {
+            | mir::Type::NullableError
+            | mir::Type::Function(_)
+            | mir::Type::NullableFunction(_) => {
                 let zero = builder.ins().iconst(pointer_type, 0);
                 let slot = local_slot(slots, local.id)?;
                 builder
@@ -1869,6 +1886,11 @@ fn lower_statement(
     debug_assert!(resources.deferred_class_temporary_drops.is_empty());
     resources.defer_class_temporary_drops = true;
     match statement {
+        mir::Statement::BindClosureEnvironment { .. } | mir::Statement::DropFunction { .. } => {
+            return Err(backend_failure(
+                "closure MIR reached Cranelift before the Stage 30e boundary",
+            ));
+        }
         mir::Statement::BindPayloadEnumFields {
             source,
             ty,
@@ -2296,6 +2318,13 @@ fn lower_statement(
                     | mir::Type::NullableScalar(_)
                     | mir::Type::Error
                     | mir::Type::NullableError => None,
+                    mir::Type::Function(_)
+                    | mir::Type::NullableFunction(_)
+                    | mir::Type::ClosureEnvironment(_) => {
+                        return Err(backend_failure(
+                            "function-valued property reached Cranelift before Stage 30e",
+                        ));
+                    }
                 }
             } else {
                 None
@@ -2646,14 +2675,16 @@ fn load_lowered_from_stack(
                 pointer.bytes() as i32,
             ),
         },
-        mir::Type::NullableString | mir::Type::Error | mir::Type::NullableError => {
-            LoweredValue::Nullable {
-                present: builder.ins().stack_load(pointer, pointer, slot, 0),
-                payload: builder
-                    .ins()
-                    .stack_load(pointer, pointer, slot, pointer.bytes() as i32),
-            }
-        }
+        mir::Type::NullableString
+        | mir::Type::Error
+        | mir::Type::NullableError
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_) => LoweredValue::Nullable {
+            present: builder.ins().stack_load(pointer, pointer, slot, 0),
+            payload: builder
+                .ins()
+                .stack_load(pointer, pointer, slot, pointer.bytes() as i32),
+        },
         mir::Type::Scalar(scalar) => LoweredValue::Single(builder.ins().stack_load(
             pointer,
             clif_scalar_type(scalar),
@@ -2681,7 +2712,8 @@ fn load_lowered_from_stack(
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_)
-        | mir::Type::NullableCollection(_) => {
+        | mir::Type::NullableCollection(_)
+        | mir::Type::ClosureEnvironment(_) => {
             LoweredValue::Single(builder.ins().stack_load(pointer, pointer, slot, 0))
         }
     }
@@ -2740,14 +2772,16 @@ fn load_lowered_from_address(
                 pointer.bytes() as i32,
             ),
         },
-        mir::Type::NullableString | mir::Type::Error | mir::Type::NullableError => {
-            LoweredValue::Nullable {
-                present: builder.ins().load(pointer, flags, address, 0),
-                payload: builder
-                    .ins()
-                    .load(pointer, flags, address, pointer.bytes() as i32),
-            }
-        }
+        mir::Type::NullableString
+        | mir::Type::Error
+        | mir::Type::NullableError
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_) => LoweredValue::Nullable {
+            present: builder.ins().load(pointer, flags, address, 0),
+            payload: builder
+                .ins()
+                .load(pointer, flags, address, pointer.bytes() as i32),
+        },
         mir::Type::Scalar(scalar) => LoweredValue::Single(builder.ins().load(
             clif_scalar_type(scalar),
             flags,
@@ -2775,7 +2809,8 @@ fn load_lowered_from_address(
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_)
-        | mir::Type::NullableCollection(_) => {
+        | mir::Type::NullableCollection(_)
+        | mir::Type::ClosureEnvironment(_) => {
             LoweredValue::Single(builder.ins().load(pointer, flags, address, 0))
         }
     }
@@ -2850,6 +2885,11 @@ fn lower_terminator(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     match terminator {
+        mir::Terminator::IndirectCall { .. } | mir::Terminator::CheckedIndirectCall { .. } => {
+            return Err(backend_failure(
+                "indirect closure call reached Cranelift before the Stage 30e boundary",
+            ));
+        }
         mir::Terminator::Return(expression) => {
             debug_assert!(resources.deferred_class_temporary_drops.is_empty());
             resources.defer_class_temporary_drops = true;
@@ -3833,6 +3873,9 @@ fn lower_rvalue(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<LoweredValue, BackendError> {
     match expression {
+        mir::Rvalue::Function(_) | mir::Rvalue::NullableFunction(_) => Err(backend_failure(
+            "function value reached Cranelift before the Stage 30e boundary",
+        )),
         mir::Rvalue::Value(value) => {
             lower_value_expression(builder, value, resources).map(LoweredValue::Single)
         }
@@ -5400,6 +5443,11 @@ fn lower_drop_value_at_address(
             lower_drop_writable_shared_value(builder, value, symbol, resources)
         }
         mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
+        mir::Type::Function(_)
+        | mir::Type::NullableFunction(_)
+        | mir::Type::ClosureEnvironment(_) => Err(backend_failure(
+            "function-value cleanup reached Cranelift before Stage 30e",
+        )),
     }
 }
 
@@ -5505,6 +5553,11 @@ fn collection_compare_kind(ty: mir::Type) -> Result<i64, BackendError> {
         | mir::Type::NullablePayloadEnum(_) => Err(malformed_mir(
             "nullable collection elements are not supported by Stage 23 Slice 3",
         )),
+        mir::Type::Function(_)
+        | mir::Type::NullableFunction(_)
+        | mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
+            "function and closure-environment values do not support collection comparison",
+        )),
     }
 }
 
@@ -5564,7 +5617,10 @@ fn value_to_collection_word(
         | mir::Type::Error
         | mir::Type::NullableError
         | mir::Type::PayloadEnum(_)
-        | mir::Type::NullablePayloadEnum(_) => {
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_)
+        | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "aggregate values cannot use scalar collection word transport",
             ))
@@ -5626,7 +5682,10 @@ fn collection_word_to_value(
         | mir::Type::Error
         | mir::Type::NullableError
         | mir::Type::PayloadEnum(_)
-        | mir::Type::NullablePayloadEnum(_) => {
+        | mir::Type::NullablePayloadEnum(_)
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_)
+        | mir::Type::ClosureEnvironment(_) => {
             return Err(malformed_mir(
                 "aggregate values cannot use scalar collection word transport",
             ))
@@ -7878,6 +7937,11 @@ fn lower_drop_stored_value(
             lower_drop_payload_enum_at(builder, value, ty, true, resources)
         }
         mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
+        mir::Type::Function(_)
+        | mir::Type::NullableFunction(_)
+        | mir::Type::ClosureEnvironment(_) => Err(backend_failure(
+            "function-value cleanup reached Cranelift before Stage 30e",
+        )),
     }
 }
 
@@ -10222,6 +10286,13 @@ fn lower_drop_class_value_impl(
             }
             mir::Type::NullablePayloadEnum(payload) => {
                 lower_drop_payload_enum_at(builder, address, payload, true, resources)?;
+            }
+            mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
+            | mir::Type::ClosureEnvironment(_) => {
+                return Err(backend_failure(
+                    "function-valued property reached Cranelift before Stage 30e",
+                ));
             }
         }
     }
@@ -13730,6 +13801,11 @@ fn lower_condition_to_branch(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     match condition {
+        mir::BoolExpression::NullableFunctionIsPresent(_) => {
+            return Err(backend_failure(
+                "nullable function test reached Cranelift before the Stage 30e boundary",
+            ));
+        }
         mir::BoolExpression::PayloadEnumIsCase {
             local,
             ty,

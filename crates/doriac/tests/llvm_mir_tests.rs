@@ -522,6 +522,9 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
         statics: vec![],
         error_descriptors: vec![],
         error_origins: vec![],
+        function_types: Vec::new(),
+        closure_descriptors: Vec::new(),
+        closure_environment_layouts: Vec::new(),
         functions: vec![
             Function {
                 id: FunctionId(0),
@@ -530,6 +533,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 method: None,
                 receiver_mode: None,
                 params: Vec::new(),
+                parameter_modes: Vec::new(),
                 return_type: ReturnType::Void,
                 checked_effects: Vec::new(),
                 locals: Vec::new(),
@@ -539,6 +543,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                     terminator: Terminator::ReturnVoid,
                 }],
                 entry_block: BlockId(0),
+                closure: None,
             },
             Function {
                 id: FunctionId(1),
@@ -547,6 +552,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 method: None,
                 receiver_mode: None,
                 params: Vec::new(),
+                parameter_modes: Vec::new(),
                 return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
                 checked_effects: Vec::new(),
                 locals: Vec::new(),
@@ -563,6 +569,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                     ))),
                 }],
                 entry_block: BlockId(0),
+                closure: None,
             },
         ],
         entry: FunctionId(0),

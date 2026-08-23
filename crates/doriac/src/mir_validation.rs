@@ -9,6 +9,7 @@ use crate::numeric::{FloatType, IntegerType};
 
 pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     validate_error_metadata(program)?;
+    validate_closure_metadata(program)?;
     for (index, definition) in program.enums.iter().enumerate() {
         if definition.id != crate::enums::EnumId(index) {
             return Err(malformed_mir(format!(
@@ -219,6 +220,140 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
         }
         validate_method_identity(program, function)?;
         validate_function(program, function)?;
+    }
+    Ok(())
+}
+
+fn validate_closure_metadata(program: &mir::Program) -> Result<(), BackendError> {
+    for (index, function_type) in program.function_types.iter().enumerate() {
+        if function_type.id != mir::FunctionTypeId(index) {
+            return Err(malformed_mir(format!(
+                "function type table slot {index} contains type#{}",
+                function_type.id.0
+            )));
+        }
+        for parameter in &function_type.parameters {
+            validate_type_reference(program, parameter.ty)?;
+        }
+        if let mir::ReturnType::Value(ty) = function_type.return_type {
+            validate_type_reference(program, ty)?;
+        }
+        validate_checked_effects(program, &function_type.checked_effects)?;
+        if let Some(return_borrow) = function_type.return_borrow {
+            match return_borrow.source {
+                mir::BorrowSource::Receiver => {
+                    return Err(malformed_mir(
+                        "structural function type uses a receiver return-borrow source",
+                    ));
+                }
+                mir::BorrowSource::Parameter(parameter)
+                    if parameter >= function_type.parameters.len() =>
+                {
+                    return Err(malformed_mir(
+                        "structural function type return-borrow parameter does not exist",
+                    ));
+                }
+                mir::BorrowSource::Parameter(_) => {}
+            }
+        }
+    }
+
+    for (index, layout) in program.closure_environment_layouts.iter().enumerate() {
+        if layout.id != mir::ClosureEnvironmentLayoutId(index) {
+            return Err(malformed_mir(format!(
+                "closure environment table slot {index} contains layout#{}",
+                layout.id.0
+            )));
+        }
+        let field_count = layout.fields.len();
+        let mut logical = HashSet::new();
+        let mut physical = HashSet::new();
+        let mut environment_bindings = HashSet::new();
+        for (field_index, field) in layout.fields.iter().enumerate() {
+            if field.id != mir::ClosureEnvironmentFieldId(field_index)
+                || field.logical_index >= field_count
+                || field.physical_index >= field_count
+                || !logical.insert(field.logical_index)
+                || !physical.insert(field.physical_index)
+                || !environment_bindings.insert(field.environment_binding)
+            {
+                return Err(malformed_mir(format!(
+                    "closure environment layout#{} has invalid field identity or ordering",
+                    layout.id.0
+                )));
+            }
+            validate_type_reference(program, field.ty)?;
+            if matches!(field.ty, mir::Type::ClosureEnvironment(_)) {
+                return Err(malformed_mir(
+                    "closure environment fields cannot contain a raw environment handle",
+                ));
+            }
+        }
+        let expected_release = (0..field_count).rev().collect::<Vec<_>>();
+        if layout.logical_release_order != expected_release {
+            return Err(malformed_mir(format!(
+                "closure environment layout#{} does not use reverse logical release order",
+                layout.id.0
+            )));
+        }
+    }
+
+    for (index, descriptor) in program.closure_descriptors.iter().enumerate() {
+        if descriptor.id != mir::ClosureDescriptorId(index) {
+            return Err(malformed_mir(format!(
+                "closure descriptor table slot {index} contains descriptor#{}",
+                descriptor.id.0
+            )));
+        }
+        let function_type = function_type_in(program, descriptor.function_type)?;
+        if descriptor.invocation_mode != function_type.invocation_mode {
+            return Err(malformed_mir(format!(
+                "closure descriptor#{} invocation mode disagrees with its function type",
+                descriptor.id.0
+            )));
+        }
+        if let Some(layout) = descriptor.environment_layout {
+            closure_environment_layout_in(program, layout)?;
+        }
+        if descriptor.source_span.start > descriptor.source_span.end
+            || descriptor.source_span.end > program.source.text.len()
+            || descriptor.debug_identity.is_empty()
+        {
+            return Err(malformed_mir(format!(
+                "closure descriptor#{} has invalid source identity",
+                descriptor.id.0
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_type_reference(program: &mir::Program, ty: mir::Type) -> Result<(), BackendError> {
+    match ty {
+        mir::Type::Function(function_type) | mir::Type::NullableFunction(function_type) => {
+            function_type_in(program, function_type)?;
+        }
+        mir::Type::ClosureEnvironment(Some(layout)) => {
+            closure_environment_layout_in(program, layout)?;
+        }
+        mir::Type::ClosureEnvironment(None) => {}
+        _ => validate_type(program, ty)?,
+    }
+    Ok(())
+}
+
+fn validate_checked_effects(
+    program: &mir::Program,
+    effects: &[mir::CheckedEffect],
+) -> Result<(), BackendError> {
+    let mut seen = HashSet::new();
+    for effect in effects {
+        if !seen.insert(*effect) {
+            return Err(malformed_mir("checked effect set contains a duplicate"));
+        }
+        if let mir::CheckedEffect::Concrete(descriptor) = effect {
+            error_descriptor_in(program, *descriptor)?;
+        }
     }
     Ok(())
 }
@@ -547,6 +682,9 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
         | mir::Type::NullableWritableSharedReferenceAccess(_) => FieldType::SharedReferenceAccess,
         mir::Type::Collection(_) | mir::Type::NullableCollection(_) => FieldType::Collection,
+        mir::Type::Function(_) => FieldType::Function,
+        mir::Type::NullableFunction(_) => FieldType::NullableFunction,
+        mir::Type::ClosureEnvironment(_) => FieldType::SharedReferenceAccess,
         mir::Type::PayloadEnum(ty) => {
             let layout = &program.enums[ty.id.0].layout;
             FieldType::Aggregate {
@@ -577,9 +715,111 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
         }
         validate_type(program, local.ty)?;
     }
+    if function.parameter_modes.len() != function.params.len() {
+        return Err(malformed_mir(format!(
+            "function {} parameter modes do not match its parameters",
+            function.name
+        )));
+    }
     for parameter in &function.params {
         let local = local_in(function, *parameter)?;
         let _ = local;
+    }
+    validate_checked_effects(program, &function.checked_effects)?;
+    match &function.closure {
+        Some(closure) => {
+            let descriptor = closure_descriptor_in(program, closure.descriptor)?;
+            let function_type = function_type_in(program, closure.function_type)?;
+            if descriptor.entry_function != function.id
+                || descriptor.function_type != closure.function_type
+                || descriptor.environment_layout != closure.environment_layout
+                || function.return_type != function_type.return_type
+                || function.checked_effects != function_type.checked_effects
+                || function.params.len() != function_type.parameters.len() + 1
+                || function.params.first() != Some(&closure.hidden_environment)
+            {
+                return Err(malformed_mir(format!(
+                    "synthetic closure function {} disagrees with its descriptor or structural type",
+                    function.name
+                )));
+            }
+            let hidden = local_in(function, closure.hidden_environment)?;
+            if hidden.ty != mir::Type::ClosureEnvironment(closure.environment_layout)
+                || hidden.writable
+                    != matches!(
+                        function_type.invocation_mode,
+                        mir::FunctionInvocationMode::Writable
+                    )
+                || hidden.owned
+                    != matches!(
+                        function_type.invocation_mode,
+                        mir::FunctionInvocationMode::Once
+                    )
+            {
+                return Err(malformed_mir(
+                    "synthetic closure function has an invalid hidden environment parameter",
+                ));
+            }
+            for ((parameter, mode), expected) in function
+                .params
+                .iter()
+                .skip(1)
+                .zip(function.parameter_modes.iter().skip(1))
+                .zip(&function_type.parameters)
+            {
+                if local_in(function, *parameter)?.ty != expected.ty || *mode != expected.mode {
+                    return Err(malformed_mir(
+                        "synthetic closure source parameter does not match its structural type",
+                    ));
+                }
+            }
+            let expected_hidden_mode = match function_type.invocation_mode {
+                mir::FunctionInvocationMode::Readonly => mir::FunctionParameterMode::Readonly,
+                mir::FunctionInvocationMode::Writable => mir::FunctionParameterMode::Writable,
+                mir::FunctionInvocationMode::Once => mir::FunctionParameterMode::Take,
+            };
+            if function.parameter_modes.first() != Some(&expected_hidden_mode) {
+                return Err(malformed_mir(
+                    "synthetic closure hidden environment mode is invalid",
+                ));
+            }
+            match closure.environment_layout {
+                Some(layout) => {
+                    let layout = closure_environment_layout_in(program, layout)?;
+                    if closure.capture_locals.len() != layout.fields.len() {
+                        return Err(malformed_mir(
+                            "synthetic closure capture bindings do not match its environment",
+                        ));
+                    }
+                    for ((field, local), expected) in
+                        closure.capture_locals.iter().zip(&layout.fields)
+                    {
+                        if *field != expected.id || local_in(function, *local)?.ty != expected.ty {
+                            return Err(malformed_mir(
+                                "synthetic closure capture local has the wrong field or type",
+                            ));
+                        }
+                    }
+                }
+                None if !closure.capture_locals.is_empty() => {
+                    return Err(malformed_mir(
+                        "no-capture closure declares environment capture locals",
+                    ));
+                }
+                None => {}
+            }
+        }
+        None => {
+            if program
+                .closure_descriptors
+                .iter()
+                .any(|descriptor| descriptor.entry_function == function.id)
+            {
+                return Err(malformed_mir(
+                    "closure descriptor entry function lacks closure metadata",
+                ));
+            }
+        }
     }
     block_in(function, function.entry_block)?;
     for (index, block) in function.blocks.iter().enumerate() {
@@ -667,15 +907,24 @@ fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendErr
         class_in(program, class)?;
     } else {
         match ty {
-            mir::Type::Collection(collection) => {
+            mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
                 collection_in(program, collection)?;
             }
+            mir::Type::Function(function_type) | mir::Type::NullableFunction(function_type) => {
+                function_type_in(program, function_type)?;
+            }
+            mir::Type::ClosureEnvironment(Some(layout)) => {
+                closure_environment_layout_in(program, layout)?;
+            }
+            mir::Type::ClosureEnvironment(None) => {}
             mir::Type::WritableSharedReference(payload)
             | mir::Type::WritableWeakReference(payload)
             | mir::Type::NullableWritableSharedReference(payload)
             | mir::Type::NullableWritableWeakReference(payload)
             | mir::Type::ReadonlySharedReferenceAccess(payload)
-            | mir::Type::WritableSharedReferenceAccess(payload) => {
+            | mir::Type::WritableSharedReferenceAccess(payload)
+            | mir::Type::NullableReadonlySharedReferenceAccess(payload)
+            | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
                 validate_writable_shared_payload(program, payload)?;
             }
             _ => {}
@@ -754,6 +1003,46 @@ fn validate_statement(
     statement: &mir::Statement,
 ) -> Result<(), BackendError> {
     match statement {
+        mir::Statement::BindClosureEnvironment {
+            environment,
+            bindings,
+        } => {
+            let closure = function
+                .closure
+                .as_ref()
+                .ok_or_else(|| malformed_mir("non-closure function binds a closure environment"))?;
+            if *environment != closure.hidden_environment || bindings != &closure.capture_locals {
+                return Err(malformed_mir(
+                    "closure environment binding disagrees with synthetic function metadata",
+                ));
+            }
+            let layout_id = closure
+                .environment_layout
+                .ok_or_else(|| malformed_mir("no-capture closure binds a closure environment"))?;
+            let layout = closure_environment_layout_in(program, layout_id)?;
+            if bindings.len() != layout.fields.len() {
+                return Err(malformed_mir(
+                    "closure environment binding count does not match its layout",
+                ));
+            }
+            for ((field, target), expected) in bindings.iter().zip(&layout.fields) {
+                let local = local_in(function, *target)?;
+                if *field != expected.id
+                    || local.ty != expected.ty
+                    || local.owned
+                    || local.writable
+                        != matches!(
+                            expected.storage,
+                            mir::ClosureEnvironmentStorage::WritableBorrow
+                        )
+                {
+                    return Err(malformed_mir(
+                        "closure environment field binding has incompatible type or access",
+                    ));
+                }
+            }
+            Ok(())
+        }
         mir::Statement::BindPayloadEnumFields {
             source,
             ty,
@@ -1261,6 +1550,39 @@ fn validate_statement(
                     "local local{} receives a mismatched shared-handle rvalue",
                     target.0
                 ))),
+                (mir::Type::Function(expected), mir::Rvalue::Function(expression))
+                    if expression.function_type() == expected =>
+                {
+                    validate_function_expression(program, function, expression)?;
+                    validate_function_assignment_ownership(
+                        local,
+                        function_expression_is_borrowed(expression),
+                    )
+                }
+                (
+                    mir::Type::NullableFunction(expected),
+                    mir::Rvalue::NullableFunction(expression),
+                ) if expression.function_type() == expected => {
+                    validate_nullable_function_expression(program, function, expression)?;
+                    if matches!(expression, mir::NullableFunctionExpression::Null { .. }) {
+                        Ok(())
+                    } else {
+                        validate_function_assignment_ownership(
+                            local,
+                            nullable_function_expression_is_borrowed(expression),
+                        )
+                    }
+                }
+                (mir::Type::Function(_) | mir::Type::NullableFunction(_), _)
+                | (_, mir::Rvalue::Function(_) | mir::Rvalue::NullableFunction(_)) => {
+                    Err(malformed_mir(format!(
+                        "local local{} receives a mismatched function-value rvalue",
+                        target.0
+                    )))
+                }
+                (mir::Type::ClosureEnvironment(_), _) => Err(malformed_mir(
+                    "closure environments may only enter through hidden parameters",
+                )),
             }
         }
         mir::Statement::AssignLocalGroup { targets, value } => {
@@ -1873,6 +2195,25 @@ fn validate_statement(
             }
             validate_payload_enum_type(program, *ty).map(|_| ())
         }
+        mir::Statement::DropFunction {
+            local,
+            function_type,
+            nullable,
+        } => {
+            let definition = local_in(function, *local)?;
+            let expected = if *nullable {
+                mir::Type::NullableFunction(*function_type)
+            } else {
+                mir::Type::Function(*function_type)
+            };
+            if definition.ty != expected || !definition.owned {
+                return Err(malformed_mir(format!(
+                    "function-value drop references incompatible local{}",
+                    local.0
+                )));
+            }
+            function_type_in(program, *function_type).map(|_| ())
+        }
         mir::Statement::ControlFlowPlan(plan) => match plan {
             mir::ControlFlowPlan::Given(plan) => {
                 block_in(function, plan.setup_entry)?;
@@ -2035,6 +2376,9 @@ fn grouped_move_rvalue_is_null(ty: mir::Type, value: &mir::Rvalue) -> bool {
         (mir::Type::NullableCollection(expected), mir::Rvalue::NullableCollection(value)) => {
             matches!(value, mir::NullableCollectionExpression::Null(actual) if *actual == expected)
         }
+        (mir::Type::NullableFunction(expected), mir::Rvalue::NullableFunction(value)) => {
+            matches!(value, mir::NullableFunctionExpression::Null { function_type } if *function_type == expected)
+        }
         _ => false,
     }
 }
@@ -2131,6 +2475,26 @@ fn validate_terminator(
                             function.name
                         )));
                     }
+                } else if let (mir::Type::Function(_), mir::Rvalue::Function(value)) =
+                    (return_type, expression)
+                {
+                    if function_expression_is_borrowed(value) {
+                        return Err(malformed_mir(format!(
+                            "return from {} receives a borrowed function carrier",
+                            function.name
+                        )));
+                    }
+                } else if let (
+                    mir::Type::NullableFunction(_),
+                    mir::Rvalue::NullableFunction(value),
+                ) = (return_type, expression)
+                {
+                    if nullable_function_expression_is_borrowed(value) {
+                        return Err(malformed_mir(format!(
+                            "return from {} receives a borrowed nullable function carrier",
+                            function.name
+                        )));
+                    }
                 }
             }
             Ok(())
@@ -2194,6 +2558,62 @@ fn validate_terminator(
             if success == failure {
                 return Err(malformed_mir(
                     "checked call success and error edges are identical",
+                ));
+            }
+            Ok(())
+        }
+        mir::Terminator::IndirectCall {
+            callee,
+            function_type,
+            invocation_mode,
+            args,
+            result,
+            continuation,
+            ..
+        } => {
+            validate_indirect_call(
+                program,
+                function,
+                IndirectCallValidation {
+                    callee,
+                    function_type: *function_type,
+                    invocation_mode: *invocation_mode,
+                    args,
+                    result: *result,
+                    error: None,
+                },
+            )?;
+            block_in(function, *continuation)?;
+            Ok(())
+        }
+        mir::Terminator::CheckedIndirectCall {
+            callee,
+            function_type,
+            invocation_mode,
+            args,
+            result,
+            error,
+            success,
+            failure,
+            ..
+        } => {
+            validate_indirect_call(
+                program,
+                function,
+                IndirectCallValidation {
+                    callee,
+                    function_type: *function_type,
+                    invocation_mode: *invocation_mode,
+                    args,
+                    result: *result,
+                    error: Some(*error),
+                },
+            )?;
+            block_in(function, *success)?;
+            block_in(function, *failure)?;
+            if success == failure {
+                return Err(malformed_mir(
+                    "checked indirect call success and error edges are identical",
                 ));
             }
             Ok(())
@@ -2386,6 +2806,128 @@ fn validate_checked_io_operation(
             validate_io_contents(program, function, contents)
         }
     }
+}
+
+struct IndirectCallValidation<'a> {
+    callee: &'a mir::FunctionExpression,
+    function_type: mir::FunctionTypeId,
+    invocation_mode: mir::FunctionInvocationMode,
+    args: &'a [mir::Rvalue],
+    result: Option<mir::LocalId>,
+    error: Option<mir::LocalId>,
+}
+
+fn validate_indirect_call(
+    program: &mir::Program,
+    caller: &mir::Function,
+    call: IndirectCallValidation<'_>,
+) -> Result<(), BackendError> {
+    let definition = function_type_in(program, call.function_type)?;
+    if call.callee.function_type() != call.function_type
+        || definition.invocation_mode != call.invocation_mode
+    {
+        return Err(malformed_mir(
+            "indirect call disagrees with its structural function type",
+        ));
+    }
+    validate_function_expression(program, caller, call.callee)?;
+    match call.invocation_mode {
+        mir::FunctionInvocationMode::Readonly => {}
+        mir::FunctionInvocationMode::Writable => {
+            let mir::FunctionExpression::Local {
+                local,
+                transfer: false,
+                ..
+            } = call.callee
+            else {
+                return Err(malformed_mir(
+                    "writable indirect call does not use a borrowed local carrier",
+                ));
+            };
+            if !local_in(caller, *local)?.writable {
+                return Err(malformed_mir(
+                    "writable indirect call uses a readonly function carrier",
+                ));
+            }
+        }
+        mir::FunctionInvocationMode::Once => {
+            if function_expression_is_borrowed(call.callee) {
+                return Err(malformed_mir(
+                    "once indirect call does not consume its function carrier",
+                ));
+            }
+        }
+    }
+    if call.args.len() != definition.parameters.len() {
+        return Err(malformed_mir(format!(
+            "indirect call expects {} arguments, got {}",
+            definition.parameters.len(),
+            call.args.len()
+        )));
+    }
+    for (index, (argument, parameter)) in call.args.iter().zip(&definition.parameters).enumerate() {
+        if argument.ty() != parameter.ty {
+            return Err(malformed_mir(format!(
+                "indirect call passes {} argument {} to {} parameter",
+                argument.ty(),
+                index + 1,
+                parameter.ty
+            )));
+        }
+        validate_rvalue(program, caller, argument)?;
+        if parameter.mode == mir::FunctionParameterMode::Take
+            && parameter.ty.has_move_ownership()
+            && argument.borrows_move_value()
+        {
+            return Err(malformed_mir(format!(
+                "indirect call borrows argument {} for a take parameter",
+                index + 1
+            )));
+        }
+    }
+    match (definition.return_type, call.result) {
+        (mir::ReturnType::Void, None) => {}
+        (mir::ReturnType::Value(expected), Some(result)) => {
+            let result = local_in(caller, result)?;
+            if result.ty != expected || !result.synthetic {
+                return Err(malformed_mir(
+                    "indirect call has an incompatible result slot",
+                ));
+            }
+            if expected.has_move_ownership() && !result.owned {
+                return Err(malformed_mir(
+                    "indirect call move result does not own its result slot",
+                ));
+            }
+        }
+        _ => {
+            return Err(malformed_mir(
+                "indirect call has the wrong result-slot shape",
+            ))
+        }
+    }
+    match (definition.checked_effects.is_empty(), call.error) {
+        (true, None) => {}
+        (false, Some(error)) => {
+            let error = local_in(caller, error)?;
+            if error.ty != mir::Type::Error || !error.owned || !error.synthetic {
+                return Err(malformed_mir(
+                    "checked indirect call has an incompatible Error slot",
+                ));
+            }
+        }
+        (true, Some(_)) => {
+            return Err(malformed_mir(
+                "checked indirect call uses a nonthrowing function type",
+            ));
+        }
+        (false, None) => {
+            return Err(malformed_mir(
+                "ordinary indirect call uses a throwing function type",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_io_contents(
@@ -2701,6 +3243,10 @@ fn validate_rvalue(
         mir::Rvalue::NullablePayloadEnum(value) => {
             validate_nullable_payload_enum_expression(program, function, value)
         }
+        mir::Rvalue::Function(value) => validate_function_expression(program, function, value),
+        mir::Rvalue::NullableFunction(value) => {
+            validate_nullable_function_expression(program, function, value)
+        }
     }?;
     let mut accesses = ClassLocalAccesses::default();
     collect_rvalue_class_local_accesses(expression, &mut accesses);
@@ -2712,6 +3258,310 @@ fn validate_rvalue(
         &mut HashSet::new(),
     )?;
     Ok(())
+}
+
+fn validate_function_assignment_ownership(
+    local: &mir::Local,
+    borrowed: bool,
+) -> Result<(), BackendError> {
+    if local.owned == borrowed {
+        return Err(malformed_mir(format!(
+            "function-value local local{} has inconsistent ownership",
+            local.id.0
+        )));
+    }
+    Ok(())
+}
+
+fn function_expression_is_borrowed(value: &mir::FunctionExpression) -> bool {
+    match value {
+        mir::FunctionExpression::Create { .. } | mir::FunctionExpression::Call { .. } => false,
+        mir::FunctionExpression::Local { transfer, .. } => !transfer,
+        mir::FunctionExpression::Property { .. } => true,
+        mir::FunctionExpression::CollectionIndex { remove, .. } => !remove,
+        mir::FunctionExpression::AssumePresent { value, .. } => {
+            nullable_function_expression_is_borrowed(value)
+        }
+    }
+}
+
+fn nullable_function_expression_is_borrowed(value: &mir::NullableFunctionExpression) -> bool {
+    match value {
+        mir::NullableFunctionExpression::Null { .. }
+        | mir::NullableFunctionExpression::Call { .. } => false,
+        mir::NullableFunctionExpression::Present(value) => function_expression_is_borrowed(value),
+        mir::NullableFunctionExpression::Local { transfer, .. } => !transfer,
+        mir::NullableFunctionExpression::Property { .. }
+        | mir::NullableFunctionExpression::DictionaryGet { .. } => true,
+        mir::NullableFunctionExpression::CollectionIndex { remove, .. } => !remove,
+    }
+}
+
+fn validate_function_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    value: &mir::FunctionExpression,
+) -> Result<(), BackendError> {
+    let expected = value.function_type();
+    function_type_in(program, expected)?;
+    match value {
+        mir::FunctionExpression::Create {
+            descriptor,
+            captures,
+            span,
+            ..
+        } => {
+            let descriptor = closure_descriptor_in(program, *descriptor)?;
+            if descriptor.function_type != expected || descriptor.source_span != *span {
+                return Err(malformed_mir(
+                    "closure construction disagrees with its descriptor",
+                ));
+            }
+            match descriptor.environment_layout {
+                None if captures.is_empty() => Ok(()),
+                None => Err(malformed_mir(
+                    "no-capture closure construction supplies capture operands",
+                )),
+                Some(layout) => {
+                    let layout = closure_environment_layout_in(program, layout)?;
+                    if captures.len() != layout.fields.len() {
+                        return Err(malformed_mir(
+                            "closure construction capture count does not match its layout",
+                        ));
+                    }
+                    for (capture, field) in captures.iter().zip(&layout.fields) {
+                        match (capture, field.storage) {
+                            (
+                                mir::ClosureCaptureOperand::BorrowLocal { local, writable },
+                                mir::ClosureEnvironmentStorage::ReadonlyBorrow
+                                | mir::ClosureEnvironmentStorage::WritableBorrow,
+                            ) => {
+                                let source = local_in(function, *local)?;
+                                let expected_writable = matches!(
+                                    field.storage,
+                                    mir::ClosureEnvironmentStorage::WritableBorrow
+                                );
+                                if source.ty != field.ty
+                                    || *writable != expected_writable
+                                    || (expected_writable && !source.writable)
+                                {
+                                    return Err(malformed_mir(
+                                        "closure borrow capture has incompatible type or access",
+                                    ));
+                                }
+                            }
+                            (
+                                mir::ClosureCaptureOperand::CopyValue(value)
+                                | mir::ClosureCaptureOperand::MoveValue(value),
+                                mir::ClosureEnvironmentStorage::Owned,
+                            ) => {
+                                if value.ty() != field.ty {
+                                    return Err(malformed_mir(
+                                        "closure owned capture has an incompatible type",
+                                    ));
+                                }
+                                validate_rvalue(program, function, value)?;
+                                if matches!(capture, mir::ClosureCaptureOperand::MoveValue(_))
+                                    && value.borrows_move_value()
+                                {
+                                    return Err(malformed_mir(
+                                        "closure move capture uses a borrowed value",
+                                    ));
+                                }
+                            }
+                            _ => {
+                                return Err(malformed_mir(
+                                    "closure capture operand does not match environment storage",
+                                ));
+                            }
+                        }
+                    }
+                    Ok(())
+                }
+            }
+        }
+        mir::FunctionExpression::Local {
+            local, transfer, ..
+        } => {
+            let local = local_in(function, *local)?;
+            if local.ty != mir::Type::Function(expected) || (*transfer && !local.owned) {
+                return Err(malformed_mir(format!(
+                    "function `{}` local expression uses local{} with type `{}` and owned={}, but expected `{}` with transfer={transfer}",
+                    function.name,
+                    local.id.0,
+                    local.ty,
+                    local.owned,
+                    mir::Type::Function(expected),
+                )));
+            }
+            Ok(())
+        }
+        mir::FunctionExpression::Property {
+            object, property, ..
+        } => validate_property_operand(
+            program,
+            function,
+            *object,
+            *property,
+            mir::Type::Function(expected),
+        ),
+        mir::FunctionExpression::Call {
+            function: callee,
+            args,
+            return_borrow,
+            ..
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::Function(expected))
+                || *return_borrow != infer_function_return_borrow(program, callee)?
+            {
+                return Err(malformed_mir(
+                    "direct call function-value result disagrees with its callee",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::FunctionExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir(
+                    "function collection access uses a non-collection local",
+                ));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            if collection_type.value != mir::Type::Function(expected) {
+                return Err(malformed_mir(
+                    "function collection element type does not match",
+                ));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection_type,
+                index,
+                *remove,
+                *positional,
+            )
+        }
+        mir::FunctionExpression::AssumePresent { value, .. } => {
+            if value.function_type() != expected {
+                return Err(malformed_mir(
+                    "narrowed nullable function uses another structural type",
+                ));
+            }
+            validate_nullable_function_expression(program, function, value)
+        }
+    }
+}
+
+fn validate_nullable_function_expression(
+    program: &mir::Program,
+    function: &mir::Function,
+    value: &mir::NullableFunctionExpression,
+) -> Result<(), BackendError> {
+    let expected = value.function_type();
+    function_type_in(program, expected)?;
+    match value {
+        mir::NullableFunctionExpression::Null { .. } => Ok(()),
+        mir::NullableFunctionExpression::Present(value) => {
+            if value.function_type() != expected {
+                return Err(malformed_mir(
+                    "present nullable function uses another structural type",
+                ));
+            }
+            validate_function_expression(program, function, value)
+        }
+        mir::NullableFunctionExpression::Local {
+            local, transfer, ..
+        } => {
+            let local = local_in(function, *local)?;
+            if local.ty != mir::Type::NullableFunction(expected) || (*transfer && !local.owned) {
+                return Err(malformed_mir(format!(
+                    "function `{}` nullable function local expression uses local{} with type `{}` and owned={}, but expected `{}` with transfer={transfer}",
+                    function.name,
+                    local.id.0,
+                    local.ty,
+                    local.owned,
+                    mir::Type::NullableFunction(expected),
+                )));
+            }
+            Ok(())
+        }
+        mir::NullableFunctionExpression::Property {
+            object, property, ..
+        } => validate_property_operand(
+            program,
+            function,
+            *object,
+            *property,
+            mir::Type::NullableFunction(expected),
+        ),
+        mir::NullableFunctionExpression::Call {
+            function: callee,
+            args,
+            return_borrow,
+            ..
+        } => {
+            let callee = function_in(program, *callee)?;
+            if callee.return_type != mir::ReturnType::Value(mir::Type::NullableFunction(expected))
+                || *return_borrow != infer_function_return_borrow(program, callee)?
+            {
+                return Err(malformed_mir(
+                    "direct call nullable-function result disagrees with its callee",
+                ));
+            }
+            validate_call_args(program, function, callee, args)
+        }
+        mir::NullableFunctionExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+            ..
+        } => validate_dictionary_get(
+            program,
+            function,
+            *collection,
+            key,
+            mir::Type::Function(expected),
+            *access,
+        ),
+        mir::NullableFunctionExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        } => {
+            let local = local_in(function, *collection)?;
+            let mir::Type::Collection(collection_type) = local.ty else {
+                return Err(malformed_mir(
+                    "nullable function collection access uses a non-collection local",
+                ));
+            };
+            let collection_type = collection_in(program, collection_type)?;
+            if collection_type.value != mir::Type::NullableFunction(expected) {
+                return Err(malformed_mir(
+                    "nullable function collection element type does not match",
+                ));
+            }
+            validate_collection_element_access(
+                program,
+                function,
+                local,
+                collection_type,
+                index,
+                *remove,
+                *positional,
+            )
+        }
+    }
 }
 
 fn validate_error_assignment_ownership(
@@ -6511,6 +7361,68 @@ fn collect_rvalue_class_local_accesses<'a>(
         mir::Rvalue::NullablePayloadEnum(value) => {
             collect_nullable_payload_enum_class_local_accesses(value, accesses)
         }
+        mir::Rvalue::Function(value) => collect_function_class_local_accesses(value, accesses),
+        mir::Rvalue::NullableFunction(value) => {
+            collect_nullable_function_class_local_accesses(value, accesses)
+        }
+    }
+}
+
+fn collect_function_class_local_accesses<'a>(
+    value: &'a mir::FunctionExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::FunctionExpression::Create { captures, .. } => {
+            for capture in captures {
+                match capture {
+                    mir::ClosureCaptureOperand::BorrowLocal { local, .. } => {
+                        accesses.borrow(*local)
+                    }
+                    mir::ClosureCaptureOperand::CopyValue(value) => {
+                        collect_rvalue_class_local_accesses(value, accesses)
+                    }
+                    mir::ClosureCaptureOperand::MoveValue(value) => {
+                        collect_rvalue_class_local_accesses(value, accesses)
+                    }
+                }
+            }
+        }
+        mir::FunctionExpression::Call { function, args, .. } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::FunctionExpression::CollectionIndex { index, .. } => {
+            collect_rvalue_class_local_accesses(index, accesses)
+        }
+        mir::FunctionExpression::AssumePresent { value, .. } => {
+            collect_nullable_function_class_local_accesses(value, accesses)
+        }
+        mir::FunctionExpression::Local { .. } | mir::FunctionExpression::Property { .. } => {}
+    }
+}
+
+fn collect_nullable_function_class_local_accesses<'a>(
+    value: &'a mir::NullableFunctionExpression,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    match value {
+        mir::NullableFunctionExpression::Present(value) => {
+            collect_function_class_local_accesses(value, accesses)
+        }
+        mir::NullableFunctionExpression::Call { function, args, .. } => {
+            accesses.begin_call();
+            collect_rvalue_args_class_local_accesses(args, accesses);
+            accesses.call(*function, args);
+        }
+        mir::NullableFunctionExpression::DictionaryGet { key, .. }
+        | mir::NullableFunctionExpression::CollectionIndex { index: key, .. } => {
+            collect_rvalue_class_local_accesses(key, accesses)
+        }
+        mir::NullableFunctionExpression::Null { .. }
+        | mir::NullableFunctionExpression::Local { .. }
+        | mir::NullableFunctionExpression::Property { .. } => {}
     }
 }
 
@@ -7470,6 +8382,9 @@ fn collect_bool_class_local_accesses<'a>(
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             collect_nullable_payload_enum_class_local_accesses(value, accesses);
         }
+        mir::BoolExpression::NullableFunctionIsPresent(value) => {
+            collect_nullable_function_class_local_accesses(value, accesses);
+        }
         mir::BoolExpression::PayloadEnumCompare { left, right, .. } => {
             collect_payload_enum_class_local_accesses(left, accesses);
             collect_payload_enum_class_local_accesses(right, accesses);
@@ -7646,7 +8561,8 @@ fn collect_format_class_local_accesses<'a>(
 fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLocalAccesses<'_> {
     let mut accesses = ClassLocalAccesses::default();
     match statement {
-        mir::Statement::BindPayloadEnumFields { .. }
+        mir::Statement::BindClosureEnvironment { .. }
+        | mir::Statement::BindPayloadEnumFields { .. }
         | mir::Statement::MatchResultPlan { .. }
         | mir::Statement::ControlFlowPlan(_) => {}
         mir::Statement::AssignLocal { value, .. }
@@ -7712,6 +8628,7 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
         | mir::Statement::DropError { .. }
         | mir::Statement::DropCollection { .. }
         | mir::Statement::DropPayloadEnum { .. }
+        | mir::Statement::DropFunction { .. }
         | mir::Statement::DropSharedReference { .. }
         | mir::Statement::DropWeakReference { .. }
         | mir::Statement::DropWritableSharedReference { .. }
@@ -7738,6 +8655,11 @@ fn collect_terminator_class_local_accesses(terminator: &mir::Terminator) -> Clas
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, &mut accesses);
             accesses.call(*function, args);
+        }
+        mir::Terminator::IndirectCall { callee, args, .. }
+        | mir::Terminator::CheckedIndirectCall { callee, args, .. } => {
+            collect_function_class_local_accesses(callee, &mut accesses);
+            collect_rvalue_args_class_local_accesses(args, &mut accesses);
         }
         mir::Terminator::CheckedConstruct {
             properties,
@@ -7942,6 +8864,11 @@ fn validate_nullable_presence(
                     pending.push_back(*target);
                 }
             }
+            mir::Terminator::IndirectCall { continuation, .. } => {
+                if merge_definitely_present(&mut entries[continuation.0], &present) {
+                    pending.push_back(*continuation);
+                }
+            }
             mir::Terminator::Branch {
                 condition,
                 then_block,
@@ -7961,6 +8888,9 @@ fn validate_nullable_presence(
                 }
             }
             mir::Terminator::CheckedCall {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedIndirectCall {
                 success, failure, ..
             }
             | mir::Terminator::CheckedConstruct {
@@ -8045,6 +8975,11 @@ fn validate_mixed_tag_proofs(
                     pending.push_back(*target);
                 }
             }
+            mir::Terminator::IndirectCall { continuation, .. } => {
+                if merge_definite_mixed_tags(&mut entries[continuation.0], &tags) {
+                    pending.push_back(*continuation);
+                }
+            }
             mir::Terminator::Branch {
                 condition,
                 then_block,
@@ -8064,6 +8999,9 @@ fn validate_mixed_tag_proofs(
                 }
             }
             mir::Terminator::CheckedCall {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedIndirectCall {
                 success, failure, ..
             }
             | mir::Terminator::CheckedConstruct {
@@ -8148,6 +9086,11 @@ fn validate_payload_case_proofs(
                     pending.push_back(*target);
                 }
             }
+            mir::Terminator::IndirectCall { continuation, .. } => {
+                if merge_definite_payload_cases(&mut entries[continuation.0], &cases) {
+                    pending.push_back(*continuation);
+                }
+            }
             mir::Terminator::Branch {
                 condition,
                 then_block,
@@ -8167,6 +9110,9 @@ fn validate_payload_case_proofs(
                 }
             }
             mir::Terminator::CheckedCall {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedIndirectCall {
                 success, failure, ..
             }
             | mir::Terminator::CheckedConstruct {
@@ -8661,8 +9607,10 @@ fn checked_success_reaches_bool_control(
         match &block_in(function, current)?.terminator {
             mir::Terminator::Branch { .. } | mir::Terminator::Jump(_) => return Ok(true),
             mir::Terminator::CheckedCall { success, .. }
+            | mir::Terminator::CheckedIndirectCall { success, .. }
             | mir::Terminator::CheckedConstruct { success, .. }
             | mir::Terminator::CheckedIo { success, .. } => current = *success,
+            mir::Terminator::IndirectCall { continuation, .. } => current = *continuation,
             _ => return Ok(false),
         }
     }
@@ -8790,6 +9738,7 @@ fn match_guard_reaches_binding(
 fn match_guard_success_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
     match terminator {
         mir::Terminator::CheckedCall { success, .. }
+        | mir::Terminator::CheckedIndirectCall { success, .. }
         | mir::Terminator::CheckedConstruct { success, .. }
         | mir::Terminator::CheckedIo { success, .. } => vec![*success],
         mir::Terminator::ErrorSwitch { .. }
@@ -8799,6 +9748,7 @@ fn match_guard_success_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId
         | mir::Terminator::Unreachable
         | mir::Terminator::PropagateError { .. } => Vec::new(),
         mir::Terminator::Jump(target) => vec![*target],
+        mir::Terminator::IndirectCall { continuation, .. } => vec![*continuation],
         mir::Terminator::Branch {
             then_block,
             else_block,
@@ -8857,6 +9807,9 @@ fn validate_result_path(
         }
         match &block.terminator {
             mir::Terminator::Jump(target) => pending.push_back((*target, assignments)),
+            mir::Terminator::IndirectCall { continuation, .. } => {
+                pending.push_back((*continuation, assignments));
+            }
             mir::Terminator::Branch {
                 then_block,
                 else_block,
@@ -8866,6 +9819,9 @@ fn validate_result_path(
                 pending.push_back((*else_block, assignments));
             }
             mir::Terminator::CheckedCall {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedIndirectCall {
                 success, failure, ..
             }
             | mir::Terminator::CheckedConstruct {
@@ -10098,12 +11054,16 @@ fn terminator_targets(terminator: &mir::Terminator) -> Vec<mir::BlockId> {
         mir::Terminator::CheckedCall {
             success, failure, ..
         }
+        | mir::Terminator::CheckedIndirectCall {
+            success, failure, ..
+        }
         | mir::Terminator::CheckedConstruct {
             success, failure, ..
         }
         | mir::Terminator::CheckedIo {
             success, failure, ..
         } => vec![*success, *failure],
+        mir::Terminator::IndirectCall { continuation, .. } => vec![*continuation],
         mir::Terminator::ErrorSwitch {
             cases,
             catch_all,
@@ -10237,6 +11197,9 @@ fn statement_observes_property(
             rvalue_observes_property(key, receiver, property)
                 || rvalue_observes_property(value, receiver, property)
         }
+        mir::Statement::BindClosureEnvironment { .. } | mir::Statement::DropFunction { .. } => {
+            false
+        }
     }
 }
 
@@ -10256,6 +11219,13 @@ fn terminator_observes_property(
         mir::Terminator::CheckedCall { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::Terminator::IndirectCall { callee, args, .. }
+        | mir::Terminator::CheckedIndirectCall { callee, args, .. } => {
+            function_observes_property(callee, receiver, property)
+                || args
+                    .iter()
+                    .any(|value| rvalue_observes_property(value, receiver, property))
+        }
         mir::Terminator::CheckedConstruct {
             properties, args, ..
         } => {
@@ -10344,6 +11314,10 @@ fn rvalue_observes_property(
         mir::Rvalue::NullableCollection(value) => {
             nullable_collection_observes_property(value, receiver, property)
         }
+        mir::Rvalue::Function(value) => function_observes_property(value, receiver, property),
+        mir::Rvalue::NullableFunction(value) => {
+            nullable_function_observes_property(value, receiver, property)
+        }
         mir::Rvalue::SharedReference(value) => {
             shared_reference_observes_property(value, receiver, property)
         }
@@ -10380,6 +11354,64 @@ fn rvalue_observes_property(
         mir::Rvalue::NullablePayloadEnum(value) => {
             nullable_payload_enum_observes_property(value, receiver, property)
         }
+    }
+}
+
+fn function_observes_property(
+    value: &mir::FunctionExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::FunctionExpression::Create { captures, .. } => captures.iter().any(|capture| {
+            matches!(
+                capture,
+                mir::ClosureCaptureOperand::CopyValue(value)
+                    | mir::ClosureCaptureOperand::MoveValue(value)
+                    if rvalue_observes_property(value, receiver, property)
+            )
+        }),
+        mir::FunctionExpression::Property {
+            object,
+            property: observed,
+            ..
+        } => *object == receiver && *observed == property,
+        mir::FunctionExpression::Call { args, .. } => args
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::FunctionExpression::CollectionIndex { index, .. } => {
+            rvalue_observes_property(index, receiver, property)
+        }
+        mir::FunctionExpression::AssumePresent { value, .. } => {
+            nullable_function_observes_property(value, receiver, property)
+        }
+        mir::FunctionExpression::Local { .. } => false,
+    }
+}
+
+fn nullable_function_observes_property(
+    value: &mir::NullableFunctionExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::NullableFunctionExpression::Present(value) => {
+            function_observes_property(value, receiver, property)
+        }
+        mir::NullableFunctionExpression::Property {
+            object,
+            property: observed,
+            ..
+        } => *object == receiver && *observed == property,
+        mir::NullableFunctionExpression::Call { args, .. } => args
+            .iter()
+            .any(|value| rvalue_observes_property(value, receiver, property)),
+        mir::NullableFunctionExpression::DictionaryGet { key, .. }
+        | mir::NullableFunctionExpression::CollectionIndex { index: key, .. } => {
+            rvalue_observes_property(key, receiver, property)
+        }
+        mir::NullableFunctionExpression::Null { .. }
+        | mir::NullableFunctionExpression::Local { .. } => false,
     }
 }
 
@@ -11235,6 +12267,9 @@ fn bool_observes_property(
         mir::BoolExpression::NullableClassIsPresent(value) => {
             nullable_class_observes_property(value, receiver, property)
         }
+        mir::BoolExpression::NullableFunctionIsPresent(value) => {
+            nullable_function_observes_property(value, receiver, property)
+        }
         mir::BoolExpression::NullableCollectionIsPresent(value) => {
             nullable_collection_observes_property(value, receiver, property)
         }
@@ -12046,6 +13081,9 @@ fn validate_condition(
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
             validate_nullable_class_expression(program, function, value)
+        }
+        mir::BoolExpression::NullableFunctionIsPresent(value) => {
+            validate_nullable_function_expression(program, function, value)
         }
         mir::BoolExpression::NullableCollectionIsPresent(value) => {
             validate_nullable_collection_expression(program, function, value)
@@ -13086,12 +14124,19 @@ fn validate_null_safe_call(
         }
         mir::Type::Collection(collection) => mir::Type::NullableCollection(collection),
         mir::Type::PayloadEnum(payload) => mir::Type::NullablePayloadEnum(payload),
+        mir::Type::Function(function_type) => mir::Type::NullableFunction(function_type),
+        mir::Type::ClosureEnvironment(_) => {
+            return Err(malformed_mir(
+                "null-safe calls cannot expose closure environments",
+            ));
+        }
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
         | mir::Type::NullableError
         | mir::Type::NullableClass(_)
         | mir::Type::NullableCollection(_)
+        | mir::Type::NullableFunction(_)
         | mir::Type::NullablePayloadEnum(_)
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
@@ -13356,6 +14401,44 @@ fn function_in(
         .get(id.0)
         .filter(|function| function.id == id)
         .ok_or_else(|| malformed_mir(format!("FunctionId function{} does not exist", id.0)))
+}
+
+fn function_type_in(
+    program: &mir::Program,
+    id: mir::FunctionTypeId,
+) -> Result<&mir::FunctionType, BackendError> {
+    program
+        .function_types
+        .get(id.0)
+        .filter(|function_type| function_type.id == id)
+        .ok_or_else(|| malformed_mir(format!("function type#{} does not exist", id.0)))
+}
+
+fn closure_descriptor_in(
+    program: &mir::Program,
+    id: mir::ClosureDescriptorId,
+) -> Result<&mir::ClosureDescriptor, BackendError> {
+    program
+        .closure_descriptors
+        .get(id.0)
+        .filter(|descriptor| descriptor.id == id)
+        .ok_or_else(|| malformed_mir(format!("closure descriptor#{} does not exist", id.0)))
+}
+
+fn closure_environment_layout_in(
+    program: &mir::Program,
+    id: mir::ClosureEnvironmentLayoutId,
+) -> Result<&mir::ClosureEnvironmentLayout, BackendError> {
+    program
+        .closure_environment_layouts
+        .get(id.0)
+        .filter(|layout| layout.id == id)
+        .ok_or_else(|| {
+            malformed_mir(format!(
+                "closure environment layout#{} does not exist",
+                id.0
+            ))
+        })
 }
 
 fn class_in(program: &mir::Program, id: ClassId) -> Result<&mir::Class, BackendError> {

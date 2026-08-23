@@ -559,29 +559,27 @@ fn stage30a_malformed_forms_have_deliberate_diagnostics_and_recover() {
 }
 
 #[test]
-fn stage30b_reports_each_closure_execution_boundary_without_hir_lowering() {
+fn stage30d_lowers_valid_closures_and_callable_invocation() {
     let source = r#"function main(): void
 {
     let $callback = fn(int $value) => $value;
     $callback(42);
 }
 "#;
-    let diagnostics = doriac::check_source("stage30a_boundary.doria", source)
-        .expect_err("callable semantics remain deferred");
-    assert_eq!(
-        diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.code == "E0641")
-            .count(),
-        2,
-        "closure construction and later invocation are distinct execution boundaries: {diagnostics:#?}"
-    );
-    assert!(diagnostics
-        .iter()
-        .all(|diagnostic| diagnostic.code == "E0641"));
-    let lowering = doriac::lower_source("stage30a_boundary.doria", source)
-        .expect_err("Stage 30a syntax must not enter HIR lowering");
-    assert!(lowering.iter().all(|diagnostic| diagnostic.code == "E0641"));
+    doriac::check_source("stage30d.doria", source)
+        .expect("valid closures should pass target-neutral checking");
+    let hir = doriac::lower_source("stage30d.doria", source)
+        .expect("valid closures should lower to closure-aware HIR");
+    let hir_dump = format!("{hir:#?}");
+    assert!(hir_dump.contains("ClosureExpression"));
+    assert!(hir_dump.contains("CallableCall"));
+
+    let mir = doriac::lower_source_to_mir("stage30d.doria", source)
+        .expect("valid closures should lower to closure-aware MIR");
+    let mir_dump = mir.to_string();
+    assert!(mir_dump.contains("function types:"));
+    assert!(mir_dump.contains("closure descriptors:"));
+    assert!(mir_dump.contains("indirect "));
 }
 
 #[test]
@@ -623,10 +621,26 @@ fn decision_0120_fixture_is_parseable_and_visible_in_ast_output() {
 }
 
 #[test]
-fn semantic_and_ide_paths_emit_one_structured_stage_30_boundary() {
+fn semantic_and_ide_paths_are_target_neutral_while_backends_keep_boundaries() {
     let source = include_str!("fixtures/accepted_syntax/closure_boundary.doria");
-    let diagnostics = doriac::check_source("closure_boundary.doria", source)
-        .expect_err("closure semantics remain a Stage 30 boundary");
+    doriac::check_source("closure_boundary.doria", source)
+        .expect("valid closure syntax should pass target-neutral checking");
+    let (_, analysis) = doriac::analyze_source_for_ide("closure_boundary.doria", source)
+        .expect("IDE analysis should succeed");
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    doriac::lower_source("closure_boundary.doria", source)
+        .expect("valid closure syntax should enter HIR lowering");
+
+    let diagnostics = doriac::compile_source(
+        "closure_boundary.doria",
+        source,
+        doriac::backend::BackendTarget::Native,
+    )
+    .expect_err("native execution remains a Stage 30e boundary");
     assert_eq!(diagnostics.len(), 1, "unexpected cascade: {diagnostics:#?}");
     let diagnostic = &diagnostics[0];
     assert_eq!(diagnostic.code, "E0641");
@@ -635,13 +649,11 @@ fn semantic_and_ide_paths_emit_one_structured_stage_30_boundary() {
         DiagnosticKind::UnsupportedDevelopmentSurface
     );
     assert!(diagnostic.development_only);
-    assert_eq!(diagnostic.title, "Closure Execution Is Not Yet Available");
-    assert!(diagnostic.message.contains("valid Doria"));
-
-    let (_, analysis) = doriac::analyze_source_for_ide("closure_boundary.doria", source)
-        .expect("IDE parsing should succeed");
-    assert_eq!(analysis.diagnostics.len(), 1);
-    assert_eq!(analysis.diagnostics[0].code, "E0641");
+    assert_eq!(
+        diagnostic.title,
+        "Closure Native Execution Is Not Yet Available"
+    );
+    assert!(diagnostic.message.contains("Stage 30e"));
 
     let json = doriac::render_diagnostics_with_options(
         "closure_boundary.doria",
@@ -660,11 +672,6 @@ fn semantic_and_ide_paths_emit_one_structured_stage_30_boundary() {
         "unsupportedDevelopmentSurface"
     );
     assert_eq!(envelope["diagnostics"][0]["developmentOnly"], true);
-
-    let lowering = doriac::lower_source("closure_boundary.doria", source)
-        .expect_err("closure syntax must not enter HIR lowering");
-    assert_eq!(lowering.len(), 1);
-    assert_eq!(lowering[0].code, "E0641");
 }
 
 #[test]
@@ -916,7 +923,7 @@ function namedFunction(int $value): bool
 }
 
 #[test]
-fn cli_ast_and_check_keep_the_parser_semantic_boundary_visible() {
+fn cli_ast_check_and_hir_accept_valid_closures() {
     let fixture = format!(
         "{}/tests/fixtures/accepted_syntax/closure_boundary.doria",
         env!("CARGO_MANIFEST_DIR")
@@ -936,11 +943,21 @@ fn cli_ast_and_check_keep_the_parser_semantic_boundary_visible() {
         .args(["check", &fixture, "--diagnostic-format", "json"])
         .output()
         .expect("doriac check should run");
-    assert!(!check.status.success());
+    assert!(check.status.success());
     assert!(check.stderr.is_empty());
     let envelope: serde_json::Value =
         serde_json::from_slice(&check.stdout).expect("check JSON should be valid");
     assert_eq!(envelope["schemaVersion"], 1);
-    assert_eq!(envelope["diagnostics"].as_array().unwrap().len(), 1);
-    assert_eq!(envelope["diagnostics"][0]["code"], "E0641");
+    assert!(envelope["diagnostics"].as_array().unwrap().is_empty());
+
+    let hir = Command::new(env!("CARGO_BIN_EXE_doriac"))
+        .args(["hir", &fixture])
+        .output()
+        .expect("doriac hir should run");
+    assert!(
+        hir.status.success(),
+        "{}",
+        String::from_utf8_lossy(&hir.stderr)
+    );
+    assert!(String::from_utf8_lossy(&hir.stdout).contains("ClosureExpression"));
 }

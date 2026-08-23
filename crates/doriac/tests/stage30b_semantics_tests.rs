@@ -40,12 +40,7 @@ fn dedicated_stage30b_fixtures_preserve_type_capture_and_execution_boundaries() 
     let valid = analyze(include_str!(
         "fixtures/stage30b/valid_execution_boundary.doria"
     ));
-    assert!(
-        permanent_errors(&valid.diagnostics).is_empty(),
-        "{:#?}",
-        valid.diagnostics
-    );
-    diagnostic(&valid.diagnostics, "E0641");
+    assert!(valid.diagnostics.is_empty(), "{:#?}", valid.diagnostics);
 
     let invalid = analyze(include_str!("fixtures/stage30b/invalid_capture.doria"));
     diagnostic(&invalid.diagnostics, "E0642");
