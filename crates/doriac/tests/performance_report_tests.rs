@@ -1,7 +1,9 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "llvm-backend")]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn opt_in_native_compile_writes_a_versioned_phase_report() {
