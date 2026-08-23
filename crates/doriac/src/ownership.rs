@@ -4150,11 +4150,29 @@ impl Checker<'_> {
             Expr::MethodCall {
                 object,
                 method,
+                member_span,
                 args,
                 span,
                 null_safe,
                 ..
             } => {
+                if self
+                    .callable_value_calls
+                    .get(&(span.start, span.end))
+                    .is_some_and(|call| {
+                        call.target_kind == crate::semantics::CallableValueTargetKind::Property
+                    })
+                {
+                    let property = Expr::PropertyAccess {
+                        object: object.clone(),
+                        property: method.clone(),
+                        member_span: *member_span,
+                        null_safe: false,
+                        span: object.span().merge(*member_span),
+                    };
+                    self.use_callable_value_call(&property, args, *span, scopes);
+                    return;
+                }
                 if let Some(collection) = self.expr_collection_info(object, scopes) {
                     self.use_collection_call(collection.family, object, method, args, scopes);
                     self.record_exceptional_exits(*span, scopes);
@@ -4407,80 +4425,12 @@ impl Checker<'_> {
             Expr::CallableCall {
                 callee, args, span, ..
             } => {
-                let Some(call) = self
-                    .callable_value_calls
-                    .get(&(span.start, span.end))
-                    .cloned()
-                else {
+                if !self.use_callable_value_call(callee, args, *span, scopes) {
                     self.use_expr(callee, scopes, UseMode::Read);
                     for argument in args {
                         self.use_expr(&argument.value, scopes, UseMode::Read);
                     }
-                    return;
-                };
-                let function_type = non_null_function_type(&call.function_type).cloned();
-                let callee_mode = match call.invocation_mode {
-                    FunctionInvocationMode::Readonly => UseMode::Read,
-                    FunctionInvocationMode::Writable => UseMode::Write,
-                    FunctionInvocationMode::Once => UseMode::Give,
-                };
-                let mut rejected_once_source = false;
-                if call.invocation_mode == FunctionInvocationMode::Once {
-                    match ungroup_expr(callee) {
-                        Expr::PropertyAccess { .. } | Expr::Index { .. } => {
-                            rejected_once_source = true;
-                            self.diagnostics.push(
-                                Diagnostic::new(
-                                    "E0660",
-                                    "once function cannot be consumed from a property or aggregate slot",
-                                    callee.span(),
-                                )
-                                .with_title("Once Function Cannot Be Consumed From Stored Place")
-                                .with_help("first obtain an owned local through an ownership-transferring operation"),
-                            );
-                        }
-                        Expr::Variable { name, .. }
-                            if scopes.get(name).is_some_and(|binding| {
-                                binding.borrowed_place
-                                    || binding
-                                        .function_value
-                                        .as_ref()
-                                        .is_some_and(|value| value.nonescaping_parameter)
-                            }) =>
-                        {
-                            rejected_once_source = true;
-                            self.diagnostics.push(
-                                Diagnostic::new(
-                                    "E0656",
-                                    format!("once invocation of `${name}` requires ownership"),
-                                    callee.span(),
-                                )
-                                .with_title("Once Invocation Requires Ownership")
-                                .with_help(
-                                    "accept the callback through a `take function once(...)` parameter",
-                                ),
-                            );
-                        }
-                        _ => {}
-                    }
                 }
-                self.use_expr(
-                    callee,
-                    scopes,
-                    if rejected_once_source {
-                        UseMode::Read
-                    } else {
-                        callee_mode
-                    },
-                );
-                if let Some(function_type) = function_type {
-                    self.use_callable_args(args, &function_type, scopes);
-                } else {
-                    for argument in args {
-                        self.use_expr(&argument.value, scopes, UseMode::Read);
-                    }
-                }
-                self.record_exceptional_exits(*span, scopes);
             }
             Expr::Match {
                 scrutinee,
@@ -4534,6 +4484,76 @@ impl Checker<'_> {
             | Expr::Bool { .. }
             | Expr::Null { .. } => {}
         }
+    }
+
+    fn use_callable_value_call(
+        &mut self,
+        callee: &Expr,
+        args: &[Argument],
+        span: Span,
+        scopes: &mut Scopes,
+    ) -> bool {
+        let Some(call) = self
+            .callable_value_calls
+            .get(&(span.start, span.end))
+            .cloned()
+        else {
+            return false;
+        };
+        let function_type = non_null_function_type(&call.function_type).cloned();
+        let callee_mode = match call.invocation_mode {
+            FunctionInvocationMode::Readonly => UseMode::Read,
+            FunctionInvocationMode::Writable => UseMode::Write,
+            FunctionInvocationMode::Once => UseMode::Give,
+        };
+        let stored_once_source = call.invocation_mode == FunctionInvocationMode::Once
+            && matches!(
+                ungroup_expr(callee),
+                Expr::PropertyAccess { .. } | Expr::Index { .. }
+            );
+        let mut borrowed_once_source = false;
+        if call.invocation_mode == FunctionInvocationMode::Once {
+            if let Expr::Variable { name, .. } = ungroup_expr(callee) {
+                if scopes.get(name).is_some_and(|binding| {
+                    binding.borrowed_place
+                        || binding
+                            .function_value
+                            .as_ref()
+                            .is_some_and(|value| value.nonescaping_parameter)
+                }) {
+                    borrowed_once_source = true;
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0656",
+                            format!("once invocation of `${name}` requires ownership"),
+                            callee.span(),
+                        )
+                        .with_title("Once Invocation Requires Ownership")
+                        .with_help(
+                            "accept the callback through a `take function once(...)` parameter",
+                        ),
+                    );
+                }
+            }
+        }
+        self.use_expr(
+            callee,
+            scopes,
+            if stored_once_source || borrowed_once_source {
+                UseMode::Read
+            } else {
+                callee_mode
+            },
+        );
+        if let Some(function_type) = function_type {
+            self.use_callable_args(args, &function_type, scopes);
+        } else {
+            for argument in args {
+                self.use_expr(&argument.value, scopes, UseMode::Read);
+            }
+        }
+        self.record_exceptional_exits(span, scopes);
+        true
     }
 
     fn use_match_expression(

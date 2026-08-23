@@ -95,6 +95,61 @@ class Store
 }
 
 #[test]
+fn once_invocation_from_stored_places_uses_the_move_out_boundary() {
+    let property = analyze(
+        r#"
+class Store
+{
+    writable function once(): int $callback = fn() => 1;
+
+    writable function invoke(): int
+    {
+        return $this->callback();
+    }
+}
+"#,
+    );
+    assert_eq!(
+        property
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0660")
+            .count(),
+        1,
+        "{:#?}",
+        property.diagnostics
+    );
+    assert!(property
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.code != "E0651"));
+
+    let aggregate = analyze(
+        r#"
+function main(): void
+{
+    List<function once(): int> $callbacks = [fn() => 1];
+    $callbacks[0]();
+}
+"#,
+    );
+    assert_eq!(
+        aggregate
+            .diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0660")
+            .count(),
+        1,
+        "{:#?}",
+        aggregate.diagnostics
+    );
+    assert!(aggregate
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.code != "E0651"));
+}
+
+#[test]
 fn capture_plans_preserve_authored_acquisition_and_reverse_release_order() {
     let source = r#"
 class Payload {}

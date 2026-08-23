@@ -7595,20 +7595,39 @@ impl<'program> Checker<'program> {
                 method_context,
             )
         {
-            let access = match function.invocation_mode {
-                FunctionInvocationMode::Readonly => "readonly",
-                FunctionInvocationMode::Writable => "writable",
-                FunctionInvocationMode::Once => "owned",
-            };
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0651",
-                    format!("this function value requires {access} invocation access"),
-                    callee.span(),
+            if function.invocation_mode == FunctionInvocationMode::Once
+                && matches!(
+                    Self::ungroup_expr(callee),
+                    Expr::PropertyAccess { .. } | Expr::Index { .. }
                 )
-                .with_title("Callable Invocation Requires Stronger Access")
-                .with_help(format!("invoke it through a {access} callable place")),
-            );
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0660",
+                        "once function cannot be consumed from a property or aggregate slot",
+                        callee.span(),
+                    )
+                    .with_title("Once Function Cannot Be Consumed From Stored Place")
+                    .with_help(
+                        "first obtain an owned local through an ownership-transferring operation",
+                    ),
+                );
+            } else {
+                let access = match function.invocation_mode {
+                    FunctionInvocationMode::Readonly => "readonly",
+                    FunctionInvocationMode::Writable => "writable",
+                    FunctionInvocationMode::Once => "owned",
+                };
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0651",
+                        format!("this function value requires {access} invocation access"),
+                        callee.span(),
+                    )
+                    .with_title("Callable Invocation Requires Stronger Access")
+                    .with_help(format!("invoke it through a {access} callable place")),
+                );
+            }
         }
 
         self.record_checked_effects(function.checked_effects.iter().copied(), span);
