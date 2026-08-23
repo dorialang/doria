@@ -195,9 +195,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-object"
-version = "0.134.2"
+version = "0.134.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef16bb4647b1f9b8ca0e8f0a8354165310551943af44d42aa9ec3307f172c7de"
+checksum = "de62346d98fa0345ed187e0daf565a1c8b3117d027e76653a1100b0a1e3ba0bf"
 dependencies = [
  "anyhow",
  "cranelift-codegen",
@@ -795,9 +795,9 @@ dependencies = [
 
 [[package]]
 name = "writeable"
-version = "0.6.3"
+version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
+checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "yoke"

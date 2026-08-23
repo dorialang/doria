@@ -1,0 +1,8 @@
+function main(): void
+{
+    writable ?function(): int $callback = null;
+    $callback = fn() => 42;
+    if ($callback != null) {
+        echo "{$callback()}\n";
+    }
+}

@@ -5,7 +5,8 @@
 - **Date:** 2026-08-15
 - **Implementation status:** Authority accepted; the pre-Stage-30 grammar slice,
   Stage 30a, Stage 30b semantic capture validation, and Stage 30c ownership,
-  lifetime, and escape checking are complete; Stage 30d is next and Stage 30
+  lifetime, and escape checking are complete; Stage 30d closure HIR/MIR and
+  debug-interpreter execution are complete; Stage 30e is next and Stage 30
   remains incomplete
 - **Scope:** Closure capture spelling, ownership modes, diagnostics, Stage 30
   boundaries, and backend-independent behavior
@@ -205,13 +206,17 @@ and return syntax, `function(T): R` type syntax, `with` capture-list syntax,
 capture-mode syntax, source-preserving AST nodes, parser recovery, and
 accepted-syntax regression tests. Stage 30b now validates free variables,
 capture modes, `$this`, inferred invocation modes, and checked effects. Valid
-closure execution routes retain the narrower catalogued `E0641` boundary. Stage
-30c acquires captures, tracks closure Move state and capture leases, validates
-escape and storage, and records logical release plans.
+closure source passes target-neutral checking. Stage 30c acquires captures,
+tracks closure Move state and capture leases, validates escape and storage, and
+records logical release plans. Stage 30d lowers closures and callable-value calls
+to explicit HIR/MIR, validates the structural function carrier and environment,
+and executes them through the debug interpreter. `E0641` now remains only at the
+native Stage 30e and PHP Stage 30f target boundaries.
 
-No HIR/MIR lowering, environment construction, collection algorithm, or backend
-execution is part of the grammar foundation through Stage 30c. Documentation
-snippets remain semantic fixtures without claiming execution.
+No collection algorithm, native closure execution, or PHP closure lowering is
+part of the grammar foundation or Stage 30d. Documentation snippets are not
+native/PHP parity fixtures merely because the debug interpreter can execute
+their accepted surface.
 
 ## Stage 30 Ownership
 

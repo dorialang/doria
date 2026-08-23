@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-19
 - **Date:** 2026-08-19
-- **Implementation Status:** Authority Accepted; Stages 30a Through 30c Implemented; Stage 30d Next; Stage 30 Not Complete
+- **Implementation Status:** Authority Accepted; Stages 30a Through 30d Implemented; Stage 30e Next; Stage 30 Not Complete
 - **Scope:** Function types, closure invocation, capture validation, ownership,
   lifetime, representation, backend behavior, diagnostics, and Stage 30
   `List<T>` algorithms
@@ -30,16 +30,23 @@ calls. Stage 30c implements creation-time capture acquisition, Move-only
 function values, non-lexical capture leases, path-sensitive invocation
 consumption, escape and storage enforcement, returned-borrow roots, nested
 environment provenance, and reverse logical release plans. Valid execution
-routes still stop at the narrowed E0641 boundary. Stage 30d Closure HIR/MIR And
-Interpreter Oracle is next; Stage 30 remains in progress and is not complete.
+routes now lower through explicit closure-aware HIR and MIR and execute through
+the debug interpreter. Stage 30d implements structural MIR function types, the
+logical descriptor/environment carrier, static closure descriptors, source-order
+capture acquisition, reverse logical release, synthetic closure functions,
+indirect and checked indirect calls, shared validation, stable interpreter
+places, and exact environment cleanup. Native execution remains Stage 30e and
+PHP compatibility remains Stage 30f; Stage 30 remains in progress and is not
+complete.
 
 ```text
 Stage 30a Callable Grammar Completion — Complete
 Stage 30b Semantic Function Types And Captures — Complete
 Stage 30c Ownership, Lifetime, And Escape — Complete
-Stage 30d Closure HIR/MIR And Interpreter Oracle — Next
+Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete
+Stage 30e Native Execution — Next
 Stage 30 — In Progress, Not Complete
-E0641 — HIR/MIR/Runtime Execution Boundary
+E0641 — Native/PHP Target Boundary
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping
@@ -483,7 +490,8 @@ E0641 retires by route:
 2. Stage 30b removes it from completed semantic function-type contexts.
 3. Valid closures retain a narrower execution boundary after semantic checking.
 4. Stage 30c replaces ownership boundaries with precise diagnostics.
-5. Stage 30d removes it from interpreter-supported expressions and calls.
+5. Stage 30d removes it from target-neutral checking, HIR/MIR lowering,
+   interpreter-supported expressions, and debug execution.
 6. Native, PHP, algorithm, and storage slices retire their bounded routes.
 7. Stage 30h makes E0641 historical only when every accepted form has an
    intentional route.
@@ -518,8 +526,10 @@ Stage 30h - Cross-Repository Closure
   non-lexical readonly/writable leases, Move behavior, once consumption,
   nonescaping callback enforcement, storage/escape and one-root return checks,
   nested provenance, and reverse logical drop plans; no HIR/MIR or execution.
-- **Stage 30d:** closure HIR/MIR, carrier/descriptors/environments, indirect and
-  checked calls, MIR validation/cleanup, and interpreter oracle.
+- **Stage 30d — Complete:** closure-aware HIR, structural function MIR,
+  carrier/descriptors/environments, indirect and checked calls, shared MIR
+  validation and cleanup, stable-place interpreter execution, and target-specific
+  E0641 boundaries for native and PHP.
 - **Stage 30e:** runtime substrate, Cranelift, LLVM, malformed-MIR and ownership
   parity, and portable benchmark structure.
 - **Stage 30f:** explicit PHP lowering with Doria ownership/effect parity.

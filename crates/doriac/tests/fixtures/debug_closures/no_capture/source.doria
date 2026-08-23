@@ -1,0 +1,5 @@
+function main(): void
+{
+    let $answer = fn() => 42;
+    echo "{$answer()}\n";
+}

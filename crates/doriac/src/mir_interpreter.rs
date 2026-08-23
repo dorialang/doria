@@ -19,6 +19,48 @@ type SharedString = Rc<str>;
 type SharedControl = Rc<RefCell<SharedControlValue>>;
 type WritableSharedControl = Rc<RefCell<WritableSharedControlValue>>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ClosureEnvironmentHandle {
+    id: usize,
+    layout: mir::ClosureEnvironmentLayoutId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InterpreterPlace {
+    FrameLocal {
+        frame: u64,
+        local: mir::LocalId,
+    },
+    EnvironmentField {
+        environment: ClosureEnvironmentHandle,
+        field: mir::ClosureEnvironmentFieldId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FunctionValue {
+    function_type: mir::FunctionTypeId,
+    descriptor: mir::ClosureDescriptorId,
+    environment: Option<ClosureEnvironmentHandle>,
+    owns_environment: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClosureEnvironmentFieldValue {
+    Borrowed {
+        place: InterpreterPlace,
+        writable: bool,
+    },
+    Owned(Option<LocalValue>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ClosureEnvironmentValue {
+    layout: mir::ClosureEnvironmentLayoutId,
+    fields: Vec<ClosureEnvironmentFieldValue>,
+    released: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SharedAccessConflict {
     ReadonlyThenWritable,
@@ -216,6 +258,12 @@ enum LocalValue {
         ty: mir::PayloadEnumType,
         value: Option<PayloadEnumValue>,
     },
+    Function(FunctionValue),
+    NullableFunction {
+        function_type: mir::FunctionTypeId,
+        value: Option<FunctionValue>,
+    },
+    ClosureEnvironment(Option<ClosureEnvironmentHandle>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -241,6 +289,7 @@ enum OwnedDrop {
         writable: bool,
     },
     Error(ErrorValue),
+    Function(FunctionValue),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -319,6 +368,12 @@ enum EvaluationValue {
         ty: mir::PayloadEnumType,
         value: Option<PayloadEnumValue>,
     },
+    Function(FunctionValue),
+    NullableFunction {
+        function_type: mir::FunctionTypeId,
+        value: Option<FunctionValue>,
+    },
+    ClosureEnvironment(Option<ClosureEnvironmentHandle>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -444,6 +499,12 @@ enum CheckedContinuation {
         object: usize,
         class: crate::class_layout::ClassId,
     },
+    Indirect {
+        result: Option<mir::LocalId>,
+        error: mir::LocalId,
+        success: mir::BlockId,
+        failure: mir::BlockId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -517,6 +578,15 @@ enum EvaluationTask {
     NullableCollection(mir::NullableCollectionExpression),
     PayloadEnum(mir::PayloadEnumExpression),
     NullablePayloadEnum(mir::NullablePayloadEnumExpression),
+    Function(mir::FunctionExpression),
+    NullableFunction(mir::NullableFunctionExpression),
+    FinishClosureCreate {
+        function_type: mir::FunctionTypeId,
+        descriptor: mir::ClosureDescriptorId,
+        captures: Vec<mir::ClosureCaptureOperand>,
+    },
+    BuildNullableFunctionSome(mir::FunctionTypeId),
+    AssumeNullableFunctionPresent(mir::FunctionTypeId),
     BuildPayloadEnum {
         ty: mir::PayloadEnumType,
         case: crate::enums::EnumCaseId,
@@ -610,6 +680,7 @@ enum EvaluationTask {
         properties: Vec<mir::PropertyValue>,
         constructor: Option<mir::FunctionId>,
         argument_count: usize,
+        argument_places: Vec<Option<InterpreterPlace>>,
         property_expression_count: usize,
         temporary_arg_drops: Vec<usize>,
         checked: Option<CheckedConstruction>,
@@ -651,6 +722,7 @@ enum EvaluationTask {
     },
     NullableMixedIsPresent(mir::MixedOwnership),
     NullableErrorIsPresent,
+    NullableFunctionIsPresent,
     MixedIs {
         tag: mir::MixedTag,
         ownership: mir::MixedOwnership,
@@ -807,6 +879,7 @@ enum EvaluationTask {
     Invoke {
         function: mir::FunctionId,
         argument_count: usize,
+        argument_places: Vec<Option<InterpreterPlace>>,
         expectation: ReturnExpectation,
         temporary_arg_drops: Vec<usize>,
         call_site: Option<Span>,
@@ -814,8 +887,26 @@ enum EvaluationTask {
     InvokeChecked {
         function: mir::FunctionId,
         argument_count: usize,
+        argument_places: Vec<Option<InterpreterPlace>>,
         continuation: CheckedContinuation,
         temporary_arg_drops: Vec<usize>,
+        call_site: Span,
+    },
+    InvokeIndirect {
+        function_type: mir::FunctionTypeId,
+        invocation_mode: mir::FunctionInvocationMode,
+        argument_count: usize,
+        argument_places: Vec<Option<InterpreterPlace>>,
+        result: Option<mir::LocalId>,
+        continuation: mir::BlockId,
+        call_site: Span,
+    },
+    InvokeCheckedIndirect {
+        function_type: mir::FunctionTypeId,
+        invocation_mode: mir::FunctionInvocationMode,
+        argument_count: usize,
+        argument_places: Vec<Option<InterpreterPlace>>,
+        continuation: CheckedContinuation,
         call_site: Span,
     },
     FinishCheckedIo {
@@ -851,6 +942,8 @@ enum EvaluationTask {
     },
     DropCollection(mir::LocalId),
     DropPayloadEnum(mir::LocalId),
+    DropFunction(mir::LocalId),
+    DropFunctionValue(FunctionValue),
     DropObject {
         object: usize,
         class: crate::class_layout::ClassId,
@@ -873,18 +966,23 @@ enum EvaluationTask {
 }
 
 struct CallFrame {
+    id: u64,
     function: mir::FunctionId,
     block: mir::BlockId,
     statement_index: usize,
     entered_block: bool,
     locals: Vec<Option<LocalValue>>,
+    local_origins: Vec<Option<InterpreterPlace>>,
     tasks: Vec<EvaluationTask>,
     values: Vec<EvaluationValue>,
     statement_temporary_drops: Vec<OwnedDrop>,
     caller_expectation: Option<ReturnExpectation>,
     checked_continuation: Option<CheckedContinuation>,
+    indirect_continuation: Option<(Option<mir::LocalId>, mir::BlockId)>,
     entered_from: Option<Span>,
     active_panic_site: Span,
+    closure_environment: Option<ClosureEnvironmentHandle>,
+    consume_closure_environment: bool,
 }
 
 struct Interpreter<'program> {
@@ -899,6 +997,11 @@ struct Interpreter<'program> {
     heap: BTreeMap<usize, ObjectValue>,
     statics: Vec<LocalValue>,
     next_object: usize,
+    next_frame: u64,
+    next_closure_environment: usize,
+    closure_environments: BTreeMap<ClosureEnvironmentHandle, ClosureEnvironmentValue>,
+    active_closure_fields: BTreeMap<(ClosureEnvironmentHandle, usize), InterpreterPlace>,
+    closure_environment_allocations: usize,
     frames: Vec<CallFrame>,
     limits: InterpreterLimits,
     executed_blocks: usize,
@@ -980,6 +1083,12 @@ pub struct InterpreterIoOutput {
     pub trace: MirIoTrace,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InterpreterMetrics {
+    closure_environment_allocations: usize,
+    live_closure_environments: usize,
+}
+
 enum StepOutcome {
     Continue,
     CleanExit,
@@ -1028,6 +1137,14 @@ fn interpret_internal(
     limits: InterpreterLimits,
     io: MirIo,
 ) -> Result<InterpreterIoOutput, InterpreterError> {
+    Ok(interpret_internal_observed(program, limits, io)?.0)
+}
+
+fn interpret_internal_observed(
+    program: &mir::Program,
+    limits: InterpreterLimits,
+    io: MirIo,
+) -> Result<(InterpreterIoOutput, InterpreterMetrics), InterpreterError> {
     crate::mir_validation::validate_program(program)
         .map_err(|error| InterpreterError::new(error.message))?;
     let entry = function_in(program, program.entry)?;
@@ -1082,44 +1199,76 @@ fn interpret_internal(
         heap: BTreeMap::new(),
         statics,
         next_object: 1,
+        next_frame: 1,
+        next_closure_environment: 0,
+        closure_environments: BTreeMap::new(),
+        active_closure_fields: BTreeMap::new(),
+        closure_environment_allocations: 0,
         frames: Vec::new(),
         limits,
         executed_blocks: 0,
         pending_panic: None,
     };
     let entry_frame_arguments: Vec<LocalValue> = entry_arguments.into_iter().collect();
-    interpreter.push_frame(program.entry, &entry_frame_arguments, None, None)?;
+    interpreter.push_frame(
+        program.entry,
+        &entry_frame_arguments,
+        &vec![None; entry_frame_arguments.len()],
+        None,
+        None,
+    )?;
 
     loop {
         match interpreter.step()? {
             StepOutcome::Continue => {}
             StepOutcome::CleanExit => {
-                return Ok(InterpreterIoOutput {
-                    output: InterpreterOutput {
-                        stdout: interpreter.stdout,
-                        stderr: interpreter.stderr,
-                        exit_status: 0,
-                        runtime_diagnostic: None,
+                let metrics = InterpreterMetrics {
+                    closure_environment_allocations: interpreter.closure_environment_allocations,
+                    live_closure_environments: interpreter.closure_environments.len(),
+                };
+                return Ok((
+                    InterpreterIoOutput {
+                        output: InterpreterOutput {
+                            stdout: interpreter.stdout,
+                            stderr: interpreter.stderr,
+                            exit_status: 0,
+                            runtime_diagnostic: None,
+                        },
+                        files: interpreter.files,
+                        trace: interpreter.io_trace,
                     },
-                    files: interpreter.files,
-                    trace: interpreter.io_trace,
-                });
+                    metrics,
+                ));
             }
             StepOutcome::RuntimePanic(event) => {
                 let output = interpreter.runtime_panic_output(event);
-                return Ok(InterpreterIoOutput {
-                    output,
-                    files: interpreter.files,
-                    trace: interpreter.io_trace,
-                });
+                let metrics = InterpreterMetrics {
+                    closure_environment_allocations: interpreter.closure_environment_allocations,
+                    live_closure_environments: interpreter.closure_environments.len(),
+                };
+                return Ok((
+                    InterpreterIoOutput {
+                        output,
+                        files: interpreter.files,
+                        trace: interpreter.io_trace,
+                    },
+                    metrics,
+                ));
             }
             StepOutcome::EntryReturned(outcome) => {
                 let output = interpreter.finish_entry(entry, outcome)?;
-                return Ok(InterpreterIoOutput {
-                    output,
-                    files: interpreter.files,
-                    trace: interpreter.io_trace,
-                });
+                let metrics = InterpreterMetrics {
+                    closure_environment_allocations: interpreter.closure_environment_allocations,
+                    live_closure_environments: interpreter.closure_environments.len(),
+                };
+                return Ok((
+                    InterpreterIoOutput {
+                        output,
+                        files: interpreter.files,
+                        trace: interpreter.io_trace,
+                    },
+                    metrics,
+                ));
             }
         }
     }
@@ -1157,6 +1306,12 @@ fn static_local_value(
             })
         }
         (mir::StaticValue::Null, mir::Type::NullableString) => Ok(LocalValue::NullableString(None)),
+        (mir::StaticValue::Null, mir::Type::NullableFunction(function_type)) => {
+            Ok(LocalValue::NullableFunction {
+                function_type,
+                value: None,
+            })
+        }
         (mir::StaticValue::Null, mir::Type::NullablePayloadEnum(payload)) => {
             Ok(LocalValue::NullablePayloadEnum {
                 ty: payload,
@@ -1255,6 +1410,12 @@ impl Interpreter<'_> {
         statement: mir::Statement,
     ) -> Result<StepOutcome, InterpreterError> {
         match statement {
+            mir::Statement::BindClosureEnvironment {
+                environment,
+                bindings,
+            } => {
+                self.bind_closure_environment(function, environment, &bindings)?;
+            }
             mir::Statement::BindPayloadEnumFields {
                 source,
                 ty,
@@ -1642,6 +1803,33 @@ impl Interpreter<'_> {
                             "MIR payload enum local received another value type",
                         ));
                     }
+                    (mir::Type::Function(expected), mir::Rvalue::Function(expression))
+                        if expression.function_type() == expected =>
+                    {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame.tasks.push(EvaluationTask::Function(expression));
+                    }
+                    (
+                        mir::Type::NullableFunction(expected),
+                        mir::Rvalue::NullableFunction(expression),
+                    ) if expression.function_type() == expected => {
+                        let frame = self.current_frame_mut()?;
+                        frame.tasks.push(EvaluationTask::Assign(target));
+                        frame
+                            .tasks
+                            .push(EvaluationTask::NullableFunction(expression));
+                    }
+                    (mir::Type::Function(_) | mir::Type::NullableFunction(_), _) => {
+                        return Err(InterpreterError::new(
+                            "MIR function-value local received another value type",
+                        ));
+                    }
+                    (mir::Type::ClosureEnvironment(_), _) => {
+                        return Err(InterpreterError::new(
+                            "MIR closure environment may only be bound as a hidden parameter",
+                        ));
+                    }
                 }
             }
             mir::Statement::EchoStringLiteral(value) => {
@@ -1898,6 +2086,11 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::DropPayloadEnum(local));
             }
+            mir::Statement::DropFunction { local, .. } => {
+                self.current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::DropFunction(local));
+            }
         }
         Ok(StepOutcome::Continue)
     }
@@ -1983,6 +2176,7 @@ impl Interpreter<'_> {
                 let callee = function_in(self.program, function)?;
                 let temporary_arg_drops =
                     temporary_argument_drop_order(&args, callee, 0, |_| false)?;
+                let argument_places = self.direct_call_argument_places(callee, &args, 0)?;
                 let continuation = CheckedContinuation::Call {
                     result,
                     error,
@@ -1994,6 +2188,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::InvokeChecked {
                     function,
                     argument_count: args.len(),
+                    argument_places,
                     continuation,
                     temporary_arg_drops,
                     call_site: span,
@@ -2001,6 +2196,69 @@ impl Interpreter<'_> {
                 for argument in args.into_iter().rev() {
                     frame.tasks.push(EvaluationTask::Rvalue(argument));
                 }
+                Ok(StepOutcome::Continue)
+            }
+            mir::Terminator::IndirectCall {
+                callee,
+                function_type,
+                invocation_mode,
+                args,
+                result,
+                continuation,
+                span,
+            } => {
+                self.set_active_panic_site(span)?;
+                let argument_places = self.indirect_call_argument_places(function_type, &args)?;
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishStatement);
+                frame.tasks.push(EvaluationTask::InvokeIndirect {
+                    function_type,
+                    invocation_mode,
+                    argument_count: args.len(),
+                    argument_places,
+                    result,
+                    continuation,
+                    call_site: span,
+                });
+                for argument in args.into_iter().rev() {
+                    frame.tasks.push(EvaluationTask::Rvalue(argument));
+                }
+                frame.tasks.push(EvaluationTask::Function(callee));
+                Ok(StepOutcome::Continue)
+            }
+            mir::Terminator::CheckedIndirectCall {
+                callee,
+                function_type,
+                invocation_mode,
+                args,
+                result,
+                error,
+                success,
+                failure,
+                span,
+            } => {
+                self.set_active_panic_site(span)?;
+                let argument_places = self.indirect_call_argument_places(function_type, &args)?;
+                let continuation = CheckedContinuation::Indirect {
+                    result,
+                    error,
+                    success,
+                    failure,
+                };
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishStatement);
+                frame.tasks.push(EvaluationTask::InvokeCheckedIndirect {
+                    function_type,
+                    invocation_mode,
+                    argument_count: args.len(),
+                    argument_places,
+                    continuation,
+                    call_site: span,
+                });
+                for argument in args.into_iter().rev() {
+                    frame.tasks.push(EvaluationTask::Rvalue(argument));
+                }
+                frame.tasks.push(EvaluationTask::Function(callee));
                 Ok(StepOutcome::Continue)
             }
             mir::Terminator::CheckedConstruct {
@@ -2026,6 +2284,7 @@ impl Interpreter<'_> {
                             )
                         })
                     })?;
+                let argument_places = self.direct_call_argument_places(definition, &args, 1)?;
                 let property_expression_count = properties
                     .iter()
                     .filter(|property| {
@@ -2046,6 +2305,7 @@ impl Interpreter<'_> {
                     properties: properties.clone(),
                     constructor: Some(constructor),
                     argument_count: args.len(),
+                    argument_places,
                     property_expression_count,
                     temporary_arg_drops,
                     checked: Some(checked),
@@ -2232,6 +2492,14 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullablePayloadEnum(value)),
+                mir::Rvalue::Function(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::Function(value)),
+                mir::Rvalue::NullableFunction(value) => self
+                    .current_frame_mut()?
+                    .tasks
+                    .push(EvaluationTask::NullableFunction(value)),
             },
             EvaluationTask::Value(expression) => match expression {
                 mir::ValueExpression::Integer(value) => {
@@ -2304,6 +2572,52 @@ impl Interpreter<'_> {
             }
             EvaluationTask::NullableSharedReferenceAccess(expression) => {
                 self.expand_nullable_shared_reference_access_expression(expression)?
+            }
+            EvaluationTask::Function(expression) => self.expand_function_expression(expression)?,
+            EvaluationTask::NullableFunction(expression) => {
+                self.expand_nullable_function_expression(expression)?
+            }
+            EvaluationTask::FinishClosureCreate {
+                function_type,
+                descriptor,
+                captures,
+            } => {
+                self.finish_closure_create(function_type, descriptor, captures)?;
+            }
+            EvaluationTask::BuildNullableFunctionSome(function_type) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::Function(value) = value else {
+                    return Err(InterpreterError::new(
+                        "nullable function wrapper received another value type",
+                    ));
+                };
+                if value.function_type != function_type {
+                    return Err(InterpreterError::new(
+                        "nullable function wrapper changed structural type",
+                    ));
+                }
+                self.push_local_value(LocalValue::NullableFunction {
+                    function_type,
+                    value: Some(value),
+                })?;
+            }
+            EvaluationTask::AssumeNullableFunctionPresent(function_type) => {
+                let value = self.pop_local_value()?;
+                let LocalValue::NullableFunction {
+                    function_type: actual,
+                    value: Some(value),
+                } = value
+                else {
+                    return Err(InterpreterError::new(
+                        "MIR assumed an absent nullable function was present",
+                    ));
+                };
+                if actual != function_type {
+                    return Err(InterpreterError::new(
+                        "narrowed nullable function changed structural type",
+                    ));
+                }
+                self.push_local_value(LocalValue::Function(value))?;
             }
             EvaluationTask::BuildSharedReference(class) => {
                 let value = self.pop_local_value()?;
@@ -3128,11 +3442,24 @@ impl Interpreter<'_> {
                 positional,
             } => {
                 let index = self.pop_local_value()?;
-                let value = match self.collection_value_at(collection, &index, transfer, positional)
+                let mut value = match self
+                    .collection_value_at(collection, &index, transfer, positional)
                 {
                     Ok(value) => value,
                     Err(error) => return self.collection_access_panic_step_at(error, index_span),
                 };
+                if !transfer {
+                    match &mut value {
+                        LocalValue::Function(function) => function.owns_environment = false,
+                        LocalValue::NullableFunction {
+                            value: Some(function),
+                            ..
+                        } => {
+                            function.owns_environment = false;
+                        }
+                        _ => {}
+                    }
+                }
                 self.push_local_value(value)?;
             }
             EvaluationTask::CollectionAdd {
@@ -3726,6 +4053,54 @@ impl Interpreter<'_> {
                     (mir::Type::Error, Some(LocalValue::NullableError(value))) => {
                         self.push_nullable_error(value)?;
                     }
+                    (
+                        mir::Type::Function(function_type),
+                        Some(LocalValue::Function(mut function)),
+                    ) if function.function_type == function_type => {
+                        let transferred = matches!(
+                            access,
+                            mir::NullableCollectionAccess::Remove
+                                | mir::NullableCollectionAccess::Pop
+                                | mir::NullableCollectionAccess::PopFront
+                                | mir::NullableCollectionAccess::PopBack
+                        );
+                        if !transferred {
+                            function.owns_environment = false;
+                        }
+                        self.push_local_value(LocalValue::NullableFunction {
+                            function_type,
+                            value: Some(function),
+                        })?;
+                    }
+                    (mir::Type::Function(function_type), None) => {
+                        self.push_local_value(LocalValue::NullableFunction {
+                            function_type,
+                            value: None,
+                        })?;
+                    }
+                    (
+                        mir::Type::Function(function_type),
+                        Some(LocalValue::NullableFunction {
+                            function_type: actual,
+                            mut value,
+                        }),
+                    ) if actual == function_type => {
+                        if !matches!(
+                            access,
+                            mir::NullableCollectionAccess::Remove
+                                | mir::NullableCollectionAccess::Pop
+                                | mir::NullableCollectionAccess::PopFront
+                                | mir::NullableCollectionAccess::PopBack
+                        ) {
+                            if let Some(function) = &mut value {
+                                function.owns_environment = false;
+                            }
+                        }
+                        self.push_local_value(LocalValue::NullableFunction {
+                            function_type,
+                            value,
+                        })?;
+                    }
                     (expected, value) if expected.shared_access().is_some() => {
                         let access = expected
                             .shared_access()
@@ -3980,6 +4355,7 @@ impl Interpreter<'_> {
                 properties,
                 constructor,
                 argument_count,
+                argument_places,
                 property_expression_count,
                 temporary_arg_drops,
                 checked,
@@ -4041,6 +4417,10 @@ impl Interpreter<'_> {
                         class,
                     });
                     constructor_arguments.extend(arguments);
+                    let mut constructor_argument_places =
+                        Vec::with_capacity(argument_places.len() + 1);
+                    constructor_argument_places.push(None);
+                    constructor_argument_places.extend(argument_places);
                     if !temporary_drops.is_empty() {
                         self.current_frame_mut()?
                             .statement_temporary_drops
@@ -4050,6 +4430,7 @@ impl Interpreter<'_> {
                         self.push_checked_frame(
                             constructor,
                             &constructor_arguments,
+                            &constructor_argument_places,
                             CheckedContinuation::Construct {
                                 result: checked.result,
                                 error: checked.error,
@@ -4070,6 +4451,7 @@ impl Interpreter<'_> {
                         self.push_frame(
                             constructor,
                             &constructor_arguments,
+                            &constructor_argument_places,
                             Some(ReturnExpectation::Void),
                             None,
                         )?;
@@ -4267,6 +4649,20 @@ impl Interpreter<'_> {
                         .push(OwnedDrop::Class { object, class });
                 }
                 self.push_scalar(mir::ScalarValue::Bool(object.is_some()))?;
+            }
+            EvaluationTask::NullableFunctionIsPresent => {
+                let LocalValue::NullableFunction { value, .. } = self.pop_local_value()? else {
+                    return Err(InterpreterError::new(
+                        "nullable function presence test produced another value type",
+                    ));
+                };
+                let present = value.is_some();
+                if let Some(value) = value.filter(|value| value.owns_environment) {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::Function(value));
+                }
+                self.push_scalar(mir::ScalarValue::Bool(present))?;
             }
             EvaluationTask::NullableCollectionIsPresent(owned) => {
                 let value = self.pop_collection_value()?;
@@ -5402,6 +5798,7 @@ impl Interpreter<'_> {
             EvaluationTask::Invoke {
                 function,
                 argument_count,
+                argument_places,
                 expectation,
                 temporary_arg_drops,
                 call_site,
@@ -5416,11 +5813,18 @@ impl Interpreter<'_> {
                         .statement_temporary_drops
                         .extend(drops);
                 }
-                self.push_frame(function, &args, Some(expectation), call_site)?;
+                self.push_frame(
+                    function,
+                    &args,
+                    &argument_places,
+                    Some(expectation),
+                    call_site,
+                )?;
             }
             EvaluationTask::InvokeChecked {
                 function,
                 argument_count,
+                argument_places,
                 continuation,
                 temporary_arg_drops,
                 call_site,
@@ -5435,7 +5839,56 @@ impl Interpreter<'_> {
                         .statement_temporary_drops
                         .extend(drops);
                 }
-                self.push_checked_frame(function, &args, continuation, call_site)?;
+                self.push_checked_frame(
+                    function,
+                    &args,
+                    &argument_places,
+                    continuation,
+                    call_site,
+                )?;
+            }
+            EvaluationTask::InvokeIndirect {
+                function_type,
+                invocation_mode,
+                argument_count,
+                argument_places,
+                result,
+                continuation,
+                call_site,
+            } => {
+                let mut values = self.take_call_arguments(argument_count + 1)?;
+                let callee = values.remove(0);
+                self.push_indirect_frame(
+                    callee,
+                    function_type,
+                    invocation_mode,
+                    &values,
+                    &argument_places,
+                    Some((result, continuation)),
+                    None,
+                    call_site,
+                )?;
+            }
+            EvaluationTask::InvokeCheckedIndirect {
+                function_type,
+                invocation_mode,
+                argument_count,
+                argument_places,
+                continuation,
+                call_site,
+            } => {
+                let mut values = self.take_call_arguments(argument_count + 1)?;
+                let callee = values.remove(0);
+                self.push_indirect_frame(
+                    callee,
+                    function_type,
+                    invocation_mode,
+                    &values,
+                    &argument_places,
+                    None,
+                    Some(continuation),
+                    call_site,
+                )?;
             }
             EvaluationTask::FinishStatement => {
                 let drops =
@@ -5606,6 +6059,35 @@ impl Interpreter<'_> {
                     self.queue_value_drops(value)?;
                 }
             }
+            EvaluationTask::DropFunction(local) => {
+                let value = self
+                    .current_frame_mut()?
+                    .locals
+                    .get_mut(local.0)
+                    .ok_or_else(|| InterpreterError::new("function local does not exist"))?
+                    .take();
+                match value {
+                    Some(LocalValue::Function(value)) => {
+                        self.current_frame_mut()?
+                            .tasks
+                            .push(EvaluationTask::DropFunctionValue(value));
+                    }
+                    Some(LocalValue::NullableFunction {
+                        value: Some(value), ..
+                    }) => {
+                        self.current_frame_mut()?
+                            .tasks
+                            .push(EvaluationTask::DropFunctionValue(value));
+                    }
+                    Some(LocalValue::NullableFunction { value: None, .. }) | None => {}
+                    Some(_) => {
+                        return Err(InterpreterError::new(
+                            "function drop targeted another local type",
+                        ));
+                    }
+                }
+            }
+            EvaluationTask::DropFunctionValue(value) => self.drop_function_value(value)?,
             EvaluationTask::CollectionClear(local) => {
                 self.clear_collection_local(local)?;
             }
@@ -5951,6 +6433,11 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableClassIsPresent(owned));
                 frame.tasks.push(EvaluationTask::NullableClass(*value));
             }
+            mir::BoolExpression::NullableFunctionIsPresent(value) => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::NullableFunctionIsPresent);
+                frame.tasks.push(EvaluationTask::NullableFunction(*value));
+            }
             mir::BoolExpression::NullableCollectionIsPresent(value) => {
                 let owned = value.owned_temporary_collection();
                 let frame = self.current_frame_mut()?;
@@ -6198,6 +6685,18 @@ impl Interpreter<'_> {
                     LocalValue::PayloadEnum(_) | LocalValue::NullablePayloadEnum { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR payload enum local local{} was used as a string value",
+                            id.0
+                        )))
+                    }
+                    LocalValue::Function(_) | LocalValue::NullableFunction { .. } => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR function local local{} was used as a string value",
+                            id.0
+                        )))
+                    }
+                    LocalValue::ClosureEnvironment(_) => {
+                        return Err(InterpreterError::new(format!(
+                            "MIR closure environment local local{} was used as a string value",
                             id.0
                         )))
                     }
@@ -6974,6 +7473,290 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn expand_function_expression(
+        &mut self,
+        expression: mir::FunctionExpression,
+    ) -> Result<(), InterpreterError> {
+        let function_type = expression.function_type();
+        match expression {
+            mir::FunctionExpression::Create {
+                descriptor,
+                captures,
+                ..
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::FinishClosureCreate {
+                    function_type,
+                    descriptor,
+                    captures: captures.clone(),
+                });
+                for capture in captures.into_iter().rev() {
+                    if let mir::ClosureCaptureOperand::CopyValue(value)
+                    | mir::ClosureCaptureOperand::MoveValue(value) = capture
+                    {
+                        frame.tasks.push(EvaluationTask::Rvalue(value));
+                    }
+                }
+            }
+            mir::FunctionExpression::Local {
+                local, transfer, ..
+            } => {
+                let mut value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::Function(function) = &mut value else {
+                    return Err(InterpreterError::new(
+                        "function expression read another local type",
+                    ));
+                };
+                if function.function_type != function_type {
+                    return Err(InterpreterError::new(
+                        "function expression changed structural type",
+                    ));
+                }
+                if !transfer {
+                    function.owns_environment = false;
+                }
+                self.push_local_value(value)?;
+            }
+            mir::FunctionExpression::Property {
+                object, property, ..
+            } => {
+                let mut value = self.read_property(object, property)?;
+                let LocalValue::Function(function) = &mut value else {
+                    return Err(InterpreterError::new(
+                        "function property read another value type",
+                    ));
+                };
+                function.owns_environment = false;
+                self.push_local_value(value)?;
+            }
+            mir::FunctionExpression::Call { function, args, .. } => self.queue_call(
+                function,
+                args,
+                ReturnExpectation::Value(mir::Type::Function(function_type)),
+            )?,
+            mir::FunctionExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    collection,
+                    index_span: Span::default(),
+                    transfer: remove,
+                    positional,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+            mir::FunctionExpression::AssumePresent { value, .. } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::AssumeNullableFunctionPresent(function_type));
+                frame.tasks.push(EvaluationTask::NullableFunction(*value));
+            }
+        }
+        Ok(())
+    }
+
+    fn expand_nullable_function_expression(
+        &mut self,
+        expression: mir::NullableFunctionExpression,
+    ) -> Result<(), InterpreterError> {
+        let function_type = expression.function_type();
+        match expression {
+            mir::NullableFunctionExpression::Null { .. } => {
+                self.push_local_value(LocalValue::NullableFunction {
+                    function_type,
+                    value: None,
+                })?;
+            }
+            mir::NullableFunctionExpression::Present(value) => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildNullableFunctionSome(function_type));
+                frame.tasks.push(EvaluationTask::Function(value));
+            }
+            mir::NullableFunctionExpression::Local {
+                local, transfer, ..
+            } => {
+                let mut value = self.read_or_take_local(local, transfer)?;
+                let LocalValue::NullableFunction {
+                    function_type: actual,
+                    value: function,
+                } = &mut value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable function expression read another local type",
+                    ));
+                };
+                if *actual != function_type {
+                    return Err(InterpreterError::new(
+                        "nullable function expression changed structural type",
+                    ));
+                }
+                if !transfer {
+                    if let Some(function) = function {
+                        function.owns_environment = false;
+                    }
+                }
+                self.push_local_value(value)?;
+            }
+            mir::NullableFunctionExpression::Property {
+                object, property, ..
+            } => {
+                let mut value = self.read_property(object, property)?;
+                let LocalValue::NullableFunction {
+                    value: function, ..
+                } = &mut value
+                else {
+                    return Err(InterpreterError::new(
+                        "nullable function property read another value type",
+                    ));
+                };
+                if let Some(function) = function {
+                    function.owns_environment = false;
+                }
+                self.push_local_value(value)?;
+            }
+            mir::NullableFunctionExpression::Call { function, args, .. } => self.queue_call(
+                function,
+                args,
+                ReturnExpectation::Value(mir::Type::NullableFunction(function_type)),
+            )?,
+            mir::NullableFunctionExpression::DictionaryGet {
+                collection,
+                key,
+                access,
+                ..
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::DictionaryGet {
+                    collection,
+                    expected: mir::Type::Function(function_type),
+                    access,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*key));
+            }
+            mir::NullableFunctionExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::LoadCollectionValue {
+                    collection,
+                    index_span: Span::default(),
+                    transfer: remove,
+                    positional,
+                });
+                frame.tasks.push(EvaluationTask::Rvalue(*index));
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_closure_create(
+        &mut self,
+        function_type: mir::FunctionTypeId,
+        descriptor: mir::ClosureDescriptorId,
+        captures: Vec<mir::ClosureCaptureOperand>,
+    ) -> Result<(), InterpreterError> {
+        let descriptor_definition = self
+            .program
+            .closure_descriptors
+            .get(descriptor.0)
+            .filter(|candidate| candidate.id == descriptor)
+            .ok_or_else(|| InterpreterError::new("closure descriptor does not exist"))?;
+        if descriptor_definition.function_type != function_type {
+            return Err(InterpreterError::new(
+                "closure descriptor changed structural function type",
+            ));
+        }
+        let owned_count = captures
+            .iter()
+            .filter(|capture| {
+                matches!(
+                    capture,
+                    mir::ClosureCaptureOperand::CopyValue(_)
+                        | mir::ClosureCaptureOperand::MoveValue(_)
+                )
+            })
+            .count();
+        let mut owned_values = self.take_call_arguments(owned_count)?.into_iter();
+        let environment = match descriptor_definition.environment_layout {
+            None => None,
+            Some(layout_id) => {
+                let layout = self
+                    .program
+                    .closure_environment_layouts
+                    .get(layout_id.0)
+                    .filter(|candidate| candidate.id == layout_id)
+                    .ok_or_else(|| {
+                        InterpreterError::new("closure environment layout is missing")
+                    })?;
+                let mut fields = Vec::with_capacity(layout.fields.len());
+                for (capture, _) in captures.into_iter().zip(&layout.fields) {
+                    let value = match capture {
+                        mir::ClosureCaptureOperand::BorrowLocal { local, writable } => {
+                            ClosureEnvironmentFieldValue::Borrowed {
+                                place: self.place_for_local(local)?,
+                                writable,
+                            }
+                        }
+                        mir::ClosureCaptureOperand::CopyValue(_)
+                        | mir::ClosureCaptureOperand::MoveValue(_) => {
+                            ClosureEnvironmentFieldValue::Owned(Some(
+                                owned_values.next().ok_or_else(|| {
+                                    InterpreterError::new(
+                                        "closure capture evaluation produced too few values",
+                                    )
+                                })?,
+                            ))
+                        }
+                    };
+                    fields.push(value);
+                }
+                let handle = ClosureEnvironmentHandle {
+                    id: self.next_closure_environment,
+                    layout: layout_id,
+                };
+                self.next_closure_environment = self
+                    .next_closure_environment
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        InterpreterError::new("closure environment identity overflow")
+                    })?;
+                self.closure_environment_allocations = self
+                    .closure_environment_allocations
+                    .checked_add(1)
+                    .ok_or_else(|| {
+                        InterpreterError::new("closure environment allocation count overflow")
+                    })?;
+                self.closure_environments.insert(
+                    handle,
+                    ClosureEnvironmentValue {
+                        layout: layout_id,
+                        fields,
+                        released: false,
+                    },
+                );
+                Some(handle)
+            }
+        };
+        self.push_local_value(LocalValue::Function(FunctionValue {
+            function_type,
+            descriptor,
+            owns_environment: environment.is_some(),
+            environment,
+        }))
+    }
+
     fn expand_class_expression(
         &mut self,
         expression: mir::ClassExpression,
@@ -7079,6 +7862,15 @@ impl Interpreter<'_> {
                 } else {
                     Vec::new()
                 };
+                let argument_places = if let Some(constructor) = constructor {
+                    self.direct_call_argument_places(
+                        function_in(self.program, constructor)?,
+                        &args,
+                        1,
+                    )?
+                } else {
+                    Vec::new()
+                };
                 let property_expression_count = properties
                     .iter()
                     .filter(|property| {
@@ -7091,6 +7883,7 @@ impl Interpreter<'_> {
                     properties: properties.clone(),
                     constructor,
                     argument_count: args.len(),
+                    argument_places,
                     property_expression_count,
                     temporary_arg_drops,
                     checked: None,
@@ -9513,6 +10306,68 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn place_for_local(&self, local: mir::LocalId) -> Result<InterpreterPlace, InterpreterError> {
+        let frame = self.current_frame()?;
+        let origin = frame.local_origins.get(local.0).ok_or_else(|| {
+            InterpreterError::new(format!("MIR local local{} does not exist", local.0))
+        })?;
+        Ok(origin.unwrap_or(InterpreterPlace::FrameLocal {
+            frame: frame.id,
+            local,
+        }))
+    }
+
+    fn argument_places(
+        &self,
+        args: &[mir::Rvalue],
+        modes: impl Iterator<Item = mir::FunctionParameterMode>,
+    ) -> Result<Vec<Option<InterpreterPlace>>, InterpreterError> {
+        args.iter()
+            .zip(modes)
+            .map(|(argument, mode)| {
+                if mode == mir::FunctionParameterMode::Take {
+                    return Ok(None);
+                }
+                direct_rvalue_local(argument)
+                    .map(|local| self.place_for_local(local))
+                    .transpose()
+            })
+            .collect()
+    }
+
+    fn direct_call_argument_places(
+        &self,
+        callee: &mir::Function,
+        args: &[mir::Rvalue],
+        parameter_offset: usize,
+    ) -> Result<Vec<Option<InterpreterPlace>>, InterpreterError> {
+        self.argument_places(
+            args,
+            callee
+                .parameter_modes
+                .iter()
+                .copied()
+                .skip(parameter_offset),
+        )
+    }
+
+    fn indirect_call_argument_places(
+        &self,
+        function_type: mir::FunctionTypeId,
+        args: &[mir::Rvalue],
+    ) -> Result<Vec<Option<InterpreterPlace>>, InterpreterError> {
+        let definition = self
+            .program
+            .function_types
+            .get(function_type.0)
+            .filter(|candidate| candidate.id == function_type)
+            .ok_or_else(|| InterpreterError::new("function type does not exist"))?;
+        self.argument_places(
+            args,
+            definition.parameters.iter().map(|parameter| parameter.mode),
+        )
+    }
+
     fn queue_call(
         &mut self,
         function: mir::FunctionId,
@@ -9534,10 +10389,12 @@ impl Interpreter<'_> {
         }
         let callee = function_in(self.program, function)?;
         let temporary_arg_drops = temporary_argument_drop_order(&args, callee, 0, |_| false)?;
+        let argument_places = self.direct_call_argument_places(callee, &args, 0)?;
         let frame = self.current_frame_mut()?;
         frame.tasks.push(EvaluationTask::Invoke {
             function,
             argument_count: args.len(),
+            argument_places,
             expectation,
             temporary_arg_drops,
             call_site,
@@ -9573,6 +10430,8 @@ impl Interpreter<'_> {
             .into_iter()
             .map(|index| index + 1)
             .collect();
+        let mut argument_places = self.direct_call_argument_places(callee, &args, 1)?;
+        argument_places.insert(0, None);
         let frame = self.current_frame_mut()?;
         frame.values.push(EvaluationValue::Class { object, class });
         if result == non_nullable_result {
@@ -9583,6 +10442,7 @@ impl Interpreter<'_> {
         frame.tasks.push(EvaluationTask::Invoke {
             function,
             argument_count: args.len() + 1,
+            argument_places,
             expectation: ReturnExpectation::Value(result),
             temporary_arg_drops,
             call_site: None,
@@ -9610,11 +10470,14 @@ impl Interpreter<'_> {
             .into_iter()
             .map(|index| index + 1)
             .collect();
+        let mut argument_places = self.direct_call_argument_places(callee, &args, 1)?;
+        argument_places.insert(0, None);
         let frame = self.current_frame_mut()?;
         frame.values.push(EvaluationValue::Class { object, class });
         frame.tasks.push(EvaluationTask::Invoke {
             function,
             argument_count: args.len() + 1,
+            argument_places,
             expectation,
             temporary_arg_drops,
             call_site,
@@ -9629,6 +10492,7 @@ impl Interpreter<'_> {
         &mut self,
         function_id: mir::FunctionId,
         args: &[LocalValue],
+        argument_places: &[Option<InterpreterPlace>],
         caller_expectation: Option<ReturnExpectation>,
         entered_from: Option<Span>,
     ) -> Result<(), InterpreterError> {
@@ -9649,7 +10513,16 @@ impl Interpreter<'_> {
                 args.len()
             )));
         }
+        if argument_places.len() != args.len() {
+            return Err(InterpreterError::new(format!(
+                "MIR function {} received {} argument place(s) for {} argument(s)",
+                function.name,
+                argument_places.len(),
+                args.len()
+            )));
+        }
         let mut locals = vec![None; function.locals.len()];
+        let mut local_origins = vec![None; function.locals.len()];
         for (index, local) in function.locals.iter().enumerate() {
             if local.id != mir::LocalId(index) {
                 return Err(InterpreterError::new(format!(
@@ -9658,7 +10531,12 @@ impl Interpreter<'_> {
                 )));
             }
         }
-        for (parameter, value) in function.params.iter().zip(args.iter().cloned()) {
+        for ((parameter, value), origin) in function
+            .params
+            .iter()
+            .zip(args.iter().cloned())
+            .zip(argument_places.iter().copied())
+        {
             let definition = local_in(function, *parameter)?;
             if local_value_type(&value) != definition.ty {
                 return Err(InterpreterError::new(format!(
@@ -9670,21 +10548,32 @@ impl Interpreter<'_> {
                 )));
             }
             let _ = assign_local(&function.locals, &mut locals, *parameter, value)?;
+            local_origins[parameter.0] = origin;
         }
         block_in(function, function.entry_block)?;
+        let frame_id = self.next_frame;
+        self.next_frame = self
+            .next_frame
+            .checked_add(1)
+            .ok_or_else(|| InterpreterError::new("MIR interpreter frame identity overflow"))?;
         self.frames.push(CallFrame {
+            id: frame_id,
             function: function_id,
             block: function.entry_block,
             statement_index: 0,
             entered_block: false,
             locals,
+            local_origins,
             tasks: Vec::new(),
             values: Vec::new(),
             statement_temporary_drops: Vec::new(),
             caller_expectation,
             checked_continuation: None,
+            indirect_continuation: None,
             entered_from,
             active_panic_site: function.source_span,
+            closure_environment: None,
+            consume_closure_environment: false,
         });
         Ok(())
     }
@@ -9693,10 +10582,11 @@ impl Interpreter<'_> {
         &mut self,
         function_id: mir::FunctionId,
         args: &[LocalValue],
+        argument_places: &[Option<InterpreterPlace>],
         continuation: CheckedContinuation,
         entered_from: Span,
     ) -> Result<(), InterpreterError> {
-        self.push_frame(function_id, args, None, Some(entered_from))?;
+        self.push_frame(function_id, args, argument_places, None, Some(entered_from))?;
         self.frames
             .last_mut()
             .expect("checked frame was just pushed")
@@ -9704,14 +10594,513 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn push_indirect_frame(
+        &mut self,
+        callee: LocalValue,
+        function_type: mir::FunctionTypeId,
+        invocation_mode: mir::FunctionInvocationMode,
+        args: &[LocalValue],
+        argument_places: &[Option<InterpreterPlace>],
+        continuation: Option<(Option<mir::LocalId>, mir::BlockId)>,
+        checked_continuation: Option<CheckedContinuation>,
+        call_site: Span,
+    ) -> Result<(), InterpreterError> {
+        let LocalValue::Function(callee) = callee else {
+            return Err(InterpreterError::new(
+                "indirect invocation callee is not a function value",
+            ));
+        };
+        if callee.function_type != function_type {
+            return Err(InterpreterError::new(
+                "indirect invocation changed structural function type",
+            ));
+        }
+        let descriptor = self
+            .program
+            .closure_descriptors
+            .get(callee.descriptor.0)
+            .filter(|candidate| candidate.id == callee.descriptor)
+            .ok_or_else(|| InterpreterError::new("closure descriptor does not exist"))?;
+        if descriptor.invocation_mode != invocation_mode {
+            return Err(InterpreterError::new(
+                "indirect invocation mode disagrees with closure descriptor",
+            ));
+        }
+        if invocation_mode == mir::FunctionInvocationMode::Once
+            && callee.environment.is_some()
+            && !callee.owns_environment
+        {
+            return Err(InterpreterError::new(
+                "once closure invocation borrowed its environment",
+            ));
+        }
+        let mut frame_args = Vec::with_capacity(args.len() + 1);
+        frame_args.push(LocalValue::ClosureEnvironment(callee.environment));
+        frame_args.extend(args.iter().cloned());
+        let mut frame_argument_places = Vec::with_capacity(argument_places.len() + 1);
+        frame_argument_places.push(None);
+        frame_argument_places.extend(argument_places.iter().copied());
+        self.push_frame(
+            descriptor.entry_function,
+            &frame_args,
+            &frame_argument_places,
+            None,
+            Some(call_site),
+        )?;
+        let frame = self
+            .frames
+            .last_mut()
+            .expect("indirect closure frame was just pushed");
+        frame.indirect_continuation = continuation;
+        frame.checked_continuation = checked_continuation;
+        frame.consume_closure_environment = invocation_mode == mir::FunctionInvocationMode::Once;
+        Ok(())
+    }
+
+    fn finish_indirect_continuation(
+        &mut self,
+        target: mir::BlockId,
+        assignment: Option<(mir::LocalId, LocalValue)>,
+    ) -> Result<(), InterpreterError> {
+        let caller_id = self.current_frame()?.function;
+        let caller = function_in(self.program, caller_id)?;
+        block_in(caller, target)?;
+        if let Some((local, value)) = assignment {
+            let old = assign_local(
+                &caller.locals,
+                &mut self.current_frame_mut()?.locals,
+                local,
+                value,
+            )?;
+            if old.is_some() && local_in(caller, local)?.owned {
+                return Err(InterpreterError::new(
+                    "indirect call overwrote an occupied owned result local",
+                ));
+            }
+        }
+        let caller = self.current_frame_mut()?;
+        caller.block = target;
+        caller.statement_index = 0;
+        caller.entered_block = false;
+        Ok(())
+    }
+
+    fn closure_environment_field_index(
+        &self,
+        environment: ClosureEnvironmentHandle,
+        field: mir::ClosureEnvironmentFieldId,
+    ) -> Result<usize, InterpreterError> {
+        let value = self
+            .closure_environments
+            .get(&environment)
+            .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?;
+        let layout = self
+            .program
+            .closure_environment_layouts
+            .get(value.layout.0)
+            .filter(|candidate| candidate.id == value.layout)
+            .ok_or_else(|| InterpreterError::new("closure environment layout does not exist"))?;
+        layout
+            .fields
+            .iter()
+            .position(|candidate| candidate.id == field)
+            .ok_or_else(|| InterpreterError::new("closure environment field does not exist"))
+    }
+
+    fn read_place(&self, place: InterpreterPlace) -> Result<LocalValue, InterpreterError> {
+        match place {
+            InterpreterPlace::FrameLocal { frame, local } => self
+                .frames
+                .iter()
+                .find(|candidate| candidate.id == frame)
+                .and_then(|frame| frame.locals.get(local.0))
+                .and_then(Option::as_ref)
+                .cloned()
+                .ok_or_else(|| {
+                    InterpreterError::new("closure capture source place is unavailable")
+                }),
+            InterpreterPlace::EnvironmentField { environment, field } => {
+                if let Some(active) = self
+                    .active_closure_fields
+                    .get(&(environment, field.0))
+                    .copied()
+                {
+                    return self.read_place(active);
+                }
+                let index = self.closure_environment_field_index(environment, field)?;
+                match &self
+                    .closure_environments
+                    .get(&environment)
+                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
+                    .fields[index]
+                {
+                    ClosureEnvironmentFieldValue::Borrowed { place, .. } => self.read_place(*place),
+                    ClosureEnvironmentFieldValue::Owned(Some(value)) => Ok(value.clone()),
+                    ClosureEnvironmentFieldValue::Owned(None) => Err(InterpreterError::new(
+                        "closure owned capture was moved before borrowed use",
+                    )),
+                }
+            }
+        }
+    }
+
+    fn write_place(
+        &mut self,
+        place: InterpreterPlace,
+        value: LocalValue,
+    ) -> Result<LocalValue, InterpreterError> {
+        match place {
+            InterpreterPlace::FrameLocal { frame, local } => self
+                .frames
+                .iter_mut()
+                .find(|candidate| candidate.id == frame)
+                .and_then(|frame| frame.locals.get_mut(local.0))
+                .ok_or_else(|| {
+                    InterpreterError::new("closure capture source place is unavailable")
+                })?
+                .replace(value)
+                .ok_or_else(|| InterpreterError::new("closure capture source place is empty")),
+            InterpreterPlace::EnvironmentField { environment, field } => {
+                if let Some(active) = self
+                    .active_closure_fields
+                    .get(&(environment, field.0))
+                    .copied()
+                {
+                    return self.write_place(active, value);
+                }
+                let index = self.closure_environment_field_index(environment, field)?;
+                let borrowed = match &self
+                    .closure_environments
+                    .get(&environment)
+                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
+                    .fields[index]
+                {
+                    ClosureEnvironmentFieldValue::Borrowed { place, writable } => {
+                        if !writable {
+                            return Err(InterpreterError::new(
+                                "readonly closure environment field was written",
+                            ));
+                        }
+                        Some(*place)
+                    }
+                    ClosureEnvironmentFieldValue::Owned(_) => None,
+                };
+                if let Some(place) = borrowed {
+                    return self.write_place(place, value);
+                }
+                let environment = self
+                    .closure_environments
+                    .get_mut(&environment)
+                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?;
+                let ClosureEnvironmentFieldValue::Owned(slot) = &mut environment.fields[index]
+                else {
+                    unreachable!("borrowed environment field handled above");
+                };
+                slot.replace(value).ok_or_else(|| {
+                    InterpreterError::new("closure owned capture was moved before replacement")
+                })
+            }
+        }
+    }
+
+    fn drop_function_value(&mut self, value: FunctionValue) -> Result<(), InterpreterError> {
+        if !value.owns_environment {
+            return Ok(());
+        }
+        let Some(environment) = value.environment else {
+            return Ok(());
+        };
+        let Some(mut environment_value) = self.closure_environments.remove(&environment) else {
+            return Ok(());
+        };
+        if environment_value.released {
+            return Ok(());
+        }
+        let layout = self
+            .program
+            .closure_environment_layouts
+            .get(environment_value.layout.0)
+            .filter(|candidate| candidate.id == environment_value.layout)
+            .ok_or_else(|| InterpreterError::new("closure environment layout does not exist"))?;
+        environment_value.released = true;
+        let mut drops = Vec::new();
+        for logical_index in &layout.logical_release_order {
+            let physical_index = layout
+                .fields
+                .iter()
+                .position(|field| field.logical_index == *logical_index)
+                .ok_or_else(|| {
+                    InterpreterError::new("closure release index has no environment field")
+                })?;
+            if let Some(ClosureEnvironmentFieldValue::Owned(value)) =
+                environment_value.fields.get_mut(physical_index)
+            {
+                if let Some(value) = value.take() {
+                    collect_owned_objects_from_value(value, &mut drops);
+                }
+            }
+        }
+        self.active_closure_fields
+            .retain(|(candidate, _), _| *candidate != environment);
+        for drop in drops.into_iter().rev() {
+            self.push_owned_drop_task(drop)?;
+        }
+        Ok(())
+    }
+
+    fn bind_closure_environment(
+        &mut self,
+        function: &mir::Function,
+        environment_local: mir::LocalId,
+        bindings: &[(mir::ClosureEnvironmentFieldId, mir::LocalId)],
+    ) -> Result<(), InterpreterError> {
+        let environment = match read_local(&self.current_frame()?.locals, environment_local)? {
+            LocalValue::ClosureEnvironment(Some(environment)) => *environment,
+            LocalValue::ClosureEnvironment(None) if bindings.is_empty() => return Ok(()),
+            _ => {
+                return Err(InterpreterError::new(
+                    "closure function received an incompatible hidden environment",
+                ));
+            }
+        };
+        let layout_id = self
+            .closure_environments
+            .get(&environment)
+            .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
+            .layout;
+        let layout = self
+            .program
+            .closure_environment_layouts
+            .get(layout_id.0)
+            .filter(|candidate| candidate.id == layout_id)
+            .ok_or_else(|| InterpreterError::new("closure environment layout does not exist"))?;
+        let frame_id = self.current_frame()?.id;
+        let mut values = Vec::with_capacity(bindings.len());
+        for (field_id, target) in bindings {
+            let index = layout
+                .fields
+                .iter()
+                .position(|field| field.id == *field_id)
+                .ok_or_else(|| InterpreterError::new("closure environment field does not exist"))?;
+            let borrowed_place = match &self
+                .closure_environments
+                .get(&environment)
+                .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
+                .fields[index]
+            {
+                ClosureEnvironmentFieldValue::Borrowed { place, .. } => Some(*place),
+                ClosureEnvironmentFieldValue::Owned(_) => None,
+            };
+            let (value, origin, owned) = if let Some(place) = borrowed_place {
+                (self.read_place(place)?, place, false)
+            } else {
+                let environment_value = self
+                    .closure_environments
+                    .get_mut(&environment)
+                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?;
+                let ClosureEnvironmentFieldValue::Owned(value) =
+                    &mut environment_value.fields[index]
+                else {
+                    unreachable!("borrowed environment field handled above");
+                };
+                (
+                    value.take().ok_or_else(|| {
+                        InterpreterError::new("closure owned capture was already moved")
+                    })?,
+                    InterpreterPlace::EnvironmentField {
+                        environment,
+                        field: *field_id,
+                    },
+                    true,
+                )
+            };
+            values.push((*field_id, *target, value, origin, owned));
+        }
+        for (field, target, value, origin, owned) in values {
+            assign_local(
+                &function.locals,
+                &mut self.current_frame_mut()?.locals,
+                target,
+                value,
+            )?;
+            self.current_frame_mut()?.local_origins[target.0] = Some(origin);
+            if owned {
+                self.active_closure_fields.insert(
+                    (environment, field.0),
+                    InterpreterPlace::FrameLocal {
+                        frame: frame_id,
+                        local: target,
+                    },
+                );
+            }
+        }
+        self.current_frame_mut()?.closure_environment = Some(environment);
+        Ok(())
+    }
+
+    fn sync_closure_frame(
+        &mut self,
+        frame: &mut CallFrame,
+    ) -> Result<Vec<OwnedDrop>, InterpreterError> {
+        let function = function_in(self.program, frame.function)?;
+        let Some(closure) = &function.closure else {
+            return Ok(Vec::new());
+        };
+        let Some(environment) = frame.closure_environment else {
+            return Ok(Vec::new());
+        };
+        let layout_id = closure
+            .environment_layout
+            .ok_or_else(|| InterpreterError::new("capturing closure has no environment layout"))?;
+        let layout = self
+            .program
+            .closure_environment_layouts
+            .get(layout_id.0)
+            .filter(|candidate| candidate.id == layout_id)
+            .ok_or_else(|| InterpreterError::new("closure environment layout does not exist"))?;
+        enum SyncAction {
+            Owned {
+                index: usize,
+                field: mir::ClosureEnvironmentFieldId,
+                value: Option<LocalValue>,
+            },
+            WritableBorrow {
+                place: InterpreterPlace,
+                value: LocalValue,
+            },
+        }
+        let mut actions = Vec::new();
+        for (physical_index, ((field_id, local), field)) in closure
+            .capture_locals
+            .iter()
+            .zip(&layout.fields)
+            .enumerate()
+        {
+            if *field_id != field.id {
+                return Err(InterpreterError::new(
+                    "closure capture binding disagrees with its environment layout",
+                ));
+            }
+            let slot = frame
+                .locals
+                .get_mut(local.0)
+                .ok_or_else(|| InterpreterError::new("closure capture local does not exist"))?;
+            match &self
+                .closure_environments
+                .get(&environment)
+                .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
+                .fields[physical_index]
+            {
+                ClosureEnvironmentFieldValue::Owned(_) => actions.push(SyncAction::Owned {
+                    index: physical_index,
+                    field: *field_id,
+                    value: slot.take(),
+                }),
+                ClosureEnvironmentFieldValue::Borrowed { place, writable } if *writable => {
+                    actions.push(SyncAction::WritableBorrow {
+                        place: *place,
+                        value: slot.as_ref().cloned().ok_or_else(|| {
+                            InterpreterError::new("writable closure capture was moved")
+                        })?,
+                    });
+                }
+                ClosureEnvironmentFieldValue::Borrowed { .. } => {}
+            }
+        }
+        let mut drops = Vec::new();
+        for action in actions {
+            match action {
+                SyncAction::Owned {
+                    index,
+                    field,
+                    value,
+                } => {
+                    self.active_closure_fields.remove(&(environment, field.0));
+                    let environment_value = self
+                        .closure_environments
+                        .get_mut(&environment)
+                        .ok_or_else(|| {
+                            InterpreterError::new("closure environment does not exist")
+                        })?;
+                    let ClosureEnvironmentFieldValue::Owned(slot) =
+                        &mut environment_value.fields[index]
+                    else {
+                        return Err(InterpreterError::new(
+                            "closure environment field changed storage kind",
+                        ));
+                    };
+                    *slot = value;
+                }
+                SyncAction::WritableBorrow { place, value } => {
+                    let current = self.read_place(place)?;
+                    if current != value {
+                        let old = self.write_place(place, value)?;
+                        collect_owned_objects_from_value(old, &mut drops);
+                    }
+                }
+            }
+        }
+        if !frame.consume_closure_environment {
+            return Ok(drops);
+        }
+        let mut environment_value = self
+            .closure_environments
+            .remove(&environment)
+            .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?;
+        environment_value.released = true;
+        for logical_index in &layout.logical_release_order {
+            let physical_index = layout
+                .fields
+                .iter()
+                .position(|field| field.logical_index == *logical_index)
+                .ok_or_else(|| {
+                    InterpreterError::new("closure release index has no environment field")
+                })?;
+            if let Some(ClosureEnvironmentFieldValue::Owned(value)) =
+                environment_value.fields.get_mut(physical_index)
+            {
+                if let Some(value) = value.take() {
+                    collect_owned_objects_from_value(value, &mut drops);
+                }
+            }
+        }
+        self.active_closure_fields
+            .retain(|(candidate, _), _| *candidate != environment);
+        Ok(drops)
+    }
+
     fn complete_frame(
         &mut self,
         outcome: FunctionOutcome,
     ) -> Result<StepOutcome, InterpreterError> {
-        let frame = self
+        let mut frame = self
             .frames
             .pop()
             .ok_or_else(|| InterpreterError::new("MIR interpreter has no call frame to return"))?;
+        let closure_drops = self.sync_closure_frame(&mut frame)?;
+        for drop in closure_drops.into_iter().rev() {
+            self.push_owned_drop_task(drop)?;
+        }
+        if let Some((result, target)) = frame.indirect_continuation {
+            let assignment = match (result, outcome) {
+                (Some(result), FunctionOutcome::Value(value)) => Some((result, value)),
+                (None, FunctionOutcome::Void) => None,
+                (Some(_), FunctionOutcome::Void) => {
+                    return Err(InterpreterError::new("indirect value call returned void"));
+                }
+                (None, FunctionOutcome::Value(_)) => {
+                    return Err(InterpreterError::new("indirect void call returned a value"));
+                }
+                (_, FunctionOutcome::CheckedError(_)) => {
+                    return Err(InterpreterError::new(
+                        "checked error escaped through an ordinary indirect call",
+                    ));
+                }
+            };
+            self.finish_indirect_continuation(target, assignment)?;
+            return Ok(StepOutcome::Continue);
+        }
         if let Some(continuation) = frame.checked_continuation {
             let (target, assignment, failed_construction) = match (continuation, outcome) {
                 (
@@ -9732,6 +11121,26 @@ impl Interpreter<'_> {
                 ) => (success, None, None),
                 (
                     CheckedContinuation::Call { error, failure, .. },
+                    FunctionOutcome::CheckedError(value),
+                ) => (failure, Some((error, LocalValue::Error(value))), None),
+                (
+                    CheckedContinuation::Indirect {
+                        result: Some(result),
+                        success,
+                        ..
+                    },
+                    FunctionOutcome::Value(value),
+                ) => (success, Some((result, value)), None),
+                (
+                    CheckedContinuation::Indirect {
+                        result: None,
+                        success,
+                        ..
+                    },
+                    FunctionOutcome::Void,
+                ) => (success, None, None),
+                (
+                    CheckedContinuation::Indirect { error, failure, .. },
                     FunctionOutcome::CheckedError(value),
                 ) => (failure, Some((error, LocalValue::Error(value))), None),
                 (
@@ -9765,6 +11174,11 @@ impl Interpreter<'_> {
                 (CheckedContinuation::Call { result: None, .. }, FunctionOutcome::Value(_)) => {
                     return Err(InterpreterError::new("checked void call returned a value"));
                 }
+                (CheckedContinuation::Indirect { result: None, .. }, FunctionOutcome::Value(_)) => {
+                    return Err(InterpreterError::new(
+                        "checked indirect void call returned a value",
+                    ));
+                }
                 (
                     CheckedContinuation::Call {
                         result: Some(_), ..
@@ -9772,6 +11186,16 @@ impl Interpreter<'_> {
                     FunctionOutcome::Void,
                 ) => {
                     return Err(InterpreterError::new("checked value call returned void"));
+                }
+                (
+                    CheckedContinuation::Indirect {
+                        result: Some(_), ..
+                    },
+                    FunctionOutcome::Void,
+                ) => {
+                    return Err(InterpreterError::new(
+                        "checked indirect value call returned void",
+                    ));
                 }
                 (CheckedContinuation::Construct { .. }, FunctionOutcome::Value(_)) => {
                     return Err(InterpreterError::new(
@@ -10469,6 +11893,17 @@ impl Interpreter<'_> {
                 EvaluationValue::NullablePayloadEnum { ty, value } => {
                     Ok(LocalValue::NullablePayloadEnum { ty, value })
                 }
+                EvaluationValue::Function(value) => Ok(LocalValue::Function(value)),
+                EvaluationValue::NullableFunction {
+                    function_type,
+                    value,
+                } => Ok(LocalValue::NullableFunction {
+                    function_type,
+                    value,
+                }),
+                EvaluationValue::ClosureEnvironment(value) => {
+                    Ok(LocalValue::ClosureEnvironment(value))
+                }
             })
             .collect()
     }
@@ -10522,6 +11957,12 @@ impl Interpreter<'_> {
                     "MIR scalar evaluation produced a payload enum",
                 ))
             }
+            Some(EvaluationValue::Function(_) | EvaluationValue::NullableFunction { .. }) => Err(
+                InterpreterError::new("MIR scalar evaluation produced a function value"),
+            ),
+            Some(EvaluationValue::ClosureEnvironment(_)) => Err(InterpreterError::new(
+                "MIR scalar evaluation produced a closure environment",
+            )),
             None => Err(InterpreterError::new(
                 "MIR scalar evaluation produced no value",
             )),
@@ -10577,6 +12018,12 @@ impl Interpreter<'_> {
                     "MIR string evaluation produced a payload enum",
                 ))
             }
+            Some(EvaluationValue::Function(_) | EvaluationValue::NullableFunction { .. }) => Err(
+                InterpreterError::new("MIR string evaluation produced a function value"),
+            ),
+            Some(EvaluationValue::ClosureEnvironment(_)) => Err(InterpreterError::new(
+                "MIR string evaluation produced a closure environment",
+            )),
             None => Err(InterpreterError::new(
                 "MIR string evaluation produced no value",
             )),
@@ -11076,6 +12523,17 @@ impl Interpreter<'_> {
             Some(EvaluationValue::NullablePayloadEnum { ty, value }) => {
                 Ok(LocalValue::NullablePayloadEnum { ty, value })
             }
+            Some(EvaluationValue::Function(value)) => Ok(LocalValue::Function(value)),
+            Some(EvaluationValue::NullableFunction {
+                function_type,
+                value,
+            }) => Ok(LocalValue::NullableFunction {
+                function_type,
+                value,
+            }),
+            Some(EvaluationValue::ClosureEnvironment(value)) => {
+                Ok(LocalValue::ClosureEnvironment(value))
+            }
             None => Err(InterpreterError::new("MIR evaluation produced no value")),
         }
     }
@@ -11181,6 +12639,15 @@ impl Interpreter<'_> {
             LocalValue::NullablePayloadEnum { ty, value } => {
                 EvaluationValue::NullablePayloadEnum { ty, value }
             }
+            LocalValue::Function(value) => EvaluationValue::Function(value),
+            LocalValue::NullableFunction {
+                function_type,
+                value,
+            } => EvaluationValue::NullableFunction {
+                function_type,
+                value,
+            },
+            LocalValue::ClosureEnvironment(value) => EvaluationValue::ClosureEnvironment(value),
         };
         self.current_frame_mut()?.values.push(value);
         Ok(())
@@ -11712,6 +13179,16 @@ impl Interpreter<'_> {
                         id.0
                     )))
                 }
+                LocalValue::Function(_) | LocalValue::NullableFunction { .. } => {
+                    Err(InterpreterError::new(format!(
+                        "MIR function local local{} was used as a scalar value",
+                        id.0
+                    )))
+                }
+                LocalValue::ClosureEnvironment(_) => Err(InterpreterError::new(format!(
+                    "MIR closure environment local local{} was used as a scalar value",
+                    id.0
+                ))),
             },
             mir::Operand::NullablePayload(id) => {
                 match read_local(&self.current_frame()?.locals, *id)? {
@@ -12115,6 +13592,7 @@ impl Interpreter<'_> {
             self.push_frame(
                 function,
                 &[LocalValue::Class { object, class }],
+                &[None],
                 Some(ReturnExpectation::Void),
                 None,
             )?;
@@ -12524,6 +14002,7 @@ impl Interpreter<'_> {
                 object: value.object,
                 class: self.error_descriptor(value.descriptor)?.class,
             },
+            OwnedDrop::Function(value) => EvaluationTask::DropFunctionValue(value),
         };
         self.current_frame_mut()?.tasks.push(task);
         Ok(())
@@ -13229,6 +14708,117 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
         }
         LocalValue::PayloadEnum(value) => mir::Type::PayloadEnum(value.ty),
         LocalValue::NullablePayloadEnum { ty, .. } => mir::Type::NullablePayloadEnum(*ty),
+        LocalValue::Function(value) => mir::Type::Function(value.function_type),
+        LocalValue::NullableFunction { function_type, .. } => {
+            mir::Type::NullableFunction(*function_type)
+        }
+        LocalValue::ClosureEnvironment(value) => {
+            mir::Type::ClosureEnvironment(value.as_ref().map(|environment| environment.layout))
+        }
+    }
+}
+
+fn operand_local(operand: &mir::Operand) -> Option<mir::LocalId> {
+    match operand {
+        mir::Operand::Local(local) | mir::Operand::NullablePayload(local) => Some(*local),
+        _ => None,
+    }
+}
+
+fn value_expression_local(value: &mir::ValueExpression) -> Option<mir::LocalId> {
+    match value {
+        mir::ValueExpression::Integer(mir::IntegerExpression::Use { operand, .. })
+        | mir::ValueExpression::Float(mir::FloatExpression::Use { operand, .. })
+        | mir::ValueExpression::Bool(mir::BoolExpression::Use { operand })
+        | mir::ValueExpression::Enum(mir::EnumExpression::Use { operand, .. }) => {
+            operand_local(operand)
+        }
+        _ => None,
+    }
+}
+
+fn payload_place_local(place: &mir::PayloadEnumPlace) -> Option<mir::LocalId> {
+    match place {
+        mir::PayloadEnumPlace::Local(local)
+        | mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local) => Some(*local),
+        _ => None,
+    }
+}
+
+/// Returns the source local only when an argument is a direct use of one place.
+/// Composite expressions intentionally have no origin: their result is a value,
+/// not an alias to one of the operands used to compute it.
+fn direct_rvalue_local(value: &mir::Rvalue) -> Option<mir::LocalId> {
+    match value {
+        mir::Rvalue::Value(value) => value_expression_local(value),
+        mir::Rvalue::String(
+            mir::StringExpression::Local(local)
+            | mir::StringExpression::NullableLocalAssumeNonNull(local),
+        )
+        | mir::Rvalue::NullableString(mir::NullableStringExpression::Local(local))
+        | mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Local { local, .. })
+        | mir::Rvalue::Mixed(mir::MixedExpression::Local { local, .. })
+        | mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Local { local, .. })
+        | mir::Rvalue::Error(
+            mir::ErrorExpression::Local { local, .. }
+            | mir::ErrorExpression::NullableLocalAssumeNonNull { local, .. },
+        )
+        | mir::Rvalue::NullableError(mir::NullableErrorExpression::Local { local, .. })
+        | mir::Rvalue::Class(
+            mir::ClassExpression::Local { local, .. }
+            | mir::ClassExpression::NullableLocalAssumeNonNull { local, .. },
+        )
+        | mir::Rvalue::NullableClass(mir::NullableClassExpression::Local { local, .. })
+        | mir::Rvalue::Collection(mir::CollectionExpression::Local { local, .. })
+        | mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Local {
+            local, ..
+        })
+        | mir::Rvalue::Function(mir::FunctionExpression::Local { local, .. })
+        | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Local { local, .. }) => {
+            Some(*local)
+        }
+        mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use { place, .. })
+        | mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
+            place, ..
+        }) => payload_place_local(place),
+        mir::Rvalue::SharedReference(
+            mir::SharedReferenceExpression::Local { local, .. }
+            | mir::SharedReferenceExpression::NullableLocalAssumeNonNull { local, .. },
+        )
+        | mir::Rvalue::WeakReference(
+            mir::WeakReferenceExpression::Local { local, .. }
+            | mir::WeakReferenceExpression::NullableLocalAssumeNonNull { local, .. },
+        )
+        | mir::Rvalue::NullableSharedReference(mir::NullableSharedReferenceExpression::Local {
+            local,
+            ..
+        })
+        | mir::Rvalue::NullableWeakReference(mir::NullableWeakReferenceExpression::Local {
+            local,
+            ..
+        })
+        | mir::Rvalue::WritableSharedReference(
+            mir::WritableSharedReferenceExpression::Local { local, .. }
+            | mir::WritableSharedReferenceExpression::NullableLocalAssumeNonNull { local, .. },
+        )
+        | mir::Rvalue::WritableWeakReference(
+            mir::WritableWeakReferenceExpression::Local { local, .. }
+            | mir::WritableWeakReferenceExpression::NullableLocalAssumeNonNull { local, .. },
+        )
+        | mir::Rvalue::NullableWritableSharedReference(
+            mir::NullableWritableSharedReferenceExpression::Local { local, .. },
+        )
+        | mir::Rvalue::NullableWritableWeakReference(
+            mir::NullableWritableWeakReferenceExpression::Local { local, .. },
+        )
+        | mir::Rvalue::SharedReferenceAccess(
+            mir::SharedReferenceAccessExpression::Local { local, .. }
+            | mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull { local, .. },
+        )
+        | mir::Rvalue::NullableSharedReferenceAccess(
+            mir::NullableSharedReferenceAccessExpression::Local { local, .. },
+        ) => Some(*local),
+        _ => None,
     }
 }
 
@@ -13256,6 +14846,7 @@ fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
         }
         mir::Type::NullableCollection(collection) => Some(mir::Type::Collection(collection)),
         mir::Type::NullablePayloadEnum(payload) => Some(mir::Type::PayloadEnum(payload)),
+        mir::Type::NullableFunction(function_type) => Some(mir::Type::Function(function_type)),
         mir::Type::Collection(_) => None,
         _ => None,
     }
@@ -13392,6 +14983,11 @@ fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop
             }
         }
         LocalValue::NullablePayloadEnum { value: None, .. } => {}
+        LocalValue::Function(value) => drops.push(OwnedDrop::Function(value)),
+        LocalValue::NullableFunction {
+            value: Some(value), ..
+        } => drops.push(OwnedDrop::Function(value)),
+        LocalValue::NullableFunction { value: None, .. } | LocalValue::ClosureEnvironment(_) => {}
         LocalValue::Mixed(MixedValue::PayloadEnum {
             value,
             owner,
@@ -13750,6 +15346,20 @@ fn assign_local(
         ) if expected == *payload
     ) || matches!(
         (definition.ty, &value),
+        (mir::Type::Function(expected), LocalValue::Function(actual))
+            if expected == actual.function_type
+    ) || matches!(
+        (definition.ty, &value),
+        (
+            mir::Type::NullableFunction(expected),
+            LocalValue::NullableFunction { function_type: actual, .. }
+        ) if expected == *actual
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::ClosureEnvironment(expected), LocalValue::ClosureEnvironment(actual))
+            if expected == actual.as_ref().map(|environment| environment.layout)
+    ) || matches!(
+        (definition.ty, &value),
         (
             mir::Type::NullableReadonlySharedReferenceAccess(expected),
             LocalValue::NullableSharedReferenceAccess {
@@ -13838,6 +15448,9 @@ fn assign_local(
             LocalValue::Collection(_) => "collection",
             LocalValue::PayloadEnum(_) => "payload enum",
             LocalValue::NullablePayloadEnum { .. } => "nullable payload enum",
+            LocalValue::Function(_) => "function",
+            LocalValue::NullableFunction { .. } => "nullable function",
+            LocalValue::ClosureEnvironment(_) => "closure environment",
         };
         return Err(InterpreterError::new(format!(
             "MIR local local{} has type {}, but assignment produced {actual}",
@@ -13975,6 +15588,58 @@ fn block_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn closure_metrics(source: &str) -> InterpreterMetrics {
+        let program = crate::lower_source_to_mir("closure-allocation.doria", source)
+            .expect("allocation fixture should lower");
+        let (output, metrics) =
+            interpret_internal_observed(&program, InterpreterLimits::default(), MirIo::default())
+                .expect("allocation fixture should execute");
+        assert_eq!(output.output.exit_status, 0);
+        metrics
+    }
+
+    #[test]
+    fn no_capture_closures_allocate_no_environment() {
+        let metrics = closure_metrics(
+            r#"
+function main(): void
+{
+    let $answer = fn() => 42;
+    let writable $i = 0;
+    while ($i < 100) {
+        $answer();
+        $i++;
+    }
+}
+"#,
+        );
+
+        assert_eq!(metrics.closure_environment_allocations, 0);
+        assert_eq!(metrics.live_closure_environments, 0);
+    }
+
+    #[test]
+    fn repeatable_invocation_and_moves_do_not_allocate_environments() {
+        let metrics = closure_metrics(
+            r#"
+function main(): void
+{
+    let $base = 42;
+    let $created = fn() with (take $base) => $base;
+    let $moved = $created;
+    let writable $i = 0;
+    while ($i < 100) {
+        $moved();
+        $i++;
+    }
+}
+"#,
+        );
+
+        assert_eq!(metrics.closure_environment_allocations, 1);
+        assert_eq!(metrics.live_closure_environments, 0);
+    }
 
     #[test]
     fn repeated_strings_share_one_immutable_allocation() {

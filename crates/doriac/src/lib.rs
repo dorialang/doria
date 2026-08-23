@@ -149,7 +149,14 @@ pub fn lower_source_to_mir(
     text: impl Into<String>,
 ) -> DiagnosticResult<mir::Program> {
     let hir = lower_source(path, text)?;
-    mir_lowering::lower_program(&hir)
+    let mir = mir_lowering::lower_program(&hir)?;
+    mir_validation::validate_program(&mir).map_err(|error| {
+        error.diagnostics.unwrap_or_else(|| {
+            vec![Diagnostic::new("B0001", error.message, Span::default())
+                .with_title("Malformed MIR")]
+        })
+    })?;
+    Ok(mir)
 }
 
 pub fn compile_source(

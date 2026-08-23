@@ -39,6 +39,8 @@ pub enum FieldType {
     NullableWritableWeakReference,
     SharedReferenceAccess,
     Collection,
+    Function,
+    NullableFunction,
     Aggregate { size: u32, align: u32 },
 }
 
@@ -128,7 +130,10 @@ pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
         | FieldType::NullableFloat(_)
         | FieldType::NullableBool
         | FieldType::NullableString => (pointer_size * 2, pointer_size),
-        FieldType::Error | FieldType::NullableError => (pointer_size * 2, pointer_size),
+        FieldType::Error
+        | FieldType::NullableError
+        | FieldType::Function
+        | FieldType::NullableFunction => (pointer_size * 2, pointer_size),
         FieldType::String
         | FieldType::Mixed
         | FieldType::NullableMixed

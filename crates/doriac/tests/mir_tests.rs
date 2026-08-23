@@ -183,6 +183,9 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
         statics: vec![],
         error_descriptors: Vec::new(),
         error_origins: Vec::new(),
+        function_types: Vec::new(),
+        closure_descriptors: Vec::new(),
+        closure_environment_layouts: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -190,6 +193,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
             method: None,
             receiver_mode: None,
             params: Vec::new(),
+            parameter_modes: Vec::new(),
             return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(DEFAULT_INT))),
             checked_effects: Vec::new(),
             locals: vec![Local {
@@ -222,6 +226,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
                 },
             ],
             entry_block: BlockId(0),
+            closure: None,
         }],
         entry: FunctionId(0),
     }
@@ -863,6 +868,9 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
         statics: vec![],
         error_descriptors: Vec::new(),
         error_origins: Vec::new(),
+        function_types: Vec::new(),
+        closure_descriptors: Vec::new(),
+        closure_environment_layouts: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -870,6 +878,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
             method: None,
             receiver_mode: None,
             params: Vec::new(),
+            parameter_modes: Vec::new(),
             return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(DEFAULT_INT))),
             checked_effects: Vec::new(),
             locals: vec![Local {
@@ -896,6 +905,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
                 terminator: int_return(local_integer_expression(LocalId(0))),
             }],
             entry_block: BlockId(0),
+            closure: None,
         }],
         entry: FunctionId(0),
     };
@@ -1527,6 +1537,9 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
         statics: vec![],
         error_descriptors: Vec::new(),
         error_origins: Vec::new(),
+        function_types: Vec::new(),
+        closure_descriptors: Vec::new(),
+        closure_environment_layouts: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -1534,6 +1547,7 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
             method: None,
             receiver_mode: None,
             params: Vec::new(),
+            parameter_modes: Vec::new(),
             return_type: ReturnType::Void,
             checked_effects: Vec::new(),
             locals: Vec::new(),
@@ -1543,6 +1557,7 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
                 terminator: Terminator::Jump(BlockId(0)),
             }],
             entry_block: BlockId(0),
+            closure: None,
         }],
         entry: FunctionId(0),
     };
@@ -3009,6 +3024,9 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
         statics: vec![],
         error_descriptors: Vec::new(),
         error_origins: Vec::new(),
+        function_types: Vec::new(),
+        closure_descriptors: Vec::new(),
+        closure_environment_layouts: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -3016,6 +3034,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
             method: None,
             receiver_mode: None,
             params: Vec::new(),
+            parameter_modes: Vec::new(),
             return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(DEFAULT_INT))),
             checked_effects: Vec::new(),
             locals: vec![Local {
@@ -3039,6 +3058,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
                 terminator: int_return(local_integer_expression(LocalId(0))),
             }],
             entry_block: BlockId(0),
+            closure: None,
         }],
         entry: FunctionId(0),
     };

@@ -1,0 +1,10 @@
+function main(): void
+{
+    let writable $count = 40;
+    let writable $next = function (): int with (writable $count) {
+        $count += 1;
+        return $count;
+    };
+
+    echo "{$next()} {$next()}\n";
+}

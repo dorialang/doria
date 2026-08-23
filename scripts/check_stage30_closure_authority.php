@@ -85,7 +85,7 @@ function check_stage30_closure_authority(string $root): array
         '# Decision 0121: Closure Function Types, Capture Semantics, And Execution Model',
         '**Status:** Accepted',
         '**Accepted:** 2026-08-19',
-        '**Implementation Status:** Authority Accepted; Stages 30a Through 30c Implemented; Stage 30d Next; Stage 30 Not Complete',
+        '**Implementation Status:** Authority Accepted; Stages 30a Through 30d Implemented; Stage 30e Next; Stage 30 Not Complete',
         '**Elaborates:** Decision 0120',
         'function writable(int): int',
         'function once(): Payload',
@@ -114,7 +114,8 @@ function check_stage30_closure_authority(string $root): array
         'It is not a tuple',
         'Stage 30a — Complete',
         'Stage 30b — Complete',
-        'Stage 30c - Ownership, Lifetime, And Escape',
+        'Stage 30c — Complete',
+        'Stage 30d — Complete',
         'E0641 retires by route',
         'Measurement Status: Pending Available Runner',
         '## Invalidated elsewhere',
@@ -156,7 +157,8 @@ function check_stage30_closure_authority(string $root): array
         '**Stage 30 Closure Authority — Accepted; Stage 30 — In Progress, Not Complete.**',
         'Stage 30b Semantic Function Types And Captures — Complete',
         'Stage 30c Ownership, Lifetime, And Escape — Complete',
-        'Stage 30d Closure HIR/MIR And Interpreter Oracle — Next',
+        'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
+        'Stage 30e Native Execution — Next',
         'Stage 30h Cross-Repository Closure',
         '`function take()` is rejected',
         '`List<T>` alone receives `map`, Copy-only preserving `filter`, and writable-accumulator `reduce`',
@@ -169,9 +171,10 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30a Callable Grammar Completion — Complete',
         'Stage 30b Semantic Function Types And Captures — Complete',
         'Stage 30c Ownership, Lifetime, And Escape — Complete',
-        'Stage 30d Closure HIR/MIR And Interpreter Oracle — Next',
+        'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
+        'Stage 30e Native Execution — Next',
         'Stage 30 — In Progress, Not Complete',
-        'E0641 remains only as the HIR/MIR/runtime execution boundary',
+        'E0641 remains only at the native Stage 30e and PHP Stage 30f target boundaries',
     ]);
     $forbid($pipelinePath, $pipeline, [
         'Stage 30 Closure Authority Proposal — In Review',
@@ -189,7 +192,8 @@ function check_stage30_closure_authority(string $root): array
         'readonly/writable/once structural function types',
         'grouping remains transparent',
         'callable-value calls',
-        '`E0641` execution boundary',
+        'target-specific `E0641` boundary',
+        'debug interpreter',
         'Stage 30 - In Progress, Not Complete',
     ]);
 
@@ -205,10 +209,10 @@ function check_stage30_closure_authority(string $root): array
     ]);
     $require($examplesPath, $examples, [
         '[Decision 0121]',
-        'Stages 30a through 30c are complete',
-        'Stage 30 remains in progress and not complete',
+        'Stages 30a through 30d are complete',
+        'Stage 30 remains in progress',
         'Stages 30b and 30c check',
-        'E0641 execution boundary',
+        'target-specific E0641 boundaries',
     ]);
 
     $require($lexerPath, $lexer, [
@@ -254,21 +258,17 @@ function check_stage30_closure_authority(string $root): array
         'tuple-like-group.doria',
         'named-callable-argument.doria',
     ]);
-    $require($loweringPath, $lowering, [
-        'callable-value invocation must stop at the Stage 30 semantic boundary',
-    ]);
-    $forbid($hirPath, $hir, ['CallableCall', 'ClosureExpression']);
-    $forbid($mirPath, $mir, ['CallableCall', 'ClosureExpression']);
+    $require($loweringPath, $lowering, ['Expr::Closure', 'Expr::CallableCall']);
+    $require($hirPath, $hir, ['CallableCall', 'ClosureExpression']);
+    $require($mirPath, $mir, ['ClosureDescriptor', 'ClosureEnvironmentLayout']);
 
     $require($semanticsPath, $semantics, [
-        '"E0641"',
-        'Closure Execution Is Not Yet Available',
-        'diagnostic.code == "E0641"',
         'fn check_closure_expression(',
         'fn function_type_compatibility(',
         'pub struct CallableValueCallInfo',
         'source_binding_id: BindingId',
     ]);
+    $forbid($semanticsPath, $semantics, ['"E0641"']);
     $require($stage30bTestsPath, $stage30bTests, [
         'semantic_function_types_preserve_structure_effects_and_nested_types',
         'capture_plans_use_stable_binding_identity_and_infer_minimum_access',

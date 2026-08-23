@@ -2119,6 +2119,24 @@ function array(): void
 }
 
 #[test]
+fn php_backend_uses_valid_callable_hints_for_type_only_function_signatures() {
+    let source = r#"
+function accept(function(int): int $callback): void
+{
+}
+
+function main(): void
+{
+}
+"#;
+
+    let php = doriac::compile_source_to_php("type-only-function.doria", source)
+        .expect("type-only structural function syntax should remain PHP-lowerable");
+    assert!(php.contains("function accept(callable $callback): void"));
+    assert!(!php.contains("function accept(function $callback)"));
+}
+
+#[test]
 fn rejects_compiler_helper_function_namespace_before_php_codegen() {
     let err = doriac::compile_source_to_php(
         "test.doria",

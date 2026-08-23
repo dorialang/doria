@@ -1,0 +1,5 @@
+no_capture
+writable_capture
+nested_factory
+checked_effect
+nullable_function

@@ -311,6 +311,8 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_) => Some(pointer_width),
         mir::Type::Error | mir::Type::NullableError => pointer_width.checked_mul(2),
+        mir::Type::Function(_) | mir::Type::NullableFunction(_) => pointer_width.checked_mul(2),
+        mir::Type::ClosureEnvironment(_) => Some(pointer_width),
         mir::Type::NullableScalar(_) => Some(16),
         mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => None,
     }
@@ -338,6 +340,7 @@ pub const fn nullable_payload_type(ty: mir::Type) -> Option<mir::Type> {
             Some(mir::Type::WritableSharedReferenceAccess(value))
         }
         mir::Type::NullableCollection(value) => Some(mir::Type::Collection(value)),
+        mir::Type::NullableFunction(value) => Some(mir::Type::Function(value)),
         _ => None,
     }
 }

@@ -1,1 +1,5 @@
-let $double = fn(int $value) => $value * 2;
+function main(): void
+{
+    let $double = fn(int $value) => $value * 2;
+    echo "{$double(21)}\n";
+}

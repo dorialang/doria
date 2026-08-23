@@ -1,6 +1,8 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+#[cfg(feature = "llvm-backend")]
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
@@ -603,34 +605,18 @@ fn release_report_identifies_llvm_without_cranelift_phase_data() {
     if !host_linker_is_available() {
         return;
     }
-    let directory = fixture_directory("llvm");
-    fs::create_dir_all(&directory).expect("fixture directory");
-    fs::write(
-        directory.join("main.doria"),
-        "function main(): int { return 42; }\n",
+    let compilation = doriac::performance::compile_native(
+        "main.doria".to_string(),
+        "function main(): int { return 42; }\n".to_string(),
+        doriac::backend::CompileOptions {
+            target: doriac::backend::BackendTarget::Native,
+            native_profile: doriac::backend::NativeProfile::Release,
+        },
+        Duration::ZERO,
+        vec!["doriac".to_string(), "compile".to_string()],
     )
-    .expect("source");
-    let output = Command::new(doriac_bin())
-        .current_dir(&directory)
-        .args([
-            "compile",
-            "main.doria",
-            "--release",
-            "--out",
-            executable_name(),
-            "--performance-report",
-            "performance.json",
-        ])
-        .output()
-        .expect("doriac");
-    assert!(
-        output.status.success(),
-        "compile failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let report: serde_json::Value =
-        serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
-            .expect("JSON");
+    .expect("the all-feature compiler library should emit an LLVM report");
+    let report = compilation.report;
     assert_eq!(report["backend"], "llvm");
     assert_eq!(report["artifacts"]["runtime"]["profile"], "release");
     assert_eq!(report["phases"]["llvmCodeGeneration"]["available"], true);
@@ -638,7 +624,6 @@ fn release_report_identifies_llvm_without_cranelift_phase_data() {
         report["phases"]["craneliftCodeGeneration"]["available"],
         false
     );
-    let _ = fs::remove_dir_all(directory);
 }
 
 fn doriac_bin() -> &'static str {

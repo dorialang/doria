@@ -5,12 +5,12 @@ use doriac::mir::{
     self, BasicBlock, BlockId, BoolExpression, Class, ClassExpression, CollectionComparator,
     CollectionExpression, CollectionKind, CollectionMembershipOp, CollectionType, CollectionTypeId,
     EnumExpression, FloatBinaryOp, FloatExpression, FormatArgument, FormatExpression, Function,
-    FunctionId, IntegerExpression, Local, LocalId, MixedExpression, NullableClassExpression,
-    NullableScalarExpression, NullableSharedReferenceExpression, NullableStringExpression, Operand,
-    Program, Property, PropertyValue, PropertyValueSource, ReturnType, Rvalue, ScalarType,
-    ScalarValue, SharedReferenceExpression, Statement, StaticId, StaticProperty, StaticValue,
-    StringExpression, StringIntrinsicCall, StringIntrinsicKind, Terminator, Type, ValueExpression,
-    WeakReferenceExpression,
+    FunctionId, FunctionParameterMode, IntegerExpression, Local, LocalId, MixedExpression,
+    NullableClassExpression, NullableScalarExpression, NullableSharedReferenceExpression,
+    NullableStringExpression, Operand, Program, Property, PropertyValue, PropertyValueSource,
+    ReturnType, Rvalue, ScalarType, ScalarValue, SharedReferenceExpression, Statement, StaticId,
+    StaticProperty, StaticValue, StringExpression, StringIntrinsicCall, StringIntrinsicKind,
+    Terminator, Type, ValueExpression, WeakReferenceExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
 
@@ -1823,6 +1823,7 @@ fn shared_validator_rejects_mixed_width_float_binary_operands() {
         method: None,
         receiver_mode: None,
         params: Vec::new(),
+        parameter_modes: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
         checked_effects: Vec::new(),
         locals: Vec::new(),
@@ -1839,6 +1840,7 @@ fn shared_validator_rejects_mixed_width_float_binary_operands() {
             ))),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -1941,6 +1943,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
         method: None,
         receiver_mode: None,
         params: Vec::new(),
+        parameter_modes: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
         checked_effects: Vec::new(),
         locals: vec![Local {
@@ -1972,6 +1975,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
             ))),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -2857,6 +2861,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
             method: None,
             receiver_mode: None,
             params: vec![LocalId(0)],
+            parameter_modes: vec![FunctionParameterMode::Readonly],
             return_type: ReturnType::Value(Type::String),
             checked_effects: Vec::new(),
             locals: vec![parameter],
@@ -2868,6 +2873,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
                 ))),
             }],
             entry_block: BlockId(0),
+            closure: None,
         });
     }
 
@@ -2954,6 +2960,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
         method: None,
         receiver_mode: None,
         params: vec![],
+        parameter_modes: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(1))),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(1))],
@@ -2967,6 +2974,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
             })),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -3001,6 +3009,10 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![
@@ -3020,6 +3032,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     doriac::mir_validation::validate_program(&program)
@@ -3074,6 +3087,10 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0)), borrowed_child],
@@ -3083,6 +3100,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -3123,6 +3141,10 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![borrowed, class_local(1, ClassId(0))],
@@ -3132,6 +3154,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -3165,6 +3188,7 @@ fn shared_validator_enforces_writable_class_argument_rules() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![parameter],
@@ -3174,6 +3198,7 @@ fn shared_validator_enforces_writable_class_argument_rules() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -3193,6 +3218,9 @@ fn shared_validator_enforces_writable_class_argument_rules() {
         transfer: false,
     }));
     program.functions[1].params.push(LocalId(1));
+    program.functions[1]
+        .parameter_modes
+        .push(FunctionParameterMode::Readonly);
     program.functions[1]
         .locals
         .push(borrowed_class_local(1, ClassId(0)));
@@ -3244,6 +3272,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::String),
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
@@ -3255,6 +3284,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
             ))),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     program.functions.push(Function {
         id: FunctionId(2),
@@ -3263,6 +3293,10 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![
@@ -3282,6 +3316,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     doriac::mir_validation::validate_program(&program)
@@ -3354,6 +3389,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Bool)),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
@@ -3367,6 +3403,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
             ))),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     program.functions.push(Function {
         id: FunctionId(2),
@@ -3375,6 +3412,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
@@ -3384,6 +3422,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     program.functions.push(Function {
         id: FunctionId(3),
@@ -3392,6 +3431,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
@@ -3401,6 +3441,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     doriac::mir_validation::validate_program(&program)
@@ -3442,6 +3483,10 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![
@@ -3461,6 +3506,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     program.functions.push(Function {
         id: FunctionId(2),
@@ -3469,6 +3515,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::String),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
@@ -3478,6 +3525,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
             terminator: Terminator::Unreachable,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -3536,6 +3584,10 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![
@@ -3555,6 +3607,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -3636,6 +3689,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(IntegerType::Int64))),
         checked_effects: Vec::new(),
         locals: vec![writable],
@@ -3650,6 +3704,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
             ))),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -3784,6 +3839,10 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![
@@ -3796,6 +3855,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -3952,6 +4012,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Class(ClassId(1))),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(1))],
@@ -3965,6 +4026,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
             })),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -4020,6 +4082,10 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![
@@ -4032,6 +4098,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -4302,6 +4369,10 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![receiver, condition],
@@ -4340,6 +4411,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
             },
         ],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -4673,6 +4745,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::String),
         checked_effects: Vec::new(),
         locals: vec![parameter],
@@ -4684,6 +4757,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
             ))),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     let Statement::AssignProperty { value, .. } = &mut program.functions[0].blocks[0].statements[0]
     else {
@@ -4867,6 +4941,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(99))],
@@ -4876,6 +4951,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     let error = doriac::mir_validation::validate_program(&parameter)
         .expect_err("parameter types must reference declared classes");
@@ -4889,6 +4965,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         method: None,
         receiver_mode: None,
         params: vec![],
+        parameter_modes: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(99))),
         checked_effects: Vec::new(),
         locals: vec![],
@@ -4898,6 +4975,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
             terminator: Terminator::Unreachable,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     let error = doriac::mir_validation::validate_program(&returned)
         .expect_err("return types must reference declared classes");
@@ -4917,6 +4995,7 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![receiver],
@@ -4926,6 +5005,7 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     doriac::mir_validation::validate_program(&valid)
         .expect("well-formed lifecycle metadata should validate");
@@ -4978,6 +5058,7 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![borrowed],
@@ -4987,6 +5068,7 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -5018,6 +5100,7 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
@@ -5027,6 +5110,7 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -5046,6 +5130,7 @@ fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
@@ -5059,6 +5144,7 @@ fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
             })),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -5105,6 +5191,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
@@ -5118,6 +5205,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
             })),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     program.functions.push(Function {
         id: FunctionId(2),
@@ -5126,6 +5214,10 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![
@@ -5138,6 +5230,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -5176,6 +5269,10 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0)), class_local(1, ClassId(0))],
@@ -5185,6 +5282,7 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -5285,6 +5383,7 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
         method: None,
         receiver_mode: None,
         params: vec![],
+        parameter_modes: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
@@ -5298,6 +5397,7 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
             })),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     let error = doriac::mir_validation::validate_program(&returned)
         .expect_err("a class return must transfer ownership");
@@ -5397,6 +5497,10 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![
@@ -5416,6 +5520,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -5496,6 +5601,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::SharedReference(ClassId(1))),
         checked_effects: Vec::new(),
         locals: vec![Local {
@@ -5521,6 +5627,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
             )),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -5575,6 +5682,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::NullableSharedReference(ClassId(1))),
         checked_effects: Vec::new(),
         locals: vec![Local {
@@ -5600,6 +5708,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
             )),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     let error = doriac::mir_validation::validate_program(&acquire)
         .expect_err("weak acquisition must preserve the payload class identity");
@@ -5637,6 +5746,9 @@ fn valid_void_program() -> Program {
         statics: vec![],
         error_descriptors: Vec::new(),
         error_origins: Vec::new(),
+        function_types: Vec::new(),
+        closure_descriptors: Vec::new(),
+        closure_environment_layouts: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -5644,6 +5756,7 @@ fn valid_void_program() -> Program {
             method: None,
             receiver_mode: None,
             params: Vec::new(),
+            parameter_modes: Vec::new(),
             return_type: ReturnType::Void,
             checked_effects: Vec::new(),
             locals: Vec::new(),
@@ -5653,6 +5766,7 @@ fn valid_void_program() -> Program {
                 terminator: Terminator::ReturnVoid,
             }],
             entry_block: BlockId(0),
+            closure: None,
         }],
         entry: FunctionId(0),
     }
@@ -5736,6 +5850,10 @@ fn class_new_program() -> Program {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![
@@ -5755,6 +5873,7 @@ fn class_new_program() -> Program {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     program
 }
@@ -5801,6 +5920,10 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
+        parameter_modes: vec![
+            FunctionParameterMode::Readonly,
+            FunctionParameterMode::Readonly,
+        ],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![
@@ -5813,6 +5936,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     program.functions.push(Function {
         id: FunctionId(2),
@@ -5821,6 +5945,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         method: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
+        parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(1))],
@@ -5830,6 +5955,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
             terminator: Terminator::ReturnVoid,
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
     (program, child)
 }

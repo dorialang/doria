@@ -341,6 +341,7 @@ fn rejects_mixed_width_float_binary_operands() {
         method: None,
         receiver_mode: None,
         params: Vec::new(),
+        parameter_modes: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
         checked_effects: Vec::new(),
         locals: Vec::new(),
@@ -357,6 +358,7 @@ fn rejects_mixed_width_float_binary_operands() {
             ))),
         }],
         entry_block: BlockId(0),
+        closure: None,
     });
 
     let error = doriac::codegen_cranelift::lower_mir_to_object(&program)
@@ -387,6 +389,9 @@ fn void_program() -> Program {
         statics: vec![],
         error_descriptors: Vec::new(),
         error_origins: Vec::new(),
+        function_types: Vec::new(),
+        closure_descriptors: Vec::new(),
+        closure_environment_layouts: Vec::new(),
         functions: vec![Function {
             id: FunctionId(0),
             name: "main".to_string(),
@@ -394,6 +399,7 @@ fn void_program() -> Program {
             method: None,
             receiver_mode: None,
             params: Vec::new(),
+            parameter_modes: Vec::new(),
             return_type: ReturnType::Void,
             checked_effects: Vec::new(),
             locals: Vec::new(),
@@ -403,6 +409,7 @@ fn void_program() -> Program {
                 terminator: Terminator::ReturnVoid,
             }],
             entry_block: BlockId(0),
+            closure: None,
         }],
         entry: FunctionId(0),
     }

@@ -123,6 +123,7 @@ fn apply_statement_checked_error_semantics(
             {
                 statement.error_type = error_type.clone();
             }
+            apply_expr_checked_error_semantics(&mut statement.expr, semantic_info);
         }
         hir::Stmt::Try(statement) => {
             apply_block_checked_error_semantics(&mut statement.body, semantic_info);
@@ -146,6 +147,10 @@ fn apply_statement_checked_error_semantics(
         }
         hir::Stmt::If(statement) => apply_if_checked_error_semantics(statement, semantic_info),
         hir::Stmt::While(statement) => {
+            if let Some(given) = &mut statement.given {
+                apply_block_checked_error_semantics(&mut given.block, semantic_info);
+            }
+            apply_expr_checked_error_semantics(&mut statement.condition, semantic_info);
             apply_block_checked_error_semantics(&mut statement.body, semantic_info);
             if let Some(finally) = &mut statement.finally {
                 apply_block_checked_error_semantics(&mut finally.block, semantic_info);
@@ -153,24 +158,65 @@ fn apply_statement_checked_error_semantics(
         }
         hir::Stmt::DoWhile(statement) => {
             apply_block_checked_error_semantics(&mut statement.body, semantic_info);
+            apply_expr_checked_error_semantics(&mut statement.condition, semantic_info);
             if let Some(finally) = &mut statement.finally {
                 apply_block_checked_error_semantics(&mut finally.block, semantic_info);
             }
         }
         hir::Stmt::For(statement) => {
+            if let Some(initializer) = &mut statement.initializer {
+                match initializer {
+                    hir::ForInitializer::VarDecl(declaration) => {
+                        apply_expr_checked_error_semantics(
+                            &mut declaration.initializer,
+                            semantic_info,
+                        );
+                    }
+                    hir::ForInitializer::Assignment(assignment) => {
+                        apply_expr_checked_error_semantics(&mut assignment.target, semantic_info);
+                        apply_expr_checked_error_semantics(&mut assignment.value, semantic_info);
+                    }
+                }
+            }
+            if let Some(condition) = &mut statement.condition {
+                apply_expr_checked_error_semantics(condition, semantic_info);
+            }
+            if let Some(increment) = &mut statement.increment {
+                match increment {
+                    hir::ForIncrement::Increment(increment) => {
+                        apply_expr_checked_error_semantics(&mut increment.target, semantic_info);
+                    }
+                    hir::ForIncrement::Assignment(assignment) => {
+                        apply_expr_checked_error_semantics(&mut assignment.target, semantic_info);
+                        apply_expr_checked_error_semantics(&mut assignment.value, semantic_info);
+                    }
+                }
+            }
             apply_block_checked_error_semantics(&mut statement.body, semantic_info)
         }
         hir::Stmt::Foreach(statement) => {
+            apply_expr_checked_error_semantics(&mut statement.iterable, semantic_info);
             apply_block_checked_error_semantics(&mut statement.body, semantic_info)
         }
-        hir::Stmt::VarDecl(_)
-        | hir::Stmt::Assignment(_)
-        | hir::Stmt::Echo { .. }
-        | hir::Stmt::Return { .. }
-        | hir::Stmt::Break { .. }
-        | hir::Stmt::Continue { .. }
-        | hir::Stmt::Increment(_)
-        | hir::Stmt::Expr { .. } => {}
+        hir::Stmt::VarDecl(declaration) => {
+            apply_expr_checked_error_semantics(&mut declaration.initializer, semantic_info)
+        }
+        hir::Stmt::Assignment(assignment) => {
+            apply_expr_checked_error_semantics(&mut assignment.target, semantic_info);
+            apply_expr_checked_error_semantics(&mut assignment.value, semantic_info);
+        }
+        hir::Stmt::Echo { expr, .. } | hir::Stmt::Expr { expr, .. } => {
+            apply_expr_checked_error_semantics(expr, semantic_info)
+        }
+        hir::Stmt::Return { expr, .. } => {
+            if let Some(expr) = expr {
+                apply_expr_checked_error_semantics(expr, semantic_info);
+            }
+        }
+        hir::Stmt::Increment(increment) => {
+            apply_expr_checked_error_semantics(&mut increment.target, semantic_info)
+        }
+        hir::Stmt::Break { .. } | hir::Stmt::Continue { .. } => {}
     }
 }
 
@@ -178,6 +224,10 @@ fn apply_if_checked_error_semantics(
     statement: &mut hir::IfStmt,
     semantic_info: &crate::semantics::SemanticInfo,
 ) {
+    if let Some(given) = &mut statement.given {
+        apply_block_checked_error_semantics(&mut given.block, semantic_info);
+    }
+    apply_expr_checked_error_semantics(&mut statement.condition, semantic_info);
     apply_block_checked_error_semantics(&mut statement.then_block, semantic_info);
     if let Some(branch) = &mut statement.else_branch {
         match branch {
@@ -189,6 +239,146 @@ fn apply_if_checked_error_semantics(
     }
     if let Some(finally) = &mut statement.finally {
         apply_block_checked_error_semantics(&mut finally.block, semantic_info);
+    }
+}
+
+fn apply_expr_checked_error_semantics(
+    expression: &mut hir::Expr,
+    semantic_info: &crate::semantics::SemanticInfo,
+) {
+    if let hir::Expr::MethodCall {
+        object,
+        method,
+        args,
+        null_safe,
+        span,
+    } = expression.clone()
+    {
+        if semantic_info
+            .callable_value_calls
+            .get(&(span.start, span.end))
+            .is_some_and(|call| {
+                call.target_kind == crate::semantics::CallableValueTargetKind::Property
+            })
+        {
+            *expression = hir::Expr::CallableCall(Box::new(hir::CallableCall {
+                callee: Box::new(hir::Expr::PropertyAccess {
+                    object,
+                    property: method,
+                    null_safe,
+                    span,
+                }),
+                args,
+                span,
+            }));
+        }
+    }
+
+    match expression {
+        hir::Expr::Closure(closure) => match &mut closure.body {
+            hir::ClosureBody::Expression(expression) => {
+                apply_expr_checked_error_semantics(expression, semantic_info)
+            }
+            hir::ClosureBody::Block(block) => {
+                apply_block_checked_error_semantics(block, semantic_info)
+            }
+        },
+        hir::Expr::CallableCall(call) => {
+            apply_expr_checked_error_semantics(&mut call.callee, semantic_info);
+            for argument in &mut call.args {
+                apply_expr_checked_error_semantics(&mut argument.value, semantic_info);
+            }
+        }
+        hir::Expr::InterpolatedString { parts, .. } => {
+            for part in parts {
+                if let hir::InterpolatedStringPart::Expr(expression) = part {
+                    apply_expr_checked_error_semantics(expression, semantic_info);
+                }
+            }
+        }
+        hir::Expr::Array { elements, .. } => {
+            for element in elements {
+                if let Some(key) = &mut element.key {
+                    apply_expr_checked_error_semantics(key, semantic_info);
+                }
+                apply_expr_checked_error_semantics(&mut element.value, semantic_info);
+            }
+        }
+        hir::Expr::ArrayRepeat { value, count, .. }
+        | hir::Expr::Index {
+            collection: value,
+            index: count,
+            ..
+        }
+        | hir::Expr::Binary {
+            left: value,
+            right: count,
+            ..
+        }
+        | hir::Expr::Range {
+            start: value,
+            end: count,
+            ..
+        } => {
+            apply_expr_checked_error_semantics(value, semantic_info);
+            apply_expr_checked_error_semantics(count, semantic_info);
+        }
+        hir::Expr::PropertyAccess { object, .. }
+        | hir::Expr::IsType { expr: object, .. }
+        | hir::Expr::Grouped { expr: object, .. }
+        | hir::Expr::Unary { expr: object, .. } => {
+            apply_expr_checked_error_semantics(object, semantic_info)
+        }
+        hir::Expr::MethodCall { object, args, .. } => {
+            apply_expr_checked_error_semantics(object, semantic_info);
+            for argument in args {
+                apply_expr_checked_error_semantics(&mut argument.value, semantic_info);
+            }
+        }
+        hir::Expr::FunctionCall { args, .. }
+        | hir::Expr::StaticCall { args, .. }
+        | hir::Expr::New { args, .. } => {
+            for argument in args {
+                apply_expr_checked_error_semantics(&mut argument.value, semantic_info);
+            }
+        }
+        hir::Expr::Match {
+            scrutinee, arms, ..
+        } => {
+            apply_expr_checked_error_semantics(scrutinee, semantic_info);
+            for arm in arms {
+                if let hir::MatchPattern::Expression(expression) = &mut arm.pattern {
+                    apply_expr_checked_error_semantics(expression, semantic_info);
+                }
+                if let Some(guard) = &mut arm.guard {
+                    apply_expr_checked_error_semantics(&mut guard.condition, semantic_info);
+                }
+                apply_expr_checked_error_semantics(&mut arm.value, semantic_info);
+            }
+        }
+        hir::Expr::When(when) => {
+            if let Some(given) = &mut when.given {
+                apply_block_checked_error_semantics(&mut given.block, semantic_info);
+            }
+            for branch in &mut when.branches {
+                if let Some(condition) = &mut branch.condition {
+                    apply_expr_checked_error_semantics(condition, semantic_info);
+                }
+                apply_block_checked_error_semantics(&mut branch.block, semantic_info);
+            }
+            if let Some(finally) = &mut when.finally {
+                apply_block_checked_error_semantics(&mut finally.block, semantic_info);
+            }
+        }
+        hir::Expr::Variable { .. }
+        | hir::Expr::This { .. }
+        | hir::Expr::Identifier { .. }
+        | hir::Expr::String { .. }
+        | hir::Expr::Int { .. }
+        | hir::Expr::Float { .. }
+        | hir::Expr::Bool { .. }
+        | hir::Expr::Null { .. }
+        | hir::Expr::StaticMember { .. } => {}
     }
 }
 
@@ -662,12 +852,61 @@ fn lower_argument(argument: &ast::Argument, class_name: Option<ClassContext<'_>>
 
 fn lower_expr(expr: &ast::Expr, class_name: Option<ClassContext<'_>>) -> hir::Expr {
     match expr {
-        ast::Expr::Closure(_) => {
-            unreachable!("closure expressions must stop at the Stage 30 semantic boundary")
-        }
-        ast::Expr::CallableCall { .. } => {
-            unreachable!("callable-value invocation must stop at the Stage 30 semantic boundary")
-        }
+        ast::Expr::Closure(closure) => hir::Expr::Closure(Box::new(hir::ClosureExpression {
+            closure_id: crate::symbols::ClosureId::from_span(closure.span),
+            form: closure.form,
+            parameters: closure
+                .parameters
+                .iter()
+                .map(|parameter| hir::ClosureParameter {
+                    take: parameter.take,
+                    writable: parameter.writable,
+                    ty: lower_type_ref(&parameter.ty, class_name),
+                    name: parameter.name.clone(),
+                    name_span: parameter.name_span,
+                    span: parameter.span,
+                })
+                .collect(),
+            return_type: closure
+                .return_type
+                .as_ref()
+                .map(|return_type| lower_type_ref(&return_type.ty, class_name)),
+            captures: closure
+                .captures
+                .as_ref()
+                .map(|captures| {
+                    captures
+                        .captures
+                        .iter()
+                        .map(|capture| hir::ClosureCapture {
+                            mode: capture.mode,
+                            name: capture.name.clone(),
+                            name_span: capture.name_span,
+                            span: capture.span,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            body: match &closure.body {
+                ast::ClosureBody::Expression { expression, .. } => {
+                    hir::ClosureBody::Expression(Box::new(lower_expr(expression, class_name)))
+                }
+                ast::ClosureBody::Block(block) => {
+                    hir::ClosureBody::Block(lower_block(block, class_name))
+                }
+            },
+            span: closure.span,
+        })),
+        ast::Expr::CallableCall {
+            callee, args, span, ..
+        } => hir::Expr::CallableCall(Box::new(hir::CallableCall {
+            callee: Box::new(lower_expr(callee, class_name)),
+            args: args
+                .iter()
+                .map(|argument| lower_argument(argument, class_name))
+                .collect(),
+            span: *span,
+        })),
         ast::Expr::Variable { name, span } => hir::Expr::Variable {
             name: name.clone(),
             span: *span,

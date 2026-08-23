@@ -453,21 +453,29 @@ capture lists, `$this` capture, inferred invocation modes and effects, nullable
 callable narrowing, callable-value calls, and callable properties. Source type
 grouping remains transparent and does not create a tuple type.
 
-No closure executes yet. A semantically valid closure construction or
-function-value call stops at the catalogued `E0641` execution boundary. Stage
-30c acquires captures at closure creation, treats every function value as Move,
-tracks readonly and writable capture leases to their last use, consumes `once`
-calls path-sensitively, rejects invalid escape and storage, validates returned
-borrow roots, and records reverse logical release plans. HIR, MIR, environments,
-indirect calls, and interpreter execution remain Stage 30d.
+Valid closures now lower through explicit HIR and MIR closure nodes and execute
+through the debug interpreter. MIR structural function types preserve parameter
+ownership, invocation mode, checked effects, return type, and return-borrow
+provenance. Function values use the logical two-word descriptor/environment
+carrier: descriptors are static, no-capture closures have no environment, and a
+capturing closure acquires fields in source order and releases owned fields in
+reverse logical order. Checked indirect calls reuse Decision 0119's ordinary
+checked-error and cleanup model.
+
+Native closure execution remains Stage 30e and PHP compatibility lowering
+remains Stage 30f. An executable function-value route therefore receives the
+target-specific `E0641` boundary only when native or PHP output is requested;
+`doriac check`, HIR/MIR lowering, IDE analysis, and the debug target do not emit
+that boundary. Type-only function syntax does not trigger it.
 
 ```text
 Stage 30a Callable Grammar Completion - Complete
 Stage 30b Semantic Function Types And Captures - Complete
 Stage 30c Ownership, Lifetime, And Escape - Complete
-Stage 30d Closure HIR/MIR And Interpreter Oracle - Next
+Stage 30d Closure HIR/MIR And Interpreter Oracle - Complete
+Stage 30e Native Execution - Next
 Stage 30 - In Progress, Not Complete
-E0641 - HIR/MIR/Runtime Execution Boundary
+E0641 - Native/PHP Target Boundary
 ```
 
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.

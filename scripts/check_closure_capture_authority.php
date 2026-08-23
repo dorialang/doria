@@ -85,7 +85,7 @@ function check_closure_capture_authority(string $root): array
         'anonymous-function expression tokens and productions',
         'source-preserving AST nodes',
         'accepted-syntax regression tests',
-        'narrower catalogued `E0641` boundary',
+        '`E0641` now remains only at the',
         'Stage 30b now validates free variables',
         'pre-Stage-30 grammar slice is complete',
         'Decision 0121 settles the questions this record deliberately left bounded',
@@ -132,7 +132,7 @@ function check_closure_capture_authority(string $root): array
         'A closure that uses no enclosing local',
         'The compiler resolves readonly/writable/once structural function types',
         'function(int): int',
-        'catalogued `E0641` execution boundary',
+        'target-specific `E0641` boundary',
         '`with ($this)` borrows a',
         '`with (writable $this)` borrows it exclusively',
     ]);
@@ -147,7 +147,8 @@ function check_closure_capture_authority(string $root): array
         'Stage 30a Callable Grammar Completion — Complete',
         'Stage 30b Semantic Function Types And Captures — Complete',
         'Stage 30c Ownership, Lifetime, And Escape — Complete',
-        'Stage 30d Closure HIR/MIR And Interpreter Oracle — Next',
+        'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
+        'Stage 30e Native Execution — Next',
         'Stage 30 — In Progress, Not Complete',
         'Decision 0120 — Accepted; Explicit Capture-List Foundation',
         'Decision 0121 — Accepted; Stage 30 Closure Authority',
@@ -164,9 +165,8 @@ function check_closure_capture_authority(string $root): array
     $require($examplesPath, $examples, [
         'These snippets are accepted Stage 30 target-state documentation.',
         'Stages 30b and 30c check',
-        'not executable examples',
-        'native parity fixtures',
-        'catalogued E0641 execution boundary',
+        'not a native, PHP, or runnable-example manifest',
+        'target-specific E0641 boundaries',
         'let $double = fn(int $value) => $value * 2;',
         'fn(int $score) with ($minimum) =>',
         'function (int $score): bool with ($minimum) {',
@@ -218,20 +218,17 @@ function check_closure_capture_authority(string $root): array
         'Doria closure captures do not use PHP reference `&` syntax',
     ]);
     $require($semanticsPath, $semantics, [
-        'record_stage_30_execution_boundary',
-        'Diagnostic::unsupported_stage(',
-        '"E0641"',
-        'Closure Execution Is Not Yet Available',
         'fn check_closure_expression(',
         'source_binding_id: BindingId',
     ]);
+    $forbid($semanticsPath, $semantics, ['"E0641"']);
     $require($cataloguePath, $catalogue, ['"E0641"']);
     $require($testsPath, $tests, [
         'capture_ast_preserves_modes_duplicates_order_and_exact_spans',
-        'semantic_and_ide_paths_emit_one_structured_stage_30_boundary',
+        'semantic_and_ide_paths_are_target_neutral_while_backends_keep_boundaries',
         'malformed_closure_inventory_has_deliberate_diagnostics',
         'closure_recovery_does_not_cascade_into_following_syntax',
-        'cli_ast_and_check_keep_the_parser_semantic_boundary_visible',
+        'cli_ast_check_and_hir_accept_valid_closures',
     ]);
     $require($fixturePath, $fixture, [
         'fn(int $value) => $value * 2',
