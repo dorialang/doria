@@ -2893,7 +2893,9 @@ fn lower_closure_function(
                 capture.required_capability,
                 crate::semantics::CaptureRequirement::Writable
             );
-            let local = context.declare_synthetic_named_local(name, writable, ty, false);
+            let owned =
+                capture.mode == crate::ast::ClosureCaptureMode::Take && ty.has_move_ownership();
+            let local = context.declare_synthetic_named_local(name, writable, ty, owned);
             capture_locals.push((field, local));
         }
         context.push_statement(mir::Statement::BindClosureEnvironment {
@@ -8448,6 +8450,21 @@ fn lower_nullable_class_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableClassExpression> {
+    if let hir::Expr::CallableCall(call) = expr {
+        let (local, ty, transfer) = materialize_indirect_call(call, transfer, context)?
+            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a value")])?;
+        if ty != mir::Type::NullableClass(expected) {
+            return Err(vec![unsupported(
+                call.span,
+                "callable result has another nullable class type",
+            )]);
+        }
+        return Ok(mir::NullableClassExpression::Local {
+            class: expected,
+            local,
+            transfer,
+        });
+    }
     if let Some(mir::Rvalue::NullableClass(value)) =
         materialize_checked_rvalue(expr, mir::Type::NullableClass(expected), transfer, context)?
     {
@@ -13651,6 +13668,85 @@ fn lower_nullable_function_expression(
                 remove: false,
             })
         }
+        hir::Expr::FunctionCall { name, args, span } => {
+            let signature = context.lookup_function(name, *span)?;
+            if signature.return_type
+                != mir::ReturnType::Value(mir::Type::NullableFunction(function_type))
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    "function returns another nullable callable type",
+                )]);
+            }
+            Ok(mir::NullableFunctionExpression::Call {
+                function_type,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args: lower_call_args(name, args, signature, *span, context)?,
+            })
+        }
+        hir::Expr::MethodCall {
+            object,
+            method,
+            args,
+            span,
+            null_safe: false,
+        } => {
+            let (signature, args) =
+                lower_instance_method_call(object, method, args, *span, context)?;
+            if signature.return_type
+                != mir::ReturnType::Value(mir::Type::NullableFunction(function_type))
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    "method returns another nullable callable type",
+                )]);
+            }
+            Ok(mir::NullableFunctionExpression::Call {
+                function_type,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+            })
+        }
+        hir::Expr::StaticCall {
+            class_name,
+            method,
+            args,
+            span,
+        } => {
+            let (signature, args) =
+                lower_static_method_call(class_name, method, args, *span, context)?;
+            if signature.return_type
+                != mir::ReturnType::Value(mir::Type::NullableFunction(function_type))
+            {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method returns another nullable callable type",
+                )]);
+            }
+            Ok(mir::NullableFunctionExpression::Call {
+                function_type,
+                function: signature.id,
+                return_borrow: signature.return_borrow,
+                args,
+            })
+        }
+        hir::Expr::CallableCall(call) => {
+            let (local, ty, transfer) = materialize_indirect_call(call, true, context)?
+                .ok_or_else(|| vec![unsupported(call.span, "callable returns void")])?;
+            if ty != mir::Type::NullableFunction(function_type) {
+                return Err(vec![unsupported(
+                    call.span,
+                    "callable returns another nullable function type",
+                )]);
+            }
+            Ok(mir::NullableFunctionExpression::Local {
+                function_type,
+                local,
+                transfer,
+            })
+        }
         hir::Expr::Grouped { expr, .. } => {
             lower_nullable_function_expression(expr, function_type, transfer, context)
         }
@@ -17554,6 +17650,21 @@ fn lower_class_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ClassExpression> {
+    if let hir::Expr::CallableCall(call) = expr {
+        let (local, ty, transfer) = materialize_indirect_call(call, transfer, context)?
+            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a value")])?;
+        if ty != mir::Type::Class(expected) {
+            return Err(vec![unsupported(
+                call.span,
+                "callable result has another class type",
+            )]);
+        }
+        return Ok(mir::ClassExpression::Local {
+            class: expected,
+            local,
+            transfer,
+        });
+    }
     if let Some(mir::Rvalue::Class(value)) =
         materialize_checked_rvalue(expr, mir::Type::Class(expected), transfer, context)?
     {

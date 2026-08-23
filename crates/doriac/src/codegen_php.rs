@@ -4726,7 +4726,9 @@ fn emit_member_access(access: &MemberAccess) -> &'static str {
 }
 
 fn php_type(ty: &TypeRef) -> String {
-    let name = if IntegerType::from_source_name(&ty.name).is_some() {
+    let name = if ty.function.is_some() {
+        "callable".to_string()
+    } else if IntegerType::from_source_name(&ty.name).is_some() {
         "int".to_string()
     } else if FloatType::from_source_name(&ty.name).is_some() {
         "float".to_string()

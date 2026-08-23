@@ -67,6 +67,31 @@ function main(): void
 }
 
 #[test]
+fn debug_moves_owned_capture_locals_out_of_once_closures() {
+    let source = r#"
+class Payload
+{
+    function __construct(string $value)
+    {
+    }
+}
+
+function main(): void
+{
+    let $payload = new Payload("moved");
+    let $consume = function (): Payload with (take $payload) {
+        return $payload;
+    };
+    let $moved = $consume();
+
+    echo "{$moved->value}\n";
+}
+"#;
+
+    assert_eq!(debug(source), "exit_status: 0\nstdout: moved\n\n");
+}
+
+#[test]
 fn debug_executes_nested_factory_closures() {
     let source = r#"
 function main(): void
@@ -100,6 +125,56 @@ function main(): void
 "#;
 
     assert_eq!(debug(source), "exit_status: 0\nstdout: 42\n\n");
+}
+
+#[test]
+fn debug_lowers_every_nullable_function_call_producer() {
+    let source = r#"
+function fromFunction(): ?function(): int
+{
+    return fn() => 10;
+}
+
+class Factory
+{
+    function fromMethod(): ?function(): int
+    {
+        return fn() => 11;
+    }
+
+    static function fromStatic(): ?function(): int
+    {
+        return fn() => 12;
+    }
+}
+
+function main(): void
+{
+    let $factory = new Factory();
+    let $fromCallable = function (): ?function(): int {
+        return fn() => 13;
+    };
+    let $first = fromFunction();
+    let $second = $factory->fromMethod();
+    let $third = Factory::fromStatic();
+    let $fourth = $fromCallable();
+
+    if ($first != null) {
+        echo "{$first()} ";
+    }
+    if ($second != null) {
+        echo "{$second()} ";
+    }
+    if ($third != null) {
+        echo "{$third()} ";
+    }
+    if ($fourth != null) {
+        echo "{$fourth()}\n";
+    }
+}
+"#;
+
+    assert_eq!(debug(source), "exit_status: 0\nstdout: 10 11 12 13\n\n");
 }
 
 #[test]

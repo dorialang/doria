@@ -3739,8 +3739,8 @@ pub enum BoolBinaryOp {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Statement {
     /// Makes closure environment fields available through ordinary local IDs
-    /// in a synthetic closure function. The interpreter binds these locals to
-    /// stable places; no values are copied by this statement.
+    /// in a synthetic closure function. Borrowed fields remain stable places;
+    /// owned fields transfer into owned locals for the invocation.
     BindClosureEnvironment {
         environment: LocalId,
         bindings: Vec<(ClosureEnvironmentFieldId, LocalId)>,
