@@ -2,4 +2,5 @@ drop map 2
 drop map 1
 caught map source=3
 drop accumulator
+drop replacement
 caught reduce source=3

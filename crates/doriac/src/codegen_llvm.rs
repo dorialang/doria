@@ -2904,7 +2904,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Statement::AssignLocal { target, value } => {
                 let local = local_in(self.function, *target)?;
                 let slot = local_slot(&self.local_slots, *target)?;
-                let old_function = (local.owned
+                let owns_replaced_value =
+                    local.owned || self.writable_parameter_addresses.contains_key(target);
+                let old_error = (owns_replaced_value
+                    && matches!(local.ty, mir::Type::Error | mir::Type::NullableError))
+                .then(|| {
+                    build(self.builder.build_load(
+                        error_carrier_type(self.context),
+                        slot,
+                        "local.old.error",
+                    ))
+                    .map(BasicValueEnum::into_struct_value)
+                })
+                .transpose()?;
+                let old_function = (owns_replaced_value
                     && matches!(
                         local.ty,
                         mir::Type::Function(_) | mir::Type::NullableFunction(_)
@@ -2937,7 +2950,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .into_struct_value();
                         Some((self.nullable_parts(old)?.1.into_pointer_value(), None))
                     }
-                    mir::Type::Class(class) | mir::Type::NullableClass(class) if local.owned => {
+                    mir::Type::Class(class) | mir::Type::NullableClass(class)
+                        if owns_replaced_value =>
+                    {
                         Some((
                             build(self.builder.build_load(
                                 self.context.ptr_type(AddressSpace::default()),
@@ -2948,7 +2963,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             Some(class),
                         ))
                     }
-                    mir::Type::Collection(_) | mir::Type::NullableCollection(_) if local.owned => {
+                    mir::Type::Collection(_) | mir::Type::NullableCollection(_)
+                        if owns_replaced_value =>
+                    {
                         Some((
                             build(self.builder.build_load(
                                 self.context.ptr_type(AddressSpace::default()),
@@ -2959,7 +2976,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                             None,
                         ))
                     }
-                    mir::Type::Mixed | mir::Type::NullableMixed if local.owned => Some((
+                    mir::Type::Mixed | mir::Type::NullableMixed if owns_replaced_value => Some((
                         build(self.builder.build_load(
                             self.context.ptr_type(AddressSpace::default()),
                             slot,
@@ -2980,7 +2997,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     | mir::Type::WritableSharedReferenceAccess(_)
                     | mir::Type::NullableReadonlySharedReferenceAccess(_)
                     | mir::Type::NullableWritableSharedReferenceAccess(_)
-                        if local.owned =>
+                        if owns_replaced_value =>
                     {
                         Some((
                             build(self.builder.build_load(
@@ -2993,7 +3010,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         ))
                     }
                     mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
-                        if local.owned =>
+                        if owns_replaced_value =>
                     {
                         let nullable = matches!(local.ty, mir::Type::NullablePayloadEnum(_));
                         let old =
@@ -3063,6 +3080,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     } else {
                         self.release_string(old)?;
                     }
+                }
+                if let Some(old) = old_error {
+                    self.drop_error_value(old)?;
                 }
                 if let Some(old) = old_function {
                     self.drop_function_carrier(old)?;

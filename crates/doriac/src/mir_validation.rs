@@ -1040,6 +1040,17 @@ fn validate_writable_shared_payload(
     Ok(())
 }
 
+fn is_writable_closure_parameter(function: &mir::Function, local: mir::LocalId) -> bool {
+    function.closure.is_some()
+        && function
+            .params
+            .iter()
+            .position(|parameter| *parameter == local)
+            .is_some_and(|index| {
+                function.parameter_modes.get(index) == Some(&mir::FunctionParameterMode::Writable)
+            })
+}
+
 fn validate_statement(
     program: &mir::Program,
     function: &mir::Function,
@@ -1199,7 +1210,16 @@ fn validate_statement(
             Ok(())
         }
         mir::Statement::AssignLocal { target, value } => {
-            let local = local_in(function, *target)?;
+            let declared_local = local_in(function, *target)?;
+            // A writable closure parameter is a non-owning frame alias to an
+            // owning caller place. Assignment replaces that caller-owned value
+            // without making the final value a lexical cleanup obligation here.
+            let replacement_owner =
+                is_writable_closure_parameter(function, *target).then(|| mir::Local {
+                    owned: true,
+                    ..declared_local.clone()
+                });
+            let local = replacement_owner.as_ref().unwrap_or(declared_local);
             match (local.ty, value) {
                 (mir::Type::PayloadEnum(expected), mir::Rvalue::PayloadEnum(expression))
                     if expression.ty() == expected =>

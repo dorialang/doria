@@ -2932,13 +2932,19 @@ fn lower_closure_function(
         .iter()
         .zip(&definition.parameters)
     {
-        params.push(context.declare_user_local_owned(
+        let local = context.declare_user_local_owned(
             &parameter.name,
             parameter.writable,
             definition.ty,
             matches!(definition.mode, mir::FunctionParameterMode::Take)
                 && definition.ty.has_move_ownership(),
-        ));
+        );
+        if definition.mode == mir::FunctionParameterMode::Writable
+            && definition.ty.has_move_ownership()
+        {
+            context.replaceable_writable_parameters.insert(local);
+        }
+        params.push(local);
     }
 
     if !definition.checked_effects.is_empty() {
@@ -5071,6 +5077,7 @@ struct LoweringContext<'semantic> {
     closure_plans: HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
     current_class: Option<ClassId>,
     locals: Vec<mir::Local>,
+    replaceable_writable_parameters: HashSet<mir::LocalId>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     materialized_collection_places: HashMap<(usize, usize), mir::LocalId>,
     scope_owned_locals: Vec<Vec<DropObligation>>,
@@ -5200,6 +5207,7 @@ impl<'semantic> LoweringContext<'semantic> {
             closure_plans: inputs.closure_plans.clone(),
             current_class: None,
             locals: Vec::new(),
+            replaceable_writable_parameters: HashSet::new(),
             local_scopes: vec![HashMap::new()],
             materialized_collection_places: HashMap::new(),
             scope_owned_locals: vec![Vec::new()],
@@ -5911,6 +5919,10 @@ impl<'semantic> LoweringContext<'semantic> {
             .filter(|local| local.id == id)
             .expect("lowered MIR local must have a matching slot")
             .owned
+    }
+
+    fn local_may_replace_borrowed_value(&self, id: mir::LocalId) -> bool {
+        self.replaceable_writable_parameters.contains(&id)
     }
 
     fn class_id_for_name(&self, name: &str) -> Option<ClassId> {
@@ -7399,7 +7411,10 @@ fn lower_assignment(
     }
     let target = lower_assignment_target(target, context)?;
     let target_type = context.local_type(target);
-    if user_local_type_owns_value(target_type) && !context.local_owns(target) {
+    if user_local_type_owns_value(target_type)
+        && !context.local_owns(target)
+        && !context.local_may_replace_borrowed_value(target)
+    {
         let diagnostic = if matches!(target_type, mir::Type::Class(_)) {
             Diagnostic::new(
                 "E0505",

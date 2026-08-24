@@ -2543,7 +2543,12 @@ fn lower_statement(
             let new_value = lower_rvalue(builder, value, resources)?;
             let slot = local_slot(resources.local_slots, *target)?;
             let pointer = resources.module.target_config().pointer_type();
-            let old_function = (definition.owned
+            let owns_replaced_value =
+                definition.owned || resources.writable_parameter_addresses.contains_key(target);
+            let old_error = (owns_replaced_value
+                && matches!(definition.ty, mir::Type::Error | mir::Type::NullableError))
+            .then(|| load_lowered_from_stack(builder, definition.ty, slot, pointer));
+            let old_function = (owns_replaced_value
                 && matches!(
                     definition.ty,
                     mir::Type::Function(_) | mir::Type::NullableFunction(_)
@@ -2560,14 +2565,16 @@ fn lower_statement(
                         .1,
                     None,
                 )),
-                mir::Type::Class(class) | mir::Type::NullableClass(class) if definition.owned => {
+                mir::Type::Class(class) | mir::Type::NullableClass(class)
+                    if owns_replaced_value =>
+                {
                     Some((
                         load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
                         Some(class),
                     ))
                 }
                 mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_)
-                    if definition.owned =>
+                    if owns_replaced_value =>
                 {
                     Some((
                         load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
@@ -2584,25 +2591,27 @@ fn lower_statement(
                 | mir::Type::WritableSharedReferenceAccess(_)
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
-                    if definition.owned =>
+                    if owns_replaced_value =>
                 {
                     Some((
                         load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
                         None,
                     ))
                 }
-                mir::Type::Mixed | mir::Type::NullableMixed if definition.owned => Some((
+                mir::Type::Mixed | mir::Type::NullableMixed if owns_replaced_value => Some((
                     load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
                     None,
                 )),
-                mir::Type::Collection(_) | mir::Type::NullableCollection(_) if definition.owned => {
+                mir::Type::Collection(_) | mir::Type::NullableCollection(_)
+                    if owns_replaced_value =>
+                {
                     Some((
                         load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
                         None,
                     ))
                 }
                 mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
-                    if definition.owned =>
+                    if owns_replaced_value =>
                 {
                     let nullable = matches!(definition.ty, mir::Type::NullablePayloadEnum(_));
                     let old = create_payload_storage(builder, payload, nullable, resources);
@@ -2618,9 +2627,6 @@ fn lower_statement(
                 }
                 _ => None,
             };
-            if let Some(old) = old_function {
-                lower_drop_function_carrier(builder, old, resources)?;
-            }
             store_lowered_to_stack(builder, definition.ty, slot, new_value, pointer)?;
             if let Some(address) = resources.writable_parameter_addresses.get(target).copied() {
                 let current = load_lowered_from_stack(builder, definition.ty, slot, pointer);
@@ -2654,6 +2660,12 @@ fn lower_statement(
                 } else {
                     release_string(builder, old, resources)?;
                 }
+            }
+            if let Some(old) = old_error {
+                lower_drop_error_value(builder, old, resources)?;
+            }
+            if let Some(old) = old_function {
+                lower_drop_function_carrier(builder, old, resources)?;
             }
         }
         mir::Statement::EchoStringLiteral(value) => {
