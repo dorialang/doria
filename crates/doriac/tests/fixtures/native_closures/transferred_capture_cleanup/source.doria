@@ -1,0 +1,64 @@
+class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        try {
+            echo "drop {$this->name}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
+    }
+}
+
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+
+    function __destruct()
+    {
+        try {
+            echo "drop error\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
+    }
+}
+
+enum Parcel
+{
+    case Token(Token $token);
+}
+
+function main(): void
+{
+    List<Token> $list = [new Token("list")];
+    let $functionToken = new Token("function");
+    let $callback = fn() with (take $functionToken) => $functionToken->name;
+    let $parcel = Parcel::Token(new Token("payload"));
+    mixed $dynamic = new Token("mixed");
+    Error $error = new Failure("error");
+    let $shared = shared new Token("shared");
+    let $consume = function (): void with (
+        take $list,
+        take $callback,
+        take $parcel,
+        take $dynamic,
+        take $error,
+        take $shared
+    ) {
+        if (false) {
+            echo "{$list->count} {$callback()} " . match ($parcel) {
+                Parcel::Token($token) => $token->name
+            } . " {$error->message} {$shared->name}\n";
+            if ($dynamic is Token) { echo "mixed\n"; }
+        }
+        echo "inside\n";
+    };
+
+    $consume();
+    echo "after\n";
+}

@@ -572,6 +572,29 @@ impl Type {
         )
     }
 
+    /// Writable closure captures of these types temporarily move the source
+    /// value into the invocation frame. Payload enums can be source-level Copy
+    /// while still containing managed fields that require exact destruction.
+    pub const fn transfers_writable_capture_ownership(self) -> bool {
+        self.has_move_ownership()
+            || matches!(
+                self,
+                Self::PayloadEnum(PayloadEnumType {
+                    capabilities: EnumCapabilities {
+                        needs_drop: true,
+                        ..
+                    },
+                    ..
+                }) | Self::NullablePayloadEnum(PayloadEnumType {
+                    capabilities: EnumCapabilities {
+                        needs_drop: true,
+                        ..
+                    },
+                    ..
+                })
+            )
+    }
+
     pub const fn shared_access(self) -> Option<SharedAccessType> {
         match self {
             Self::ReadonlySharedReferenceAccess(payload) => Some(SharedAccessType {

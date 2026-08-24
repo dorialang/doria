@@ -10745,6 +10745,127 @@ impl Interpreter<'_> {
         }
     }
 
+    fn take_place(&mut self, place: InterpreterPlace) -> Result<LocalValue, InterpreterError> {
+        match place {
+            InterpreterPlace::FrameLocal { frame, local } => self
+                .frames
+                .iter_mut()
+                .find(|candidate| candidate.id == frame)
+                .and_then(|frame| frame.locals.get_mut(local.0))
+                .and_then(Option::take)
+                .ok_or_else(|| {
+                    InterpreterError::new("closure capture source place is unavailable")
+                }),
+            InterpreterPlace::EnvironmentField { environment, field } => {
+                if let Some(active) = self
+                    .active_closure_fields
+                    .get(&(environment, field.0))
+                    .copied()
+                {
+                    return self.take_place(active);
+                }
+                let index = self.closure_environment_field_index(environment, field)?;
+                let borrowed = match &self
+                    .closure_environments
+                    .get(&environment)
+                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
+                    .fields[index]
+                {
+                    ClosureEnvironmentFieldValue::Borrowed { place, writable } => {
+                        if !writable {
+                            return Err(InterpreterError::new(
+                                "readonly closure environment field was transferred",
+                            ));
+                        }
+                        Some(*place)
+                    }
+                    ClosureEnvironmentFieldValue::Owned(_) => None,
+                };
+                if let Some(place) = borrowed {
+                    return self.take_place(place);
+                }
+                let environment = self
+                    .closure_environments
+                    .get_mut(&environment)
+                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?;
+                let ClosureEnvironmentFieldValue::Owned(slot) = &mut environment.fields[index]
+                else {
+                    unreachable!("borrowed environment field handled above");
+                };
+                slot.take()
+                    .ok_or_else(|| InterpreterError::new("closure owned capture was already moved"))
+            }
+        }
+    }
+
+    fn restore_place(
+        &mut self,
+        place: InterpreterPlace,
+        value: LocalValue,
+    ) -> Result<(), InterpreterError> {
+        match place {
+            InterpreterPlace::FrameLocal { frame, local } => {
+                let slot = self
+                    .frames
+                    .iter_mut()
+                    .find(|candidate| candidate.id == frame)
+                    .and_then(|frame| frame.locals.get_mut(local.0))
+                    .ok_or_else(|| {
+                        InterpreterError::new("closure capture source place is unavailable")
+                    })?;
+                if slot.replace(value).is_some() {
+                    return Err(InterpreterError::new(
+                        "transferred closure capture source was unexpectedly occupied",
+                    ));
+                }
+                Ok(())
+            }
+            InterpreterPlace::EnvironmentField { environment, field } => {
+                if let Some(active) = self
+                    .active_closure_fields
+                    .get(&(environment, field.0))
+                    .copied()
+                {
+                    return self.restore_place(active, value);
+                }
+                let index = self.closure_environment_field_index(environment, field)?;
+                let borrowed = match &self
+                    .closure_environments
+                    .get(&environment)
+                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?
+                    .fields[index]
+                {
+                    ClosureEnvironmentFieldValue::Borrowed { place, writable } => {
+                        if !writable {
+                            return Err(InterpreterError::new(
+                                "readonly closure environment field was restored",
+                            ));
+                        }
+                        Some(*place)
+                    }
+                    ClosureEnvironmentFieldValue::Owned(_) => None,
+                };
+                if let Some(place) = borrowed {
+                    return self.restore_place(place, value);
+                }
+                let environment = self
+                    .closure_environments
+                    .get_mut(&environment)
+                    .ok_or_else(|| InterpreterError::new("closure environment does not exist"))?;
+                let ClosureEnvironmentFieldValue::Owned(slot) = &mut environment.fields[index]
+                else {
+                    unreachable!("borrowed environment field handled above");
+                };
+                if slot.replace(value).is_some() {
+                    return Err(InterpreterError::new(
+                        "transferred closure environment field was unexpectedly occupied",
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn write_place(
         &mut self,
         place: InterpreterPlace,
@@ -10874,7 +10995,8 @@ impl Interpreter<'_> {
             .closure_environment_layouts
             .get(layout_id.0)
             .filter(|candidate| candidate.id == layout_id)
-            .ok_or_else(|| InterpreterError::new("closure environment layout does not exist"))?;
+            .ok_or_else(|| InterpreterError::new("closure environment layout does not exist"))?
+            .clone();
         let frame_id = self.current_frame()?.id;
         let mut values = Vec::with_capacity(bindings.len());
         for (field_id, target) in bindings {
@@ -10892,8 +11014,16 @@ impl Interpreter<'_> {
                 ClosureEnvironmentFieldValue::Borrowed { place, .. } => Some(*place),
                 ClosureEnvironmentFieldValue::Owned(_) => None,
             };
+            let field = &layout.fields[index];
+            let transfer = field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
+                && field.ty.transfers_writable_capture_ownership();
             let (value, origin, owned) = if let Some(place) = borrowed_place {
-                (self.read_place(place)?, place, false)
+                let value = if transfer {
+                    self.take_place(place)?
+                } else {
+                    self.read_place(place)?
+                };
+                (value, place, false)
             } else {
                 let environment_value = self
                     .closure_environments
@@ -10968,6 +11098,7 @@ impl Interpreter<'_> {
             WritableBorrow {
                 place: InterpreterPlace,
                 value: LocalValue,
+                transferred: bool,
             },
         }
         let mut actions = Vec::new();
@@ -10998,11 +11129,20 @@ impl Interpreter<'_> {
                     value: slot.take(),
                 }),
                 ClosureEnvironmentFieldValue::Borrowed { place, writable } if *writable => {
+                    let transferred = field.ty.transfers_writable_capture_ownership();
+                    let value = if transferred {
+                        slot.take().ok_or_else(|| {
+                            InterpreterError::new("writable closure capture was moved")
+                        })?
+                    } else {
+                        slot.as_ref().cloned().ok_or_else(|| {
+                            InterpreterError::new("writable closure capture was moved")
+                        })?
+                    };
                     actions.push(SyncAction::WritableBorrow {
                         place: *place,
-                        value: slot.as_ref().cloned().ok_or_else(|| {
-                            InterpreterError::new("writable closure capture was moved")
-                        })?,
+                        value,
+                        transferred,
                     });
                 }
                 ClosureEnvironmentFieldValue::Borrowed { .. } => {}
@@ -11032,11 +11172,19 @@ impl Interpreter<'_> {
                     };
                     *slot = value;
                 }
-                SyncAction::WritableBorrow { place, value } => {
-                    let current = self.read_place(place)?;
-                    if current != value {
-                        let old = self.write_place(place, value)?;
-                        collect_owned_objects_from_value(old, &mut drops);
+                SyncAction::WritableBorrow {
+                    place,
+                    value,
+                    transferred,
+                } => {
+                    if transferred {
+                        self.restore_place(place, value)?;
+                    } else {
+                        let current = self.read_place(place)?;
+                        if current != value {
+                            let old = self.write_place(place, value)?;
+                            collect_owned_objects_from_value(old, &mut drops);
+                        }
                     }
                 }
             }
@@ -13645,11 +13793,36 @@ impl Interpreter<'_> {
 
     fn cleanup_current_frame(&mut self) -> Result<(), InterpreterError> {
         let function = function_in(self.program, self.current_frame()?.function)?;
+        let transferred_writable_captures = function
+            .closure
+            .as_ref()
+            .and_then(|closure| closure.environment_layout)
+            .and_then(|layout| self.program.closure_environment_layouts.get(layout.0))
+            .map(|layout| {
+                function
+                    .closure
+                    .as_ref()
+                    .expect("closure metadata exists")
+                    .capture_locals
+                    .iter()
+                    .zip(&layout.fields)
+                    .filter_map(|((_, local), field)| {
+                        (field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
+                            && field.ty.transfers_writable_capture_ownership())
+                        .then_some(*local)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let owned_classes = function
             .locals
             .iter()
             .filter_map(|local| match (local.owned, local.ty) {
-                (true, mir::Type::Class(_)) => Some(local.id),
+                (true, mir::Type::Class(_))
+                    if !transferred_writable_captures.contains(&local.id) =>
+                {
+                    Some(local.id)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -13657,7 +13830,11 @@ impl Interpreter<'_> {
             .locals
             .iter()
             .filter_map(|local| match (local.owned, local.ty) {
-                (true, mir::Type::Collection(_)) => Some(local.id),
+                (true, mir::Type::Collection(_))
+                    if !transferred_writable_captures.contains(&local.id) =>
+                {
+                    Some(local.id)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -13665,7 +13842,11 @@ impl Interpreter<'_> {
             .locals
             .iter()
             .filter_map(|local| match (local.owned, local.ty) {
-                (true, mir::Type::Mixed | mir::Type::NullableMixed) => Some(local.id),
+                (true, mir::Type::Mixed | mir::Type::NullableMixed)
+                    if !transferred_writable_captures.contains(&local.id) =>
+                {
+                    Some(local.id)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();

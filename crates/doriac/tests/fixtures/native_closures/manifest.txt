@@ -3,8 +3,10 @@ no_capture
 callable_scalar_expressions
 readonly_capture
 writable_capture
+writable_move_captures
 taking_copy_capture
 taking_move_capture
+transferred_capture_cleanup
 once_return
 nested_factory
 nested_factory_repeated

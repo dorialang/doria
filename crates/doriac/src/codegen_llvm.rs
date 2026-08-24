@@ -2125,6 +2125,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     build(self.builder.build_store(target_slot, retained))?;
                 }
             }
+            if field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
+                && field.ty.transfers_writable_capture_ownership()
+            {
+                match field.ty {
+                    mir::Type::PayloadEnum(payload) => {
+                        self.zero_payload_bytes(place, payload, false)?;
+                    }
+                    mir::Type::NullablePayloadEnum(payload) => {
+                        self.zero_payload_bytes(place, payload, true)?;
+                    }
+                    _ => {
+                        build(self.builder.build_store(
+                            place,
+                            llvm_type(self.context, self.target_data, field.ty).const_zero(),
+                        ))?;
+                    }
+                }
+            }
             let address = if field.storage == mir::ClosureEnvironmentStorage::Owned {
                 target_slot
             } else {
@@ -2393,38 +2411,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
                     let nullable = matches!(field.ty, mir::Type::NullablePayloadEnum(_));
-                    let old =
-                        self.entry_payload_alloca(payload, nullable, "closure.capture.old")?;
-                    self.copy_payload_bytes(old, field.address, payload, nullable)?;
                     self.copy_payload_bytes(field.address, slot, payload, nullable)?;
                     self.zero_payload_bytes(slot, payload, nullable)?;
-                    self.drop_payload_enum_at(old, payload, nullable)?;
                 }
                 mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
                     let ty = closure_carrier_type(self.context);
-                    let old = build(self.builder.build_load(
-                        ty,
-                        field.address,
-                        "closure.capture.old",
-                    ))?
-                    .into_struct_value();
                     let new = build(self.builder.build_load(ty, slot, "closure.capture.new"))?;
                     build(self.builder.build_store(field.address, new))?;
                     self.clear_function_slot(slot)?;
-                    self.drop_function_carrier(old)?;
                 }
                 mir::Type::Error | mir::Type::NullableError => {
                     let ty = error_carrier_type(self.context);
-                    let old = build(self.builder.build_load(
-                        ty,
-                        field.address,
-                        "closure.capture.old",
-                    ))?
-                    .into_struct_value();
                     let new = build(self.builder.build_load(ty, slot, "closure.capture.new"))?;
                     build(self.builder.build_store(field.address, new))?;
                     build(self.builder.build_store(slot, ty.const_zero()))?;
-                    self.drop_error_value(old)?;
                 }
                 mir::Type::Class(_)
                 | mir::Type::NullableClass(_)
@@ -2445,18 +2445,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
                 | mir::Type::NullableWritableSharedReferenceAccess(_) => {
                     let pointer = self.context.ptr_type(AddressSpace::default());
-                    let old = build(self.builder.build_load(
-                        pointer,
-                        field.address,
-                        "closure.capture.old",
-                    ))?;
                     let new = build(
                         self.builder
                             .build_load(pointer, slot, "closure.capture.new"),
                     )?;
                     build(self.builder.build_store(field.address, new))?;
                     build(self.builder.build_store(slot, pointer.const_null()))?;
-                    self.drop_stored_value(old, field.ty)?;
                 }
                 mir::Type::ClosureEnvironment(_) => {
                     return Err(malformed_mir(

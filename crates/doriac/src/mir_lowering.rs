@@ -2889,12 +2889,12 @@ fn lower_closure_function(
             .expect("closure environment metadata exists");
         for (field_index, capture) in environment.captures.iter().enumerate() {
             let field = mir::ClosureEnvironmentFieldId(field_index);
-            let ty = layout
+            let definition = layout
                 .fields
                 .get(field_index)
                 .filter(|definition| definition.id == field)
-                .expect("closure capture field exists")
-                .ty;
+                .expect("closure capture field exists");
+            let ty = definition.ty;
             let name = inputs
                 .semantic_info
                 .binding_resolution
@@ -2902,13 +2902,15 @@ fn lower_closure_function(
                 .get(&capture.source_binding_id)
                 .map(|binding| binding.name.as_str())
                 .unwrap_or("_capture");
-            let writable = matches!(
-                capture.required_capability,
-                crate::semantics::CaptureRequirement::Writable
-            );
-            let owned =
-                capture.mode == crate::ast::ClosureCaptureMode::Take && ty.has_move_ownership();
-            let local = context.declare_synthetic_named_local(name, writable, ty, owned);
+            let writable = definition.storage == mir::ClosureEnvironmentStorage::WritableBorrow;
+            let taken = capture.mode == crate::ast::ClosureCaptureMode::Take;
+            // A writable lease temporarily transfers move ownership into the
+            // invocation frame. Backends restore it to the borrowed source on
+            // every non-aborting exit, so only a taken capture owns a lexical
+            // cleanup obligation in the synthetic function.
+            let owned = (taken && ty.has_move_ownership())
+                || (writable && ty.transfers_writable_capture_ownership());
+            let local = context.declare_synthetic_named_local(name, writable, ty, owned, taken);
             capture_locals.push((field, local));
         }
         context.push_statement(mir::Statement::BindClosureEnvironment {
@@ -5657,7 +5659,7 @@ impl<'semantic> LoweringContext<'semantic> {
     ) -> mir::LocalId {
         let name = format!("{prefix}{}", self.temp_counter);
         self.temp_counter += 1;
-        self.declare_synthetic_named_local(&name, writable, ty, owned)
+        self.declare_synthetic_named_local(&name, writable, ty, owned, true)
     }
 
     fn declare_synthetic_named_local(
@@ -5666,6 +5668,7 @@ impl<'semantic> LoweringContext<'semantic> {
         writable: bool,
         ty: mir::Type,
         owned: bool,
+        track_cleanup: bool,
     ) -> mir::LocalId {
         let id = mir::LocalId(self.locals.len());
         self.locals.push(mir::Local {
@@ -5680,6 +5683,12 @@ impl<'semantic> LoweringContext<'semantic> {
             .last_mut()
             .expect("MIR lowering must have a local scope")
             .insert(name.to_string(), id);
+        if track_cleanup && owned && ty.has_move_ownership() {
+            self.scope_owned_locals
+                .last_mut()
+                .expect("an owned synthetic local requires an active ownership scope")
+                .push(drop_obligation_for_owned_local(id, ty));
+        }
         id
     }
 

@@ -2194,6 +2194,20 @@ fn lower_bind_closure_environment(
                 .ins()
                 .stack_store(pointer, string, target_slot, offset);
         }
+        if field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
+            && field.ty.transfers_writable_capture_ownership()
+        {
+            let size = match field.ty {
+                mir::Type::PayloadEnum(payload) => payload.storage_size(false),
+                mir::Type::NullablePayloadEnum(payload) => payload.storage_size(true),
+                mir::Type::Error
+                | mir::Type::NullableError
+                | mir::Type::Function(_)
+                | mir::Type::NullableFunction(_) => pointer.bytes() * 2,
+                _ => pointer.bytes(),
+            };
+            zero_inline_bytes(builder, place, size, pointer);
+        }
         let address = if field.storage == mir::ClosureEnvironmentStorage::Owned {
             builder.ins().stack_addr(pointer, target_slot, 0)
         } else {
@@ -2270,85 +2284,77 @@ fn sync_writable_closure_captures(
                 builder.switch_to_block(done);
             }
             mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
-                let old = load_lowered_from_address(builder, field.ty, field.address, pointer);
-                let (old_descriptor, old_environment) = old.nullable()?;
-                let (new_descriptor, new_environment) = new.nullable()?;
-                let same_descriptor =
-                    builder
-                        .ins()
-                        .icmp(IntCC::Equal, old_descriptor, new_descriptor);
-                let same_environment =
-                    builder
-                        .ins()
-                        .icmp(IntCC::Equal, old_environment, new_environment);
-                let same = builder.ins().band(same_descriptor, same_environment);
-                let done = builder.create_block();
-                let replace = builder.create_block();
-                builder.ins().brif(same, done, &[], replace, &[]);
-                builder.switch_to_block(replace);
-                store_lowered_to_address(builder, field.ty, field.address, new, pointer)?;
-                clear_function_carrier_stack(builder, slot, pointer);
-                lower_drop_function_carrier(builder, old, resources)?;
-                builder.ins().jump(done, &[]);
-                builder.switch_to_block(done);
+                sync_writable_two_word_capture(builder, field, slot, new, pointer)?;
             }
-            mir::Type::Class(class) | mir::Type::NullableClass(class) => {
-                sync_writable_pointer_capture(
+            mir::Type::Error | mir::Type::NullableError => {
+                sync_writable_two_word_capture(builder, field, slot, new, pointer)?;
+            }
+            mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
+                let nullable = matches!(field.ty, mir::Type::NullablePayloadEnum(_));
+                let replacement = new.single()?;
+                copy_inline_bytes(
                     builder,
-                    field,
-                    slot,
-                    new.single()?,
+                    field.address,
+                    replacement,
+                    payload.storage_size(nullable),
                     pointer,
-                    resources,
-                    |builder, old, resources| {
-                        lower_drop_class_value_checked(builder, old, class, resources)
-                    },
-                )?;
-            }
-            mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
-                sync_writable_pointer_capture(
+                );
+                zero_inline_bytes(
                     builder,
-                    field,
-                    slot,
-                    new.single()?,
+                    replacement,
+                    payload.storage_size(nullable),
                     pointer,
-                    resources,
-                    |builder, old, resources| {
-                        lower_drop_collection_value(builder, old, collection, resources)
-                    },
-                )?;
+                );
             }
-            _ => {
-                return Err(backend_failure(format!(
-                    "writable closure capture of {} is not yet lowered",
-                    field.ty
-                )))
+            mir::Type::Class(_)
+            | mir::Type::NullableClass(_)
+            | mir::Type::Collection(_)
+            | mir::Type::NullableCollection(_)
+            | mir::Type::Mixed
+            | mir::Type::NullableMixed
+            | mir::Type::SharedReference(_)
+            | mir::Type::WeakReference(_)
+            | mir::Type::NullableSharedReference(_)
+            | mir::Type::NullableWeakReference(_)
+            | mir::Type::WritableSharedReference(_)
+            | mir::Type::WritableWeakReference(_)
+            | mir::Type::NullableWritableSharedReference(_)
+            | mir::Type::NullableWritableWeakReference(_)
+            | mir::Type::ReadonlySharedReferenceAccess(_)
+            | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+                sync_writable_pointer_capture(builder, field, slot, new.single()?, pointer)?;
+            }
+            mir::Type::ClosureEnvironment(_) => {
+                return Err(malformed_mir(
+                    "closure environment pointer cannot be a captured source value",
+                ));
             }
         }
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+fn sync_writable_two_word_capture(
+    builder: &mut FunctionBuilder,
+    field: BoundClosureField,
+    slot: StackSlot,
+    new: LoweredValue,
+    pointer: ClifType,
+) -> Result<(), BackendError> {
+    store_lowered_to_address(builder, field.ty, field.address, new, pointer)?;
+    clear_function_carrier_stack(builder, slot, pointer);
+    Ok(())
+}
+
 fn sync_writable_pointer_capture(
     builder: &mut FunctionBuilder,
     field: BoundClosureField,
     slot: StackSlot,
     new: Value,
     pointer: ClifType,
-    resources: &mut LoweringResources<'_, '_>,
-    drop_old: impl FnOnce(
-        &mut FunctionBuilder,
-        Value,
-        &mut LoweringResources<'_, '_>,
-    ) -> Result<(), BackendError>,
 ) -> Result<(), BackendError> {
-    let old = load_lowered_from_address(builder, field.ty, field.address, pointer).single()?;
-    let same = builder.ins().icmp(IntCC::Equal, old, new);
-    let done = builder.create_block();
-    let replace = builder.create_block();
-    builder.ins().brif(same, done, &[], replace, &[]);
-    builder.switch_to_block(replace);
     store_lowered_to_address(
         builder,
         field.ty,
@@ -2358,9 +2364,6 @@ fn sync_writable_pointer_capture(
     )?;
     let zero = builder.ins().iconst(pointer, 0);
     builder.ins().stack_store(pointer, zero, slot, 0);
-    drop_old(builder, old, resources)?;
-    builder.ins().jump(done, &[]);
-    builder.switch_to_block(done);
     Ok(())
 }
 

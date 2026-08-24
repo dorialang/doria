@@ -1070,9 +1070,13 @@ fn validate_statement(
             }
             for ((field, target), expected) in bindings.iter().zip(&layout.fields) {
                 let local = local_in(function, *target)?;
-                let expected_owned =
-                    matches!(expected.storage, mir::ClosureEnvironmentStorage::Owned)
-                        && expected.ty.has_move_ownership();
+                let expected_owned = match expected.storage {
+                    mir::ClosureEnvironmentStorage::Owned => expected.ty.has_move_ownership(),
+                    mir::ClosureEnvironmentStorage::WritableBorrow => {
+                        expected.ty.transfers_writable_capture_ownership()
+                    }
+                    mir::ClosureEnvironmentStorage::ReadonlyBorrow => false,
+                };
                 if *field != expected.id
                     || local.ty != expected.ty
                     || local.owned != expected_owned

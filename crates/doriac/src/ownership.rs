@@ -6627,6 +6627,7 @@ fn resolved_type_is_move_type(
     match ty {
         crate::types::ResolvedType::Bytes
         | crate::types::ResolvedType::Mixed
+        | crate::types::ResolvedType::Error
         | crate::types::ResolvedType::Function(_)
         | crate::types::ResolvedType::Class(_)
         | crate::types::ResolvedType::SharedHandle(_, _)

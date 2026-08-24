@@ -134,8 +134,9 @@ function check_stage30e_native_closure_execution(string $root): array
         'NativeProfile::Release',
     ]);
     foreach ([
-        'no_capture', 'readonly_capture', 'writable_capture', 'taking_copy_capture',
-        'taking_move_capture', 'once_return', 'nested_factory', 'nullable_function',
+        'no_capture', 'readonly_capture', 'writable_capture', 'writable_move_captures',
+        'taking_copy_capture', 'taking_move_capture', 'transferred_capture_cleanup',
+        'once_return', 'nested_factory', 'nullable_function',
         'parameter_callback', 'returned_closure', 'callable_property',
         'property_replacement', 'collection_storage', 'payload_enum_storage',
         'generic_closure', 'checked_effect', 'checked_once', 'destructor_order',

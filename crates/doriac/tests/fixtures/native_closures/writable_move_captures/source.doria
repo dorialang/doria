@@ -1,0 +1,58 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+class Node
+{
+    function __construct(string $name)
+    {
+    }
+}
+
+enum Packet
+{
+    case Text(string $value);
+}
+
+function packetText(Packet $packet): string
+{
+    return match ($packet) {
+        Packet::Text($value) => $value
+    };
+}
+
+function mixedText(mixed $value): string
+{
+    if ($value is string) {
+        return $value;
+    }
+    return "unknown";
+}
+
+function main(): void
+{
+    let writable $packet = Packet::Text("old packet");
+    writable mixed $dynamic = "old mixed";
+    writable Error $error = new Failure("old error");
+    let writable $shared = shared new Node("old shared");
+    let writable $rewrite = function (): void with (
+        writable $packet,
+        writable $dynamic,
+        writable $error,
+        writable $shared
+    ) {
+        $packet = Packet::Text("new packet");
+        $dynamic = "new mixed";
+        $error = new Failure("new error");
+        $shared = shared new Node("new shared");
+    };
+
+    $rewrite();
+    echo packetText($packet) . "\n";
+    echo mixedText($dynamic) . "\n";
+    echo $error->message . "\n";
+    echo $shared->name . "\n";
+}
