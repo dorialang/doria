@@ -442,7 +442,12 @@ insertion order, and propagate the callback's checked effects. A
 readonly-repeatable callback is borrowed readonly. A writable-repeatable callback
 is borrowed exclusively and requires writable access to the function value;
 invocation mode never silently widens a readonly function-value borrow. Other
-collection families receive no Stage 30 higher-order algorithms.
+collection families receive no Stage 30 higher-order algorithms. These three
+methods lower through explicit algorithm HIR and one validated MIR traversal CFG
+for the debug interpreter, Cranelift, and LLVM. PHP compatibility emits the same
+ordered behavior through compiler-generated loops rather than host array
+higher-order functions. Checked failure destroys a partial result or reduce
+accumulator exactly once and leaves the source list unchanged.
 
 ### Current compiler support
 
@@ -487,9 +492,10 @@ Stage 30c Ownership, Lifetime, And Escape - Complete
 Stage 30d Closure HIR/MIR And Interpreter Oracle - Complete
 Stage 30e Native Execution - Complete
 Stage 30f PHP Compatibility - Complete
-Stage 30g List Algorithms - Next
+Stage 30g List Algorithms - Complete
+Stage 30h Cross-Repository Closure - Next
 Stage 30 - In Progress, Not Complete
-E0641 - Unreachable For Supported Plain Closure Execution
+E0641 - Catalogued But Unreachable For The Supported Stage 30g Surface
 ```
 
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.

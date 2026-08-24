@@ -3081,16 +3081,6 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 "#,
         ),
         (
-            "collection mutator",
-            r#"
-function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
-{
-    writable List<int> $items = [];
-    $items->add(1);
-}
-"#,
-        ),
-        (
             "list indexOf",
             r#"
 function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error

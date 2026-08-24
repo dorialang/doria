@@ -254,7 +254,35 @@ fn apply_expr_checked_error_semantics(
         span,
     } = expression.clone()
     {
-        if semantic_info
+        if let Some(plan) = semantic_info
+            .list_algorithm_calls
+            .get(&(span.start, span.end))
+        {
+            let kind = match plan.kind {
+                crate::semantics::ListAlgorithmKind::Map => hir::ListAlgorithmKind::Map,
+                crate::semantics::ListAlgorithmKind::Filter => hir::ListAlgorithmKind::Filter,
+                crate::semantics::ListAlgorithmKind::Reduce => hir::ListAlgorithmKind::Reduce,
+            };
+            let callback_access = match plan.callback_access {
+                crate::semantics::ListCallbackAccess::Readonly => hir::ListCallbackAccess::Readonly,
+                crate::semantics::ListCallbackAccess::Writable => hir::ListCallbackAccess::Writable,
+            };
+            *expression = hir::Expr::ListAlgorithmCall(Box::new(hir::ListAlgorithmCall {
+                kind,
+                receiver: object,
+                arguments: args,
+                receiver_type: plan.receiver_type.clone(),
+                element_type: plan.element_type.clone(),
+                result_type: plan.result_type.clone(),
+                accumulator_type: plan.accumulator_type.clone(),
+                callback_type: plan.callback_type.clone(),
+                callback_access,
+                checked_effects: plan.checked_effects.clone(),
+                receiver_span: plan.receiver_span,
+                callback_span: plan.callback_span,
+                span,
+            }));
+        } else if semantic_info
             .callable_value_calls
             .get(&(span.start, span.end))
             .is_some_and(|call| {
@@ -286,6 +314,12 @@ fn apply_expr_checked_error_semantics(
         hir::Expr::CallableCall(call) => {
             apply_expr_checked_error_semantics(&mut call.callee, semantic_info);
             for argument in &mut call.args {
+                apply_expr_checked_error_semantics(&mut argument.value, semantic_info);
+            }
+        }
+        hir::Expr::ListAlgorithmCall(call) => {
+            apply_expr_checked_error_semantics(&mut call.receiver, semantic_info);
+            for argument in &mut call.arguments {
                 apply_expr_checked_error_semantics(&mut argument.value, semantic_info);
             }
         }

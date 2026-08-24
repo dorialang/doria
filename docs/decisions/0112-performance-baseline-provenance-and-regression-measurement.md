@@ -100,6 +100,22 @@ Later stages that change runtime representation, allocation, ownership, dispatch
 code generation, control flow, I/O, concurrency, or FFI must update relevant
 cases and record their performance impact under the master-plan rule.
 
+## Stage 30g Portable Workloads
+
+The coordinated benchmark manifest includes eight Doria-only runtime-subsystem
+workloads for `list_map_readonly`, `list_map_writable`,
+`list_map_move_result`, `list_filter_copy`,
+`list_reduce_copy_accumulator`, `list_reduce_move_accumulator`,
+`list_map_checked`, and `list_reduce_checked`. Each has exact correctness output,
+separate smoke and baseline scales, and distinct Cranelift and LLVM targets.
+
+These cases preserve compiler/runtime provenance and the existing compiler
+report's compile duration, peak-resource, artifact-size, and MIR structural
+evidence. Their fixtures also make callback/environment and result-allocation
+behavior available for structural investigation without claiming unavailable
+runtime allocation counters. They do not launch a controlled timing campaign;
+`Measurement Status: Pending Available Runner` remains binding.
+
 ## Native Runtime Acceptance Standard
 
 Doria aims to match or beat C, C++, and Rust on comparable native workloads.
@@ -184,8 +200,9 @@ evidence, and an accepted exact structural baseline. Slice 3 adds peer sources
 for the new runtime cases, controlled-runner and baseline-promotion workflows,
 the exact native acceptance policy, and the stage-completion workflow. All three
 Stage 26b slices are complete. Decision 0113 and all four slices, Stages 27,
-28, and 28a are complete. Stage 29 is complete; the pre-Stage-30 grammar slice
-is next with no performance-evidence dependency.
+28, and 28a are complete. Stage 29, the pre-Stage-30 grammar slice, and Stages
+30a through 30g are complete. Stage 30h is next with no performance-evidence
+dependency.
 
 Slice 3 is split. Part 1 delivers the peer matrix, peer fairness and
 semantic-equivalence records, controlled candidate measurement, and a timing

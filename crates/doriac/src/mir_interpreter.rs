@@ -983,6 +983,7 @@ struct CallFrame {
     active_panic_site: Span,
     closure_environment: Option<ClosureEnvironmentHandle>,
     consume_closure_environment: bool,
+    write_back_writable_parameters: bool,
 }
 
 struct Interpreter<'program> {
@@ -1216,6 +1217,7 @@ fn interpret_internal_observed(
         &vec![None; entry_frame_arguments.len()],
         None,
         None,
+        false,
     )?;
 
     loop {
@@ -4454,6 +4456,7 @@ impl Interpreter<'_> {
                             &constructor_argument_places,
                             Some(ReturnExpectation::Void),
                             None,
+                            false,
                         )?;
                     }
                 } else {
@@ -5819,6 +5822,7 @@ impl Interpreter<'_> {
                     &argument_places,
                     Some(expectation),
                     call_site,
+                    false,
                 )?;
             }
             EvaluationTask::InvokeChecked {
@@ -5908,12 +5912,37 @@ impl Interpreter<'_> {
                 let value = self.pop_local_value()?;
                 let function = function_in(self.program, self.current_frame()?.function)?;
                 let owned = local_in(function, target)?.owned;
+                let writable_origin = self
+                    .current_frame()?
+                    .write_back_writable_parameters
+                    .then(|| {
+                        function
+                            .params
+                            .iter()
+                            .position(|parameter| *parameter == target)
+                            .filter(|index| {
+                                function.parameter_modes[*index]
+                                    == mir::FunctionParameterMode::Writable
+                            })
+                            .and_then(|_| self.current_frame().ok()?.local_origins[target.0])
+                    })
+                    .flatten();
                 let old = assign_local(
                     &function.locals,
                     &mut self.current_frame_mut()?.locals,
                     target,
                     value,
                 )?;
+                if let Some(origin) = writable_origin {
+                    let current = self.current_frame()?.locals[target.0]
+                        .as_ref()
+                        .expect("assigned writable parameter remains initialized")
+                        .clone();
+                    let replaced = self.write_place(origin, current.clone())?;
+                    if replaced != current {
+                        self.queue_value_drops(replaced)?;
+                    }
+                }
                 if owned {
                     if let Some(value) = old {
                         self.queue_value_drops(value)?;
@@ -10328,7 +10357,8 @@ impl Interpreter<'_> {
                 if mode == mir::FunctionParameterMode::Take {
                     return Ok(None);
                 }
-                direct_rvalue_local(argument)
+                argument
+                    .direct_place_local()
                     .map(|local| self.place_for_local(local))
                     .transpose()
             })
@@ -10495,6 +10525,7 @@ impl Interpreter<'_> {
         argument_places: &[Option<InterpreterPlace>],
         caller_expectation: Option<ReturnExpectation>,
         entered_from: Option<Span>,
+        write_back_writable_parameters: bool,
     ) -> Result<(), InterpreterError> {
         if let Some(limit) = self.limits.max_call_frames {
             if self.frames.len() >= limit {
@@ -10574,6 +10605,7 @@ impl Interpreter<'_> {
             active_panic_site: function.source_span,
             closure_environment: None,
             consume_closure_environment: false,
+            write_back_writable_parameters,
         });
         Ok(())
     }
@@ -10586,7 +10618,14 @@ impl Interpreter<'_> {
         continuation: CheckedContinuation,
         entered_from: Span,
     ) -> Result<(), InterpreterError> {
-        self.push_frame(function_id, args, argument_places, None, Some(entered_from))?;
+        self.push_frame(
+            function_id,
+            args,
+            argument_places,
+            None,
+            Some(entered_from),
+            false,
+        )?;
         self.frames
             .last_mut()
             .expect("checked frame was just pushed")
@@ -10647,6 +10686,7 @@ impl Interpreter<'_> {
             &frame_argument_places,
             None,
             Some(call_site),
+            true,
         )?;
         let frame = self
             .frames
@@ -13743,6 +13783,7 @@ impl Interpreter<'_> {
                 &[None],
                 Some(ReturnExpectation::Void),
                 None,
+                false,
             )?;
         }
         Ok(())
@@ -14896,110 +14937,6 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
         LocalValue::ClosureEnvironment(value) => {
             mir::Type::ClosureEnvironment(value.as_ref().map(|environment| environment.layout))
         }
-    }
-}
-
-fn operand_local(operand: &mir::Operand) -> Option<mir::LocalId> {
-    match operand {
-        mir::Operand::Local(local) | mir::Operand::NullablePayload(local) => Some(*local),
-        _ => None,
-    }
-}
-
-fn value_expression_local(value: &mir::ValueExpression) -> Option<mir::LocalId> {
-    match value {
-        mir::ValueExpression::Integer(mir::IntegerExpression::Use { operand, .. })
-        | mir::ValueExpression::Float(mir::FloatExpression::Use { operand, .. })
-        | mir::ValueExpression::Bool(mir::BoolExpression::Use { operand })
-        | mir::ValueExpression::Enum(mir::EnumExpression::Use { operand, .. }) => {
-            operand_local(operand)
-        }
-        _ => None,
-    }
-}
-
-fn payload_place_local(place: &mir::PayloadEnumPlace) -> Option<mir::LocalId> {
-    match place {
-        mir::PayloadEnumPlace::Local(local)
-        | mir::PayloadEnumPlace::NullableLocalAssumeNonNull(local) => Some(*local),
-        _ => None,
-    }
-}
-
-/// Returns the source local only when an argument is a direct use of one place.
-/// Composite expressions intentionally have no origin: their result is a value,
-/// not an alias to one of the operands used to compute it.
-fn direct_rvalue_local(value: &mir::Rvalue) -> Option<mir::LocalId> {
-    match value {
-        mir::Rvalue::Value(value) => value_expression_local(value),
-        mir::Rvalue::String(
-            mir::StringExpression::Local(local)
-            | mir::StringExpression::NullableLocalAssumeNonNull(local),
-        )
-        | mir::Rvalue::NullableString(mir::NullableStringExpression::Local(local))
-        | mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Local { local, .. })
-        | mir::Rvalue::Mixed(mir::MixedExpression::Local { local, .. })
-        | mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Local { local, .. })
-        | mir::Rvalue::Error(
-            mir::ErrorExpression::Local { local, .. }
-            | mir::ErrorExpression::NullableLocalAssumeNonNull { local, .. },
-        )
-        | mir::Rvalue::NullableError(mir::NullableErrorExpression::Local { local, .. })
-        | mir::Rvalue::Class(
-            mir::ClassExpression::Local { local, .. }
-            | mir::ClassExpression::NullableLocalAssumeNonNull { local, .. },
-        )
-        | mir::Rvalue::NullableClass(mir::NullableClassExpression::Local { local, .. })
-        | mir::Rvalue::Collection(mir::CollectionExpression::Local { local, .. })
-        | mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Local {
-            local, ..
-        })
-        | mir::Rvalue::Function(mir::FunctionExpression::Local { local, .. })
-        | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Local { local, .. }) => {
-            Some(*local)
-        }
-        mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use { place, .. })
-        | mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
-            place, ..
-        }) => payload_place_local(place),
-        mir::Rvalue::SharedReference(
-            mir::SharedReferenceExpression::Local { local, .. }
-            | mir::SharedReferenceExpression::NullableLocalAssumeNonNull { local, .. },
-        )
-        | mir::Rvalue::WeakReference(
-            mir::WeakReferenceExpression::Local { local, .. }
-            | mir::WeakReferenceExpression::NullableLocalAssumeNonNull { local, .. },
-        )
-        | mir::Rvalue::NullableSharedReference(mir::NullableSharedReferenceExpression::Local {
-            local,
-            ..
-        })
-        | mir::Rvalue::NullableWeakReference(mir::NullableWeakReferenceExpression::Local {
-            local,
-            ..
-        })
-        | mir::Rvalue::WritableSharedReference(
-            mir::WritableSharedReferenceExpression::Local { local, .. }
-            | mir::WritableSharedReferenceExpression::NullableLocalAssumeNonNull { local, .. },
-        )
-        | mir::Rvalue::WritableWeakReference(
-            mir::WritableWeakReferenceExpression::Local { local, .. }
-            | mir::WritableWeakReferenceExpression::NullableLocalAssumeNonNull { local, .. },
-        )
-        | mir::Rvalue::NullableWritableSharedReference(
-            mir::NullableWritableSharedReferenceExpression::Local { local, .. },
-        )
-        | mir::Rvalue::NullableWritableWeakReference(
-            mir::NullableWritableWeakReferenceExpression::Local { local, .. },
-        )
-        | mir::Rvalue::SharedReferenceAccess(
-            mir::SharedReferenceAccessExpression::Local { local, .. }
-            | mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull { local, .. },
-        )
-        | mir::Rvalue::NullableSharedReferenceAccess(
-            mir::NullableSharedReferenceAccessExpression::Local { local, .. },
-        ) => Some(*local),
-        _ => None,
     }
 }
 

@@ -57,7 +57,7 @@ declare(strict_types=1);
         ]);
     }
     $require($paths['decision'], $files['decision'], [
-        'Authority Accepted; Stages 30a Through 30f Implemented; Stage 30g Next; Stage 30 Not Complete',
+        'Authority Accepted; Stages 30a Through 30g Implemented; Stage 30h Next; Stage 30 Not Complete',
     ]);
     $require($paths['audit'], $files['audit'], [
         'No valid supported plain closure route emits it',

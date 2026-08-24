@@ -903,6 +903,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
     let binding_resolution = BindingResolution::default();
     let closures = HashMap::new();
     let callable_value_calls = HashMap::new();
+    let list_algorithm_calls = HashMap::new();
     check_program_with_inferred_move_returns(
         program,
         &OwnershipAnalysisContext {
@@ -917,6 +918,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
             binding_resolution: &binding_resolution,
             closures: &closures,
             callable_value_calls: &callable_value_calls,
+            list_algorithm_calls: &list_algorithm_calls,
         },
     )
     .diagnostics
@@ -935,6 +937,8 @@ pub(crate) struct OwnershipAnalysisContext<'a> {
     pub(crate) closures: &'a HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
     pub(crate) callable_value_calls:
         &'a HashMap<(usize, usize), crate::semantics::CallableValueCallInfo>,
+    pub(crate) list_algorithm_calls:
+        &'a HashMap<(usize, usize), crate::semantics::ListAlgorithmCallInfo>,
 }
 
 pub(crate) fn check_program_with_inferred_move_returns(
@@ -953,6 +957,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         binding_resolution,
         closures,
         callable_value_calls,
+        list_algorithm_calls,
     } = *context;
     let classes = program
         .items
@@ -1167,6 +1172,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         binding_resolution,
         closures,
         callable_value_calls,
+        list_algorithm_calls,
         next_binding_id: 0,
         diagnostics: Vec::new(),
         closure_ownership: HashMap::new(),
@@ -1865,6 +1871,7 @@ struct Checker<'a> {
     binding_resolution: &'a BindingResolution,
     closures: &'a HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
     callable_value_calls: &'a HashMap<(usize, usize), crate::semantics::CallableValueCallInfo>,
+    list_algorithm_calls: &'a HashMap<(usize, usize), crate::semantics::ListAlgorithmCallInfo>,
     next_binding_id: usize,
     diagnostics: Vec<Diagnostic>,
     closure_ownership: HashMap<ClosureId, ClosureOwnershipInfo>,
@@ -4437,7 +4444,14 @@ impl Checker<'_> {
                     return;
                 }
                 if let Some(collection) = self.expr_collection_info(object, scopes) {
-                    self.use_collection_call(collection.family, object, method, args, scopes);
+                    self.use_collection_call(
+                        collection.family,
+                        object,
+                        method,
+                        args,
+                        *span,
+                        scopes,
+                    );
                     self.record_exceptional_exits(*span, scopes);
                     return;
                 }
@@ -6180,8 +6194,34 @@ impl Checker<'_> {
         object: &Expr,
         method: &str,
         args: &[Argument],
+        span: Span,
         scopes: &mut Scopes,
     ) {
+        if let Some(plan) = self
+            .list_algorithm_calls
+            .get(&(span.start, span.end))
+            .cloned()
+        {
+            let borrow_depth = self.active_borrows.len();
+            self.use_expr(object, scopes, UseMode::Read);
+            self.activate_place_input_borrows(object, scopes);
+            self.activate_borrow(object, UseMode::Read, scopes);
+            for (index, argument) in args.iter().enumerate() {
+                let is_initial =
+                    plan.kind == crate::semantics::ListAlgorithmKind::Reduce && index == 0;
+                if is_initial {
+                    self.use_owned_expression(&argument.value, scopes);
+                    continue;
+                }
+                let mode = match plan.callback_access {
+                    crate::semantics::ListCallbackAccess::Readonly => UseMode::Read,
+                    crate::semantics::ListCallbackAccess::Writable => UseMode::Write,
+                };
+                self.use_expr(&argument.value, scopes, mode);
+            }
+            self.active_borrows.truncate(borrow_depth);
+            return;
+        }
         let mutating = matches!(
             (collection, method),
             (

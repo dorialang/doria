@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-19
 - **Date:** 2026-08-19
-- **Implementation Status:** Authority Accepted; Stages 30a Through 30f Implemented; Stage 30g Next; Stage 30 Not Complete
+- **Implementation Status:** Authority Accepted; Stages 30a Through 30g Implemented; Stage 30h Next; Stage 30 Not Complete
 - **Scope:** Function types, closure invocation, capture validation, ownership,
   lifetime, representation, backend behavior, diagnostics, and Stage 30
   `List<T>` algorithms
@@ -39,8 +39,12 @@ places, and exact environment cleanup. Stage 30e implements the shared native
 two-word carrier and descriptor ABI, stack/heap environment placement, generated
 drop glue, and indirect execution through Cranelift and LLVM. Stage 30f emits
 PHP compatibility closures from the same semantic and validated MIR authority
-through explicit carriers, environments, and stable places. Stage 30 remains in
-progress and is not complete.
+through explicit carriers, environments, and stable places. Stage 30g adds
+explicit semantic and HIR List algorithm plans plus validated MIR traversal CFG
+for `map`, Copy-only `filter`, and writable-accumulator `reduce`. The debug
+interpreter, Cranelift, LLVM, and PHP compatibility execute the supported
+surface with exact callback effects, readonly source traversal, and checked
+partial-state cleanup. Stage 30 remains in progress and is not complete.
 
 ```text
 Stage 30a Callable Grammar Completion — Complete
@@ -49,9 +53,10 @@ Stage 30c Ownership, Lifetime, And Escape — Complete
 Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete
 Stage 30e Native Execution — Complete
 Stage 30f PHP Compatibility — Complete
-Stage 30g List Algorithms — Next
+Stage 30g List Algorithms — Complete
+Stage 30h Cross-Repository Closure — Next
 Stage 30 — In Progress, Not Complete
-E0641 — Unreachable For Supported Plain Closure Execution
+E0641 — Catalogued But Unreachable For The Supported Stage 30g Surface
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping
@@ -542,9 +547,10 @@ Stage 30h - Cross-Repository Closure
   MIR closure plans; compiler-owned carriers, environments, stable places,
   source identities, checked effects, moves, replacement, and cleanup preserve
   Doria behavior without PHP automatic capture or host callable semantics.
-- **Stage 30g:** the three `List<T>` algorithms, internal effect variables,
-  partial-result cleanup, and all-backend parity.
-- **Stage 30h:** final language-server semantics, installed-toolchain refresh,
+- **Stage 30g — Complete:** the three `List<T>` algorithms, internal effect
+  specialization, partial-result and accumulator cleanup, shared MIR validation,
+  and interpreter/Cranelift/LLVM/PHP parity.
+- **Stage 30h — Next:** final language-server semantics, installed-toolchain refresh,
   website/playground activation, benchmark closure, final audit, and historical
   E0641.
 

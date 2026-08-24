@@ -294,6 +294,12 @@ fn collect_closure_expressions<'a>(
                     visit_expr(&argument.value, closures);
                 }
             }
+            hir::Expr::ListAlgorithmCall(call) => {
+                visit_expr(&call.receiver, closures);
+                for argument in &call.arguments {
+                    visit_expr(&argument.value, closures);
+                }
+            }
             hir::Expr::InterpolatedString { parts, .. } => {
                 for part in parts {
                     if let hir::InterpolatedStringPart::Expr(expr) = part {
@@ -2926,13 +2932,19 @@ fn lower_closure_function(
         .iter()
         .zip(&definition.parameters)
     {
-        params.push(context.declare_user_local_owned(
+        let local = context.declare_user_local_owned(
             &parameter.name,
             parameter.writable,
             definition.ty,
             matches!(definition.mode, mir::FunctionParameterMode::Take)
                 && definition.ty.has_move_ownership(),
-        ));
+        );
+        if definition.mode == mir::FunctionParameterMode::Writable
+            && definition.ty.has_move_ownership()
+        {
+            context.replaceable_writable_parameters.insert(local);
+        }
+        params.push(local);
     }
 
     if !definition.checked_effects.is_empty() {
@@ -5065,6 +5077,7 @@ struct LoweringContext<'semantic> {
     closure_plans: HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
     current_class: Option<ClassId>,
     locals: Vec<mir::Local>,
+    replaceable_writable_parameters: HashSet<mir::LocalId>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
     materialized_collection_places: HashMap<(usize, usize), mir::LocalId>,
     scope_owned_locals: Vec<Vec<DropObligation>>,
@@ -5194,6 +5207,7 @@ impl<'semantic> LoweringContext<'semantic> {
             closure_plans: inputs.closure_plans.clone(),
             current_class: None,
             locals: Vec::new(),
+            replaceable_writable_parameters: HashSet::new(),
             local_scopes: vec![HashMap::new()],
             materialized_collection_places: HashMap::new(),
             scope_owned_locals: vec![Vec::new()],
@@ -5253,6 +5267,7 @@ impl<'semantic> LoweringContext<'semantic> {
                                 metrics.given_predicate_count += plan.predicates.len();
                             }
                             mir::ControlFlowPlan::DoWhile(_) => metrics.do_while_count += 1,
+                            mir::ControlFlowPlan::ListAlgorithm(_) => {}
                             mir::ControlFlowPlan::Finalizer(plan) => {
                                 metrics.finalizer_count += 1;
                                 metrics.structured_exit_count += plan.exits.len();
@@ -5904,6 +5919,10 @@ impl<'semantic> LoweringContext<'semantic> {
             .filter(|local| local.id == id)
             .expect("lowered MIR local must have a matching slot")
             .owned
+    }
+
+    fn local_may_replace_borrowed_value(&self, id: mir::LocalId) -> bool {
+        self.replaceable_writable_parameters.contains(&id)
     }
 
     fn class_id_for_name(&self, name: &str) -> Option<ClassId> {
@@ -7392,7 +7411,10 @@ fn lower_assignment(
     }
     let target = lower_assignment_target(target, context)?;
     let target_type = context.local_type(target);
-    if user_local_type_owns_value(target_type) && !context.local_owns(target) {
+    if user_local_type_owns_value(target_type)
+        && !context.local_owns(target)
+        && !context.local_may_replace_borrowed_value(target)
+    {
         let diagnostic = if matches!(target_type, mir::Type::Class(_)) {
             Diagnostic::new(
                 "E0505",
@@ -14374,6 +14396,17 @@ fn materialize_checked_rvalue(
     consume_result: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<mir::Rvalue>> {
+    if let hir::Expr::ListAlgorithmCall(call) = expr {
+        let (local, ty) = materialize_list_algorithm_call(call, context)?;
+        if ty != expected {
+            return Err(vec![Diagnostic::new(
+                "I3002",
+                "List algorithm result does not match its semantic result type",
+                call.span,
+            )]);
+        }
+        return Ok(Some(local_rvalue(local, ty, consume_result)));
+    }
     let Some((local, ty, transfer)) = materialize_checked_call(expr, consume_result, context)?
     else {
         return Ok(None);
@@ -14385,6 +14418,428 @@ fn materialize_checked_rvalue(
         )]);
     }
     Ok(Some(local_rvalue(local, ty, transfer)))
+}
+
+fn declare_list_algorithm_value_local(
+    prefix: &str,
+    writable: bool,
+    ty: mir::Type,
+    context: &mut LoweringContext,
+) -> mir::LocalId {
+    let local = if user_local_type_owns_value(ty) {
+        context.declare_owned_temp(ty)
+    } else if matches!(ty, mir::Type::String | mir::Type::NullableString) {
+        let local = context.declare_borrowed_temp(ty, writable);
+        context
+            .statement_owned_locals
+            .last_mut()
+            .expect("List algorithm requires an active statement scope")
+            .push(DropObligation::String(local));
+        local
+    } else {
+        context.declare_borrowed_temp(ty, writable)
+    };
+    context.locals[local.0].name = format!("{prefix}{}", context.temp_counter);
+    context.temp_counter += 1;
+    context.locals[local.0].writable = writable;
+    local
+}
+
+fn materialize_list_algorithm_call(
+    call: &hir::ListAlgorithmCall,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<(mir::LocalId, mir::Type)> {
+    let concrete = |ty: &crate::types::ResolvedType, context: &LoweringContext<'_>| {
+        let ty = substitute_resolved_type(ty, &context.type_substitutions);
+        context.mir_resolved_type(&ty)
+    };
+    let mir::Type::Collection(source_type) =
+        concrete(&call.receiver_type, context).ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I3002",
+                "List algorithm source type has no concrete MIR representation",
+                call.receiver_span,
+            )]
+        })?
+    else {
+        return Err(vec![Diagnostic::new(
+            "I3002",
+            "List algorithm source is not a concrete List type",
+            call.receiver_span,
+        )]);
+    };
+    let source_definition = context.collection_type(source_type).clone();
+    if source_definition.kind != mir::CollectionKind::List {
+        return Err(vec![Diagnostic::new(
+            "I3002",
+            "List algorithm source MIR type is not List",
+            call.receiver_span,
+        )]);
+    }
+    let element_type = concrete(&call.element_type, context).ok_or_else(|| {
+        vec![Diagnostic::new(
+            "I3002",
+            "List algorithm element type has no concrete MIR representation",
+            call.span,
+        )]
+    })?;
+    if source_definition.value != element_type {
+        return Err(vec![Diagnostic::new(
+            "I3002",
+            "List algorithm element type does not match its source List",
+            call.span,
+        )]);
+    }
+    let result_type = concrete(&call.result_type, context).ok_or_else(|| {
+        vec![Diagnostic::new(
+            "I3002",
+            "List algorithm result type has no concrete MIR representation",
+            call.span,
+        )]
+    })?;
+    let mir::Type::Function(function_type) =
+        concrete(&call.callback_type, context).ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I3002",
+                "List algorithm callback type has no concrete MIR representation",
+                call.callback_span,
+            )]
+        })?
+    else {
+        return Err(vec![Diagnostic::new(
+            "I3002",
+            "List algorithm callback is not a concrete function type",
+            call.callback_span,
+        )]);
+    };
+    let function = context
+        .collection_registry
+        .function_types
+        .get(function_type.0)
+        .filter(|definition| definition.id == function_type)
+        .cloned()
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I3002",
+                "List algorithm callback function type is not interned",
+                call.callback_span,
+            )]
+        })?;
+
+    materialize_collection_place_as(&call.receiver, source_type, false, context)?;
+    let (source, actual_source_type) = lower_collection_local(&call.receiver, context)?;
+    if actual_source_type != source_type {
+        return Err(vec![Diagnostic::new(
+            "I3002",
+            "List algorithm receiver materialized with another collection type",
+            call.receiver_span,
+        )]);
+    }
+
+    let (accumulator, callback_argument) = match call.kind {
+        hir::ListAlgorithmKind::Reduce => {
+            let [initial, callback] = call.arguments.as_slice() else {
+                return Err(vec![Diagnostic::new(
+                    "I3002",
+                    "checked List::reduce does not have two arguments",
+                    call.span,
+                )]);
+            };
+            let accumulator_type = call
+                .accumulator_type
+                .as_ref()
+                .and_then(|ty| concrete(ty, context))
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "I3002",
+                        "List::reduce accumulator type has no concrete MIR representation",
+                        initial.span,
+                    )]
+                })?;
+            if accumulator_type != result_type {
+                return Err(vec![Diagnostic::new(
+                    "I3002",
+                    "List::reduce accumulator and result MIR types differ",
+                    call.span,
+                )]);
+            }
+            let initial_value =
+                lower_rvalue_as_expected(&initial.value, accumulator_type, context)?;
+            let accumulator = declare_list_algorithm_value_local(
+                "_list_reduce_accumulator",
+                true,
+                accumulator_type,
+                context,
+            );
+            context.push_statement(mir::Statement::AssignLocal {
+                target: accumulator,
+                value: initial_value,
+            });
+            (Some(accumulator), callback)
+        }
+        hir::ListAlgorithmKind::Map | hir::ListAlgorithmKind::Filter => {
+            let [callback] = call.arguments.as_slice() else {
+                return Err(vec![Diagnostic::new(
+                    "I3002",
+                    "checked List algorithm does not have one callback argument",
+                    call.span,
+                )]);
+            };
+            (None, callback)
+        }
+    };
+
+    let callback_value =
+        lower_function_expression(&callback_argument.value, function_type, false, context)?;
+    let callback_owned = !mir::function_expression_is_borrowed(&callback_value);
+    let callback_local = if callback_owned {
+        context.declare_owned_temp(mir::Type::Function(function_type))
+    } else {
+        context.declare_borrowed_temp(
+            mir::Type::Function(function_type),
+            call.callback_access == hir::ListCallbackAccess::Writable,
+        )
+    };
+    context.locals[callback_local.0].writable =
+        call.callback_access == hir::ListCallbackAccess::Writable;
+    context.push_statement(mir::Statement::AssignLocal {
+        target: callback_local,
+        value: mir::Rvalue::Function(callback_value),
+    });
+
+    let output = match call.kind {
+        hir::ListAlgorithmKind::Map | hir::ListAlgorithmKind::Filter => {
+            let mir::Type::Collection(output_type) = result_type else {
+                return Err(vec![Diagnostic::new(
+                    "I3002",
+                    "List::map/filter result is not a collection",
+                    call.span,
+                )]);
+            };
+            let output = declare_list_algorithm_value_local(
+                "_list_algorithm_result",
+                true,
+                result_type,
+                context,
+            );
+            context.push_statement(mir::Statement::AssignLocal {
+                target: output,
+                value: mir::Rvalue::Collection(mir::CollectionExpression::Literal {
+                    collection: output_type,
+                    entries: Vec::new(),
+                }),
+            });
+            Some(output)
+        }
+        hir::ListAlgorithmKind::Reduce => None,
+    };
+
+    let index_type = IntegerType::Int64;
+    let count = context.declare_temp(false, index_type);
+    let index = context.declare_temp(true, index_type);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: count,
+        value: mir::Rvalue::Value(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+            ty: index_type,
+            operand: mir::Operand::CollectionLength(source),
+        })),
+    });
+    context.push_statement(mir::Statement::AssignLocal {
+        target: index,
+        value: integer_constant_rvalue(0),
+    });
+
+    let header = context.create_block();
+    let body = context.create_block();
+    let after_callback = context.create_block();
+    let update = context.create_block();
+    let exit = context.create_block();
+    let setup = context
+        .current_block
+        .expect("List algorithm setup block must remain reachable");
+    context.terminate_current(mir::Terminator::Jump(header));
+    context.current_block = Some(header);
+    context.terminate_current(mir::Terminator::Branch {
+        condition: mir::BoolExpression::Compare {
+            op: mir::CompareOp::Less,
+            left: Box::new(mir::ValueExpression::Integer(local_integer_expression(
+                index, index_type,
+            ))),
+            right: Box::new(mir::ValueExpression::Integer(local_integer_expression(
+                count, index_type,
+            ))),
+        },
+        then_block: body,
+        else_block: exit,
+    });
+
+    context.current_block = Some(body);
+    let offset = collection_offset_rvalue(index);
+    let element = collection_value_rvalue(source, offset.clone(), offset, element_type, true)?;
+    let mut callback_args = Vec::with_capacity(function.parameters.len());
+    if let Some(accumulator) = accumulator {
+        callback_args.push(local_rvalue(accumulator, result_type, false));
+    }
+    callback_args.push(element.clone());
+    let callback_result = match function.return_type {
+        mir::ReturnType::Void => None,
+        mir::ReturnType::Value(ty) => {
+            let owned = user_local_type_owns_value(ty);
+            let local = context.declare_checked_call_slot(ty, owned);
+            track_checked_result(local, ty, owned, context);
+            Some((local, ty))
+        }
+    };
+    let callee = mir::FunctionExpression::Local {
+        function_type,
+        local: callback_local,
+        transfer: false,
+    };
+    let mut callback_failure = None;
+    if function.checked_effects.is_empty() {
+        context.terminate_current(mir::Terminator::IndirectCall {
+            callee,
+            function_type,
+            invocation_mode: function.invocation_mode,
+            args: callback_args,
+            result: callback_result.map(|(local, _)| local),
+            continuation: after_callback,
+            span: call.callback_span,
+        });
+    } else {
+        let error = context.declare_checked_call_slot(mir::Type::Error, true);
+        let failure = context.create_block();
+        callback_failure = Some(failure);
+        context.terminate_current(mir::Terminator::CheckedIndirectCall {
+            callee,
+            function_type,
+            invocation_mode: function.invocation_mode,
+            args: callback_args,
+            result: callback_result.map(|(local, _)| local),
+            error,
+            success: after_callback,
+            failure,
+            span: call.callback_span,
+        });
+        let statement_temporaries = context.statement_owned_locals.clone();
+        context.current_block = Some(failure);
+        context.route_checked_error(error);
+        context.statement_owned_locals = statement_temporaries;
+    }
+
+    context.current_block = Some(after_callback);
+    let mut filter_selected = None;
+    match call.kind {
+        hir::ListAlgorithmKind::Map => {
+            let output = output.expect("map has an output List");
+            let (result, result_ty) = callback_result.expect("map callback returns a value");
+            context.push_statement(mir::Statement::CollectionAdd {
+                collection: output,
+                value: local_rvalue(result, result_ty, true),
+                index: None,
+                op: mir::CollectionMutationOp::Add,
+            });
+            context.terminate_current(mir::Terminator::Jump(update));
+        }
+        hir::ListAlgorithmKind::Filter => {
+            let output = output.expect("filter has an output List");
+            let (predicate, predicate_type) =
+                callback_result.expect("filter callback returns bool");
+            if predicate_type != mir::Type::Scalar(mir::ScalarType::Bool) {
+                return Err(vec![Diagnostic::new(
+                    "I3002",
+                    "List::filter callback result is not bool in MIR",
+                    call.callback_span,
+                )]);
+            }
+            let selected = context.create_block();
+            filter_selected = Some(selected);
+            context.terminate_current(mir::Terminator::Branch {
+                condition: mir::BoolExpression::Use {
+                    operand: mir::Operand::Local(predicate),
+                },
+                then_block: selected,
+                else_block: update,
+            });
+            context.current_block = Some(selected);
+            context.push_statement(mir::Statement::CollectionAdd {
+                collection: output,
+                value: element,
+                index: None,
+                op: mir::CollectionMutationOp::Add,
+            });
+            context.terminate_current(mir::Terminator::Jump(update));
+        }
+        hir::ListAlgorithmKind::Reduce => {
+            context.terminate_current(mir::Terminator::Jump(update));
+        }
+    }
+
+    context.current_block = Some(update);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: index,
+        value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+            mir::IntegerExpression::Binary {
+                ty: index_type,
+                op: mir::IntegerBinaryOp::Add,
+                left: Box::new(local_integer_expression(index, index_type)),
+                right: Box::new(mir::IntegerExpression::constant(IntegerValue::one(
+                    index_type,
+                ))),
+                span: call.span,
+                right_span: call.span,
+            },
+        )),
+    });
+    context.terminate_current(mir::Terminator::Jump(header));
+    context.current_block = Some(exit);
+
+    context.blocks[setup.0]
+        .statements
+        .push(mir::Statement::ControlFlowPlan(
+            mir::ControlFlowPlan::ListAlgorithm(Box::new(mir::ListAlgorithmPlan {
+                kind: match call.kind {
+                    hir::ListAlgorithmKind::Map => mir::ListAlgorithmKind::Map,
+                    hir::ListAlgorithmKind::Filter => mir::ListAlgorithmKind::Filter,
+                    hir::ListAlgorithmKind::Reduce => mir::ListAlgorithmKind::Reduce,
+                },
+                source,
+                source_collection: source_type,
+                element_type,
+                result_type,
+                accumulator_type: accumulator.map(|_| result_type),
+                callback: callback_local,
+                callback_type: function_type,
+                callback_access: match call.callback_access {
+                    hir::ListCallbackAccess::Readonly => mir::FunctionInvocationMode::Readonly,
+                    hir::ListCallbackAccess::Writable => mir::FunctionInvocationMode::Writable,
+                },
+                checked_effects: function.checked_effects.clone(),
+                output,
+                accumulator,
+                count,
+                index,
+                callback_result: callback_result.map(|(local, _)| local),
+                callback_failure,
+                filter_selected,
+                setup,
+                header,
+                body,
+                callback_success: after_callback,
+                update,
+                exit,
+                source_span: call.span,
+            })),
+        ));
+
+    Ok(match call.kind {
+        hir::ListAlgorithmKind::Map | hir::ListAlgorithmKind::Filter => {
+            (output.expect("algorithm output exists"), result_type)
+        }
+        hir::ListAlgorithmKind::Reduce => {
+            (accumulator.expect("reduce accumulator exists"), result_type)
+        }
+    })
 }
 
 fn materialize_checked_signature_call(
@@ -16356,6 +16811,12 @@ fn materialize_nested_collection_places(
 ) -> DiagnosticResult<()> {
     match expr {
         hir::Expr::Closure(_) | hir::Expr::CallableCall(_) => {}
+        hir::Expr::ListAlgorithmCall(call) => {
+            materialize_nested_collection_places(&call.receiver, false, context)?;
+            for argument in &call.arguments {
+                materialize_nested_collection_places(&argument.value, false, context)?;
+            }
+        }
         hir::Expr::Array { elements, .. } => {
             for element in elements {
                 if let Some(key) = &element.key {
@@ -21423,6 +21884,9 @@ fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
         hir::Expr::Closure(_) => "a closure value cannot be used as an integer expression",
         hir::Expr::CallableCall(_) => {
             "this callable result cannot be used as an integer expression in this lowering path"
+        }
+        hir::Expr::ListAlgorithmCall(_) => {
+            "this List algorithm result cannot be used as an integer expression in this lowering path"
         }
         hir::Expr::String { .. } | hir::Expr::InterpolatedString { .. } => {
             "a string expression cannot be used as an integer expression"

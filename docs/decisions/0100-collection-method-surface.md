@@ -99,7 +99,7 @@ through the Stage 22 flow model. Naming follows the §9.1 charter.
 | `contains(T): bool` | readonly | value membership |
 | `first: ?T` / `last: ?T` | readonly properties | safe end borrows; `null` if empty |
 | `count` / `isEmpty` | readonly properties | live size / emptiness |
-| `map` / `filter` / `reduce` | — | **deferred to Stage 30g**; exact `List<T>` contracts are finalized by Decision 0121 |
+| `map` / `filter` / `reduce` | readonly | **implemented by Stage 30g** for `List<T>` only; Decision 0121 fixes callback, ownership, effect, and cleanup contracts |
 
 ### `Dictionary<K, V>`
 
@@ -237,9 +237,9 @@ with the runtime representation (0092).
   and the missing-element contract are fixed, not improvised.
 - The whole 0092 family has a coherent surface, so the sorted variants,
   `PriorityQueue`, and `Deque` slot in without a second design pass.
-- `map`/`filter`/`reduce` belong only to `List<T>` and are scheduled at Stage 30g
-  under Decision 0121; until then a call yields a stage-named unsupported
-  diagnostic under the two-clocks rule.
+- `map`/`filter`/`reduce` belong only to `List<T>` and are implemented by Stage
+  30g under Decision 0121. Other collection families retain their ordinary
+  unavailable-member diagnostics.
 - The `void`-mutator choice and 0088's fluent-API conventions are explicitly
   reconciled: built-in collections are not fluent, user types may be.
 
@@ -249,7 +249,7 @@ The default `List`/`Dictionary`/`Set` surface (minus `map`/`filter`/`reduce`) an
 `T[]` land at Stage 23 (the collections-runtime slice). `SortedDictionary`,
 `SortedSet`, `PriorityQueue`, and `Deque` land with their types, at or after Stage
 23 per the collections-runtime rollout. `List<T>` alone receives
-`map`/`filter`/`reduce` at Stage 30g under Decision 0121. Nothing here changes the
+`map`/`filter`/`reduce` through Stage 30g under Decision 0121. Nothing here changes the
 type inventory or naming (0092).
 
 ## Affected components
@@ -257,9 +257,9 @@ type inventory or naming (0092).
 Semantic analysis (member resolution, receiver-mode and move/borrow checking for
 collection members), the collections-runtime implementation in `doria-rt`, shared
 MIR validation (indexed-place and move/borrow invariants), diagnostics
-(missing-element panic messages, `map`/`filter`/`reduce` stage-named
-unsupported), plan §4.9 and §9, the stdlib reference, and the durable parity
-fixtures. SPEC is updated when the members are implemented, not now.
+(missing-element panic messages and compiler-owned List algorithm contract
+errors), plan §4.9 and §9, the stdlib reference, and the durable parity fixtures.
+Stage 30g updates SPEC for the implemented List algorithm members.
 
 ## Invalidated elsewhere
 

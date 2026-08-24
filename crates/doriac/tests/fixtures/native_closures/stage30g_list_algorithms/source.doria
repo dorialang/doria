@@ -1,0 +1,33 @@
+function main(): void
+{
+    List<int> $values = [1, 2, 3, 4];
+    let writable $calls = 0;
+    let writable $twice = function (int $value): int with (writable $calls) {
+        $calls += 1;
+        return $value * 2;
+    };
+
+    List<int> $mapped = $values->map($twice);
+    List<int> $filtered = $values->filter(fn(int $value) => $value > 2);
+    int $total = $values->reduce(
+        0,
+        function (writable int $sum, int $value): void {
+            $sum += $value;
+        },
+    );
+
+    List<string> $parts = ["atlas", "birch", "cedar"];
+    List<string> $selected = $parts->filter(fn(string $part) => $part != "birch");
+    List<string> $copy = $parts->reduce(
+        [],
+        function (writable List<string> $result, string $part): void {
+            $result->add($part);
+        },
+    );
+
+    foreach ($mapped as int $value) { echo "m={$value}\n"; }
+    foreach ($filtered as int $value) { echo "f={$value}\n"; }
+    foreach ($selected as string $part) { echo "s={$part}\n"; }
+    foreach ($copy as string $part) { echo "p={$part}\n"; }
+    echo "sum={$total} calls={$calls} source={$values->count}\n";
+}

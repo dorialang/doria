@@ -10,3 +10,5 @@ native_closures/payload_enum_storage
 native_closures/checked_effect
 native_closures/checked_once
 php_closures/panic_no_cleanup
+php_closures/stage30g_list_algorithms
+php_closures/stage30g_checked_algorithms

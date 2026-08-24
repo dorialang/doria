@@ -70,6 +70,13 @@ counting; PHP uses explicit compiler-generated carriers, environments, and
 stable places rather than PHP automatic capture or references as language
 semantics.
 
+`List<T>` provides `map`, Copy-preserving `filter`, and writable-accumulator
+`reduce`. These methods borrow the source readonly, visit elements in insertion
+order, accept readonly- or writable-repeatable callbacks, and propagate the
+callback's exact checked Errors. `map` may produce owned Move values, while
+`filter` remains limited to Copy elements until an explicit cloning capability
+exists. Other collection families do not expose these algorithms.
+
 When a graph genuinely needs several owners, Doria provides an explicit escape
 hatch rather than changing the default model. `shared new Node()` creates a
 readonly `SharedReference<Node>`; writable shared graphs use

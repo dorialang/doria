@@ -707,18 +707,18 @@ function main(): void
 }
 
 #[test]
-fn later_collection_family_and_closure_members_keep_named_gates() {
+fn deferred_collection_family_members_keep_named_gates() {
     let closures = diagnostic(
         r#"
 function main(): void
 {
-    List<int> $values = [1];
+    Set<int> $values = Set::from([1]);
     $values->map(unknown);
 }
 "#,
         "E0521",
     );
-    assert!(closures.message.contains("Stage 30"));
+    assert!(closures.message.contains("Decision 0113"));
 
     let family = diagnostic(
         r#"

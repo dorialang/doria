@@ -217,8 +217,12 @@ final class SortedDictionary extends __DoriaOrderedCollection implements ArrayAc
     {
         if ($name === 'count') { return count($this->entries); }
         if ($name === 'isEmpty') { return count($this->entries) === 0; }
-        if ($name === 'keys') { return array_map(fn($entry) => $entry[0], $this->entries); }
-        if ($name === 'values') { return array_map(fn($entry) => $entry[1], $this->entries); }
+        if ($name === 'keys' || $name === 'values') {
+            $projection = [];
+            $index = $name === 'keys' ? 0 : 1;
+            foreach ($this->entries as $entry) { $projection[] = $entry[$index]; }
+            return $projection;
+        }
         return null;
     }
 
@@ -2048,6 +2052,10 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             validate_expr(&call.callee, semantic_info)?;
             validate_arguments(&call.args, semantic_info)
         }
+        Expr::ListAlgorithmCall(call) => {
+            validate_expr(&call.receiver, semantic_info)?;
+            validate_arguments(&call.arguments, semantic_info)
+        }
         Expr::Variable { .. }
         | Expr::This { .. }
         | Expr::Identifier { .. }
@@ -2112,10 +2120,12 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             ..
         } => {
             validate_expr(object, semantic_info)?;
-            if semantic_info
-                .expression_type(object.span())
-                .is_some_and(is_stage23_runtime_type)
-            {
+            let receiver_type = semantic_info.expression_type(object.span());
+            let supported_list_property = matches!(
+                receiver_type,
+                Some(ResolvedType::List(_)) if matches!(property.as_str(), "count" | "isEmpty")
+            );
+            if receiver_type.is_some_and(is_stage23_runtime_type) && !supported_list_property {
                 return Err(unsupported_collection_shape(
                     *span,
                     format!("collection property `{property}`"),
@@ -2145,9 +2155,9 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
         } => {
             validate_expr(object, semantic_info)?;
             validate_arguments(args, semantic_info)?;
-            if semantic_info
-                .expression_type(object.span())
-                .is_some_and(is_stage23_runtime_type)
+            let receiver_type = semantic_info.expression_type(object.span());
+            if receiver_type.is_some_and(is_stage23_runtime_type)
+                && !matches!(receiver_type, Some(ResolvedType::List(_)) if method == "add")
             {
                 return Err(unsupported_collection_shape(
                     *span,
@@ -2493,6 +2503,7 @@ fn requires_php_runtime_property_initializer(
     }
     match expr {
         Expr::Closure(_) | Expr::CallableCall(_) => Some((expr.span(), "closure execution")),
+        Expr::ListAlgorithmCall(call) => Some((call.span, "List algorithm execution")),
         Expr::StaticMember {
             class_name,
             member,
@@ -5047,10 +5058,46 @@ fn emit_callable_call(call: &CallableCall, scopes: &PhpNameScopes) -> String {
     format!("({callee})({arguments})")
 }
 
+fn emit_list_algorithm_call(call: &ListAlgorithmCall, scopes: &PhpNameScopes) -> String {
+    let source = emit_expr(&call.receiver, scopes);
+    let callback_index = usize::from(call.kind == ListAlgorithmKind::Reduce);
+    let callback = emit_expr(&call.arguments[callback_index].value, scopes);
+    let mut body = if call.kind == ListAlgorithmKind::Reduce {
+        "(function ($__doriaAlgorithmSource, $__doriaAlgorithmInitial, $__doriaAlgorithmCallback) { ".to_string()
+    } else {
+        "(function ($__doriaAlgorithmSource, $__doriaAlgorithmCallback) { ".to_string()
+    };
+    match call.kind {
+        ListAlgorithmKind::Map | ListAlgorithmKind::Filter => {
+            body.push_str("$__doriaAlgorithmResult = []; try { foreach ($__doriaAlgorithmSource as $__doriaAlgorithmElement) { ");
+            if call.kind == ListAlgorithmKind::Map {
+                body.push_str("$__doriaAlgorithmValue = ($__doriaAlgorithmCallback)($__doriaAlgorithmElement); $__doriaAlgorithmResult[] = $__doriaAlgorithmValue; ");
+            } else {
+                body.push_str("if (($__doriaAlgorithmCallback)($__doriaAlgorithmElement)) { $__doriaAlgorithmResult[] = $__doriaAlgorithmElement; } ");
+            }
+            body.push_str("} } catch (__DoriaCheckedError $__doriaAlgorithmError) { __doria_drop_value($__doriaAlgorithmResult); throw $__doriaAlgorithmError; } return $__doriaAlgorithmResult; ");
+        }
+        ListAlgorithmKind::Reduce => {
+            body.push_str("$__doriaAlgorithmAccumulator = new __DoriaCell($__doriaAlgorithmInitial); try { foreach ($__doriaAlgorithmSource as $__doriaAlgorithmElement) { ($__doriaAlgorithmCallback)($__doriaAlgorithmAccumulator, $__doriaAlgorithmElement); } } catch (__DoriaCheckedError $__doriaAlgorithmError) { __doria_drop_cell($__doriaAlgorithmAccumulator); throw $__doriaAlgorithmError; } return __doria_take_cell($__doriaAlgorithmAccumulator); ");
+        }
+    }
+    body.push_str("})(");
+    body.push_str(&source);
+    body.push_str(", ");
+    if call.kind == ListAlgorithmKind::Reduce {
+        body.push_str(&emit_owned_expr(&call.arguments[0].value, scopes));
+        body.push_str(", ");
+    }
+    body.push_str(&callback);
+    body.push(')');
+    body
+}
+
 fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
     match expr {
         Expr::Closure(closure) => emit_closure_expression(closure, scopes),
         Expr::CallableCall(call) => emit_callable_call(call, scopes),
+        Expr::ListAlgorithmCall(call) => emit_list_algorithm_call(call, scopes),
         Expr::Variable { name, span } => {
             let value = scopes
                 .place_for_use(*span)
@@ -5117,6 +5164,25 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
         Expr::PropertyAccess {
             object,
             property,
+            null_safe: false,
+            ..
+        } if matches!(
+            scopes
+                .expression_types
+                .get(&(object.span().start, object.span().end)),
+            Some(ResolvedType::List(_))
+        ) && matches!(property.as_str(), "count" | "isEmpty") =>
+        {
+            let count = format!("count({})", emit_expr(object, scopes));
+            if property == "isEmpty" {
+                format!("({count} === 0)")
+            } else {
+                count
+            }
+        }
+        Expr::PropertyAccess {
+            object,
+            property,
             null_safe,
             ..
         } => format!(
@@ -5124,6 +5190,25 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             emit_member_receiver(object, scopes),
             if *null_safe { "?->" } else { "->" }
         ),
+        Expr::MethodCall {
+            object,
+            method,
+            args,
+            null_safe: false,
+            ..
+        } if matches!(
+            scopes
+                .expression_types
+                .get(&(object.span().start, object.span().end)),
+            Some(ResolvedType::List(_))
+        ) && method == "add" =>
+        {
+            let value = args
+                .first()
+                .map(|argument| emit_owned_expr(&argument.value, scopes))
+                .expect("semantic checking requires one List::add argument");
+            format!("({}[] = {value})", emit_expr(object, scopes))
+        }
         Expr::MethodCall {
             object,
             method,

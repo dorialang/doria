@@ -23,3 +23,5 @@ checked_effect
 checked_once
 destructor_order
 panic_no_cleanup
+stage30g_list_algorithms
+stage30g_checked_cleanup

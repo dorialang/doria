@@ -296,12 +296,22 @@ fn function_signature(
             .params
             .push(AbiParam::new(module.target_config().pointer_type()));
     }
-    for parameter in &function.params {
-        append_type_abi_params(
-            &mut signature.params,
-            local_in(function, *parameter)?.ty,
-            module.target_config().pointer_type(),
-        );
+    for (index, parameter) in function.params.iter().enumerate() {
+        let ty = local_in(function, *parameter)?.ty;
+        if function.closure.is_some()
+            && !matches!(ty, mir::Type::ClosureEnvironment(_))
+            && function.parameter_modes[index] == mir::FunctionParameterMode::Writable
+        {
+            signature
+                .params
+                .push(AbiParam::new(module.target_config().pointer_type()));
+        } else {
+            append_type_abi_params(
+                &mut signature.params,
+                ty,
+                module.target_config().pointer_type(),
+            );
+        }
     }
     if plan.checked {
         signature.returns.push(AbiParam::new(types::I8));
@@ -883,7 +893,8 @@ fn define_function(
         for slot in &deferred_class_temporary_slots {
             builder.ins().stack_store(pointer_type, zero, *slot, 0);
         }
-        bind_parameters(&mut builder, function, &local_slots, entry, pointer_type)?;
+        let writable_parameter_addresses =
+            bind_parameters(&mut builder, function, &local_slots, entry, pointer_type)?;
         let signature_plan = native_closure_abi::NativeCallableSignaturePlan::direct(function);
         let parent_frame = builder.block_params(entry)[signature_plan
             .index_of(native_closure_abi::NativeCallableHiddenInput::CurrentFrame)
@@ -1003,6 +1014,7 @@ fn define_function(
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses,
+            writable_parameter_addresses,
             static_ids,
             local_slots: &local_slots,
             deferred_class_temporary_slots,
@@ -1085,6 +1097,7 @@ fn define_class_drop_function(
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
+            writable_parameter_addresses: HashMap::new(),
             static_ids,
             local_slots: &local_slots,
             deferred_class_temporary_slots: Vec::new(),
@@ -1153,6 +1166,7 @@ fn define_collection_drop_function(
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
+            writable_parameter_addresses: HashMap::new(),
             static_ids,
             local_slots: &local_slots,
             deferred_class_temporary_slots: Vec::new(),
@@ -1230,6 +1244,7 @@ fn define_closure_drop_function(
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
+            writable_parameter_addresses: HashMap::new(),
             static_ids,
             local_slots: &local_slots,
             deferred_class_temporary_slots: Vec::new(),
@@ -1385,16 +1400,26 @@ fn bind_parameters(
     slots: &[Option<StackSlot>],
     entry: Block,
     pointer_type: ClifType,
-) -> Result<(), BackendError> {
+) -> Result<HashMap<mir::LocalId, Value>, BackendError> {
     let params = builder.block_params(entry).to_vec();
     let plan = native_closure_abi::NativeCallableSignaturePlan::direct(function);
     let mut params = params.into_iter().skip(plan.source_parameter_offset());
-    for parameter in &function.params {
+    let mut writable_parameter_addresses = HashMap::new();
+    for (index, parameter) in function.params.iter().enumerate() {
         let slot = local_slot(slots, *parameter)?;
         let ty = local_in(function, *parameter)?.ty;
         let first = params
             .next()
             .ok_or_else(|| malformed_mir("function parameter is missing an ABI value"))?;
+        if function.closure.is_some()
+            && !matches!(ty, mir::Type::ClosureEnvironment(_))
+            && function.parameter_modes[index] == mir::FunctionParameterMode::Writable
+        {
+            let value = load_lowered_from_address(builder, ty, first, pointer_type);
+            store_lowered_to_stack(builder, ty, slot, value, pointer_type)?;
+            writable_parameter_addresses.insert(*parameter, first);
+            continue;
+        }
         let first = value_from_doria_abi(builder, first, ty);
         if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) = ty {
             let destination = builder.ins().stack_addr(pointer_type, slot, 0);
@@ -1427,7 +1452,7 @@ fn bind_parameters(
                 .stack_store(pointer_type, payload, slot, payload_offset);
         }
     }
-    Ok(())
+    Ok(writable_parameter_addresses)
 }
 
 fn retain_string_parameters(
@@ -2013,6 +2038,7 @@ struct LoweringResources<'module, 'program> {
     closure_environment_slots: &'program [Option<StackSlot>],
     closure_bound_fields: HashMap<mir::LocalId, BoundClosureField>,
     borrow_home_addresses: HashMap<mir::LocalId, Value>,
+    writable_parameter_addresses: HashMap<mir::LocalId, Value>,
     static_ids: &'program [DataId],
     local_slots: &'program [Option<StackSlot>],
     deferred_class_temporary_slots: Vec<StackSlot>,
@@ -2517,7 +2543,12 @@ fn lower_statement(
             let new_value = lower_rvalue(builder, value, resources)?;
             let slot = local_slot(resources.local_slots, *target)?;
             let pointer = resources.module.target_config().pointer_type();
-            let old_function = (definition.owned
+            let owns_replaced_value =
+                definition.owned || resources.writable_parameter_addresses.contains_key(target);
+            let old_error = (owns_replaced_value
+                && matches!(definition.ty, mir::Type::Error | mir::Type::NullableError))
+            .then(|| load_lowered_from_stack(builder, definition.ty, slot, pointer));
+            let old_function = (owns_replaced_value
                 && matches!(
                     definition.ty,
                     mir::Type::Function(_) | mir::Type::NullableFunction(_)
@@ -2534,14 +2565,16 @@ fn lower_statement(
                         .1,
                     None,
                 )),
-                mir::Type::Class(class) | mir::Type::NullableClass(class) if definition.owned => {
+                mir::Type::Class(class) | mir::Type::NullableClass(class)
+                    if owns_replaced_value =>
+                {
                     Some((
                         load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
                         Some(class),
                     ))
                 }
                 mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_)
-                    if definition.owned =>
+                    if owns_replaced_value =>
                 {
                     Some((
                         load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
@@ -2558,25 +2591,27 @@ fn lower_statement(
                 | mir::Type::WritableSharedReferenceAccess(_)
                 | mir::Type::NullableReadonlySharedReferenceAccess(_)
                 | mir::Type::NullableWritableSharedReferenceAccess(_)
-                    if definition.owned =>
+                    if owns_replaced_value =>
                 {
                     Some((
                         load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
                         None,
                     ))
                 }
-                mir::Type::Mixed | mir::Type::NullableMixed if definition.owned => Some((
+                mir::Type::Mixed | mir::Type::NullableMixed if owns_replaced_value => Some((
                     load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
                     None,
                 )),
-                mir::Type::Collection(_) | mir::Type::NullableCollection(_) if definition.owned => {
+                mir::Type::Collection(_) | mir::Type::NullableCollection(_)
+                    if owns_replaced_value =>
+                {
                     Some((
                         load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
                         None,
                     ))
                 }
                 mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
-                    if definition.owned =>
+                    if owns_replaced_value =>
                 {
                     let nullable = matches!(definition.ty, mir::Type::NullablePayloadEnum(_));
                     let old = create_payload_storage(builder, payload, nullable, resources);
@@ -2592,10 +2627,11 @@ fn lower_statement(
                 }
                 _ => None,
             };
-            if let Some(old) = old_function {
-                lower_drop_function_carrier(builder, old, resources)?;
-            }
             store_lowered_to_stack(builder, definition.ty, slot, new_value, pointer)?;
+            if let Some(address) = resources.writable_parameter_addresses.get(target).copied() {
+                let current = load_lowered_from_stack(builder, definition.ty, slot, pointer);
+                store_lowered_to_address(builder, definition.ty, address, current, pointer)?;
+            }
             if let Some((old, class)) = old_value {
                 if let mir::Type::Collection(collection)
                 | mir::Type::NullableCollection(collection) = definition.ty
@@ -2624,6 +2660,12 @@ fn lower_statement(
                 } else {
                     release_string(builder, old, resources)?;
                 }
+            }
+            if let Some(old) = old_error {
+                lower_drop_error_value(builder, old, resources)?;
+            }
+            if let Some(old) = old_function {
+                lower_drop_function_carrier(builder, old, resources)?;
             }
         }
         mir::Statement::EchoStringLiteral(value) => {
@@ -4067,7 +4109,8 @@ fn lower_indirect_call(
     }
     let carrier = lower_function_expression(builder, callee, resources)?;
     let (descriptor, environment) = carrier.nullable()?;
-    let lowered = lower_call_args(builder, args, resources)?;
+    let lowered =
+        lower_call_args_with_parameters(builder, args, &function_type.parameters, resources)?;
     let pointer = resources.module.target_config().pointer_type();
     let mut values = vec![resources.current_frame];
     if matches!(
@@ -4126,7 +4169,8 @@ fn lower_checked_indirect_call(
     }
     let carrier = lower_function_expression(builder, callee, resources)?;
     let (descriptor, environment) = carrier.nullable()?;
-    let lowered = lower_call_args(builder, args, resources)?;
+    let lowered =
+        lower_call_args_with_parameters(builder, args, &function_type.parameters, resources)?;
     let pointer = resources.module.target_config().pointer_type();
     let mut values = vec![resources.current_frame];
     if let Some(result) = result {
@@ -4195,7 +4239,11 @@ fn indirect_function_signature(
         signature.params.push(AbiParam::new(pointer));
     }
     for parameter in &function_type.parameters {
-        append_type_abi_params(&mut signature.params, parameter.ty, pointer);
+        if parameter.mode == mir::FunctionParameterMode::Writable {
+            signature.params.push(AbiParam::new(pointer));
+        } else {
+            append_type_abi_params(&mut signature.params, parameter.ty, pointer);
+        }
     }
     if plan.checked {
         signature.returns.push(AbiParam::new(types::I8));
@@ -4969,6 +5017,9 @@ fn closure_source_address(
 ) -> Result<Value, BackendError> {
     if let Some(field) = resources.closure_bound_fields.get(&local) {
         return Ok(field.address);
+    }
+    if let Some(address) = resources.writable_parameter_addresses.get(&local) {
+        return Ok(*address);
     }
     if let Some(address) = resources.borrow_home_addresses.get(&local) {
         return Ok(*address);
@@ -14389,11 +14440,46 @@ fn lower_call_args(
     args: &[mir::Rvalue],
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<LoweredCallArgs, BackendError> {
+    lower_call_args_with_optional_parameters(builder, args, None, resources)
+}
+
+fn lower_call_args_with_parameters(
+    builder: &mut FunctionBuilder,
+    args: &[mir::Rvalue],
+    parameters: &[mir::FunctionParameter],
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredCallArgs, BackendError> {
+    lower_call_args_with_optional_parameters(builder, args, Some(parameters), resources)
+}
+
+fn lower_call_args_with_optional_parameters(
+    builder: &mut FunctionBuilder,
+    args: &[mir::Rvalue],
+    parameters: Option<&[mir::FunctionParameter]>,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredCallArgs, BackendError> {
     let mut arguments = Vec::with_capacity(args.len());
     let mut abi_values = Vec::with_capacity(args.len() * 2);
     let mut owned_strings = Vec::new();
     let mut temporary_mixed = Vec::new();
     for (index, argument) in args.iter().enumerate() {
+        if parameters
+            .and_then(|parameters| parameters.get(index))
+            .is_some_and(|parameter| parameter.mode == mir::FunctionParameterMode::Writable)
+        {
+            let local = argument.direct_place_local().ok_or_else(|| {
+                malformed_mir("writable indirect-call argument is not a direct local place")
+            })?;
+            let address = closure_source_address(builder, local, resources)?;
+            arguments.push(load_lowered_from_address(
+                builder,
+                argument.ty(),
+                address,
+                resources.module.target_config().pointer_type(),
+            ));
+            abi_values.push(address);
+            continue;
+        }
         let value = lower_rvalue(builder, argument, resources)?;
         if matches!(argument.ty(), mir::Type::String | mir::Type::NullableString) {
             let string = match argument.ty() {

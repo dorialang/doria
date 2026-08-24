@@ -9,15 +9,16 @@ documents later Stage 30 surfaces and is not an executable manifest.
 
 [Decision 0121](../../../docs/decisions/0121-closure-function-types-capture-semantics-and-execution-model.md)
 accepts the complete closure model and elaborates Decision 0120's explicit
-capture lists. **Stages 30a through 30f are complete**: structural function
+capture lists. **Stages 30a through 30g are complete**: structural function
 types have semantic identity; captures, closure bodies, inferred modes/effects,
 callable-value calls, capture acquisition, Move state, leases, and escape are
 checked; explicit closure/callable-call HIR, structural function MIR, indirect
 calls, environment cleanup, the debug-interpreter oracle, and Cranelift/LLVM
 native execution and explicit PHP compatibility lowering are implemented.
-Stage 30g List algorithms are next. Stage 30 remains in progress and not complete;
-E0641 is unreachable for supported plain closure execution and remains
-catalogued until Stage 30h.
+Stage 30g List algorithms are implemented across the debug interpreter, both
+native profiles, and PHP compatibility for supported values. Stage 30h is next.
+Stage 30 remains in progress and not complete; E0641 is catalogued but
+unreachable for the supported Stage 30g surface until Stage 30h.
 
 The inventory covers:
 
@@ -30,8 +31,9 @@ The inventory covers:
 
 Keeping these examples in this document is deliberate. The accepted syntax has
 checked source fixtures; Stage 30d has a durable debug-interpreter manifest and
-Stages 30e and 30f have separate native and PHP parity manifests. Complete target-state examples
-must not be registered as runnable programs before their owning slices land.
+Stages 30e through 30g have separate native and PHP parity manifests. Complete
+target-state examples must not be registered as runnable programs before their
+owning slices land.
 
 ## No capture
 

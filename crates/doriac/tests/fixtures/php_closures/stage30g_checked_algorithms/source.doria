@@ -1,0 +1,41 @@
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function main(): void
+{
+    List<int> $values = [1, 2, 3];
+
+    try {
+        List<int> $mapped = $values->map(function (int $value): int {
+            if ($value == 3) { throw new Failure("map"); }
+            return $value;
+        });
+    } catch (Failure $error) {
+        echo "caught {$error->message} source={$values->count}\n";
+    }
+
+    try {
+        List<int> $filtered = $values->filter(function (int $value): bool {
+            if ($value == 2) { throw new Failure("filter"); }
+            return true;
+        });
+    } catch (Failure $error) {
+        echo "caught {$error->message} source={$values->count}\n";
+    }
+
+    try {
+        int $total = $values->reduce(
+            0,
+            function (writable int $sum, int $value): void {
+                if ($value == 2) { throw new Failure("reduce"); }
+                $sum = $value;
+            },
+        );
+    } catch (Failure $error) {
+        echo "caught {$error->message} source={$values->count}\n";
+    }
+}

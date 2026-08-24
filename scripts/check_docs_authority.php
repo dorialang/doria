@@ -15,6 +15,7 @@ require_once __DIR__ . '/check_stage30_closure_authority.php';
 require_once __DIR__ . '/check_stage30c_ownership.php';
 require_once __DIR__ . '/check_stage30d_closure_execution.php';
 require_once __DIR__ . '/check_stage30e_native_closure_execution.php';
+require_once __DIR__ . '/check_stage30g_list_algorithms.php';
 require_once __DIR__ . '/check_inferred_main_effects.php';
 require_once __DIR__ . '/check_constructor_owned_property_writes.php';
 
@@ -28,6 +29,7 @@ array_push($failures, ...check_stage30_closure_authority($root));
 array_push($failures, ...check_stage30c_ownership($root));
 array_push($failures, ...check_stage30d_closure_execution($root));
 array_push($failures, ...check_stage30e_native_closure_execution($root));
+array_push($failures, ...check_stage30g_list_algorithms($root));
 array_push($failures, ...check_inferred_main_effects($root));
 array_push($failures, ...check_constructor_owned_property_writes($root));
 

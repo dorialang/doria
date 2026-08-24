@@ -8,6 +8,18 @@ It is **not** a status tracker. Stage completion, sequencing, acceptance criteri
 
 Where sequencing genuinely matters to a rule, express it as a **dependency**, not a stage number: "migrates to declared `throws` when checked errors land" survives renumbering and re-planning; "at Stage 29" does not.
 
+## Agent Response Discipline
+
+Read and follow [`AGENT_RESPONSE_DISCIPLINE.md`](AGENT_RESPONSE_DISCIPLINE.md) before interacting with Andrew. It is binding project guidance, not optional style advice.
+
+In particular:
+
+- Do not infer a technical knowledge gap merely because Andrew asks for clarification or project status. He is managing several technically dense projects and may be recovering context rather than asking for introductory teaching.
+- For stage, slice, beat, dependency, and implementation-status questions, report what has landed, what remains missing or deferred, and which stage, decision, or repository owns the remainder. Stop there unless Andrew asks for rationale, tradeoffs, a walkthrough, or simpler terms.
+- Do not use corrective or beginner-teaching framing such as “X does not automatically happen merely because Y exists,” “you need to understand,” “obviously,” or wording that implies Andrew should already have known or failed to understand a foundational point.
+- Answer the literal question at the level requested. Do not speculate about why it was asked, restate supplied premises unnecessarily, or expand into adjacent fundamentals without request.
+- If Andrew corrects the tone, apologize directly, do not defend intent, and update durable guidance when the correction establishes a reusable rule.
+
 ## Project
 
 Doria is a compiled programming language for native applications, command-line tools, services, games, and systems software. The compiler is `doriac`, and the current `doriac` is a Rust bootstrap compiler. The native backend and standalone native executables are the primary product target. PHP is only an optional compatibility, migration, debugging, and inspection backend.
