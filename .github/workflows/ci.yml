@@ -237,6 +237,7 @@ jobs:
           php scripts/check_stage25a_completion.php
           php scripts/check_checked_error_foundation.php
           php scripts/check_stage29_completion.php
+          php scripts/check_stage30f_php_closure_compatibility.php
 
       # Reachability needs the network and, for private repositories, an
       # explicitly scoped credential. Structural checks always run. A configured

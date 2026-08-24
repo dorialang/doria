@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-19
 - **Date:** 2026-08-19
-- **Implementation Status:** Authority Accepted; Stages 30a Through 30e Implemented; Stage 30f Next; Stage 30 Not Complete
+- **Implementation Status:** Authority Accepted; Stages 30a Through 30f Implemented; Stage 30g Next; Stage 30 Not Complete
 - **Scope:** Function types, closure invocation, capture validation, ownership,
   lifetime, representation, backend behavior, diagnostics, and Stage 30
   `List<T>` algorithms
@@ -37,8 +37,10 @@ capture acquisition, reverse logical release, synthetic closure functions,
 indirect and checked indirect calls, shared validation, stable interpreter
 places, and exact environment cleanup. Stage 30e implements the shared native
 two-word carrier and descriptor ABI, stack/heap environment placement, generated
-drop glue, and indirect execution through Cranelift and LLVM. PHP compatibility
-remains Stage 30f; Stage 30 remains in progress and is not complete.
+drop glue, and indirect execution through Cranelift and LLVM. Stage 30f emits
+PHP compatibility closures from the same semantic and validated MIR authority
+through explicit carriers, environments, and stable places. Stage 30 remains in
+progress and is not complete.
 
 ```text
 Stage 30a Callable Grammar Completion — Complete
@@ -46,9 +48,10 @@ Stage 30b Semantic Function Types And Captures — Complete
 Stage 30c Ownership, Lifetime, And Escape — Complete
 Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete
 Stage 30e Native Execution — Complete
-Stage 30f PHP Compatibility — Next
+Stage 30f PHP Compatibility — Complete
+Stage 30g List Algorithms — Next
 Stage 30 — In Progress, Not Complete
-E0641 — PHP Target Boundary
+E0641 — Unreachable For Supported Plain Closure Execution
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping
@@ -535,7 +538,10 @@ Stage 30h - Cross-Repository Closure
 - **Stage 30e — Complete:** shared native carrier/descriptor/environment ABI,
   stack and heap placement, stable native capture places, generated drop glue,
   Cranelift and LLVM execution, malformed-MIR validation, and native parity.
-- **Stage 30f:** explicit PHP lowering with Doria ownership/effect parity.
+- **Stage 30f — Complete:** explicit PHP lowering consumes semantic and validated
+  MIR closure plans; compiler-owned carriers, environments, stable places,
+  source identities, checked effects, moves, replacement, and cleanup preserve
+  Doria behavior without PHP automatic capture or host callable semantics.
 - **Stage 30g:** the three `List<T>` algorithms, internal effect variables,
   partial-result cleanup, and all-backend parity.
 - **Stage 30h:** final language-server semantics, installed-toolchain refresh,

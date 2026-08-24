@@ -31,11 +31,10 @@ diagnostic, and performance direction on 2026-08-19, with these amendments:
   than moving it into and out of every call.
 
 The accepted record also fixes the dependency-ordered Stage 30a through Stage
-30h implementation slices. Stage 30a Callable Grammar Completion and Stage 30b
-Semantic Function Types And Captures are complete. Stage 30c Ownership,
-Lifetime, And Escape is next, Stage 30 is in progress and not complete, and
-E0641 remains only on valid execution routes that later slices have not
-implemented.
+30h implementation slices. Stages 30a through 30f are complete.
+Stage 30g List Algorithms is next. Stage 30 is in progress and not complete.
+E0641 is unreachable for supported plain closure execution while its catalogue
+identity remains until the Stage 30h audit.
 
 ## Historical Scope
 

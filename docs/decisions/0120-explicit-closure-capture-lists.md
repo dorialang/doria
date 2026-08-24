@@ -6,8 +6,9 @@
 - **Implementation status:** Authority accepted; the pre-Stage-30 grammar slice,
   Stage 30a, Stage 30b semantic capture validation, and Stage 30c ownership,
   lifetime, and escape checking are complete; Stage 30d closure HIR/MIR and
-  debug-interpreter execution are complete; Stage 30e native execution is
-  complete; Stage 30f is next and Stage 30 remains incomplete
+  debug-interpreter execution are complete; Stage 30e native execution and Stage
+  30f PHP compatibility are complete; Stage 30g is next and Stage 30 remains
+  incomplete
 - **Scope:** Closure capture spelling, ownership modes, diagnostics, Stage 30
   boundaries, and backend-independent behavior
 - **Amends:** D10 and the Stage 30 plan; preserves Decision 0119's callable-effect
@@ -211,13 +212,14 @@ tracks closure Move state and capture leases, validates escape and storage, and
 records logical release plans. Stage 30d lowers closures and callable-value calls
 to explicit HIR/MIR, validates the structural function carrier and environment,
 and executes them through the debug interpreter. Stage 30e executes the same
-validated MIR through Cranelift and LLVM. `E0641` now remains only at the PHP
-Stage 30f target boundary.
+validated MIR through Cranelift and LLVM. Stage 30f emits the PHP compatibility
+route from semantic and validated MIR closure plans. `E0641` is unreachable for
+supported plain closure execution but remains catalogued until Stage 30h.
 
 No collection algorithm, native closure execution, or PHP closure lowering was
-part of the grammar foundation or Stage 30d. Stage 30e has a separate durable
-native parity manifest; documentation snippets remain distinct from executable
-fixtures.
+part of the grammar foundation or Stage 30d. Stages 30e and 30f have separate
+durable native and PHP parity manifests; documentation snippets remain distinct
+from executable fixtures.
 
 ## Stage 30 Ownership
 
@@ -258,11 +260,13 @@ allocation-free.
 
 ## PHP Compatibility
 
-Generated PHP follows Doria's written capture list, not PHP arrow-function
-defaults. The backend may lower a Doria arrow to an anonymous PHP closure with an
-explicit host capture list. Readonly, writable, and taking behavior follows Doria
-ownership semantics; backend helper identity is unobservable and no runtime
-reflection discovers captures.
+Generated PHP follows Doria's written capture list through compiler-generated
+carrier and environment objects. Stable places are selected by canonical
+binding identity. The backend does not use PHP arrow automatic capture or
+`use (...)` as an ownership model, and PHP references do not define Doria
+borrowing. Readonly, writable, and taking behavior follows Doria ownership
+semantics; backend helper identity is unobservable and no runtime reflection
+discovers captures.
 
 ## Self-Hosting
 

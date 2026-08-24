@@ -483,6 +483,70 @@ function sample(int $count = 1 + 2, float $ratio = 1.0 / 2.0, bool $ordered = 1 
 }
 
 #[test]
+fn php_backend_normalizes_defaulted_cell_parameters_without_leaking_transport() {
+    let php = doriac::compile_source_to_php(
+        "defaulted-cell-parameters.doria",
+        r#"
+function invert(writable bool $value = false): bool
+{
+    let writable $apply = function (): bool with (writable $value) {
+        $value = !$value;
+        return $value;
+    };
+    return $apply();
+}
+
+class Counter
+{
+    function __construct(writable bool $value = false)
+    {
+        let writable $read = function (): bool with (writable $value) {
+            $value = !!$value;
+            return $value;
+        };
+        $read();
+    }
+
+    function read(): bool { return $this->value; }
+}
+
+function main(): void throws Doria\Std\Io\IoError
+{
+    let writable $seed = true;
+    let writable $constructorSeed = true;
+    let $defaultCounter = new Counter();
+    let $explicitCounter = new Counter($constructorSeed);
+    echo invert() . ":" . invert($seed) . ":{$seed}:" .
+        $defaultCounter->read() . ":" . $explicitCounter->read() . "\n";
+}
+"#,
+    )
+    .expect("defaulted cell parameters should lower to PHP");
+
+    assert!(php.contains("function invert(__DoriaCell|bool $value = false): bool"));
+    assert!(php.contains("public bool $value;"));
+    assert!(php.contains("function __construct(__DoriaCell|bool $value = false)"));
+    assert!(php.contains("if (!($value instanceof __DoriaCell))"));
+    assert!(php.contains("$this->value = $value->value;"));
+
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("PHP should execute defaulted and explicit cell arguments");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"true:false:false:false:true\n");
+}
+
+#[test]
 fn emits_php_for_boolean_word_operators() {
     let php = doriac::compile_source_to_php(
         "test.doria",
@@ -2132,7 +2196,9 @@ function main(): void
 
     let php = doriac::compile_source_to_php("type-only-function.doria", source)
         .expect("type-only structural function syntax should remain PHP-lowerable");
-    assert!(php.contains("function accept(callable $callback): void"));
+    assert!(php.contains("function accept(__DoriaFunctionValue $callback): void"));
+    assert!(php.contains("interface __DoriaFunctionValue"));
+    assert!(!php.contains("function accept(callable $callback)"));
     assert!(!php.contains("function accept(function $callback)"));
 }
 
@@ -2288,9 +2354,9 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     assert!(php.contains("if (@fflush(STDOUT)) { return; }"));
     assert!(php.contains("if (__doria_is_broken_pipe(error_get_last())) { exit(0); }"));
     assert!(!php.contains("readline("));
-    assert!(php.contains(
-        "function __doria_panic(string $code, int $start, int $end, ?string $message = null)"
-    ));
+    assert!(php.contains("function __doria_panic("));
+    assert!(php.contains("?string $message = null,"));
+    assert!(php.contains("?string $callable = null,"));
     assert!(!php.contains("): never"));
     assert!(php.contains("if ($line === false)"));
     assert!(php.contains("if (feof(STDIN)) { return null; }"));
@@ -2627,14 +2693,18 @@ fn php_backend_preserves_the_exact_displayable_contract() {
 
 #[test]
 fn php_backend_reserves_helper_class_names_case_insensitively() {
-    for (name, canonical) in [
-        ("__DoriaDisplayable", "__DoriaDisplayable"),
-        ("__doriadisplayable", "__DoriaDisplayable"),
-        ("__DORIADISPLAYABLE", "__DoriaDisplayable"),
-        ("__DoriaValueEquatable", "__DoriaValueEquatable"),
-        ("__doriavalueequatable", "__DoriaValueEquatable"),
-        ("__DoriaMixedValue", "__DoriaMixedValue"),
-        ("__doriamixedvalue", "__DoriaMixedValue"),
+    for name in [
+        "__DoriaDisplayable",
+        "__doriadisplayable",
+        "__DORIADISPLAYABLE",
+        "__DoriaValueEquatable",
+        "__doriavalueequatable",
+        "__DoriaMixedValue",
+        "__doriamixedvalue",
+        "__DoriaFunctionValue",
+        "__doriafunctionvalue",
+        "__DoriaClosureEnvironment42",
+        "__doriafuturehelper",
     ] {
         let diagnostics = doriac::compile_source_to_php(
             "reserved_display_helper.doria",
@@ -2644,7 +2714,8 @@ fn php_backend_reserves_helper_class_names_case_insensitively() {
 
         assert!(diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "E0309"
-                && diagnostic.message.contains(&format!("`{canonical}`"))
+                && diagnostic.message.contains("`__Doria` type prefix")
+                && diagnostic.message.contains(&format!("`{name}`"))
                 && diagnostic.message.contains("reserved")
         }));
     }

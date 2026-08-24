@@ -454,7 +454,8 @@ callable narrowing, callable-value calls, and callable properties. Source type
 grouping remains transparent and does not create a tuple type.
 
 Valid closures now lower through explicit HIR and MIR closure nodes and execute
-through the debug interpreter, Cranelift fast profile, and LLVM release profile.
+through the debug interpreter, Cranelift fast profile, LLVM release profile,
+and the PHP compatibility backend for its supported value surface.
 MIR structural function types preserve parameter
 ownership, invocation mode, checked effects, return type, and return-borrow
 provenance. Function values use the logical two-word descriptor/environment
@@ -471,9 +472,13 @@ Capture acquisition follows source order and remaining owned captures drop in
 reverse logical order. Checked indirect calls reuse the ordinary checked-error
 ABI and cleanup model.
 
-PHP compatibility lowering remains Stage 30f. `E0641` is therefore a PHP-only
-executable-route boundary; `doriac check`, HIR/MIR lowering, IDE analysis, debug,
-and native output do not emit it. Type-only function syntax does not trigger it.
+PHP compatibility uses compiler-generated function carriers, explicit capture
+environments, and stable BindingId-backed places derived from semantic and
+validated MIR authority. PHP automatic capture, host `callable`, capture
+`use (...)`, and PHP references do not define Doria closure or borrowing
+semantics. No-capture closures create no PHP environment. `E0641` is unreachable
+for supported plain closure execution but remains catalogued until the Stage 30h
+audit. Unrelated PHP compatibility boundaries remain independent.
 
 ```text
 Stage 30a Callable Grammar Completion - Complete
@@ -481,9 +486,10 @@ Stage 30b Semantic Function Types And Captures - Complete
 Stage 30c Ownership, Lifetime, And Escape - Complete
 Stage 30d Closure HIR/MIR And Interpreter Oracle - Complete
 Stage 30e Native Execution - Complete
-Stage 30f PHP Compatibility - Next
+Stage 30f PHP Compatibility - Complete
+Stage 30g List Algorithms - Next
 Stage 30 - In Progress, Not Complete
-E0641 - PHP Target Boundary
+E0641 - Unreachable For Supported Plain Closure Execution
 ```
 
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.
@@ -1648,6 +1654,9 @@ function greet(string $name): void
 
 Top-level function names beginning with `__doria_` are reserved for compiler-generated helpers.
 The prefix does not reserve method names or otherwise change Doria's member model.
+Type declaration names beginning with `__Doria` are reserved case-insensitively for
+compiler-generated compatibility types. This type prefix does not reserve local,
+property, method, or function names.
 
 Parameters are readonly unless marked `writable`:
 

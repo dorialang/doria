@@ -32,6 +32,7 @@ pub mod numeric;
 pub mod ownership;
 pub mod parser;
 pub mod performance;
+mod php_closure;
 pub mod return_analysis;
 pub mod runtime_artifact;
 #[path = "runtime_digest.rs"]

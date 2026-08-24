@@ -1,7 +1,6 @@
 use std::process::Command;
 
 use doriac::ast::{ClosureBody, ClosureCaptureMode, ClosureForm, Expr, Item, Stmt};
-use doriac::diagnostics::{DiagnosticFormat, DiagnosticKind, RenderOptions};
 use doriac::source::Span;
 use doriac::types::{FunctionInvocationMode, FunctionTypeParameterMode};
 
@@ -621,8 +620,14 @@ fn decision_0120_fixture_is_parseable_and_visible_in_ast_output() {
 }
 
 #[test]
-fn semantic_and_ide_paths_are_target_neutral_while_only_php_keeps_its_boundary() {
-    let source = include_str!("fixtures/accepted_syntax/closure_boundary.doria");
+fn semantic_ide_and_php_paths_accept_php_compatible_closures() {
+    let source = r#"
+function main(): void
+{
+    let $identity = fn(string $value) => $value;
+    echo $identity("ok") . "\n";
+}
+"#;
     doriac::check_source("closure_boundary.doria", source)
         .expect("valid closure syntax should pass target-neutral checking");
     let (_, analysis) = doriac::analyze_source_for_ide("closure_boundary.doria", source)
@@ -642,40 +647,13 @@ fn semantic_and_ide_paths_are_target_neutral_while_only_php_keeps_its_boundary()
     )
     .expect("native closure execution should be available in Stage 30e");
 
-    let diagnostics = doriac::compile_source(
+    let php = doriac::compile_source(
         "closure_boundary.doria",
         source,
         doriac::backend::BackendTarget::Php,
     )
-    .expect_err("PHP closure output remains a Stage 30f boundary");
-    assert_eq!(diagnostics.len(), 1, "unexpected cascade: {diagnostics:#?}");
-    let diagnostic = &diagnostics[0];
-    assert_eq!(diagnostic.code, "E0641");
-    assert_eq!(
-        diagnostic.kind,
-        DiagnosticKind::UnsupportedDevelopmentSurface
-    );
-    assert!(diagnostic.development_only);
-    assert_eq!(diagnostic.title, "Closure PHP Output Is Not Yet Available");
-    assert!(diagnostic.message.contains("Stage 30f"));
-
-    let json = doriac::render_diagnostics_with_options(
-        "closure_boundary.doria",
-        source,
-        &diagnostics,
-        RenderOptions {
-            format: DiagnosticFormat::Json,
-            ..RenderOptions::default()
-        },
-    );
-    let envelope: serde_json::Value = serde_json::from_str(&json).expect("schema-version-1 JSON");
-    assert_eq!(envelope["schemaVersion"], 1);
-    assert_eq!(envelope["diagnostics"][0]["code"], "E0641");
-    assert_eq!(
-        envelope["diagnostics"][0]["kind"],
-        "unsupportedDevelopmentSurface"
-    );
-    assert_eq!(envelope["diagnostics"][0]["developmentOnly"], true);
+    .expect("PHP-compatible closure source should lower in Stage 30f");
+    assert!(matches!(php, doriac::backend::BackendOutput::Text { .. }));
 }
 
 #[test]

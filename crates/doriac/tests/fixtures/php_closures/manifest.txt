@@ -1,0 +1,12 @@
+# Stage 30f PHP compatibility closure execution.
+php_closures/compatibility_matrix
+php_closures/taking_copy_capture
+php_closures/grouped_function_places
+native_closures/taking_move_capture
+native_closures/once_return
+native_closures/nullable_function
+native_closures/property_replacement
+native_closures/payload_enum_storage
+native_closures/checked_effect
+native_closures/checked_once
+php_closures/panic_no_cleanup
