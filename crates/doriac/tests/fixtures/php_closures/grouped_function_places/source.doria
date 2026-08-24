@@ -1,0 +1,10 @@
+function main(): void
+{
+    let writable $first, $second = false;
+    let writable $invert = function (): void with (writable $first, writable $second) {
+        $first = !$first;
+        $second = !$second;
+    };
+    $invert();
+    echo $first . ":" . $second . "\n";
+}

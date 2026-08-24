@@ -2788,15 +2788,9 @@ impl<'program> Checker<'program> {
                 "`{name}` is a compiler-known integer companion and cannot be redeclared"
             ));
         }
-        let php_helper = match name.to_ascii_lowercase().as_str() {
-            "__doriadisplayable" => Some("__DoriaDisplayable"),
-            "__doriavalueequatable" => Some("__DoriaValueEquatable"),
-            "__doriamixedvalue" => Some("__DoriaMixedValue"),
-            _ => None,
-        };
-        if let Some(helper) = php_helper {
+        if name.to_ascii_lowercase().starts_with("__doria") {
             return Some(format!(
-                "`{helper}` is reserved for compiler-generated PHP compatibility output"
+                "the `__Doria` type prefix is reserved for compiler-generated PHP compatibility output; `{name}` cannot be redeclared"
             ));
         }
         match name {

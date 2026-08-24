@@ -3303,6 +3303,30 @@ fn emit_class(
         output.push('\n');
     }
     for member in &class_decl.members {
+        let ClassMember::Method(method) = member else {
+            continue;
+        };
+        let callable_plan = scopes.closure_plan.callable_definition(method.span.start);
+        for (index, parameter) in method.params.iter().enumerate() {
+            let Some(access) = parameter.promoted_access.as_ref() else {
+                continue;
+            };
+            if !callable_parameter_uses_cell(callable_plan, index) {
+                continue;
+            }
+            writeln(
+                output,
+                indent + 1,
+                &format!(
+                    "{} {} ${};",
+                    emit_member_access(access),
+                    php_type(&parameter.ty),
+                    parameter.name
+                ),
+            );
+        }
+    }
+    for member in &class_decl.members {
         match member {
             ClassMember::Property(property) => emit_property(
                 property,
@@ -3766,13 +3790,10 @@ fn emit_function(
             scopes.mark_mixed(&param.name);
         }
         if let Some(binding) = scopes.binding_for_declaration(&param.name, param.span) {
-            let transported_cell = callable_plan
-                .as_ref()
-                .and_then(|plan| plan.parameters.get(index))
-                .is_some_and(|parameter| parameter.cell && param.default.is_none());
+            let uses_cell = callable_parameter_uses_cell(callable_plan.as_ref(), index);
             scopes.bind_place(
                 binding,
-                if transported_cell || scopes.needs_cell(binding) {
+                if uses_cell || scopes.needs_cell(binding) {
                     PhpBindingPlace::Cell(param.name.clone())
                 } else {
                     PhpBindingPlace::Direct(param.name.clone())
@@ -3798,10 +3819,8 @@ fn emit_function(
             .iter()
             .enumerate()
             .map(|(parameter_index, param)| {
-                let transported_cell = callable_plan
-                    .as_ref()
-                    .and_then(|plan| plan.parameters.get(parameter_index))
-                    .is_some_and(|parameter| parameter.cell && param.default.is_none());
+                let uses_cell =
+                    callable_parameter_uses_cell(callable_plan.as_ref(), parameter_index);
                 emit_param(
                     param,
                     semantic_info.parameter_defaults.get(&ParameterDefaultKey {
@@ -3810,7 +3829,7 @@ fn emit_function(
                     }),
                     &semantic_info.const_evaluation,
                     &scopes,
-                    transported_cell,
+                    uses_cell,
                 )
             })
             .collect::<Vec<_>>()
@@ -3841,32 +3860,6 @@ fn emit_function(
         writeln(output, indent + 1, "{");
     }
     scopes.push();
-    for (index, param) in function.params.iter().enumerate() {
-        let Some(binding) = scopes.binding_for_declaration(&param.name, param.span) else {
-            continue;
-        };
-        let transported_cell = callable_plan
-            .as_ref()
-            .and_then(|plan| plan.parameters.get(index))
-            .is_some_and(|parameter| parameter.cell && param.default.is_none());
-        if scopes.needs_cell(binding) && !transported_cell {
-            writeln(
-                output,
-                body_indent,
-                &format!("${0} = new __DoriaCell(${0});", param.name),
-            );
-        }
-        if resolved_type_ref_is_function(&param.ty) && param.take {
-            scopes.own_function_cell(param.name.clone());
-        }
-    }
-    for (name, initializer) in property_initializers {
-        writeln(
-            output,
-            body_indent,
-            &format!("$this->{name} = {};", emit_expr(initializer, &scopes)),
-        );
-    }
     for (parameter_index, param) in function.params.iter().enumerate() {
         let Some(default @ ConstValue::PayloadEnum(_)) =
             semantic_info.parameter_defaults.get(&ParameterDefaultKey {
@@ -3895,6 +3888,42 @@ fn emit_function(
         }
         writeln(output, body_indent, "}");
     }
+    for (index, param) in function.params.iter().enumerate() {
+        if scopes
+            .binding_for_declaration(&param.name, param.span)
+            .is_none()
+        {
+            continue;
+        }
+        let uses_cell = callable_parameter_uses_cell(callable_plan.as_ref(), index);
+        if uses_cell && param.default.is_some() {
+            writeln(
+                output,
+                body_indent,
+                &format!(
+                    "if (!(${0} instanceof __DoriaCell)) {{ ${0} = new __DoriaCell(${0}); }}",
+                    param.name
+                ),
+            );
+        }
+        if param.promoted_access.is_some() && uses_cell {
+            writeln(
+                output,
+                body_indent,
+                &format!("$this->{0} = ${0}->value;", param.name),
+            );
+        }
+        if resolved_type_ref_is_function(&param.ty) && param.take {
+            scopes.own_function_cell(param.name.clone());
+        }
+    }
+    for (name, initializer) in property_initializers {
+        writeln(
+            output,
+            body_indent,
+            &format!("$this->{name} = {};", emit_expr(initializer, &scopes)),
+        );
+    }
     for statement in &function.body.statements {
         emit_statement(statement, output, body_indent, &mut scopes);
     }
@@ -3919,23 +3948,26 @@ fn emit_param(
     evaluated_default: Option<&ConstValue>,
     evaluation: &Evaluation,
     scopes: &PhpNameScopes,
-    transported_cell: bool,
+    uses_cell: bool,
 ) -> String {
     let mut output = String::new();
-    if let Some(access) = &param.promoted_access {
+    if let Some(access) = param.promoted_access.as_ref().filter(|_| !uses_cell) {
         output.push_str(emit_member_access(access));
         output.push(' ');
     }
     let payload_default = matches!(evaluated_default, Some(ConstValue::PayloadEnum(_)));
-    if transported_cell {
+    if uses_cell && param.default.is_none() {
         output.push_str("__DoriaCell");
-    } else if payload_default {
-        let payload_type = php_type(&param.ty);
-        output.push_str(payload_type.trim_start_matches('?'));
-        output.push_str("|array");
-        if param.ty.nullable {
-            output.push_str("|null");
+    } else if uses_cell {
+        let value_type = php_parameter_value_type(&param.ty, payload_default);
+        if value_type == "mixed" {
+            output.push_str("mixed");
+        } else {
+            output.push_str("__DoriaCell|");
+            output.push_str(&value_type);
         }
+    } else if payload_default {
+        output.push_str(&php_parameter_value_type(&param.ty, true));
     } else {
         output.push_str(&php_type(&param.ty));
     }
@@ -3952,6 +3984,27 @@ fn emit_param(
         }
     }
     output
+}
+
+fn callable_parameter_uses_cell(
+    callable_plan: Option<&crate::php_closure::PhpCallablePlan>,
+    parameter_index: usize,
+) -> bool {
+    callable_plan
+        .and_then(|plan| plan.parameters.get(parameter_index))
+        .is_some_and(|parameter| parameter.cell)
+}
+
+fn php_parameter_value_type(ty: &TypeRef, payload_default: bool) -> String {
+    let php_type = php_type(ty);
+    let mut members = vec![php_type.trim_start_matches('?').to_string()];
+    if payload_default {
+        members.push("array".to_string());
+    }
+    if ty.nullable {
+        members.push("null".to_string());
+    }
+    members.join("|")
 }
 
 fn php_top_level_constant_name(name: &str) -> String {
@@ -4022,39 +4075,28 @@ fn emit_statement(
                         Some(ResolvedType::Mixed)
                     ));
             if decl.bindings.len() == 1 {
-                let php_name = scopes.declare(&decl.bindings[0].name);
-                let binding = scopes.binding_for_declaration(&decl.bindings[0].name, decl.span);
-                if binding_is_mixed {
-                    scopes.mark_mixed(&decl.bindings[0].name);
-                }
-                if binding.is_some_and(|binding| scopes.needs_cell(binding)) {
-                    writeln(
-                        output,
-                        indent,
-                        &format!("${php_name} = new __DoriaCell({initializer});"),
-                    );
-                    scopes.bind_place(
-                        binding.expect("checked binding exists"),
-                        PhpBindingPlace::Cell(php_name.clone()),
-                    );
-                    if owns_function {
-                        scopes.own_function_cell(php_name);
-                    }
-                } else {
-                    writeln(output, indent, &format!("${php_name} = {initializer};"));
-                    if let Some(binding) = binding {
-                        scopes.bind_place(binding, PhpBindingPlace::Direct(php_name));
-                    }
-                }
+                emit_local_binding(
+                    &decl.bindings[0],
+                    &initializer,
+                    binding_is_mixed,
+                    owns_function,
+                    output,
+                    indent,
+                    scopes,
+                );
             } else {
                 let temporary = scopes.fresh_temp("__doria_grouped_value");
                 writeln(output, indent, &format!("${temporary} = {initializer};"));
                 for binding in &decl.bindings {
-                    let php_name = scopes.declare(&binding.name);
-                    if binding_is_mixed {
-                        scopes.mark_mixed(&binding.name);
-                    }
-                    writeln(output, indent, &format!("${php_name} = ${temporary};"));
+                    emit_local_binding(
+                        binding,
+                        &format!("${temporary}"),
+                        binding_is_mixed,
+                        owns_function,
+                        output,
+                        indent,
+                        scopes,
+                    );
                 }
                 writeln(output, indent, &format!("unset(${temporary});"));
             }
@@ -4495,6 +4537,41 @@ fn assignment_target_is_function(target: &Expr, scopes: &PhpNameScopes) -> bool 
             .expression_types
             .get(&(target.span().start, target.span().end))
             .is_some_and(resolved_is_function_type),
+    }
+}
+
+fn emit_local_binding(
+    declaration: &VarBinding,
+    initializer: &str,
+    binding_is_mixed: bool,
+    owns_function: bool,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    let php_name = scopes.declare(&declaration.name);
+    let binding = scopes.binding_for_declaration(&declaration.name, declaration.span);
+    if binding_is_mixed {
+        scopes.mark_mixed(&declaration.name);
+    }
+    if binding.is_some_and(|binding| scopes.needs_cell(binding)) {
+        writeln(
+            output,
+            indent,
+            &format!("${php_name} = new __DoriaCell({initializer});"),
+        );
+        scopes.bind_place(
+            binding.expect("checked binding exists"),
+            PhpBindingPlace::Cell(php_name.clone()),
+        );
+        if owns_function {
+            scopes.own_function_cell(php_name);
+        }
+    } else {
+        writeln(output, indent, &format!("${php_name} = {initializer};"));
+        if let Some(binding) = binding {
+            scopes.bind_place(binding, PhpBindingPlace::Direct(php_name));
+        }
     }
 }
 
