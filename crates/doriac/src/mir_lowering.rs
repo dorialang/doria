@@ -426,7 +426,8 @@ fn build_closure_plans(
             .closure_ownership
             .get(&expression.closure_id)
             .expect("checked closure has ownership metadata");
-        let resolved = substitute_resolved_type(&semantic.function_type, context.substitutions);
+        let resolved =
+            substitute_resolved_type(&semantic.execution_function_type, context.substitutions);
         let mir::Type::Function(function_type) =
             intern_resolved_collection_types(&resolved, context.class_ids, context.registry)
                 .ok_or_else(|| {
@@ -524,6 +525,17 @@ fn build_closure_plans(
             function_type,
             entry_function: function_id,
             environment_layout,
+            environment_placement: match (environment_layout, ownership.escape) {
+                (None, _) => mir::ClosureEnvironmentPlacement::None,
+                (Some(_), crate::ownership::ClosureEscapeClassification::Local) => {
+                    mir::ClosureEnvironmentPlacement::Stack
+                }
+                (
+                    Some(_),
+                    crate::ownership::ClosureEscapeClassification::Owned
+                    | crate::ownership::ClosureEscapeClassification::ReturnedBorrow,
+                ) => mir::ClosureEnvironmentPlacement::Heap,
+            },
             invocation_mode: function_definition.invocation_mode,
             source_span: expression.span,
             debug_identity,
@@ -2826,6 +2838,7 @@ fn lower_function(
             .chain(signature.parameter_modes.iter().copied())
             .collect(),
         return_type: signature.return_type,
+        return_borrow: signature.return_borrow,
         checked_effects: signature.checked_effects,
         locals,
         blocks,
@@ -2876,12 +2889,12 @@ fn lower_closure_function(
             .expect("closure environment metadata exists");
         for (field_index, capture) in environment.captures.iter().enumerate() {
             let field = mir::ClosureEnvironmentFieldId(field_index);
-            let ty = layout
+            let definition = layout
                 .fields
                 .get(field_index)
                 .filter(|definition| definition.id == field)
-                .expect("closure capture field exists")
-                .ty;
+                .expect("closure capture field exists");
+            let ty = definition.ty;
             let name = inputs
                 .semantic_info
                 .binding_resolution
@@ -2889,13 +2902,15 @@ fn lower_closure_function(
                 .get(&capture.source_binding_id)
                 .map(|binding| binding.name.as_str())
                 .unwrap_or("_capture");
-            let writable = matches!(
-                capture.required_capability,
-                crate::semantics::CaptureRequirement::Writable
-            );
-            let owned =
-                capture.mode == crate::ast::ClosureCaptureMode::Take && ty.has_move_ownership();
-            let local = context.declare_synthetic_named_local(name, writable, ty, owned);
+            let writable = definition.storage == mir::ClosureEnvironmentStorage::WritableBorrow;
+            let taken = capture.mode == crate::ast::ClosureCaptureMode::Take;
+            // A writable lease temporarily transfers move ownership into the
+            // invocation frame. Backends restore it to the borrowed source on
+            // every non-aborting exit, so only a taken capture owns a lexical
+            // cleanup obligation in the synthetic function.
+            let owned = (taken && ty.has_move_ownership())
+                || (writable && ty.transfers_writable_capture_ownership());
+            let local = context.declare_synthetic_named_local(name, writable, ty, owned, taken);
             capture_locals.push((field, local));
         }
         context.push_statement(mir::Statement::BindClosureEnvironment {
@@ -2968,6 +2983,7 @@ fn lower_closure_function(
         .chain(definition.parameters.iter().map(|parameter| parameter.mode))
         .collect(),
         return_type: definition.return_type,
+        return_borrow: definition.return_borrow,
         checked_effects: definition.checked_effects,
         locals,
         blocks,
@@ -5643,7 +5659,7 @@ impl<'semantic> LoweringContext<'semantic> {
     ) -> mir::LocalId {
         let name = format!("{prefix}{}", self.temp_counter);
         self.temp_counter += 1;
-        self.declare_synthetic_named_local(&name, writable, ty, owned)
+        self.declare_synthetic_named_local(&name, writable, ty, owned, true)
     }
 
     fn declare_synthetic_named_local(
@@ -5652,6 +5668,7 @@ impl<'semantic> LoweringContext<'semantic> {
         writable: bool,
         ty: mir::Type,
         owned: bool,
+        track_cleanup: bool,
     ) -> mir::LocalId {
         let id = mir::LocalId(self.locals.len());
         self.locals.push(mir::Local {
@@ -5666,6 +5683,12 @@ impl<'semantic> LoweringContext<'semantic> {
             .last_mut()
             .expect("MIR lowering must have a local scope")
             .insert(name.to_string(), id);
+        if track_cleanup && owned && ty.has_move_ownership() {
+            self.scope_owned_locals
+                .last_mut()
+                .expect("an owned synthetic local requires an active ownership scope")
+                .push(drop_obligation_for_owned_local(id, ty));
+        }
         id
     }
 
@@ -11712,12 +11735,10 @@ fn lower_condition(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
-    if let hir::Expr::CallableCall(call) = expr {
-        let (local, ty, _) = materialize_indirect_call(call, false, context)?
-            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a condition")])?;
-        if ty != mir::Type::Scalar(mir::ScalarType::Bool) {
+    if let Some((local, ty)) = materialize_callable_scalar_result(expr, context)? {
+        if ty != mir::ScalarType::Bool {
             return Err(vec![unsupported(
-                call.span,
+                expr.span(),
                 "callable does not return bool",
             )]);
         }
@@ -12724,15 +12745,7 @@ fn lower_value_expression(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::ValueExpression> {
-    if let hir::Expr::CallableCall(call) = expr {
-        let (local, ty, _) = materialize_indirect_call(call, false, context)?
-            .ok_or_else(|| vec![unsupported(call.span, "void callable used as a scalar")])?;
-        let mir::Type::Scalar(scalar) = ty else {
-            return Err(vec![unsupported(
-                call.span,
-                "callable does not return a scalar",
-            )]);
-        };
+    if let Some((local, scalar)) = materialize_callable_scalar_result(expr, context)? {
         return Ok(value_expression_from_operand(
             scalar,
             mir::Operand::Local(local),
@@ -12784,11 +12797,41 @@ fn lower_value_expression(
     }
 }
 
+fn materialize_callable_scalar_result(
+    expr: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::ScalarType)>> {
+    let hir::Expr::CallableCall(call) = expr else {
+        return Ok(None);
+    };
+    let (local, ty, _) = materialize_indirect_call(call, false, context)?
+        .ok_or_else(|| vec![unsupported(call.span, "void callable used as a scalar")])?;
+    let mir::Type::Scalar(scalar) = ty else {
+        return Err(vec![unsupported(
+            call.span,
+            "callable does not return a scalar",
+        )]);
+    };
+    Ok(Some((local, scalar)))
+}
+
 fn lower_enum_expression(
     expr: &hir::Expr,
     enum_id: crate::enums::EnumId,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::EnumExpression> {
+    if let Some((local, scalar)) = materialize_callable_scalar_result(expr, context)? {
+        if scalar != mir::ScalarType::Enum(enum_id) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "callable returns another enum type",
+            )]);
+        }
+        return Ok(mir::EnumExpression::Use {
+            enum_id,
+            operand: mir::Operand::Local(local),
+        });
+    }
     if let Some(mir::Rvalue::Value(mir::ValueExpression::Enum(value))) = materialize_checked_rvalue(
         expr,
         mir::Type::Scalar(mir::ScalarType::Enum(enum_id)),
@@ -20530,6 +20573,18 @@ fn lower_float_expression(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::FloatExpression> {
     let result_ty = context.float_type(expr)?;
+    if let Some((local, scalar)) = materialize_callable_scalar_result(expr, context)? {
+        if scalar != mir::ScalarType::Float(result_ty) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "callable returns another float type",
+            )]);
+        }
+        return Ok(mir::FloatExpression::Use {
+            ty: result_ty,
+            operand: mir::Operand::Local(local),
+        });
+    }
     if let Some(mir::Rvalue::Value(mir::ValueExpression::Float(value))) =
         materialize_checked_rvalue(
             expr,
@@ -20797,6 +20852,18 @@ fn lower_integer_expression(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::IntegerExpression> {
     let result_ty = context.integer_type(expr)?;
+    if let Some((local, scalar)) = materialize_callable_scalar_result(expr, context)? {
+        if scalar != mir::ScalarType::Integer(result_ty) {
+            return Err(vec![unsupported(
+                expr.span(),
+                "callable returns another integer type",
+            )]);
+        }
+        return Ok(mir::IntegerExpression::use_operand(
+            result_ty,
+            mir::Operand::Local(local),
+        ));
+    }
     if let Some(mir::Rvalue::Value(mir::ValueExpression::Integer(value))) =
         materialize_checked_rvalue(
             expr,

@@ -1,0 +1,17 @@
+enum Work
+{
+    case Run(function(): int $callback);
+}
+
+function execute(take Work $work): int
+{
+    return match (take $work) {
+        Work::Run($callback) => $callback()
+    };
+}
+
+function main(): void
+{
+    let $work = Work::Run(fn() => 42);
+    echo "{execute($work)}\n";
+}

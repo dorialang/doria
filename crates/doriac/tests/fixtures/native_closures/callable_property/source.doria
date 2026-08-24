@@ -1,0 +1,15 @@
+class Runner
+{
+    function(int): int $callback = fn(int $value) => $value * 2;
+
+    function run(int $value): int
+    {
+        return $this->callback($value);
+    }
+}
+
+function main(): void
+{
+    let $runner = new Runner();
+    echo "{$runner->run(21)}\n";
+}

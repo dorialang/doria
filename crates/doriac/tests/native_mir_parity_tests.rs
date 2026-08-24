@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use doriac::backend::NativeProfile;
 
 const MANIFEST: &str = include_str!("fixtures/native_parity_examples.txt");
+const NATIVE_CLOSURE_MANIFEST: &str = include_str!("fixtures/native_closures/manifest.txt");
 const BROKEN_PIPE_STDOUT: &str = include_str!("fixtures/native_io/broken_pipe_stdout.doria");
 const BROKEN_PIPE_STDERR: &str = include_str!("fixtures/native_io/broken_pipe_stderr.doria");
 const BROKEN_PIPE_STDOUT_BYTES: &str =
@@ -165,6 +166,68 @@ fn interpreter_cranelift_and_enabled_llvm_match_for_the_durable_native_manifest(
                 &interpreted,
                 &release,
             );
+        }
+    }
+}
+
+#[test]
+fn native_closure_manifest_covers_every_fixture() {
+    let root = native_closure_fixture_root();
+    let manifest = native_closure_fixture_names()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let disk = fs::read_dir(root)
+        .expect("native closure fixture directory should be readable")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(manifest, disk);
+}
+
+#[test]
+fn interpreter_cranelift_and_enabled_llvm_match_for_native_closures() {
+    if !host_linker_is_available() {
+        let message = format!(
+            "native closure parity requires host linker {}",
+            host_linker()
+        );
+        if std::env::var_os("CI").is_some() {
+            panic!("{message}; CI must not skip the closure parity matrix");
+        }
+        eprintln!("{message}; skipping local executable parity");
+        return;
+    }
+
+    let root = native_closure_fixture_root();
+    for name in native_closure_fixture_names() {
+        let fixture_root = root.join(&name);
+        let source_path = fixture_root.join("source.doria");
+        let source = fs::read_to_string(&source_path)
+            .unwrap_or_else(|error| panic!("failed to read native closure {name}: {error}"));
+        let mir = doriac::lower_source_to_mir(source_path.to_string_lossy(), &source)
+            .unwrap_or_else(|diagnostics| {
+                panic!("native closure fixture {name} should lower: {diagnostics:#?}")
+            });
+        let fixture = IoFixture::load_root(&fixture_root);
+        let interpreted = doriac::mir_interpreter::interpret_with_io(
+            &mir,
+            doriac::mir_interpreter::MirIo::default(),
+        )
+        .unwrap_or_else(|error| panic!("interpreter rejected native closure {name}: {error}"));
+        fixture.assert_expected(&name, &interpreted);
+
+        for profile in native_closure_profiles(&fixture_root) {
+            if profile == NativeProfile::Release && !cfg!(feature = "llvm-backend") {
+                continue;
+            }
+            let backend = match profile {
+                NativeProfile::Fast => "Cranelift",
+                NativeProfile::Release => "LLVM",
+            };
+            let native = compile_and_run(&mir, profile, &name, backend, &fixture);
+            assert_matches_interpreter(&name, backend, profile, &interpreted, &native);
         }
     }
 }
@@ -477,6 +540,34 @@ fn manifest_paths() -> BTreeSet<String> {
         .collect()
 }
 
+fn native_closure_fixture_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/native_closures")
+}
+
+fn native_closure_fixture_names() -> Vec<String> {
+    NATIVE_CLOSURE_MANIFEST
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn native_closure_profiles(root: &Path) -> Vec<NativeProfile> {
+    let source = fs::read_to_string(root.join("profiles"))
+        .unwrap_or_else(|error| panic!("native closure fixture needs profiles: {error}"));
+    source
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|profile| match profile {
+            "fast" => NativeProfile::Fast,
+            "release" => NativeProfile::Release,
+            other => panic!("unknown native closure profile `{other}`"),
+        })
+        .collect()
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -621,6 +712,10 @@ impl IoFixture {
         let root = workspace
             .join("crates/doriac/tests/fixtures/native_io")
             .join(stem);
+        Self::load_root(&root)
+    }
+
+    fn load_root(root: &Path) -> Self {
         if !root.exists() {
             return Self::default();
         }

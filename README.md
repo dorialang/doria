@@ -62,6 +62,10 @@ or access guard should be cleaned up before the surrounding function continues.
 Closures use explicit `with` capture lists and structural function types.
 Captures are acquired in written order, function values move as one owned value,
 and owned captures are released in reverse order when the closure dies.
+Valid closures execute through the debug interpreter and both native profiles.
+No-capture closures allocate no environment; nonescaping captures use stack
+storage, while escaping environments use one allocation without reference
+counting.
 
 When a graph genuinely needs several owners, Doria provides an explicit escape
 hatch rather than changing the default model. `shared new Node()` creates a

@@ -345,11 +345,11 @@ Runner** and non-blocking; the accepted performance standard is unchanged.
 Stage 29 is complete. The pre-Stage-30 closure grammar slice is complete:
 Decision 0120's base closure forms and function-type spelling now parse into
 source-preserving AST nodes. Decision 0121 accepts complete closure effect and
-function-type authority. Stages 30a through 30d are complete: valid closures
+function-type authority. Stages 30a through 30e are complete: valid closures
 lower through closure-aware HIR and structural MIR, checked indirect calls reuse
-this decision's Error model, and the debug interpreter executes them. Native and
-PHP executable closure routes retain target-specific E0641 boundaries; Stage 30e
-native execution is next, and Stage 30 remains incomplete.
+this decision's Error model, and the debug interpreter, Cranelift, and LLVM
+execute them. PHP executable closure routes retain the Stage 30f E0641 boundary;
+Stage 30 remains incomplete.
 
 ## Explicit Exclusions
 

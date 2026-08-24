@@ -118,8 +118,8 @@ $require($decisionPath, $decision, [
     'Runner** and non-blocking',
     'pre-Stage-30 closure grammar slice is complete',
     'checked indirect calls reuse',
-    'debug interpreter executes them',
-    'target-specific E0641 boundaries',
+    'debug interpreter, Cranelift, and LLVM',
+    'Stage 30f E0641 boundary',
 ]);
 
 foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
@@ -135,7 +135,8 @@ foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents)
         'Stage 30b Semantic Function Types And Captures — Complete',
         'Stage 30c Ownership, Lifetime, And Escape — Complete',
         'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
-        'Stage 30e Native Execution — Next',
+        'Stage 30e Native Execution — Complete',
+        'Stage 30f PHP Compatibility — Next',
         'Stage 30 — In Progress, Not Complete',
         'Stage 26b — Complete',
         'Measurement Status: Pending Available Runner',

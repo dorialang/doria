@@ -415,6 +415,34 @@ function main(): void
 }
 
 #[test]
+fn returned_writable_closure_carriers_do_not_alias_their_capture_root() {
+    let analysis = analyze(
+        r#"
+function bind(writable int $value): function writable(): int
+{
+    return function (): int with (writable $value) {
+        $value += 1;
+        return $value;
+    };
+}
+
+function main(): void
+{
+    let writable $value = 40;
+    writable function writable(): int $callback = bind($value);
+    echo "{$callback()}\n";
+    echo "{$value}\n";
+}
+"#,
+    );
+    assert!(
+        language_errors(&analysis.diagnostics).is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
 fn target_neutral_analysis_reports_ownership_without_execution_boundaries() {
     let invalid = analyze(
         r#"

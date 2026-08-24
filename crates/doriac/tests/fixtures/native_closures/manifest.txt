@@ -1,0 +1,25 @@
+# Stage 30e native closure execution parity.
+no_capture
+callable_scalar_expressions
+readonly_capture
+writable_capture
+writable_move_captures
+taking_copy_capture
+taking_move_capture
+transferred_capture_cleanup
+once_return
+nested_factory
+nested_factory_repeated
+nullable_function
+parameter_callback
+returned_closure
+returned_writable_closure
+callable_property
+property_replacement
+collection_storage
+payload_enum_storage
+generic_closure
+checked_effect
+checked_once
+destructor_order
+panic_no_cleanup

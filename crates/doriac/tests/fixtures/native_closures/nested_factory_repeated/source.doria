@@ -1,0 +1,12 @@
+function main(): void
+{
+    let writable $checksum = 0;
+    for (let writable $index = 0; $index < 3; $index++) {
+        let $unit = 1;
+        let $factory = fn(int $value) with (take $unit) =>
+            fn() with (take $value, take $unit) => $value + $unit;
+        let $callback = $factory(0);
+        $checksum += $callback();
+    }
+    echo "{$checksum}\n";
+}

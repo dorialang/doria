@@ -1,0 +1,9 @@
+function main(): void
+{
+    List<function(): int> $callbacks = [fn() => 20, fn() => 22];
+    Dictionary<string, function(): int> $named = ["answer" => fn() => 42];
+    int $left = $callbacks[0]();
+    int $right = $callbacks[1]();
+    int $answer = $named["answer"]();
+    echo "{$left + $right} {$answer}\n";
+}

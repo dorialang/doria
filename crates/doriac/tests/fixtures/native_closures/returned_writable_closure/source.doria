@@ -1,0 +1,15 @@
+function bind(writable int $value): function writable(): int
+{
+    return function (): int with (writable $value) {
+        $value += 1;
+        return $value;
+    };
+}
+
+function main(): void
+{
+    let writable $value = 40;
+    writable function writable(): int $callback = bind($value);
+    echo "{$callback()}\n";
+    echo "{$value}\n";
+}

@@ -33,7 +33,8 @@ use crate::native_abi::{
     CHECKED_IO_META_OPERATION_SHIFT, CHECKED_IO_META_REASON_SHIFT, CHECKED_IO_META_TARGET_SHIFT,
     CHECKED_IO_READ_FILE_BYTES, CHECKED_IO_READ_FILE_TEXT, CHECKED_IO_READ_LINE,
     CHECKED_IO_READ_STDIN_BYTES, CHECKED_IO_WRITE_FILE, CHECKED_IO_WRITE_STDERR,
-    CHECKED_IO_WRITE_STDOUT, CLASS_ALLOCATE, CLASS_FREE, COLLECTION_AGGREGATE_INSERT_SLOT,
+    CHECKED_IO_WRITE_STDOUT, CLASS_ALLOCATE, CLASS_FREE, CLOSURE_ENVIRONMENT_ALLOCATE,
+    CLOSURE_ENVIRONMENT_FREE, COLLECTION_AGGREGATE_INSERT_SLOT,
     COLLECTION_AGGREGATE_KEYED_SET_SLOT, COLLECTION_AGGREGATE_NEW,
     COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO, COLLECTION_AGGREGATE_PUSH_FRONT_SLOT,
     COLLECTION_AGGREGATE_PUSH_SLOT, COLLECTION_AGGREGATE_REMOVE_AT_INTO,
@@ -76,6 +77,7 @@ use crate::native_abi::{
     WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES,
     WRITE_STDOUT_BYTES,
 };
+use crate::native_closure_abi;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
 pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
@@ -150,6 +152,14 @@ fn build_module<'ctx>(
     let functions = declare_functions(context, &module, &target_data, program)?;
     let class_drop_functions = declare_class_drop_functions(context, &module, program);
     let collection_drop_functions = declare_collection_drop_functions(context, &module, program);
+    let closure_drop_functions = declare_closure_drop_functions(context, &module, program);
+    let closure_descriptors = declare_closure_descriptors(
+        context,
+        &module,
+        program,
+        &functions,
+        &closure_drop_functions,
+    )?;
     let statics = declare_statics(context, &module, &target_data, program)?;
     let (error_descriptors, error_origins) = declare_error_metadata(
         context,
@@ -162,6 +172,8 @@ fn build_module<'ctx>(
         functions,
         class_drop_functions,
         collection_drop_functions,
+        closure_drop_functions,
+        closure_descriptors,
         statics,
         error_descriptors,
         error_origins,
@@ -178,6 +190,7 @@ fn build_module<'ctx>(
     }
     define_class_drop_functions(context, &module, &target_data, program, &declarations)?;
     define_collection_drop_functions(context, &module, &target_data, program, &declarations)?;
+    define_closure_drop_functions(context, &module, &target_data, program, &declarations)?;
     define_process_main(context, &module, &target_data, program, &declarations)?;
 
     module
@@ -199,9 +212,69 @@ struct DeclaredProgram<'ctx> {
     functions: Vec<FunctionValue<'ctx>>,
     class_drop_functions: Vec<FunctionValue<'ctx>>,
     collection_drop_functions: Vec<FunctionValue<'ctx>>,
+    closure_drop_functions: Vec<FunctionValue<'ctx>>,
+    closure_descriptors: Vec<GlobalValue<'ctx>>,
     statics: Vec<GlobalValue<'ctx>>,
     error_descriptors: Vec<GlobalValue<'ctx>>,
     error_origins: Vec<GlobalValue<'ctx>>,
+}
+
+fn declare_closure_drop_functions<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    program: &mir::Program,
+) -> Vec<FunctionValue<'ctx>> {
+    let pointer = context.ptr_type(AddressSpace::default());
+    let signature = context
+        .void_type()
+        .fn_type(&[pointer.into(), pointer.into()], false);
+    program
+        .closure_descriptors
+        .iter()
+        .map(|descriptor| {
+            module.add_function(
+                &format!("__doria_drop_closure_environment_{}", descriptor.id.0),
+                signature,
+                Some(Linkage::Internal),
+            )
+        })
+        .collect()
+}
+
+fn declare_closure_descriptors<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    program: &mir::Program,
+    functions: &[FunctionValue<'ctx>],
+    closure_drop_functions: &[FunctionValue<'ctx>],
+) -> Result<Vec<GlobalValue<'ctx>>, BackendError> {
+    let ty = closure_descriptor_type(context);
+    program
+        .closure_descriptors
+        .iter()
+        .map(|descriptor| {
+            let entry = functions
+                .get(descriptor.entry_function.0)
+                .ok_or_else(|| malformed_mir("closure entry function was not declared"))?
+                .as_global_value()
+                .as_pointer_value();
+            let drop_environment = closure_drop_functions
+                .get(descriptor.id.0)
+                .ok_or_else(|| malformed_mir("closure drop function was not declared"))?
+                .as_global_value()
+                .as_pointer_value();
+            let initializer = ty.const_named_struct(&[entry.into(), drop_environment.into()]);
+            let global = module.add_global(
+                ty,
+                None,
+                &format!("__doria_closure_descriptor_{}", descriptor.id.0),
+            );
+            global.set_initializer(&initializer);
+            global.set_constant(true);
+            global.set_linkage(Linkage::Internal);
+            Ok(global)
+        })
+        .collect()
 }
 
 fn declare_class_drop_functions<'ctx>(
@@ -473,20 +546,14 @@ fn function_type<'ctx>(
     target_data: &TargetData,
     function: &mir::Function,
 ) -> Result<inkwell::types::FunctionType<'ctx>, BackendError> {
-    let mut parameters = vec![context.ptr_type(AddressSpace::default()).into()];
+    let pointer = context.ptr_type(AddressSpace::default());
+    let signature_plan = native_closure_abi::NativeCallableSignaturePlan::direct(function);
+    let mut parameters = signature_plan
+        .hidden_inputs
+        .iter()
+        .map(|_| pointer.into())
+        .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
     let checked = !function.checked_effects.is_empty();
-    let aggregate_return = matches!(
-        function.return_type,
-        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-    );
-    if checked {
-        if matches!(function.return_type, mir::ReturnType::Value(_)) {
-            parameters.push(context.ptr_type(AddressSpace::default()).into());
-        }
-        parameters.push(context.ptr_type(AddressSpace::default()).into());
-    } else if aggregate_return {
-        parameters.push(context.ptr_type(AddressSpace::default()).into());
-    }
     for parameter in &function.params {
         let local = local_in(function, *parameter)?;
         parameters.push(
@@ -497,6 +564,45 @@ fn function_type<'ctx>(
                 context.ptr_type(AddressSpace::default()).into()
             } else {
                 llvm_type(context, target_data, local.ty).into()
+            },
+        );
+    }
+    if checked {
+        return Ok(context.i8_type().fn_type(&parameters, false));
+    }
+    Ok(match function.return_type {
+        mir::ReturnType::Void => context.void_type().fn_type(&parameters, false),
+        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)) => {
+            context.void_type().fn_type(&parameters, false)
+        }
+        mir::ReturnType::Value(ty) => {
+            llvm_type(context, target_data, ty).fn_type(&parameters, false)
+        }
+    })
+}
+
+fn indirect_function_type<'ctx>(
+    context: &'ctx Context,
+    target_data: &TargetData,
+    function: &mir::FunctionType,
+) -> Result<inkwell::types::FunctionType<'ctx>, BackendError> {
+    let pointer = context.ptr_type(AddressSpace::default());
+    let signature_plan = native_closure_abi::NativeCallableSignaturePlan::indirect(function);
+    let mut parameters = signature_plan
+        .hidden_inputs
+        .iter()
+        .map(|_| pointer.into())
+        .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
+    let checked = !function.checked_effects.is_empty();
+    for parameter in &function.parameters {
+        parameters.push(
+            if matches!(
+                parameter.ty,
+                mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+            ) {
+                pointer.into()
+            } else {
+                llvm_type(context, target_data, parameter.ty).into()
             },
         );
     }
@@ -526,21 +632,15 @@ fn apply_function_abi_attributes(
             apply_integer_extension_attribute(context, llvm_function, AttributeLoc::Return, ty);
         }
     }
-    let hidden_return = if function.checked_effects.is_empty() {
-        u32::from(matches!(
-            function.return_type,
-            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-        ))
-    } else {
-        1 + u32::from(matches!(function.return_type, mir::ReturnType::Value(_)))
-    };
+    let source_parameter_offset = native_closure_abi::NativeCallableSignaturePlan::direct(function)
+        .source_parameter_offset() as u32;
     for (index, parameter) in function.params.iter().enumerate() {
         let local = local_in(function, *parameter)?;
         if let mir::Type::Scalar(mir::ScalarType::Integer(ty)) = local.ty {
             apply_integer_extension_attribute(
                 context,
                 llvm_function,
-                AttributeLoc::Param(index as u32 + 1 + hidden_return),
+                AttributeLoc::Param(index as u32 + source_parameter_offset),
                 ty,
             );
         }
@@ -599,6 +699,34 @@ fn define_function<'ctx>(
         build(builder.build_store(slot, ty.const_zero()))?;
         local_slots.push(Some(slot));
     }
+    let closure_environment_slots = program
+        .closure_descriptors
+        .iter()
+        .map(|descriptor| {
+            if descriptor.environment_placement != mir::ClosureEnvironmentPlacement::Stack {
+                return Ok(None);
+            }
+            let logical = descriptor.environment_layout.ok_or_else(|| {
+                malformed_mir("stack closure descriptor has no environment layout")
+            })?;
+            let layout = native_closure_abi::environment_layout(
+                program,
+                logical,
+                target_data.get_pointer_byte_size(None),
+            )?;
+            let slot = build(builder.build_alloca(
+                context.i8_type().array_type(layout.layout.size.max(1)),
+                &format!("closure.environment.{}", descriptor.id.0),
+            ))?;
+            slot.as_instruction_value()
+                .ok_or_else(|| backend_failure("closure environment alloca has no instruction"))?
+                .set_alignment(layout.layout.align)
+                .map_err(|error| {
+                    backend_failure(format!("failed to align closure environment: {error}"))
+                })?;
+            Ok(Some(slot))
+        })
+        .collect::<Result<Vec<_>, BackendError>>()?;
     let mut deferred_class_temporary_slots =
         Vec::with_capacity(mir::class_temporary_capacity(function));
     for index in 0..mir::class_temporary_capacity(function) {
@@ -609,33 +737,18 @@ fn define_function<'ctx>(
         build(builder.build_store(slot, context.ptr_type(AddressSpace::default()).const_null()))?;
         deferred_class_temporary_slots.push(slot);
     }
-    let checked = !function.checked_effects.is_empty();
-    let aggregate_return = !checked
-        && matches!(
-            function.return_type,
-            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-        );
-    let return_address = (aggregate_return
-        || (checked && matches!(function.return_type, mir::ReturnType::Value(_))))
-    .then(|| llvm_function.get_nth_param(1))
-    .flatten()
-    .map(BasicValueEnum::into_pointer_value);
-    let checked_error_address = checked
-        .then(|| {
-            llvm_function.get_nth_param(
-                1 + u32::from(matches!(function.return_type, mir::ReturnType::Value(_))),
-            )
-        })
-        .flatten()
+    let signature_plan = native_closure_abi::NativeCallableSignaturePlan::direct(function);
+    let return_address = signature_plan
+        .index_of(native_closure_abi::NativeCallableHiddenInput::ResultOut)
+        .and_then(|index| llvm_function.get_nth_param(index as u32))
         .map(BasicValueEnum::into_pointer_value);
-    let hidden_parameters = if checked {
-        1 + u32::from(matches!(function.return_type, mir::ReturnType::Value(_)))
-    } else {
-        u32::from(aggregate_return)
-    };
+    let checked_error_address = signature_plan
+        .index_of(native_closure_abi::NativeCallableHiddenInput::ErrorOut)
+        .and_then(|index| llvm_function.get_nth_param(index as u32))
+        .map(BasicValueEnum::into_pointer_value);
     for (index, parameter) in function.params.iter().enumerate() {
         let value = llvm_function
-            .get_nth_param(index as u32 + 1 + hidden_parameters)
+            .get_nth_param(index as u32 + signature_plan.source_parameter_offset() as u32)
             .ok_or_else(|| malformed_mir("LLVM function is missing a declared parameter"))?;
         let local = local_in(function, *parameter)?;
         let destination = local_slot(&local_slots, *parameter)?;
@@ -677,7 +790,11 @@ fn define_function<'ctx>(
     );
     let frame = build(builder.build_alloca(frame_type, "doria.frame.v2"))?;
     let parent = llvm_function
-        .get_nth_param(0)
+        .get_nth_param(
+            signature_plan
+                .index_of(native_closure_abi::NativeCallableHiddenInput::CurrentFrame)
+                .expect("native callable plans always include a current frame") as u32,
+        )
         .ok_or_else(|| malformed_mir("LLVM function is missing its parent frame"))?
         .into_pointer_value();
     let function_name = define_bytes(
@@ -731,6 +848,24 @@ fn define_function<'ctx>(
         build(builder.build_store(field, value))?;
     }
     let current_frame = frame;
+    let borrow_home_addresses = match (
+        native_closure_abi::return_borrow_source_parameter(function)?,
+        signature_plan.index_of(native_closure_abi::NativeCallableHiddenInput::BorrowHome),
+    ) {
+        (Some(local), Some(index)) => HashMap::from([(
+            local,
+            llvm_function
+                .get_nth_param(index as u32)
+                .ok_or_else(|| malformed_mir("LLVM function is missing its borrow home"))?
+                .into_pointer_value(),
+        )]),
+        (None, None) => HashMap::new(),
+        _ => {
+            return Err(malformed_mir(
+                "callable borrow-home ABI plan is inconsistent",
+            ))
+        }
+    };
     let mut lowerer = FunctionLowerer {
         context,
         module,
@@ -742,10 +877,14 @@ fn define_function<'ctx>(
         functions: &declarations.functions,
         class_drop_functions: &declarations.class_drop_functions,
         collection_drop_functions: &declarations.collection_drop_functions,
+        closure_descriptors: &declarations.closure_descriptors,
         statics: &declarations.statics,
         error_descriptors: &declarations.error_descriptors,
         error_origins: &declarations.error_origins,
         local_slots,
+        closure_environment_slots,
+        closure_bound_fields: HashMap::new(),
+        borrow_home_addresses,
         blocks,
         current_frame,
         return_address,
@@ -808,10 +947,14 @@ fn define_class_drop_functions<'ctx>(
             functions: &declarations.functions,
             class_drop_functions: &declarations.class_drop_functions,
             collection_drop_functions: &declarations.collection_drop_functions,
+            closure_descriptors: &declarations.closure_descriptors,
             statics: &declarations.statics,
             error_descriptors: &declarations.error_descriptors,
             error_origins: &declarations.error_origins,
             local_slots: Vec::new(),
+            closure_environment_slots: Vec::new(),
+            closure_bound_fields: HashMap::new(),
+            borrow_home_addresses: HashMap::new(),
             blocks: Vec::new(),
             current_frame,
             return_address: None,
@@ -859,10 +1002,14 @@ fn define_collection_drop_functions<'ctx>(
             functions: &declarations.functions,
             class_drop_functions: &declarations.class_drop_functions,
             collection_drop_functions: &declarations.collection_drop_functions,
+            closure_descriptors: &declarations.closure_descriptors,
             statics: &declarations.statics,
             error_descriptors: &declarations.error_descriptors,
             error_origins: &declarations.error_origins,
             local_slots: Vec::new(),
+            closure_environment_slots: Vec::new(),
+            closure_bound_fields: HashMap::new(),
+            borrow_home_addresses: HashMap::new(),
             blocks: Vec::new(),
             current_frame: context.ptr_type(AddressSpace::default()).const_null(),
             return_address: None,
@@ -874,6 +1021,125 @@ fn define_collection_drop_functions<'ctx>(
             deferred_class_temporary_drops: Vec::new(),
         };
         lowerer.drop_collection_value(value, collection.id)?;
+        build(lowerer.builder.build_return(None))?;
+    }
+    Ok(())
+}
+
+fn define_closure_drop_functions<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    target_data: &TargetData,
+    program: &mir::Program,
+    declarations: &DeclaredProgram<'ctx>,
+) -> Result<(), BackendError> {
+    for descriptor in &program.closure_descriptors {
+        let llvm_function = *declarations
+            .closure_drop_functions
+            .get(descriptor.id.0)
+            .ok_or_else(|| malformed_mir("closure drop function was not declared"))?;
+        let builder = context.create_builder();
+        let entry = context.append_basic_block(llvm_function, "entry");
+        builder.position_at_end(entry);
+        let current_frame = llvm_function
+            .get_nth_param(0)
+            .ok_or_else(|| malformed_mir("closure drop function is missing its frame"))?
+            .into_pointer_value();
+        let environment = llvm_function
+            .get_nth_param(1)
+            .ok_or_else(|| malformed_mir("closure drop function is missing its environment"))?
+            .into_pointer_value();
+        let function = function_in(program, descriptor.entry_function)?;
+        let mut lowerer = FunctionLowerer {
+            context,
+            module,
+            target_data,
+            builder,
+            entry_block: entry,
+            program,
+            function,
+            functions: &declarations.functions,
+            class_drop_functions: &declarations.class_drop_functions,
+            collection_drop_functions: &declarations.collection_drop_functions,
+            closure_descriptors: &declarations.closure_descriptors,
+            statics: &declarations.statics,
+            error_descriptors: &declarations.error_descriptors,
+            error_origins: &declarations.error_origins,
+            local_slots: Vec::new(),
+            closure_environment_slots: Vec::new(),
+            closure_bound_fields: HashMap::new(),
+            borrow_home_addresses: HashMap::new(),
+            blocks: Vec::new(),
+            current_frame,
+            return_address: None,
+            checked_error_address: None,
+            next_data_id: 0,
+            defer_class_temporary_drops: false,
+            deferred_class_temporary_slots: Vec::new(),
+            deferred_class_temporary_slot_cursor: 0,
+            deferred_class_temporary_drops: Vec::new(),
+        };
+        if let Some(logical_id) = descriptor.environment_layout {
+            let logical = closure_environment_layout_in(program, logical_id)?.clone();
+            let native = native_closure_abi::environment_layout(
+                program,
+                logical_id,
+                target_data.get_pointer_byte_size(None),
+            )?;
+            for logical_index in &logical.logical_release_order {
+                let field = logical
+                    .fields
+                    .get(*logical_index)
+                    .ok_or_else(|| malformed_mir("closure drop field does not exist"))?;
+                if field.storage != mir::ClosureEnvironmentStorage::Owned {
+                    continue;
+                }
+                let layout = native
+                    .fields
+                    .iter()
+                    .find(|layout| layout.field == field.id)
+                    .ok_or_else(|| malformed_mir("native closure drop field does not exist"))?;
+                let Some(bit) = layout.live_bit else {
+                    continue;
+                };
+                let byte = build(lowerer.builder.build_load(
+                    context.i8_type(),
+                    lowerer.byte_offset(environment, bit / 8, "closure.live.byte")?,
+                    "closure.live",
+                ))?
+                .into_int_value();
+                let mask = context.i8_type().const_int(1_u64 << (bit % 8), false);
+                let live = build(lowerer.builder.build_and(byte, mask, "closure.live.mask"))?;
+                let live = build(lowerer.builder.build_int_compare(
+                    IntPredicate::NE,
+                    live,
+                    context.i8_type().const_zero(),
+                    "closure.live.test",
+                ))?;
+                let drop_block = context.append_basic_block(llvm_function, "closure.field.drop");
+                let next = context.append_basic_block(llvm_function, "closure.field.next");
+                build(
+                    lowerer
+                        .builder
+                        .build_conditional_branch(live, drop_block, next),
+                )?;
+                lowerer.builder.position_at_end(drop_block);
+                let address = lowerer.byte_offset(environment, layout.offset, "closure.field")?;
+                lowerer.drop_value_at_address(address, field.ty)?;
+                lowerer.set_environment_live_bit(environment, bit, false)?;
+                build(lowerer.builder.build_unconditional_branch(next))?;
+                lowerer.builder.position_at_end(next);
+            }
+            if descriptor.environment_placement == mir::ClosureEnvironmentPlacement::Heap {
+                let pointer = context.ptr_type(AddressSpace::default());
+                let _ = lowerer.call_runtime(
+                    CLOSURE_ENVIRONMENT_FREE,
+                    &[pointer.into()],
+                    None,
+                    &[environment.into()],
+                )?;
+            }
+        }
         build(lowerer.builder.build_return(None))?;
     }
     Ok(())
@@ -1285,10 +1551,14 @@ struct FunctionLowerer<'ctx, 'program> {
     functions: &'program [FunctionValue<'ctx>],
     class_drop_functions: &'program [FunctionValue<'ctx>],
     collection_drop_functions: &'program [FunctionValue<'ctx>],
+    closure_descriptors: &'program [GlobalValue<'ctx>],
     statics: &'program [GlobalValue<'ctx>],
     error_descriptors: &'program [GlobalValue<'ctx>],
     error_origins: &'program [GlobalValue<'ctx>],
     local_slots: Vec<Option<PointerValue<'ctx>>>,
+    closure_environment_slots: Vec<Option<PointerValue<'ctx>>>,
+    closure_bound_fields: HashMap<mir::LocalId, BoundClosureField<'ctx>>,
+    borrow_home_addresses: HashMap<mir::LocalId, PointerValue<'ctx>>,
     blocks: Vec<BasicBlock<'ctx>>,
     current_frame: PointerValue<'ctx>,
     return_address: Option<PointerValue<'ctx>>,
@@ -1298,6 +1568,13 @@ struct FunctionLowerer<'ctx, 'program> {
     deferred_class_temporary_slots: Vec<PointerValue<'ctx>>,
     deferred_class_temporary_slot_cursor: usize,
     deferred_class_temporary_drops: Vec<(PointerValue<'ctx>, DeferredOwnedTemporary)>,
+}
+
+#[derive(Clone, Copy)]
+struct BoundClosureField<'ctx> {
+    address: PointerValue<'ctx>,
+    storage: mir::ClosureEnvironmentStorage,
+    ty: mir::Type,
 }
 
 struct LoweredCallArguments<'ctx> {
@@ -1629,6 +1906,562 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok((present, payload))
     }
 
+    fn closure_value(
+        &self,
+        descriptor: PointerValue<'ctx>,
+        environment: PointerValue<'ctx>,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let value = closure_carrier_type(self.context).get_undef();
+        let value =
+            build(
+                self.builder
+                    .build_insert_value(value, descriptor, 0, "closure.descriptor"),
+            )?
+            .into_struct_value();
+        Ok(build(
+            self.builder
+                .build_insert_value(value, environment, 1, "closure.environment"),
+        )?
+        .into_struct_value())
+    }
+
+    fn closure_parts(
+        &self,
+        value: StructValue<'ctx>,
+    ) -> Result<(PointerValue<'ctx>, PointerValue<'ctx>), BackendError> {
+        let descriptor = build(
+            self.builder
+                .build_extract_value(value, 0, "closure.descriptor"),
+        )?
+        .into_pointer_value();
+        let environment = build(
+            self.builder
+                .build_extract_value(value, 1, "closure.environment"),
+        )?
+        .into_pointer_value();
+        Ok((descriptor, environment))
+    }
+
+    fn clear_function_slot(&self, slot: PointerValue<'ctx>) -> Result<(), BackendError> {
+        build(
+            self.builder
+                .build_store(slot, closure_carrier_type(self.context).const_zero()),
+        )?;
+        Ok(())
+    }
+
+    fn set_environment_live_bit(
+        &self,
+        environment: PointerValue<'ctx>,
+        bit: u32,
+        live: bool,
+    ) -> Result<(), BackendError> {
+        let address = self.byte_offset(environment, bit / 8, "closure.live.byte")?;
+        let current = build(self.builder.build_load(
+            self.context.i8_type(),
+            address,
+            "closure.live",
+        ))?
+        .into_int_value();
+        let mask = 1_u64 << (bit % 8);
+        let next = if live {
+            build(self.builder.build_or(
+                current,
+                self.context.i8_type().const_int(mask, false),
+                "closure.live.set",
+            ))?
+        } else {
+            build(self.builder.build_and(
+                current,
+                self.context.i8_type().const_int((!mask) & 0xff, false),
+                "closure.live.clear",
+            ))?
+        };
+        build(self.builder.build_store(address, next))?;
+        Ok(())
+    }
+
+    fn drop_function_carrier(&mut self, value: StructValue<'ctx>) -> Result<(), BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let (descriptor, environment) = self.closure_parts(value)?;
+        let present = build(
+            self.builder
+                .build_is_not_null(descriptor, "closure.drop.present"),
+        )?;
+        let has_environment = build(
+            self.builder
+                .build_is_not_null(environment, "closure.drop.environment-present"),
+        )?;
+        let should_drop = build(self.builder.build_and(
+            present,
+            has_environment,
+            "closure.drop.required",
+        ))?;
+        let function = current_function(&self.builder)?;
+        let drop_block = self.context.append_basic_block(function, "closure.drop");
+        let done = self
+            .context
+            .append_basic_block(function, "closure.drop.done");
+        build(
+            self.builder
+                .build_conditional_branch(should_drop, drop_block, done),
+        )?;
+        self.builder.position_at_end(drop_block);
+        let descriptor_ty = closure_descriptor_type(self.context);
+        let drop_field = build(self.builder.build_struct_gep(
+            descriptor_ty,
+            descriptor,
+            1,
+            "closure.drop.field",
+        ))?;
+        let drop_function = build(self.builder.build_load(
+            pointer,
+            drop_field,
+            "closure.drop.function",
+        ))?
+        .into_pointer_value();
+        let signature = self
+            .context
+            .void_type()
+            .fn_type(&[pointer.into(), pointer.into()], false);
+        let _ = build(self.builder.build_indirect_call(
+            signature,
+            drop_function,
+            &[self.current_frame.into(), environment.into()],
+            "closure.drop.call",
+        ))?;
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        Ok(())
+    }
+
+    fn bind_closure_environment(
+        &mut self,
+        environment_local: mir::LocalId,
+        bindings: &[(mir::ClosureEnvironmentFieldId, mir::LocalId)],
+    ) -> Result<(), BackendError> {
+        let descriptor = self
+            .program
+            .closure_descriptors
+            .iter()
+            .find(|descriptor| descriptor.entry_function == self.function.id)
+            .ok_or_else(|| malformed_mir("closure environment binding is outside a closure"))?
+            .clone();
+        let logical_id = descriptor
+            .environment_layout
+            .ok_or_else(|| malformed_mir("closure environment binding has no layout"))?;
+        let logical = closure_environment_layout_in(self.program, logical_id)?.clone();
+        let native = native_closure_abi::environment_layout(
+            self.program,
+            logical_id,
+            self.target_data.get_pointer_byte_size(None),
+        )?;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let environment = build(self.builder.build_load(
+            pointer,
+            local_slot(&self.local_slots, environment_local)?,
+            "closure.environment",
+        ))?
+        .into_pointer_value();
+        for (field_id, target) in bindings {
+            let field = logical
+                .fields
+                .iter()
+                .find(|field| field.id == *field_id)
+                .ok_or_else(|| malformed_mir("closure binding field does not exist"))?;
+            let layout = native
+                .fields
+                .iter()
+                .find(|layout| layout.field == *field_id)
+                .ok_or_else(|| malformed_mir("native closure binding field does not exist"))?;
+            let field_address =
+                self.byte_offset(environment, layout.offset, "closure.binding.field")?;
+            let place = match field.storage {
+                mir::ClosureEnvironmentStorage::ReadonlyBorrow
+                | mir::ClosureEnvironmentStorage::WritableBorrow => build(
+                    self.builder
+                        .build_load(pointer, field_address, "closure.binding.place"),
+                )?
+                .into_pointer_value(),
+                mir::ClosureEnvironmentStorage::Owned => field_address,
+            };
+            let target_slot = local_slot(&self.local_slots, *target)?;
+            if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
+                field.ty
+            {
+                self.copy_payload_bytes(
+                    target_slot,
+                    place,
+                    payload,
+                    matches!(field.ty, mir::Type::NullablePayloadEnum(_)),
+                )?;
+            } else {
+                let value = build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, field.ty),
+                    place,
+                    "closure.binding.value",
+                ))?;
+                build(self.builder.build_store(target_slot, value))?;
+            }
+            if matches!(field.ty, mir::Type::String | mir::Type::NullableString) {
+                let stored = build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, field.ty),
+                    target_slot,
+                    "closure.binding.string",
+                ))?;
+                let string = if field.ty == mir::Type::NullableString {
+                    self.nullable_parts(stored.into_struct_value())?
+                        .1
+                        .into_pointer_value()
+                } else {
+                    stored.into_pointer_value()
+                };
+                let retained = self.retain_string(string)?;
+                if field.ty == mir::Type::NullableString {
+                    let (present, _) = self.nullable_parts(stored.into_struct_value())?;
+                    let replacement = self.nullable_value(present, retained.into())?;
+                    build(self.builder.build_store(target_slot, replacement))?;
+                } else {
+                    build(self.builder.build_store(target_slot, retained))?;
+                }
+            }
+            if field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
+                && field.ty.transfers_writable_capture_ownership()
+            {
+                match field.ty {
+                    mir::Type::PayloadEnum(payload) => {
+                        self.zero_payload_bytes(place, payload, false)?;
+                    }
+                    mir::Type::NullablePayloadEnum(payload) => {
+                        self.zero_payload_bytes(place, payload, true)?;
+                    }
+                    _ => {
+                        build(self.builder.build_store(
+                            place,
+                            llvm_type(self.context, self.target_data, field.ty).const_zero(),
+                        ))?;
+                    }
+                }
+            }
+            let address = if field.storage == mir::ClosureEnvironmentStorage::Owned {
+                target_slot
+            } else {
+                place
+            };
+            self.closure_bound_fields.insert(
+                *target,
+                BoundClosureField {
+                    address,
+                    storage: field.storage,
+                    ty: field.ty,
+                },
+            );
+            if field.storage == mir::ClosureEnvironmentStorage::Owned
+                && field.ty.has_move_ownership()
+            {
+                let zero = self.context.i8_type().const_zero();
+                let size = self
+                    .context
+                    .ptr_sized_int_type(self.target_data, None)
+                    .const_int(u64::from(layout.layout.size), false);
+                build(
+                    self.builder
+                        .build_memset(field_address, layout.layout.align, zero, size),
+                )?;
+                if let Some(bit) = layout.live_bit {
+                    self.set_environment_live_bit(environment, bit, false)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn closure_source_address(
+        &self,
+        local: mir::LocalId,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        if let Some(field) = self.closure_bound_fields.get(&local) {
+            return Ok(field.address);
+        }
+        if let Some(address) = self.borrow_home_addresses.get(&local) {
+            return Ok(*address);
+        }
+        local_slot(&self.local_slots, local)
+    }
+
+    fn direct_call_borrow_home(
+        &self,
+        callee: &mir::Function,
+        args: &[mir::Rvalue],
+        separately_lowered_receiver: Option<PointerValue<'ctx>>,
+    ) -> Result<Option<PointerValue<'ctx>>, BackendError> {
+        let Some(return_borrow) = callee
+            .return_borrow
+            .filter(|_| native_closure_abi::returns_function_value(callee.return_type))
+        else {
+            return Ok(None);
+        };
+        let source = match (return_borrow.source, separately_lowered_receiver) {
+            (mir::BorrowSource::Receiver, Some(_)) => {
+                return Err(malformed_mir(
+                    "borrow-returning null-safe method call has no stable receiver place",
+                ));
+            }
+            (mir::BorrowSource::Parameter(index), Some(_)) => args.get(index),
+            (_, None) => args.get(native_closure_abi::return_borrow_argument_index(
+                return_borrow,
+                callee.receiver_mode.is_some(),
+            )),
+        }
+        .ok_or_else(|| {
+            malformed_mir(format!(
+                "borrow-returning call to {} has no source argument",
+                callee.name
+            ))
+        })?;
+        self.rvalue_borrow_home(source).map(Some)
+    }
+
+    fn indirect_call_borrow_home(
+        &self,
+        function_type: &mir::FunctionType,
+        args: &[mir::Rvalue],
+    ) -> Result<Option<PointerValue<'ctx>>, BackendError> {
+        let Some(return_borrow) = function_type
+            .return_borrow
+            .filter(|_| native_closure_abi::returns_function_value(function_type.return_type))
+        else {
+            return Ok(None);
+        };
+        let source = args
+            .get(native_closure_abi::return_borrow_argument_index(
+                return_borrow,
+                false,
+            ))
+            .ok_or_else(|| {
+                malformed_mir("borrow-returning indirect call has no source argument")
+            })?;
+        self.rvalue_borrow_home(source).map(Some)
+    }
+
+    fn rvalue_borrow_home(&self, source: &mir::Rvalue) -> Result<PointerValue<'ctx>, BackendError> {
+        let place = match source {
+            mir::Rvalue::Value(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                operand,
+                ..
+            }))
+            | mir::Rvalue::Value(mir::ValueExpression::Float(mir::FloatExpression::Use {
+                operand,
+                ..
+            }))
+            | mir::Rvalue::Value(mir::ValueExpression::Bool(mir::BoolExpression::Use {
+                operand,
+            }))
+            | mir::Rvalue::Value(mir::ValueExpression::Enum(mir::EnumExpression::Use {
+                operand,
+                ..
+            })) => return self.operand_borrow_home(operand),
+            mir::Rvalue::String(mir::StringExpression::Local(local))
+            | mir::Rvalue::String(mir::StringExpression::NullableLocalAssumeNonNull(local))
+            | mir::Rvalue::Class(mir::ClassExpression::Local { local, .. })
+            | mir::Rvalue::Class(mir::ClassExpression::NullableLocalAssumeNonNull {
+                local, ..
+            })
+            | mir::Rvalue::Collection(mir::CollectionExpression::Local { local, .. })
+            | mir::Rvalue::Mixed(mir::MixedExpression::Local { local, .. })
+            | mir::Rvalue::Error(mir::ErrorExpression::Local { local, .. })
+            | mir::Rvalue::Error(mir::ErrorExpression::NullableLocalAssumeNonNull {
+                local, ..
+            })
+            | mir::Rvalue::Function(mir::FunctionExpression::Local { local, .. })
+            | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Local {
+                local, ..
+            })
+            | mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Local { local, .. })
+            | mir::Rvalue::NullableString(mir::NullableStringExpression::Local(local))
+            | mir::Rvalue::NullableClass(mir::NullableClassExpression::Local { local, .. })
+            | mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Local {
+                local,
+                ..
+            })
+            | mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Local { local, .. })
+            | mir::Rvalue::NullableError(mir::NullableErrorExpression::Local { local, .. }) => {
+                Some((*local, None))
+            }
+            mir::Rvalue::String(mir::StringExpression::Property {
+                object, property, ..
+            })
+            | mir::Rvalue::Class(mir::ClassExpression::Property {
+                object, property, ..
+            })
+            | mir::Rvalue::Collection(mir::CollectionExpression::Property {
+                object,
+                property,
+                ..
+            })
+            | mir::Rvalue::Mixed(mir::MixedExpression::Property {
+                object, property, ..
+            })
+            | mir::Rvalue::Error(mir::ErrorExpression::Property {
+                object, property, ..
+            })
+            | mir::Rvalue::Function(mir::FunctionExpression::Property {
+                object, property, ..
+            })
+            | mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Property {
+                object,
+                property,
+                ..
+            })
+            | mir::Rvalue::NullableString(mir::NullableStringExpression::Property {
+                object,
+                property,
+                ..
+            })
+            | mir::Rvalue::NullableClass(mir::NullableClassExpression::Property {
+                object,
+                property,
+                ..
+            })
+            | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Property {
+                object,
+                property,
+                ..
+            }) => Some((*object, Some(*property))),
+            _ => None,
+        };
+        match place {
+            Some((local, None)) => self.closure_source_address(local),
+            Some((object, Some(property))) => self.lower_property_address(object, property),
+            None => Err(malformed_mir(
+                "borrow-returning call source is not an addressable Doria place",
+            )),
+        }
+    }
+
+    fn operand_borrow_home(
+        &self,
+        operand: &mir::Operand,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        match operand {
+            mir::Operand::Local(local) | mir::Operand::NullablePayload(local) => {
+                self.closure_source_address(*local)
+            }
+            mir::Operand::Property { object, property } => {
+                self.lower_property_address(*object, *property)
+            }
+            _ => Err(malformed_mir(
+                "borrow-returning call source is not an addressable scalar place",
+            )),
+        }
+    }
+
+    fn sync_writable_closure_captures(&mut self) -> Result<(), BackendError> {
+        let bindings = self
+            .closure_bound_fields
+            .iter()
+            .filter_map(|(local, field)| {
+                (field.storage == mir::ClosureEnvironmentStorage::WritableBorrow)
+                    .then_some((*local, *field))
+            })
+            .collect::<Vec<_>>();
+        for (local, field) in bindings {
+            let slot = local_slot(&self.local_slots, local)?;
+            match field.ty {
+                mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {
+                    let value = build(self.builder.build_load(
+                        llvm_type(self.context, self.target_data, field.ty),
+                        slot,
+                        "closure.capture.new",
+                    ))?;
+                    build(self.builder.build_store(field.address, value))?;
+                }
+                mir::Type::String | mir::Type::NullableString => {
+                    let ty = llvm_type(self.context, self.target_data, field.ty);
+                    let new = build(self.builder.build_load(ty, slot, "closure.capture.new"))?;
+                    let old = build(self.builder.build_load(
+                        ty,
+                        field.address,
+                        "closure.capture.old",
+                    ))?;
+                    let new_string = if field.ty == mir::Type::NullableString {
+                        self.nullable_parts(new.into_struct_value())?
+                            .1
+                            .into_pointer_value()
+                    } else {
+                        new.into_pointer_value()
+                    };
+                    let old_string = if field.ty == mir::Type::NullableString {
+                        self.nullable_parts(old.into_struct_value())?
+                            .1
+                            .into_pointer_value()
+                    } else {
+                        old.into_pointer_value()
+                    };
+                    let retained = self.retain_string(new_string)?;
+                    let replacement: BasicValueEnum<'ctx> = if field.ty == mir::Type::NullableString
+                    {
+                        let (present, _) = self.nullable_parts(new.into_struct_value())?;
+                        self.nullable_value(present, retained.into())?.into()
+                    } else {
+                        retained.into()
+                    };
+                    build(self.builder.build_store(field.address, replacement))?;
+                    self.release_string(old_string)?;
+                }
+                mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
+                    let nullable = matches!(field.ty, mir::Type::NullablePayloadEnum(_));
+                    self.copy_payload_bytes(field.address, slot, payload, nullable)?;
+                    self.zero_payload_bytes(slot, payload, nullable)?;
+                }
+                mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+                    let ty = closure_carrier_type(self.context);
+                    let new = build(self.builder.build_load(ty, slot, "closure.capture.new"))?;
+                    build(self.builder.build_store(field.address, new))?;
+                    self.clear_function_slot(slot)?;
+                }
+                mir::Type::Error | mir::Type::NullableError => {
+                    let ty = error_carrier_type(self.context);
+                    let new = build(self.builder.build_load(ty, slot, "closure.capture.new"))?;
+                    build(self.builder.build_store(field.address, new))?;
+                    build(self.builder.build_store(slot, ty.const_zero()))?;
+                }
+                mir::Type::Class(_)
+                | mir::Type::NullableClass(_)
+                | mir::Type::Collection(_)
+                | mir::Type::NullableCollection(_)
+                | mir::Type::Mixed
+                | mir::Type::NullableMixed
+                | mir::Type::SharedReference(_)
+                | mir::Type::WeakReference(_)
+                | mir::Type::NullableSharedReference(_)
+                | mir::Type::NullableWeakReference(_)
+                | mir::Type::WritableSharedReference(_)
+                | mir::Type::WritableWeakReference(_)
+                | mir::Type::NullableWritableSharedReference(_)
+                | mir::Type::NullableWritableWeakReference(_)
+                | mir::Type::ReadonlySharedReferenceAccess(_)
+                | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+                    let pointer = self.context.ptr_type(AddressSpace::default());
+                    let new = build(
+                        self.builder
+                            .build_load(pointer, slot, "closure.capture.new"),
+                    )?;
+                    build(self.builder.build_store(field.address, new))?;
+                    build(self.builder.build_store(slot, pointer.const_null()))?;
+                }
+                mir::Type::ClosureEnvironment(_) => {
+                    return Err(malformed_mir(
+                        "closure environment pointer cannot be a captured source value",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn present_word(&self, present: bool) -> IntValue<'ctx> {
         self.context
             .ptr_sized_int_type(self.target_data, None)
@@ -1642,14 +2475,221 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         self.lower_terminator(&block.terminator)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn lower_indirect_call(
+        &mut self,
+        callee: &mir::FunctionExpression,
+        function_type_id: mir::FunctionTypeId,
+        invocation_mode: mir::FunctionInvocationMode,
+        args: &[mir::Rvalue],
+        result: Option<mir::LocalId>,
+        continuation: mir::BlockId,
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        self.set_active_panic_site(span)?;
+        let function_type = function_type_in(self.program, function_type_id)?.clone();
+        if !function_type.checked_effects.is_empty() {
+            return Err(malformed_mir(
+                "throwing function type reached nonthrowing indirect call",
+            ));
+        }
+        let carrier = self.lower_function_expression(callee)?;
+        let (descriptor, environment) = self.closure_parts(carrier)?;
+        let lowered = self.lower_call_arguments(args)?;
+        let mut values = vec![self.current_frame.into()];
+        let aggregate_return = matches!(
+            function_type.return_type,
+            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
+        );
+        if aggregate_return {
+            let result =
+                result.ok_or_else(|| malformed_mir("indirect payload call has no result"))?;
+            values.push(local_slot(&self.local_slots, result)?.into());
+        }
+        if let Some(home) = self.indirect_call_borrow_home(&function_type, args)? {
+            values.push(home.into());
+        }
+        values.push(environment.into());
+        values.extend(lowered.values.iter().copied());
+        let entry = self.load_closure_entry(descriptor)?;
+        let call = build(self.builder.build_indirect_call(
+            indirect_function_type(self.context, self.target_data, &function_type)?,
+            entry,
+            &values,
+            "closure.call",
+        ))?;
+        if let mir::ReturnType::Value(ty) = function_type.return_type {
+            if !aggregate_return {
+                let value = call
+                    .try_as_basic_value()
+                    .basic()
+                    .ok_or_else(|| malformed_mir("indirect call produced no result"))?;
+                let result = result
+                    .ok_or_else(|| malformed_mir("value indirect call has no result local"))?;
+                self.store_value_at_address(local_slot(&self.local_slots, result)?, value, ty)?;
+            }
+        }
+        self.cleanup_indirect_call_arguments(&function_type, args, &lowered)?;
+        if invocation_mode == mir::FunctionInvocationMode::Once {
+            self.drop_function_carrier(carrier)?;
+        }
+        build(
+            self.builder
+                .build_unconditional_branch(block_for(&self.blocks, continuation)?),
+        )?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn lower_checked_indirect_call(
+        &mut self,
+        callee: &mir::FunctionExpression,
+        function_type_id: mir::FunctionTypeId,
+        invocation_mode: mir::FunctionInvocationMode,
+        args: &[mir::Rvalue],
+        result: Option<mir::LocalId>,
+        error: mir::LocalId,
+        success: mir::BlockId,
+        failure: mir::BlockId,
+        span: crate::source::Span,
+    ) -> Result<(), BackendError> {
+        self.set_active_panic_site(span)?;
+        let function_type = function_type_in(self.program, function_type_id)?.clone();
+        if function_type.checked_effects.is_empty() {
+            return Err(malformed_mir(
+                "nonthrowing function type reached checked indirect call",
+            ));
+        }
+        let carrier = self.lower_function_expression(callee)?;
+        let (descriptor, environment) = self.closure_parts(carrier)?;
+        let lowered = self.lower_call_arguments(args)?;
+        let mut values = vec![self.current_frame.into()];
+        if let Some(result) = result {
+            values.push(local_slot(&self.local_slots, result)?.into());
+        }
+        values.push(local_slot(&self.local_slots, error)?.into());
+        if let Some(home) = self.indirect_call_borrow_home(&function_type, args)? {
+            values.push(home.into());
+        }
+        values.push(environment.into());
+        values.extend(lowered.values.iter().copied());
+        let entry = self.load_closure_entry(descriptor)?;
+        let call = build(self.builder.build_indirect_call(
+            indirect_function_type(self.context, self.target_data, &function_type)?,
+            entry,
+            &values,
+            "closure.checked.call",
+        ))?;
+        let status = call
+            .try_as_basic_value()
+            .basic()
+            .ok_or_else(|| malformed_mir("checked indirect call produced no status"))?
+            .into_int_value();
+        self.cleanup_indirect_call_arguments(&function_type, args, &lowered)?;
+        if invocation_mode == mir::FunctionInvocationMode::Once {
+            self.drop_function_carrier(carrier)?;
+        }
+        let current = current_function(&self.builder)?;
+        let failed_status = self
+            .context
+            .append_basic_block(current, "closure.checked.failed-status");
+        let invalid_status = self
+            .context
+            .append_basic_block(current, "closure.checked.invalid-status");
+        let succeeded = build(self.builder.build_int_compare(
+            IntPredicate::EQ,
+            status,
+            self.context.i8_type().const_zero(),
+            "closure.checked.succeeded",
+        ))?;
+        build(self.builder.build_conditional_branch(
+            succeeded,
+            block_for(&self.blocks, success)?,
+            failed_status,
+        ))?;
+        self.builder.position_at_end(failed_status);
+        let failed = build(self.builder.build_int_compare(
+            IntPredicate::EQ,
+            status,
+            self.context.i8_type().const_int(1, false),
+            "closure.checked.failed",
+        ))?;
+        build(self.builder.build_conditional_branch(
+            failed,
+            block_for(&self.blocks, failure)?,
+            invalid_status,
+        ))?;
+        self.builder.position_at_end(invalid_status);
+        build(self.builder.build_unreachable())?;
+        Ok(())
+    }
+
+    fn load_closure_entry(
+        &self,
+        descriptor: PointerValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let field = build(self.builder.build_struct_gep(
+            closure_descriptor_type(self.context),
+            descriptor,
+            0,
+            "closure.entry.field",
+        ))?;
+        Ok(build(self.builder.build_load(pointer, field, "closure.entry"))?.into_pointer_value())
+    }
+
+    fn cleanup_indirect_call_arguments(
+        &mut self,
+        function_type: &mir::FunctionType,
+        args: &[mir::Rvalue],
+        lowered: &LoweredCallArguments<'ctx>,
+    ) -> Result<(), BackendError> {
+        for string in &lowered.owned_strings {
+            self.release_string(*string)?;
+        }
+        for index in ordered_owned_argument_indices(args) {
+            let parameter = function_type
+                .parameters
+                .get(index)
+                .ok_or_else(|| malformed_mir("indirect call parameter is missing"))?;
+            if parameter.mode != mir::FunctionParameterMode::Take {
+                let value = lowered.lowered[index];
+                if let Some(class) = args[index].owned_temporary_class() {
+                    self.defer_or_drop_class_temporary(value.into_pointer_value(), class)?;
+                } else if let Some(collection) = args[index].owned_temporary_collection() {
+                    self.defer_or_drop_collection_temporary(
+                        value.into_pointer_value(),
+                        collection,
+                    )?;
+                } else if let Some(shared) = args[index].owned_temporary_shared() {
+                    self.defer_or_drop_owned_shared_temporary(value.into_pointer_value(), shared)?;
+                } else if let Some((payload, nullable)) = args[index].owned_temporary_payload_enum()
+                {
+                    self.drop_payload_enum_at(value.into_pointer_value(), payload, nullable)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn lower_statement(&mut self, statement: &mir::Statement) -> Result<(), BackendError> {
         debug_assert!(self.deferred_class_temporary_drops.is_empty());
         self.defer_class_temporary_drops = true;
         match statement {
-            mir::Statement::BindClosureEnvironment { .. } | mir::Statement::DropFunction { .. } => {
-                return Err(backend_failure(
-                    "closure MIR reached LLVM before the Stage 30e boundary",
-                ));
+            mir::Statement::BindClosureEnvironment {
+                environment,
+                bindings,
+            } => self.bind_closure_environment(*environment, bindings)?,
+            mir::Statement::DropFunction { local, .. } => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                let carrier = build(self.builder.build_load(
+                    closure_carrier_type(self.context),
+                    slot,
+                    "closure.drop.local",
+                ))?
+                .into_struct_value();
+                self.drop_function_carrier(carrier)?;
+                self.clear_function_slot(slot)?;
             }
             mir::Statement::BindPayloadEnumFields {
                 source,
@@ -1823,6 +2863,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Statement::AssignLocal { target, value } => {
                 let local = local_in(self.function, *target)?;
                 let slot = local_slot(&self.local_slots, *target)?;
+                let old_function = (local.owned
+                    && matches!(
+                        local.ty,
+                        mir::Type::Function(_) | mir::Type::NullableFunction(_)
+                    ))
+                .then(|| {
+                    build(self.builder.build_load(
+                        closure_carrier_type(self.context),
+                        slot,
+                        "closure.old",
+                    ))
+                    .map(BasicValueEnum::into_struct_value)
+                })
+                .transpose()?;
                 let old = match local.ty {
                     mir::Type::String => Some((
                         build(self.builder.build_load(
@@ -1949,6 +3003,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     } else {
                         self.release_string(old)?;
                     }
+                }
+                if let Some(old) = old_function {
+                    self.drop_function_carrier(old)?;
                 }
             }
             mir::Statement::EchoStringLiteral(value) => self.lower_echo(value.as_bytes())?,
@@ -2080,6 +3137,20 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .map(BasicValueEnum::into_struct_value)
                 })
                 .transpose()?;
+                let old_function = (replaces
+                    && matches!(
+                        property_ty,
+                        mir::Type::Function(_) | mir::Type::NullableFunction(_)
+                    ))
+                .then(|| {
+                    build(self.builder.build_load(
+                        closure_carrier_type(self.context),
+                        address,
+                        "property.old.function",
+                    ))
+                    .map(BasicValueEnum::into_struct_value)
+                })
+                .transpose()?;
                 let old = if replaces {
                     match property_ty {
                         mir::Type::String
@@ -2132,11 +3203,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         | mir::Type::NullableScalar(_)
                         | mir::Type::Error
                         | mir::Type::NullableError => None,
-                        mir::Type::Function(_)
-                        | mir::Type::NullableFunction(_)
-                        | mir::Type::ClosureEnvironment(_) => {
-                            return Err(backend_failure(
-                                "function-valued property reached LLVM before Stage 30e",
+                        mir::Type::Function(_) | mir::Type::NullableFunction(_) => None,
+                        mir::Type::ClosureEnvironment(_) => {
+                            return Err(malformed_mir(
+                                "closure environment pointer is not a property value",
                             ));
                         }
                     }
@@ -2193,6 +3263,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     }
                     _ => {}
                 }
+                if let Some(old) = old_function {
+                    self.drop_function_carrier(old)?;
+                }
                 if let Some(old_error) = old_error {
                     self.drop_error_value(old_error)?;
                 }
@@ -2211,6 +3284,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .map(BasicValueEnum::into_struct_value)
                     })
                     .transpose()?;
+                let old_function = matches!(
+                    property.ty,
+                    mir::Type::Function(_) | mir::Type::NullableFunction(_)
+                )
+                .then(|| {
+                    build(self.builder.build_load(
+                        closure_carrier_type(self.context),
+                        address,
+                        "static.old.function",
+                    ))
+                    .map(BasicValueEnum::into_struct_value)
+                })
+                .transpose()?;
                 let old = match property.ty {
                     mir::Type::String | mir::Type::Mixed | mir::Type::NullableMixed => Some(
                         build(self.builder.build_load(
@@ -2241,6 +3327,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 if let Some(old_error) = old_error {
                     self.drop_error_value(old_error)?;
+                }
+                if let Some(old_function) = old_function {
+                    self.drop_function_carrier(old_function)?;
                 }
             }
             mir::Statement::DropClass { local, .. } => {
@@ -2462,11 +3551,44 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
     fn lower_terminator(&mut self, terminator: &mir::Terminator) -> Result<(), BackendError> {
         match terminator {
-            mir::Terminator::IndirectCall { .. } | mir::Terminator::CheckedIndirectCall { .. } => {
-                return Err(backend_failure(
-                    "indirect closure call reached LLVM before the Stage 30e boundary",
-                ));
-            }
+            mir::Terminator::IndirectCall {
+                callee,
+                function_type,
+                invocation_mode,
+                args,
+                result,
+                continuation,
+                span,
+            } => self.lower_indirect_call(
+                callee,
+                *function_type,
+                *invocation_mode,
+                args,
+                *result,
+                *continuation,
+                *span,
+            )?,
+            mir::Terminator::CheckedIndirectCall {
+                callee,
+                function_type,
+                invocation_mode,
+                args,
+                result,
+                error,
+                success,
+                failure,
+                span,
+            } => self.lower_checked_indirect_call(
+                callee,
+                *function_type,
+                *invocation_mode,
+                args,
+                *result,
+                *error,
+                *success,
+                *failure,
+                *span,
+            )?,
             mir::Terminator::Return(expression) => {
                 debug_assert!(self.deferred_class_temporary_drops.is_empty());
                 self.defer_class_temporary_drops = true;
@@ -2489,6 +3611,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     } else {
                         build(self.builder.build_store(destination, value))?;
                     }
+                    self.sync_writable_closure_captures()?;
                     self.cleanup_mixed_locals()?;
                     self.cleanup_class_locals()?;
                     self.cleanup_string_locals()?;
@@ -2498,6 +3621,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     )?;
                     return Ok(());
                 }
+                self.sync_writable_closure_captures()?;
                 self.cleanup_mixed_locals()?;
                 self.cleanup_class_locals()?;
                 self.cleanup_string_locals()?;
@@ -2519,6 +3643,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
             }
             mir::Terminator::ReturnVoid => {
+                self.sync_writable_closure_captures()?;
                 self.cleanup_mixed_locals()?;
                 self.cleanup_class_locals()?;
                 self.cleanup_string_locals()?;
@@ -2638,6 +3763,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     values.push(local_slot(&self.local_slots, *result)?.into());
                 }
                 values.push(local_slot(&self.local_slots, *error)?.into());
+                if let Some(home) = self.direct_call_borrow_home(callee_definition, args, None)? {
+                    values.push(home.into());
+                }
                 values.extend(lowered.values.iter().copied());
                 let call = build(self.builder.build_call(callee, &values, "checked.call"))?;
                 apply_call_abi_attributes(self.context, call, callee_definition)?;
@@ -2840,6 +3968,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.builder
                         .build_store(slot, error_carrier_type(self.context).const_zero()),
                 )?;
+                self.sync_writable_closure_captures()?;
                 self.cleanup_mixed_locals()?;
                 self.cleanup_class_locals()?;
                 self.cleanup_string_locals()?;
@@ -4265,10 +5394,17 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match ty {
-            mir::Type::Function(_)
-            | mir::Type::NullableFunction(_)
-            | mir::Type::ClosureEnvironment(_) => Err(backend_failure(
-                "function-value cleanup reached LLVM before Stage 30e",
+            mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+                let value = build(self.builder.build_load(
+                    closure_carrier_type(self.context),
+                    address,
+                    "payload.function",
+                ))?
+                .into_struct_value();
+                self.drop_function_carrier(value)
+            }
+            mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
+                "closure environment pointer reached ordinary value cleanup",
             )),
             mir::Type::Error | mir::Type::NullableError => {
                 let value = build(self.builder.build_load(
@@ -4790,14 +5926,238 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
     }
 
+    fn lower_function_expression(
+        &mut self,
+        expression: &mir::FunctionExpression,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        match expression {
+            mir::FunctionExpression::Create {
+                descriptor,
+                captures,
+                ..
+            } => {
+                let descriptor_pointer = self
+                    .closure_descriptors
+                    .get(descriptor.0)
+                    .ok_or_else(|| malformed_mir("closure descriptor was not emitted"))?
+                    .as_pointer_value();
+                let environment = self.create_closure_environment(*descriptor, captures)?;
+                self.closure_value(descriptor_pointer, environment)
+            }
+            mir::FunctionExpression::Local {
+                local, transfer, ..
+            } => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(self.builder.build_load(
+                    closure_carrier_type(self.context),
+                    slot,
+                    "closure.local",
+                ))?
+                .into_struct_value();
+                if *transfer {
+                    self.clear_function_slot(slot)?;
+                }
+                Ok(value)
+            }
+            mir::FunctionExpression::Property {
+                object, property, ..
+            } => Ok(build(self.builder.build_load(
+                closure_carrier_type(self.context),
+                self.lower_property_address(*object, *property)?,
+                "closure.property",
+            ))?
+            .into_struct_value()),
+            mir::FunctionExpression::Call { function, args, .. } => Ok(self
+                .lower_call(*function, args, true)?
+                .ok_or_else(|| malformed_mir("function-valued call returned void"))?
+                .into_struct_value()),
+            mir::FunctionExpression::AssumePresent { value, .. } => {
+                self.lower_nullable_function_expression(value)
+            }
+            mir::FunctionExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            } => self.lower_function_collection_index(*collection, index, *positional, *remove),
+        }
+    }
+
+    fn create_closure_environment(
+        &mut self,
+        descriptor_id: mir::ClosureDescriptorId,
+        captures: &[mir::ClosureCaptureOperand],
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let descriptor = closure_descriptor_in(self.program, descriptor_id)?.clone();
+        let Some(logical_id) = descriptor.environment_layout else {
+            if !captures.is_empty() {
+                return Err(malformed_mir(
+                    "environment-free closure has capture operands",
+                ));
+            }
+            return Ok(pointer.const_null());
+        };
+        let logical = closure_environment_layout_in(self.program, logical_id)?.clone();
+        let native = native_closure_abi::environment_layout(
+            self.program,
+            logical_id,
+            self.target_data.get_pointer_byte_size(None),
+        )?;
+        if captures.len() != logical.fields.len() {
+            return Err(malformed_mir(
+                "closure capture count disagrees with its environment layout",
+            ));
+        }
+        let environment = match descriptor.environment_placement {
+            mir::ClosureEnvironmentPlacement::None => {
+                return Err(malformed_mir(
+                    "capturing closure uses environment-free placement",
+                ));
+            }
+            mir::ClosureEnvironmentPlacement::Stack => self
+                .closure_environment_slots
+                .get(descriptor_id.0)
+                .copied()
+                .flatten()
+                .ok_or_else(|| malformed_mir("stack closure environment has no entry alloca"))?,
+            mir::ClosureEnvironmentPlacement::Heap => {
+                let word = self.context.ptr_sized_int_type(self.target_data, None);
+                self.call_runtime(
+                    CLOSURE_ENVIRONMENT_ALLOCATE,
+                    &[pointer.into(), word.into(), word.into()],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        word.const_int(u64::from(native.layout.size), false).into(),
+                        word.const_int(u64::from(native.layout.align), false).into(),
+                    ],
+                )?
+                .ok_or_else(|| {
+                    backend_failure("closure environment allocation produced no result")
+                })?
+                .into_pointer_value()
+            }
+        };
+        let size = self
+            .context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(u64::from(native.layout.size), false);
+        build(self.builder.build_memset(
+            environment,
+            native.layout.align,
+            self.context.i8_type().const_zero(),
+            size,
+        ))?;
+        for ((field, layout), capture) in logical
+            .fields
+            .iter()
+            .zip(native.fields.iter())
+            .zip(captures)
+        {
+            if field.id != layout.field {
+                return Err(malformed_mir(
+                    "native closure field identity disagrees with MIR",
+                ));
+            }
+            let address = self.byte_offset(environment, layout.offset, "closure.capture.field")?;
+            match capture {
+                mir::ClosureCaptureOperand::BorrowLocal { local, writable } => {
+                    let expected = if *writable {
+                        mir::ClosureEnvironmentStorage::WritableBorrow
+                    } else {
+                        mir::ClosureEnvironmentStorage::ReadonlyBorrow
+                    };
+                    if field.storage != expected {
+                        return Err(malformed_mir(
+                            "borrow capture storage disagrees with environment layout",
+                        ));
+                    }
+                    let source = self.closure_source_address(*local)?;
+                    build(self.builder.build_store(address, source))?;
+                }
+                mir::ClosureCaptureOperand::CopyValue(value)
+                | mir::ClosureCaptureOperand::MoveValue(value) => {
+                    if field.storage != mir::ClosureEnvironmentStorage::Owned {
+                        return Err(malformed_mir(
+                            "owned capture uses a borrowed environment field",
+                        ));
+                    }
+                    let value = self.lower_rvalue(value)?;
+                    self.store_value_at_address(address, value, field.ty)?;
+                    if let Some(bit) = layout.live_bit {
+                        self.set_environment_live_bit(environment, bit, true)?;
+                    }
+                }
+            }
+        }
+        Ok(environment)
+    }
+
+    fn lower_nullable_function_expression(
+        &mut self,
+        expression: &mir::NullableFunctionExpression,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        match expression {
+            mir::NullableFunctionExpression::Null { .. } => {
+                Ok(closure_carrier_type(self.context).const_zero())
+            }
+            mir::NullableFunctionExpression::Present(value) => {
+                self.lower_function_expression(value)
+            }
+            mir::NullableFunctionExpression::Local {
+                local, transfer, ..
+            } => {
+                let slot = local_slot(&self.local_slots, *local)?;
+                let value = build(self.builder.build_load(
+                    closure_carrier_type(self.context),
+                    slot,
+                    "nullable-closure.local",
+                ))?
+                .into_struct_value();
+                if *transfer {
+                    self.clear_function_slot(slot)?;
+                }
+                Ok(value)
+            }
+            mir::NullableFunctionExpression::Property {
+                object, property, ..
+            } => Ok(build(self.builder.build_load(
+                closure_carrier_type(self.context),
+                self.lower_property_address(*object, *property)?,
+                "nullable-closure.property",
+            ))?
+            .into_struct_value()),
+            mir::NullableFunctionExpression::Call { function, args, .. } => Ok(self
+                .lower_call(*function, args, true)?
+                .ok_or_else(|| malformed_mir("nullable function call returned void"))?
+                .into_struct_value()),
+            mir::NullableFunctionExpression::DictionaryGet {
+                collection,
+                key,
+                access,
+                ..
+            } => self.lower_nullable_function_collection_get(*collection, key, *access),
+            mir::NullableFunctionExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            } => self.lower_function_collection_index(*collection, index, *positional, *remove),
+        }
+    }
+
     fn lower_rvalue(
         &mut self,
         expression: &mir::Rvalue,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         match expression {
-            mir::Rvalue::Function(_) | mir::Rvalue::NullableFunction(_) => Err(backend_failure(
-                "function value reached LLVM before the Stage 30e boundary",
-            )),
+            mir::Rvalue::Function(value) => Ok(self.lower_function_expression(value)?.into()),
+            mir::Rvalue::NullableFunction(value) => {
+                Ok(self.lower_nullable_function_expression(value)?.into())
+            }
             mir::Rvalue::Value(value) => self.lower_value_expression(value),
             mir::Rvalue::String(value) => Ok(self.lower_string_expression(value)?.into()),
             mir::Rvalue::NullableScalar(value) => {
@@ -5126,6 +6486,96 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         .into_struct_value())
     }
 
+    fn lower_function_collection_index(
+        &mut self,
+        collection: mir::LocalId,
+        index: &mir::Rvalue,
+        positional: bool,
+        remove: bool,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let local = local_in(self.function, collection)?;
+        let mir::Type::Collection(collection_type) = local.ty else {
+            return Err(malformed_mir(
+                "function collection place uses a non-collection local",
+            ));
+        };
+        let definition = self.collection_definition(collection_type)?.clone();
+        let index_type = match (positional, definition.key) {
+            (false, Some(key)) => key,
+            _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+        };
+        let collection_value = self.collection_pointer(collection)?;
+        let index_value = self.lower_rvalue(index)?;
+        let index_word = self.value_to_collection_word(index_value, index_type)?;
+        let address = if remove {
+            let slot = self.entry_alloca(
+                closure_carrier_type(self.context),
+                "function.collection.remove",
+            )?;
+            let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+            let index = if usize_type.get_bit_width() == 64 {
+                index_word
+            } else {
+                build(self.builder.build_int_truncate(
+                    index_word,
+                    usize_type,
+                    "function.collection.remove.index",
+                ))?
+            };
+            let _ = self.call_runtime(
+                COLLECTION_AGGREGATE_REMOVE_AT_INTO,
+                &[
+                    pointer.into(),
+                    pointer.into(),
+                    usize_type.into(),
+                    pointer.into(),
+                ],
+                None,
+                &[
+                    self.current_frame.into(),
+                    collection_value.into(),
+                    index.into(),
+                    slot.into(),
+                ],
+            )?;
+            slot
+        } else {
+            self.call_runtime(
+                COLLECTION_AGGREGATE_VALUE_AT,
+                &[
+                    pointer.into(),
+                    pointer.into(),
+                    self.context.i64_type().into(),
+                    self.context.i8_type().into(),
+                    self.context.i8_type().into(),
+                ],
+                Some(pointer.into()),
+                &[
+                    self.current_frame.into(),
+                    collection_value.into(),
+                    index_word.into(),
+                    self.context
+                        .i8_type()
+                        .const_int(u64::from(positional), false)
+                        .into(),
+                    self.collection_compare_kind(index_type)?.into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("function collection read produced no slot"))?
+            .into_pointer_value()
+        };
+        if index_type == mir::Type::String {
+            self.release_string(index_value.into_pointer_value())?;
+        }
+        Ok(build(self.builder.build_load(
+            closure_carrier_type(self.context),
+            address,
+            "function.collection.value",
+        ))?
+        .into_struct_value())
+    }
+
     fn lower_nullable_error_collection_get(
         &mut self,
         collection: mir::LocalId,
@@ -5217,6 +6667,101 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             error_carrier_type(self.context),
             result,
             "error.collection.optional.value",
+        ))?
+        .into_struct_value())
+    }
+
+    fn lower_nullable_function_collection_get(
+        &mut self,
+        collection: mir::LocalId,
+        key: &mir::Rvalue,
+        access: mir::NullableCollectionAccess,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let local = local_in(self.function, collection)?;
+        let mir::Type::Collection(collection_type) = local.ty else {
+            return Err(malformed_mir(
+                "nullable function access uses a non-collection local",
+            ));
+        };
+        let definition = self.collection_definition(collection_type)?.clone();
+        let key_type = match access {
+            mir::NullableCollectionAccess::Get
+            | mir::NullableCollectionAccess::Index
+            | mir::NullableCollectionAccess::Remove => definition
+                .key
+                .ok_or_else(|| malformed_mir("dictionary access has no key type"))?,
+            _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+        };
+        let collection_value = self.collection_pointer(collection)?;
+        let key_value = self.lower_rvalue(key)?;
+        let key_word = self.value_to_collection_word(key_value, key_type)?;
+        let result = self.entry_alloca(
+            closure_carrier_type(self.context),
+            "function.collection.optional",
+        )?;
+        build(
+            self.builder
+                .build_store(result, closure_carrier_type(self.context).const_zero()),
+        )?;
+        let found = self.entry_alloca(self.context.i8_type(), "function.collection.found")?;
+        let removed_key =
+            self.entry_alloca(self.context.i64_type(), "function.collection.removed-key")?;
+        let stored_nullable = matches!(definition.value, mir::Type::NullableFunction(_));
+        let _ = self.call_runtime(
+            COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO,
+            &[
+                pointer.into(),
+                self.context.i64_type().into(),
+                self.context.i8_type().into(),
+                self.context.i8_type().into(),
+                self.context.i8_type().into(),
+                pointer.into(),
+                pointer.into(),
+                pointer.into(),
+            ],
+            None,
+            &[
+                collection_value.into(),
+                key_word.into(),
+                self.collection_compare_kind(key_type)?.into(),
+                self.context
+                    .i8_type()
+                    .const_int(
+                        u64::from(nullable_collection_access_code(access).ok_or_else(|| {
+                            malformed_mir("function nullable index has no direct access code")
+                        })?),
+                        false,
+                    )
+                    .into(),
+                self.context
+                    .i8_type()
+                    .const_int(u64::from(stored_nullable), false)
+                    .into(),
+                found.into(),
+                removed_key.into(),
+                result.into(),
+            ],
+        )?;
+        if key_type == mir::Type::String {
+            self.release_string(key_value.into_pointer_value())?;
+            if access == mir::NullableCollectionAccess::Remove {
+                let removed = build(self.builder.build_load(
+                    self.context.i64_type(),
+                    removed_key,
+                    "function.collection.removed-key.value",
+                ))?
+                .into_int_value();
+                self.release_string(
+                    self.collection_word_to_value(removed, mir::Type::String)?
+                        .into_pointer_value(),
+                )?;
+            }
+        }
+        Ok(build(self.builder.build_load(
+            closure_carrier_type(self.context),
+            result,
+            "function.collection.optional.value",
         ))?
         .into_struct_value())
     }
@@ -5875,6 +7420,117 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(result)
     }
 
+    fn lower_function_collection_literal(
+        &mut self,
+        definition: &mir::CollectionType,
+        entries: &[mir::CollectionEntry],
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let byte = self.context.i8_type();
+        let fixed = definition.kind == mir::CollectionKind::TypedArray;
+        let carrier = closure_carrier_type(self.context);
+        let result = self
+            .call_runtime(
+                COLLECTION_AGGREGATE_NEW,
+                &[
+                    pointer.into(),
+                    usize_type.into(),
+                    byte.into(),
+                    byte.into(),
+                    usize_type.into(),
+                    usize_type.into(),
+                    byte.into(),
+                    byte.into(),
+                ],
+                Some(pointer.into()),
+                &[
+                    self.current_frame.into(),
+                    usize_type.const_int(entries.len() as u64, false).into(),
+                    byte.const_int(u64::from(definition.key.is_some()), false)
+                        .into(),
+                    byte.const_int(u64::from(fixed), false).into(),
+                    usize_type
+                        .const_int(self.target_data.get_store_size(&carrier), false)
+                        .into(),
+                    usize_type
+                        .const_int(
+                            u64::from(self.target_data.get_abi_alignment(&carrier)),
+                            false,
+                        )
+                        .into(),
+                    byte.const_int(
+                        u64::from(stage26_collection_kind(definition.kind).unwrap_or(0)),
+                        false,
+                    )
+                    .into(),
+                    byte.const_int(
+                        u64::from(
+                            definition
+                                .comparator
+                                .map(collection_comparator_code)
+                                .unwrap_or(COLLECTION_COMPARE_WORD),
+                        ),
+                        false,
+                    )
+                    .into(),
+                ],
+            )?
+            .ok_or_else(|| backend_failure("function collection allocation produced no result"))?
+            .into_pointer_value();
+        for (index, entry) in entries.iter().enumerate() {
+            let value = self.lower_rvalue(&entry.value)?;
+            let destination = if let (Some(key_type), Some(key)) = (definition.key, &entry.key) {
+                let key = self.lower_rvalue(key)?;
+                self.lower_error_dictionary_write_slot(result, key, key_type, definition.value)?
+            } else if fixed {
+                self.call_runtime(
+                    COLLECTION_AGGREGATE_VALUE_AT,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        self.context.i64_type().into(),
+                        byte.into(),
+                        byte.into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        result.into(),
+                        self.context
+                            .i64_type()
+                            .const_int(index as u64, false)
+                            .into(),
+                        byte.const_int(1, false).into(),
+                        byte.const_int(u64::from(COLLECTION_COMPARE_WORD), false)
+                            .into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("function array initialization produced no slot"))?
+                .into_pointer_value()
+            } else {
+                self.call_runtime(
+                    COLLECTION_AGGREGATE_PUSH_SLOT,
+                    &[pointer.into()],
+                    Some(pointer.into()),
+                    &[result.into()],
+                )?
+                .ok_or_else(|| backend_failure("function collection insertion produced no slot"))?
+                .into_pointer_value()
+            };
+            self.store_value_at_address(destination, value, definition.value)?;
+        }
+        if stage26_collection_kind(definition.kind).is_some() {
+            let _ = self.call_runtime(
+                COLLECTION_STAGE26_FINALIZE,
+                &[pointer.into()],
+                None,
+                &[result.into()],
+            )?;
+        }
+        Ok(result)
+    }
+
     fn lower_error_dictionary_write_slot(
         &mut self,
         collection: PointerValue<'ctx>,
@@ -5926,20 +7582,30 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ))?;
         build(self.builder.build_conditional_branch(has_old, drop, done))?;
         self.builder.position_at_end(drop);
-        let old = build(self.builder.build_load(
-            error_carrier_type(self.context),
-            destination,
-            "error.dictionary.old",
-        ))?
+        let carrier = match value_type {
+            mir::Type::Error | mir::Type::NullableError => error_carrier_type(self.context),
+            mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+                closure_carrier_type(self.context)
+            }
+            _ => {
+                return Err(malformed_mir(
+                    "two-word dictionary slot has a non-carrier value type",
+                ));
+            }
+        };
+        let old = build(
+            self.builder
+                .build_load(carrier, destination, "aggregate.dictionary.old"),
+        )?
         .into_struct_value();
-        self.drop_error_value(old)?;
+        if matches!(value_type, mir::Type::Error | mir::Type::NullableError) {
+            self.drop_error_value(old)?;
+        } else {
+            self.drop_function_carrier(old)?;
+        }
         self.drop_stored_value(key, key_type)?;
         build(self.builder.build_unconditional_branch(done))?;
         self.builder.position_at_end(done);
-        debug_assert!(matches!(
-            value_type,
-            mir::Type::Error | mir::Type::NullableError
-        ));
         Ok(destination)
     }
 
@@ -6138,6 +7804,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     mir::Type::Error | mir::Type::NullableError
                 ) {
                     return self.lower_error_collection_literal(&definition, entries);
+                }
+                if matches!(
+                    definition.value,
+                    mir::Type::Function(_) | mir::Type::NullableFunction(_)
+                ) {
+                    return self.lower_function_collection_literal(&definition, entries);
                 }
                 let fixed = definition.kind == mir::CollectionKind::TypedArray;
                 let value_width = collection_value_width(
@@ -6955,11 +8627,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         };
         if matches!(
             definition.value,
-            mir::Type::Error | mir::Type::NullableError
+            mir::Type::Error
+                | mir::Type::NullableError
+                | mir::Type::Function(_)
+                | mir::Type::NullableFunction(_)
         ) {
             if op == mir::CollectionMutationOp::Remove {
                 return Err(malformed_mir(
-                    "Error remove-by-value requires a collection equality capability",
+                    "aggregate remove-by-value requires a collection equality capability",
                 ));
             }
             let value = self.lower_rvalue(value)?;
@@ -7287,7 +8962,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let index = self.lower_rvalue(index)?;
         if matches!(
             definition.value,
-            mir::Type::Error | mir::Type::NullableError
+            mir::Type::Error
+                | mir::Type::NullableError
+                | mir::Type::Function(_)
+                | mir::Type::NullableFunction(_)
         ) {
             let replacement = self.lower_rvalue(value)?;
             let destination = if let Some(key_type) = definition.key.filter(|_| !positional) {
@@ -7326,13 +9004,28 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     )?
                     .ok_or_else(|| backend_failure("Error collection write produced no slot"))?
                     .into_pointer_value();
+                let carrier = if matches!(
+                    definition.value,
+                    mir::Type::Error | mir::Type::NullableError
+                ) {
+                    error_carrier_type(self.context)
+                } else {
+                    closure_carrier_type(self.context)
+                };
                 let old = build(self.builder.build_load(
-                    error_carrier_type(self.context),
+                    carrier,
                     destination,
-                    "error.collection.old",
+                    "aggregate.collection.old",
                 ))?
                 .into_struct_value();
-                self.drop_error_value(old)?;
+                if matches!(
+                    definition.value,
+                    mir::Type::Error | mir::Type::NullableError
+                ) {
+                    self.drop_error_value(old)?;
+                } else {
+                    self.drop_function_carrier(old)?;
+                }
                 destination
             };
             self.store_value_at_address(destination, replacement, definition.value)?;
@@ -8274,10 +9967,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.drop_payload_enum_at(value.into_pointer_value(), payload, true)
             }
             mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
-            mir::Type::Function(_)
-            | mir::Type::NullableFunction(_)
-            | mir::Type::ClosureEnvironment(_) => Err(backend_failure(
-                "function-value cleanup reached LLVM before Stage 30e",
+            mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+                self.drop_function_carrier(value.into_struct_value())
+            }
+            mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
+                "closure environment pointer reached ordinary value cleanup",
             )),
         }
     }
@@ -8453,6 +10147,50 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             ))?
             .into_struct_value();
             self.drop_error_value(value)?;
+        } else if matches!(
+            definition.value,
+            mir::Type::Function(_) | mir::Type::NullableFunction(_)
+        ) {
+            let index = if usize_type.get_bit_width() == 64 {
+                current
+            } else {
+                build(self.builder.build_int_z_extend(
+                    current,
+                    self.context.i64_type(),
+                    "function.collection.drop.index",
+                ))?
+            };
+            let value = self
+                .call_runtime(
+                    COLLECTION_AGGREGATE_VALUE_AT,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        self.context.i64_type().into(),
+                        self.context.i8_type().into(),
+                        self.context.i8_type().into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        cleanup_collection.into(),
+                        index.into(),
+                        self.context.i8_type().const_int(1, false).into(),
+                        self.context
+                            .i8_type()
+                            .const_int(u64::from(COLLECTION_COMPARE_WORD), false)
+                            .into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("function collection value read produced no slot"))?
+                .into_pointer_value();
+            let value = build(self.builder.build_load(
+                closure_carrier_type(self.context),
+                value,
+                "function.collection.drop.value",
+            ))?
+            .into_struct_value();
+            self.drop_function_carrier(value)?;
         } else if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
             let index = if usize_type.get_bit_width() == 64 {
                 current
@@ -12614,11 +14352,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.drop_payload_enum_at(address, payload, true)?;
                 }
                 mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {}
-                mir::Type::Function(_)
-                | mir::Type::NullableFunction(_)
-                | mir::Type::ClosureEnvironment(_) => {
-                    return Err(backend_failure(
-                        "function-valued property reached LLVM before Stage 30e",
+                mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+                    let value = build(self.builder.build_load(
+                        closure_carrier_type(self.context),
+                        address,
+                        "property.function",
+                    ))?
+                    .into_struct_value();
+                    self.drop_function_carrier(value)?;
+                }
+                mir::Type::ClosureEnvironment(_) => {
+                    return Err(malformed_mir(
+                        "closure environment pointer is not a class property",
                     ));
                 }
             }
@@ -14296,6 +16041,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         if let Some((result, _, _)) = aggregate_result {
             values.push(result.into());
         }
+        if let Some(home) = self.direct_call_borrow_home(callee_definition, args, receiver)? {
+            values.push(home.into());
+        }
         if let Some(receiver) = receiver {
             values.push(receiver.into());
         }
@@ -14359,21 +16107,15 @@ fn apply_call_abi_attributes(
             apply_call_integer_extension_attribute(context, call, AttributeLoc::Return, ty);
         }
     }
-    let hidden_return = if function.checked_effects.is_empty() {
-        u32::from(matches!(
-            function.return_type,
-            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-        ))
-    } else {
-        1 + u32::from(matches!(function.return_type, mir::ReturnType::Value(_)))
-    };
+    let source_parameter_offset = native_closure_abi::NativeCallableSignaturePlan::direct(function)
+        .source_parameter_offset() as u32;
     for (index, parameter) in function.params.iter().enumerate() {
         let local = local_in(function, *parameter)?;
         if let mir::Type::Scalar(mir::ScalarType::Integer(ty)) = local.ty {
             apply_call_integer_extension_attribute(
                 context,
                 call,
-                AttributeLoc::Param(index as u32 + 1 + hidden_return),
+                AttributeLoc::Param(index as u32 + source_parameter_offset),
                 ty,
             );
         }
@@ -14403,10 +16145,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         else_block: BasicBlock<'ctx>,
     ) -> Result<(), BackendError> {
         match condition {
-            mir::BoolExpression::NullableFunctionIsPresent(_) => {
-                return Err(backend_failure(
-                    "nullable function test reached LLVM before the Stage 30e boundary",
-                ));
+            mir::BoolExpression::NullableFunctionIsPresent(value) => {
+                let value = self.lower_nullable_function_expression(value)?;
+                let (descriptor, _) = self.closure_parts(value)?;
+                let present = build(self.builder.build_int_compare(
+                    IntPredicate::NE,
+                    descriptor,
+                    descriptor.get_type().const_null(),
+                    "nullable.closure.present",
+                ))?;
+                build(
+                    self.builder
+                        .build_conditional_branch(present, then_block, else_block),
+                )?;
             }
             mir::BoolExpression::PayloadEnumIsCase {
                 local,
@@ -15874,6 +17625,16 @@ fn error_carrier_type(context: &Context) -> StructType<'_> {
     context.struct_type(&[pointer.into(), pointer.into()], false)
 }
 
+fn closure_carrier_type(context: &Context) -> StructType<'_> {
+    let pointer = context.ptr_type(AddressSpace::default());
+    context.struct_type(&[pointer.into(), pointer.into()], false)
+}
+
+fn closure_descriptor_type(context: &Context) -> StructType<'_> {
+    let pointer = context.ptr_type(AddressSpace::default());
+    context.struct_type(&[pointer.into(), pointer.into()], false)
+}
+
 fn error_descriptor_type<'ctx>(
     context: &'ctx Context,
     target_data: &TargetData,
@@ -15950,12 +17711,9 @@ fn llvm_type<'ctx>(
         )
         .into(),
         mir::Type::Error | mir::Type::NullableError => error_carrier_type(context).into(),
-        mir::Type::Function(_) | mir::Type::NullableFunction(_) => nullable_type(
-            context,
-            target_data,
-            context.ptr_type(AddressSpace::default()).into(),
-        )
-        .into(),
+        mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+            closure_carrier_type(context).into()
+        }
         mir::Type::ClosureEnvironment(_) => context.ptr_type(AddressSpace::default()).into(),
         mir::Type::String
         | mir::Type::Class(_)
@@ -16059,6 +17817,39 @@ fn function_in(
         .get(id.0)
         .filter(|function| function.id == id)
         .ok_or_else(|| malformed_mir(format!("FunctionId function{} does not exist", id.0)))
+}
+
+fn function_type_in(
+    program: &mir::Program,
+    id: mir::FunctionTypeId,
+) -> Result<&mir::FunctionType, BackendError> {
+    program
+        .function_types
+        .get(id.0)
+        .filter(|function| function.id == id)
+        .ok_or_else(|| malformed_mir(format!("function type#{} does not exist", id.0)))
+}
+
+fn closure_descriptor_in(
+    program: &mir::Program,
+    id: mir::ClosureDescriptorId,
+) -> Result<&mir::ClosureDescriptor, BackendError> {
+    program
+        .closure_descriptors
+        .get(id.0)
+        .filter(|descriptor| descriptor.id == id)
+        .ok_or_else(|| malformed_mir(format!("closure descriptor#{} does not exist", id.0)))
+}
+
+fn closure_environment_layout_in(
+    program: &mir::Program,
+    id: mir::ClosureEnvironmentLayoutId,
+) -> Result<&mir::ClosureEnvironmentLayout, BackendError> {
+    program
+        .closure_environment_layouts
+        .get(id.0)
+        .filter(|layout| layout.id == id)
+        .ok_or_else(|| malformed_mir(format!("closure environment#{} does not exist", id.0)))
 }
 
 fn class_definition(

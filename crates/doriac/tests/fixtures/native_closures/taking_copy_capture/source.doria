@@ -1,0 +1,6 @@
+function main(): void
+{
+    let $value = 42;
+    let $consume = fn() with (take $value) => $value;
+    echo "{$consume()}\n";
+}

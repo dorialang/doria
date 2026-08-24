@@ -1,0 +1,16 @@
+class Payload
+{
+    function __construct(string $value)
+    {
+    }
+}
+
+function main(): void
+{
+    let $payload = new Payload("owned");
+    let $consume = function (): Payload with (take $payload) {
+        return $payload;
+    };
+    let $result = $consume();
+    echo $result->value . "\n";
+}

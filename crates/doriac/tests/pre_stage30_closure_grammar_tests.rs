@@ -621,7 +621,7 @@ fn decision_0120_fixture_is_parseable_and_visible_in_ast_output() {
 }
 
 #[test]
-fn semantic_and_ide_paths_are_target_neutral_while_backends_keep_boundaries() {
+fn semantic_and_ide_paths_are_target_neutral_while_only_php_keeps_its_boundary() {
     let source = include_str!("fixtures/accepted_syntax/closure_boundary.doria");
     doriac::check_source("closure_boundary.doria", source)
         .expect("valid closure syntax should pass target-neutral checking");
@@ -635,12 +635,19 @@ fn semantic_and_ide_paths_are_target_neutral_while_backends_keep_boundaries() {
     doriac::lower_source("closure_boundary.doria", source)
         .expect("valid closure syntax should enter HIR lowering");
 
-    let diagnostics = doriac::compile_source(
+    doriac::compile_source(
         "closure_boundary.doria",
         source,
         doriac::backend::BackendTarget::Native,
     )
-    .expect_err("native execution remains a Stage 30e boundary");
+    .expect("native closure execution should be available in Stage 30e");
+
+    let diagnostics = doriac::compile_source(
+        "closure_boundary.doria",
+        source,
+        doriac::backend::BackendTarget::Php,
+    )
+    .expect_err("PHP closure output remains a Stage 30f boundary");
     assert_eq!(diagnostics.len(), 1, "unexpected cascade: {diagnostics:#?}");
     let diagnostic = &diagnostics[0];
     assert_eq!(diagnostic.code, "E0641");
@@ -649,11 +656,8 @@ fn semantic_and_ide_paths_are_target_neutral_while_backends_keep_boundaries() {
         DiagnosticKind::UnsupportedDevelopmentSurface
     );
     assert!(diagnostic.development_only);
-    assert_eq!(
-        diagnostic.title,
-        "Closure Native Execution Is Not Yet Available"
-    );
-    assert!(diagnostic.message.contains("Stage 30e"));
+    assert_eq!(diagnostic.title, "Closure PHP Output Is Not Yet Available");
+    assert!(diagnostic.message.contains("Stage 30f"));
 
     let json = doriac::render_diagnostics_with_options(
         "closure_boundary.doria",

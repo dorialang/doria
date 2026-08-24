@@ -166,7 +166,13 @@ pub struct CaptureSemanticInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClosureSemanticInfo {
     pub closure_id: ClosureId,
+    /// The closure's inferred source type before capability/effect substitution.
     pub function_type: ResolvedType,
+    /// The compatible contextual function type selected at this creation site.
+    ///
+    /// Native lowering uses this contract so accepted invocation-capability and
+    /// checked-effect substitutions are reflected in the closure ABI.
+    pub execution_function_type: ResolvedType,
     pub captures: Vec<CaptureSemanticInfo>,
     pub inferred_invocation_mode: FunctionInvocationMode,
     pub inferred_checked_effects: Vec<ResolvedType>,
@@ -538,12 +544,8 @@ pub fn analyze_program_for_ide_with_source<'source>(
         },
     );
     let closure_ownership = ownership_analysis.closures;
+    let return_borrows = ownership_analysis.return_borrows;
     checker.diagnostics.extend(ownership_analysis.diagnostics);
-    let return_borrows = checker
-        .function_signatures
-        .iter()
-        .filter_map(|(span, signature)| signature.return_borrow.map(|borrow| (*span, borrow)))
-        .collect();
     let classes = collect_ordered_class_semantics(program, &mut checker);
     let enums = collect_ordered_enum_semantics(&checker);
     SemanticAnalysis {
@@ -1555,15 +1557,22 @@ fn semantic_layout_shape(
         | TypeKind::PriorityQueue(_)
         | TypeKind::Deque(_)
         | TypeKind::SharedHandle(_, _) => Some(scalar(POINTER)),
-        // Function values have semantic identity in Stage 30b, but no runtime
-        // representation until executable closure lowering lands.
-        TypeKind::Function(_) => None,
+        TypeKind::Function(_) => Some(LayoutShape {
+            size: POINTER * crate::native_closure_abi::CARRIER_WORDS,
+            align: POINTER,
+        }),
         TypeKind::Enum(enum_type) => enum_layouts.get(&enum_type.id).map(|layout| LayoutShape {
             size: layout.size,
             align: layout.align,
         }),
         TypeKind::Nullable(inner) => {
             let inner_kind = types.kind(*inner);
+            if matches!(inner_kind, TypeKind::Function(_)) {
+                return Some(LayoutShape {
+                    size: POINTER * crate::native_closure_abi::CARRIER_WORDS,
+                    align: POINTER,
+                });
+            }
             if matches!(
                 inner_kind,
                 TypeKind::Class(_)
@@ -7971,6 +7980,13 @@ impl<'program> Checker<'program> {
             return_borrow,
         };
         let ty = self.types.intern(TypeKind::Function(semantic.clone()));
+        let execution_semantic = expected_function
+            .filter(|expected| {
+                self.function_type_compatibility(expected, &semantic)
+                    .is_ok()
+            })
+            .unwrap_or_else(|| semantic.clone());
+        let execution_ty = self.types.intern(TypeKind::Function(execution_semantic));
         self.closure_types.insert(key, ty);
 
         let capture_info = active
@@ -7992,6 +8008,7 @@ impl<'program> Checker<'program> {
             ClosureSemanticInfo {
                 closure_id,
                 function_type: self.types.resolved(ty),
+                execution_function_type: self.types.resolved(execution_ty),
                 captures: capture_info,
                 inferred_invocation_mode: invocation_mode,
                 inferred_checked_effects: inferred_effects

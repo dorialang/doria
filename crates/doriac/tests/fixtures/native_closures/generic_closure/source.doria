@@ -1,0 +1,10 @@
+function applyIdentity<T>(take T $value): T
+{
+    let $identity = fn(take T $item) => $item;
+    return $identity($value);
+}
+
+function main(): void
+{
+    echo "{applyIdentity(42)}\n";
+}

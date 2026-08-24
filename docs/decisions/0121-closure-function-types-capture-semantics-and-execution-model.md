@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-19
 - **Date:** 2026-08-19
-- **Implementation Status:** Authority Accepted; Stages 30a Through 30d Implemented; Stage 30e Next; Stage 30 Not Complete
+- **Implementation Status:** Authority Accepted; Stages 30a Through 30e Implemented; Stage 30f Next; Stage 30 Not Complete
 - **Scope:** Function types, closure invocation, capture validation, ownership,
   lifetime, representation, backend behavior, diagnostics, and Stage 30
   `List<T>` algorithms
@@ -35,18 +35,20 @@ the debug interpreter. Stage 30d implements structural MIR function types, the
 logical descriptor/environment carrier, static closure descriptors, source-order
 capture acquisition, reverse logical release, synthetic closure functions,
 indirect and checked indirect calls, shared validation, stable interpreter
-places, and exact environment cleanup. Native execution remains Stage 30e and
-PHP compatibility remains Stage 30f; Stage 30 remains in progress and is not
-complete.
+places, and exact environment cleanup. Stage 30e implements the shared native
+two-word carrier and descriptor ABI, stack/heap environment placement, generated
+drop glue, and indirect execution through Cranelift and LLVM. PHP compatibility
+remains Stage 30f; Stage 30 remains in progress and is not complete.
 
 ```text
 Stage 30a Callable Grammar Completion — Complete
 Stage 30b Semantic Function Types And Captures — Complete
 Stage 30c Ownership, Lifetime, And Escape — Complete
 Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete
-Stage 30e Native Execution — Next
+Stage 30e Native Execution — Complete
+Stage 30f PHP Compatibility — Next
 Stage 30 — In Progress, Not Complete
-E0641 — Native/PHP Target Boundary
+E0641 — PHP Target Boundary
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping
@@ -528,10 +530,11 @@ Stage 30h - Cross-Repository Closure
   nested provenance, and reverse logical drop plans; no HIR/MIR or execution.
 - **Stage 30d — Complete:** closure-aware HIR, structural function MIR,
   carrier/descriptors/environments, indirect and checked calls, shared MIR
-  validation and cleanup, stable-place interpreter execution, and target-specific
-  E0641 boundaries for native and PHP.
-- **Stage 30e:** runtime substrate, Cranelift, LLVM, malformed-MIR and ownership
-  parity, and portable benchmark structure.
+  validation and cleanup, stable-place interpreter execution, and the bounded
+  executable-backend handoff.
+- **Stage 30e — Complete:** shared native carrier/descriptor/environment ABI,
+  stack and heap placement, stable native capture places, generated drop glue,
+  Cranelift and LLVM execution, malformed-MIR validation, and native parity.
 - **Stage 30f:** explicit PHP lowering with Doria ownership/effect parity.
 - **Stage 30g:** the three `List<T>` algorithms, internal effect variables,
   partial-result cleanup, and all-backend parity.

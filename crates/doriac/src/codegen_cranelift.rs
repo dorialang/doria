@@ -26,7 +26,8 @@ use crate::native_abi::{
     CHECKED_IO_META_OPERATION_SHIFT, CHECKED_IO_META_REASON_SHIFT, CHECKED_IO_META_TARGET_SHIFT,
     CHECKED_IO_READ_FILE_BYTES, CHECKED_IO_READ_FILE_TEXT, CHECKED_IO_READ_LINE,
     CHECKED_IO_READ_STDIN_BYTES, CHECKED_IO_WRITE_FILE, CHECKED_IO_WRITE_STDERR,
-    CHECKED_IO_WRITE_STDOUT, CLASS_ALLOCATE, CLASS_FREE, COLLECTION_AGGREGATE_INSERT_SLOT,
+    CHECKED_IO_WRITE_STDOUT, CLASS_ALLOCATE, CLASS_FREE, CLOSURE_ENVIRONMENT_ALLOCATE,
+    CLOSURE_ENVIRONMENT_FREE, COLLECTION_AGGREGATE_INSERT_SLOT,
     COLLECTION_AGGREGATE_KEYED_SET_SLOT, COLLECTION_AGGREGATE_NEW,
     COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO, COLLECTION_AGGREGATE_PUSH_FRONT_SLOT,
     COLLECTION_AGGREGATE_PUSH_SLOT, COLLECTION_AGGREGATE_REMOVE_AT_INTO,
@@ -68,9 +69,19 @@ use crate::native_abi::{
     WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES,
     WRITE_STDOUT_BYTES,
 };
+use crate::native_closure_abi;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
 
 const RUNTIME_RETURNED_TRAP: u8 = 1;
+
+struct DeclaredNativeItems<'a> {
+    function_ids: &'a [FuncId],
+    class_drop_function_ids: &'a [FuncId],
+    collection_drop_function_ids: &'a [FuncId],
+    closure_drop_function_ids: &'a [FuncId],
+    closure_descriptor_ids: &'a [DataId],
+    static_ids: &'a [DataId],
+}
 
 pub fn lower_mir_to_object(program: &mir::Program) -> Result<Vec<u8>, BackendError> {
     mir_validation::validate_program(program)?;
@@ -104,7 +115,22 @@ pub(crate) fn lower_validated_mir_to_object(
     }
     let class_drop_function_ids = declare_class_drop_functions(&mut module, program)?;
     let collection_drop_function_ids = declare_collection_drop_functions(&mut module, program)?;
+    let closure_drop_function_ids = declare_closure_drop_functions(&mut module, program)?;
+    let closure_descriptor_ids = define_closure_descriptors(
+        &mut module,
+        program,
+        &function_ids,
+        &closure_drop_function_ids,
+    )?;
     let static_ids = define_static_data(&mut module, program, &class_drop_function_ids)?;
+    let declarations = DeclaredNativeItems {
+        function_ids: &function_ids,
+        class_drop_function_ids: &class_drop_function_ids,
+        collection_drop_function_ids: &collection_drop_function_ids,
+        closure_drop_function_ids: &closure_drop_function_ids,
+        closure_descriptor_ids: &closure_descriptor_ids,
+        static_ids: &static_ids,
+    };
 
     // The process entry point is C `main(int argc, char **argv)`. Both
     // parameters are always declared, even when the Doria entry ignores them,
@@ -121,37 +147,16 @@ pub(crate) fn lower_validated_mir_to_object(
         .map_err(|error| backend_failure(error.to_string()))?;
 
     for function in &program.functions {
-        define_function(
-            &mut module,
-            program,
-            function,
-            &function_ids,
-            &class_drop_function_ids,
-            &collection_drop_function_ids,
-            &static_ids,
-        )?;
+        define_function(&mut module, program, function, &declarations)?;
     }
     for class in &program.classes {
-        define_class_drop_function(
-            &mut module,
-            program,
-            class.id,
-            &function_ids,
-            &class_drop_function_ids,
-            &collection_drop_function_ids,
-            &static_ids,
-        )?;
+        define_class_drop_function(&mut module, program, class.id, &declarations)?;
     }
     for collection in &program.collection_types {
-        define_collection_drop_function(
-            &mut module,
-            program,
-            collection.id,
-            &function_ids,
-            &class_drop_function_ids,
-            &collection_drop_function_ids,
-            &static_ids,
-        )?;
+        define_collection_drop_function(&mut module, program, collection.id, &declarations)?;
+    }
+    for descriptor in &program.closure_descriptors {
+        define_closure_drop_function(&mut module, program, descriptor, &declarations)?;
     }
     define_process_main(
         &mut module,
@@ -214,28 +219,79 @@ fn declare_collection_drop_functions(
         .collect()
 }
 
+fn declare_closure_drop_functions(
+    module: &mut ObjectModule,
+    program: &mir::Program,
+) -> Result<Vec<FuncId>, BackendError> {
+    let pointer = module.target_config().pointer_type();
+    program
+        .closure_descriptors
+        .iter()
+        .map(|descriptor| {
+            let mut signature = module.make_signature();
+            signature.params.push(AbiParam::new(pointer));
+            signature.params.push(AbiParam::new(pointer));
+            module
+                .declare_function(
+                    &format!("__doria_drop_closure_environment_{}", descriptor.id.0),
+                    Linkage::Local,
+                    &signature,
+                )
+                .map_err(|error| backend_failure(error.to_string()))
+        })
+        .collect()
+}
+
+fn define_closure_descriptors(
+    module: &mut ObjectModule,
+    program: &mir::Program,
+    function_ids: &[FuncId],
+    closure_drop_function_ids: &[FuncId],
+) -> Result<Vec<DataId>, BackendError> {
+    let pointer_bytes = usize::from(module.target_config().pointer_bytes());
+    let layout = native_closure_abi::descriptor_layout(pointer_bytes as u32);
+    program
+        .closure_descriptors
+        .iter()
+        .map(|descriptor| {
+            let entry = *function_ids
+                .get(descriptor.entry_function.0)
+                .ok_or_else(|| malformed_mir("closure descriptor entry was not declared"))?;
+            let drop_environment = *closure_drop_function_ids
+                .get(descriptor.id.0)
+                .ok_or_else(|| malformed_mir("closure descriptor drop glue was not declared"))?;
+            let id = module
+                .declare_data(
+                    &format!("__doria_closure_descriptor_{}", descriptor.id.0),
+                    Linkage::Local,
+                    false,
+                    false,
+                )
+                .map_err(|error| backend_failure(error.to_string()))?;
+            let mut data = DataDescription::new();
+            data.set_align(u64::from(layout.layout.align));
+            // Relocated pointer slots must live in initialized data. Mach-O
+            // linkers cannot apply function relocations to a BSS section.
+            data.define(vec![0; layout.layout.size as usize].into_boxed_slice());
+            let entry = module.declare_func_in_data(entry, &mut data);
+            data.write_function_addr(layout.entry_offset, entry);
+            let drop_environment = module.declare_func_in_data(drop_environment, &mut data);
+            data.write_function_addr(layout.drop_environment_offset, drop_environment);
+            module
+                .define_data(id, &data)
+                .map_err(|error| backend_failure(error.to_string()))?;
+            Ok(id)
+        })
+        .collect()
+}
+
 fn function_signature(
     module: &mut ObjectModule,
     function: &mir::Function,
 ) -> Result<Signature, BackendError> {
     let mut signature = module.make_signature();
-    signature
-        .params
-        .push(AbiParam::new(module.target_config().pointer_type()));
-    let checked = !function.checked_effects.is_empty();
-    if checked {
-        if matches!(function.return_type, mir::ReturnType::Value(_)) {
-            signature
-                .params
-                .push(AbiParam::new(module.target_config().pointer_type()));
-        }
-        signature
-            .params
-            .push(AbiParam::new(module.target_config().pointer_type()));
-    } else if matches!(
-        function.return_type,
-        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-    ) {
+    let plan = native_closure_abi::NativeCallableSignaturePlan::direct(function);
+    for _ in &plan.hidden_inputs {
         signature
             .params
             .push(AbiParam::new(module.target_config().pointer_type()));
@@ -247,7 +303,7 @@ fn function_signature(
             module.target_config().pointer_type(),
         );
     }
-    if checked {
+    if plan.checked {
         signature.returns.push(AbiParam::new(types::I8));
     } else if let mir::ReturnType::Value(ty) = function.return_type {
         if !matches!(
@@ -497,7 +553,10 @@ fn define_static_data(
             mir::StaticValue::Null => {
                 let bytes = if matches!(
                     property.ty,
-                    mir::Type::NullableScalar(_) | mir::Type::NullableString
+                    mir::Type::NullableScalar(_)
+                        | mir::Type::NullableString
+                        | mir::Type::Function(_)
+                        | mir::Type::NullableFunction(_)
                 ) {
                     pointer_bytes * 2
                 } else {
@@ -684,11 +743,16 @@ fn define_function(
     module: &mut ObjectModule,
     program: &mir::Program,
     function: &mir::Function,
-    function_ids: &[FuncId],
-    class_drop_function_ids: &[FuncId],
-    collection_drop_function_ids: &[FuncId],
-    static_ids: &[DataId],
+    declarations: &DeclaredNativeItems<'_>,
 ) -> Result<(), BackendError> {
+    let DeclaredNativeItems {
+        function_ids,
+        class_drop_function_ids,
+        collection_drop_function_ids,
+        closure_descriptor_ids,
+        static_ids,
+        ..
+    } = declarations;
     let function_id = *function_ids
         .get(function.id.0)
         .ok_or_else(|| malformed_mir(format!("function{} was not declared", function.id.0)))?;
@@ -774,6 +838,28 @@ fn define_function(
                 }
             })
             .collect::<Vec<_>>();
+        let closure_environment_slots = program
+            .closure_descriptors
+            .iter()
+            .map(|descriptor| {
+                if descriptor.environment_placement != mir::ClosureEnvironmentPlacement::Stack {
+                    return Ok(None);
+                }
+                let logical = descriptor.environment_layout.ok_or_else(|| {
+                    malformed_mir("stack closure descriptor has no environment layout")
+                })?;
+                let layout = native_closure_abi::environment_layout(
+                    program,
+                    logical,
+                    u32::from(module.target_config().pointer_bytes()),
+                )?;
+                Ok(Some(builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    layout.layout.size.max(1),
+                    layout.layout.align.trailing_zeros() as u8,
+                ))))
+            })
+            .collect::<Result<Vec<_>, BackendError>>()?;
         let pointer_type = module.target_config().pointer_type();
         let pointer_bytes = pointer_type.bytes();
         let deferred_class_temporary_slots = (0..mir::class_temporary_capacity(function))
@@ -798,24 +884,30 @@ fn define_function(
             builder.ins().stack_store(pointer_type, zero, *slot, 0);
         }
         bind_parameters(&mut builder, function, &local_slots, entry, pointer_type)?;
-        let parent_frame = builder.block_params(entry)[0];
-        let checked = !function.checked_effects.is_empty();
-        let return_address = if checked {
-            matches!(function.return_type, mir::ReturnType::Value(_))
-                .then(|| builder.block_params(entry)[1])
-        } else {
-            matches!(
-                function.return_type,
-                mir::ReturnType::Value(
-                    mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-                )
-            )
-            .then(|| builder.block_params(entry)[1])
+        let signature_plan = native_closure_abi::NativeCallableSignaturePlan::direct(function);
+        let parent_frame = builder.block_params(entry)[signature_plan
+            .index_of(native_closure_abi::NativeCallableHiddenInput::CurrentFrame)
+            .expect("native callable plans always include a current frame")];
+        let return_address = signature_plan
+            .index_of(native_closure_abi::NativeCallableHiddenInput::ResultOut)
+            .map(|index| builder.block_params(entry)[index]);
+        let checked_error_address = signature_plan
+            .index_of(native_closure_abi::NativeCallableHiddenInput::ErrorOut)
+            .map(|index| builder.block_params(entry)[index]);
+        let borrow_home_addresses = match (
+            native_closure_abi::return_borrow_source_parameter(function)?,
+            signature_plan.index_of(native_closure_abi::NativeCallableHiddenInput::BorrowHome),
+        ) {
+            (Some(local), Some(index)) => {
+                HashMap::from([(local, builder.block_params(entry)[index])])
+            }
+            (None, None) => HashMap::new(),
+            _ => {
+                return Err(malformed_mir(
+                    "callable borrow-home ABI plan is inconsistent",
+                ))
+            }
         };
-        let checked_error_address = checked.then(|| {
-            builder.block_params(entry)
-                [1 + usize::from(matches!(function.return_type, mir::ReturnType::Value(_)))]
-        });
         let function_name = define_named_data(
             &mut builder,
             function.name.as_bytes(),
@@ -907,6 +999,10 @@ fn define_function(
             function_ids,
             class_drop_function_ids,
             collection_drop_function_ids,
+            closure_descriptor_ids,
+            closure_environment_slots: &closure_environment_slots,
+            closure_bound_fields: HashMap::new(),
+            borrow_home_addresses,
             static_ids,
             local_slots: &local_slots,
             deferred_class_temporary_slots,
@@ -952,11 +1048,16 @@ fn define_class_drop_function(
     module: &mut ObjectModule,
     program: &mir::Program,
     class: crate::class_layout::ClassId,
-    function_ids: &[FuncId],
-    class_drop_function_ids: &[FuncId],
-    collection_drop_function_ids: &[FuncId],
-    static_ids: &[DataId],
+    declarations: &DeclaredNativeItems<'_>,
 ) -> Result<(), BackendError> {
+    let DeclaredNativeItems {
+        function_ids,
+        class_drop_function_ids,
+        collection_drop_function_ids,
+        closure_descriptor_ids,
+        static_ids,
+        ..
+    } = declarations;
     let function_id = *class_drop_function_ids
         .get(class.0)
         .ok_or_else(|| malformed_mir(format!("class{} drop function was not declared", class.0)))?;
@@ -973,12 +1074,17 @@ fn define_class_drop_function(
         let current_frame = builder.block_params(entry)[0];
         let object = builder.block_params(entry)[1];
         let local_slots = [];
+        let closure_environment_slots = [];
         let mut resources = LoweringResources {
             module,
             program,
             function_ids,
             class_drop_function_ids,
             collection_drop_function_ids,
+            closure_descriptor_ids,
+            closure_environment_slots: &closure_environment_slots,
+            closure_bound_fields: HashMap::new(),
+            borrow_home_addresses: HashMap::new(),
             static_ids,
             local_slots: &local_slots,
             deferred_class_temporary_slots: Vec::new(),
@@ -1010,11 +1116,16 @@ fn define_collection_drop_function(
     module: &mut ObjectModule,
     program: &mir::Program,
     collection: mir::CollectionTypeId,
-    function_ids: &[FuncId],
-    class_drop_function_ids: &[FuncId],
-    collection_drop_function_ids: &[FuncId],
-    static_ids: &[DataId],
+    declarations: &DeclaredNativeItems<'_>,
 ) -> Result<(), BackendError> {
+    let DeclaredNativeItems {
+        function_ids,
+        class_drop_function_ids,
+        collection_drop_function_ids,
+        closure_descriptor_ids,
+        static_ids,
+        ..
+    } = declarations;
     let function_id = *collection_drop_function_ids
         .get(collection.0)
         .ok_or_else(|| malformed_mir("collection drop function was not declared"))?;
@@ -1031,12 +1142,17 @@ fn define_collection_drop_function(
         let current_frame = builder.block_params(entry)[0];
         let value = builder.block_params(entry)[1];
         let local_slots = [];
+        let closure_environment_slots = [];
         let mut resources = LoweringResources {
             module,
             program,
             function_ids,
             class_drop_function_ids,
             collection_drop_function_ids,
+            closure_descriptor_ids,
+            closure_environment_slots: &closure_environment_slots,
+            closure_bound_fields: HashMap::new(),
+            borrow_home_addresses: HashMap::new(),
             static_ids,
             local_slots: &local_slots,
             deferred_class_temporary_slots: Vec::new(),
@@ -1053,6 +1169,132 @@ fn define_collection_drop_function(
             deferred_class_temporary_drops: Vec::new(),
         };
         lower_drop_collection_value(&mut builder, value, collection, &mut resources)?;
+        builder.ins().return_(&[]);
+        builder.seal_all_blocks();
+        builder.finalize(module.target_config());
+    }
+    module
+        .define_function(function_id, &mut context)
+        .map_err(|error| backend_failure(format!("{error:?}")))?;
+    module.clear_context(&mut context);
+    Ok(())
+}
+
+fn define_closure_drop_function(
+    module: &mut ObjectModule,
+    program: &mir::Program,
+    descriptor: &mir::ClosureDescriptor,
+    declarations: &DeclaredNativeItems<'_>,
+) -> Result<(), BackendError> {
+    let DeclaredNativeItems {
+        function_ids,
+        class_drop_function_ids,
+        collection_drop_function_ids,
+        closure_drop_function_ids,
+        closure_descriptor_ids,
+        static_ids,
+    } = declarations;
+    let function_id = *closure_drop_function_ids
+        .get(descriptor.id.0)
+        .ok_or_else(|| malformed_mir("closure environment drop function was not declared"))?;
+    let pointer = module.target_config().pointer_type();
+    let environment_layout = descriptor
+        .environment_layout
+        .map(|logical| -> Result<_, BackendError> {
+            Ok((
+                closure_environment_layout_in(program, logical)?.clone(),
+                native_closure_abi::environment_layout(program, logical, pointer.bytes())?,
+            ))
+        })
+        .transpose()?;
+    let mut context = module.make_context();
+    context.func.signature.params.push(AbiParam::new(pointer));
+    context.func.signature.params.push(AbiParam::new(pointer));
+    let mut builder_context = FunctionBuilderContext::new();
+    {
+        let mut builder = FunctionBuilder::new(&mut context.func, &mut builder_context);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        let current_frame = builder.block_params(entry)[0];
+        let environment = builder.block_params(entry)[1];
+        let local_slots = [];
+        let closure_environment_slots = [];
+        let mut resources = LoweringResources {
+            module,
+            program,
+            function_ids,
+            class_drop_function_ids,
+            collection_drop_function_ids,
+            closure_descriptor_ids,
+            closure_environment_slots: &closure_environment_slots,
+            closure_bound_fields: HashMap::new(),
+            borrow_home_addresses: HashMap::new(),
+            static_ids,
+            local_slots: &local_slots,
+            deferred_class_temporary_slots: Vec::new(),
+            deferred_class_temporary_slot_cursor: 0,
+            write_stdout_func_id: None,
+            panic_func_id: None,
+            runtime_functions: HashMap::new(),
+            next_data_id: 0,
+            function_id: descriptor.entry_function,
+            current_frame,
+            return_address: None,
+            checked_error_address: None,
+            defer_class_temporary_drops: false,
+            deferred_class_temporary_drops: Vec::new(),
+        };
+        if let Some((logical, native)) = &environment_layout {
+            for logical_index in &logical.logical_release_order {
+                let field = logical
+                    .fields
+                    .get(*logical_index)
+                    .ok_or_else(|| malformed_mir("closure drop field does not exist"))?;
+                if field.storage != mir::ClosureEnvironmentStorage::Owned {
+                    continue;
+                }
+                let layout = native
+                    .fields
+                    .iter()
+                    .find(|layout| layout.field == field.id)
+                    .ok_or_else(|| malformed_mir("native closure drop field does not exist"))?;
+                let Some(bit) = layout.live_bit else {
+                    continue;
+                };
+                let byte_offset = (bit / 8) as i32;
+                let mask = 1_i64 << (bit % 8);
+                let byte = builder.ins().load(
+                    types::I8,
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    environment,
+                    byte_offset,
+                );
+                let live = builder.ins().band_imm_u(byte, mask);
+                let live = builder.ins().icmp_imm_u(IntCC::NotEqual, live, 0);
+                let drop_block = builder.create_block();
+                let next = builder.create_block();
+                builder.ins().brif(live, drop_block, &[], next, &[]);
+                builder.switch_to_block(drop_block);
+                let address = builder
+                    .ins()
+                    .iadd_imm_u(environment, i64::from(layout.offset));
+                lower_drop_value_at_address(&mut builder, field.ty, address, &mut resources)?;
+                set_environment_live_bit(&mut builder, environment, bit, false);
+                builder.ins().jump(next, &[]);
+                builder.switch_to_block(next);
+            }
+            if descriptor.environment_placement == mir::ClosureEnvironmentPlacement::Heap {
+                runtime_call(
+                    &mut builder,
+                    CLOSURE_ENVIRONMENT_FREE,
+                    &[pointer],
+                    None,
+                    &[environment],
+                    &mut resources,
+                )?;
+            }
+        }
         builder.ins().return_(&[]);
         builder.seal_all_blocks();
         builder.finalize(module.target_config());
@@ -1145,15 +1387,8 @@ fn bind_parameters(
     pointer_type: ClifType,
 ) -> Result<(), BackendError> {
     let params = builder.block_params(entry).to_vec();
-    let hidden_return = if function.checked_effects.is_empty() {
-        usize::from(matches!(
-            function.return_type,
-            mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
-        ))
-    } else {
-        1 + usize::from(matches!(function.return_type, mir::ReturnType::Value(_)))
-    };
-    let mut params = params.into_iter().skip(1 + hidden_return);
+    let plan = native_closure_abi::NativeCallableSignaturePlan::direct(function);
+    let mut params = params.into_iter().skip(plan.source_parameter_offset());
     for parameter in &function.params {
         let slot = local_slot(slots, *parameter)?;
         let ty = local_in(function, *parameter)?.ty;
@@ -1179,6 +1414,8 @@ fn bind_parameters(
                 | mir::Type::NullableString
                 | mir::Type::Error
                 | mir::Type::NullableError
+                | mir::Type::Function(_)
+                | mir::Type::NullableFunction(_)
         ) {
             let payload = params.next().ok_or_else(|| {
                 malformed_mir("nullable function parameter is missing its ABI payload")
@@ -1772,6 +2009,10 @@ struct LoweringResources<'module, 'program> {
     function_ids: &'program [FuncId],
     class_drop_function_ids: &'program [FuncId],
     collection_drop_function_ids: &'program [FuncId],
+    closure_descriptor_ids: &'program [DataId],
+    closure_environment_slots: &'program [Option<StackSlot>],
+    closure_bound_fields: HashMap<mir::LocalId, BoundClosureField>,
+    borrow_home_addresses: HashMap<mir::LocalId, Value>,
     static_ids: &'program [DataId],
     local_slots: &'program [Option<StackSlot>],
     deferred_class_temporary_slots: Vec<StackSlot>,
@@ -1786,6 +2027,13 @@ struct LoweringResources<'module, 'program> {
     checked_error_address: Option<Value>,
     defer_class_temporary_drops: bool,
     deferred_class_temporary_drops: Vec<(StackSlot, DeferredOwnedTemporary)>,
+}
+
+#[derive(Clone, Copy)]
+struct BoundClosureField {
+    address: Value,
+    storage: mir::ClosureEnvironmentStorage,
+    ty: mir::Type,
 }
 
 #[derive(Clone, Copy)]
@@ -1878,6 +2126,247 @@ fn lower_block(
     lower_terminator(builder, &block.terminator, blocks, resources)
 }
 
+fn lower_bind_closure_environment(
+    builder: &mut FunctionBuilder,
+    environment_local: mir::LocalId,
+    bindings: &[(mir::ClosureEnvironmentFieldId, mir::LocalId)],
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let descriptor = resources
+        .program
+        .closure_descriptors
+        .iter()
+        .find(|descriptor| descriptor.entry_function == resources.function_id)
+        .ok_or_else(|| malformed_mir("closure environment binding is outside a closure"))?
+        .clone();
+    let logical_id = descriptor
+        .environment_layout
+        .ok_or_else(|| malformed_mir("closure environment binding has no environment layout"))?;
+    let logical = closure_environment_layout_in(resources.program, logical_id)?.clone();
+    let pointer = resources.module.target_config().pointer_type();
+    let native =
+        native_closure_abi::environment_layout(resources.program, logical_id, pointer.bytes())?;
+    let environment = load_lowered_from_stack(
+        builder,
+        mir::Type::ClosureEnvironment(Some(logical_id)),
+        local_slot(resources.local_slots, environment_local)?,
+        pointer,
+    )
+    .single()?;
+    for (field_id, target) in bindings {
+        let field = logical
+            .fields
+            .iter()
+            .find(|field| field.id == *field_id)
+            .ok_or_else(|| malformed_mir("closure binding field does not exist"))?;
+        let layout = native
+            .fields
+            .iter()
+            .find(|layout| layout.field == *field_id)
+            .ok_or_else(|| malformed_mir("native closure binding field does not exist"))?;
+        let field_address = builder
+            .ins()
+            .iadd_imm_u(environment, i64::from(layout.offset));
+        let place = match field.storage {
+            mir::ClosureEnvironmentStorage::ReadonlyBorrow
+            | mir::ClosureEnvironmentStorage::WritableBorrow => builder.ins().load(
+                pointer,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                field_address,
+                0,
+            ),
+            mir::ClosureEnvironmentStorage::Owned => field_address,
+        };
+        let value = load_lowered_from_address(builder, field.ty, place, pointer);
+        let target_slot = local_slot(resources.local_slots, *target)?;
+        store_lowered_to_stack(builder, field.ty, target_slot, value, pointer)?;
+        if matches!(field.ty, mir::Type::String | mir::Type::NullableString) {
+            let offset = if field.ty == mir::Type::NullableString {
+                pointer.bytes() as i32
+            } else {
+                0
+            };
+            let string = builder
+                .ins()
+                .stack_load(pointer, pointer, target_slot, offset);
+            let string = retain_string(builder, string, resources)?;
+            builder
+                .ins()
+                .stack_store(pointer, string, target_slot, offset);
+        }
+        if field.storage == mir::ClosureEnvironmentStorage::WritableBorrow
+            && field.ty.transfers_writable_capture_ownership()
+        {
+            let size = match field.ty {
+                mir::Type::PayloadEnum(payload) => payload.storage_size(false),
+                mir::Type::NullablePayloadEnum(payload) => payload.storage_size(true),
+                mir::Type::Error
+                | mir::Type::NullableError
+                | mir::Type::Function(_)
+                | mir::Type::NullableFunction(_) => pointer.bytes() * 2,
+                _ => pointer.bytes(),
+            };
+            zero_inline_bytes(builder, place, size, pointer);
+        }
+        let address = if field.storage == mir::ClosureEnvironmentStorage::Owned {
+            builder.ins().stack_addr(pointer, target_slot, 0)
+        } else {
+            place
+        };
+        resources.closure_bound_fields.insert(
+            *target,
+            BoundClosureField {
+                address,
+                storage: field.storage,
+                ty: field.ty,
+            },
+        );
+        if field.storage == mir::ClosureEnvironmentStorage::Owned && field.ty.has_move_ownership() {
+            zero_inline_bytes(builder, field_address, layout.layout.size, pointer);
+            if let Some(bit) = layout.live_bit {
+                set_environment_live_bit(builder, environment, bit, false);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sync_writable_closure_captures(
+    builder: &mut FunctionBuilder,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let bindings = resources
+        .closure_bound_fields
+        .iter()
+        .filter_map(|(local, field)| {
+            (field.storage == mir::ClosureEnvironmentStorage::WritableBorrow)
+                .then_some((*local, *field))
+        })
+        .collect::<Vec<_>>();
+    let pointer = resources.module.target_config().pointer_type();
+    for (local, field) in bindings {
+        let slot = local_slot(resources.local_slots, local)?;
+        let new = load_lowered_from_stack(builder, field.ty, slot, pointer);
+        match field.ty {
+            mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {
+                store_lowered_to_address(builder, field.ty, field.address, new, pointer)?;
+            }
+            mir::Type::String | mir::Type::NullableString => {
+                let old = load_lowered_from_address(builder, field.ty, field.address, pointer);
+                let old_string = if field.ty == mir::Type::NullableString {
+                    old.nullable()?.1
+                } else {
+                    old.single()?
+                };
+                let new_string = if field.ty == mir::Type::NullableString {
+                    new.nullable()?.1
+                } else {
+                    new.single()?
+                };
+                let same = builder.ins().icmp(IntCC::Equal, old_string, new_string);
+                let done = builder.create_block();
+                let replace = builder.create_block();
+                builder.ins().brif(same, done, &[], replace, &[]);
+                builder.switch_to_block(replace);
+                let retained = retain_string(builder, new_string, resources)?;
+                let replacement = if field.ty == mir::Type::NullableString {
+                    let (present, _) = new.nullable()?;
+                    LoweredValue::Nullable {
+                        present,
+                        payload: retained,
+                    }
+                } else {
+                    LoweredValue::Single(retained)
+                };
+                store_lowered_to_address(builder, field.ty, field.address, replacement, pointer)?;
+                release_string(builder, old_string, resources)?;
+                builder.ins().jump(done, &[]);
+                builder.switch_to_block(done);
+            }
+            mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+                sync_writable_two_word_capture(builder, field, slot, new, pointer)?;
+            }
+            mir::Type::Error | mir::Type::NullableError => {
+                sync_writable_two_word_capture(builder, field, slot, new, pointer)?;
+            }
+            mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
+                let nullable = matches!(field.ty, mir::Type::NullablePayloadEnum(_));
+                let replacement = new.single()?;
+                copy_inline_bytes(
+                    builder,
+                    field.address,
+                    replacement,
+                    payload.storage_size(nullable),
+                    pointer,
+                );
+                zero_inline_bytes(
+                    builder,
+                    replacement,
+                    payload.storage_size(nullable),
+                    pointer,
+                );
+            }
+            mir::Type::Class(_)
+            | mir::Type::NullableClass(_)
+            | mir::Type::Collection(_)
+            | mir::Type::NullableCollection(_)
+            | mir::Type::Mixed
+            | mir::Type::NullableMixed
+            | mir::Type::SharedReference(_)
+            | mir::Type::WeakReference(_)
+            | mir::Type::NullableSharedReference(_)
+            | mir::Type::NullableWeakReference(_)
+            | mir::Type::WritableSharedReference(_)
+            | mir::Type::WritableWeakReference(_)
+            | mir::Type::NullableWritableSharedReference(_)
+            | mir::Type::NullableWritableWeakReference(_)
+            | mir::Type::ReadonlySharedReferenceAccess(_)
+            | mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+                sync_writable_pointer_capture(builder, field, slot, new.single()?, pointer)?;
+            }
+            mir::Type::ClosureEnvironment(_) => {
+                return Err(malformed_mir(
+                    "closure environment pointer cannot be a captured source value",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sync_writable_two_word_capture(
+    builder: &mut FunctionBuilder,
+    field: BoundClosureField,
+    slot: StackSlot,
+    new: LoweredValue,
+    pointer: ClifType,
+) -> Result<(), BackendError> {
+    store_lowered_to_address(builder, field.ty, field.address, new, pointer)?;
+    clear_function_carrier_stack(builder, slot, pointer);
+    Ok(())
+}
+
+fn sync_writable_pointer_capture(
+    builder: &mut FunctionBuilder,
+    field: BoundClosureField,
+    slot: StackSlot,
+    new: Value,
+    pointer: ClifType,
+) -> Result<(), BackendError> {
+    store_lowered_to_address(
+        builder,
+        field.ty,
+        field.address,
+        LoweredValue::Single(new),
+        pointer,
+    )?;
+    let zero = builder.ins().iconst(pointer, 0);
+    builder.ins().stack_store(pointer, zero, slot, 0);
+    Ok(())
+}
+
 fn lower_statement(
     builder: &mut FunctionBuilder,
     statement: &mir::Statement,
@@ -1886,10 +2375,21 @@ fn lower_statement(
     debug_assert!(resources.deferred_class_temporary_drops.is_empty());
     resources.defer_class_temporary_drops = true;
     match statement {
-        mir::Statement::BindClosureEnvironment { .. } | mir::Statement::DropFunction { .. } => {
-            return Err(backend_failure(
-                "closure MIR reached Cranelift before the Stage 30e boundary",
-            ));
+        mir::Statement::BindClosureEnvironment {
+            environment,
+            bindings,
+        } => lower_bind_closure_environment(builder, *environment, bindings, resources)?,
+        mir::Statement::DropFunction { local, .. } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let slot = local_slot(resources.local_slots, *local)?;
+            let carrier = load_lowered_from_stack(
+                builder,
+                local_definition(resources.program, resources.function_id, *local)?.ty,
+                slot,
+                pointer,
+            );
+            lower_drop_function_carrier(builder, carrier, resources)?;
+            clear_function_carrier_stack(builder, slot, pointer);
         }
         mir::Statement::BindPayloadEnumFields {
             source,
@@ -2017,6 +2517,12 @@ fn lower_statement(
             let new_value = lower_rvalue(builder, value, resources)?;
             let slot = local_slot(resources.local_slots, *target)?;
             let pointer = resources.module.target_config().pointer_type();
+            let old_function = (definition.owned
+                && matches!(
+                    definition.ty,
+                    mir::Type::Function(_) | mir::Type::NullableFunction(_)
+                ))
+            .then(|| load_lowered_from_stack(builder, definition.ty, slot, pointer));
             let old_value = match definition.ty {
                 mir::Type::String => Some((
                     load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
@@ -2086,6 +2592,9 @@ fn lower_statement(
                 }
                 _ => None,
             };
+            if let Some(old) = old_function {
+                lower_drop_function_carrier(builder, old, resources)?;
+            }
             store_lowered_to_stack(builder, definition.ty, slot, new_value, pointer)?;
             if let Some((old, class)) = old_value {
                 if let mir::Type::Collection(collection)
@@ -2262,6 +2771,14 @@ fn lower_statement(
             .then(|| {
                 load_lowered_from_address(builder, property_definition.ty, address, pointer_type)
             });
+            let old_function = (replaces
+                && matches!(
+                    property_definition.ty,
+                    mir::Type::Function(_) | mir::Type::NullableFunction(_)
+                ))
+            .then(|| {
+                load_lowered_from_address(builder, property_definition.ty, address, pointer_type)
+            });
             let old_value = if replaces {
                 match property_definition.ty {
                     mir::Type::String
@@ -2318,11 +2835,10 @@ fn lower_statement(
                     | mir::Type::NullableScalar(_)
                     | mir::Type::Error
                     | mir::Type::NullableError => None,
-                    mir::Type::Function(_)
-                    | mir::Type::NullableFunction(_)
-                    | mir::Type::ClosureEnvironment(_) => {
-                        return Err(backend_failure(
-                            "function-valued property reached Cranelift before Stage 30e",
+                    mir::Type::Function(_) | mir::Type::NullableFunction(_) => None,
+                    mir::Type::ClosureEnvironment(_) => {
+                        return Err(malformed_mir(
+                            "closure environment pointer reached a Doria property",
                         ));
                     }
                 }
@@ -2378,6 +2894,9 @@ fn lower_statement(
             }
             if let Some(old_error) = old_error {
                 lower_drop_error_value(builder, old_error, resources)?;
+            }
+            if let Some(old_function) = old_function {
+                lower_drop_function_carrier(builder, old_function, resources)?;
             }
         }
         mir::Statement::AssignStatic { target, value } => {
@@ -2741,7 +3260,9 @@ fn store_lowered_to_stack(
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::Error
-        | mir::Type::NullableError => {
+        | mir::Type::NullableError
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_) => {
             let (present, payload) = value.nullable()?;
             builder.ins().stack_store(pointer, present, slot, 0);
             builder
@@ -2838,7 +3359,9 @@ fn store_lowered_to_address(
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::Error
-        | mir::Type::NullableError => {
+        | mir::Type::NullableError
+        | mir::Type::Function(_)
+        | mir::Type::NullableFunction(_) => {
             let (present, payload) = value.nullable()?;
             builder.ins().store(flags, present, address, 0);
             builder
@@ -2885,11 +3408,48 @@ fn lower_terminator(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     match terminator {
-        mir::Terminator::IndirectCall { .. } | mir::Terminator::CheckedIndirectCall { .. } => {
-            return Err(backend_failure(
-                "indirect closure call reached Cranelift before the Stage 30e boundary",
-            ));
-        }
+        mir::Terminator::IndirectCall {
+            callee,
+            function_type,
+            invocation_mode,
+            args,
+            result,
+            continuation,
+            span,
+        } => lower_indirect_call(
+            builder,
+            callee,
+            *function_type,
+            *invocation_mode,
+            args,
+            *result,
+            block_for(blocks, *continuation)?,
+            *span,
+            resources,
+        )?,
+        mir::Terminator::CheckedIndirectCall {
+            callee,
+            function_type,
+            invocation_mode,
+            args,
+            result,
+            error,
+            success,
+            failure,
+            span,
+        } => lower_checked_indirect_call(
+            builder,
+            callee,
+            *function_type,
+            *invocation_mode,
+            args,
+            *result,
+            *error,
+            block_for(blocks, *success)?,
+            block_for(blocks, *failure)?,
+            *span,
+            resources,
+        )?,
         mir::Terminator::Return(expression) => {
             debug_assert!(resources.deferred_class_temporary_drops.is_empty());
             resources.defer_class_temporary_drops = true;
@@ -2909,12 +3469,14 @@ fn lower_terminator(
                     value,
                     resources.module.target_config().pointer_type(),
                 )?;
+                sync_writable_closure_captures(builder, resources)?;
                 cleanup_class_locals(builder, resources)?;
                 cleanup_string_locals(builder, resources)?;
                 let success = builder.ins().iconst(types::I8, 0);
                 builder.ins().return_(&[success]);
                 return Ok(());
             }
+            sync_writable_closure_captures(builder, resources)?;
             cleanup_class_locals(builder, resources)?;
             cleanup_string_locals(builder, resources)?;
             if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
@@ -2939,6 +3501,7 @@ fn lower_terminator(
             builder.ins().return_(&values);
         }
         mir::Terminator::ReturnVoid => {
+            sync_writable_closure_captures(builder, resources)?;
             cleanup_class_locals(builder, resources)?;
             cleanup_string_locals(builder, resources)?;
             if resources.checked_error_address.is_some() {
@@ -3042,6 +3605,11 @@ fn lower_terminator(
             }
             let error_slot = local_slot(resources.local_slots, *error)?;
             values.push(builder.ins().stack_addr(pointer, error_slot, 0));
+            if let Some(home) =
+                direct_call_borrow_home(builder, callee_definition, args, resources)?
+            {
+                values.push(home);
+            }
             values.extend(lowered.abi_values.iter().copied());
             let callee = declared_function(builder, resources, *function)?;
             let call = builder.ins().call(callee, &values);
@@ -3204,6 +3772,7 @@ fn lower_terminator(
             builder
                 .ins()
                 .stack_store(pointer, zero, slot, pointer.bytes() as i32);
+            sync_writable_closure_captures(builder, resources)?;
             cleanup_class_locals(builder, resources)?;
             cleanup_string_locals(builder, resources)?;
             let failure = builder.ins().iconst(types::I8, 1);
@@ -3475,6 +4044,254 @@ fn lower_checked_io_contents(
             Ok((lower_collection_pointer(builder, *local, resources)?, true))
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_indirect_call(
+    builder: &mut FunctionBuilder,
+    callee: &mir::FunctionExpression,
+    function_type: mir::FunctionTypeId,
+    invocation_mode: mir::FunctionInvocationMode,
+    args: &[mir::Rvalue],
+    result: Option<mir::LocalId>,
+    continuation: Block,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    set_active_panic_site(builder, span, resources);
+    let function_type = function_type_in(resources.program, function_type)?.clone();
+    if !function_type.checked_effects.is_empty() {
+        return Err(malformed_mir(
+            "throwing function type reached nonthrowing indirect call",
+        ));
+    }
+    let carrier = lower_function_expression(builder, callee, resources)?;
+    let (descriptor, environment) = carrier.nullable()?;
+    let lowered = lower_call_args(builder, args, resources)?;
+    let pointer = resources.module.target_config().pointer_type();
+    let mut values = vec![resources.current_frame];
+    if matches!(
+        function_type.return_type,
+        mir::ReturnType::Value(mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_))
+    ) {
+        let target = result.ok_or_else(|| malformed_mir("indirect payload call has no result"))?;
+        let slot = local_slot(resources.local_slots, target)?;
+        values.push(builder.ins().stack_addr(pointer, slot, 0));
+    }
+    if let Some(home) = indirect_call_borrow_home(builder, &function_type, args, resources)? {
+        values.push(home);
+    }
+    values.push(environment);
+    values.extend(lowered.abi_values.iter().copied());
+    let entry = load_closure_entry(builder, descriptor, pointer);
+    let signature = indirect_function_signature(resources.module, &function_type);
+    let signature = builder.import_signature(signature);
+    let call = builder.ins().call_indirect(signature, entry, &values);
+    let call_results = builder.inst_results(call).to_vec();
+    store_indirect_result(
+        builder,
+        &function_type.return_type,
+        result,
+        &call_results,
+        resources,
+    )?;
+    cleanup_indirect_call_arguments(builder, &function_type, args, &lowered, resources)?;
+    if invocation_mode == mir::FunctionInvocationMode::Once {
+        lower_drop_function_carrier(builder, carrier, resources)?;
+    }
+    builder.ins().jump(continuation, &[]);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_checked_indirect_call(
+    builder: &mut FunctionBuilder,
+    callee: &mir::FunctionExpression,
+    function_type: mir::FunctionTypeId,
+    invocation_mode: mir::FunctionInvocationMode,
+    args: &[mir::Rvalue],
+    result: Option<mir::LocalId>,
+    error: mir::LocalId,
+    success: Block,
+    failure: Block,
+    span: crate::source::Span,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    set_active_panic_site(builder, span, resources);
+    let function_type = function_type_in(resources.program, function_type)?.clone();
+    if function_type.checked_effects.is_empty() {
+        return Err(malformed_mir(
+            "nonthrowing function type reached checked indirect call",
+        ));
+    }
+    let carrier = lower_function_expression(builder, callee, resources)?;
+    let (descriptor, environment) = carrier.nullable()?;
+    let lowered = lower_call_args(builder, args, resources)?;
+    let pointer = resources.module.target_config().pointer_type();
+    let mut values = vec![resources.current_frame];
+    if let Some(result) = result {
+        let slot = local_slot(resources.local_slots, result)?;
+        values.push(builder.ins().stack_addr(pointer, slot, 0));
+    }
+    let error_slot = local_slot(resources.local_slots, error)?;
+    values.push(builder.ins().stack_addr(pointer, error_slot, 0));
+    if let Some(home) = indirect_call_borrow_home(builder, &function_type, args, resources)? {
+        values.push(home);
+    }
+    values.push(environment);
+    values.extend(lowered.abi_values.iter().copied());
+    let entry = load_closure_entry(builder, descriptor, pointer);
+    let signature = indirect_function_signature(resources.module, &function_type);
+    let signature = builder.import_signature(signature);
+    let call = builder.ins().call_indirect(signature, entry, &values);
+    let status = *builder
+        .inst_results(call)
+        .first()
+        .ok_or_else(|| malformed_mir("checked indirect call produced no status"))?;
+    cleanup_indirect_call_arguments(builder, &function_type, args, &lowered, resources)?;
+    if invocation_mode == mir::FunctionInvocationMode::Once {
+        lower_drop_function_carrier(builder, carrier, resources)?;
+    }
+    let invalid_status = builder.create_block();
+    let failed_status = builder.create_block();
+    let succeeded = builder.ins().icmp_imm_u(IntCC::Equal, status, 0);
+    builder
+        .ins()
+        .brif(succeeded, success, &[], failed_status, &[]);
+    builder.switch_to_block(failed_status);
+    let failed = builder.ins().icmp_imm_u(IntCC::Equal, status, 1);
+    builder
+        .ins()
+        .brif(failed, failure, &[], invalid_status, &[]);
+    builder.switch_to_block(invalid_status);
+    builder
+        .ins()
+        .trap(TrapCode::unwrap_user(RUNTIME_RETURNED_TRAP));
+    Ok(())
+}
+
+fn load_closure_entry(
+    builder: &mut FunctionBuilder,
+    descriptor: Value,
+    pointer: ClifType,
+) -> Value {
+    let layout = native_closure_abi::descriptor_layout(pointer.bytes());
+    builder.ins().load(
+        pointer,
+        cranelift_codegen::ir::MachMemFlags::trusted(),
+        descriptor,
+        layout.entry_offset as i32,
+    )
+}
+
+fn indirect_function_signature(
+    module: &mut ObjectModule,
+    function_type: &mir::FunctionType,
+) -> Signature {
+    let pointer = module.target_config().pointer_type();
+    let mut signature = module.make_signature();
+    let plan = native_closure_abi::NativeCallableSignaturePlan::indirect(function_type);
+    for _ in &plan.hidden_inputs {
+        signature.params.push(AbiParam::new(pointer));
+    }
+    for parameter in &function_type.parameters {
+        append_type_abi_params(&mut signature.params, parameter.ty, pointer);
+    }
+    if plan.checked {
+        signature.returns.push(AbiParam::new(types::I8));
+    } else if let mir::ReturnType::Value(ty) = function_type.return_type {
+        if !matches!(
+            ty,
+            mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+        ) {
+            append_type_abi_params(&mut signature.returns, ty, pointer);
+        }
+    }
+    signature
+}
+
+fn store_indirect_result(
+    builder: &mut FunctionBuilder,
+    return_type: &mir::ReturnType,
+    result: Option<mir::LocalId>,
+    results: &[Value],
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let mir::ReturnType::Value(ty) = *return_type else {
+        return Ok(());
+    };
+    if matches!(
+        ty,
+        mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+    ) {
+        return Ok(());
+    }
+    let target = result.ok_or_else(|| malformed_mir("value indirect call has no result local"))?;
+    let value = if matches!(
+        ty,
+        mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::Error
+            | mir::Type::NullableError
+            | mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
+    ) {
+        let present = *results
+            .first()
+            .ok_or_else(|| malformed_mir("indirect call has no first result word"))?;
+        let payload = *results
+            .get(1)
+            .ok_or_else(|| malformed_mir("indirect call has no second result word"))?;
+        LoweredValue::Nullable {
+            present,
+            payload: nullable_payload_from_doria_abi(builder, payload, ty),
+        }
+    } else {
+        let value = *results
+            .first()
+            .ok_or_else(|| malformed_mir("indirect call has no result"))?;
+        LoweredValue::Single(value_from_doria_abi(builder, value, ty))
+    };
+    let pointer = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, target)?;
+    store_lowered_to_stack(builder, ty, slot, value, pointer)
+}
+
+fn cleanup_indirect_call_arguments(
+    builder: &mut FunctionBuilder,
+    function_type: &mir::FunctionType,
+    args: &[mir::Rvalue],
+    lowered: &LoweredCallArgs,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    for (_, string) in &lowered.owned_strings {
+        release_string(builder, *string, resources)?;
+    }
+    for (index, value, ownership) in &lowered.temporary_mixed {
+        if args[*index].transferred_owned_local().is_some()
+            || function_type.parameters[*index].mode == mir::FunctionParameterMode::Take
+        {
+            continue;
+        }
+        lower_cleanup_mixed_temporary(builder, *value, *ownership, resources)?;
+    }
+    for index in ordered_owned_argument_indices(args) {
+        let argument = &args[index];
+        if function_type.parameters[index].mode == mir::FunctionParameterMode::Take {
+            continue;
+        }
+        let value = lowered.arguments[index];
+        if let Some(class) = argument.owned_temporary_class() {
+            defer_or_drop_class_temporary(builder, value.single()?, class, resources)?;
+        } else if let Some(collection) = argument.owned_temporary_collection() {
+            defer_or_drop_collection_temporary(builder, value.single()?, collection, resources)?;
+        } else if let Some(shared) = argument.owned_temporary_shared() {
+            defer_or_drop_owned_shared_temporary(builder, value.single()?, shared, resources)?;
+        } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
+            lower_drop_payload_enum_at(builder, value.single()?, payload, nullable, resources)?;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3873,9 +4690,10 @@ fn lower_rvalue(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<LoweredValue, BackendError> {
     match expression {
-        mir::Rvalue::Function(_) | mir::Rvalue::NullableFunction(_) => Err(backend_failure(
-            "function value reached Cranelift before the Stage 30e boundary",
-        )),
+        mir::Rvalue::Function(value) => lower_function_expression(builder, value, resources),
+        mir::Rvalue::NullableFunction(value) => {
+            lower_nullable_function_expression(builder, value, resources)
+        }
         mir::Rvalue::Value(value) => {
             lower_value_expression(builder, value, resources).map(LoweredValue::Single)
         }
@@ -3957,6 +4775,461 @@ fn lower_rvalue(
                 .map(LoweredValue::Single)
         }
     }
+}
+
+fn lower_function_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::FunctionExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredValue, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    match expression {
+        mir::FunctionExpression::Create {
+            descriptor,
+            captures,
+            ..
+        } => {
+            let descriptor_id = *resources
+                .closure_descriptor_ids
+                .get(descriptor.0)
+                .ok_or_else(|| malformed_mir("closure descriptor was not emitted"))?;
+            let descriptor_global = resources
+                .module
+                .declare_data_in_func(descriptor_id, builder.func);
+            let descriptor_pointer = builder.ins().symbol_value(pointer, descriptor_global);
+            let environment =
+                lower_closure_environment_create(builder, *descriptor, captures, resources)?;
+            Ok(LoweredValue::Nullable {
+                present: descriptor_pointer,
+                payload: environment,
+            })
+        }
+        mir::FunctionExpression::Local {
+            local, transfer, ..
+        } => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            let value = load_lowered_from_stack(
+                builder,
+                mir::Type::Function(expression.function_type()),
+                slot,
+                pointer,
+            );
+            if *transfer {
+                clear_function_carrier_stack(builder, slot, pointer);
+            }
+            Ok(value)
+        }
+        mir::FunctionExpression::Property {
+            object, property, ..
+        } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(load_lowered_from_address(
+                builder,
+                mir::Type::Function(expression.function_type()),
+                address,
+                pointer,
+            ))
+        }
+        mir::FunctionExpression::Call { function, args, .. } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("function-valued call returned void"))
+        }
+        mir::FunctionExpression::AssumePresent { value, .. } => {
+            lower_nullable_function_expression(builder, value, resources)
+        }
+        mir::FunctionExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        } => lower_two_word_collection_index(
+            builder,
+            *collection,
+            index,
+            *positional,
+            *remove,
+            resources,
+        ),
+    }
+}
+
+fn lower_closure_environment_create(
+    builder: &mut FunctionBuilder,
+    descriptor_id: mir::ClosureDescriptorId,
+    captures: &[mir::ClosureCaptureOperand],
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let descriptor = closure_descriptor_in(resources.program, descriptor_id)?.clone();
+    let Some(logical_id) = descriptor.environment_layout else {
+        if !captures.is_empty() {
+            return Err(malformed_mir(
+                "environment-free closure has capture operands",
+            ));
+        }
+        return Ok(builder.ins().iconst(pointer, 0));
+    };
+    let logical = closure_environment_layout_in(resources.program, logical_id)?.clone();
+    let native =
+        native_closure_abi::environment_layout(resources.program, logical_id, pointer.bytes())?;
+    if captures.len() != logical.fields.len() {
+        return Err(malformed_mir(
+            "closure capture count disagrees with its environment layout",
+        ));
+    }
+    let environment = match descriptor.environment_placement {
+        mir::ClosureEnvironmentPlacement::None => {
+            return Err(malformed_mir(
+                "capturing closure uses environment-free placement",
+            ))
+        }
+        mir::ClosureEnvironmentPlacement::Stack => {
+            let slot = resources
+                .closure_environment_slots
+                .get(descriptor_id.0)
+                .copied()
+                .flatten()
+                .ok_or_else(|| malformed_mir("stack closure environment has no stack slot"))?;
+            builder.ins().stack_addr(pointer, slot, 0)
+        }
+        mir::ClosureEnvironmentPlacement::Heap => {
+            let size = builder.ins().iconst(pointer, i64::from(native.layout.size));
+            let align = builder
+                .ins()
+                .iconst(pointer, i64::from(native.layout.align));
+            runtime_call(
+                builder,
+                CLOSURE_ENVIRONMENT_ALLOCATE,
+                &[pointer, pointer, pointer],
+                Some(pointer),
+                &[resources.current_frame, size, align],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("closure environment allocation produced no result"))?
+        }
+    };
+    zero_inline_bytes(builder, environment, native.layout.size, pointer);
+    for ((field, field_layout), capture) in logical
+        .fields
+        .iter()
+        .zip(native.fields.iter())
+        .zip(captures)
+    {
+        if field.id != field_layout.field {
+            return Err(malformed_mir(
+                "native closure field identity disagrees with MIR",
+            ));
+        }
+        let address = builder
+            .ins()
+            .iadd_imm_u(environment, i64::from(field_layout.offset));
+        match capture {
+            mir::ClosureCaptureOperand::BorrowLocal { local, writable } => {
+                let expected = if *writable {
+                    mir::ClosureEnvironmentStorage::WritableBorrow
+                } else {
+                    mir::ClosureEnvironmentStorage::ReadonlyBorrow
+                };
+                if field.storage != expected {
+                    return Err(malformed_mir(
+                        "borrow capture storage disagrees with environment layout",
+                    ));
+                }
+                let source = closure_source_address(builder, *local, resources)?;
+                builder.ins().store(
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    source,
+                    address,
+                    0,
+                );
+            }
+            mir::ClosureCaptureOperand::CopyValue(value)
+            | mir::ClosureCaptureOperand::MoveValue(value) => {
+                if field.storage != mir::ClosureEnvironmentStorage::Owned {
+                    return Err(malformed_mir(
+                        "owned capture uses a borrowed environment field",
+                    ));
+                }
+                let value = lower_rvalue(builder, value, resources)?;
+                store_lowered_to_address(builder, field.ty, address, value, pointer)?;
+                if let Some(bit) = field_layout.live_bit {
+                    set_environment_live_bit(builder, environment, bit, true);
+                }
+            }
+        }
+    }
+    Ok(environment)
+}
+
+fn closure_source_address(
+    builder: &mut FunctionBuilder,
+    local: mir::LocalId,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    if let Some(field) = resources.closure_bound_fields.get(&local) {
+        return Ok(field.address);
+    }
+    if let Some(address) = resources.borrow_home_addresses.get(&local) {
+        return Ok(*address);
+    }
+    let pointer = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, local)?;
+    Ok(builder.ins().stack_addr(pointer, slot, 0))
+}
+
+fn direct_call_borrow_home(
+    builder: &mut FunctionBuilder,
+    callee: &mir::Function,
+    args: &[mir::Rvalue],
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Option<Value>, BackendError> {
+    let Some(return_borrow) = callee
+        .return_borrow
+        .filter(|_| native_closure_abi::returns_function_value(callee.return_type))
+    else {
+        return Ok(None);
+    };
+    let index = native_closure_abi::return_borrow_argument_index(
+        return_borrow,
+        callee.receiver_mode.is_some(),
+    );
+    let source = args.get(index).ok_or_else(|| {
+        malformed_mir(format!(
+            "borrow-returning call to {} has no source argument",
+            callee.name
+        ))
+    })?;
+    Ok(Some(rvalue_borrow_home(builder, source, resources)?))
+}
+
+fn indirect_call_borrow_home(
+    builder: &mut FunctionBuilder,
+    function_type: &mir::FunctionType,
+    args: &[mir::Rvalue],
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Option<Value>, BackendError> {
+    let Some(return_borrow) = function_type
+        .return_borrow
+        .filter(|_| native_closure_abi::returns_function_value(function_type.return_type))
+    else {
+        return Ok(None);
+    };
+    let source = args
+        .get(native_closure_abi::return_borrow_argument_index(
+            return_borrow,
+            false,
+        ))
+        .ok_or_else(|| malformed_mir("borrow-returning indirect call has no source argument"))?;
+    Ok(Some(rvalue_borrow_home(builder, source, resources)?))
+}
+
+fn rvalue_borrow_home(
+    builder: &mut FunctionBuilder,
+    source: &mir::Rvalue,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let place = match source {
+        mir::Rvalue::Value(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+            operand,
+            ..
+        }))
+        | mir::Rvalue::Value(mir::ValueExpression::Float(mir::FloatExpression::Use {
+            operand,
+            ..
+        }))
+        | mir::Rvalue::Value(mir::ValueExpression::Bool(mir::BoolExpression::Use { operand }))
+        | mir::Rvalue::Value(mir::ValueExpression::Enum(mir::EnumExpression::Use {
+            operand,
+            ..
+        })) => return operand_borrow_home(builder, operand, resources),
+        mir::Rvalue::String(mir::StringExpression::Local(local))
+        | mir::Rvalue::String(mir::StringExpression::NullableLocalAssumeNonNull(local))
+        | mir::Rvalue::Class(mir::ClassExpression::Local { local, .. })
+        | mir::Rvalue::Class(mir::ClassExpression::NullableLocalAssumeNonNull { local, .. })
+        | mir::Rvalue::Collection(mir::CollectionExpression::Local { local, .. })
+        | mir::Rvalue::Mixed(mir::MixedExpression::Local { local, .. })
+        | mir::Rvalue::Error(mir::ErrorExpression::Local { local, .. })
+        | mir::Rvalue::Error(mir::ErrorExpression::NullableLocalAssumeNonNull { local, .. })
+        | mir::Rvalue::Function(mir::FunctionExpression::Local { local, .. })
+        | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Local { local, .. }) => {
+            Some((*local, None))
+        }
+        mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Local { local, .. })
+        | mir::Rvalue::NullableString(mir::NullableStringExpression::Local(local))
+        | mir::Rvalue::NullableClass(mir::NullableClassExpression::Local { local, .. })
+        | mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Local {
+            local, ..
+        })
+        | mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Local { local, .. })
+        | mir::Rvalue::NullableError(mir::NullableErrorExpression::Local { local, .. }) => {
+            Some((*local, None))
+        }
+        mir::Rvalue::String(mir::StringExpression::Property {
+            object, property, ..
+        })
+        | mir::Rvalue::Class(mir::ClassExpression::Property {
+            object, property, ..
+        })
+        | mir::Rvalue::Collection(mir::CollectionExpression::Property {
+            object, property, ..
+        })
+        | mir::Rvalue::Mixed(mir::MixedExpression::Property {
+            object, property, ..
+        })
+        | mir::Rvalue::Error(mir::ErrorExpression::Property {
+            object, property, ..
+        })
+        | mir::Rvalue::Function(mir::FunctionExpression::Property {
+            object, property, ..
+        })
+        | mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Property {
+            object,
+            property,
+            ..
+        })
+        | mir::Rvalue::NullableString(mir::NullableStringExpression::Property {
+            object,
+            property,
+            ..
+        })
+        | mir::Rvalue::NullableClass(mir::NullableClassExpression::Property {
+            object,
+            property,
+            ..
+        })
+        | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Property {
+            object,
+            property,
+            ..
+        }) => Some((*object, Some(*property))),
+        _ => None,
+    };
+    match place {
+        Some((local, None)) => closure_source_address(builder, local, resources),
+        Some((object, Some(property))) => {
+            lower_property_address(builder, object, property, resources)
+        }
+        None => Err(malformed_mir(
+            "borrow-returning call source is not an addressable Doria place",
+        )),
+    }
+}
+
+fn operand_borrow_home(
+    builder: &mut FunctionBuilder,
+    operand: &mir::Operand,
+    resources: &LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    match operand {
+        mir::Operand::Local(local) | mir::Operand::NullablePayload(local) => {
+            closure_source_address(builder, *local, resources)
+        }
+        mir::Operand::Property { object, property } => {
+            lower_property_address(builder, *object, *property, resources)
+        }
+        _ => Err(malformed_mir(
+            "borrow-returning call source is not an addressable scalar place",
+        )),
+    }
+}
+
+fn set_environment_live_bit(
+    builder: &mut FunctionBuilder,
+    environment: Value,
+    bit: u32,
+    live: bool,
+) {
+    let byte_offset = (bit / 8) as i32;
+    let bit_mask = 1_i64 << (bit % 8);
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let current = builder
+        .ins()
+        .load(types::I8, flags, environment, byte_offset);
+    let next = if live {
+        builder.ins().bor_imm_u(current, bit_mask)
+    } else {
+        builder.ins().band_imm_u(current, (!bit_mask) & 0xff)
+    };
+    builder.ins().store(flags, next, environment, byte_offset);
+}
+
+fn lower_nullable_function_expression(
+    builder: &mut FunctionBuilder,
+    expression: &mir::NullableFunctionExpression,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredValue, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    match expression {
+        mir::NullableFunctionExpression::Null { .. } => {
+            let zero = builder.ins().iconst(pointer, 0);
+            Ok(LoweredValue::Nullable {
+                present: zero,
+                payload: zero,
+            })
+        }
+        mir::NullableFunctionExpression::Present(value) => {
+            lower_function_expression(builder, value, resources)
+        }
+        mir::NullableFunctionExpression::Local {
+            local, transfer, ..
+        } => {
+            let slot = local_slot(resources.local_slots, *local)?;
+            let value = load_lowered_from_stack(
+                builder,
+                mir::Type::NullableFunction(expression.function_type()),
+                slot,
+                pointer,
+            );
+            if *transfer {
+                clear_function_carrier_stack(builder, slot, pointer);
+            }
+            Ok(value)
+        }
+        mir::NullableFunctionExpression::Property {
+            object, property, ..
+        } => {
+            let address = lower_property_address(builder, *object, *property, resources)?;
+            Ok(load_lowered_from_address(
+                builder,
+                mir::Type::NullableFunction(expression.function_type()),
+                address,
+                pointer,
+            ))
+        }
+        mir::NullableFunctionExpression::Call { function, args, .. } => {
+            lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("nullable function-valued call returned void"))
+        }
+        mir::NullableFunctionExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+            ..
+        } => lower_nullable_two_word_collection_get(builder, *collection, key, *access, resources),
+        mir::NullableFunctionExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        } => lower_two_word_collection_index(
+            builder,
+            *collection,
+            index,
+            *positional,
+            *remove,
+            resources,
+        ),
+    }
+}
+
+fn clear_function_carrier_stack(builder: &mut FunctionBuilder, slot: StackSlot, pointer: ClifType) {
+    let zero = builder.ins().iconst(pointer, 0);
+    builder.ins().stack_store(pointer, zero, slot, 0);
+    builder
+        .ins()
+        .stack_store(pointer, zero, slot, pointer.bytes() as i32);
 }
 
 fn create_payload_storage(
@@ -4076,7 +5349,7 @@ fn lower_error_expression(
             index,
             positional,
             remove,
-        } => lower_error_collection_index(
+        } => lower_two_word_collection_index(
             builder,
             *collection,
             index,
@@ -4186,13 +5459,13 @@ fn lower_nullable_error_expression(
             collection,
             key,
             access,
-        } => lower_nullable_error_collection_get(builder, *collection, key, *access, resources),
+        } => lower_nullable_two_word_collection_get(builder, *collection, key, *access, resources),
         mir::NullableErrorExpression::CollectionIndex {
             collection,
             index,
             positional,
             remove,
-        } => lower_error_collection_index(
+        } => lower_two_word_collection_index(
             builder,
             *collection,
             index,
@@ -4203,7 +5476,7 @@ fn lower_nullable_error_expression(
     }
 }
 
-fn lower_error_collection_index(
+fn lower_two_word_collection_index(
     builder: &mut FunctionBuilder,
     collection: mir::LocalId,
     index: &mir::Rvalue,
@@ -4215,7 +5488,7 @@ fn lower_error_collection_index(
     let local = local_definition(resources.program, resources.function_id, collection)?;
     let mir::Type::Collection(collection_type) = local.ty else {
         return Err(malformed_mir(
-            "Error collection place uses a non-collection local",
+            "aggregate collection place uses a non-collection local",
         ));
     };
     let definition = collection_definition(resources.program, collection_type)?.clone();
@@ -4266,7 +5539,7 @@ fn lower_error_collection_index(
             ],
             resources,
         )?
-        .ok_or_else(|| backend_failure("Error collection read produced no slot"))?
+        .ok_or_else(|| backend_failure("aggregate collection read produced no slot"))?
     };
     Ok(load_lowered_from_address(
         builder,
@@ -4276,7 +5549,7 @@ fn lower_error_collection_index(
     ))
 }
 
-fn lower_nullable_error_collection_get(
+fn lower_nullable_two_word_collection_get(
     builder: &mut FunctionBuilder,
     collection: mir::LocalId,
     key: &mir::Rvalue,
@@ -4287,7 +5560,7 @@ fn lower_nullable_error_collection_get(
     let local = local_definition(resources.program, resources.function_id, collection)?;
     let mir::Type::Collection(collection_type) = local.ty else {
         return Err(malformed_mir(
-            "Error nullable access uses a non-collection local",
+            "aggregate nullable access uses a non-collection local",
         ));
     };
     let definition = collection_definition(resources.program, collection_type)?.clone();
@@ -4296,7 +5569,7 @@ fn lower_nullable_error_collection_get(
         | mir::NullableCollectionAccess::Index
         | mir::NullableCollectionAccess::Remove => definition
             .key
-            .ok_or_else(|| malformed_mir("dictionary Error access has no key type"))?,
+            .ok_or_else(|| malformed_mir("dictionary aggregate access has no key type"))?,
         _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
     };
     let collection = lower_collection_pointer(builder, collection, resources)?;
@@ -4323,7 +5596,10 @@ fn lower_nullable_error_collection_get(
     let access_value = builder.ins().iconst(types::I8, i64::from(access_code));
     let stored_nullable = builder.ins().iconst(
         types::I8,
-        i64::from(matches!(definition.value, mir::Type::NullableError)),
+        i64::from(matches!(
+            definition.value,
+            mir::Type::NullableError | mir::Type::NullableFunction(_)
+        )),
     );
     runtime_call(
         builder,
@@ -4362,9 +5638,20 @@ fn lower_nullable_error_collection_get(
             release_string(builder, removed_key, resources)?;
         }
     }
+    let result_type = match definition.value {
+        mir::Type::Error | mir::Type::NullableError => mir::Type::NullableError,
+        mir::Type::Function(function) | mir::Type::NullableFunction(function) => {
+            mir::Type::NullableFunction(function)
+        }
+        ty => {
+            return Err(malformed_mir(format!(
+                "type {ty} does not use two-word nullable collection access"
+            )))
+        }
+    };
     Ok(load_lowered_from_address(
         builder,
-        mir::Type::NullableError,
+        result_type,
         raw,
         pointer,
     ))
@@ -5442,13 +6729,57 @@ fn lower_drop_value_at_address(
             };
             lower_drop_writable_shared_value(builder, value, symbol, resources)
         }
+        mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+            let value = load_lowered_from_address(builder, ty, address, pointer);
+            lower_drop_function_carrier(builder, value, resources)
+        }
         mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
-        mir::Type::Function(_)
-        | mir::Type::NullableFunction(_)
-        | mir::Type::ClosureEnvironment(_) => Err(backend_failure(
-            "function-value cleanup reached Cranelift before Stage 30e",
+        mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
+            "closure environment pointer reached ordinary value cleanup",
         )),
     }
+}
+
+fn lower_drop_function_carrier(
+    builder: &mut FunctionBuilder,
+    value: LoweredValue,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let (descriptor, environment) = value.nullable()?;
+    let zero = builder.ins().iconst(pointer, 0);
+    let present = builder.ins().icmp(IntCC::NotEqual, descriptor, zero);
+    let has_environment = builder.ins().icmp(IntCC::NotEqual, environment, zero);
+    let should_drop = builder.ins().band(present, has_environment);
+    let drop_block = builder.create_block();
+    let done = builder.create_block();
+    builder.ins().brif(should_drop, drop_block, &[], done, &[]);
+    builder.switch_to_block(drop_block);
+    let layout = native_closure_abi::descriptor_layout(pointer.bytes());
+    let drop_function = builder.ins().load(
+        pointer,
+        cranelift_codegen::ir::MachMemFlags::trusted(),
+        descriptor,
+        layout.drop_environment_offset as i32,
+    );
+    let signature = closure_drop_signature(resources.module);
+    let signature = builder.import_signature(signature);
+    builder.ins().call_indirect(
+        signature,
+        drop_function,
+        &[resources.current_frame, environment],
+    );
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+    Ok(())
+}
+
+fn closure_drop_signature(module: &mut ObjectModule) -> Signature {
+    let pointer = module.target_config().pointer_type();
+    let mut signature = module.make_signature();
+    signature.params.push(AbiParam::new(pointer));
+    signature.params.push(AbiParam::new(pointer));
+    signature
 }
 
 fn lower_drop_error_value(
@@ -5907,7 +7238,7 @@ fn lower_payload_enum_collection_literal(
     Ok(result)
 }
 
-fn lower_error_collection_literal(
+fn lower_two_word_collection_literal(
     builder: &mut FunctionBuilder,
     definition: &mir::CollectionType,
     entries: &[mir::CollectionEntry],
@@ -5963,12 +7294,12 @@ fn lower_error_collection_literal(
         ],
         resources,
     )?
-    .ok_or_else(|| backend_failure("Error collection allocation produced no result"))?;
+    .ok_or_else(|| backend_failure("aggregate collection allocation produced no result"))?;
     for (index, entry) in entries.iter().enumerate() {
         let value = lower_rvalue(builder, &entry.value, resources)?;
         let destination = if let (Some(key_ty), Some(key)) = (definition.key, &entry.key) {
             let key = lower_rvalue(builder, key, resources)?.single()?;
-            lower_error_dictionary_write_slot(
+            lower_two_word_dictionary_write_slot(
                 builder,
                 result,
                 key,
@@ -5990,7 +7321,7 @@ fn lower_error_collection_literal(
                 &[resources.current_frame, result, index, positional, key_kind],
                 resources,
             )?
-            .ok_or_else(|| backend_failure("Error array initialization produced no slot"))?
+            .ok_or_else(|| backend_failure("aggregate array initialization produced no slot"))?
         } else {
             runtime_call(
                 builder,
@@ -6000,7 +7331,7 @@ fn lower_error_collection_literal(
                 &[result],
                 resources,
             )?
-            .ok_or_else(|| backend_failure("Error collection insertion produced no slot"))?
+            .ok_or_else(|| backend_failure("aggregate collection insertion produced no slot"))?
         };
         store_lowered_to_address(builder, definition.value, destination, value, pointer)?;
     }
@@ -6017,7 +7348,7 @@ fn lower_error_collection_literal(
     Ok(result)
 }
 
-fn lower_error_dictionary_write_slot(
+fn lower_two_word_dictionary_write_slot(
     builder: &mut FunctionBuilder,
     collection: Value,
     key: Value,
@@ -6041,7 +7372,7 @@ fn lower_error_dictionary_write_slot(
         &[collection, key_word, key_kind, replaced_pointer],
         resources,
     )?
-    .ok_or_else(|| backend_failure("Error dictionary write produced no slot"))?;
+    .ok_or_else(|| backend_failure("aggregate dictionary write produced no slot"))?;
     let replaced = builder
         .ins()
         .stack_load(pointer, types::I8, replaced_slot, 0);
@@ -6051,8 +7382,7 @@ fn lower_error_dictionary_write_slot(
     let done = builder.create_block();
     builder.ins().brif(has_old, drop_block, &[], done, &[]);
     builder.switch_to_block(drop_block);
-    let old = load_lowered_from_address(builder, value_type, destination, pointer);
-    lower_drop_error_value(builder, old, resources)?;
+    lower_drop_value_at_address(builder, value_type, destination, resources)?;
     lower_drop_stored_value(builder, key, key_type, resources)?;
     builder.ins().jump(done, &[]);
     builder.switch_to_block(done);
@@ -6129,9 +7459,12 @@ fn lower_collection_expression(
             let definition = collection_definition(resources.program, *collection)?.clone();
             if matches!(
                 definition.value,
-                mir::Type::Error | mir::Type::NullableError
+                mir::Type::Error
+                    | mir::Type::NullableError
+                    | mir::Type::Function(_)
+                    | mir::Type::NullableFunction(_)
             ) {
-                return lower_error_collection_literal(builder, &definition, entries, resources);
+                return lower_two_word_collection_literal(builder, &definition, entries, resources);
             }
             if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
                 return lower_payload_enum_collection_literal(
@@ -6856,11 +8189,14 @@ fn lower_collection_add(
     };
     if matches!(
         definition.value,
-        mir::Type::Error | mir::Type::NullableError
+        mir::Type::Error
+            | mir::Type::NullableError
+            | mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
     ) {
         if op == mir::CollectionMutationOp::Remove {
             return Err(malformed_mir(
-                "Error remove-by-value requires a collection equality capability",
+                "aggregate remove-by-value requires a collection equality capability",
             ));
         }
         let value = lower_rvalue(builder, value, resources)?;
@@ -6877,7 +8213,7 @@ fn lower_collection_add(
                 ],
                 resources,
             )?
-            .ok_or_else(|| backend_failure("Error collection insertion produced no slot"))?
+            .ok_or_else(|| backend_failure("aggregate collection insertion produced no slot"))?
         } else if op == mir::CollectionMutationOp::PushFront {
             runtime_call(
                 builder,
@@ -6887,7 +8223,9 @@ fn lower_collection_add(
                 &[collection_value],
                 resources,
             )?
-            .ok_or_else(|| backend_failure("Error collection front insertion produced no slot"))?
+            .ok_or_else(|| {
+                backend_failure("aggregate collection front insertion produced no slot")
+            })?
         } else {
             runtime_call(
                 builder,
@@ -6897,7 +8235,7 @@ fn lower_collection_add(
                 &[collection_value],
                 resources,
             )?
-            .ok_or_else(|| backend_failure("Error collection insertion produced no slot"))?
+            .ok_or_else(|| backend_failure("aggregate collection insertion produced no slot"))?
         };
         store_lowered_to_address(builder, definition.value, destination, value, pointer)?;
         return Ok(());
@@ -7176,11 +8514,14 @@ fn lower_collection_set(
     let index = lower_rvalue(builder, index, resources)?.single()?;
     if matches!(
         definition.value,
-        mir::Type::Error | mir::Type::NullableError
+        mir::Type::Error
+            | mir::Type::NullableError
+            | mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
     ) {
         let replacement = lower_rvalue(builder, value, resources)?;
         let destination = if let Some(key_type) = definition.key.filter(|_| !positional) {
-            lower_error_dictionary_write_slot(
+            lower_two_word_dictionary_write_slot(
                 builder,
                 collection_value,
                 index,
@@ -7212,9 +8553,8 @@ fn lower_collection_set(
                 ],
                 resources,
             )?
-            .ok_or_else(|| backend_failure("Error collection write produced no slot"))?;
-            let old = load_lowered_from_address(builder, definition.value, destination, pointer);
-            lower_drop_error_value(builder, old, resources)?;
+            .ok_or_else(|| backend_failure("aggregate collection write produced no slot"))?;
+            lower_drop_value_at_address(builder, definition.value, destination, resources)?;
             destination
         };
         store_lowered_to_address(builder, definition.value, destination, replacement, pointer)?;
@@ -7936,11 +9276,14 @@ fn lower_drop_stored_value(
         mir::Type::NullablePayloadEnum(ty) => {
             lower_drop_payload_enum_at(builder, value, ty, true, resources)
         }
+        mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+            let pointer = resources.module.target_config().pointer_type();
+            let carrier = load_lowered_from_address(builder, ty, value, pointer);
+            lower_drop_function_carrier(builder, carrier, resources)
+        }
         mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
-        mir::Type::Function(_)
-        | mir::Type::NullableFunction(_)
-        | mir::Type::ClosureEnvironment(_) => Err(backend_failure(
-            "function-value cleanup reached Cranelift before Stage 30e",
+        mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
+            "closure environment pointer reached stored-value cleanup",
         )),
     }
 }
@@ -8074,7 +9417,10 @@ fn lower_finish_collection_value(
     let index = builder.ins().isub(remaining, one);
     if matches!(
         definition.value,
-        mir::Type::Error | mir::Type::NullableError
+        mir::Type::Error
+            | mir::Type::NullableError
+            | mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
     ) {
         let index_word = if pointer == types::I64 {
             index
@@ -8099,9 +9445,8 @@ fn lower_finish_collection_value(
             ],
             resources,
         )?
-        .ok_or_else(|| backend_failure("Error collection value read produced no slot"))?;
-        let value = load_lowered_from_address(builder, definition.value, value, pointer);
-        lower_drop_error_value(builder, value, resources)?;
+        .ok_or_else(|| backend_failure("aggregate collection value read produced no slot"))?;
+        lower_drop_value_at_address(builder, definition.value, value, resources)?;
     } else if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
         let index_word = if pointer == types::I64 {
             index
@@ -10287,11 +11632,13 @@ fn lower_drop_class_value_impl(
             mir::Type::NullablePayloadEnum(payload) => {
                 lower_drop_payload_enum_at(builder, address, payload, true, resources)?;
             }
-            mir::Type::Function(_)
-            | mir::Type::NullableFunction(_)
-            | mir::Type::ClosureEnvironment(_) => {
-                return Err(backend_failure(
-                    "function-valued property reached Cranelift before Stage 30e",
+            mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+                let value = load_lowered_from_address(builder, property.ty, address, pointer_type);
+                lower_drop_function_carrier(builder, value, resources)?;
+            }
+            mir::Type::ClosureEnvironment(_) => {
+                return Err(malformed_mir(
+                    "closure environment pointer reached a Doria property",
                 ));
             }
         }
@@ -13485,6 +14832,9 @@ fn lower_function_call_at(
         }
         _ => None,
     };
+    if let Some(home) = direct_call_borrow_home(builder, callee_definition, args, resources)? {
+        values.push(home);
+    }
     values.extend(lowered.abi_values.iter().copied());
     let callee = declared_function(builder, resources, function)?;
     let call = builder.ins().call(callee, &values);
@@ -13495,7 +14845,9 @@ fn lower_function_call_at(
             mir::Type::NullableScalar(_)
             | mir::Type::NullableString
             | mir::Type::Error
-            | mir::Type::NullableError,
+            | mir::Type::NullableError
+            | mir::Type::Function(_)
+            | mir::Type::NullableFunction(_),
         ) => {
             let ty = match callee_definition.return_type {
                 mir::ReturnType::Value(ty) => ty,
@@ -13686,7 +15038,12 @@ fn lower_method_call_with_receiver(
     let results = builder.inst_results(call);
     let result = match definition.return_type {
         mir::ReturnType::Void => None,
-        mir::ReturnType::Value(mir::Type::NullableScalar(_) | mir::Type::NullableString) => {
+        mir::ReturnType::Value(
+            mir::Type::NullableScalar(_)
+            | mir::Type::NullableString
+            | mir::Type::Function(_)
+            | mir::Type::NullableFunction(_),
+        ) => {
             let ty = match definition.return_type {
                 mir::ReturnType::Value(ty) => ty,
                 mir::ReturnType::Void => unreachable!(),
@@ -13801,10 +15158,15 @@ fn lower_condition_to_branch(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     match condition {
-        mir::BoolExpression::NullableFunctionIsPresent(_) => {
-            return Err(backend_failure(
-                "nullable function test reached Cranelift before the Stage 30e boundary",
-            ));
+        mir::BoolExpression::NullableFunctionIsPresent(value) => {
+            let pointer = resources.module.target_config().pointer_type();
+            let (descriptor, _) =
+                lower_nullable_function_expression(builder, value, resources)?.nullable()?;
+            let zero = builder.ins().iconst(pointer, 0);
+            let present = builder.ins().icmp(IntCC::NotEqual, descriptor, zero);
+            builder
+                .ins()
+                .brif(present, then_block, &[], else_block, &[]);
         }
         mir::BoolExpression::PayloadEnumIsCase {
             local,
@@ -14941,6 +16303,44 @@ fn function_in(
         .get(id.0)
         .filter(|function| function.id == id)
         .ok_or_else(|| malformed_mir(format!("FunctionId function{} does not exist", id.0)))
+}
+
+fn function_type_in(
+    program: &mir::Program,
+    id: mir::FunctionTypeId,
+) -> Result<&mir::FunctionType, BackendError> {
+    program
+        .function_types
+        .get(id.0)
+        .filter(|definition| definition.id == id)
+        .ok_or_else(|| malformed_mir(format!("function type#{} does not exist", id.0)))
+}
+
+fn closure_descriptor_in(
+    program: &mir::Program,
+    id: mir::ClosureDescriptorId,
+) -> Result<&mir::ClosureDescriptor, BackendError> {
+    program
+        .closure_descriptors
+        .get(id.0)
+        .filter(|definition| definition.id == id)
+        .ok_or_else(|| malformed_mir(format!("closure descriptor#{} does not exist", id.0)))
+}
+
+fn closure_environment_layout_in(
+    program: &mir::Program,
+    id: mir::ClosureEnvironmentLayoutId,
+) -> Result<&mir::ClosureEnvironmentLayout, BackendError> {
+    program
+        .closure_environment_layouts
+        .get(id.0)
+        .filter(|definition| definition.id == id)
+        .ok_or_else(|| {
+            malformed_mir(format!(
+                "closure environment layout#{} does not exist",
+                id.0
+            ))
+        })
 }
 
 fn local_in(function: &mir::Function, id: mir::LocalId) -> Result<&mir::Local, BackendError> {

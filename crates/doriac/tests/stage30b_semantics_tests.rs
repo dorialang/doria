@@ -627,6 +627,7 @@ function main(): void
     function(): Payload $oToR = $once;
     function writable(): Payload $oToW = $once;
 }
+
 "#;
     let analysis = analyze(source);
     assert_eq!(
@@ -640,6 +641,37 @@ function main(): void
         "{:#?}",
         analysis.diagnostics
     );
+}
+
+#[test]
+fn compatible_closure_context_is_preserved_for_execution_without_erasing_inference() {
+    let source = r#"
+class Failure implements Error { function __construct(string $message) {} }
+
+function makeOnce(): function once(): int throws Failure
+{
+    let $value = 42;
+    return fn() with (take $value) => $value;
+}
+"#;
+    let analysis = analyze(source);
+    assert!(
+        permanent_errors(&analysis.diagnostics).is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+
+    let closure = analysis.info.closures.values().next().unwrap();
+    let ResolvedType::Function(inferred) = &closure.function_type else {
+        panic!("closure must have an inferred function type")
+    };
+    let ResolvedType::Function(execution) = &closure.execution_function_type else {
+        panic!("closure must have an execution function type")
+    };
+    assert_eq!(inferred.invocation_mode, FunctionInvocationMode::Readonly);
+    assert!(inferred.checked_effects.is_empty());
+    assert_eq!(execution.invocation_mode, FunctionInvocationMode::Once);
+    assert_eq!(execution.checked_effects.len(), 1);
 }
 
 #[test]

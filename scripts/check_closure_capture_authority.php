@@ -132,7 +132,7 @@ function check_closure_capture_authority(string $root): array
         'A closure that uses no enclosing local',
         'The compiler resolves readonly/writable/once structural function types',
         'function(int): int',
-        'target-specific `E0641` boundary',
+        '`E0641` is therefore a PHP-only',
         '`with ($this)` borrows a',
         '`with (writable $this)` borrows it exclusively',
     ]);
@@ -148,7 +148,8 @@ function check_closure_capture_authority(string $root): array
         'Stage 30b Semantic Function Types And Captures — Complete',
         'Stage 30c Ownership, Lifetime, And Escape — Complete',
         'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
-        'Stage 30e Native Execution — Next',
+        'Stage 30e Native Execution — Complete',
+        'Stage 30f PHP Compatibility — Next',
         'Stage 30 — In Progress, Not Complete',
         'Decision 0120 — Accepted; Explicit Capture-List Foundation',
         'Decision 0121 — Accepted; Stage 30 Closure Authority',
@@ -166,7 +167,7 @@ function check_closure_capture_authority(string $root): array
         'These snippets are accepted Stage 30 target-state documentation.',
         'Stages 30b and 30c check',
         'not a native, PHP, or runnable-example manifest',
-        'target-specific E0641 boundaries',
+        'Stage 30f E0641',
         'let $double = fn(int $value) => $value * 2;',
         'fn(int $score) with ($minimum) =>',
         'function (int $score): bool with ($minimum) {',
@@ -225,7 +226,7 @@ function check_closure_capture_authority(string $root): array
     $require($cataloguePath, $catalogue, ['"E0641"']);
     $require($testsPath, $tests, [
         'capture_ast_preserves_modes_duplicates_order_and_exact_spans',
-        'semantic_and_ide_paths_are_target_neutral_while_backends_keep_boundaries',
+        'semantic_and_ide_paths_are_target_neutral_while_only_php_keeps_its_boundary',
         'malformed_closure_inventory_has_deliberate_diagnostics',
         'closure_recovery_does_not_cascade_into_following_syntax',
         'cli_ast_check_and_hir_accept_valid_closures',

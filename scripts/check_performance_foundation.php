@@ -117,7 +117,7 @@ function check_performance_foundation(string $root): array
         ],
         'benchmarks-revision.json' => [
             '"repository": "dorialang/benchmarks"',
-            '"revision": "6234ccd6ac34589734998f3ab0967a5fdb5051e8"',
+            '"revision": "9e62998eb116d521b166016dab751b3cbd5e1e6d"',
         ],
         'scripts/check_benchmark_revision.php' => [
             'check_benchmark_revision',
