@@ -85,7 +85,7 @@ function check_closure_capture_authority(string $root): array
         'anonymous-function expression tokens and productions',
         'source-preserving AST nodes',
         'accepted-syntax regression tests',
-        '`E0641` now remains only at the',
+        '`E0641` is unreachable for',
         'Stage 30b now validates free variables',
         'pre-Stage-30 grammar slice is complete',
         'Decision 0121 settles the questions this record deliberately left bounded',
@@ -96,7 +96,7 @@ function check_closure_capture_authority(string $root): array
         'The later structured-concurrency stage owns async closures',
         'The audit found no accepted grant of',
         'runtime reflection occurs',
-        'not PHP arrow-function',
+        'does not use PHP arrow automatic capture',
         'Rust bootstrap representation does not define the language model',
     ]);
 
@@ -132,7 +132,7 @@ function check_closure_capture_authority(string $root): array
         'A closure that uses no enclosing local',
         'The compiler resolves readonly/writable/once structural function types',
         'function(int): int',
-        '`E0641` is therefore a PHP-only',
+        '`E0641` is unreachable',
         '`with ($this)` borrows a',
         '`with (writable $this)` borrows it exclusively',
     ]);
@@ -149,7 +149,8 @@ function check_closure_capture_authority(string $root): array
         'Stage 30c Ownership, Lifetime, And Escape — Complete',
         'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
         'Stage 30e Native Execution — Complete',
-        'Stage 30f PHP Compatibility — Next',
+        'Stage 30f PHP Compatibility — Complete',
+        'Stage 30g List Algorithms — Next',
         'Stage 30 — In Progress, Not Complete',
         'Decision 0120 — Accepted; Explicit Capture-List Foundation',
         'Decision 0121 — Accepted; Stage 30 Closure Authority',
@@ -166,8 +167,8 @@ function check_closure_capture_authority(string $root): array
     $require($examplesPath, $examples, [
         'These snippets are accepted Stage 30 target-state documentation.',
         'Stages 30b and 30c check',
-        'not a native, PHP, or runnable-example manifest',
-        'Stage 30f E0641',
+        'not an executable manifest',
+        'Stage 30g List',
         'let $double = fn(int $value) => $value * 2;',
         'fn(int $score) with ($minimum) =>',
         'function (int $score): bool with ($minimum) {',
@@ -226,7 +227,7 @@ function check_closure_capture_authority(string $root): array
     $require($cataloguePath, $catalogue, ['"E0641"']);
     $require($testsPath, $tests, [
         'capture_ast_preserves_modes_duplicates_order_and_exact_spans',
-        'semantic_and_ide_paths_are_target_neutral_while_only_php_keeps_its_boundary',
+        'semantic_ide_and_php_paths_accept_php_compatible_closures',
         'malformed_closure_inventory_has_deliberate_diagnostics',
         'closure_recovery_does_not_cascade_into_following_syntax',
         'cli_ast_check_and_hir_accept_valid_closures',

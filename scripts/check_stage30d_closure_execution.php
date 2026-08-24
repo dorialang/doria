@@ -61,17 +61,18 @@ function check_stage30d_closure_execution(string $root): array
             'Complete',
             'Stage 30e Native Execution',
             'Stage 30f PHP Compatibility',
+            'Stage 30g List Algorithms',
             'Next',
             'Stage 30',
             'Not Complete',
         ]);
     }
     $require($paths['decision'], $files['decision'], [
-        'Authority Accepted; Stages 30a Through 30e Implemented; Stage 30f Next; Stage 30 Not Complete',
+        'Authority Accepted; Stages 30a Through 30f Implemented; Stage 30g Next; Stage 30 Not Complete',
     ]);
     $require($paths['audit'], $files['audit'], [
-        'implemented for debug/native',
-        'PHP Stage 30f',
+        'Implemented for debug, Cranelift, LLVM, and the PHP-supported value surface',
+        'catalogue identity retained until Stage 30h',
     ]);
 
     $require($paths['hir'], $files['hir'], [
@@ -121,19 +122,25 @@ function check_stage30d_closure_execution(string $root): array
         $forbid($paths[$key], $files[$key], ['"E0641"']);
     }
     $require($paths['backend'], $files['backend'], [
+        'Some(lower_validated_mir(program)?)',
+        'codegen_php::generate(program, mir.as_ref())',
+    ]);
+    $forbid($paths['backend'], $files['backend'], [
         'Closure PHP Output Is Not Yet Available',
-        'PHP closure lowering lands in Stage 30f',
         'Diagnostic::unsupported_stage("E0641"',
     ]);
     $forbid($paths['backend'], $files['backend'], ['Closure Native Execution Is Not Yet Available']);
     $forbid($paths['cranelift'], $files['cranelift'], ['before the Stage 30e boundary']);
     $forbid($paths['llvm'], $files['llvm'], ['before the Stage 30e boundary']);
-    $require($paths['php'], $files['php'], ['Stage 30f target boundary']);
+    $require($paths['php'], $files['php'], [
+        'PhpClosurePlan',
+        'validated MIR must back executable PHP closures',
+    ]);
 
     $require($paths['executionTests'], $files['executionTests'], [
         'debug_preserves_readonly_and_writable_capture_places',
         'debug_propagates_and_catches_checked_closure_effects',
-        'executable_closures_reach_native_while_php_retains_its_boundary',
+        'executable_closures_reach_native_and_php_compatibility',
         'type_only_function_syntax_does_not_trigger_target_boundaries',
     ]);
     $require($paths['malformedTests'], $files['malformedTests'], [

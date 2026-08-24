@@ -85,7 +85,7 @@ function check_stage30_closure_authority(string $root): array
         '# Decision 0121: Closure Function Types, Capture Semantics, And Execution Model',
         '**Status:** Accepted',
         '**Accepted:** 2026-08-19',
-        '**Implementation Status:** Authority Accepted; Stages 30a Through 30e Implemented; Stage 30f Next; Stage 30 Not Complete',
+        '**Implementation Status:** Authority Accepted; Stages 30a Through 30f Implemented; Stage 30g Next; Stage 30 Not Complete',
         '**Elaborates:** Decision 0120',
         'function writable(int): int',
         'function once(): Payload',
@@ -117,6 +117,7 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30c — Complete',
         'Stage 30d — Complete',
         'Stage 30e — Complete',
+        'Stage 30f — Complete',
         'E0641 retires by route',
         'Measurement Status: Pending Available Runner',
         '## Invalidated elsewhere',
@@ -133,9 +134,9 @@ function check_stage30_closure_authority(string $root): array
     $require($proposalPath, $proposal, [
         '**Superseded By Accepted Decision 0121.**',
         'It is not normative authority',
-        'Stage 30a Callable Grammar Completion and Stage 30b',
-        'Semantic Function Types And Captures are complete',
-        'E0641 remains only on valid execution routes',
+        'Stages 30a through 30f are complete',
+        'Stage 30g List Algorithms is next',
+        'E0641 is unreachable for supported plain closure execution',
     ]);
     $forbid($proposalPath, $proposal, [
         '**In Review.**',
@@ -160,7 +161,8 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30c Ownership, Lifetime, And Escape — Complete',
         'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
         'Stage 30e Native Execution — Complete',
-        'Stage 30f PHP Compatibility — Next',
+        'Stage 30f PHP Compatibility — Complete',
+        'Stage 30g List Algorithms — Next',
         'Stage 30h Cross-Repository Closure',
         '`function take()` is rejected',
         '`List<T>` alone receives `map`, Copy-only preserving `filter`, and writable-accumulator `reduce`',
@@ -175,9 +177,10 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30c Ownership, Lifetime, And Escape — Complete',
         'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
         'Stage 30e Native Execution — Complete',
-        'Stage 30f PHP Compatibility — Next',
+        'Stage 30f PHP Compatibility — Complete',
+        'Stage 30g List Algorithms — Next',
         'Stage 30 — In Progress, Not Complete',
-        'E0641 remains only at the PHP Stage 30f target boundary',
+        'E0641 is unreachable for supported plain closure execution',
     ]);
     $forbid($pipelinePath, $pipeline, [
         'Stage 30 Closure Authority Proposal — In Review',
@@ -195,7 +198,7 @@ function check_stage30_closure_authority(string $root): array
         'readonly/writable/once structural function types',
         'grouping remains transparent',
         'callable-value calls',
-        '`E0641` is therefore a PHP-only',
+        '`E0641` is unreachable',
         'debug interpreter',
         'Stage 30 - In Progress, Not Complete',
     ]);
@@ -212,10 +215,10 @@ function check_stage30_closure_authority(string $root): array
     ]);
     $require($examplesPath, $examples, [
         '[Decision 0121]',
-        'Stages 30a through 30e are complete',
+        'Stages 30a through 30f are complete',
         'remains in progress and not complete',
         'Stages 30b and 30c check',
-        'Stage 30f E0641',
+        'Stage 30g List algorithms are next',
     ]);
 
     $require($lexerPath, $lexer, [

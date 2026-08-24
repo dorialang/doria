@@ -91,7 +91,8 @@ function check_constructor_owned_property_writes(string $root): array
             'Stage 30c Ownership, Lifetime, And Escape — Complete',
             'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
             'Stage 30e Native Execution — Complete',
-            'Stage 30f PHP Compatibility — Next',
+            'Stage 30f PHP Compatibility — Complete',
+            'Stage 30g List Algorithms — Next',
             'Stage 30 — In Progress, Not Complete',
         ]);
     }

@@ -2132,7 +2132,9 @@ function main(): void
 
     let php = doriac::compile_source_to_php("type-only-function.doria", source)
         .expect("type-only structural function syntax should remain PHP-lowerable");
-    assert!(php.contains("function accept(callable $callback): void"));
+    assert!(php.contains("function accept(__DoriaFunctionValue $callback): void"));
+    assert!(php.contains("interface __DoriaFunctionValue"));
+    assert!(!php.contains("function accept(callable $callback)"));
     assert!(!php.contains("function accept(function $callback)"));
 }
 
@@ -2288,9 +2290,9 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     assert!(php.contains("if (@fflush(STDOUT)) { return; }"));
     assert!(php.contains("if (__doria_is_broken_pipe(error_get_last())) { exit(0); }"));
     assert!(!php.contains("readline("));
-    assert!(php.contains(
-        "function __doria_panic(string $code, int $start, int $end, ?string $message = null)"
-    ));
+    assert!(php.contains("function __doria_panic("));
+    assert!(php.contains("?string $message = null,"));
+    assert!(php.contains("?string $callable = null,"));
     assert!(!php.contains("): never"));
     assert!(php.contains("if ($line === false)"));
     assert!(php.contains("if (feof(STDIN)) { return null; }"));

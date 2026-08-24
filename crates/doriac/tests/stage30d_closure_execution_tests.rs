@@ -5,14 +5,6 @@ fn debug(source: &str) -> String {
         .unwrap_or_else(|diagnostics| panic!("Stage 30d source should execute: {diagnostics:#?}"))
 }
 
-fn target_error(source: &str, target: BackendTarget) -> doriac::diagnostics::Diagnostic {
-    doriac::compile_source("stage30d.doria", source, target)
-        .expect_err("executable closure route should stop at the target boundary")
-        .into_iter()
-        .next()
-        .expect("target boundary should produce one diagnostic")
-}
-
 #[test]
 fn debug_executes_no_capture_arrow_and_block_closures() {
     let source = r#"
@@ -358,8 +350,9 @@ function main(): void
 }
 
 #[test]
-fn executable_closures_reach_native_while_php_retains_its_boundary() {
-    let source = "function main(): void { let $callback = fn() => 1; echo \"{$callback()}\\n\"; }";
+fn executable_closures_reach_native_and_php_compatibility() {
+    let source =
+        "function main(): void { let $callback = fn() => \"ok\"; echo $callback() . \"\\n\"; }";
 
     let native = doriac::compile_source("stage30e.doria", source, BackendTarget::Native)
         .expect("executable closures should lower through the native target");
@@ -368,10 +361,9 @@ fn executable_closures_reach_native_while_php_retains_its_boundary() {
         doriac::backend::BackendOutput::Executable { .. }
     ));
 
-    let php = target_error(source, BackendTarget::Php);
-    assert_eq!(php.code, "E0641");
-    assert_eq!(php.title, "Closure PHP Output Is Not Yet Available");
-    assert!(php.message.contains("Stage 30f"));
+    let php = doriac::compile_source("stage30f.doria", source, BackendTarget::Php)
+        .expect("PHP-compatible closures should lower through the PHP target");
+    assert!(matches!(php, doriac::backend::BackendOutput::Text { .. }));
 }
 
 #[test]

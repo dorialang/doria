@@ -1,0 +1,7 @@
+function main(): void
+{
+    let $fail = function (): void {
+        panic("closure panic");
+    };
+    $fail();
+}

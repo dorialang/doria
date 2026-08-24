@@ -55,17 +55,18 @@ function check_stage30e_native_closure_execution(string $root): array
             'Stage 30e Native Execution',
             'Complete',
             'Stage 30f PHP Compatibility',
+            'Stage 30g List Algorithms',
             'Next',
             'Stage 30',
             'Not Complete',
         ]);
     }
     $require($paths['decision'], $files['decision'], [
-        'Authority Accepted; Stages 30a Through 30e Implemented; Stage 30f Next; Stage 30 Not Complete',
+        'Authority Accepted; Stages 30a Through 30f Implemented; Stage 30g Next; Stage 30 Not Complete',
     ]);
     $require($paths['audit'], $files['audit'], [
-        'implemented for debug/native',
-        'PHP Stage 30f',
+        'Implemented for debug, Cranelift, LLVM, and the PHP-supported value surface',
+        'catalogue identity retained until Stage 30h',
     ]);
 
     $require($paths['abi'], $files['abi'], [
@@ -117,14 +118,14 @@ function check_stage30e_native_closure_execution(string $root): array
         'closure_release',
     ]);
     $require($paths['backend'], $files['backend'], [
-        'Closure PHP Output Is Not Yet Available',
-        'PHP closure lowering lands in Stage 30f',
-        'Diagnostic::unsupported_stage("E0641"',
-        'BackendTarget::Native | BackendTarget::Debug | BackendTarget::Wasm => return Ok(())',
+        'Some(lower_validated_mir(program)?)',
+        'codegen_php::generate(program, mir.as_ref())',
     ]);
     $forbid($paths['backend'], $files['backend'], [
         'Closure Native Execution Is Not Yet Available',
         'native closure execution lands in Stage 30e',
+        'Closure PHP Output Is Not Yet Available',
+        'Diagnostic::unsupported_stage("E0641"',
     ]);
 
     $require($paths['parityTests'], $files['parityTests'], [

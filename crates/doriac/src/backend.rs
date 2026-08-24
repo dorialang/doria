@@ -139,10 +139,16 @@ impl Backend for PhpBackend {
     }
 
     fn emit(&self, program: &hir::Program) -> Result<BackendOutput, BackendError> {
-        reject_executable_closure_hir_route(program, BackendTarget::Php)?;
+        let mir = if program.semantic_info.closures.is_empty()
+            && program.semantic_info.callable_value_calls.is_empty()
+        {
+            None
+        } else {
+            Some(lower_validated_mir(program)?)
+        };
         Ok(BackendOutput::Text {
             extension: "php".to_string(),
-            contents: codegen_php::generate(program)?,
+            contents: codegen_php::generate(program, mir.as_ref())?,
         })
     }
 }
@@ -198,49 +204,6 @@ fn lower_validated_mir(program: &hir::Program) -> Result<mir::Program, BackendEr
     let mir = mir_lowering::lower_program(program).map_err(BackendError::from_diagnostics)?;
     crate::mir_validation::validate_program(&mir)?;
     Ok(mir)
-}
-
-fn reject_executable_closure_hir_route(
-    program: &hir::Program,
-    target: BackendTarget,
-) -> Result<(), BackendError> {
-    let span = program
-        .semantic_info
-        .closures
-        .values()
-        .map(|closure| closure.execution_boundary_span)
-        .chain(
-            program
-                .semantic_info
-                .callable_value_calls
-                .keys()
-                .map(|(start, end)| Span::new(*start, *end)),
-        )
-        .min_by_key(|span| (span.start, span.end));
-    reject_executable_closure_span(span, target)
-}
-
-fn reject_executable_closure_span(
-    span: Option<Span>,
-    target: BackendTarget,
-) -> Result<(), BackendError> {
-    let Some(span) = span else {
-        return Ok(());
-    };
-    let (title, message, explanation) = match target {
-        BackendTarget::Php => (
-            "Closure PHP Output Is Not Yet Available",
-            "PHP closure lowering lands in Stage 30f",
-            "Closure semantics, ownership, HIR, MIR, and debug-interpreter execution are implemented. Explicit PHP compatibility lowering lands in Stage 30f; PHP automatic capture does not define Doria behavior.",
-        ),
-        BackendTarget::Native | BackendTarget::Debug | BackendTarget::Wasm => return Ok(()),
-    };
-    Err(BackendError::from_diagnostics(vec![
-        Diagnostic::unsupported_stage("E0641", message, span)
-            .with_title(title)
-            .with_explanation(explanation)
-            .with_help("execute this source with `--target debug`; no source rewrite is required"),
-    ]))
 }
 
 pub fn emit(program: &hir::Program, target: BackendTarget) -> Result<BackendOutput, BackendError> {

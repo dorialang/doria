@@ -1,0 +1,73 @@
+class Greeter
+{
+    function __construct(string $name)
+    {
+    }
+
+    function make(): function(): string
+    {
+        return fn() with ($this) => $this->message();
+    }
+
+    internal function message(): string
+    {
+        return $this->name;
+    }
+}
+
+class Runner
+{
+    writable function(): string $callback = fn() => "initial";
+
+    writable function replace(take function(): string $callback): void
+    {
+        $this->callback = $callback;
+    }
+
+    function run(): string
+    {
+        return $this->callback();
+    }
+}
+
+function apply(function(string): string $callback, string $value): string
+{
+    return $callback($value);
+}
+
+function factory(string $base): function(string): string
+{
+    return fn(string $suffix) with (take $base) => $base . $suffix;
+}
+
+function main(): void
+{
+    let $identity = fn(string $value) => $value;
+    echo apply($identity, "plain") . "\n";
+
+    let writable $word = "a";
+    let writable $append = function (): string with (writable $word) {
+        $word = $word . "b";
+        return $word;
+    };
+    echo $append() . " " . $append() . "\n";
+
+    let $joined = factory("left-");
+    echo $joined("right") . "\n";
+
+    writable ?function(): string $maybe = null;
+    $maybe = fn() => "present";
+    if ($maybe != null) {
+        echo $maybe() . "\n";
+    }
+    $maybe = null;
+
+    let $greeter = new Greeter("private");
+    let $greet = $greeter->make();
+    echo $greet() . "\n";
+
+    let writable $runner = new Runner();
+    echo $runner->run() . " ";
+    $runner->replace(fn() => "replacement");
+    echo $runner->run() . "\n";
+}
