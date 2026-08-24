@@ -154,8 +154,9 @@ future pass does not re-propose them as oversights.
 | Fluent mutators                                       | Unchanged from 0100: mutators return `void`; userland fluency is Decision 0088's capability                                                                                                      |
 | `List::from`, `Dictionary::from`, `T[]::from`         | **Withdrawn from 0100, not implemented** — see below                                                                                                                                             |
 
-Decision 0121 finalizes `map` / `filter` / `reduce` for `List<T>` only at Stage
-30g. The other collection families do not receive those methods in Stage 30.
+Decision 0121 finalizes and Stage 30g implements `map` / `filter` / `reduce` for
+`List<T>` only. The other collection families do not receive those methods in
+Stage 30.
 
 **`::from` on the literal-constructible types is withdrawn.** 0100 states that
 `::from` is "also available as the equivalent explicit form" for `List`,
@@ -237,10 +238,11 @@ incomplete checks against this, not against a peer language.
 | `union` / `intersect` / `difference` | —    | —    | yes | —     | yes  | —   | —     |
 | `clear`                              | yes  | yes  | yes | yes   | yes  | yes | yes   |
 | `::from`                             | —    | —    | yes | yes   | yes  | yes | yes   |
-| `map` / `filter` / `reduce`          | S30g | —    | —   | —     | —    | —   | —     |
+| `map` / `filter` / `reduce`          | yes  | —    | —   | —     | —    | —   | —     |
 
 The higher-order row is amended by Decision 0121. `List<T>` alone receives
-these algorithms in Stage 30; every other family requires separate authority.
+these algorithms through Stage 30g; every other family requires separate
+authority.
 
 `T[]` carries `length`, indexing, `foreach`, and `contains`; it is built by
 literal only. `List` and `Dictionary` are likewise literal-only. `Bytes`

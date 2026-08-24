@@ -62,13 +62,13 @@ function check_stage30c_ownership(string $root): array
             'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
             'Stage 30e Native Execution — Complete',
             'Stage 30f PHP Compatibility — Complete',
-            'Stage 30g List Algorithms — Next',
+            'Stage 30g List Algorithms — Complete',
             'Stage 30 — In Progress, Not Complete',
         ]);
         $forbid($path, $contents, ['Stage 30c Ownership, Lifetime, And Escape — Next']);
     }
     $require($decisionPath, $decision, [
-        'Stages 30a Through 30f Implemented',
+        'Stages 30a Through 30g Implemented',
         'acquisition at closure creation in authored order',
         'non-lexical readonly/writable leases',
         'Stage 30d — Complete',
@@ -78,8 +78,8 @@ function check_stage30c_ownership(string $root): array
         'Stage 30d Closure HIR/MIR And Interpreter Oracle - Complete',
         'Stage 30e Native Execution - Complete',
         'Stage 30f PHP Compatibility - Complete',
-        'Stage 30g List Algorithms - Next',
-        'E0641 - Unreachable For Supported Plain Closure Execution',
+        'Stage 30g List Algorithms - Complete',
+        'E0641 - Catalogued But Unreachable For The Supported Stage 30g Surface',
     ]);
     $require($auditPath, $audit, [
         'Implemented for debug, Cranelift, LLVM, and the PHP-supported value surface',

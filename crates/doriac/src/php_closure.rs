@@ -347,6 +347,12 @@ fn collect_expr_closures(expr: &Expr, closures: &mut HashMap<ClosureId, hir::Clo
                 collect_expr_closures(&argument.value, closures);
             }
         }
+        Expr::ListAlgorithmCall(call) => {
+            collect_expr_closures(&call.receiver, closures);
+            for argument in &call.arguments {
+                collect_expr_closures(&argument.value, closures);
+            }
+        }
         Expr::FunctionCall { args, .. }
         | Expr::MethodCall { args, .. }
         | Expr::StaticCall { args, .. }
@@ -744,6 +750,12 @@ fn visit_expr_calls(
             }
             visit_expr_calls(&call.callee, program, callables, call_targets, cells);
             for argument in &call.args {
+                visit_expr_calls(&argument.value, program, callables, call_targets, cells);
+            }
+        }
+        Expr::ListAlgorithmCall(call) => {
+            visit_expr_calls(&call.receiver, program, callables, call_targets, cells);
+            for argument in &call.arguments {
                 visit_expr_calls(&argument.value, program, callables, call_targets, cells);
             }
         }

@@ -85,7 +85,7 @@ function check_stage30_closure_authority(string $root): array
         '# Decision 0121: Closure Function Types, Capture Semantics, And Execution Model',
         '**Status:** Accepted',
         '**Accepted:** 2026-08-19',
-        '**Implementation Status:** Authority Accepted; Stages 30a Through 30f Implemented; Stage 30g Next; Stage 30 Not Complete',
+        '**Implementation Status:** Authority Accepted; Stages 30a Through 30g Implemented; Stage 30h Next; Stage 30 Not Complete',
         '**Elaborates:** Decision 0120',
         'function writable(int): int',
         'function once(): Payload',
@@ -134,9 +134,9 @@ function check_stage30_closure_authority(string $root): array
     $require($proposalPath, $proposal, [
         '**Superseded By Accepted Decision 0121.**',
         'It is not normative authority',
-        'Stages 30a through 30f are complete',
-        'Stage 30g List Algorithms is next',
-        'E0641 is unreachable for supported plain closure execution',
+        'Stages 30a through 30g are complete',
+        'Stage 30h Cross-Repository Closure is next',
+        'E0641 is catalogued but unreachable for the supported Stage 30g surface',
     ]);
     $forbid($proposalPath, $proposal, [
         '**In Review.**',
@@ -162,7 +162,7 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
         'Stage 30e Native Execution — Complete',
         'Stage 30f PHP Compatibility — Complete',
-        'Stage 30g List Algorithms — Next',
+        'Stage 30g List Algorithms — Complete',
         'Stage 30h Cross-Repository Closure',
         '`function take()` is rejected',
         '`List<T>` alone receives `map`, Copy-only preserving `filter`, and writable-accumulator `reduce`',
@@ -178,9 +178,9 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
         'Stage 30e Native Execution — Complete',
         'Stage 30f PHP Compatibility — Complete',
-        'Stage 30g List Algorithms — Next',
+        'Stage 30g List Algorithms — Complete',
         'Stage 30 — In Progress, Not Complete',
-        'E0641 is unreachable for supported plain closure execution',
+        'E0641 is catalogued but unreachable for the supported Stage 30g surface',
     ]);
     $forbid($pipelinePath, $pipeline, [
         'Stage 30 Closure Authority Proposal — In Review',
@@ -204,21 +204,21 @@ function check_stage30_closure_authority(string $root): array
     ]);
 
     $require($collectionPath, $collection, [
-        '| `map` / `filter` / `reduce`          | S30g | —    | —   | —     | —    | —   | —     |',
+        '| `map` / `filter` / `reduce`          | yes  | —    | —   | —     | —    | —   | —     |',
         '`List<T>` alone receives',
     ]);
     $require($stdlibPath, $stdlib, [
         '`filter(function(T): bool $predicate): List<T>`',
         '`reduce<A>(take A $initial, function(writable A, T): void $reducer): A`',
         'writable function writable(...)` callback through an exclusive function-value borrow',
-        'No other collection family receives them in Stage 30',
+        'No other collection family receives these algorithms in Stage 30',
     ]);
     $require($examplesPath, $examples, [
         '[Decision 0121]',
-        'Stages 30a through 30f are complete',
+        'Stages 30a through 30g are complete',
         'remains in progress and not complete',
         'Stages 30b and 30c check',
-        'Stage 30g List algorithms are next',
+        'Stage 30g List algorithms are implemented',
     ]);
 
     $require($lexerPath, $lexer, [

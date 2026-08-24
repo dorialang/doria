@@ -1,0 +1,45 @@
+class Token
+{
+    function __construct(string $name)
+    {
+    }
+
+    function __destruct()
+    {
+        try {
+            echo "drop {$this->name}\n";
+        } catch (Doria\Std\Io\IoError) {
+        }
+    }
+}
+
+class Failure implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function main(): void
+{
+    List<int> $values = [1, 2, 3];
+    try {
+        List<Token> $mapped = $values->map(function (int $value): Token {
+            if ($value == 3) { throw new Failure("map"); }
+            return new Token("map {$value}");
+        });
+    } catch (Failure $error) {
+        echo "caught {$error->message} source={$values->count}\n";
+    }
+
+    try {
+        Token $accumulator = $values->reduce(
+            new Token("accumulator"),
+            function (writable Token $result, int $value): void {
+                if ($value == 2) { throw new Failure("reduce"); }
+            },
+        );
+    } catch (Failure $error) {
+        echo "caught {$error->message} source={$values->count}\n";
+    }
+}

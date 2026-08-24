@@ -79,14 +79,14 @@ function check_inferred_main_effects(string $root): array
             'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
             'Stage 30e Native Execution — Complete',
             'Stage 30f PHP Compatibility — Complete',
-            'Stage 30g List Algorithms — Next',
+            'Stage 30g List Algorithms — Complete',
             'Stage 30 — In Progress, Not Complete',
         ]);
     }
     $require($proposalPath, $proposal, [
         '**Superseded By Accepted Decision 0121.**',
-        'Stages 30a through 30f are complete',
-        'Stage 30g List Algorithms is next',
+        'Stages 30a through 30g are complete',
+        'Stage 30h Cross-Repository Closure is next',
     ]);
     $require($compatibilityPath, $compatibility, [
         'function main(): void throws Doria\Std\Io\IoError',

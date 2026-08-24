@@ -886,7 +886,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     validate_payload_case_proofs(program, function)?;
     validate_match_result_plans(function)?;
     validate_match_binding_plans(function)?;
-    validate_control_flow_plans(function)?;
+    validate_control_flow_plans(program, function)?;
     validate_class_local_lifetimes(function)
 }
 
@@ -2369,6 +2369,9 @@ fn validate_statement(
                     }
                 }
                 Ok(())
+            }
+            mir::ControlFlowPlan::ListAlgorithm(plan) => {
+                validate_list_algorithm_types(program, function, plan)
             }
         },
     }
@@ -9413,7 +9416,10 @@ fn validate_match_result_plans(function: &mir::Function) -> Result<(), BackendEr
     Ok(())
 }
 
-fn validate_control_flow_plans(function: &mir::Function) -> Result<(), BackendError> {
+fn validate_control_flow_plans(
+    program: &mir::Program,
+    function: &mir::Function,
+) -> Result<(), BackendError> {
     let finalizer_plans = function
         .blocks
         .iter()
@@ -9576,10 +9582,586 @@ fn validate_control_flow_plans(function: &mir::Function) -> Result<(), BackendEr
                     }
                     validate_finalizer_plan(function, block.id, plan)?;
                 }
+                mir::ControlFlowPlan::ListAlgorithm(plan) => {
+                    validate_list_algorithm_cfg(program, function, block.id, plan)?;
+                }
             }
         }
     }
     Ok(())
+}
+
+fn validate_list_algorithm_types(
+    program: &mir::Program,
+    function: &mir::Function,
+    plan: &mir::ListAlgorithmPlan,
+) -> Result<(), BackendError> {
+    let source_collection = collection_in(program, plan.source_collection)?;
+    if source_collection.kind != mir::CollectionKind::List
+        || source_collection.key.is_some()
+        || source_collection.value != plan.element_type
+        || local_in(function, plan.source)?.ty != mir::Type::Collection(plan.source_collection)
+    {
+        return Err(malformed_mir(
+            "List algorithm source metadata does not describe its concrete List",
+        ));
+    }
+    let callback = function_type_in(program, plan.callback_type)?;
+    if callback.invocation_mode != plan.callback_access
+        || matches!(callback.invocation_mode, mir::FunctionInvocationMode::Once)
+        || callback.checked_effects != plan.checked_effects
+    {
+        return Err(malformed_mir(
+            "List algorithm callback mode or checked effects disagree with its function type",
+        ));
+    }
+    let callback_local = local_in(function, plan.callback)?;
+    if callback_local.ty != mir::Type::Function(plan.callback_type)
+        || callback_local.writable
+            != matches!(plan.callback_access, mir::FunctionInvocationMode::Writable)
+    {
+        return Err(malformed_mir(
+            "List algorithm callback local disagrees with its selected access",
+        ));
+    }
+    let count = local_in(function, plan.count)?;
+    let index = local_in(function, plan.index)?;
+    let doria_int = mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64));
+    if count.ty != doria_int
+        || index.ty != doria_int
+        || !count.synthetic
+        || !index.synthetic
+        || count.writable
+        || !index.writable
+    {
+        return Err(malformed_mir(
+            "List algorithm count and index locals must be concrete Doria int traversal state",
+        ));
+    }
+    validate_checked_effects(program, &plan.checked_effects)?;
+
+    match plan.kind {
+        mir::ListAlgorithmKind::Map => {
+            let [parameter] = callback.parameters.as_slice() else {
+                return Err(malformed_mir("List::map callback must have one parameter"));
+            };
+            let mir::ReturnType::Value(mapped) = callback.return_type else {
+                return Err(malformed_mir("List::map callback cannot return void"));
+            };
+            let mir::Type::Collection(result_collection) = plan.result_type else {
+                return Err(malformed_mir("List::map result must be a List"));
+            };
+            let result_collection = collection_in(program, result_collection)?;
+            if parameter.mode != mir::FunctionParameterMode::Readonly
+                || parameter.ty != plan.element_type
+                || callback.return_borrow.is_some()
+                || result_collection.kind != mir::CollectionKind::List
+                || result_collection.key.is_some()
+                || result_collection.value != mapped
+                || plan.accumulator_type.is_some()
+                || plan.accumulator.is_some()
+                || plan.callback_result.is_none()
+                || plan.filter_selected.is_some()
+            {
+                return Err(malformed_mir(
+                    "List::map specialization has an invalid shape",
+                ));
+            }
+        }
+        mir::ListAlgorithmKind::Filter => {
+            let [parameter] = callback.parameters.as_slice() else {
+                return Err(malformed_mir(
+                    "List::filter callback must have one parameter",
+                ));
+            };
+            if parameter.mode != mir::FunctionParameterMode::Readonly
+                || parameter.ty != plan.element_type
+                || callback.return_type
+                    != mir::ReturnType::Value(mir::Type::Scalar(mir::ScalarType::Bool))
+                || plan.element_type.has_move_ownership()
+                || plan.result_type != mir::Type::Collection(plan.source_collection)
+                || plan.accumulator_type.is_some()
+                || plan.accumulator.is_some()
+                || plan.callback_result.is_none()
+                || plan.filter_selected.is_none()
+            {
+                return Err(malformed_mir(
+                    "List::filter specialization has an invalid Copy-preserving shape",
+                ));
+            }
+        }
+        mir::ListAlgorithmKind::Reduce => {
+            let [accumulator, element] = callback.parameters.as_slice() else {
+                return Err(malformed_mir(
+                    "List::reduce callback must have two parameters",
+                ));
+            };
+            if accumulator.mode != mir::FunctionParameterMode::Writable
+                || accumulator.ty != plan.result_type
+                || element.mode != mir::FunctionParameterMode::Readonly
+                || element.ty != plan.element_type
+                || callback.return_type != mir::ReturnType::Void
+                || callback.return_borrow.is_some()
+                || plan.accumulator_type != Some(plan.result_type)
+                || plan.callback_result.is_some()
+                || plan.filter_selected.is_some()
+            {
+                return Err(malformed_mir(
+                    "List::reduce specialization has an invalid shape",
+                ));
+            }
+        }
+    }
+
+    match plan.kind {
+        mir::ListAlgorithmKind::Map | mir::ListAlgorithmKind::Filter => {
+            let output = plan
+                .output
+                .ok_or_else(|| malformed_mir("List algorithm result local is missing"))?;
+            let output = local_in(function, output)?;
+            if output.ty != plan.result_type || !output.synthetic || !output.writable {
+                return Err(malformed_mir(
+                    "List algorithm result local has incompatible type or ownership",
+                ));
+            }
+        }
+        mir::ListAlgorithmKind::Reduce => {
+            if plan.output.is_some() {
+                return Err(malformed_mir("List::reduce cannot declare a result List"));
+            }
+            let accumulator = plan
+                .accumulator
+                .ok_or_else(|| malformed_mir("List::reduce accumulator local is missing"))?;
+            let accumulator = local_in(function, accumulator)?;
+            if accumulator.ty != plan.result_type || !accumulator.synthetic || !accumulator.writable
+            {
+                return Err(malformed_mir(
+                    "List::reduce accumulator local has incompatible type or ownership",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_list_algorithm_cfg(
+    program: &mir::Program,
+    function: &mir::Function,
+    anchor: mir::BlockId,
+    plan: &mir::ListAlgorithmPlan,
+) -> Result<(), BackendError> {
+    validate_list_algorithm_types(program, function, plan)?;
+    for id in [
+        plan.setup,
+        plan.header,
+        plan.body,
+        plan.callback_success,
+        plan.update,
+        plan.exit,
+    ] {
+        block_in(function, id)?;
+    }
+    if let Some(block) = plan.callback_failure {
+        block_in(function, block)?;
+    }
+    if let Some(block) = plan.filter_selected {
+        block_in(function, block)?;
+    }
+    let setup = block_in(function, plan.setup)?;
+    let initializes_count = setup.statements.iter().any(|statement| {
+        matches!(
+            statement,
+            mir::Statement::AssignLocal {
+                target,
+                value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+                    mir::IntegerExpression::Use {
+                        ty: IntegerType::Int64,
+                        operand: mir::Operand::CollectionLength(source),
+                    },
+                )),
+            } if *target == plan.count && *source == plan.source
+        )
+    });
+    let initializes_index = setup.statements.iter().any(|statement| {
+        matches!(
+            statement,
+            mir::Statement::AssignLocal {
+                target,
+                value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+                    mir::IntegerExpression::Use {
+                        ty: IntegerType::Int64,
+                        operand: mir::Operand::Scalar(mir::ScalarValue::Integer(value)),
+                    },
+                )),
+            } if *target == plan.index && value.bits == 0
+        )
+    });
+    let header_condition = matches!(
+        &block_in(function, plan.header)?.terminator,
+        mir::Terminator::Branch {
+            condition: mir::BoolExpression::Compare {
+                op: mir::CompareOp::Less,
+                left,
+                right,
+            },
+            then_block,
+            else_block,
+        } if *then_block == plan.body
+            && *else_block == plan.exit
+            && value_expression_reads_integer_local(left, plan.index)
+            && value_expression_reads_integer_local(right, plan.count)
+    );
+    let increments_index = block_in(function, plan.update)?
+        .statements
+        .iter()
+        .any(|statement| {
+            matches!(
+                statement,
+                mir::Statement::AssignLocal {
+                    target,
+                    value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+                        mir::IntegerExpression::Binary {
+                            ty: IntegerType::Int64,
+                            op: mir::IntegerBinaryOp::Add,
+                            left,
+                            right,
+                            ..
+                        },
+                    )),
+                } if *target == plan.index
+                    && integer_expression_reads_local(left, plan.index)
+                    && integer_expression_is_constant(right, 1)
+            )
+        });
+    if anchor != plan.setup
+        || !initializes_count
+        || !initializes_index
+        || !header_condition
+        || !increments_index
+        || !matches!(
+            block_in(function, plan.setup)?.terminator,
+            mir::Terminator::Jump(target) if target == plan.header
+        )
+        || !matches!(
+            block_in(function, plan.update)?.terminator,
+            mir::Terminator::Jump(target) if target == plan.header
+        )
+        || !cfg_reaches(function, plan.callback_success, plan.update)?
+    {
+        return Err(malformed_mir(
+            "List algorithm plan does not describe its traversal CFG",
+        ));
+    }
+    let callback_shape = match &block_in(function, plan.body)?.terminator {
+        mir::Terminator::IndirectCall {
+            callee,
+            function_type,
+            invocation_mode,
+            args,
+            result,
+            continuation,
+            ..
+        } if plan.checked_effects.is_empty() => {
+            if plan.callback_failure.is_some() {
+                return Err(malformed_mir(
+                    "nonthrowing List algorithm declares a checked failure continuation",
+                ));
+            }
+            (
+                *function_type,
+                *invocation_mode,
+                callee,
+                args,
+                *result,
+                *continuation,
+                None,
+            )
+        }
+        mir::Terminator::CheckedIndirectCall {
+            callee,
+            function_type,
+            invocation_mode,
+            args,
+            result,
+            success,
+            failure,
+            ..
+        } if !plan.checked_effects.is_empty() => (
+            *function_type,
+            *invocation_mode,
+            callee,
+            args,
+            *result,
+            *success,
+            Some(*failure),
+        ),
+        _ => {
+            return Err(malformed_mir(
+                "List algorithm body must invoke its callback with matching checkedness",
+            ))
+        }
+    };
+    let (function_type, invocation_mode, callee, args, result, success, failure) = callback_shape;
+    if function_type != plan.callback_type
+        || invocation_mode != plan.callback_access
+        || result != plan.callback_result
+        || failure != plan.callback_failure
+        || success != plan.callback_success
+        || !matches!(
+            callee,
+            mir::FunctionExpression::Local {
+                function_type,
+                local,
+                transfer: false,
+            } if *function_type == plan.callback_type && *local == plan.callback
+        )
+    {
+        return Err(malformed_mir(
+            "List algorithm callback terminator disagrees with its specialization",
+        ));
+    }
+    match plan.kind {
+        mir::ListAlgorithmKind::Map | mir::ListAlgorithmKind::Filter => {
+            if args.len() != 1 {
+                return Err(malformed_mir(
+                    "List map/filter callback must receive exactly one element borrow",
+                ));
+            }
+        }
+        mir::ListAlgorithmKind::Reduce => {
+            if args.len() != 2 || args[0].direct_place_local() != plan.accumulator {
+                return Err(malformed_mir(
+                    "List::reduce callback must receive its accumulator place before the element borrow",
+                ));
+            }
+        }
+    }
+    validate_list_algorithm_success_path(function, plan)?;
+    validate_list_algorithm_checked_cleanup(function, plan)?;
+    validate_list_algorithm_region_does_not_mutate_sources(function, plan)?;
+    Ok(())
+}
+
+fn integer_expression_reads_local(
+    expression: &mir::IntegerExpression,
+    local: mir::LocalId,
+) -> bool {
+    matches!(
+        expression,
+        mir::IntegerExpression::Use {
+            ty: IntegerType::Int64,
+            operand: mir::Operand::Local(candidate),
+        } if *candidate == local
+    )
+}
+
+fn value_expression_reads_integer_local(
+    expression: &mir::ValueExpression,
+    local: mir::LocalId,
+) -> bool {
+    matches!(
+        expression,
+        mir::ValueExpression::Integer(value) if integer_expression_reads_local(value, local)
+    )
+}
+
+fn integer_expression_is_constant(expression: &mir::IntegerExpression, value: u64) -> bool {
+    matches!(
+        expression,
+        mir::IntegerExpression::Use {
+            ty: IntegerType::Int64,
+            operand: mir::Operand::Scalar(mir::ScalarValue::Integer(candidate)),
+        } if candidate.bits == value
+    )
+}
+
+fn validate_list_algorithm_success_path(
+    function: &mir::Function,
+    plan: &mir::ListAlgorithmPlan,
+) -> Result<(), BackendError> {
+    let success = block_in(function, plan.callback_success)?;
+    match plan.kind {
+        mir::ListAlgorithmKind::Map => {
+            let output = plan.output.expect("validated map output");
+            let result = plan.callback_result.expect("validated map callback result");
+            if !success.statements.iter().any(|statement| {
+                matches!(
+                    statement,
+                    mir::Statement::CollectionAdd {
+                        collection,
+                        value,
+                        index: None,
+                        op: mir::CollectionMutationOp::Add,
+                    } if *collection == output && value.direct_place_local() == Some(result)
+                )
+            }) || !matches!(success.terminator, mir::Terminator::Jump(target) if target == plan.update)
+            {
+                return Err(malformed_mir(
+                    "List::map success path must append the callback result before updating the index",
+                ));
+            }
+        }
+        mir::ListAlgorithmKind::Filter => {
+            let selected = plan
+                .filter_selected
+                .expect("validated filter selected block");
+            let predicate = plan
+                .callback_result
+                .expect("validated filter callback result");
+            if !matches!(
+                success.terminator,
+                mir::Terminator::Branch {
+                    condition: mir::BoolExpression::Use {
+                        operand: mir::Operand::Local(local),
+                    },
+                    then_block,
+                    else_block,
+                } if local == predicate && then_block == selected && else_block == plan.update
+            ) {
+                return Err(malformed_mir(
+                    "List::filter success path must branch on its predicate result",
+                ));
+            }
+            let selected = block_in(function, selected)?;
+            if !selected.statements.iter().any(|statement| {
+                matches!(
+                    statement,
+                    mir::Statement::CollectionAdd {
+                        collection,
+                        index: None,
+                        op: mir::CollectionMutationOp::Add,
+                        ..
+                    } if Some(*collection) == plan.output
+                )
+            }) || !matches!(selected.terminator, mir::Terminator::Jump(target) if target == plan.update)
+            {
+                return Err(malformed_mir(
+                    "List::filter selected path must copy the element before updating the index",
+                ));
+            }
+        }
+        mir::ListAlgorithmKind::Reduce => {
+            if !success.statements.is_empty()
+                || !matches!(success.terminator, mir::Terminator::Jump(target) if target == plan.update)
+            {
+                return Err(malformed_mir(
+                    "List::reduce success path must continue with the same accumulator",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_list_algorithm_checked_cleanup(
+    function: &mir::Function,
+    plan: &mir::ListAlgorithmPlan,
+) -> Result<(), BackendError> {
+    let Some(failure) = plan.callback_failure else {
+        return Ok(());
+    };
+    let failure = block_in(function, failure)?;
+    let owned = plan
+        .output
+        .or(plan.accumulator)
+        .expect("algorithm owns result state");
+    let owned_local = local_in(function, owned)?;
+    let requires_drop = owned_local.owned
+        || matches!(
+            owned_local.ty,
+            mir::Type::String | mir::Type::NullableString
+        );
+    let drops = failure
+        .statements
+        .iter()
+        .filter(|statement| statement_drops_local(statement, owned))
+        .count();
+    let expected_drops = usize::from(requires_drop);
+    if drops != expected_drops {
+        return Err(malformed_mir(
+            "checked List algorithm failure has an invalid partial-result cleanup count",
+        ));
+    }
+    Ok(())
+}
+
+fn statement_drops_local(statement: &mir::Statement, expected: mir::LocalId) -> bool {
+    matches!(
+        statement,
+        mir::Statement::DropClass { local, .. }
+            | mir::Statement::DropSharedReference { local, .. }
+            | mir::Statement::DropWeakReference { local, .. }
+            | mir::Statement::DropWritableSharedReference { local, .. }
+            | mir::Statement::DropWritableWeakReference { local, .. }
+            | mir::Statement::DropSharedReferenceAccess { local, .. }
+            | mir::Statement::DropString { local }
+            | mir::Statement::DropMixed { local }
+            | mir::Statement::DropError { local }
+            | mir::Statement::DropPayloadEnum { local, .. }
+            | mir::Statement::DropCollection { local, .. }
+            | mir::Statement::DropFunction { local, .. }
+            if *local == expected
+    )
+}
+
+fn validate_list_algorithm_region_does_not_mutate_sources(
+    function: &mir::Function,
+    plan: &mir::ListAlgorithmPlan,
+) -> Result<(), BackendError> {
+    let setup = block_in(function, plan.setup)?;
+    let plan_index = setup
+        .statements
+        .iter()
+        .position(|statement| {
+            matches!(
+                statement,
+                mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::ListAlgorithm(candidate))
+                    if candidate.as_ref() == plan
+            )
+        })
+        .ok_or_else(|| malformed_mir("List algorithm setup is missing its validation plan"))?;
+    if setup.statements[plan_index + 1..]
+        .iter()
+        .any(|statement| list_algorithm_statement_mutates_source(statement, plan))
+    {
+        return Err(malformed_mir(
+            "List algorithm setup cannot mutate its source or consume its callback after activation",
+        ));
+    }
+
+    let mut blocks = vec![plan.header, plan.body, plan.callback_success, plan.update];
+    blocks.extend(plan.filter_selected);
+    for block in blocks {
+        for statement in &block_in(function, block)?.statements {
+            if list_algorithm_statement_mutates_source(statement, plan) {
+                return Err(malformed_mir(
+                    "List algorithm traversal cannot mutate its source or consume its callback",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn list_algorithm_statement_mutates_source(
+    statement: &mir::Statement,
+    plan: &mir::ListAlgorithmPlan,
+) -> bool {
+    matches!(
+        statement,
+        mir::Statement::AssignLocal { target, .. } if *target == plan.source
+    ) || matches!(
+        statement,
+        mir::Statement::CollectionAdd { collection, .. }
+            | mir::Statement::CollectionSet { collection, .. }
+            | mir::Statement::AssignCollectionIndex { collection, .. }
+            | mir::Statement::CollectionClear { collection, .. }
+            | mir::Statement::DropCollection { local: collection, .. }
+            if *collection == plan.source
+    ) || matches!(
+        statement,
+        mir::Statement::DropFunction { local, .. } if *local == plan.callback
+    )
 }
 
 fn validate_finalizer_plan(
@@ -10650,10 +11232,15 @@ fn validate_class_local_lifetimes_with_aliases(
     loop {
         let mut changed = false;
         for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
-            let moved_at_entry = predecessors[block.id.0]
-                .iter()
-                .flat_map(|predecessor| moved_on_exit[predecessor.0].iter().copied())
-                .collect::<HashSet<_>>();
+            let mut moved_at_entry = HashSet::new();
+            for predecessor in &predecessors[block.id.0] {
+                moved_at_entry.extend(class_local_state_on_edge(
+                    function,
+                    *predecessor,
+                    block.id,
+                    &moved_on_exit[predecessor.0],
+                )?);
+            }
             let mut moved_at_exit = moved_at_entry.clone();
             for statement in &block.statements {
                 apply_class_local_state(
@@ -10692,6 +11279,45 @@ fn validate_class_local_lifetimes_with_aliases(
         apply_class_local_accesses(function, &accesses, &mut moved, true)?;
     }
     Ok(())
+}
+
+fn class_local_state_on_edge(
+    function: &mir::Function,
+    predecessor: mir::BlockId,
+    target: mir::BlockId,
+    moved: &HashSet<mir::LocalId>,
+) -> Result<HashSet<mir::LocalId>, BackendError> {
+    let mut state = moved.clone();
+    let terminator = &block_in(function, predecessor)?.terminator;
+    let initialized = match terminator {
+        mir::Terminator::IndirectCall {
+            result,
+            continuation,
+            ..
+        } if *continuation == target => *result,
+        mir::Terminator::CheckedCall {
+            result, success, ..
+        }
+        | mir::Terminator::CheckedIndirectCall {
+            result, success, ..
+        }
+        | mir::Terminator::CheckedIo {
+            result, success, ..
+        } if *success == target => *result,
+        mir::Terminator::CheckedConstruct {
+            result, success, ..
+        } if *success == target => Some(*result),
+        _ => None,
+    };
+    if let Some(local) = initialized {
+        if matches!(
+            local_in(function, local)?.ty,
+            mir::Type::Class(_) | mir::Type::NullableClass(_)
+        ) {
+            state.remove(&local);
+        }
+    }
+    Ok(state)
 }
 
 fn validate_class_expression(

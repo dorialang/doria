@@ -62,7 +62,7 @@ function check_stage30e_native_closure_execution(string $root): array
         ]);
     }
     $require($paths['decision'], $files['decision'], [
-        'Authority Accepted; Stages 30a Through 30f Implemented; Stage 30g Next; Stage 30 Not Complete',
+        'Authority Accepted; Stages 30a Through 30g Implemented; Stage 30h Next; Stage 30 Not Complete',
     ]);
     $require($paths['audit'], $files['audit'], [
         'Implemented for debug, Cranelift, LLVM, and the PHP-supported value surface',

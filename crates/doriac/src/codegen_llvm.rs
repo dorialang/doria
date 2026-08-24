@@ -554,18 +554,20 @@ fn function_type<'ctx>(
         .map(|_| pointer.into())
         .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
     let checked = !function.checked_effects.is_empty();
-    for parameter in &function.params {
+    for (index, parameter) in function.params.iter().enumerate() {
         let local = local_in(function, *parameter)?;
-        parameters.push(
-            if matches!(
+        let passed_by_pointer = (function.closure.is_some()
+            && !matches!(local.ty, mir::Type::ClosureEnvironment(_))
+            && function.parameter_modes[index] == mir::FunctionParameterMode::Writable)
+            || matches!(
                 local.ty,
                 mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-            ) {
-                context.ptr_type(AddressSpace::default()).into()
-            } else {
-                llvm_type(context, target_data, local.ty).into()
-            },
-        );
+            );
+        parameters.push(if passed_by_pointer {
+            pointer.into()
+        } else {
+            llvm_type(context, target_data, local.ty).into()
+        });
     }
     if checked {
         return Ok(context.i8_type().fn_type(&parameters, false));
@@ -595,16 +597,16 @@ fn indirect_function_type<'ctx>(
         .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
     let checked = !function.checked_effects.is_empty();
     for parameter in &function.parameters {
-        parameters.push(
-            if matches!(
+        let passed_by_pointer = parameter.mode == mir::FunctionParameterMode::Writable
+            || matches!(
                 parameter.ty,
                 mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
-            ) {
-                pointer.into()
-            } else {
-                llvm_type(context, target_data, parameter.ty).into()
-            },
-        );
+            );
+        parameters.push(if passed_by_pointer {
+            pointer.into()
+        } else {
+            llvm_type(context, target_data, parameter.ty).into()
+        });
     }
     if checked {
         return Ok(context.i8_type().fn_type(&parameters, false));
@@ -746,12 +748,43 @@ fn define_function<'ctx>(
         .index_of(native_closure_abi::NativeCallableHiddenInput::ErrorOut)
         .and_then(|index| llvm_function.get_nth_param(index as u32))
         .map(BasicValueEnum::into_pointer_value);
+    let mut writable_parameter_addresses = HashMap::new();
     for (index, parameter) in function.params.iter().enumerate() {
         let value = llvm_function
             .get_nth_param(index as u32 + signature_plan.source_parameter_offset() as u32)
             .ok_or_else(|| malformed_mir("LLVM function is missing a declared parameter"))?;
         let local = local_in(function, *parameter)?;
         let destination = local_slot(&local_slots, *parameter)?;
+        if function.closure.is_some()
+            && !matches!(local.ty, mir::Type::ClosureEnvironment(_))
+            && function.parameter_modes[index] == mir::FunctionParameterMode::Writable
+        {
+            let address = value.into_pointer_value();
+            if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) =
+                local.ty
+            {
+                let nullable = matches!(local.ty, mir::Type::NullablePayloadEnum(_));
+                let size = context
+                    .ptr_sized_int_type(target_data, None)
+                    .const_int(u64::from(payload.storage_size(nullable)), false);
+                build(builder.build_memcpy(
+                    destination,
+                    payload.align,
+                    address,
+                    payload.align,
+                    size,
+                ))?;
+            } else {
+                let loaded = build(builder.build_load(
+                    llvm_type(context, target_data, local.ty),
+                    address,
+                    "writable.parameter",
+                ))?;
+                build(builder.build_store(destination, loaded))?;
+            }
+            writable_parameter_addresses.insert(*parameter, address);
+            continue;
+        }
         if let mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) = local.ty
         {
             let nullable = matches!(local.ty, mir::Type::NullablePayloadEnum(_));
@@ -885,6 +918,7 @@ fn define_function<'ctx>(
         closure_environment_slots,
         closure_bound_fields: HashMap::new(),
         borrow_home_addresses,
+        writable_parameter_addresses,
         blocks,
         current_frame,
         return_address,
@@ -955,6 +989,7 @@ fn define_class_drop_functions<'ctx>(
             closure_environment_slots: Vec::new(),
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
+            writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
             current_frame,
             return_address: None,
@@ -1010,6 +1045,7 @@ fn define_collection_drop_functions<'ctx>(
             closure_environment_slots: Vec::new(),
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
+            writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
             current_frame: context.ptr_type(AddressSpace::default()).const_null(),
             return_address: None,
@@ -1069,6 +1105,7 @@ fn define_closure_drop_functions<'ctx>(
             closure_environment_slots: Vec::new(),
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
+            writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
             current_frame,
             return_address: None,
@@ -1559,6 +1596,7 @@ struct FunctionLowerer<'ctx, 'program> {
     closure_environment_slots: Vec<Option<PointerValue<'ctx>>>,
     closure_bound_fields: HashMap<mir::LocalId, BoundClosureField<'ctx>>,
     borrow_home_addresses: HashMap<mir::LocalId, PointerValue<'ctx>>,
+    writable_parameter_addresses: HashMap<mir::LocalId, PointerValue<'ctx>>,
     blocks: Vec<BasicBlock<'ctx>>,
     current_frame: PointerValue<'ctx>,
     return_address: Option<PointerValue<'ctx>>,
@@ -2183,6 +2221,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         if let Some(field) = self.closure_bound_fields.get(&local) {
             return Ok(field.address);
         }
+        if let Some(address) = self.writable_parameter_addresses.get(&local) {
+            return Ok(*address);
+        }
         if let Some(address) = self.borrow_home_addresses.get(&local) {
             return Ok(*address);
         }
@@ -2495,7 +2536,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
         let carrier = self.lower_function_expression(callee)?;
         let (descriptor, environment) = self.closure_parts(carrier)?;
-        let lowered = self.lower_call_arguments(args)?;
+        let lowered = self.lower_call_arguments_with_parameters(args, &function_type.parameters)?;
         let mut values = vec![self.current_frame.into()];
         let aggregate_return = matches!(
             function_type.return_type,
@@ -2562,7 +2603,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
         let carrier = self.lower_function_expression(callee)?;
         let (descriptor, environment) = self.closure_parts(carrier)?;
-        let lowered = self.lower_call_arguments(args)?;
+        let lowered = self.lower_call_arguments_with_parameters(args, &function_type.parameters)?;
         let mut values = vec![self.current_frame.into()];
         if let Some(result) = result {
             values.push(local_slot(&self.local_slots, result)?.into());
@@ -2974,6 +3015,25 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     )?;
                 } else {
                     build(self.builder.build_store(slot, value))?;
+                }
+                if let Some(address) = self.writable_parameter_addresses.get(target).copied() {
+                    if let mir::Type::PayloadEnum(payload)
+                    | mir::Type::NullablePayloadEnum(payload) = local.ty
+                    {
+                        self.copy_payload_bytes(
+                            address,
+                            slot,
+                            payload,
+                            matches!(local.ty, mir::Type::NullablePayloadEnum(_)),
+                        )?;
+                    } else {
+                        let current = build(self.builder.build_load(
+                            llvm_type(self.context, self.target_data, local.ty),
+                            slot,
+                            "writable.parameter.updated",
+                        ))?;
+                        build(self.builder.build_store(address, current))?;
+                    }
                 }
                 if let Some((old, class)) = old {
                     if let mir::Type::Collection(collection)
@@ -15791,11 +15851,51 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &mut self,
         args: &[mir::Rvalue],
     ) -> Result<LoweredCallArguments<'ctx>, BackendError> {
+        self.lower_call_arguments_with_optional_parameters(args, None)
+    }
+
+    fn lower_call_arguments_with_parameters(
+        &mut self,
+        args: &[mir::Rvalue],
+        parameters: &[mir::FunctionParameter],
+    ) -> Result<LoweredCallArguments<'ctx>, BackendError> {
+        self.lower_call_arguments_with_optional_parameters(args, Some(parameters))
+    }
+
+    fn lower_call_arguments_with_optional_parameters(
+        &mut self,
+        args: &[mir::Rvalue],
+        parameters: Option<&[mir::FunctionParameter]>,
+    ) -> Result<LoweredCallArguments<'ctx>, BackendError> {
         let mut values = Vec::with_capacity(args.len());
         let mut lowered = Vec::with_capacity(args.len());
         let mut owned_strings = Vec::new();
         let mut temporary_mixed = Vec::new();
         for (index, argument) in args.iter().enumerate() {
+            if parameters
+                .and_then(|parameters| parameters.get(index))
+                .is_some_and(|parameter| parameter.mode == mir::FunctionParameterMode::Writable)
+            {
+                let local = argument.direct_place_local().ok_or_else(|| {
+                    malformed_mir("writable indirect-call argument is not a direct local place")
+                })?;
+                let address = self.closure_source_address(local)?;
+                let value = if matches!(
+                    argument.ty(),
+                    mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+                ) {
+                    address.into()
+                } else {
+                    build(self.builder.build_load(
+                        llvm_type(self.context, self.target_data, argument.ty()),
+                        address,
+                        "writable.argument",
+                    ))?
+                };
+                values.push(address.into());
+                lowered.push(value);
+                continue;
+            }
             let value = self.lower_rvalue(argument)?;
             match argument.ty() {
                 mir::Type::String => owned_strings.push(value.into_pointer_value()),

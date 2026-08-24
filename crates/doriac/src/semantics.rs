@@ -114,6 +114,11 @@ pub struct SemanticInfo {
     pub closures: HashMap<ClosureId, ClosureSemanticInfo>,
     /// Semantically checked indirect-call plans, still blocked from execution.
     pub callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
+    /// Fully specialized compiler-known `List<T>` algorithm calls.
+    ///
+    /// HIR and MIR consume this plan directly. Backends must not recover the
+    /// contract from a method-name string.
+    pub list_algorithm_calls: HashMap<(usize, usize), ListAlgorithmCallInfo>,
     /// Backend-independent capture acquisition, provenance, escape, and
     /// invocation-consumption plans proven by Stage 30c.
     pub closure_ownership: HashMap<ClosureId, crate::ownership::ClosureOwnershipInfo>,
@@ -193,6 +198,34 @@ pub struct CallableValueCallInfo {
     pub return_type: ResolvedType,
     pub checked_effects: Vec<ResolvedType>,
     pub target_kind: CallableValueTargetKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListAlgorithmKind {
+    Map,
+    Filter,
+    Reduce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ListCallbackAccess {
+    Readonly,
+    Writable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListAlgorithmCallInfo {
+    pub kind: ListAlgorithmKind,
+    pub receiver_type: ResolvedType,
+    pub element_type: ResolvedType,
+    pub result_type: ResolvedType,
+    pub accumulator_type: Option<ResolvedType>,
+    pub callback_type: ResolvedType,
+    pub callback_access: ListCallbackAccess,
+    pub checked_effects: Vec<ResolvedType>,
+    pub source_span: Span,
+    pub receiver_span: Span,
+    pub callback_span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -541,6 +574,7 @@ pub fn analyze_program_for_ide_with_source<'source>(
             binding_resolution: &checker.binding_resolution,
             closures: &checker.closures,
             callable_value_calls: &checker.callable_value_calls,
+            list_algorithm_calls: &checker.list_algorithm_calls,
         },
     );
     let closure_ownership = ownership_analysis.closures;
@@ -578,6 +612,7 @@ pub fn analyze_program_for_ide_with_source<'source>(
             binding_resolution: checker.binding_resolution,
             closures: checker.closures,
             callable_value_calls: checker.callable_value_calls,
+            list_algorithm_calls: checker.list_algorithm_calls,
             closure_ownership,
             property_writes: checker.property_writes,
             writable_object_paths: checker.writable_object_paths,
@@ -1256,6 +1291,7 @@ struct Checker<'program> {
     closures: HashMap<ClosureId, ClosureSemanticInfo>,
     closure_types: HashMap<(usize, usize), TypeId>,
     callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
+    list_algorithm_calls: HashMap<(usize, usize), ListAlgorithmCallInfo>,
     property_writes: HashMap<(usize, usize), PropertyWriteSemanticInfo>,
     writable_object_paths: HashSet<(usize, usize)>,
     active_closures: Vec<ActiveClosure>,
@@ -1871,6 +1907,7 @@ impl<'program> Checker<'program> {
             closures: HashMap::new(),
             closure_types: HashMap::new(),
             callable_value_calls: HashMap::new(),
+            list_algorithm_calls: HashMap::new(),
             property_writes: HashMap::new(),
             writable_object_paths: HashSet::new(),
             active_closures: Vec::new(),
@@ -6769,10 +6806,24 @@ impl<'program> Checker<'program> {
         object: &Expr,
         method: &str,
         args: &[Argument],
+        span: Span,
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
         let object_ty = self.infer_expr_type(object, scopes, method_context);
+        if let TypeKind::List(element) = self.types.kind(object_ty).clone() {
+            if matches!(method, "map" | "filter" | "reduce") {
+                self.record_list_algorithm_argument_types(
+                    method,
+                    args,
+                    span,
+                    element,
+                    scopes,
+                    method_context,
+                );
+                return;
+            }
+        }
         if matches!(self.types.kind(object_ty), TypeKind::String) {
             if let Some((params, _)) = self.string_companion_signature(method) {
                 self.record_expected_argument_types(&params[1..], args);
@@ -6790,6 +6841,97 @@ impl<'program> Checker<'program> {
         if let Some(method_info) = method_info {
             let method_info = self.specialize_method_for_class(&method_info, &class_type);
             self.record_expected_argument_types(&method_info.params, args);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_list_algorithm_argument_types(
+        &mut self,
+        method: &str,
+        args: &[Argument],
+        span: Span,
+        element: TypeId,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let bool_ty = self.types.intern(TypeKind::Bool);
+        let void = self.types.intern(TypeKind::Void);
+        let expected_result = self
+            .contextual_expression_types
+            .get(&(span.start, span.end))
+            .copied();
+        let make_callback = |checker: &mut Self, invocation_mode, parameters, return_type| {
+            checker
+                .types
+                .intern(TypeKind::Function(SemanticFunctionType {
+                    invocation_mode,
+                    parameters,
+                    return_type,
+                    checked_effects: Vec::new(),
+                    return_borrow: None,
+                }))
+        };
+        match (method, args) {
+            ("map", [callback]) => {
+                let result = expected_result.and_then(|result| match self.types.kind(result) {
+                    TypeKind::List(value) => Some(*value),
+                    _ => None,
+                });
+                if let Some(result) = result {
+                    let callback_ty = make_callback(
+                        self,
+                        FunctionInvocationMode::Readonly,
+                        vec![SemanticFunctionParameter {
+                            ownership_mode: FunctionTypeParameterMode::Readonly,
+                            ty: element,
+                        }],
+                        result,
+                    );
+                    self.record_expected_expression_type(&callback.value, callback_ty);
+                }
+            }
+            ("filter", [callback]) => {
+                let callback_ty = make_callback(
+                    self,
+                    FunctionInvocationMode::Readonly,
+                    vec![SemanticFunctionParameter {
+                        ownership_mode: FunctionTypeParameterMode::Readonly,
+                        ty: element,
+                    }],
+                    bool_ty,
+                );
+                self.record_expected_expression_type(&callback.value, callback_ty);
+            }
+            ("reduce", [initial, callback]) => {
+                let inferred = self.infer_expr_type(&initial.value, scopes, method_context);
+                let accumulator = expected_result.or_else(|| {
+                    (!matches!(
+                        self.types.kind(inferred),
+                        TypeKind::Unknown | TypeKind::EmptyCollection
+                    ))
+                    .then_some(inferred)
+                });
+                if let Some(accumulator) = accumulator {
+                    self.record_expected_expression_type(&initial.value, accumulator);
+                    let callback_ty = make_callback(
+                        self,
+                        FunctionInvocationMode::Readonly,
+                        vec![
+                            SemanticFunctionParameter {
+                                ownership_mode: FunctionTypeParameterMode::Writable,
+                                ty: accumulator,
+                            },
+                            SemanticFunctionParameter {
+                                ownership_mode: FunctionTypeParameterMode::Readonly,
+                                ty: element,
+                            },
+                        ],
+                        void,
+                    );
+                    self.record_expected_expression_type(&callback.value, callback_ty);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -6984,7 +7126,14 @@ impl<'program> Checker<'program> {
                 null_safe,
             } => {
                 self.check_expr(object, scopes, method_context);
-                self.record_method_argument_types(object, method, args, scopes, method_context);
+                self.record_method_argument_types(
+                    object,
+                    method,
+                    args,
+                    *span,
+                    scopes,
+                    method_context,
+                );
                 for arg in args {
                     self.check_expr(&arg.value, scopes, method_context);
                 }
@@ -16037,6 +16186,9 @@ impl<'program> Checker<'program> {
                 if let Some(call) = self.callable_value_calls.get(&(span.start, span.end)) {
                     return self.types.intern_resolved(&call.return_type.clone());
                 }
+                if let Some(call) = self.list_algorithm_calls.get(&(span.start, span.end)) {
+                    return self.types.intern_resolved(&call.result_type.clone());
+                }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
                 if let Some((kind, payload)) = self.shared_handle_type(object_ty, *null_safe) {
                     if let Some(result) =
@@ -17480,6 +17632,20 @@ impl<'program> Checker<'program> {
             return true;
         }
 
+        if matches!(kind, TypeKind::List(_)) && matches!(method, "map" | "filter" | "reduce") {
+            self.check_list_algorithm_call(
+                ty,
+                &kind,
+                method,
+                args,
+                object,
+                span,
+                scopes,
+                method_context,
+            );
+            return true;
+        }
+
         let int = self.types.intern(TypeKind::Integer(IntegerType::Int64));
         let compared_type = match (&kind, method) {
             (
@@ -17569,25 +17735,6 @@ impl<'program> Checker<'program> {
                 "clear",
             ) => (vec![], true),
             (TypeKind::Bytes, "toArray") => (vec![], false),
-            (
-                TypeKind::Bytes
-                | TypeKind::TypedArray(_)
-                | TypeKind::List(_)
-                | TypeKind::Dictionary(_, _)
-                | TypeKind::SortedDictionary(_, _)
-                | TypeKind::Set(_)
-                | TypeKind::SortedSet(_)
-                | TypeKind::PriorityQueue(_)
-                | TypeKind::Deque(_),
-                "map" | "filter" | "reduce",
-            ) => {
-                self.diagnostics.push(Diagnostic::unsupported_stage(
-                    "E0521",
-                    format!("collection method `{method}` requires Stage 30 closures"),
-                    span,
-                ));
-                return true;
-            }
             (TypeKind::Bytes, _) => {
                 self.diagnostics.push(Diagnostic::unsupported_stage(
                     "E0524",
@@ -17650,6 +17797,338 @@ impl<'program> Checker<'program> {
             }
         }
         true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn check_list_algorithm_call(
+        &mut self,
+        receiver_ty: TypeId,
+        receiver_kind: &TypeKind,
+        method: &str,
+        args: &[Argument],
+        receiver: &Expr,
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let TypeKind::List(element) = receiver_kind else {
+            unreachable!("List algorithm recognition requires a List receiver");
+        };
+        let expected_count = if method == "reduce" { 2 } else { 1 };
+        if args.len() != expected_count {
+            self.report_argument_count_mismatch(
+                &format!("List::{method}"),
+                expected_count,
+                expected_count,
+                args.len(),
+                span,
+            );
+            return;
+        }
+
+        let callback_index = usize::from(method == "reduce");
+        let callback = &args[callback_index].value;
+        let callback_ty = self.infer_expr_type(callback, scopes, method_context);
+        let TypeKind::Function(function) = self.types.kind(callback_ty).clone() else {
+            if !matches!(self.types.kind(callback_ty), TypeKind::Unknown) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0665",
+                        format!(
+                            "List::{method} expects a function value, got `{}`",
+                            self.types.display(callback_ty)
+                        ),
+                        callback.span(),
+                    )
+                    .with_title("List Algorithm Callback Type Mismatch"),
+                );
+            }
+            return;
+        };
+
+        let callback_access = match function.invocation_mode {
+            FunctionInvocationMode::Readonly => ListCallbackAccess::Readonly,
+            FunctionInvocationMode::Writable => {
+                self.record_capture_requirement_for_expr(
+                    callback,
+                    scopes,
+                    CaptureRequirement::Writable,
+                );
+                if !self.callable_access_is_sufficient(
+                    callback,
+                    FunctionInvocationMode::Writable,
+                    scopes,
+                    method_context,
+                ) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0668",
+                            format!(
+                                "writable callback passed to List::{method} requires writable access"
+                            ),
+                            callback.span(),
+                        )
+                        .with_title("List Algorithm Callback Requires Writable Access")
+                        .with_help("store the callback in a writable binding before this call"),
+                    );
+                    return;
+                }
+                ListCallbackAccess::Writable
+            }
+            FunctionInvocationMode::Once => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0664",
+                        format!(
+                            "List::{method} requires a repeatable callback, but this callback is `once`"
+                        ),
+                        callback.span(),
+                    )
+                    .with_title("List Algorithm Requires A Repeatable Callback")
+                    .with_explanation(
+                        "The algorithm may invoke its callback once for every element in the List.",
+                    ),
+                );
+                return;
+            }
+        };
+        if callback_access == ListCallbackAccess::Readonly {
+            self.record_capture_requirement_for_expr(
+                callback,
+                scopes,
+                CaptureRequirement::Readonly,
+            );
+        }
+
+        let void = self.types.intern(TypeKind::Void);
+        let bool_ty = self.types.intern(TypeKind::Bool);
+        let (kind, result, accumulator) = match method {
+            "map" => {
+                let [parameter] = function.parameters.as_slice() else {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Arity Mismatch",
+                        "exactly one element parameter",
+                    );
+                    return;
+                };
+                if parameter.ownership_mode != FunctionTypeParameterMode::Readonly {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Parameter Ownership Mismatch",
+                        "a readonly element parameter",
+                    );
+                    return;
+                }
+                if parameter.ty != *element {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Parameter Type Mismatch",
+                        &format!(
+                            "an element parameter of type `{}`",
+                            self.types.display(*element)
+                        ),
+                    );
+                    return;
+                }
+                if function.return_type == void {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0665",
+                            "List::map callback must return a value",
+                            callback.span(),
+                        )
+                        .with_title("List Map Callback Cannot Return Void"),
+                    );
+                    return;
+                }
+                if self.type_is_move_type(function.return_type) && function.return_borrow.is_some()
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0667",
+                            "List::map cannot store a result borrowed from its callback input",
+                            callback.span(),
+                        )
+                        .with_title("List Map Result Must Be Owned")
+                        .with_explanation("List::map stores owned result elements in a new List."),
+                    );
+                    return;
+                }
+                (
+                    ListAlgorithmKind::Map,
+                    self.types.intern(TypeKind::List(function.return_type)),
+                    None,
+                )
+            }
+            "filter" => {
+                let [parameter] = function.parameters.as_slice() else {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Arity Mismatch",
+                        "exactly one element parameter",
+                    );
+                    return;
+                };
+                if parameter.ownership_mode != FunctionTypeParameterMode::Readonly {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Parameter Ownership Mismatch",
+                        "a readonly element parameter",
+                    );
+                    return;
+                }
+                if parameter.ty != *element {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Parameter Type Mismatch",
+                        &format!(
+                            "an element parameter of type `{}`",
+                            self.types.display(*element)
+                        ),
+                    );
+                    return;
+                }
+                if function.return_type != bool_ty {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Return Type Mismatch",
+                        "a `bool` return",
+                    );
+                    return;
+                }
+                if self.type_is_move_type(*element) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0666",
+                            format!(
+                                "List::filter cannot preserve source elements of Move type `{}`",
+                                self.types.display(*element)
+                            ),
+                            span,
+                        )
+                        .with_title("List Filter Requires Copy Elements")
+                        .with_explanation(
+                            "The preserving filter leaves the source unchanged and copies selected elements into a new List.",
+                        )
+                        .with_help("Move-element preserving filter waits for `Cloneable`"),
+                    );
+                    return;
+                }
+                (ListAlgorithmKind::Filter, receiver_ty, None)
+            }
+            "reduce" => {
+                let [accumulator_parameter, element_parameter] = function.parameters.as_slice()
+                else {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Arity Mismatch",
+                        "exactly two parameters",
+                    );
+                    return;
+                };
+                if accumulator_parameter.ownership_mode != FunctionTypeParameterMode::Writable {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Reduce Accumulator Must Be Writable",
+                        "a writable accumulator parameter first",
+                    );
+                    return;
+                }
+                if element_parameter.ownership_mode != FunctionTypeParameterMode::Readonly {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Parameter Ownership Mismatch",
+                        "a readonly element parameter second",
+                    );
+                    return;
+                }
+                if element_parameter.ty != *element {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Callback Parameter Type Mismatch",
+                        &format!(
+                            "a second parameter of type `{}`",
+                            self.types.display(*element)
+                        ),
+                    );
+                    return;
+                }
+                if function.return_type != void {
+                    self.report_list_callback_mismatch(
+                        method,
+                        callback.span(),
+                        "Reduce Callback Must Return Void",
+                        "a `void` return",
+                    );
+                    return;
+                }
+                let accumulator = accumulator_parameter.ty;
+                let initial = &args[0].value;
+                if !self.check_expr_assignable(
+                    accumulator,
+                    initial,
+                    scopes,
+                    method_context,
+                    AssignmentDestination::Type,
+                ) {
+                    return;
+                }
+                (ListAlgorithmKind::Reduce, accumulator, Some(accumulator))
+            }
+            _ => unreachable!("recognized List algorithm"),
+        };
+
+        self.record_checked_effects(function.checked_effects.iter().copied(), span);
+        let checked_effects = function
+            .checked_effects
+            .iter()
+            .map(|effect| self.types.resolved(*effect))
+            .collect();
+        self.list_algorithm_calls.insert(
+            (span.start, span.end),
+            ListAlgorithmCallInfo {
+                kind,
+                receiver_type: self.types.resolved(receiver_ty),
+                element_type: self.types.resolved(*element),
+                result_type: self.types.resolved(result),
+                accumulator_type: accumulator.map(|ty| self.types.resolved(ty)),
+                callback_type: self.types.resolved(callback_ty),
+                callback_access,
+                checked_effects,
+                source_span: span,
+                receiver_span: receiver.span(),
+                callback_span: callback.span(),
+            },
+        );
+    }
+
+    fn report_list_callback_mismatch(
+        &mut self,
+        method: &str,
+        span: Span,
+        axis: &str,
+        expected: &str,
+    ) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0665",
+                format!("List::{method} callback must have {expected}"),
+                span,
+            )
+            .with_title(format!("List Algorithm {axis}")),
+        );
     }
 
     fn check_stage23_equatable_type(&mut self, ty: TypeId, span: Span, operation: &str) {

@@ -1270,6 +1270,92 @@ impl Rvalue {
         }
     }
 
+    /// Returns the source local only when this value is a direct read of one
+    /// place. Writable call arguments use this identity to transport the place,
+    /// rather than a detached value snapshot, across the callable ABI.
+    pub fn direct_place_local(&self) -> Option<LocalId> {
+        let operand_local = |operand: &Operand| match operand {
+            Operand::Local(local) | Operand::NullablePayload(local) => Some(*local),
+            _ => None,
+        };
+        match self {
+            Self::Value(
+                ValueExpression::Integer(IntegerExpression::Use { operand, .. })
+                | ValueExpression::Float(FloatExpression::Use { operand, .. })
+                | ValueExpression::Bool(BoolExpression::Use { operand })
+                | ValueExpression::Enum(EnumExpression::Use { operand, .. }),
+            ) => operand_local(operand),
+            Self::String(
+                StringExpression::Local(local)
+                | StringExpression::NullableLocalAssumeNonNull(local),
+            )
+            | Self::NullableString(NullableStringExpression::Local(local))
+            | Self::NullableScalar(NullableScalarExpression::Local { local, .. })
+            | Self::Mixed(MixedExpression::Local { local, .. })
+            | Self::NullableMixed(NullableMixedExpression::Local { local, .. })
+            | Self::Error(
+                ErrorExpression::Local { local, .. }
+                | ErrorExpression::NullableLocalAssumeNonNull { local, .. },
+            )
+            | Self::NullableError(NullableErrorExpression::Local { local, .. })
+            | Self::Class(
+                ClassExpression::Local { local, .. }
+                | ClassExpression::NullableLocalAssumeNonNull { local, .. },
+            )
+            | Self::NullableClass(NullableClassExpression::Local { local, .. })
+            | Self::Collection(CollectionExpression::Local { local, .. })
+            | Self::NullableCollection(NullableCollectionExpression::Local { local, .. })
+            | Self::Function(FunctionExpression::Local { local, .. })
+            | Self::NullableFunction(NullableFunctionExpression::Local { local, .. })
+            | Self::SharedReference(
+                SharedReferenceExpression::Local { local, .. }
+                | SharedReferenceExpression::NullableLocalAssumeNonNull { local, .. },
+            )
+            | Self::WeakReference(
+                WeakReferenceExpression::Local { local, .. }
+                | WeakReferenceExpression::NullableLocalAssumeNonNull { local, .. },
+            )
+            | Self::NullableSharedReference(NullableSharedReferenceExpression::Local {
+                local,
+                ..
+            })
+            | Self::NullableWeakReference(NullableWeakReferenceExpression::Local {
+                local, ..
+            })
+            | Self::WritableSharedReference(
+                WritableSharedReferenceExpression::Local { local, .. }
+                | WritableSharedReferenceExpression::NullableLocalAssumeNonNull { local, .. },
+            )
+            | Self::WritableWeakReference(WritableWeakReferenceExpression::Local {
+                local, ..
+            })
+            | Self::NullableWritableSharedReference(
+                NullableWritableSharedReferenceExpression::Local { local, .. },
+            )
+            | Self::NullableWritableWeakReference(
+                NullableWritableWeakReferenceExpression::Local { local, .. },
+            )
+            | Self::SharedReferenceAccess(
+                SharedReferenceAccessExpression::Local { local, .. }
+                | SharedReferenceAccessExpression::NullableLocalAssumeNonNull { local, .. },
+            )
+            | Self::NullableSharedReferenceAccess(
+                NullableSharedReferenceAccessExpression::Local { local, .. },
+            ) => Some(*local),
+            Self::PayloadEnum(PayloadEnumExpression::Use {
+                place:
+                    PayloadEnumPlace::Local(local) | PayloadEnumPlace::NullableLocalAssumeNonNull(local),
+                ..
+            })
+            | Self::NullablePayloadEnum(NullablePayloadEnumExpression::Use {
+                place:
+                    PayloadEnumPlace::Local(local) | PayloadEnumPlace::NullableLocalAssumeNonNull(local),
+                ..
+            }) => Some(*local),
+            _ => None,
+        }
+    }
+
     pub const fn mixed_ownership(&self) -> MixedOwnership {
         match self {
             Self::Mixed(value) => value.ownership(),
@@ -3997,6 +4083,44 @@ pub enum ControlFlowPlan {
     When(WhenResultPlan),
     DoWhile(DoWhilePlan),
     Finalizer(FinalizerRegionPlan),
+    ListAlgorithm(Box<ListAlgorithmPlan>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ListAlgorithmKind {
+    Map,
+    Filter,
+    Reduce,
+}
+
+/// Validation identity for one fully specialized List algorithm. Execution
+/// uses the ordinary CFG and indirect-call terminators referenced here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListAlgorithmPlan {
+    pub kind: ListAlgorithmKind,
+    pub source: LocalId,
+    pub source_collection: CollectionTypeId,
+    pub element_type: Type,
+    pub result_type: Type,
+    pub accumulator_type: Option<Type>,
+    pub callback: LocalId,
+    pub callback_type: FunctionTypeId,
+    pub callback_access: FunctionInvocationMode,
+    pub checked_effects: Vec<CheckedEffect>,
+    pub output: Option<LocalId>,
+    pub accumulator: Option<LocalId>,
+    pub count: LocalId,
+    pub index: LocalId,
+    pub callback_result: Option<LocalId>,
+    pub callback_failure: Option<BlockId>,
+    pub filter_selected: Option<BlockId>,
+    pub setup: BlockId,
+    pub header: BlockId,
+    pub body: BlockId,
+    pub callback_success: BlockId,
+    pub update: BlockId,
+    pub exit: BlockId,
+    pub source_span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6933,6 +7057,24 @@ impl fmt::Display for ControlFlowPlan {
                     .map(|exit| format!("{:?}:block{}", exit.kind, exit.source.0))
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            Self::ListAlgorithm(plan) => write!(
+                formatter,
+                "list {:?} collection#{} local{} callback function-type#{} local{} {:?} count local{} index local{} blocks {}:{}:{}:{}:{} -> block{}",
+                plan.kind,
+                plan.source_collection.0,
+                plan.source.0,
+                plan.callback_type.0,
+                plan.callback.0,
+                plan.callback_access,
+                plan.count.0,
+                plan.index.0,
+                plan.setup.0,
+                plan.header.0,
+                plan.body.0,
+                plan.callback_success.0,
+                plan.update.0,
+                plan.exit.0,
             ),
         }
     }

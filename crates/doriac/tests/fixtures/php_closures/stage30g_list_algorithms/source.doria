@@ -1,0 +1,33 @@
+function main(): void
+{
+    List<int> $values = [1, 2, 3, 4];
+    let writable $lastMapped = 0;
+    let writable $identity = function (int $value): int with (writable $lastMapped) {
+        $lastMapped = $value;
+        return $value;
+    };
+
+    List<int> $mapped = $values->map($identity);
+    List<int> $filtered = $values->filter(fn(int $value) => true);
+    int $lastReduced = $values->reduce(
+        0,
+        function (writable int $last, int $value): void {
+            $last = $value;
+        },
+    );
+
+    List<string> $parts = ["atlas", "birch", "cedar"];
+    List<string> $selected = $parts->filter(fn(string $part) => $part != "birch");
+    List<string> $copy = $parts->reduce(
+        [],
+        function (writable List<string> $result, string $part): void {
+            $result->add($part);
+        },
+    );
+
+    foreach ($mapped as int $value) { echo "m={$value}\n"; }
+    foreach ($filtered as int $value) { echo "f={$value}\n"; }
+    foreach ($selected as string $part) { echo "s={$part}\n"; }
+    foreach ($copy as string $part) { echo "p={$part}\n"; }
+    echo "mapped={$lastMapped} reduced={$lastReduced} source={$values->count}\n";
+}

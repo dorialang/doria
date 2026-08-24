@@ -387,10 +387,44 @@ pub struct CallableCall {
     pub span: Span,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ListAlgorithmKind {
+    Map,
+    Filter,
+    Reduce,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ListCallbackAccess {
+    Readonly,
+    Writable,
+}
+
+/// A fully specialized compiler-known List algorithm call. The frontend records
+/// the contract once; later phases consume these facts instead of interpreting
+/// a source method name independently.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ListAlgorithmCall {
+    pub kind: ListAlgorithmKind,
+    pub receiver: Box<Expr>,
+    pub arguments: Vec<Argument>,
+    pub receiver_type: ResolvedType,
+    pub element_type: ResolvedType,
+    pub result_type: ResolvedType,
+    pub accumulator_type: Option<ResolvedType>,
+    pub callback_type: ResolvedType,
+    pub callback_access: ListCallbackAccess,
+    pub checked_effects: Vec<ResolvedType>,
+    pub receiver_span: Span,
+    pub callback_span: Span,
+    pub span: Span,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Closure(Box<ClosureExpression>),
     CallableCall(Box<CallableCall>),
+    ListAlgorithmCall(Box<ListAlgorithmCall>),
     Variable {
         name: String,
         span: Span,
@@ -587,6 +621,7 @@ impl Expr {
         match self {
             Expr::Closure(closure) => closure.span,
             Expr::CallableCall(call) => call.span,
+            Expr::ListAlgorithmCall(call) => call.span,
             Expr::Variable { span, .. }
             | Expr::This { span }
             | Expr::Identifier { span, .. }
