@@ -396,6 +396,11 @@ enum MixedValue {
         owner: Rc<Cell<usize>>,
         payload_owned: bool,
     },
+    Function {
+        value: FunctionValue,
+        owner: Rc<Cell<usize>>,
+        payload_owned: bool,
+    },
 }
 
 impl MixedValue {
@@ -409,6 +414,7 @@ impl MixedValue {
             Self::Class { class, .. } => mir::MixedTag::Class(*class),
             Self::PayloadEnum { value, .. } => mir::MixedTag::PayloadEnum(value.ty),
             Self::Error { .. } => mir::MixedTag::Error,
+            Self::Function { value, .. } => mir::MixedTag::Function(value.function_type),
         }
     }
 }
@@ -700,6 +706,7 @@ enum EvaluationTask {
     BuildMixedClass(bool),
     BuildMixedPayloadEnum,
     BuildMixedError,
+    BuildMixedFunction(bool),
     BuildNullableMixedPayloadEnum,
     OwnMixed,
     BuildNullableMixedSome,
@@ -4615,6 +4622,18 @@ impl Interpreter<'_> {
                     payload_owned: true,
                 })?;
             }
+            EvaluationTask::BuildMixedFunction(payload_owned) => {
+                let LocalValue::Function(value) = self.pop_local_value()? else {
+                    return Err(InterpreterError::new(
+                        "mixed function payload is not a function carrier",
+                    ));
+                };
+                self.push_mixed(MixedValue::Function {
+                    value,
+                    owner: Rc::new(Cell::new(1)),
+                    payload_owned,
+                })?;
+            }
             EvaluationTask::BuildNullableMixedPayloadEnum => {
                 let (_, value) = self.pop_nullable_payload_enum()?;
                 self.push_nullable_mixed(value.map(|value| MixedValue::PayloadEnum {
@@ -7050,6 +7069,16 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::BuildMixedError);
                 frame.tasks.push(EvaluationTask::Error(*value));
+            }
+            mir::MixedExpression::BoxFunction {
+                value,
+                payload_owned,
+            } => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildMixedFunction(payload_owned));
+                frame.tasks.push(EvaluationTask::Function(*value));
             }
             mir::MixedExpression::CollectionIndex {
                 positional,
@@ -15008,7 +15037,8 @@ fn retain_mixed_claim(value: &mut MixedValue, ownership: mir::MixedOwnership) {
     match value {
         MixedValue::Class { owner, .. }
         | MixedValue::PayloadEnum { owner, .. }
-        | MixedValue::Error { owner, .. } => {
+        | MixedValue::Error { owner, .. }
+        | MixedValue::Function { owner, .. } => {
             owner.set(owner.get().saturating_add(1));
         }
         MixedValue::Scalar(_) | MixedValue::String(_) => {}
@@ -15148,6 +15178,24 @@ fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop
                 owner.set(claims - 1);
                 if claims == 1 && payload_owned {
                     drops.push(OwnedDrop::Error(value));
+                }
+            }
+        }
+        LocalValue::Mixed(MixedValue::Function {
+            value,
+            owner,
+            payload_owned,
+        })
+        | LocalValue::NullableMixed(Some(MixedValue::Function {
+            value,
+            owner,
+            payload_owned,
+        })) => {
+            let claims = owner.get();
+            if claims != 0 {
+                owner.set(claims - 1);
+                if claims == 1 && payload_owned {
+                    drops.push(OwnedDrop::Function(value));
                 }
             }
         }

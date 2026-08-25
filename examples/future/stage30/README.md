@@ -9,16 +9,16 @@ documents later Stage 30 surfaces and is not an executable manifest.
 
 [Decision 0121](../../../docs/decisions/0121-closure-function-types-capture-semantics-and-execution-model.md)
 accepts the complete closure model and elaborates Decision 0120's explicit
-capture lists. **Stages 30a through 30g are complete**: structural function
+capture lists. **Stages 30a through 30h and Stage 30 are complete**: structural function
 types have semantic identity; captures, closure bodies, inferred modes/effects,
 callable-value calls, capture acquisition, Move state, leases, and escape are
 checked; explicit closure/callable-call HIR, structural function MIR, indirect
 calls, environment cleanup, the debug-interpreter oracle, and Cranelift/LLVM
 native execution and explicit PHP compatibility lowering are implemented.
 Stage 30g List algorithms are implemented across the debug interpreter, both
-native profiles, and PHP compatibility for supported values. Stage 30h is next.
-Stage 30 remains in progress and not complete; E0641 is catalogued but
-unreachable for the supported Stage 30g surface until Stage 30h.
+native profiles, and PHP compatibility for supported values. Stage 30h closes
+the accepted storage and backend routes, including function values in `mixed`.
+E0641 is historical and reserved. Stage 31 is next.
 
 The inventory covers:
 

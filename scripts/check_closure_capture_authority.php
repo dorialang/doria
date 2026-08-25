@@ -85,8 +85,7 @@ function check_closure_capture_authority(string $root): array
         'anonymous-function expression tokens and productions',
         'source-preserving AST nodes',
         'accepted-syntax regression tests',
-        '`E0641` is catalogued but unreachable for the',
-        'supported Stage 30g surface until Stage 30h',
+        '`E0641` is historical and remains reserved',
         'Stage 30b now validates free variables',
         'pre-Stage-30 grammar slice is complete',
         'Decision 0121 settles the questions this record deliberately left bounded',
@@ -111,7 +110,7 @@ function check_closure_capture_authority(string $root): array
         'authoritative `function(T): R` type syntax',
         'catalogued `E0641` Stage 30 boundary',
         'No free-variable discovery',
-        '**Stage 30 Closure Authority — Accepted; Stage 30 — In Progress, Not Complete.**',
+        '**Stage 30 Closure Authority — Accepted And Implemented; Stage 30 — Complete.**',
         'Missing, duplicate, wrong-mode, unused, moved, and insufficient-lifetime captures',
         'Function types preserve checked effects',
         '`List<T>` alone receives `map`, Copy-only preserving `filter`, and writable-accumulator `reduce`',
@@ -133,7 +132,7 @@ function check_closure_capture_authority(string $root): array
         'A closure that uses no enclosing local',
         'The compiler resolves readonly/writable/once structural function types',
         'function(int): int',
-        '`E0641` is unreachable',
+        '`E0641` is historical',
         '`with ($this)` borrows a',
         '`with (writable $this)` borrows it exclusively',
     ]);
@@ -152,7 +151,7 @@ function check_closure_capture_authority(string $root): array
         'Stage 30e Native Execution — Complete',
         'Stage 30f PHP Compatibility — Complete',
         'Stage 30g List Algorithms — Complete',
-        'Stage 30 — In Progress, Not Complete',
+        'Stage 30 — Complete',
         'Decision 0120 — Accepted; Explicit Capture-List Foundation',
         'Decision 0121 — Accepted; Stage 30 Closure Authority',
         'Pre-Stage-30 Grammar Slice — Complete',
@@ -250,7 +249,7 @@ function check_closure_capture_authority(string $root): array
     }
 
     $grammarPosition = strpos($plan, '**Pre-Stage-30 Grammar Slice — Closure accepted syntax — Complete.**');
-    $stage30Position = strpos($plan, '**Stage 30 Closure Authority — Accepted; Stage 30 — In Progress, Not Complete.**');
+    $stage30Position = strpos($plan, '**Stage 30 Closure Authority — Accepted And Implemented; Stage 30 — Complete.**');
     if ($grammarPosition === false || $stage30Position === false || $grammarPosition >= $stage30Position) {
         $failures[] = "{$planPath}: the accepted-syntax grammar slice must precede Stage 30";
     }

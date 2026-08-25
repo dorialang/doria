@@ -15,9 +15,7 @@ fn analyze(source: &str) -> doriac::semantics::SemanticAnalysis {
 fn permanent_errors(diagnostics: &[Diagnostic]) -> Vec<&Diagnostic> {
     diagnostics
         .iter()
-        .filter(|diagnostic| {
-            diagnostic.severity == DiagnosticSeverity::Error && diagnostic.code != "E0641"
-        })
+        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
         .collect()
 }
 
@@ -313,8 +311,11 @@ function main(): void
     assert!(analysis
         .diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.code != "E0641")
         .all(|diagnostic| diagnostic.code.starts_with("E064")));
+    assert!(analysis
+        .diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.code != "E0641"));
 }
 
 #[test]

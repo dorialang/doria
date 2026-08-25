@@ -44,24 +44,24 @@ use crate::native_abi::{
     COLLECTION_SET_AT_NULLABLE, COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY,
     COLLECTION_STAGE26_NEW, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
     FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
-    MIXED_NEW_AGGREGATE, MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG,
-    MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM, MIXED_TAG_ERROR, MIXED_TAG_FLOAT32,
-    MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8,
-    MIXED_TAG_PAYLOAD_ENUM, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64,
-    MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE,
-    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE,
-    SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
-    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
-    STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
-    STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
-    STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
-    STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY,
-    STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER,
-    STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT,
-    STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
-    STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
-    STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
-    WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
+    MIXED_NEW_AGGREGATE, MIXED_NEW_AGGREGATE_BORROWED, MIXED_NEW_BORROWED, MIXED_PAYLOAD,
+    MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM,
+    MIXED_TAG_ERROR, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_FUNCTION, MIXED_TAG_INT16,
+    MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_PAYLOAD_ENUM, MIXED_TAG_STRING,
+    MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID,
+    NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
+    READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD,
+    SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE,
+    STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES,
+    STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE,
+    STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64,
+    STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF,
+    STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF,
+    STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END,
+    STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE,
+    STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM,
+    STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR,
+    STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
     WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS, WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK,
     WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
     WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
@@ -11894,6 +11894,32 @@ fn lower_drop_mixed_value(
     builder.ins().jump(after_string, &[]);
 
     builder.switch_to_block(after_string);
+    let function_block = builder.create_block();
+    let after_function = builder.create_block();
+    let function_tag = builder
+        .ins()
+        .iconst(types::I8, i64::from(MIXED_TAG_FUNCTION));
+    let is_function = builder.ins().icmp(IntCC::Equal, tag, function_tag);
+    builder
+        .ins()
+        .brif(is_function, function_block, &[], after_function, &[]);
+    builder.switch_to_block(function_block);
+    let carrier_address = collection_word_to_value(
+        builder,
+        payload,
+        mir::Type::Class(crate::class_layout::ClassId(0)),
+        pointer,
+    )?;
+    let carrier = load_lowered_from_address(
+        builder,
+        mir::Type::Function(mir::FunctionTypeId(0)),
+        carrier_address,
+        pointer,
+    );
+    lower_drop_function_carrier(builder, carrier, resources)?;
+    builder.ins().jump(after_function, &[]);
+
+    builder.switch_to_block(after_function);
     let class_block = builder.create_block();
     let after_class = builder.create_block();
     let class_tag = builder.ins().iconst(types::I8, i64::from(MIXED_TAG_CLASS));
@@ -12120,6 +12146,7 @@ fn mixed_tag_value(tag: mir::MixedTag) -> (u8, u32) {
         mir::MixedTag::Error => (MIXED_TAG_ERROR, 0),
         mir::MixedTag::Enum(enum_id) => (MIXED_TAG_ENUM, enum_id.0 as u32),
         mir::MixedTag::PayloadEnum(ty) => (MIXED_TAG_PAYLOAD_ENUM, ty.id.0 as u32),
+        mir::MixedTag::Function(ty) => (MIXED_TAG_FUNCTION, ty.0 as u32),
     }
 }
 
@@ -12262,6 +12289,46 @@ fn lower_mixed_expression(
                 resources,
             )?
             .ok_or_else(|| backend_failure("mixed Error allocation produced no result"))
+        }
+        mir::MixedExpression::BoxFunction {
+            value,
+            payload_owned,
+        } => {
+            let function_type = value.function_type();
+            let value = lower_function_expression(builder, value, resources)?;
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                pointer.bytes() * 2,
+                pointer.bytes().trailing_zeros() as u8,
+            ));
+            store_lowered_to_stack(
+                builder,
+                mir::Type::Function(function_type),
+                slot,
+                value,
+                pointer,
+            )?;
+            let source = builder.ins().stack_addr(pointer, slot, 0);
+            let (tag_value, type_id) = mixed_tag_value(mir::MixedTag::Function(function_type));
+            let tag = builder.ins().iconst(types::I8, i64::from(tag_value));
+            let type_id = builder.ins().iconst(types::I32, i64::from(type_id));
+            let size = builder
+                .ins()
+                .iconst(pointer, i64::from(pointer.bytes() * 2));
+            let alignment = builder.ins().iconst(pointer, i64::from(pointer.bytes()));
+            runtime_call(
+                builder,
+                if *payload_owned {
+                    MIXED_NEW_AGGREGATE
+                } else {
+                    MIXED_NEW_AGGREGATE_BORROWED
+                },
+                &[types::I8, types::I32, pointer, pointer, pointer],
+                Some(pointer),
+                &[tag, type_id, source, size, alignment],
+                resources,
+            )?
+            .ok_or_else(|| backend_failure("mixed function allocation produced no result"))
         }
         mir::MixedExpression::CollectionIndex {
             positional,

@@ -56,17 +56,16 @@ function check_stage30e_native_closure_execution(string $root): array
             'Complete',
             'Stage 30f PHP Compatibility',
             'Stage 30g List Algorithms',
-            'Next',
             'Stage 30',
-            'Not Complete',
+            'Complete',
         ]);
     }
     $require($paths['decision'], $files['decision'], [
-        'Authority Accepted; Stages 30a Through 30g Implemented; Stage 30h Next; Stage 30 Not Complete',
+        'Authority Accepted; Stages 30a Through 30h Implemented; Stage 30 Complete',
     ]);
     $require($paths['audit'], $files['audit'], [
-        'Implemented for debug, Cranelift, LLVM, and the PHP-supported value surface',
-        'catalogue identity retained until Stage 30h',
+        'Historical and reserved after Stage 30h',
+        'no active emitter or generic fallback remains',
     ]);
 
     $require($paths['abi'], $files['abi'], [

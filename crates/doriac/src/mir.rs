@@ -1400,7 +1400,7 @@ pub(crate) fn function_expression_is_borrowed(value: &FunctionExpression) -> boo
     }
 }
 
-fn nullable_function_expression_is_borrowed(value: &NullableFunctionExpression) -> bool {
+pub(crate) fn nullable_function_expression_is_borrowed(value: &NullableFunctionExpression) -> bool {
     match value {
         NullableFunctionExpression::Null { .. } | NullableFunctionExpression::Call { .. } => false,
         NullableFunctionExpression::Present(value) => function_expression_is_borrowed(value),
@@ -2806,6 +2806,7 @@ pub enum MixedTag {
     Error,
     Enum(EnumId),
     PayloadEnum(PayloadEnumType),
+    Function(FunctionTypeId),
 }
 
 impl MixedTag {
@@ -2819,6 +2820,7 @@ impl MixedTag {
             Self::Error => Type::Error,
             Self::Enum(enum_id) => Type::Scalar(ScalarType::Enum(enum_id)),
             Self::PayloadEnum(ty) => Type::PayloadEnum(ty),
+            Self::Function(ty) => Type::Function(ty),
         }
     }
 }
@@ -2866,6 +2868,10 @@ pub enum MixedExpression {
     BoxPayloadEnum {
         value: Box<PayloadEnumExpression>,
     },
+    BoxFunction {
+        value: Box<FunctionExpression>,
+        payload_owned: bool,
+    },
     CollectionIndex {
         collection: LocalId,
         index: Box<Rvalue>,
@@ -2888,7 +2894,9 @@ impl MixedExpression {
             } => MixedOwnership::Owned,
             Self::BoxValue(_) => MixedOwnership::ShellOnly,
             Self::BoxPayloadEnum { .. } | Self::BoxError { .. } => MixedOwnership::Owned,
-            Self::BoxString { payload_owned, .. } | Self::BoxClass { payload_owned, .. } => {
+            Self::BoxString { payload_owned, .. }
+            | Self::BoxClass { payload_owned, .. }
+            | Self::BoxFunction { payload_owned, .. } => {
                 if *payload_owned {
                     MixedOwnership::Owned
                 } else {
@@ -4889,6 +4897,7 @@ fn mixed_class_temporary_capacity(value: &MixedExpression) -> usize {
             rvalue_class_temporary_capacity(&Rvalue::Error((**value).clone()))
         }
         MixedExpression::BoxPayloadEnum { value } => payload_enum_class_temporary_capacity(value),
+        MixedExpression::BoxFunction { value, .. } => function_class_temporary_capacity(value),
         MixedExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
@@ -6094,6 +6103,7 @@ impl fmt::Display for MixedTag {
             Self::Integer(ty) => write!(formatter, "{ty}"),
             Self::Float(ty) => write!(formatter, "{ty}"),
             Self::String => formatter.write_str("string"),
+            Self::Function(ty) => write!(formatter, "function-type#{}", ty.0),
             Self::Class(class) => write!(formatter, "class#{}", class.0),
             Self::Error => formatter.write_str("Error"),
             Self::PayloadEnum(ty) => write!(formatter, "payload-enum#{}", ty.id.0),
@@ -6120,6 +6130,7 @@ impl fmt::Display for MixedExpression {
             Self::Call { function, args, .. } => write_call(formatter, *function, args),
             Self::BoxValue(value) => write!(formatter, "mixed({value})"),
             Self::BoxString { value, .. } => write!(formatter, "mixed({value})"),
+            Self::BoxFunction { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxClass { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxError { value } => {
                 write!(formatter, "mixed({})", Rvalue::Error((**value).clone()))

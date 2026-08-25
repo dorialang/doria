@@ -31,10 +31,8 @@ diagnostic, and performance direction on 2026-08-19, with these amendments:
   than moving it into and out of every call.
 
 The accepted record also fixes the dependency-ordered Stage 30a through Stage
-30h implementation slices. Stages 30a through 30g are complete.
-Stage 30h Cross-Repository Closure is next. Stage 30 is in progress and not complete.
-E0641 is catalogued but unreachable for the supported Stage 30g surface while
-its catalogue identity remains until the Stage 30h audit.
+30h implementation slices. Stages 30a through 30h and Stage 30 are complete.
+E0641 is historical and reserved. Stage 31 is next.
 
 ## Historical Scope
 

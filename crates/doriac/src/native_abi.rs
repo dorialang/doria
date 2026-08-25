@@ -127,6 +127,7 @@ pub const WRITABLE_SHARED_WRITABLE_PAYLOAD: &str = "dr_v1_writable_shared_writab
 pub const MIXED_NEW: &str = "dr_v1_mixed_new";
 pub const MIXED_NEW_BORROWED: &str = "dr_v1_mixed_new_borrowed";
 pub const MIXED_NEW_AGGREGATE: &str = "dr_v2_mixed_new_aggregate";
+pub const MIXED_NEW_AGGREGATE_BORROWED: &str = "dr_v3_mixed_new_aggregate_borrowed";
 pub const MIXED_CLONE_OWNED: &str = "dr_v1_mixed_clone_owned";
 pub const MIXED_RELEASE_OWNED: &str = "dr_v1_mixed_release_owned";
 pub const MIXED_FREE: &str = "dr_v1_mixed_free";
@@ -284,6 +285,7 @@ pub const MIXED_TAG_CLASS: u8 = 13;
 pub const MIXED_TAG_ENUM: u8 = 14;
 pub const MIXED_TAG_PAYLOAD_ENUM: u8 = 15;
 pub const MIXED_TAG_ERROR: u8 = 16;
+pub const MIXED_TAG_FUNCTION: u8 = 17;
 
 pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<u8> {
     match ty {

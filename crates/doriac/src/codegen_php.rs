@@ -505,7 +505,10 @@ function __doria_take_cell(__DoriaCell $cell): mixed
 
 function __doria_drop_value(mixed &$value): void
 {
-    if ($value instanceof __DoriaFunctionValue) {
+    if ($value instanceof __DoriaMixedValue) {
+        $payload = $value->value();
+        __doria_drop_value($payload);
+    } elseif ($value instanceof __DoriaFunctionValue) {
         $value->__doriaDrop();
     } elseif (is_array($value)) {
         foreach (array_reverse(array_keys($value)) as $key) {
@@ -5713,6 +5716,7 @@ fn php_mixed_type_tag(ty: &ResolvedType) -> String {
         ResolvedType::Bool => "bool".to_string(),
         ResolvedType::Null => "null".to_string(),
         ResolvedType::Error => "error".to_string(),
+        ResolvedType::Function(_) => "function".to_string(),
         ResolvedType::Enum(ty) => format!("enum:{}", ty.name),
         ResolvedType::Class(ty) => format!("class:{}", ty.name),
         ResolvedType::Nullable(inner) => php_mixed_type_tag(inner),

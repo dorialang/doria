@@ -53,15 +53,15 @@ declare(strict_types=1);
             'Stage 30g List Algorithms',
             'Next',
             'Stage 30',
-            'Not Complete',
+            'Complete',
         ]);
     }
     $require($paths['decision'], $files['decision'], [
-        'Authority Accepted; Stages 30a Through 30g Implemented; Stage 30h Next; Stage 30 Not Complete',
+        'Authority Accepted; Stages 30a Through 30h Implemented; Stage 30 Complete',
     ]);
     $require($paths['audit'], $files['audit'], [
         'No valid supported plain closure route emits it',
-        'catalogue identity retained until Stage 30h',
+        'Historical and reserved after Stage 30h',
     ]);
 
     $require($paths['backend'], $files['backend'], [

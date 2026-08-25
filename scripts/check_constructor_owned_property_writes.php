@@ -93,7 +93,7 @@ function check_constructor_owned_property_writes(string $root): array
             'Stage 30e Native Execution — Complete',
             'Stage 30f PHP Compatibility — Complete',
             'Stage 30g List Algorithms — Complete',
-            'Stage 30 — In Progress, Not Complete',
+            'Stage 30 — Complete',
         ]);
     }
     $require($semanticsPath, $semantics, [

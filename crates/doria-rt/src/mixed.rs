@@ -106,17 +106,18 @@ pub unsafe fn new_borrowed(tag: u8, type_id: u32, payload: u64) -> *mut DrMixedV
     value
 }
 
-pub unsafe fn new_owned_aggregate(
+unsafe fn new_aggregate(
     tag: u8,
     type_id: u32,
     source: *const u8,
     byte_length: usize,
     alignment: usize,
+    owns_payload: bool,
 ) -> *mut DrMixedV1 {
     if source.is_null() || byte_length == 0 {
         return ptr::null_mut();
     }
-    let owner = allocate_owner(true, byte_length, alignment);
+    let owner = allocate_owner(owns_payload, byte_length, alignment);
     if owner.is_null() {
         return ptr::null_mut();
     }
@@ -127,6 +128,26 @@ pub unsafe fn new_owned_aggregate(
         deallocate(owner.cast::<u8>());
     }
     value
+}
+
+pub unsafe fn new_owned_aggregate(
+    tag: u8,
+    type_id: u32,
+    source: *const u8,
+    byte_length: usize,
+    alignment: usize,
+) -> *mut DrMixedV1 {
+    new_aggregate(tag, type_id, source, byte_length, alignment, true)
+}
+
+pub unsafe fn new_borrowed_aggregate(
+    tag: u8,
+    type_id: u32,
+    source: *const u8,
+    byte_length: usize,
+    alignment: usize,
+) -> *mut DrMixedV1 {
+    new_aggregate(tag, type_id, source, byte_length, alignment, false)
 }
 
 pub unsafe fn clone_owned(value: *const DrMixedV1) -> *mut DrMixedV1 {
@@ -226,6 +247,24 @@ mod tests {
             assert_eq!(*payload.add(1), 2);
             assert!(release_owned(value));
             assert_eq!(*payload.add(1), 2);
+            free(value);
+        }
+    }
+
+    #[test]
+    fn borrowed_aggregate_shells_never_claim_the_copied_payload() {
+        unsafe {
+            let source = [1_u64, 2_u64];
+            let value = new_borrowed_aggregate(
+                17,
+                1,
+                source.as_ptr().cast(),
+                mem::size_of_val(&source),
+                mem::align_of_val(&source),
+            );
+            assert!(!value.is_null());
+            assert_eq!(*((*value).payload as *const [u64; 2]), source);
+            assert!(!release_owned(value));
             free(value);
         }
     }

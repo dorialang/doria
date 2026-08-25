@@ -2246,11 +2246,10 @@ impl Checker<'_> {
                 }
                 let function_destination_valid = function_value.as_ref().is_none_or(|value| {
                     if decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed") {
-                        self.reject_deferred_function_storage(
+                        self.validate_owned_function_storage(
                             value,
                             decl.initializer.span(),
                             "`mixed`",
-                            "Function Value Mixed Representation Is Not Yet Available",
                         )
                     } else {
                         self.validate_local_function_destination(
@@ -2376,16 +2375,25 @@ impl Checker<'_> {
                     let mixed_assignment = target.as_ref().is_some_and(|binding| binding.mixed);
                     let move_assignment = target.is_some() && value_moves;
                     if mixed_assignment && value_is_function {
-                        if let Some(value) = self.prepare_function_value(&assignment.value, scopes)
-                        {
-                            self.reject_deferred_function_storage(
-                                &value,
+                        let pending_value = self.prepare_function_value(&assignment.value, scopes);
+                        let valid = pending_value.as_ref().is_none_or(|value| {
+                            self.validate_owned_function_storage(
+                                value,
                                 assignment.value.span(),
                                 "`mixed`",
-                                "Function Value Mixed Representation Is Not Yet Available",
-                            );
+                            )
+                        });
+                        self.use_expr(
+                            &assignment.value,
+                            scopes,
+                            if valid { UseMode::Give } else { UseMode::Read },
+                        );
+                        if valid {
+                            if let Some(binding) = scopes.get_mut(name) {
+                                binding.state = State::Owned;
+                                binding.function_value = pending_value;
+                            }
                         }
-                        self.use_expr(&assignment.value, scopes, UseMode::Read);
                         return Flow::fallthrough();
                     }
                     if function_assignment {

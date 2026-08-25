@@ -7,8 +7,8 @@
   Stage 30a, Stage 30b semantic capture validation, and Stage 30c ownership,
   lifetime, and escape checking are complete; Stage 30d closure HIR/MIR and
   debug-interpreter execution are complete; Stage 30e native execution, Stage
-  30f PHP compatibility, and Stage 30g List Algorithms are complete; Stage 30h
-  is next and Stage 30 remains incomplete
+  30f PHP compatibility, Stage 30g List Algorithms, and Stage 30h
+  cross-repository closure are complete; Stage 30 is complete
 - **Scope:** Closure capture spelling, ownership modes, diagnostics, Stage 30
   boundaries, and backend-independent behavior
 - **Amends:** D10 and the Stage 30 plan; preserves Decision 0119's callable-effect
@@ -215,8 +215,8 @@ and executes them through the debug interpreter. Stage 30e executes the same
 validated MIR through Cranelift and LLVM. Stage 30f emits the PHP compatibility
 route from semantic and validated MIR closure plans. Stage 30g executes
 `List<T>::map`, Copy-only `filter`, and writable-accumulator `reduce` through
-compiler-owned algorithm plans. `E0641` is catalogued but unreachable for the
-supported Stage 30g surface until Stage 30h.
+compiler-owned algorithm plans. Stage 30h completes the accepted storage and
+integration routes. `E0641` is historical and remains reserved.
 
 No collection algorithm was part of the grammar foundation or Stage 30d. Stage
 30g has separate durable native and PHP parity fixtures; documentation snippets

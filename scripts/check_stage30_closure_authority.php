@@ -85,7 +85,7 @@ function check_stage30_closure_authority(string $root): array
         '# Decision 0121: Closure Function Types, Capture Semantics, And Execution Model',
         '**Status:** Accepted',
         '**Accepted:** 2026-08-19',
-        '**Implementation Status:** Authority Accepted; Stages 30a Through 30g Implemented; Stage 30h Next; Stage 30 Not Complete',
+        '**Implementation Status:** Authority Accepted; Stages 30a Through 30h Implemented; Stage 30 Complete',
         '**Elaborates:** Decision 0120',
         'function writable(int): int',
         'function once(): Payload',
@@ -118,6 +118,8 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30d — Complete',
         'Stage 30e — Complete',
         'Stage 30f — Complete',
+        'Stage 30g — Complete',
+        'Stage 30h — Complete',
         'E0641 retires by route',
         'Measurement Status: Pending Available Runner',
         '## Invalidated elsewhere',
@@ -127,16 +129,15 @@ function check_stage30_closure_authority(string $root): array
         'function take(): Payload',
         'function I(T)',
         'function I(writable A, T)',
-        'Stage 30 — Complete',
         'Stage 30 is implemented',
     ]);
 
     $require($proposalPath, $proposal, [
         '**Superseded By Accepted Decision 0121.**',
         'It is not normative authority',
-        'Stages 30a through 30g are complete',
-        'Stage 30h Cross-Repository Closure is next',
-        'E0641 is catalogued but unreachable for the supported Stage 30g surface',
+        'Stages 30a through 30h and Stage 30 are complete',
+        'E0641 is historical and reserved',
+        'Stage 31 is next',
     ]);
     $forbid($proposalPath, $proposal, [
         '**In Review.**',
@@ -156,7 +157,7 @@ function check_stage30_closure_authority(string $root): array
 
     $require($planPath, $plan, [
         'Decision 0121: closure function types, capture semantics, and execution model',
-        '**Stage 30 Closure Authority — Accepted; Stage 30 — In Progress, Not Complete.**',
+        '**Stage 30 Closure Authority — Accepted And Implemented; Stage 30 — Complete.**',
         'Stage 30b Semantic Function Types And Captures — Complete',
         'Stage 30c Ownership, Lifetime, And Escape — Complete',
         'Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete',
@@ -166,7 +167,7 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30h Cross-Repository Closure',
         '`function take()` is rejected',
         '`List<T>` alone receives `map`, Copy-only preserving `filter`, and writable-accumulator `reduce`',
-        'E0641 retires by completed route',
+        'E0641 has retired by completed route',
         'Measurement Status: Pending Available Runner',
     ]);
 
@@ -179,8 +180,9 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30e Native Execution — Complete',
         'Stage 30f PHP Compatibility — Complete',
         'Stage 30g List Algorithms — Complete',
-        'Stage 30 — In Progress, Not Complete',
-        'E0641 is catalogued but unreachable for the supported Stage 30g surface',
+        'Stage 30 — Complete',
+        'E0641 is historical and remains reserved',
+        'Stage 31 — Next',
     ]);
     $forbid($pipelinePath, $pipeline, [
         'Stage 30 Closure Authority Proposal — In Review',
@@ -198,9 +200,9 @@ function check_stage30_closure_authority(string $root): array
         'readonly/writable/once structural function types',
         'grouping remains transparent',
         'callable-value calls',
-        '`E0641` is unreachable',
+        '`E0641` is historical',
         'debug interpreter',
-        'Stage 30 - In Progress, Not Complete',
+        'Stage 30 - Complete',
     ]);
 
     $require($collectionPath, $collection, [
@@ -215,8 +217,8 @@ function check_stage30_closure_authority(string $root): array
     ]);
     $require($examplesPath, $examples, [
         '[Decision 0121]',
-        'Stages 30a through 30g are complete',
-        'remains in progress and not complete',
+        'Stages 30a through 30h and Stage 30 are complete',
+        'E0641 is historical and reserved',
         'Stages 30b and 30c check',
         'Stage 30g List algorithms are implemented',
     ]);

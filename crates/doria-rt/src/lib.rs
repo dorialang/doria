@@ -1030,6 +1030,27 @@ pub unsafe extern "C" fn dr_v2_mixed_new_aggregate(
     value
 }
 
+/// Copies one borrowed compiler-laid-out aggregate into a mixed shell.
+///
+/// # Safety
+///
+/// `source` must point to `byte_length` readable bytes whose alignment is described by
+/// `alignment`. The aggregate's referenced payload must outlive the returned shell.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_mixed_new_aggregate_borrowed(
+    tag: u8,
+    type_id: u32,
+    source: *const u8,
+    byte_length: usize,
+    alignment: usize,
+) -> *mut DrMixedV1 {
+    let value = mixed::new_borrowed_aggregate(tag, type_id, source, byte_length, alignment);
+    if value.is_null() {
+        panic_catalogued(ptr::null(), b"P1320");
+    }
+    value
+}
+
 /// # Safety
 ///
 /// `value` must point to a live mixed box.

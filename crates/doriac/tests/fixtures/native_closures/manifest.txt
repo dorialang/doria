@@ -25,3 +25,4 @@ destructor_order
 panic_no_cleanup
 stage30g_list_algorithms
 stage30g_checked_cleanup
+stage30h_completion
