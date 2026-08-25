@@ -3,6 +3,17 @@ function invoke(function(): int $callback): int
     return $callback();
 }
 
+function inspectWritable(take function writable(): int $callback): void throws Doria\Std\Io\IoError
+{
+    writable mixed $value = $callback;
+    if ($value is function writable(): int) {
+        echo "writable\n";
+    }
+    if ($value is function(): int) {
+        echo "wrong readonly\n";
+    }
+}
+
 function main(): void
 {
     mixed $value = fn() => 42;
@@ -21,4 +32,7 @@ function main(): void
     if ($nullable is function(): int) {
         echo "nullable {$nullable()}\n";
     }
+
+    function writable(): int $writable = fn() => 41;
+    inspectWritable($writable);
 }

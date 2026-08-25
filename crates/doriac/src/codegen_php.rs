@@ -4602,14 +4602,21 @@ fn assignment_target_cell(target: &Expr, scopes: &PhpNameScopes) -> Option<Strin
 
 fn emit_owned_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
     match expr {
-        Expr::Grouped { expr, .. } => format!("({})", emit_owned_expr(expr, scopes)),
-        Expr::Variable { span, .. } => scopes
-            .place_for_use(*span)
-            .and_then(PhpBindingPlace::cell)
-            .map_or_else(
-                || emit_expr(expr, scopes),
-                |cell| format!("__doria_take_cell({cell})"),
-            ),
+        Expr::Grouped { expr: inner, .. } => emit_mixed_box_plan(
+            expr,
+            format!("({})", emit_owned_expr(inner, scopes)),
+            scopes,
+        ),
+        Expr::Variable { span, .. } => {
+            let emitted = scopes
+                .place_for_use(*span)
+                .and_then(PhpBindingPlace::cell)
+                .map_or_else(
+                    || emit_expr_unboxed(expr, scopes),
+                    |cell| format!("__doria_take_cell({cell})"),
+                );
+            emit_mixed_box_plan(expr, emitted, scopes)
+        }
         _ => emit_expr(expr, scopes),
     }
 }
@@ -4943,6 +4950,10 @@ fn emit_range_foreach(
 
 fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
     let emitted = emit_expr_unboxed(expr, scopes);
+    emit_mixed_box_plan(expr, emitted, scopes)
+}
+
+fn emit_mixed_box_plan(expr: &Expr, emitted: String, scopes: &PhpNameScopes) -> String {
     let Some(plan) = scopes
         .mixed_box_plans
         .get(&(expr.span().start, expr.span().end))
