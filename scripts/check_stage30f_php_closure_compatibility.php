@@ -50,17 +50,14 @@ declare(strict_types=1);
         $require($paths[$key], $files[$key], [
             'Stage 30f PHP Compatibility',
             'Complete',
-            'Stage 30g List Algorithms',
-            'Next',
             'Stage 30',
-            'Complete',
         ]);
     }
     $require($paths['decision'], $files['decision'], [
         'Authority Accepted; Stages 30a Through 30h Implemented; Stage 30 Complete',
     ]);
     $require($paths['audit'], $files['audit'], [
-        'No valid supported plain closure route emits it',
+        'No valid accepted closure route emits it',
         'Historical and reserved after Stage 30h',
     ]);
 
