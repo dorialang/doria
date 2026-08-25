@@ -201,8 +201,8 @@ for the new runtime cases, controlled-runner and baseline-promotion workflows,
 the exact native acceptance policy, and the stage-completion workflow. All three
 Stage 26b slices are complete. Decision 0113 and all four slices, Stages 27,
 28, and 28a are complete. Stage 29, the pre-Stage-30 grammar slice, and Stages
-30a through 30g are complete. Stage 30h is next with no performance-evidence
-dependency.
+30a through 30h and Stage 30 are complete. Stage 31 is next. Controlled timing
+remains `Measurement Status: Pending Available Runner` and does not block it.
 
 Slice 3 is split. Part 1 delivers the peer matrix, peer fairness and
 semantic-equivalence records, controlled candidate measurement, and a timing

@@ -2907,17 +2907,24 @@ fn validate_indirect_call(
     match call.invocation_mode {
         mir::FunctionInvocationMode::Readonly => {}
         mir::FunctionInvocationMode::Writable => {
-            let mir::FunctionExpression::Local {
-                local,
-                transfer: false,
-                ..
-            } = call.callee
-            else {
-                return Err(malformed_mir(
-                    "writable indirect call does not use a borrowed local carrier",
-                ));
+            let local = match call.callee {
+                mir::FunctionExpression::Local {
+                    local,
+                    transfer: false,
+                    ..
+                }
+                | mir::FunctionExpression::MixedPayload {
+                    mixed: local,
+                    transfer: false,
+                    ..
+                } => *local,
+                _ => {
+                    return Err(malformed_mir(
+                        "writable indirect call does not use a borrowed local carrier",
+                    ));
+                }
             };
-            if !local_in(caller, *local)?.writable {
+            if !local_in(caller, local)?.writable {
                 return Err(malformed_mir(
                     "writable indirect call uses a readonly function carrier",
                 ));
@@ -3347,27 +3354,11 @@ fn validate_function_assignment_ownership(
 }
 
 fn function_expression_is_borrowed(value: &mir::FunctionExpression) -> bool {
-    match value {
-        mir::FunctionExpression::Create { .. } | mir::FunctionExpression::Call { .. } => false,
-        mir::FunctionExpression::Local { transfer, .. } => !transfer,
-        mir::FunctionExpression::Property { .. } => true,
-        mir::FunctionExpression::CollectionIndex { remove, .. } => !remove,
-        mir::FunctionExpression::AssumePresent { value, .. } => {
-            nullable_function_expression_is_borrowed(value)
-        }
-    }
+    mir::function_expression_is_borrowed(value)
 }
 
 fn nullable_function_expression_is_borrowed(value: &mir::NullableFunctionExpression) -> bool {
-    match value {
-        mir::NullableFunctionExpression::Null { .. }
-        | mir::NullableFunctionExpression::Call { .. } => false,
-        mir::NullableFunctionExpression::Present(value) => function_expression_is_borrowed(value),
-        mir::NullableFunctionExpression::Local { transfer, .. } => !transfer,
-        mir::NullableFunctionExpression::Property { .. }
-        | mir::NullableFunctionExpression::DictionaryGet { .. } => true,
-        mir::NullableFunctionExpression::CollectionIndex { remove, .. } => !remove,
-    }
+    mir::nullable_function_expression_is_borrowed(value)
 }
 
 fn validate_function_expression(
@@ -3523,6 +3514,12 @@ fn validate_function_expression(
                 *positional,
             )
         }
+        mir::FunctionExpression::MixedPayload { mixed, .. } => validate_mixed_payload_operand(
+            function,
+            *mixed,
+            mir::MixedTag::Function(expected),
+            mir::Type::Function(expected),
+        ),
         mir::FunctionExpression::AssumePresent { value, .. } => {
             if value.function_type() != expected {
                 return Err(malformed_mir(
@@ -5450,6 +5447,18 @@ fn validate_mixed_expression(
         mir::MixedExpression::BoxPayloadEnum { value } => {
             validate_payload_enum_expression(program, function, value)
         }
+        mir::MixedExpression::BoxFunction {
+            value,
+            payload_owned,
+        } => {
+            validate_function_expression(program, function, value)?;
+            if *payload_owned == mir::function_expression_is_borrowed(value) {
+                return Err(malformed_mir(
+                    "mixed function box ownership disagrees with its carrier expression",
+                ));
+            }
+            Ok(())
+        }
         mir::MixedExpression::CollectionIndex {
             positional,
             collection,
@@ -6550,6 +6559,12 @@ fn infer_function_expression_return_borrow(
         mir::FunctionExpression::CollectionIndex { collection, .. } => {
             infer_local_return_borrow(program, function, *collection)
         }
+        mir::FunctionExpression::MixedPayload {
+            mixed,
+            transfer: false,
+            ..
+        } => infer_local_return_borrow(program, function, *mixed),
+        mir::FunctionExpression::MixedPayload { transfer: true, .. } => Ok(None),
         mir::FunctionExpression::Call {
             return_borrow: None,
             ..
@@ -6945,6 +6960,7 @@ fn infer_mixed_expression_return_borrow(
         | mir::MixedExpression::BoxClass { .. }
         | mir::MixedExpression::BoxError { .. }
         | mir::MixedExpression::BoxPayloadEnum { .. }
+        | mir::MixedExpression::BoxFunction { .. }
         | mir::MixedExpression::CollectionIndex { transfer: true, .. } => Ok(None),
     }
 }
@@ -7643,6 +7659,11 @@ fn collect_function_class_local_accesses<'a>(
         mir::FunctionExpression::AssumePresent { value, .. } => {
             collect_nullable_function_class_local_accesses(value, accesses)
         }
+        mir::FunctionExpression::MixedPayload {
+            function_type,
+            mixed,
+            ..
+        } => accesses.assume_mixed_tag(*mixed, mir::MixedTag::Function(*function_type)),
         mir::FunctionExpression::Local { .. } | mir::FunctionExpression::Property { .. } => {}
     }
 }
@@ -8138,6 +8159,9 @@ fn collect_mixed_class_local_accesses<'a>(
         }
         mir::MixedExpression::BoxPayloadEnum { value } => {
             collect_payload_enum_class_local_accesses(value, accesses)
+        }
+        mir::MixedExpression::BoxFunction { value, .. } => {
+            collect_function_class_local_accesses(value, accesses)
         }
         mir::MixedExpression::Call { function, args, .. } => {
             accesses.begin_call();
@@ -12252,7 +12276,9 @@ fn function_observes_property(
         mir::FunctionExpression::AssumePresent { value, .. } => {
             nullable_function_observes_property(value, receiver, property)
         }
-        mir::FunctionExpression::Local { .. } => false,
+        mir::FunctionExpression::Local { .. } | mir::FunctionExpression::MixedPayload { .. } => {
+            false
+        }
     }
 }
 
@@ -12795,6 +12821,9 @@ fn mixed_observes_property(
         }
         mir::MixedExpression::BoxPayloadEnum { value } => {
             payload_enum_observes_property(value, receiver, property)
+        }
+        mir::MixedExpression::BoxFunction { value, .. } => {
+            function_observes_property(value, receiver, property)
         }
         mir::MixedExpression::Call { args, .. } => args
             .iter()
@@ -14036,6 +14065,9 @@ fn validate_condition(
             }
             if let mir::MixedTag::PayloadEnum(payload) = tag {
                 validate_payload_enum_type(program, *payload)?;
+            }
+            if let mir::MixedTag::Function(function_type) = tag {
+                function_type_in(program, *function_type)?;
             }
             Ok(())
         }

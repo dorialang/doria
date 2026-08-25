@@ -345,12 +345,12 @@ Runner** and non-blocking; the accepted performance standard is unchanged.
 Stage 29 is complete. The pre-Stage-30 closure grammar slice is complete:
 Decision 0120's base closure forms and function-type spelling now parse into
 source-preserving AST nodes. Decision 0121 accepts complete closure effect and
-function-type authority. Stages 30a through 30g are complete: valid closures
+function-type authority. Stages 30a through 30h are complete: valid closures
 lower through closure-aware HIR and structural MIR, checked indirect calls reuse
 this decision's Error model, and the debug interpreter, Cranelift, LLVM, and PHP
 compatibility backend execute the supported surface. List algorithm calls carry
 their callback's exact checked effects and use the same propagation and cleanup
-model. Stage 30h is next and Stage 30 remains incomplete.
+model. Stage 30 is complete and Stage 31 is next.
 
 ## Explicit Exclusions
 

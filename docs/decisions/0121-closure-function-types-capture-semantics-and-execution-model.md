@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-19
 - **Date:** 2026-08-19
-- **Implementation Status:** Authority Accepted; Stages 30a Through 30g Implemented; Stage 30h Next; Stage 30 Not Complete
+- **Implementation Status:** Authority Accepted; Stages 30a Through 30h Implemented; Stage 30 Complete
 - **Scope:** Function types, closure invocation, capture validation, ownership,
   lifetime, representation, backend behavior, diagnostics, and Stage 30
   `List<T>` algorithms
@@ -44,7 +44,9 @@ explicit semantic and HIR List algorithm plans plus validated MIR traversal CFG
 for `map`, Copy-only `filter`, and writable-accumulator `reduce`. The debug
 interpreter, Cranelift, LLVM, and PHP compatibility execute the supported
 surface with exact callback effects, readonly source traversal, and checked
-partial-state cleanup. Stage 30 remains in progress and is not complete.
+partial-state cleanup. Stage 30h completes the accepted mixed function-value
+representation, storage-route audit, tooling integration, UAT, and portable
+benchmark closure. Stage 30 is complete.
 
 ```text
 Stage 30a Callable Grammar Completion — Complete
@@ -54,9 +56,10 @@ Stage 30d Closure HIR/MIR And Interpreter Oracle — Complete
 Stage 30e Native Execution — Complete
 Stage 30f PHP Compatibility — Complete
 Stage 30g List Algorithms — Complete
-Stage 30h Cross-Repository Closure — Next
-Stage 30 — In Progress, Not Complete
-E0641 — Catalogued But Unreachable For The Supported Stage 30g Surface
+Stage 30h Cross-Repository Closure — Complete
+Stage 30 — Complete
+E0641 — Historical And Reserved
+Stage 31 — Next
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping
@@ -352,7 +355,7 @@ provenance. `List<T>` algorithm callbacks are nonescaping.
 | `Deque` elements | Supported |
 | Enum payloads | Supported |
 | Nullable values | Supported |
-| `mixed` | Supported only in the final representation slice |
+| `mixed` | Supported |
 | Generic arguments | Supported invariantly |
 | Shared-reference payloads | Deferred |
 
@@ -550,9 +553,9 @@ Stage 30h - Cross-Repository Closure
 - **Stage 30g — Complete:** the three `List<T>` algorithms, internal effect
   specialization, partial-result and accumulator cleanup, shared MIR validation,
   and interpreter/Cranelift/LLVM/PHP parity.
-- **Stage 30h — Next:** final language-server semantics, installed-toolchain refresh,
-  website/playground activation, benchmark closure, final audit, and historical
-  E0641.
+- **Stage 30h — Complete:** mixed function-value carriers, final storage-route
+  and E0641 audits, language-server/editor alignment, installed-toolchain
+  refresh, website/playground activation, and portable benchmark closure.
 
 Every slice remains independently testable and does not hide future-slice work
 inside backend conveniences.
@@ -616,17 +619,17 @@ Stage 30 gate and does not convert missing evidence into a pass.
 - Runtime representation is compact without becoming reflective.
 - `List<T>` algorithms have exact callback, ownership, order, and failure
   contracts rather than a nominal method list.
-- Stage 30 implementation is risk-separated and E0641 remains honest until each
-  route exists.
+- Stage 30 implementation is risk-separated. E0641 is historical and reserved
+  now that every accepted route has an intentional outcome.
 
 ## Affected Components
 
-Future Stage 30 work affects parser/AST, semantic types and binding identities,
+Stage 30 implementation affected parser/AST, semantic types and binding identities,
 ownership/lifetime/escape checking, HIR/MIR and validation, interpreter,
 Cranelift, LLVM, PHP compatibility, diagnostics, `List<T>` algorithms,
 language-server/editor tooling, website/playground material, installed tooling,
-and benchmark infrastructure. This authority beat changes none of those
-executing components.
+and benchmark infrastructure. Stage 30h closes those routes without changing
+the accepted semantics or deferrals.
 
 ## Invalidated elsewhere
 
@@ -644,5 +647,5 @@ executing components.
   closure semantics or execution route.
 - The website's versioned closure guides, `List<T>` API contract, target-state
   collection matrix, writable-callback fixture, tests, and release lock are
-  synchronized in this authority beat. Stage 30h still owns activation against
-  executing compiler support rather than changing the accepted public contract.
+  synchronized with executing compiler support. Stage 30h changes no accepted
+  public contract.

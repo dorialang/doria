@@ -57,9 +57,8 @@ function check_stage30g_list_algorithms(string $root): array
             'Stage 30g List Algorithms',
             'Complete',
             'Stage 30h Cross-Repository Closure',
-            'Next',
             'Stage 30',
-            'Not Complete',
+            'Complete',
         ]);
     }
     $forbid($paths['decision'], $files['decision'], ['Stage 30g Next']);

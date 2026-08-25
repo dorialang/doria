@@ -11219,6 +11219,7 @@ fn non_null_match_type(ty: mir::Type) -> (mir::Type, bool) {
             (mir::Type::WritableSharedReferenceAccess(payload), true)
         }
         mir::Type::NullablePayloadEnum(ty) => (mir::Type::PayloadEnum(ty), true),
+        mir::Type::NullableFunction(function_type) => (mir::Type::Function(function_type), true),
         other => (other, false),
     }
 }
@@ -11319,6 +11320,15 @@ fn match_presence_condition(
                 mode: mir::PayloadEnumUseMode::Borrow,
             }),
         ),
+        mir::Type::NullableFunction(function_type) => {
+            mir::BoolExpression::NullableFunctionIsPresent(Box::new(
+                mir::NullableFunctionExpression::Local {
+                    function_type,
+                    local,
+                    transfer: false,
+                },
+            ))
+        }
         mir::Type::Mixed => mir::BoolExpression::NullableMixedIsPresent(Box::new(
             mir::NullableMixedExpression::Mixed(mir::MixedExpression::Local {
                 local,
@@ -11544,6 +11554,16 @@ fn narrowed_match_local_rvalue(
                 mode: payload_enum_use_mode(target, transfer),
             })
         }
+        (mir::Type::NullableFunction(source), mir::Type::Function(target)) if source == target => {
+            mir::Rvalue::Function(mir::FunctionExpression::AssumePresent {
+                function_type: target,
+                value: Box::new(mir::NullableFunctionExpression::Local {
+                    function_type: source,
+                    local,
+                    transfer,
+                }),
+            })
+        }
         (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::Scalar(target)) => {
             mir::Rvalue::Value(value_expression_from_operand(
                 target,
@@ -11568,6 +11588,13 @@ fn narrowed_match_local_rvalue(
                 ty,
                 place: mir::PayloadEnumPlace::MixedPayload { mixed: local },
                 mode: payload_enum_use_mode(ty, transfer),
+            })
+        }
+        (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::Function(function_type)) => {
+            mir::Rvalue::Function(mir::FunctionExpression::MixedPayload {
+                function_type,
+                mixed: local,
+                transfer,
             })
         }
         (source, target) if source == target => local_rvalue(local, target, transfer),
@@ -13564,6 +13591,19 @@ fn lower_function_expression(
                         }),
                     })
                 }
+                mir::Type::Mixed | mir::Type::NullableMixed
+                    if context
+                        .exact_mixed_local(expr)
+                        .is_some_and(|(_, narrowed)| {
+                            narrowed == mir::Type::Function(function_type)
+                        }) =>
+                {
+                    Ok(mir::FunctionExpression::MixedPayload {
+                        function_type,
+                        mixed: local,
+                        transfer,
+                    })
+                }
                 _ => Err(vec![unsupported(*span, "local has another callable type")]),
             }
         }
@@ -13708,6 +13748,30 @@ fn lower_nullable_function_expression(
             }
         }
         hir::Expr::PropertyAccess { .. } => {
+            if let Some((collection, key, value_type, access)) =
+                lower_collection_nullable_property(expr, context)?
+            {
+                let (mir::Type::Function(actual) | mir::Type::NullableFunction(actual)) =
+                    value_type
+                else {
+                    return Err(vec![unsupported(
+                        expr.span(),
+                        "collection property returns another nullable value type",
+                    )]);
+                };
+                if actual != function_type {
+                    return Err(vec![unsupported(
+                        expr.span(),
+                        "collection property returns another nullable callable type",
+                    )]);
+                }
+                return Ok(mir::NullableFunctionExpression::DictionaryGet {
+                    function_type,
+                    collection,
+                    key: Box::new(key),
+                    access,
+                });
+            }
             let (object, property) =
                 lower_property_operand(expr, mir::Type::NullableFunction(function_type), context)?;
             Ok(mir::NullableFunctionExpression::Property {
@@ -13757,6 +13821,30 @@ fn lower_nullable_function_expression(
             span,
             null_safe: false,
         } => {
+            if let Some((collection, key, value_type, access)) =
+                lower_dictionary_get(object, method, args, context)?
+            {
+                let (mir::Type::Function(actual) | mir::Type::NullableFunction(actual)) =
+                    value_type
+                else {
+                    return Err(vec![unsupported(
+                        *span,
+                        "collection method returns another nullable value type",
+                    )]);
+                };
+                if actual != function_type {
+                    return Err(vec![unsupported(
+                        *span,
+                        "collection method returns another nullable callable type",
+                    )]);
+                }
+                return Ok(mir::NullableFunctionExpression::DictionaryGet {
+                    function_type,
+                    collection,
+                    key: Box::new(key),
+                    access,
+                });
+            }
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
             if signature.return_type
@@ -15808,6 +15896,14 @@ fn lower_mixed_expression(
         mir::Type::PayloadEnum(ty) => Ok(mir::MixedExpression::BoxPayloadEnum {
             value: Box::new(lower_payload_enum_expression(expr, ty, transfer, context)?),
         }),
+        mir::Type::Function(function_type) => {
+            let value = lower_function_expression(expr, function_type, transfer, context)?;
+            let payload_owned = !mir::function_expression_is_borrowed(&value);
+            Ok(mir::MixedExpression::BoxFunction {
+                value: Box::new(value),
+                payload_owned,
+            })
+        }
         mir::Type::Mixed => Err(vec![unsupported(
             expr.span(),
             "mixed expression could not be lowered as a mixed value",
@@ -15848,13 +15944,11 @@ fn lower_mixed_expression(
             "boxing nullable values into `mixed` lands after Stage 23 Slice 3",
             expr.span(),
         )]),
-        mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
-            Err(vec![Diagnostic::unsupported_stage(
-                "M1101",
-                "boxing function values into `mixed` is not part of the Stage 30 closure runtime",
-                expr.span(),
-            )])
-        }
+        mir::Type::NullableFunction(_) => Err(vec![Diagnostic::unsupported_stage(
+            "M1101",
+            "boxing a nullable function value into `mixed` requires an explicit present value",
+            expr.span(),
+        )]),
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source values")
         }
@@ -15880,11 +15974,12 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
-                | mir::Type::NullableReadonlySharedReferenceAccess(_)
-                | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             Err(vec![shared_ownership_mixed_runtime_unsupported(span)])
         }
         mir::Type::Class(class) => Ok(mir::MixedTag::Class(class)),
+        mir::Type::Function(function_type) => Ok(mir::MixedTag::Function(function_type)),
         mir::Type::Mixed
         | mir::Type::NullableMixed
         | mir::Type::NullableScalar(_)
@@ -15894,10 +15989,9 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         | mir::Type::NullableCollection(_)
         | mir::Type::Collection(_)
         | mir::Type::NullablePayloadEnum(_)
-        | mir::Type::Function(_)
         | mir::Type::NullableFunction(_) => Err(vec![Diagnostic::unsupported_stage(
             "M1101",
-            "only exact bool, integer, float, string, and concrete-class `is` tests unbox `mixed` in Stage 23 Slice 3",
+            "this type has no exact runtime `mixed` tag",
             span,
         )]),
         mir::Type::ClosureEnvironment(_) => {

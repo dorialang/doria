@@ -36,6 +36,12 @@ enum DictionaryProjection {
     Values,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MixedBoxPlan {
+    pub source_type: ResolvedType,
+    pub nullable_target: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SemanticInfo {
     /// Canonical integer type for every integer-valued source expression.
@@ -48,12 +54,12 @@ pub struct SemanticInfo {
     pub float_expression_types: HashMap<(usize, usize), FloatType>,
     /// Resolved semantic type for checked expressions, independent of backend layout.
     pub expression_types: HashMap<(usize, usize), ResolvedType>,
-    /// Concrete source type at each value-to-`mixed` boundary.
+    /// Concrete transport plan at each value-to-`mixed` boundary.
     ///
     /// Compatibility backends use this semantic fact to preserve Doria's exact
     /// runtime identity instead of reconstructing it from a host value after
     /// width, signedness, or nominal identity has been erased.
-    pub mixed_box_types: HashMap<(usize, usize), ResolvedType>,
+    pub mixed_box_plans: HashMap<(usize, usize), MixedBoxPlan>,
     /// Resolved enum case for each unit/backed case expression.
     pub enum_case_values: HashMap<(usize, usize), EnumValue>,
     /// Resolved payload-enum construction for each checked case call.
@@ -587,7 +593,7 @@ pub fn analyze_program_for_ide_with_source<'source>(
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
             expression_types: checker.expression_types,
-            mixed_box_types: checker.mixed_box_types,
+            mixed_box_plans: checker.mixed_box_plans,
             enum_case_values: checker.enum_case_values,
             enum_case_constructions: checker.enum_case_constructions,
             type_test_types: checker.type_test_types,
@@ -1249,7 +1255,7 @@ struct Checker<'program> {
     integer_expression_types: HashMap<(usize, usize), IntegerType>,
     float_expression_types: HashMap<(usize, usize), FloatType>,
     expression_types: HashMap<(usize, usize), ResolvedType>,
-    mixed_box_types: HashMap<(usize, usize), ResolvedType>,
+    mixed_box_plans: HashMap<(usize, usize), MixedBoxPlan>,
     enum_case_values: HashMap<(usize, usize), EnumValue>,
     enum_case_constructions: HashMap<(usize, usize), EnumCaseId>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
@@ -1866,7 +1872,7 @@ impl<'program> Checker<'program> {
             integer_expression_types: HashMap::new(),
             float_expression_types: HashMap::new(),
             expression_types: HashMap::new(),
-            mixed_box_types: HashMap::new(),
+            mixed_box_plans: HashMap::new(),
             enum_case_values: HashMap::new(),
             enum_case_constructions: HashMap::new(),
             type_test_types: HashMap::new(),
@@ -9621,6 +9627,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::Bool
                 | TypeKind::Enum(_)
                 | TypeKind::Class(_)
+                | TypeKind::Function(_)
         )
     }
 
@@ -13978,12 +13985,20 @@ impl<'program> Checker<'program> {
     }
 
     fn record_mixed_boundary(&mut self, target: TypeId, value_expr: &Expr, value: TypeId) {
-        if matches!(self.types.kind(target), TypeKind::Mixed)
+        let nullable_target = matches!(
+            self.types.kind(target),
+            TypeKind::Nullable(inner) if matches!(self.types.kind(*inner), TypeKind::Mixed)
+        );
+        if (matches!(self.types.kind(target), TypeKind::Mixed) || nullable_target)
             && !matches!(self.types.kind(value), TypeKind::Mixed | TypeKind::Unknown)
+            && !(nullable_target && matches!(self.types.kind(value), TypeKind::Null))
         {
-            self.mixed_box_types.insert(
+            self.mixed_box_plans.insert(
                 (value_expr.span().start, value_expr.span().end),
-                self.types.resolved(value),
+                MixedBoxPlan {
+                    source_type: self.types.resolved(value),
+                    nullable_target,
+                },
             );
         }
     }
@@ -15619,7 +15634,12 @@ impl<'program> Checker<'program> {
         record_boundary: bool,
     ) -> bool {
         self.complete_generic_call_from_expected(value_expr, target);
-        if record_boundary && matches!(self.types.kind(target), TypeKind::Mixed) {
+        let target_is_mixed_boundary = matches!(self.types.kind(target), TypeKind::Mixed)
+            || matches!(
+                self.types.kind(target),
+                TypeKind::Nullable(inner) if matches!(self.types.kind(*inner), TypeKind::Mixed)
+            );
+        if record_boundary && target_is_mixed_boundary {
             let value = self.infer_expr_type(value_expr, scopes, method_context);
             self.record_mixed_boundary(target, value_expr, value);
         }
@@ -18789,6 +18809,7 @@ impl<'program> Checker<'program> {
                     | TypeKind::Bool
                     | TypeKind::Enum(_)
                     | TypeKind::Class(_)
+                    | TypeKind::Function(_)
                     | TypeKind::Unknown
             )
         {

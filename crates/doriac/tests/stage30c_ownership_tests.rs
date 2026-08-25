@@ -679,11 +679,29 @@ function main(): void
 }
 
 #[test]
-fn mixed_static_and_shared_function_storage_use_development_boundaries() {
-    let mixed = analyze("function main(): void { mixed $value = fn() => 1; }");
-    let mixed_boundary = diagnostic(&mixed.diagnostics, "E0661");
-    assert!(mixed_boundary.development_only);
-    assert!(mixed_boundary.title.contains("Mixed Representation"));
+fn mixed_function_storage_is_complete_while_static_and_shared_storage_remain_deferred() {
+    let mixed = analyze(
+        r#"
+function inspect(mixed $value): void {}
+function consume(take mixed $value): void {}
+function boxed(): mixed { return fn() => 13; }
+function main(): void
+{
+    let $callback = fn() => 42;
+    inspect($callback);
+    $callback();
+    consume(fn() => 1);
+    mixed $returned = boxed();
+    writable mixed $stored = fn() => 2;
+    $stored = fn() => 3;
+}
+"#,
+    );
+    assert!(
+        language_errors(&mixed.diagnostics).is_empty(),
+        "{:#?}",
+        mixed.diagnostics
+    );
 
     let static_storage = analyze(
         r#"

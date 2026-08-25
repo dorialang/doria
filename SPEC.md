@@ -481,9 +481,9 @@ PHP compatibility uses compiler-generated function carriers, explicit capture
 environments, and stable BindingId-backed places derived from semantic and
 validated MIR authority. PHP automatic capture, host `callable`, capture
 `use (...)`, and PHP references do not define Doria closure or borrowing
-semantics. No-capture closures create no PHP environment. `E0641` is unreachable
-for supported plain closure execution but remains catalogued until the Stage 30h
-audit. Unrelated PHP compatibility boundaries remain independent.
+semantics. No-capture closures create no PHP environment. `E0641` is historical
+and remains reserved; no accepted Stage 30 route emits it. Unrelated PHP
+compatibility boundaries remain independent.
 
 ```text
 Stage 30a Callable Grammar Completion - Complete
@@ -493,9 +493,9 @@ Stage 30d Closure HIR/MIR And Interpreter Oracle - Complete
 Stage 30e Native Execution - Complete
 Stage 30f PHP Compatibility - Complete
 Stage 30g List Algorithms - Complete
-Stage 30h Cross-Repository Closure - Next
-Stage 30 - In Progress, Not Complete
-E0641 - Catalogued But Unreachable For The Supported Stage 30g Surface
+Stage 30h Cross-Repository Closure - Complete
+Stage 30 - Complete
+E0641 - Historical And Reserved
 ```
 
 Methods receive readonly `$this` by default. A method that mutates `$this` must be declared with `writable function`.

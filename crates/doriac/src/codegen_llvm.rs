@@ -52,24 +52,24 @@ use crate::native_abi::{
     COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW,
     COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
     FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
-    MIXED_NEW_AGGREGATE, MIXED_NEW_BORROWED, MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG,
-    MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM, MIXED_TAG_ERROR, MIXED_TAG_FLOAT32,
-    MIXED_TAG_FLOAT64, MIXED_TAG_INT16, MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8,
-    MIXED_TAG_PAYLOAD_ENUM, MIXED_TAG_STRING, MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64,
-    MIXED_TAG_UINT8, MIXED_TYPE_ID, NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE,
-    READ_FILE_BYTES, READ_STDIN_BYTES, READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE,
-    SHARED_CREATE_WEAK, SHARED_PAYLOAD, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
-    STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
-    STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
-    STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
-    STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
-    STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY,
-    STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER,
-    STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT,
-    STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
-    STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
-    STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
-    WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
+    MIXED_NEW_AGGREGATE, MIXED_NEW_AGGREGATE_BORROWED, MIXED_NEW_BORROWED, MIXED_PAYLOAD,
+    MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM,
+    MIXED_TAG_ERROR, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_FUNCTION, MIXED_TAG_INT16,
+    MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_PAYLOAD_ENUM, MIXED_TAG_STRING,
+    MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID,
+    NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
+    READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD,
+    SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE,
+    STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES,
+    STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE,
+    STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64,
+    STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF,
+    STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF,
+    STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END,
+    STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE,
+    STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM,
+    STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR,
+    STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
     WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS, WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK,
     WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
     WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
@@ -6061,6 +6061,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 remove,
                 ..
             } => self.lower_function_collection_index(*collection, index, *positional, *remove),
+            mir::FunctionExpression::MixedPayload {
+                mixed, transfer, ..
+            } => self.lower_mixed_function_payload(*mixed, *transfer),
         }
     }
 
@@ -13176,6 +13179,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::MixedTag::Error => (MIXED_TAG_ERROR, 0),
             mir::MixedTag::Enum(enum_id) => (MIXED_TAG_ENUM, enum_id.0 as u32),
             mir::MixedTag::PayloadEnum(ty) => (MIXED_TAG_PAYLOAD_ENUM, ty.id.0 as u32),
+            mir::MixedTag::Function(ty) => (MIXED_TAG_FUNCTION, ty.0 as u32),
         }
     }
 
@@ -13312,6 +13316,56 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         ],
                     )?
                     .ok_or_else(|| backend_failure("mixed Error allocation produced no result"))?
+                    .into_pointer_value())
+            }
+            mir::MixedExpression::BoxFunction {
+                value,
+                payload_owned,
+            } => {
+                let function_type = value.function_type();
+                let value = self.lower_function_expression(value)?;
+                let carrier_type = closure_carrier_type(self.context);
+                let source = self.entry_alloca(carrier_type, "mixed.function")?;
+                build(self.builder.build_store(source, value))?;
+                let (tag, type_id) = self.mixed_tag_value(mir::MixedTag::Function(function_type));
+                let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+                Ok(self
+                    .call_runtime(
+                        if *payload_owned {
+                            MIXED_NEW_AGGREGATE
+                        } else {
+                            MIXED_NEW_AGGREGATE_BORROWED
+                        },
+                        &[
+                            self.context.i8_type().into(),
+                            self.context.i32_type().into(),
+                            pointer.into(),
+                            usize_type.into(),
+                            usize_type.into(),
+                        ],
+                        Some(pointer.into()),
+                        &[
+                            self.context
+                                .i8_type()
+                                .const_int(u64::from(tag), false)
+                                .into(),
+                            self.context
+                                .i32_type()
+                                .const_int(u64::from(type_id), false)
+                                .into(),
+                            source.into(),
+                            usize_type
+                                .const_int(self.target_data.get_store_size(&carrier_type), false)
+                                .into(),
+                            usize_type
+                                .const_int(
+                                    u64::from(self.target_data.get_abi_alignment(&carrier_type)),
+                                    false,
+                                )
+                                .into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("mixed function allocation produced no result"))?
                     .into_pointer_value())
             }
             mir::MixedExpression::BoxPayloadEnum { value } => {
@@ -13576,6 +13630,62 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         self.collection_word_to_value(payload, tag.ty())
     }
 
+    fn lower_mixed_function_payload(
+        &mut self,
+        mixed: mir::LocalId,
+        transfer: bool,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let slot = local_slot(&self.local_slots, mixed)?;
+        let mixed_value = build(
+            self.builder
+                .build_load(pointer, slot, "mixed.function.local"),
+        )?
+        .into_pointer_value();
+        let payload = self
+            .call_runtime(
+                MIXED_PAYLOAD,
+                &[pointer.into()],
+                Some(self.context.i64_type().into()),
+                &[mixed_value.into()],
+            )?
+            .ok_or_else(|| backend_failure("mixed function payload read produced no result"))?
+            .into_int_value();
+        let address = build(self.builder.build_int_to_ptr(
+            payload,
+            pointer,
+            "mixed.function.payload",
+        ))?;
+        let value = build(self.builder.build_load(
+            closure_carrier_type(self.context),
+            address,
+            "mixed.function.value",
+        ))?
+        .into_struct_value();
+        if transfer {
+            build(self.builder.build_store(slot, pointer.const_null()))?;
+            let final_claim = self
+                .call_runtime(
+                    MIXED_RELEASE_OWNED,
+                    &[pointer.into()],
+                    Some(self.context.i8_type().into()),
+                    &[mixed_value.into()],
+                )?
+                .ok_or_else(|| backend_failure("mixed function move released no ownership claim"))?
+                .into_int_value();
+            let no_claim = build(self.builder.build_int_compare(
+                IntPredicate::EQ,
+                final_claim,
+                self.context.i8_type().const_zero(),
+                "mixed.function.move.shared",
+            ))?;
+            self.lower_panic_if_code_at_active_site(no_claim, "P1321")?;
+            let _ =
+                self.call_runtime(MIXED_FREE, &[pointer.into()], None, &[mixed_value.into()])?;
+        }
+        Ok(value)
+    }
+
     fn lower_take_mixed_payload(
         &mut self,
         local: mir::LocalId,
@@ -13650,10 +13760,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             i8_type.const_int(u64::from(expected_tag), false),
             "mixed.tag.matches",
         ))?;
-        let result = if matches!(
-            tag,
-            mir::MixedTag::Class(_) | mir::MixedTag::Enum(_) | mir::MixedTag::PayloadEnum(_)
-        ) {
+        let result = if tag.has_structural_type_id() {
             let actual_type_id = self
                 .call_runtime(
                     MIXED_TYPE_ID,
@@ -13798,6 +13905,38 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         build(self.builder.build_unconditional_branch(after_error))?;
 
         self.builder.position_at_end(after_error);
+        let function_block = self
+            .context
+            .append_basic_block(function, "mixed.drop.function");
+        let after_function = self
+            .context
+            .append_basic_block(function, "mixed.drop.after.function");
+        let is_function = build(self.builder.build_int_compare(
+            IntPredicate::EQ,
+            tag,
+            i8_type.const_int(u64::from(MIXED_TAG_FUNCTION), false),
+            "mixed.drop.is_function",
+        ))?;
+        build(
+            self.builder
+                .build_conditional_branch(is_function, function_block, after_function),
+        )?;
+        self.builder.position_at_end(function_block);
+        let carrier_address = build(self.builder.build_int_to_ptr(
+            payload,
+            pointer,
+            "mixed.function.address",
+        ))?;
+        let carrier = build(self.builder.build_load(
+            closure_carrier_type(self.context),
+            carrier_address,
+            "mixed.function.value",
+        ))?
+        .into_struct_value();
+        self.drop_function_carrier(carrier)?;
+        build(self.builder.build_unconditional_branch(after_function))?;
+
+        self.builder.position_at_end(after_function);
         let class_block = self
             .context
             .append_basic_block(function, "mixed.drop.class");

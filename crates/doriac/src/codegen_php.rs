@@ -505,7 +505,10 @@ function __doria_take_cell(__DoriaCell $cell): mixed
 
 function __doria_drop_value(mixed &$value): void
 {
-    if ($value instanceof __DoriaFunctionValue) {
+    if ($value instanceof __DoriaMixedValue) {
+        $payload = $value->value();
+        __doria_drop_value($payload);
+    } elseif ($value instanceof __DoriaFunctionValue) {
         $value->__doriaDrop();
     } elseif (is_array($value)) {
         foreach (array_reverse(array_keys($value)) as $key) {
@@ -848,6 +851,9 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
 
     let mut output = String::from(
         "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\ninterface __DoriaValueEquatable\n{\n    public function __doriaEquals(mixed $other): bool;\n}\n\nfinal class __DoriaMixedValue\n{\n    public function __construct(\n        private readonly string $typeTag,\n        private mixed $value,\n    ) {\n    }\n\n    public function is(string $typeTag): bool { return $this->typeTag === $typeTag; }\n    public function value(): mixed { return $this->value; }\n}\n\nfunction __doria_box_mixed(string $typeTag, mixed $value): __DoriaMixedValue\n{\n    if ($typeTag === 'float32') { $value = unpack('G', pack('G', $value))[1]; }\n    return new __DoriaMixedValue($value === null ? 'null' : $typeTag, $value);\n}\n\nfunction __doria_mixed_is(mixed $value, string $typeTag): bool\n{\n    return $value instanceof __DoriaMixedValue && $value->is($typeTag);\n}\n\nfunction __doria_mixed_value(mixed $value): mixed\n{\n    return $value instanceof __DoriaMixedValue ? $value->value() : $value;\n}\n\nfunction __doria_equal(mixed $left, mixed $right): bool\n{\n    if ($left instanceof __DoriaValueEquatable) { return $left->__doriaEquals($right); }\n    if ($right instanceof __DoriaValueEquatable) { return $right->__doriaEquals($left); }\n    return $left === $right;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
+    );
+    output.push_str(
+        "function __doria_box_nullable_mixed(string $typeTag, mixed $value): mixed\n{\n    return $value === null ? null : __doria_box_mixed($typeTag, $value);\n}\n\n",
     );
     if program
         .semantic_info
@@ -1583,7 +1589,7 @@ function __doria_printf(
     scopes.given_preludes = program.semantic_info.given_preludes.clone();
     scopes.expression_types = program.semantic_info.expression_types.clone();
     scopes.type_test_types = program.semantic_info.type_test_types.clone();
-    scopes.mixed_box_types = program.semantic_info.mixed_box_types.clone();
+    scopes.mixed_box_plans = program.semantic_info.mixed_box_plans.clone();
     scopes.throw_error_types = program.semantic_info.throw_error_types.clone();
     scopes.catch_error_types = program.semantic_info.catch_error_types.clone();
     scopes.const_evaluation = program.semantic_info.const_evaluation.clone();
@@ -2708,7 +2714,7 @@ struct PhpNameScopes {
     given_preludes: HashMap<(usize, usize), GivenSemanticInfo>,
     expression_types: HashMap<(usize, usize), ResolvedType>,
     type_test_types: HashMap<(usize, usize), ResolvedType>,
-    mixed_box_types: HashMap<(usize, usize), ResolvedType>,
+    mixed_box_plans: HashMap<(usize, usize), crate::semantics::MixedBoxPlan>,
     throw_error_types: HashMap<(usize, usize), ResolvedType>,
     catch_error_types: HashMap<(usize, usize), ResolvedType>,
     const_evaluation: Evaluation,
@@ -2765,7 +2771,7 @@ impl PhpNameScopes {
             given_preludes: HashMap::new(),
             expression_types: HashMap::new(),
             type_test_types: HashMap::new(),
-            mixed_box_types: HashMap::new(),
+            mixed_box_plans: HashMap::new(),
             throw_error_types: HashMap::new(),
             catch_error_types: HashMap::new(),
             const_evaluation: Evaluation::default(),
@@ -2791,7 +2797,7 @@ impl PhpNameScopes {
         scopes.given_preludes = self.given_preludes.clone();
         scopes.expression_types = self.expression_types.clone();
         scopes.type_test_types = self.type_test_types.clone();
-        scopes.mixed_box_types = self.mixed_box_types.clone();
+        scopes.mixed_box_plans = self.mixed_box_plans.clone();
         scopes.throw_error_types = self.throw_error_types.clone();
         scopes.catch_error_types = self.catch_error_types.clone();
         scopes.const_evaluation = self.const_evaluation.clone();
@@ -4937,15 +4943,20 @@ fn emit_range_foreach(
 
 fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
     let emitted = emit_expr_unboxed(expr, scopes);
-    let Some(source_type) = scopes
-        .mixed_box_types
+    let Some(plan) = scopes
+        .mixed_box_plans
         .get(&(expr.span().start, expr.span().end))
     else {
         return emitted;
     };
+    let helper = if plan.nullable_target {
+        "__doria_box_nullable_mixed"
+    } else {
+        "__doria_box_mixed"
+    };
     format!(
-        "__doria_box_mixed({}, {emitted})",
-        emit_php_string_literal(&php_mixed_type_tag(source_type))
+        "{helper}({}, {emitted})",
+        emit_php_string_literal(&php_mixed_type_tag(&plan.source_type))
     )
 }
 
@@ -5104,10 +5115,10 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 .map(PhpBindingPlace::read)
                 .unwrap_or_else(|| format!("${}", scopes.php_name(name)));
             if scopes.is_mixed_binding(name)
-                && !matches!(
-                    scopes.expression_types.get(&(span.start, span.end)),
-                    Some(ResolvedType::Mixed) | None
-                )
+                && scopes
+                    .expression_types
+                    .get(&(span.start, span.end))
+                    .is_some_and(|ty| !is_mixed_storage_type(ty))
             {
                 format!("__doria_mixed_value({value})")
             } else {
@@ -5611,9 +5622,9 @@ fn emit_php_match_condition(
                 Some(format!("{value} === {qualifier}::{case}"))
             }
         }
-        ResolvedMatchPattern::ExactType(ty) if matches!(scrutinee_type, ResolvedType::Mixed) => {
+        ResolvedMatchPattern::ExactType(ty) if is_mixed_storage_type(scrutinee_type) => {
             Some(format!(
-                "__doria_mixed_is({value}, {})",
+                "{value} !== null && __doria_mixed_is({value}, {})",
                 emit_php_string_literal(&php_mixed_type_tag(ty))
             ))
         }
@@ -5655,7 +5666,7 @@ fn emit_php_match_bindings(
             } else {
                 arm_scopes.declare(&binding.name)
             };
-            let value = if matches!(scrutinee_type, ResolvedType::Mixed) {
+            let value = if is_mixed_storage_type(scrutinee_type) {
                 format!("__doria_mixed_value(${temporary})")
             } else {
                 format!("${temporary}")
@@ -5680,10 +5691,25 @@ fn php_exact_type_test_for_source(
             "__doria_mixed_is({value}, {})",
             emit_php_string_literal(&php_mixed_type_tag(exact))
         ),
+        ResolvedType::Nullable(inner) if matches!(inner.as_ref(), ResolvedType::Mixed) => {
+            if matches!(exact, ResolvedType::Null) {
+                format!("{value} === null")
+            } else {
+                format!(
+                    "{value} !== null && __doria_mixed_is({value}, {})",
+                    emit_php_string_literal(&php_mixed_type_tag(exact))
+                )
+            }
+        }
         ResolvedType::Nullable(inner) if inner.as_ref() == exact => format!("{value} !== null"),
         ResolvedType::Nullable(_) => "false".to_string(),
         _ => (source == exact).to_string(),
     }
+}
+
+fn is_mixed_storage_type(ty: &ResolvedType) -> bool {
+    matches!(ty, ResolvedType::Mixed)
+        || matches!(ty, ResolvedType::Nullable(inner) if matches!(inner.as_ref(), ResolvedType::Mixed))
 }
 
 fn php_host_exact_type_test(value: &str, type_tag: &str) -> String {
@@ -5713,10 +5739,104 @@ fn php_mixed_type_tag(ty: &ResolvedType) -> String {
         ResolvedType::Bool => "bool".to_string(),
         ResolvedType::Null => "null".to_string(),
         ResolvedType::Error => "error".to_string(),
+        ResolvedType::Function(_) => resolved_type_identity(ty),
         ResolvedType::Enum(ty) => format!("enum:{}", ty.name),
         ResolvedType::Class(ty) => format!("class:{}", ty.name),
         ResolvedType::Nullable(inner) => php_mixed_type_tag(inner),
         _ => unreachable!("only exact Doria runtime values cross a PHP mixed boundary"),
+    }
+}
+
+fn resolved_type_identity(ty: &ResolvedType) -> String {
+    fn list(values: impl IntoIterator<Item = String>) -> String {
+        values
+            .into_iter()
+            .map(|value| format!("{}:{value}", value.len()))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    match ty {
+        ResolvedType::Void => "void".to_string(),
+        ResolvedType::Integer(ty) => ty.source_name().to_string(),
+        ResolvedType::Float(ty) => ty.source_name().to_string(),
+        ResolvedType::String => "string".to_string(),
+        ResolvedType::Bytes => "Bytes".to_string(),
+        ResolvedType::Bool => "bool".to_string(),
+        ResolvedType::Null => "null".to_string(),
+        ResolvedType::Mixed => "mixed".to_string(),
+        ResolvedType::Error => "Error".to_string(),
+        ResolvedType::TypeParameter(name) => format!("type:{}:{name}", name.len()),
+        ResolvedType::Function(function) => {
+            let invocation = match function.invocation_mode {
+                crate::types::FunctionInvocationMode::Readonly => "readonly",
+                crate::types::FunctionInvocationMode::Writable => "writable",
+                crate::types::FunctionInvocationMode::Once => "once",
+            };
+            let parameters = list(function.parameters.iter().map(|parameter| {
+                let ownership = match parameter.ownership_mode {
+                    crate::types::FunctionTypeParameterMode::Readonly => "readonly",
+                    crate::types::FunctionTypeParameterMode::Writable => "writable",
+                    crate::types::FunctionTypeParameterMode::Take => "take",
+                };
+                format!("{ownership}:{}", resolved_type_identity(&parameter.ty))
+            }));
+            let effects = list(function.checked_effects.iter().map(resolved_type_identity));
+            let return_borrow = function.return_borrow.map_or_else(
+                || "owned".to_string(),
+                |borrow| {
+                    let crate::types::FunctionBorrowSource::Parameter(index) = borrow.source;
+                    format!(
+                        "{}-parameter-{index}",
+                        if borrow.writable {
+                            "writable"
+                        } else {
+                            "readonly"
+                        }
+                    )
+                },
+            );
+            format!(
+                "function:{invocation}:params[{parameters}]:return[{}]:effects[{effects}]:borrow[{return_borrow}]",
+                resolved_type_identity(&function.return_type)
+            )
+        }
+        ResolvedType::Enum(ty) => format!("enum:{}:{}", ty.name.len(), ty.name),
+        ResolvedType::Nullable(inner) => format!("nullable[{}]", resolved_type_identity(inner)),
+        ResolvedType::Class(ty) => format!(
+            "class:{}:{}[{}]",
+            ty.name.len(),
+            ty.name,
+            list(ty.arguments.iter().map(resolved_type_identity))
+        ),
+        ResolvedType::TypedArray(element) => {
+            format!("array[{}]", resolved_type_identity(element))
+        }
+        ResolvedType::List(element) => format!("List[{}]", resolved_type_identity(element)),
+        ResolvedType::Dictionary(key, value) => format!(
+            "Dictionary[{}][{}]",
+            resolved_type_identity(key),
+            resolved_type_identity(value)
+        ),
+        ResolvedType::SortedDictionary(key, value) => format!(
+            "SortedDictionary[{}][{}]",
+            resolved_type_identity(key),
+            resolved_type_identity(value)
+        ),
+        ResolvedType::Set(element) => format!("Set[{}]", resolved_type_identity(element)),
+        ResolvedType::SortedSet(element) => {
+            format!("SortedSet[{}]", resolved_type_identity(element))
+        }
+        ResolvedType::PriorityQueue(element) => {
+            format!("PriorityQueue[{}]", resolved_type_identity(element))
+        }
+        ResolvedType::Deque(element) => format!("Deque[{}]", resolved_type_identity(element)),
+        ResolvedType::SharedHandle(kind, payload) => format!(
+            "{}[{}]",
+            kind.source_name(),
+            resolved_type_identity(payload)
+        ),
+        ResolvedType::Unsupported => "unsupported".to_string(),
     }
 }
 

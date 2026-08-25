@@ -1,0 +1,36 @@
+class Counter
+{
+    writable int $value = 40;
+
+    writable function advance(): int
+    {
+        let writable $increment = function (): int with (writable $this) {
+            $this->value = 41;
+            return $this->value;
+        };
+        return $increment();
+    }
+}
+
+function inspect(mixed $value): void
+{
+}
+
+function boxed(): mixed
+{
+    return fn() => 13;
+}
+
+function main(): void
+{
+    let writable $counter = new Counter();
+    echo "{$counter->advance()}\n";
+
+    let $callable = fn() => 42;
+    inspect($callable);
+    echo "borrow {$callable()}\n";
+    mixed $returned = boxed();
+    writable mixed $stored = fn() => 1;
+    $stored = fn() => 2;
+    echo "body\n";
+}
