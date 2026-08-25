@@ -1,0 +1,29 @@
+class Payload
+{
+}
+
+function main(): void
+{
+    let $copy = "copy";
+    mixed $readonly = function (): string with (take $copy) {
+        return $copy;
+    };
+    if ($readonly is function(): string) {
+        echo "copy remains readonly\n";
+    }
+    if ($readonly is function once(): string) {
+        echo "wrong copy mode\n";
+    }
+
+    let $payload = new Payload();
+    mixed $callback = function (): Payload with (take $payload) {
+        return $payload;
+    };
+
+    if ($callback is function once(): Payload) {
+        echo "once\n";
+    }
+    if ($callback is function(): Payload) {
+        echo "wrong mode\n";
+    }
+}

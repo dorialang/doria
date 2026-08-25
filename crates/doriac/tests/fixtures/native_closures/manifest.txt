@@ -27,3 +27,4 @@ stage30g_list_algorithms
 stage30g_checked_cleanup
 stage30h_completion
 mixed_function_narrowing
+mixed_function_once_identity
