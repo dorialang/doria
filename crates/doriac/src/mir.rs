@@ -746,6 +746,11 @@ pub enum FunctionExpression {
         positional: bool,
         remove: bool,
     },
+    MixedPayload {
+        function_type: FunctionTypeId,
+        mixed: LocalId,
+        transfer: bool,
+    },
     AssumePresent {
         function_type: FunctionTypeId,
         value: Box<NullableFunctionExpression>,
@@ -760,6 +765,7 @@ impl FunctionExpression {
             | Self::Property { function_type, .. }
             | Self::Call { function_type, .. }
             | Self::CollectionIndex { function_type, .. }
+            | Self::MixedPayload { function_type, .. }
             | Self::AssumePresent { function_type, .. } => *function_type,
         }
     }
@@ -1394,6 +1400,7 @@ pub(crate) fn function_expression_is_borrowed(value: &FunctionExpression) -> boo
         FunctionExpression::Local { transfer, .. } => !transfer,
         FunctionExpression::Property { .. } => true,
         FunctionExpression::CollectionIndex { remove, .. } => !remove,
+        FunctionExpression::MixedPayload { transfer, .. } => !transfer,
         FunctionExpression::AssumePresent { value, .. } => {
             nullable_function_expression_is_borrowed(value)
         }
@@ -2822,6 +2829,13 @@ impl MixedTag {
             Self::PayloadEnum(ty) => Type::PayloadEnum(ty),
             Self::Function(ty) => Type::Function(ty),
         }
+    }
+
+    pub const fn has_structural_type_id(self) -> bool {
+        matches!(
+            self,
+            Self::Class(_) | Self::Enum(_) | Self::PayloadEnum(_) | Self::Function(_)
+        )
     }
 }
 
@@ -4575,7 +4589,9 @@ fn function_class_temporary_capacity(value: &FunctionExpression) -> usize {
         FunctionExpression::AssumePresent { value, .. } => {
             nullable_function_class_temporary_capacity(value)
         }
-        FunctionExpression::Local { .. } | FunctionExpression::Property { .. } => 0,
+        FunctionExpression::Local { .. }
+        | FunctionExpression::Property { .. }
+        | FunctionExpression::MixedPayload { .. } => 0,
     }
 }
 
@@ -5751,6 +5767,14 @@ impl fmt::Display for FunctionExpression {
                 collection.0,
                 if *positional { "offset " } else { "" },
                 index
+            ),
+            Self::MixedPayload {
+                mixed, transfer, ..
+            } => write!(
+                formatter,
+                "{} function payload from mixed local{}",
+                if *transfer { "move" } else { "borrow" },
+                mixed.0
             ),
             Self::AssumePresent { value, .. } => write!(formatter, "nonnull({value})"),
         }

@@ -13,3 +13,4 @@ php_closures/panic_no_cleanup
 php_closures/stage30g_list_algorithms
 php_closures/stage30g_checked_algorithms
 php_closures/stage30h_completion
+php_closures/mixed_function_narrowing

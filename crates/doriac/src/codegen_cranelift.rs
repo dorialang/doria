@@ -4899,6 +4899,11 @@ fn lower_function_expression(
             *remove,
             resources,
         ),
+        mir::FunctionExpression::MixedPayload {
+            function_type,
+            mixed,
+            transfer,
+        } => lower_mixed_function_payload(builder, *mixed, *function_type, *transfer, resources),
     }
 }
 
@@ -12496,6 +12501,62 @@ fn lower_mixed_payload(
     collection_word_to_value(builder, word, tag.ty(), pointer)
 }
 
+fn lower_mixed_function_payload(
+    builder: &mut FunctionBuilder,
+    mixed: mir::LocalId,
+    function_type: mir::FunctionTypeId,
+    transfer: bool,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredValue, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, mixed)?;
+    let mixed_value = load_lowered_from_stack(builder, mir::Type::Mixed, slot, pointer).single()?;
+    let payload_word = runtime_call(
+        builder,
+        MIXED_PAYLOAD,
+        &[pointer],
+        Some(types::I64),
+        &[mixed_value],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed function payload read produced no result"))?;
+    let address = if pointer == types::I64 {
+        payload_word
+    } else {
+        builder.ins().ireduce(pointer, payload_word)
+    };
+    let value = load_lowered_from_address(
+        builder,
+        mir::Type::Function(function_type),
+        address,
+        pointer,
+    );
+    if transfer {
+        let zero = builder.ins().iconst(pointer, 0);
+        builder.ins().stack_store(pointer, zero, slot, 0);
+        let final_claim = runtime_call(
+            builder,
+            MIXED_RELEASE_OWNED,
+            &[pointer],
+            Some(types::I8),
+            &[mixed_value],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("mixed function move released no ownership claim"))?;
+        let no_claim = builder.ins().icmp_imm_u(IntCC::Equal, final_claim, 0);
+        lower_panic_if_code_at_active_site(builder, no_claim, "P1321", resources)?;
+        runtime_call(
+            builder,
+            MIXED_FREE,
+            &[pointer],
+            None,
+            &[mixed_value],
+            resources,
+        )?;
+    }
+    Ok(value)
+}
+
 fn lower_take_mixed_payload(
     builder: &mut FunctionBuilder,
     mixed: mir::LocalId,
@@ -12569,10 +12630,7 @@ fn lower_mixed_is(
     let (expected_tag, expected_type_id) = mixed_tag_value(tag);
     let expected_tag = builder.ins().iconst(types::I8, i64::from(expected_tag));
     let tag_matches = builder.ins().icmp(IntCC::Equal, actual_tag, expected_tag);
-    let result = if matches!(
-        tag,
-        mir::MixedTag::Class(_) | mir::MixedTag::Enum(_) | mir::MixedTag::PayloadEnum(_)
-    ) {
+    let result = if tag.has_structural_type_id() {
         let actual_type_id = runtime_call(
             builder,
             MIXED_TYPE_ID,

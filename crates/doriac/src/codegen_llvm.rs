@@ -6061,6 +6061,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 remove,
                 ..
             } => self.lower_function_collection_index(*collection, index, *positional, *remove),
+            mir::FunctionExpression::MixedPayload {
+                mixed, transfer, ..
+            } => self.lower_mixed_function_payload(*mixed, *transfer),
         }
     }
 
@@ -13627,6 +13630,62 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         self.collection_word_to_value(payload, tag.ty())
     }
 
+    fn lower_mixed_function_payload(
+        &mut self,
+        mixed: mir::LocalId,
+        transfer: bool,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let slot = local_slot(&self.local_slots, mixed)?;
+        let mixed_value = build(
+            self.builder
+                .build_load(pointer, slot, "mixed.function.local"),
+        )?
+        .into_pointer_value();
+        let payload = self
+            .call_runtime(
+                MIXED_PAYLOAD,
+                &[pointer.into()],
+                Some(self.context.i64_type().into()),
+                &[mixed_value.into()],
+            )?
+            .ok_or_else(|| backend_failure("mixed function payload read produced no result"))?
+            .into_int_value();
+        let address = build(self.builder.build_int_to_ptr(
+            payload,
+            pointer,
+            "mixed.function.payload",
+        ))?;
+        let value = build(self.builder.build_load(
+            closure_carrier_type(self.context),
+            address,
+            "mixed.function.value",
+        ))?
+        .into_struct_value();
+        if transfer {
+            build(self.builder.build_store(slot, pointer.const_null()))?;
+            let final_claim = self
+                .call_runtime(
+                    MIXED_RELEASE_OWNED,
+                    &[pointer.into()],
+                    Some(self.context.i8_type().into()),
+                    &[mixed_value.into()],
+                )?
+                .ok_or_else(|| backend_failure("mixed function move released no ownership claim"))?
+                .into_int_value();
+            let no_claim = build(self.builder.build_int_compare(
+                IntPredicate::EQ,
+                final_claim,
+                self.context.i8_type().const_zero(),
+                "mixed.function.move.shared",
+            ))?;
+            self.lower_panic_if_code_at_active_site(no_claim, "P1321")?;
+            let _ =
+                self.call_runtime(MIXED_FREE, &[pointer.into()], None, &[mixed_value.into()])?;
+        }
+        Ok(value)
+    }
+
     fn lower_take_mixed_payload(
         &mut self,
         local: mir::LocalId,
@@ -13701,10 +13760,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             i8_type.const_int(u64::from(expected_tag), false),
             "mixed.tag.matches",
         ))?;
-        let result = if matches!(
-            tag,
-            mir::MixedTag::Class(_) | mir::MixedTag::Enum(_) | mir::MixedTag::PayloadEnum(_)
-        ) {
+        let result = if tag.has_structural_type_id() {
             let actual_type_id = self
                 .call_runtime(
                     MIXED_TYPE_ID,

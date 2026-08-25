@@ -32,6 +32,7 @@ function check_stage30h_closure_completion(string $root): array
         'abi' => 'crates/doriac/src/native_abi.rs',
         'mir' => 'crates/doriac/src/mir.rs',
         'lowering' => 'crates/doriac/src/mir_lowering.rs',
+        'php' => 'crates/doriac/src/codegen_php.rs',
         'runtime' => 'crates/doria-rt/src/mixed.rs',
         'runtimeExports' => 'crates/doria-rt/src/lib.rs',
         'nativeManifest' => 'crates/doriac/tests/fixtures/native_closures/manifest.txt',
@@ -70,12 +71,27 @@ function check_stage30h_closure_completion(string $root): array
     $require($paths['mir'], $files['mir'], [
         'Function(FunctionTypeId)',
         'BoxFunction {',
+        'MixedPayload {',
     ]);
-    $require($paths['lowering'], $files['lowering'], ['MixedExpression::BoxFunction']);
+    $require($paths['lowering'], $files['lowering'], [
+        'MixedExpression::BoxFunction',
+        'MixedTag::Function(function_type)',
+        'FunctionExpression::MixedPayload',
+    ]);
+    $require($paths['php'], $files['php'], [
+        'ResolvedType::Function(_) => resolved_type_identity(ty)',
+        'fn resolved_type_identity(ty: &ResolvedType)',
+    ]);
     $require($paths['runtime'], $files['runtime'], ['borrowed_aggregate_shells_never_claim_the_copied_payload']);
     $require($paths['runtimeExports'], $files['runtimeExports'], ['dr_v3_mixed_new_aggregate_borrowed']);
-    $require($paths['nativeManifest'], $files['nativeManifest'], ['stage30h_completion']);
-    $require($paths['phpManifest'], $files['phpManifest'], ['stage30h_completion']);
+    $require($paths['nativeManifest'], $files['nativeManifest'], [
+        'stage30h_completion',
+        'mixed_function_narrowing',
+    ]);
+    $require($paths['phpManifest'], $files['phpManifest'], [
+        'stage30h_completion',
+        'mixed_function_narrowing',
+    ]);
 
     $sourceRoot = $root . '/crates/doriac/src';
     $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($sourceRoot));

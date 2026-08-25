@@ -7608,6 +7608,54 @@ impl Interpreter<'_> {
                 });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
+            mir::FunctionExpression::MixedPayload {
+                mixed, transfer, ..
+            } => {
+                let value = if transfer {
+                    self.current_frame_mut()?
+                        .locals
+                        .get_mut(mixed.0)
+                        .and_then(Option::take)
+                        .ok_or_else(|| {
+                            InterpreterError::new("mixed function payload was moved before use")
+                        })?
+                } else {
+                    read_local(&self.current_frame()?.locals, mixed)?.clone()
+                };
+                let mixed = mixed_value_from_local(&value).ok_or_else(|| {
+                    InterpreterError::new("mixed function payload references another local type")
+                })?;
+                let MixedValue::Function {
+                    value,
+                    owner,
+                    payload_owned,
+                } = mixed
+                else {
+                    return Err(InterpreterError::new(
+                        "mixed function payload observed another tag",
+                    ));
+                };
+                if value.function_type != function_type {
+                    return Err(InterpreterError::new(
+                        "mixed function payload observed another structural type",
+                    ));
+                }
+                let mut value = value.clone();
+                if transfer {
+                    let claims = owner.get();
+                    let owns_final = claims != 0 && claims == 1 && *payload_owned;
+                    if claims != 0 {
+                        owner.set(claims - 1);
+                    }
+                    if !owns_final {
+                        self.pending_panic = Some("P1321");
+                        return Ok(());
+                    }
+                } else {
+                    value.owns_environment = false;
+                }
+                self.push_local_value(LocalValue::Function(value))?;
+            }
             mir::FunctionExpression::AssumePresent { value, .. } => {
                 let frame = self.current_frame_mut()?;
                 frame

@@ -1,0 +1,24 @@
+function invoke(function(): int $callback): int
+{
+    return $callback();
+}
+
+function main(): void
+{
+    mixed $value = fn() => 42;
+    if ($value is function(): int) {
+        echo "guard {$value()} {invoke($value)}\n";
+    }
+
+    mixed $other = fn(int $input) => $input;
+    if ($other is function(): int) {
+        echo "wrong signature\n";
+    } else {
+        echo "exact signature\n";
+    }
+
+    ?mixed $nullable = fn() => 9;
+    if ($nullable is function(): int) {
+        echo "nullable {$nullable()}\n";
+    }
+}

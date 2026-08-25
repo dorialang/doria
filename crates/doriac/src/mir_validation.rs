@@ -2907,17 +2907,24 @@ fn validate_indirect_call(
     match call.invocation_mode {
         mir::FunctionInvocationMode::Readonly => {}
         mir::FunctionInvocationMode::Writable => {
-            let mir::FunctionExpression::Local {
-                local,
-                transfer: false,
-                ..
-            } = call.callee
-            else {
-                return Err(malformed_mir(
-                    "writable indirect call does not use a borrowed local carrier",
-                ));
+            let local = match call.callee {
+                mir::FunctionExpression::Local {
+                    local,
+                    transfer: false,
+                    ..
+                }
+                | mir::FunctionExpression::MixedPayload {
+                    mixed: local,
+                    transfer: false,
+                    ..
+                } => *local,
+                _ => {
+                    return Err(malformed_mir(
+                        "writable indirect call does not use a borrowed local carrier",
+                    ));
+                }
             };
-            if !local_in(caller, *local)?.writable {
+            if !local_in(caller, local)?.writable {
                 return Err(malformed_mir(
                     "writable indirect call uses a readonly function carrier",
                 ));
@@ -3507,6 +3514,12 @@ fn validate_function_expression(
                 *positional,
             )
         }
+        mir::FunctionExpression::MixedPayload { mixed, .. } => validate_mixed_payload_operand(
+            function,
+            *mixed,
+            mir::MixedTag::Function(expected),
+            mir::Type::Function(expected),
+        ),
         mir::FunctionExpression::AssumePresent { value, .. } => {
             if value.function_type() != expected {
                 return Err(malformed_mir(
@@ -6546,6 +6559,12 @@ fn infer_function_expression_return_borrow(
         mir::FunctionExpression::CollectionIndex { collection, .. } => {
             infer_local_return_borrow(program, function, *collection)
         }
+        mir::FunctionExpression::MixedPayload {
+            mixed,
+            transfer: false,
+            ..
+        } => infer_local_return_borrow(program, function, *mixed),
+        mir::FunctionExpression::MixedPayload { transfer: true, .. } => Ok(None),
         mir::FunctionExpression::Call {
             return_borrow: None,
             ..
@@ -7640,6 +7659,11 @@ fn collect_function_class_local_accesses<'a>(
         mir::FunctionExpression::AssumePresent { value, .. } => {
             collect_nullable_function_class_local_accesses(value, accesses)
         }
+        mir::FunctionExpression::MixedPayload {
+            function_type,
+            mixed,
+            ..
+        } => accesses.assume_mixed_tag(*mixed, mir::MixedTag::Function(*function_type)),
         mir::FunctionExpression::Local { .. } | mir::FunctionExpression::Property { .. } => {}
     }
 }
@@ -12252,7 +12276,9 @@ fn function_observes_property(
         mir::FunctionExpression::AssumePresent { value, .. } => {
             nullable_function_observes_property(value, receiver, property)
         }
-        mir::FunctionExpression::Local { .. } => false,
+        mir::FunctionExpression::Local { .. } | mir::FunctionExpression::MixedPayload { .. } => {
+            false
+        }
     }
 }
 

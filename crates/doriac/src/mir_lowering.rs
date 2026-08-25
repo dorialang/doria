@@ -11590,6 +11590,13 @@ fn narrowed_match_local_rvalue(
                 mode: payload_enum_use_mode(ty, transfer),
             })
         }
+        (mir::Type::Mixed | mir::Type::NullableMixed, mir::Type::Function(function_type)) => {
+            mir::Rvalue::Function(mir::FunctionExpression::MixedPayload {
+                function_type,
+                mixed: local,
+                transfer,
+            })
+        }
         (source, target) if source == target => local_rvalue(local, target, transfer),
         _ => {
             return Err(vec![Diagnostic::new(
@@ -13582,6 +13589,19 @@ fn lower_function_expression(
                             local,
                             transfer,
                         }),
+                    })
+                }
+                mir::Type::Mixed | mir::Type::NullableMixed
+                    if context
+                        .exact_mixed_local(expr)
+                        .is_some_and(|(_, narrowed)| {
+                            narrowed == mir::Type::Function(function_type)
+                        }) =>
+                {
+                    Ok(mir::FunctionExpression::MixedPayload {
+                        function_type,
+                        mixed: local,
+                        transfer,
                     })
                 }
                 _ => Err(vec![unsupported(*span, "local has another callable type")]),
@@ -15954,11 +15974,12 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         | mir::Type::NullableWritableWeakReference(_)
         | mir::Type::ReadonlySharedReferenceAccess(_)
         | mir::Type::WritableSharedReferenceAccess(_)
-                | mir::Type::NullableReadonlySharedReferenceAccess(_)
-                | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
             Err(vec![shared_ownership_mixed_runtime_unsupported(span)])
         }
         mir::Type::Class(class) => Ok(mir::MixedTag::Class(class)),
+        mir::Type::Function(function_type) => Ok(mir::MixedTag::Function(function_type)),
         mir::Type::Mixed
         | mir::Type::NullableMixed
         | mir::Type::NullableScalar(_)
@@ -15968,10 +15989,9 @@ fn mixed_tag_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::MixedT
         | mir::Type::NullableCollection(_)
         | mir::Type::Collection(_)
         | mir::Type::NullablePayloadEnum(_)
-        | mir::Type::Function(_)
         | mir::Type::NullableFunction(_) => Err(vec![Diagnostic::unsupported_stage(
             "M1101",
-            "only exact bool, integer, float, string, and concrete-class `is` tests unbox `mixed` in Stage 23 Slice 3",
+            "this type has no exact runtime `mixed` tag",
             span,
         )]),
         mir::Type::ClosureEnvironment(_) => {
