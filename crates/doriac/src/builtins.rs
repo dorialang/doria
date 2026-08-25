@@ -55,6 +55,23 @@ pub fn is_reserved_intrinsic_name(name: &str) -> bool {
 }
 
 impl Builtin {
+    pub const ALL: [Self; 14] = [
+        Self::Panic,
+        Self::ReadLine,
+        Self::Sprintf,
+        Self::Printf,
+        Self::ReadFile,
+        Self::WriteFile,
+        Self::AppendFile,
+        Self::WriteStderr,
+        Self::ReadFileBytes,
+        Self::WriteFileBytes,
+        Self::AppendFileBytes,
+        Self::ReadStdinBytes,
+        Self::WriteStdoutBytes,
+        Self::WriteStderrBytes,
+    ];
+
     pub fn from_name(name: &str) -> Option<Self> {
         match name {
             "panic" => Some(Self::Panic),

@@ -3,7 +3,8 @@ use crate::ast::{
     Item, MemberAccess, Param, Program,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
-use crate::lexer::{Lexer, Token, TokenKind};
+use crate::lexer::{Lexer, TokenKind};
+use crate::names::{CompilerSymbolIdentity, GlobalSymbolFacts, GlobalSymbolOwner};
 use crate::source::{SourceFile, Span};
 use crate::types::TypeRef;
 
@@ -166,17 +167,26 @@ pub fn is_canonical_type(name: &str) -> bool {
 
 pub fn validate_reserved_identities(program: &Program) -> DiagnosticResult<()> {
     let mut diagnostics = Vec::new();
+    let namespace = program
+        .namespace
+        .as_ref()
+        .map(|namespace| namespace.name.canonical());
     for item in &program.items {
         let (name, span) = match item {
-            Item::Class(class) => (&class.name, class.span),
-            Item::Enum(definition) => (&definition.name, definition.span),
+            Item::Class(class) => (&class.name, class.name_span),
+            Item::Enum(definition) => (&definition.name, definition.name_span),
+            Item::Interface(interface) => (&interface.name, interface.name_span),
+            Item::Trait(declaration) => (&declaration.name, declaration.name_span),
             _ => continue,
         };
-        if is_canonical_type(name) {
+        let canonical = namespace
+            .as_ref()
+            .map_or_else(|| name.clone(), |namespace| format!("{namespace}\\{name}"));
+        if is_canonical_type(&canonical) {
             diagnostics.push(
                 Diagnostic::new(
                     "E0640",
-                    format!("`{name}` is a compiler-known Doria standard-library type"),
+                    format!("`{canonical}` is a compiler-known Doria standard-library type"),
                     span,
                 )
                 .with_title("Reserved Standard-Library Type")
@@ -191,12 +201,12 @@ pub fn validate_reserved_identities(program: &Program) -> DiagnosticResult<()> {
     }
 }
 
-/// Returns whether this compilation unit needs the compiler-known I/O family.
+/// Returns whether executable source syntax needs the compiler-known I/O family.
 ///
-/// Tokens keep comments and string contents from activating the family. Builtin
-/// effects come from `Builtin::checked_error_types`, while explicit type usage
-/// must spell one of the six complete canonical qualified identities.
-pub fn source_uses_canonical_io(source: &SourceFile) -> DiagnosticResult<bool> {
+/// The central name resolver owns canonical type identity. This narrow token
+/// pass exists only for `echo` and compiler intrinsics whose checked effects
+/// require the synthetic semantic declarations.
+pub fn source_uses_io_intrinsics(source: &SourceFile) -> DiagnosticResult<bool> {
     let tokens = Lexer::new(source).lex()?;
     Ok(tokens.iter().any(|token| {
         matches!(token.kind, TokenKind::Echo)
@@ -205,32 +215,22 @@ pub fn source_uses_canonical_io(source: &SourceFile) -> DiagnosticResult<bool> {
                     .is_some_and(|builtin| !builtin.checked_error_types().is_empty()),
                 _ => false,
             }
-    }) || tokens.windows(7).any(canonical_type_tokens))
+    }))
 }
 
-fn canonical_type_tokens(tokens: &[Token]) -> bool {
-    matches!(
-        tokens,
-        [
-            Token { kind: TokenKind::Identifier(root), .. },
-            Token { kind: TokenKind::Backslash, .. },
-            Token { kind: TokenKind::Identifier(standard), .. },
-            Token { kind: TokenKind::Backslash, .. },
-            Token { kind: TokenKind::Identifier(io), .. },
-            Token { kind: TokenKind::Backslash, .. },
-            Token { kind: TokenKind::Identifier(name), .. },
-        ] if root == "Doria"
-            && standard == "Std"
-            && io == "Io"
-            && CANONICAL_TYPES.iter().any(|canonical| {
-                canonical.rsplit('\\').next() == Some(name.as_str())
-            })
-    )
+pub fn resolved_facts_use_canonical_io(facts: &GlobalSymbolFacts) -> bool {
+    facts.references.iter().any(|reference| {
+        matches!(
+            reference.symbol_id.owner,
+            GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(_))
+        )
+    })
 }
 
 /// Adds the six Stage 29 compiler-known I/O identities to the ordinary AST
-/// model. They deliberately bypass general namespace lookup; after this narrow
-/// boundary, semantic analysis and every backend see normal classes and enums.
+/// model. General namespace lookup has already resolved every authored use;
+/// after this representation boundary, semantic analysis and every backend see
+/// normal classes and enums.
 pub fn augment_program(program: &Program) -> Program {
     let mut augmented = program.clone();
     let synthetic = |index| Span::new(usize::MAX / 2 + index, usize::MAX / 2 + index + 1);
@@ -351,6 +351,7 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
         .collect();
     Item::Class(ClassDecl {
         name: name.to_string(),
+        name_span: span,
         type_params: Vec::new(),
         parent: None,
         parent_span: None,
@@ -362,6 +363,7 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
             is_static: false,
             static_span: None,
             name: "__construct".to_string(),
+            name_span: span,
             type_params: Vec::new(),
             params,
             return_type: None,

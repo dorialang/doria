@@ -266,3 +266,4 @@ examples/native/main_native_collection_property_initializers.doria
 examples/native/main_constructor_owned_property_writes.doria
 examples/native/main_constructor_checked_property_replacement.doria
 examples/native/main_constructor_property_write_order.doria
+examples/native/main_stage31_namespaces.doria

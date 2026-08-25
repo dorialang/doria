@@ -59,7 +59,9 @@ Stage 30g List Algorithms — Complete
 Stage 30h Cross-Repository Closure — Complete
 Stage 30 — Complete
 E0641 — Historical And Reserved
-Stage 31 — Next
+Stage 31 Slice 1 — Complete
+Stage 31 Slice 2 — Next
+Stage 31 — In Progress, Not Complete
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping

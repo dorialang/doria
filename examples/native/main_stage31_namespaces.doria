@@ -1,0 +1,65 @@
+namespace Acme\Parity;
+
+use Acme\Parity\{
+    Box as ImportedBox,
+    Status as ImportedStatus,
+    offset as importedOffset,
+};
+use Doria\Std\Io\IoError;
+
+const int OFFSET = 2;
+
+enum Status
+{
+    case Ready;
+}
+
+class Box
+{
+    function __construct(int $value)
+    {
+    }
+
+    function current(): int
+    {
+        return $this->value;
+    }
+
+    static function fixed(): int
+    {
+        return 40;
+    }
+}
+
+function offset(): int
+{
+    return OFFSET;
+}
+
+function label(ImportedStatus $status): string
+{
+    return match ($status) {
+        ImportedStatus::Ready => "ready",
+    };
+}
+
+function acknowledge(?IoError $error): void
+{
+}
+
+function main(): void
+{
+    let $box = new ImportedBox(40);
+    let $captured = fn() with ($box) => $box->value;
+    List<ImportedBox> $boxes = [new Acme\Parity\Box(7)];
+    List<int> $mapped = $boxes->map(fn(ImportedBox $item) => $item->value);
+
+    echo "{$box->current()} " .
+        "{label(ImportedStatus::Ready)} " .
+        "{importedOffset()} " .
+        "{$captured()} " .
+        "{Acme\Parity\Box::fixed()} ";
+    foreach ($mapped as int $value) {
+        echo "{$value}\n";
+    }
+}

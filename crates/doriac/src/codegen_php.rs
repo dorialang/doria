@@ -1614,6 +1614,33 @@ function __doria_printf(
         }
         output.push('\n');
     }
+    if let Some(entry) = program.items.iter().find_map(|item| match item {
+        Item::Function(function) if crate::names::source_name_is(&function.name, "main") => {
+            Some(function)
+        }
+        _ => None,
+    }) {
+        let arguments = if entry.params.is_empty() {
+            String::new()
+        } else {
+            "array_slice($_SERVER['argv'] ?? [], 1)".to_string()
+        };
+        let invocation = format!("{}({arguments})", php_symbol_name(&entry.name));
+        output.push_str("if (isset($_SERVER['SCRIPT_FILENAME']) && realpath($_SERVER['SCRIPT_FILENAME']) === __FILE__) {\n    ");
+        if entry
+            .return_type
+            .as_ref()
+            .is_some_and(|return_type| return_type.name == "int")
+        {
+            output.push_str("exit(");
+            output.push_str(&invocation);
+            output.push_str(");");
+        } else {
+            output.push_str(&invocation);
+            output.push(';');
+        }
+        output.push_str("\n}\n");
+    }
     Ok(output)
 }
 
@@ -3693,11 +3720,11 @@ fn emit_constant(
             "function "
         });
         output.push_str(&class_name.map_or_else(
-            || format!("__doria_const_{}", constant.name),
+            || format!("__doria_const_{}", php_symbol_name(&constant.name)),
             |_| format!("__doriaConst{}", constant.name),
         ));
         output.push_str("(): ");
-        output.push_str(enum_name);
+        output.push_str(&php_symbol_name(enum_name));
         output.push('\n');
         writeln(output, indent, "{");
         writeln(output, indent + 1, "static $value = null;");
@@ -3828,7 +3855,11 @@ fn emit_function(
         }
     }
     output.push_str("function ");
-    output.push_str(&function.name);
+    if is_method {
+        output.push_str(&function.name);
+    } else {
+        output.push_str(&php_symbol_name(&function.name));
+    }
     output.push('(');
     output.push_str(
         &function
@@ -3865,7 +3896,7 @@ fn emit_function(
     }
     output.push('\n');
     writeln(output, indent, "{");
-    let is_entry = !is_method && function.name == "main";
+    let is_entry = !is_method && crate::names::source_name_is(&function.name, "main");
     let checked_entry = is_entry && !function.checked_effects.is_empty();
     let body_indent = if checked_entry {
         indent + 2
@@ -4025,7 +4056,7 @@ fn php_parameter_value_type(ty: &TypeRef, payload_default: bool) -> String {
 }
 
 fn php_top_level_constant_name(name: &str) -> String {
-    format!("__DORIA_CONST_{name}")
+    format!("__DORIA_CONST_{}", php_symbol_name(name))
 }
 
 fn php_payload_case_method(case_name: &str, has_payload: bool) -> String {
@@ -5141,7 +5172,7 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             .map(PhpBindingPlace::read)
             .unwrap_or_else(|| "$this".to_string()),
         Expr::Identifier { name, .. } if scopes.is_payload_top_constant(name) => {
-            format!("__doria_const_{name}()")
+            format!("__doria_const_{}()", php_symbol_name(name))
         }
         Expr::Identifier { name, .. } => php_top_level_constant_name(name),
         Expr::String { value, .. } => emit_php_string_literal(value),
@@ -5967,14 +5998,14 @@ fn emit_binary_op(op: &BinaryOp) -> &'static str {
 
 fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNameScopes) -> String {
     let helper = match name {
-        "read_line" => "__doria_read_line",
-        "read_file" => "__doria_read_file",
-        "write_file" => "__doria_write_file",
-        "append_file" => "__doria_append_file",
-        "write_stderr" => "__doria_write_stderr",
-        "sprintf" => "__doria_sprintf",
-        "printf" => "__doria_printf",
-        _ => name,
+        "read_line" => "__doria_read_line".to_string(),
+        "read_file" => "__doria_read_file".to_string(),
+        "write_file" => "__doria_write_file".to_string(),
+        "append_file" => "__doria_append_file".to_string(),
+        "write_stderr" => "__doria_write_stderr".to_string(),
+        "sprintf" => "__doria_sprintf".to_string(),
+        "printf" => "__doria_printf".to_string(),
+        _ => php_symbol_name(name),
     };
     let mut emitted = emit_call_argument_values(args, span, scopes);
     if matches!(name, "sprintf" | "printf") {
@@ -6128,6 +6159,9 @@ fn php_symbol_name(name: &str) -> String {
         crate::compiler_known_io::UTF8_INPUT_SOURCE => "__DoriaStdIoUtf8InputSource".to_string(),
         crate::compiler_known_io::IO_ERROR => "__DoriaStdIoIoError".to_string(),
         crate::compiler_known_io::INVALID_UTF8_ERROR => "__DoriaStdIoInvalidUtf8Error".to_string(),
+        _ if name.contains('\\') => {
+            format!("__DoriaQualified_{}", hex_bytes(name.as_bytes()))
+        }
         _ => name.to_string(),
     }
 }

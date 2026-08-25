@@ -29,6 +29,7 @@ pub enum NodeKind {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum NodeAction {
     None,
     Statement(Stmt),

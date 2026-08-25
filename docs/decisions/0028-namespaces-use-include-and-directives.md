@@ -2,7 +2,7 @@
 
 Status: Accepted
 
-Implementation note: `docs/decisions/0031-stage-7b-break-continue.md` implements the first compiler and native smoke slice for `break;` and `continue;`. Namespace, `use`, `include`, and `declare` compiler support still remain future work.
+Implementation note: `docs/decisions/0031-stage-7b-break-continue.md` implements the first compiler and native smoke slice for `break;` and `continue;`. Stage 31 Slice 1 implements namespace syntax, semantic `use` imports, same-file canonical resolution, and source-preserving `include` grammar. Stage 31 Slice 2 remains responsible for multi-file package graphs and include resolution. Structured `declare` remains future work.
 
 Phase F amendment: Decision 0117 is the complete accepted authority for
 compile-time `autoload`, hybrid strict source layout, package compilation
@@ -29,7 +29,7 @@ The following remain evaluation-only and are not accepted for implementation by 
 - C/C++-style textual preprocessor directives copied as syntax
 - textual macro substitution such as `#define` and `#undef`
 
-This is a language-design decision only. It does not implement lexer, parser, AST, HIR, semantic checker, Doria IR, PHP backend, native backend, or LSP support.
+This record originally settled language design only. Its namespace, `use`, and `include` grammar is now partially implemented by Stage 31 Slice 1; the remaining implementation boundaries are stated above.
 
 ## Categories
 
@@ -277,11 +277,11 @@ Doria source should remain parseable, typed, and semantically checked by `doriac
 
 ## Non-goals
 
-This decision itself did not implement:
+This decision itself did not implement, and later work still has not implemented where noted:
 
-- namespaces
-- `use`
-- `include`
+- multi-file namespace indexing (Stage 31 Slice 2)
+- external import resolution (Stage 31 Slice 2)
+- include path resolution and include-once composition (Stage 31 Slice 2)
 - `declare`
 - `goto`
 - preprocessor directives

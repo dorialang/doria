@@ -1353,7 +1353,9 @@ fn lower_program_impl(
         .iter()
         .enumerate()
         .filter_map(|(index, declaration)| {
-            (declaration.is_top_level() && declaration.function.name == "main").then_some(index)
+            (declaration.is_top_level()
+                && crate::names::source_name_is(&declaration.function.name, "main"))
+            .then_some(index)
         })
         .collect::<Vec<_>>();
     if main_indices.len() != 1 {
@@ -1414,7 +1416,8 @@ fn lower_program_impl(
             },
             SignatureOptions {
                 lifecycle: matches!(function.name.as_str(), "__construct" | "__destruct"),
-                is_entry: declaration.is_top_level() && function.name == "main",
+                is_entry: declaration.is_top_level()
+                    && crate::names::source_name_is(&function.name, "main"),
             },
         )?;
         signature.method_class = declaration.class;
@@ -1514,7 +1517,7 @@ fn lower_program_impl(
 
     let entry = signatures
         .get(&FunctionInstanceKey {
-            name: "main".to_string(),
+            name: declarations[main_indices[0]].function.name.clone(),
             arguments: Vec::new(),
         })
         .expect("exactly one collected main signature")
@@ -1749,6 +1752,12 @@ fn lower_program_impl(
     } = collection_registry;
     Ok(mir::Program {
         source,
+        compilation_context: program.semantic_info.compilation_context.clone(),
+        namespace: program
+            .namespace
+            .as_ref()
+            .map(|namespace| namespace.name.clone()),
+        global_symbols: program.semantic_info.global_symbols.clone(),
         classes,
         enums,
         collection_types,

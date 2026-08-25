@@ -25,6 +25,7 @@ pub mod mir;
 pub mod mir_interpreter;
 pub mod mir_lowering;
 pub mod mir_validation;
+pub mod names;
 mod narrowing;
 pub mod native_abi;
 pub mod native_closure_abi;
@@ -49,7 +50,15 @@ pub const BUILD_COMMIT: &str = env!("DORIA_BUILD_COMMIT");
 use ast::Program;
 use backend::{BackendTarget, CompileOptions};
 use diagnostics::{Diagnostic, DiagnosticFormat, DiagnosticResult, RenderOptions};
+use names::{CompilationContext, GlobalSymbolFacts};
 use source::{SourceFile, Span};
+
+struct PreparedSource {
+    authored: Program,
+    resolved: Program,
+    context: CompilationContext,
+    global_symbols: GlobalSymbolFacts,
+}
 
 pub fn lex_source(
     path: impl Into<String>,
@@ -66,15 +75,17 @@ pub fn parse_source(path: impl Into<String>, text: impl Into<String>) -> Diagnos
 
 pub fn check_source(path: impl Into<String>, text: impl Into<String>) -> DiagnosticResult<Program> {
     let source = SourceFile::new(path, text);
-    let program = parse_source_file(&source)?;
-    compiler_known_io::validate_reserved_identities(&program)?;
-    let augmented = if compiler_known_io::source_uses_canonical_io(&source)? {
-        compiler_known_io::augment_program(&program)
-    } else {
-        program.clone()
-    };
-    semantics::analyze_program_with_source(&augmented, &source.text)?;
-    Ok(program)
+    let context = CompilationContext::standalone(source.path.clone());
+    check_source_file_with_context(&source, context)
+}
+
+pub fn check_source_with_context(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    context: CompilationContext,
+) -> DiagnosticResult<Program> {
+    let source = SourceFile::new(path, text);
+    check_source_file_with_context(&source, context)
 }
 
 /// Parses and semantically analyzes one source file for editor tooling.
@@ -87,16 +98,39 @@ pub fn analyze_source_for_ide(
     text: impl Into<String>,
 ) -> DiagnosticResult<(Program, semantics::SemanticAnalysis)> {
     let source = SourceFile::new(path, text);
-    let program = parse_source_file(&source)?;
-    compiler_known_io::validate_reserved_identities(&program)?;
-    let analyzed_program = if compiler_known_io::source_uses_canonical_io(&source)? {
-        compiler_known_io::augment_program(&program)
+    let context = CompilationContext::standalone(source.path.clone());
+    analyze_source_for_ide_with_context(source.path.clone(), source.text.clone(), context)
+}
+
+pub fn analyze_source_for_ide_with_context(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    context: CompilationContext,
+) -> DiagnosticResult<(Program, semantics::SemanticAnalysis)> {
+    let source = SourceFile::new(path, text);
+    let authored = parse_source_file(&source)?;
+    compiler_known_io::validate_reserved_identities(&authored)?;
+    let mut resolution = names::resolve_program_for_ide(&authored, &context);
+    let uses_compiler_known_io = compiler_known_io::source_uses_io_intrinsics(&source)?
+        || compiler_known_io::resolved_facts_use_canonical_io(&resolution.resolved.facts);
+    if uses_compiler_known_io {
+        resolution.resolved.program =
+            compiler_known_io::augment_program(&resolution.resolved.program);
+    }
+    let mut analysis = if resolution.diagnostics.is_empty() {
+        semantics::analyze_program_for_ide_with_source(
+            &resolution.resolved.program,
+            Some(&source.text),
+        )
     } else {
-        program.clone()
+        semantics::SemanticAnalysis {
+            info: semantics::SemanticInfo::default(),
+            diagnostics: resolution.diagnostics,
+        }
     };
-    let analysis =
-        semantics::analyze_program_for_ide_with_source(&analyzed_program, Some(&source.text));
-    Ok((program, analysis))
+    analysis.info.compilation_context = context;
+    analysis.info.global_symbols = resolution.resolved.facts;
+    Ok((authored, analysis))
 }
 
 pub fn compile_source_to_php(
@@ -132,15 +166,29 @@ pub fn lower_source(
     text: impl Into<String>,
 ) -> DiagnosticResult<hir::Program> {
     let source = SourceFile::new(path, text);
-    let program = parse_source_file(&source)?;
-    compiler_known_io::validate_reserved_identities(&program)?;
-    let program = if compiler_known_io::source_uses_canonical_io(&source)? {
-        compiler_known_io::augment_program(&program)
-    } else {
-        program
-    };
-    let semantic_info = semantics::analyze_program_with_source(&program, &source.text)?;
-    let mut hir = lowering::lower_program_with_semantics(&program, semantic_info)?;
+    let context = CompilationContext::standalone(source.path.clone());
+    lower_source_file_with_context(source, context)
+}
+
+pub fn lower_source_with_context(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    context: CompilationContext,
+) -> DiagnosticResult<hir::Program> {
+    let source = SourceFile::new(path, text);
+    lower_source_file_with_context(source, context)
+}
+
+fn lower_source_file_with_context(
+    source: SourceFile,
+    context: CompilationContext,
+) -> DiagnosticResult<hir::Program> {
+    let prepared = prepare_source(&source, context)?;
+    let mut semantic_info =
+        semantics::analyze_program_with_source(&prepared.resolved, &source.text)?;
+    semantic_info.compilation_context = prepared.context;
+    semantic_info.global_symbols = prepared.global_symbols;
+    let mut hir = lowering::lower_program_with_semantics(&prepared.resolved, semantic_info)?;
     hir.source_path = source.path;
     hir.source_text = source.text;
     Ok(hir)
@@ -151,6 +199,22 @@ pub fn lower_source_to_mir(
     text: impl Into<String>,
 ) -> DiagnosticResult<mir::Program> {
     let hir = lower_source(path, text)?;
+    let mir = mir_lowering::lower_program(&hir)?;
+    mir_validation::validate_program(&mir).map_err(|error| {
+        error.diagnostics.unwrap_or_else(|| {
+            vec![Diagnostic::new("B0001", error.message, Span::default())
+                .with_title("Malformed MIR")]
+        })
+    })?;
+    Ok(mir)
+}
+
+pub fn lower_source_to_mir_with_context(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    context: CompilationContext,
+) -> DiagnosticResult<mir::Program> {
+    let hir = lower_source_with_context(path, text, context)?;
     let mir = mir_lowering::lower_program(&hir)?;
     mir_validation::validate_program(&mir).map_err(|error| {
         error.diagnostics.unwrap_or_else(|| {
@@ -191,6 +255,49 @@ pub fn compile_source_with_options(
                     ),
             ]
         })
+    })
+}
+
+pub fn compile_source_with_context(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    context: CompilationContext,
+    options: CompileOptions,
+) -> Result<backend::BackendOutput, Vec<Diagnostic>> {
+    let hir = lower_source_with_context(path, text, context)?;
+    backend::emit_with_options(&hir, options).map_err(|error| {
+        error
+            .diagnostics
+            .unwrap_or_else(|| vec![Diagnostic::new("B0001", error.message, Span::default())])
+    })
+}
+
+fn check_source_file_with_context(
+    source: &SourceFile,
+    context: CompilationContext,
+) -> DiagnosticResult<Program> {
+    let prepared = prepare_source(source, context)?;
+    semantics::analyze_program_with_source(&prepared.resolved, &source.text)?;
+    Ok(prepared.authored)
+}
+
+fn prepare_source(
+    source: &SourceFile,
+    context: CompilationContext,
+) -> DiagnosticResult<PreparedSource> {
+    let authored = parse_source_file(source)?;
+    compiler_known_io::validate_reserved_identities(&authored)?;
+    let mut resolved = names::resolve_program(&authored, &context)?;
+    let uses_compiler_known_io = compiler_known_io::source_uses_io_intrinsics(source)?
+        || compiler_known_io::resolved_facts_use_canonical_io(&resolved.facts);
+    if uses_compiler_known_io {
+        resolved.program = compiler_known_io::augment_program(&resolved.program);
+    }
+    Ok(PreparedSource {
+        authored,
+        resolved: resolved.program,
+        context,
+        global_symbols: resolved.facts,
     })
 }
 

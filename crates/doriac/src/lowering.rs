@@ -47,7 +47,7 @@ pub fn lower_program_with_semantics(
             .namespace
             .as_ref()
             .map(|namespace| hir::NamespaceDecl {
-                name: namespace.name.clone(),
+                name: namespace.name.canonical(),
                 span: namespace.span,
             }),
         items,

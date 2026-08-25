@@ -134,7 +134,7 @@ See Decision 0116 for the current control-flow authority.
 
 ### Source organization and compiler directives
 
-The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Current compiler support may lag this accepted direction until the scheduled compiler and Baton stages implement it.
+The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Stage 31 Slice 1 implements namespace and import syntax, same-file resolution, an explicit edition-2026 prelude, canonical package-owned global identities, and compiler-facing edition/package/source context. Filesystem discovery, multi-file compiler indexing, build plans, and include resolution remain Stage 31 Slice 2 work.
 
 Namespaces define logical symbol ownership and declaration scope. They are part of semantic name resolution, not source inclusion, package resolution, build orchestration, or runtime loading.
 
@@ -1567,7 +1567,7 @@ class Article
 }
 ```
 
-The parser can distinguish namespace/file-scope import `use` from class-body or trait-body trait-composition `uses` by spelling and context. Neither form is implemented by the current compiler slice.
+Namespace/file-scope import `use` is implemented and resolved at compile time. Class-body or trait-body trait-composition `uses` remains a distinct spelling under its own later implementation stage.
 
 Doria is PHP-shaped, not PHP++. Accepting PHP-shaped OOP declaration syntax does not import PHP dynamic object semantics, magic methods as core behavior, autoloading behavior, reflection behavior, loose typing, PHP visibility rules beyond what Doria has separately accepted, PHP trait conflict-resolution rules without review, or PHP runtime initialization behavior.
 
@@ -1883,10 +1883,10 @@ Future work includes:
 
 - Better diagnostics with suggestions.
 - Full type inference for lists and dictionaries.
-- Interfaces, traits, and namespaces.
+- Interface and trait execution semantics.
 - Class inheritance through `extends`, interface conformance through `implements`, and class-body/trait-body `uses` trait composition.
-- `use` statements for semantic imports and aliases.
-- `include` as required include-once compile-time source inclusion.
+- Multi-file package-graph resolution for imports and qualified names.
+- Resolution of accepted `include` syntax as required include-once compile-time source inclusion.
 - `declare` as structured compiler/source directives.
 - Attribute syntax and metadata representation.
 - Richer instance property initializers.

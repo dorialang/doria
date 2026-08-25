@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::fmt;
 
 use crate::enums::EnumType;
-use crate::source::Span;
+use crate::source::{QualifiedNameRef, Span};
 
 pub use crate::numeric::{FloatType, IntegerType};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeRef {
     pub name: String,
+    pub source_name: Option<QualifiedNameRef>,
     /// Generic arguments in source order. Decision 0105 reserves value
     /// arguments, so the syntax tree must preserve both their kind and their
     /// position without pretending every argument is a type.
@@ -93,6 +94,7 @@ impl TypeRef {
     pub fn named(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            source_name: None,
             arguments: Vec::new(),
             nullable: false,
             function: None,
@@ -103,6 +105,7 @@ impl TypeRef {
     pub fn generic(name: impl Into<String>, args: Vec<TypeRef>) -> Self {
         Self {
             name: name.into(),
+            source_name: None,
             arguments: args.into_iter().map(TypeArgumentRef::Type).collect(),
             nullable: false,
             function: None,
@@ -116,6 +119,7 @@ impl TypeRef {
     ) -> Self {
         Self {
             name: name.into(),
+            source_name: None,
             arguments,
             nullable: false,
             function: None,
@@ -126,6 +130,7 @@ impl TypeRef {
     pub fn function(function: FunctionTypeRef) -> Self {
         Self {
             name: "function".to_string(),
+            source_name: None,
             arguments: Vec::new(),
             nullable: false,
             function: Some(Box::new(function)),
@@ -136,6 +141,7 @@ impl TypeRef {
     pub fn grouped(inner: TypeRef, open_span: Span, close_span: Span) -> Self {
         Self {
             name: inner.name.clone(),
+            source_name: inner.source_name.clone(),
             arguments: inner.arguments.clone(),
             nullable: false,
             function: inner.function.clone(),
@@ -158,6 +164,11 @@ impl TypeRef {
 
     pub fn nullable(mut self) -> Self {
         self.nullable = true;
+        self
+    }
+
+    pub fn with_source_name(mut self, source_name: QualifiedNameRef) -> Self {
+        self.source_name = Some(source_name);
         self
     }
 
@@ -200,6 +211,7 @@ impl TypeRef {
 
         Self {
             name: self.name.clone(),
+            source_name: self.source_name.clone(),
             arguments: self
                 .arguments
                 .iter()

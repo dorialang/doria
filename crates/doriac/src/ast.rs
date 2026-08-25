@@ -1,19 +1,67 @@
-use crate::source::Span;
+use crate::lexer::StringQuoteKind;
+use crate::source::{QualifiedNameRef, Span};
 use crate::types::TypeRef;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub namespace: Option<NamespaceDecl>,
+    pub imports: Vec<UseDecl>,
+    pub includes: Vec<IncludeDecl>,
+    /// Every namespace-sensitive authored name, including nested type names and
+    /// value references. Semantic facts attach canonical identities to these
+    /// spans without editor tooling searching source text.
+    pub qualified_names: Vec<QualifiedNameRef>,
     pub items: Vec<Item>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NamespaceDecl {
-    pub name: String,
+    pub keyword_span: Span,
+    pub name: QualifiedNameRef,
+    pub semicolon_span: Span,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct UseDecl {
+    pub keyword_span: Span,
+    pub prefix: Option<QualifiedNameRef>,
+    pub group_separator_span: Option<Span>,
+    pub group_open_span: Option<Span>,
+    pub entries: Vec<UseEntry>,
+    pub group_close_span: Option<Span>,
+    pub comma_spans: Vec<Span>,
+    pub semicolon_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UseEntry {
+    pub target: QualifiedNameRef,
+    pub as_span: Option<Span>,
+    pub alias: Option<NameRef>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NameRef {
+    pub text: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncludeDecl {
+    pub keyword_span: Span,
+    pub raw: String,
+    pub value: String,
+    pub quote: StringQuoteKind,
+    pub literal_span: Span,
+    pub semicolon_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Item {
     Class(ClassDecl),
     Enum(EnumDecl),
@@ -53,6 +101,7 @@ pub struct EnumPayloadField {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraitDecl {
     pub name: String,
+    pub name_span: Span,
     pub members: Vec<ClassMember>,
     pub span: Span,
 }
@@ -60,12 +109,14 @@ pub struct TraitDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InterfaceDecl {
     pub name: String,
+    pub name_span: Span,
     pub span: Span,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassDecl {
     pub name: String,
+    pub name_span: Span,
     pub type_params: Vec<TypeParamDecl>,
     pub parent: Option<String>,
     pub parent_span: Option<Span>,
@@ -103,6 +154,7 @@ pub struct ConstDecl {
     pub access: MemberAccess,
     pub ty: Option<TypeRef>,
     pub name: String,
+    pub name_span: Span,
     pub initializer: Expr,
     pub span: Span,
 }
@@ -115,6 +167,7 @@ pub struct FunctionDecl {
     pub is_static: bool,
     pub static_span: Option<Span>,
     pub name: String,
+    pub name_span: Span,
     pub type_params: Vec<TypeParamDecl>,
     pub params: Vec<Param>,
     pub return_type: Option<TypeRef>,

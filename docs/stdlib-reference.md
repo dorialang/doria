@@ -4,6 +4,33 @@
 
 Two layers (plan §9): **core** (no I/O, always available) and **std** (hosted under the reserved `Doria\Std` namespace, per the namespace-model decision). Both are written in Doria as early as self-hosting allows.
 
+## Edition 2026 Prelude
+
+The prelude is an explicit compiler-owned table, not a wildcard import. Its
+complete edition-2026 inventory is:
+
+```text
+Displayable Error Comparable Hashable Equatable
+Int Int8 Int16 Int32 Int64 UInt8 UInt16 UInt32 UInt64
+Float Float32 Float64 Bool String Bytes
+List Dictionary SortedDictionary Set SortedSet PriorityQueue Deque
+SharedReference WeakReference WritableSharedReference WritableWeakReference
+ReadonlySharedReferenceAccess WritableSharedReferenceAccess
+```
+
+`Comparable`, `Hashable`, and `Equatable` are ordinary conveniences that a
+current-namespace declaration or explicit import may shadow. The other listed
+compiler-owned identities retain their existing reserved-name rules. Prelude
+changes are edition changes.
+
+Lowercase primitive spellings and `T[]` are language type syntax rather than
+prelude aliases. Built-in free functions such as `read_line`, formatting and
+byte I/O, and `panic` are language intrinsics; they resolve before namespace
+lookup and are not prelude entries. Domain APIs under `Doria\Std`, including
+the six exact `Doria\Std\Io` checked-error identities, require their canonical
+qualified name or an explicit import. The compiler does not implicitly import
+`Doria\Std\Console`, `Doria\Std\Math`, or any future standard-library module.
+
 ---
 
 ## Core layer (no I/O, always available)
@@ -111,7 +138,7 @@ The four no-literal forms use positional-only `Type::from(source)`. Direct brack
 ## Standard library modules (`Doria\Std\*`)
 Hosted modules under the reserved `Doria\Std` namespace. Most are direction-only in the plan today; each links to its owning section/record and is marked *(surface TBD)* where its decision is unauthored.
 
-- **`Doria\Std\Io`** — Stage 29 implements exactly six compiler-known public identities before general namespaces: `IoOperation`, `IoTarget`, `IoErrorReason`, `Utf8InputSource`, `IoError`, and `InvalidUtf8Error`. They have no temporary unqualified aliases and cannot be redeclared. `IoOperation` cases are `Open`, `Read`, `Write`, `Append`, `Flush`; `IoTarget` cases are `File(string $path)`, `StandardInput`, `StandardOutput`, `StandardError`; `IoErrorReason` cases are `NotFound`, `PermissionDenied`, `InvalidInput`, `Interrupted`, `ResourceExhausted`, `Unsupported`, `Closed`, `Other`; `Utf8InputSource` cases are `File(string $path)`, `StandardInput`. `IoError` implements `Error` and exposes readonly `message`, `operation`, `target`, `reason`, and `?int systemCode`. `InvalidUtf8Error` implements `Error` and exposes readonly `message`, `source`, `int validByteCount`, and `?int invalidByteCount`; these are byte counts. Stable messages are Doria-owned, while raw platform prose is never exposed. Ordinary closed stdout/stderr pipes still exit cleanly with status 0; allocation remains panic. An unhandled Error is R1000/status 70 after cleanup. **Stage 36a scheduled and not implemented; semantics and performance contract accepted, public spellings deferred.** It will use small readable/writable/duplex/seekable/flushable/blocking/readiness capabilities with owned handles, reusable buffers, and first-class standard streams. Exact interfaces, handles, readiness, buffering, adapters, files, and processes still await its bounded surface appendix. The current free functions are intrinsics, not proof that the Stage 36a layer exists.
+- **`Doria\Std\Io`** — Stage 29 implements exactly six compiler-known public identities, and Stage 31 Slice 1 integrates them into general namespace resolution: `IoOperation`, `IoTarget`, `IoErrorReason`, `Utf8InputSource`, `IoError`, and `InvalidUtf8Error`. They have no temporary unqualified aliases and cannot be redeclared. `IoOperation` cases are `Open`, `Read`, `Write`, `Append`, `Flush`; `IoTarget` cases are `File(string $path)`, `StandardInput`, `StandardOutput`, `StandardError`; `IoErrorReason` cases are `NotFound`, `PermissionDenied`, `InvalidInput`, `Interrupted`, `ResourceExhausted`, `Unsupported`, `Closed`, `Other`; `Utf8InputSource` cases are `File(string $path)`, `StandardInput`. `IoError` implements `Error` and exposes readonly `message`, `operation`, `target`, `reason`, and `?int systemCode`. `InvalidUtf8Error` implements `Error` and exposes readonly `message`, `source`, `int validByteCount`, and `?int invalidByteCount`; these are byte counts. Stable messages are Doria-owned, while raw platform prose is never exposed. Ordinary closed stdout/stderr pipes still exit cleanly with status 0; allocation remains panic. An unhandled Error is R1000/status 70 after cleanup. **Stage 36a scheduled and not implemented; semantics and performance contract accepted, public spellings deferred.** It will use small readable/writable/duplex/seekable/flushable/blocking/readiness capabilities with owned handles, reusable buffers, and first-class standard streams. Exact interfaces, handles, readiness, buffering, adapters, files, and processes still await its bounded surface appendix. The current free functions are intrinsics, not proof that the Stage 36a layer exists.
 - **`Doria\Std\Fs`** — filesystem/namespace operations without an open handle: existence, size/metadata, permissions, timestamps, rename, delete, `mkdir`, directory listing, and path manipulation. Decision 0110 fixes the `Io`/`Fs` boundary while deferring the exact `Path` representation to the filesystem design; Stage 36a must preserve typed-path evolution. *(Surface TBD.)*
 - **`Doria\Std\Env`** — environment variables. *(Surface TBD.)*
 - **`Doria\Std\Process`** — process facts (exit code, process id, executable path) and decision-0110 owned child processes with typed stdin/stdout/stderr pipes, stdin half-close, explicit wait/detach/terminate lifetime resolution, concurrent bounded output drainage, and shared timeout/readiness/cancellation integration. Destruction does not silently wait, detach, or terminate. Exact process and type-state spellings remain deferred to the process owner. The pipe capability depends on Stage 36a and is not currently executable. Command-line arguments arrive through `main(List<string> $args)` (decision 0099), not here.

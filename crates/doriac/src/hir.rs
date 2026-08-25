@@ -28,6 +28,7 @@ pub struct NamespaceDecl {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Item {
     Class(ClassDecl),
     Enum(EnumDecl),

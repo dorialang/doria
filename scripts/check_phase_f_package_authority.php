@@ -93,8 +93,9 @@ $require($namespacePath, $namespace, [
     'cannot be redeclared',
     'Stage 31 Slice 1',
     'Stage 31 Slice 2',
-    'Stage 29 — Checked errors end-to-end — Complete',
-    'Stage 31 is scheduled',
+    'Stage 31 Slice 1 implemented',
+    'Stage 31 Slice 1',
+    'Stage 31 Slice 2',
 ]);
 
 $require($batonPath, $baton, [
@@ -145,7 +146,9 @@ $require($pipelinePath, $pipeline, [
     'Stage 29 Slice 2 — Complete',
     'Corrective Beat: Native Collection Property Initializers — Complete',
     'Stage 29 Slice 3 — Complete',
-    'Stage 31 — Scheduled, Not Implemented',
+    'Stage 31 Slice 1 — Complete',
+    'Stage 31 Slice 2 — Next',
+    'Stage 31 — In Progress, Not Complete',
     'Stage 33 — Scheduled, Not Implemented',
 ]);
 $require($auditPath, $audit, [
