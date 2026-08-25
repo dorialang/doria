@@ -28,3 +28,4 @@ stage30g_checked_cleanup
 stage30h_completion
 mixed_function_narrowing
 mixed_function_once_identity
+generic_function_type_test
