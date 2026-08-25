@@ -87,6 +87,7 @@ function check_stage30h_closure_completion(string $root): array
     $require($paths['nativeManifest'], $files['nativeManifest'], [
         'stage30h_completion',
         'mixed_function_narrowing',
+        'mixed_function_once_identity',
     ]);
     $require($paths['phpManifest'], $files['phpManifest'], [
         'stage30h_completion',

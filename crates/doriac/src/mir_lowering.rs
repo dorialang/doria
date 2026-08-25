@@ -1392,6 +1392,16 @@ fn lower_program_impl(
                 );
             }
         }
+        for (span, ty) in &program.semantic_info.type_test_types {
+            if span.0 >= function.span.start && span.1 <= function.span.end {
+                let specialized = substitute_resolved_type(ty, &substitutions);
+                let _ = intern_resolved_collection_types(
+                    &specialized,
+                    &class_ids,
+                    &mut collection_registry,
+                );
+            }
+        }
         let mut signature = collect_function_signature(
             function,
             mir::FunctionId(index),
@@ -1438,6 +1448,9 @@ fn lower_program_impl(
     }
 
     for ty in program.semantic_info.expression_types.values() {
+        let _ = intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
+    }
+    for ty in program.semantic_info.type_test_types.values() {
         let _ = intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
     }
 
@@ -6244,12 +6257,18 @@ impl<'semantic> LoweringContext<'semantic> {
             ResolvedType::String => Some(mir::Type::String),
             ResolvedType::Mixed => Some(mir::Type::Mixed),
             ResolvedType::Error => Some(mir::Type::Error),
-            ResolvedType::Function(function) => self
-                .collection_registry
-                .function_ids
-                .get(function.as_ref())
-                .copied()
-                .map(mir::Type::Function),
+            ResolvedType::Function(_) => {
+                let ResolvedType::Function(function) =
+                    substitute_resolved_type(ty, &self.type_substitutions)
+                else {
+                    unreachable!("substituting a function type preserves its outer type")
+                };
+                self.collection_registry
+                    .function_ids
+                    .get(function.as_ref())
+                    .copied()
+                    .map(mir::Type::Function)
+            }
             ResolvedType::Enum(enum_type) => {
                 Some(self.enum_types.get(&enum_type.id).copied().map_or(
                     mir::Type::Scalar(mir::ScalarType::Enum(enum_type.id)),

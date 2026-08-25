@@ -1,0 +1,13 @@
+function matchesReturnType<T>(mixed $value, T $witness): bool
+{
+    return $value is function(): T;
+}
+
+function main(): void
+{
+    mixed $callback = fn() => 42;
+
+    if (matchesReturnType($callback, 0)) {
+        echo "generic function type test\n";
+    }
+}
