@@ -604,7 +604,12 @@ impl<'a> Resolver<'a> {
         let local_names = self
             .declarations
             .values()
-            .map(|declaration| (declaration.source_name.clone(), declaration.name_span))
+            .map(|declaration| {
+                (
+                    declaration.source_name.clone(),
+                    (declaration.id.qualified_name.clone(), declaration.name_span),
+                )
+            })
             .collect::<HashMap<_, _>>();
         let mut imported_targets = HashMap::<String, Span>::new();
         for declaration in &self.authored.imports {
@@ -651,19 +656,21 @@ impl<'a> Resolver<'a> {
                     );
                     continue;
                 }
-                if let Some(span) = local_names.get(&alias) {
-                    self.diagnostics.push(
-                        Diagnostic::new(
-                            "E0670",
-                            format!(
-                                "import alias `{alias}` collides with a declaration in this file"
-                            ),
-                            alias_span,
-                        )
-                        .with_title("Import Alias Conflicts With Declaration")
-                        .with_related(*span, "the declaration using this name is here"),
-                    );
-                    continue;
+                if let Some((local_target, span)) = local_names.get(&alias) {
+                    if local_target != &target {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0670",
+                                format!(
+                                    "import alias `{alias}` collides with a declaration in this file"
+                                ),
+                                alias_span,
+                            )
+                            .with_title("Import Alias Conflicts With Declaration")
+                            .with_related(*span, "the declaration using this name is here"),
+                        );
+                        continue;
+                    }
                 }
                 if let Some(previous) = self.imports.get(&alias) {
                     self.diagnostics.push(

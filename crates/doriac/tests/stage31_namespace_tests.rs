@@ -404,6 +404,41 @@ fn same_file_resolution_uses_canonical_package_owned_identities() {
 }
 
 #[test]
+fn exact_same_file_imports_do_not_conflict_with_their_declarations() {
+    let source = r#"namespace Acme\Imports;
+use Acme\Imports\Individual;
+use Acme\Imports\{GroupedOne, GroupedTwo};
+class Individual {}
+class GroupedOne {}
+class GroupedTwo {}
+function main(): void
+{
+    let $individual = new Individual();
+    let $one = new GroupedOne();
+    let $two = new GroupedTwo();
+}
+"#;
+
+    let (_, analysis) = doriac::analyze_source_for_ide("same-file-imports.doria", source)
+        .expect("exact same-file imports should analyze");
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    assert_eq!(analysis.info.global_symbols.imports.len(), 3);
+    assert!(analysis
+        .info
+        .global_symbols
+        .references
+        .iter()
+        .any(|reference| {
+            reference.role == GlobalReferenceRole::ImportTarget
+                && reference.symbol_id.qualified_name == "Acme\\Imports\\Individual"
+        }));
+}
+
+#[test]
 fn package_identity_and_namespace_are_independent() {
     let analyze = |package: &str| {
         let context = CompilationContext {
