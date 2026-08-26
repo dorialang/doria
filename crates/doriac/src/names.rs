@@ -222,6 +222,7 @@ pub struct UnresolvedGlobalReference {
     pub source_span: Span,
     pub role: GlobalReferenceRole,
     pub source_spelling: String,
+    pub import_alias: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -420,7 +421,7 @@ struct Resolver<'a> {
     diagnostics: Vec<Diagnostic>,
     references: Vec<GlobalSymbolReference>,
     unresolved: Vec<UnresolvedGlobalReference>,
-    external_causes: HashSet<(usize, usize)>,
+    external_causes: HashSet<String>,
 }
 
 impl<'a> Resolver<'a> {
@@ -449,6 +450,7 @@ impl<'a> Resolver<'a> {
                 source_span: include.literal_span,
                 role: GlobalReferenceRole::Include,
                 source_spelling: include.value.clone(),
+                import_alias: None,
             });
             self.diagnostics.push(
                 Diagnostic::unsupported_stage(
@@ -704,6 +706,7 @@ impl<'a> Resolver<'a> {
                         &target,
                         entry.target.span,
                         GlobalReferenceRole::ImportTarget,
+                        None,
                     );
                     continue;
                 }
@@ -730,15 +733,22 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    fn report_external(&mut self, name: &str, span: Span, role: GlobalReferenceRole) {
-        if !self.external_causes.insert((span.start, span.end)) {
-            return;
-        }
+    fn report_external(
+        &mut self,
+        name: &str,
+        span: Span,
+        role: GlobalReferenceRole,
+        import_alias: Option<String>,
+    ) {
         self.unresolved.push(UnresolvedGlobalReference {
             source_span: span,
             role,
             source_spelling: name.to_string(),
+            import_alias,
         });
+        if !self.external_causes.insert(name.to_string()) {
+            return;
+        }
         self.diagnostics.push(
             Diagnostic::unsupported_stage(
                 EXTERNAL_SYMBOL_BOUNDARY_CODE,
@@ -823,8 +833,8 @@ impl<'a> Resolver<'a> {
         };
 
         let Some(symbol_id) = self.symbol_id(&canonical) else {
-            if source_name.contains('\\') {
-                self.report_external(&canonical, span, role);
+            if source_name.contains('\\') || alias.is_some() {
+                self.report_external(&canonical, span, role, alias);
             }
             return None;
         };
@@ -1013,8 +1023,6 @@ impl<'a> Resolver<'a> {
         let span = ty.source_name.as_ref().map_or(fallback, |name| name.span);
         if let Some(resolved) = self.resolve_name(&ty.name, span, role, false) {
             ty.name = resolved;
-        } else if ty.name.contains('\\') {
-            self.report_external(&ty.name, span, role);
         }
     }
 
@@ -1223,12 +1231,6 @@ impl<'a> Resolver<'a> {
                     true,
                 ) {
                     *name = resolved;
-                } else if source_name.contains('\\') {
-                    self.report_external(
-                        &source_name,
-                        source_span,
-                        GlobalReferenceRole::FunctionCall,
-                    );
                 }
                 self.normalize_arguments(args);
             }
@@ -1298,12 +1300,6 @@ impl<'a> Resolver<'a> {
                                 false,
                             ) {
                                 *qualifier = resolved;
-                            } else if qualifier.contains('\\') {
-                                self.report_external(
-                                    qualifier,
-                                    *qualifier_span,
-                                    GlobalReferenceRole::MatchPattern,
-                                );
                             }
                         }
                         MatchPattern::TypeBinding { ty, span, .. } => {
@@ -1366,8 +1362,6 @@ impl<'a> Resolver<'a> {
         if let StaticQualifier::Class(name) = qualifier {
             if let Some(resolved) = self.resolve_name(name, span, role, false) {
                 *name = resolved;
-            } else if name.contains('\\') {
-                self.report_external(name, span, role);
             }
         }
     }

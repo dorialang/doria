@@ -463,6 +463,38 @@ fn external_symbols_and_includes_use_slice_two_boundaries_without_cascades() {
 }
 
 #[test]
+fn unresolved_import_aliases_preserve_every_tooling_occurrence_without_cascades() {
+    let source = r#"namespace Acme\App;
+use Other\Model\User as ModelUser;
+function inspect(ModelUser $user): void {}
+function main(): void { let $user = new ModelUser(); }
+"#;
+    let context = CompilationContext {
+        edition: Edition::Doria2026,
+        package: PackageIdentity::SyntheticTooling("test-workspace".to_string()),
+        source: SourceIdentity("app.doria".to_string()),
+    };
+    let (_, analysis) =
+        doriac::analyze_source_for_ide_with_context("app.doria", source, context).unwrap();
+    assert_eq!(analysis.diagnostics.len(), 1, "{:#?}", analysis.diagnostics);
+    assert_eq!(analysis.diagnostics[0].code, EXTERNAL_SYMBOL_BOUNDARY_CODE);
+
+    let occurrences = analysis
+        .info
+        .global_symbols
+        .unresolved
+        .iter()
+        .filter(|reference| reference.source_spelling == "Other\\Model\\User")
+        .collect::<Vec<_>>();
+    assert_eq!(occurrences.len(), 3, "{occurrences:#?}");
+    assert_eq!(occurrences[0].role, GlobalReferenceRole::ImportTarget);
+    assert_eq!(occurrences[0].import_alias, None);
+    assert!(occurrences[1..]
+        .iter()
+        .all(|reference| reference.import_alias.as_deref() == Some("ModelUser")));
+}
+
+#[test]
 fn unqualified_unknowns_remain_language_diagnostics() {
     let diagnostics = doriac::check_source(
         "test.doria",
