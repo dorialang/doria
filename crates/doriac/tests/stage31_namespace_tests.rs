@@ -599,6 +599,26 @@ fn invalid_compiler_inputs_are_diagnosed_deliberately() {
 }
 
 #[test]
+fn namespace_segments_follow_the_pascal_case_naming_charter() {
+    doriac::check_source(
+        "valid-namespace.doria",
+        "namespace Acme\\Http; function main(): void {}",
+    )
+    .expect("PascalCase namespace segments with folded acronyms should be accepted");
+
+    let source = "namespace acme\\HTTP; function main(): void {}";
+    let diagnostics = doriac::check_source("invalid-namespace.doria", source)
+        .expect_err("every invalid namespace segment should be diagnosed");
+    let naming = diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "E0675")
+        .collect::<Vec<_>>();
+    assert_eq!(naming.len(), 2, "{diagnostics:#?}");
+    assert_eq!(&source[naming[0].span.start..naming[0].span.end], "acme");
+    assert_eq!(&source[naming[1].span.start..naming[1].span.end], "HTTP");
+}
+
+#[test]
 fn parsed_global_declaration_name_spans_are_exact() {
     let source = "namespace Acme; class Value {} function main(): void {}";
     let program = doriac::parse_source("test.doria", source).unwrap();

@@ -8,6 +8,7 @@ use crate::types::{SharedHandleKind, TypeArgumentRef, TypeRef};
 
 pub const EXTERNAL_SYMBOL_BOUNDARY_CODE: &str = "E0671";
 pub const INCLUDE_BOUNDARY_CODE: &str = "E0672";
+pub const NAMESPACE_NAMING_CODE: &str = "E0675";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Edition {
@@ -443,6 +444,7 @@ impl<'a> Resolver<'a> {
     }
 
     fn resolve(mut self) -> ResolutionAnalysis {
+        self.validate_namespace_name();
         self.collect_declarations();
         self.collect_imports();
         for include in &self.authored.includes {
@@ -505,6 +507,29 @@ impl<'a> Resolver<'a> {
                 },
             },
             diagnostics: self.diagnostics,
+        }
+    }
+
+    fn validate_namespace_name(&mut self) {
+        let Some(namespace) = &self.authored.namespace else {
+            return;
+        };
+        for segment in &namespace.name.segments {
+            if namespace_segment_uses_pascal_case(&segment.text) {
+                continue;
+            }
+            self.diagnostics.push(
+                Diagnostic::new(
+                    NAMESPACE_NAMING_CODE,
+                    format!(
+                        "namespace segment `{}` must use PascalCase with folded acronyms",
+                        segment.text
+                    ),
+                    segment.span,
+                )
+                .with_title("Namespace Segment Must Use PascalCase")
+                .with_help("use spellings such as `Acme`, `Io`, or `Http`"),
+            );
         }
     }
 
@@ -1372,6 +1397,15 @@ impl<'a> Resolver<'a> {
             }
         }
     }
+}
+
+fn namespace_segment_uses_pascal_case(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.first().is_some_and(u8::is_ascii_uppercase)
+        && bytes.iter().all(u8::is_ascii_alphanumeric)
+        && !bytes
+            .windows(2)
+            .any(|pair| pair[0].is_ascii_uppercase() && pair[1].is_ascii_uppercase())
 }
 
 fn duplicate_declaration_diagnostic(

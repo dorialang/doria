@@ -308,6 +308,30 @@ fn pascal_case_fixes_are_exact_and_suppressed_on_collisions() {
         .iter()
         .find(|diagnostic| diagnostic.code == "E0564")
         .is_some_and(|diagnostic| diagnostic.fix.is_none()));
+
+    let namespaced = diagnostics("namespace Acme; enum status { case Ready; }");
+    let namespaced_name = namespaced
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0563")
+        .expect("the authored enum segment should be validated");
+    assert_eq!(
+        namespaced_name.message,
+        "enum name `status` must use PascalCase"
+    );
+    assert_eq!(
+        namespaced_name
+            .fix
+            .as_ref()
+            .map(|fix| fix.replacement.as_str()),
+        Some("Status")
+    );
+
+    let namespaced_collision =
+        diagnostics("namespace Acme; class Status {} enum status { case Ready; }");
+    assert!(namespaced_collision
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0563")
+        .is_some_and(|diagnostic| diagnostic.fix.is_none()));
 }
 
 #[test]

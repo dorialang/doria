@@ -2269,16 +2269,25 @@ impl<'program> Checker<'program> {
             let Some(mut definition) = self.enums.get(&declaration.name).cloned() else {
                 continue;
             };
-            if !Self::uses_pascal_case(&declaration.name) {
+            let source_name = declaration
+                .name
+                .rsplit('\\')
+                .next()
+                .unwrap_or(declaration.name.as_str());
+            if !Self::uses_pascal_case(source_name) {
                 let mut diagnostic = Diagnostic::new(
                     "E0563",
-                    format!("enum name `{}` must use PascalCase", declaration.name),
+                    format!("enum name `{source_name}` must use PascalCase"),
                     declaration.name_span,
                 )
                 .with_title("Enum Name Must Use PascalCase");
-                if let Some(replacement) = Self::safe_pascal_case_fix(&declaration.name) {
-                    let collides = non_enum_types.contains(replacement.as_str())
-                        || self.enums.contains_key(&replacement);
+                if let Some(replacement) = Self::safe_pascal_case_fix(source_name) {
+                    let canonical_replacement = declaration.name.rsplit_once('\\').map_or_else(
+                        || replacement.clone(),
+                        |(namespace, _)| format!("{namespace}\\{replacement}"),
+                    );
+                    let collides = non_enum_types.contains(canonical_replacement.as_str())
+                        || self.enums.contains_key(&canonical_replacement);
                     if !collides {
                         diagnostic = diagnostic.with_fix(declaration.name_span, replacement);
                     }
