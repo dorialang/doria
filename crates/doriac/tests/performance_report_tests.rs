@@ -514,26 +514,25 @@ fn enum_fixture_reports_additive_structural_counts_without_a_schema_bump() {
         serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
             .expect("JSON");
     assert_eq!(report["schemaVersion"], 1);
-    // The report describes the complete semantic/MIR program. Stage 29's four
-    // compiler-known I/O enums are therefore counted alongside these six
-    // source declarations, including their cases, payloads, and glue needs.
-    assert_eq!(report["metrics"]["enumCount"], 10);
-    assert_eq!(report["metrics"]["unitEnumCount"], 3);
+    // The report describes the complete semantic/MIR program, including only
+    // compiler-known declarations that this source actually requires.
+    assert_eq!(report["metrics"]["enumCount"], 6);
+    assert_eq!(report["metrics"]["unitEnumCount"], 1);
     assert_eq!(report["metrics"]["backedEnumCount"], 2);
-    assert_eq!(report["metrics"]["payloadEnumCount"], 5);
-    assert_eq!(report["metrics"]["copyPayloadEnumCount"], 4);
+    assert_eq!(report["metrics"]["payloadEnumCount"], 3);
+    assert_eq!(report["metrics"]["copyPayloadEnumCount"], 2);
     assert_eq!(report["metrics"]["movePayloadEnumCount"], 1);
-    assert_eq!(report["metrics"]["enumCaseCount"], 29);
-    assert_eq!(report["metrics"]["enumPayloadFieldCount"], 8);
+    assert_eq!(report["metrics"]["enumCaseCount"], 10);
+    assert_eq!(report["metrics"]["enumPayloadFieldCount"], 6);
     assert!(report["metrics"]["maximumPayloadEnumSize"]
         .as_u64()
         .is_some_and(|value| value > 0));
     assert!(report["metrics"]["maximumPayloadEnumAlignment"]
         .as_u64()
         .is_some_and(|value| value > 0));
-    assert_eq!(report["metrics"]["enumCopyGlueTypeCount"], 4);
-    assert_eq!(report["metrics"]["enumDropGlueTypeCount"], 4);
-    assert_eq!(report["metrics"]["enumEqualityGlueTypeCount"], 5);
+    assert_eq!(report["metrics"]["enumCopyGlueTypeCount"], 2);
+    assert_eq!(report["metrics"]["enumDropGlueTypeCount"], 2);
+    assert_eq!(report["metrics"]["enumEqualityGlueTypeCount"], 3);
     let _ = fs::remove_dir_all(directory);
 }
 

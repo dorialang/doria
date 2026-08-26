@@ -6,13 +6,15 @@
 
 use std::fmt;
 
+use crate::build_plan::{SourceOrigin, SourceScope, TargetKind};
 use crate::class_layout::{ClassId, ClassLayout, PropertyId};
 use crate::enums::{
     EnumBackingType, EnumBackingValue, EnumCapabilities, EnumCaseId, EnumId, EnumLayout, EnumValue,
 };
 use crate::format_string::FormatPiece;
+use crate::names::{PackageIdentity, SourceIdentity};
 use crate::numeric::{FloatType, FloatValue, IntegerType, IntegerValue};
-use crate::source::{SourceFile, Span};
+use crate::source::{SourceFile, SourceId, Span};
 use crate::symbols::{BindingId, ClosureId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -53,6 +55,9 @@ pub struct ClosureEnvironmentFieldId(pub usize);
 
 #[derive(Debug, Clone)]
 pub struct Program {
+    pub sources: Vec<SourceUnit>,
+    pub packages: Vec<PackageUnit>,
+    pub selected_target: SelectedTarget,
     pub source: SourceFile,
     pub compilation_context: crate::names::CompilationContext,
     pub namespace: Option<String>,
@@ -67,6 +72,10 @@ pub struct Program {
     pub closure_descriptors: Vec<ClosureDescriptor>,
     pub closure_environment_layouts: Vec<ClosureEnvironmentLayout>,
     pub functions: Vec<Function>,
+    /// The validated process entry. Libraries deliberately have no entry.
+    pub selected_entry: Option<FunctionId>,
+    /// Compatibility view for existing single-source backend code. Graph-aware
+    /// consumers use `selected_entry`.
     pub entry: FunctionId,
 }
 
@@ -84,7 +93,85 @@ impl PartialEq for Program {
             && self.closure_descriptors == other.closure_descriptors
             && self.closure_environment_layouts == other.closure_environment_layouts
             && self.functions == other.functions
+            && self.selected_entry == other.selected_entry
             && self.entry == other.entry
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceUnit {
+    pub id: SourceId,
+    pub identity: SourceIdentity,
+    pub package: PackageIdentity,
+    pub display_path: String,
+    pub scope: SourceScope,
+    pub origin: SourceOrigin,
+    pub generated_for: Option<crate::build_plan::GeneratedFor>,
+    pub active: bool,
+    pub source: SourceFile,
+}
+
+impl SourceUnit {
+    pub fn standalone(path: impl Into<String>, text: impl Into<String>) -> Self {
+        let path = path.into();
+        Self {
+            id: SourceId(0),
+            identity: SourceIdentity(path.clone()),
+            package: PackageIdentity::Standalone,
+            display_path: path.clone(),
+            scope: SourceScope::Main,
+            origin: SourceOrigin::Entry,
+            generated_for: None,
+            active: true,
+            source: SourceFile::with_id(SourceId(0), path, text),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageUnit {
+    pub identity: PackageIdentity,
+    pub normal_dependencies: Vec<PackageIdentity>,
+    pub development_dependencies: Vec<PackageIdentity>,
+}
+
+impl PackageUnit {
+    pub fn standalone() -> Self {
+        Self {
+            identity: PackageIdentity::Standalone,
+            normal_dependencies: Vec::new(),
+            development_dependencies: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedTarget {
+    pub package: PackageIdentity,
+    pub kind: TargetKind,
+    pub entry_source: Option<SourceIdentity>,
+}
+
+impl SelectedTarget {
+    pub fn standalone(path: impl Into<String>) -> Self {
+        Self {
+            package: PackageIdentity::Standalone,
+            kind: TargetKind::Binary,
+            entry_source: Some(SourceIdentity(path.into())),
+        }
+    }
+}
+
+impl Program {
+    pub fn source_by_id(&self, id: SourceId) -> Option<&SourceFile> {
+        self.sources
+            .iter()
+            .find(|source| source.id == id)
+            .map(|source| &source.source)
+    }
+
+    pub fn source_for_span(&self, span: Span) -> Option<&SourceFile> {
+        self.source_by_id(span.source)
     }
 }
 
@@ -92,6 +179,7 @@ impl PartialEq for Program {
 pub struct EnumDefinition {
     pub id: EnumId,
     pub name: String,
+    pub source_span: Span,
     pub backing_type: Option<EnumBackingType>,
     pub cases: Vec<EnumCaseDefinition>,
     pub capabilities: EnumCapabilities,
@@ -201,6 +289,7 @@ pub struct StaticProperty {
     pub id: StaticId,
     pub class: ClassId,
     pub name: String,
+    pub source_span: Span,
     pub ty: Type,
     pub writable: bool,
     pub initializer: StaticValue,
@@ -225,6 +314,7 @@ pub struct PayloadEnumConstant {
 pub struct Class {
     pub id: ClassId,
     pub name: String,
+    pub source_span: Span,
     pub properties: Vec<Property>,
     pub layout: ClassLayout,
     pub constructor: Option<FunctionId>,

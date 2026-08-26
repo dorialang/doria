@@ -4,7 +4,7 @@ use doriac::diagnostics::DiagnosticKind;
 use doriac::names::{
     compiler_known_symbol_facts, edition_prelude, CompilationContext, CompilerKnownProvenance,
     CompilerSymbolIdentity, Edition, GlobalReferenceRole, GlobalSymbolKind, GlobalSymbolOwner,
-    PackageIdentity, SourceIdentity, EXTERNAL_SYMBOL_BOUNDARY_CODE, INCLUDE_BOUNDARY_CODE,
+    PackageIdentity, SourceIdentity,
 };
 use doriac::source::Span;
 use std::collections::HashSet;
@@ -49,6 +49,7 @@ function main(): void
     }
 }
 "#;
+const INCOMPLETE_GRAPH_CODE: &str = "E0681";
 
 fn php_available() -> bool {
     Command::new("php")
@@ -469,30 +470,27 @@ fn package_identity_and_namespace_are_independent() {
 }
 
 #[test]
-fn external_symbols_and_includes_use_slice_two_boundaries_without_cascades() {
+fn external_symbols_and_includes_require_complete_graph_input_without_cascades() {
     for (source, code) in [
         (
             "use Other\\Package\\Value; function main(): void {}",
-            EXTERNAL_SYMBOL_BOUNDARY_CODE,
+            INCOMPLETE_GRAPH_CODE,
         ),
         (
             "function main(): void { let $value = new Other\\Package\\Value(); }",
-            EXTERNAL_SYMBOL_BOUNDARY_CODE,
+            INCOMPLETE_GRAPH_CODE,
         ),
         (
             "include \"generated/routes.doria\"; function main(): void {}",
-            INCLUDE_BOUNDARY_CODE,
+            INCOMPLETE_GRAPH_CODE,
         ),
     ] {
         let diagnostics = doriac::check_source("test.doria", source)
             .expect_err("unresolved graph input should stop before lowering");
         assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
         assert_eq!(diagnostics[0].code, code);
-        assert_eq!(
-            diagnostics[0].kind,
-            DiagnosticKind::UnsupportedDevelopmentSurface
-        );
-        assert!(diagnostics[0].development_only);
+        assert_eq!(diagnostics[0].kind, DiagnosticKind::CompilerInput);
+        assert!(!diagnostics[0].development_only);
         assert_ne!(diagnostics[0].code, "E0641");
     }
 }
@@ -512,7 +510,7 @@ function main(): void { let $user = new ModelUser(); }
     let (_, analysis) =
         doriac::analyze_source_for_ide_with_context("app.doria", source, context).unwrap();
     assert_eq!(analysis.diagnostics.len(), 1, "{:#?}", analysis.diagnostics);
-    assert_eq!(analysis.diagnostics[0].code, EXTERNAL_SYMBOL_BOUNDARY_CODE);
+    assert_eq!(analysis.diagnostics[0].code, INCOMPLETE_GRAPH_CODE);
 
     let occurrences = analysis
         .info
@@ -538,7 +536,7 @@ fn unqualified_unknowns_remain_language_diagnostics() {
     .expect_err("unknown unqualified type should fail");
     assert!(diagnostics.iter().all(|diagnostic| {
         diagnostic.kind == DiagnosticKind::Language
-            && diagnostic.code != EXTERNAL_SYMBOL_BOUNDARY_CODE
+            && diagnostic.code != INCOMPLETE_GRAPH_CODE
             && diagnostic.code != "E0641"
     }));
 }
@@ -683,12 +681,11 @@ function main(): void
         .expect("IDE analysis should preserve boundary facts");
     let diagnostics = &analysis.diagnostics;
     assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == EXTERNAL_SYMBOL_BOUNDARY_CODE
+        diagnostic.code == INCOMPLETE_GRAPH_CODE
             && diagnostic.message.contains("Acme\\Imported\\Comparable")
     }));
     assert!(diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == EXTERNAL_SYMBOL_BOUNDARY_CODE
-            && diagnostic.message.contains("Other\\Local")
+        diagnostic.code == INCOMPLETE_GRAPH_CODE && diagnostic.message.contains("Other\\Local")
     }));
     assert!(!diagnostics.iter().any(|diagnostic| {
         diagnostic.message.contains("Acme\\Other\\Local")
@@ -787,7 +784,7 @@ fn canonical_io_requires_qualification_or_an_explicit_import() {
     )
     .expect_err("the standard I/O module must not create an implicit short alias");
     assert!(diagnostics.iter().all(|diagnostic| {
-        diagnostic.code != EXTERNAL_SYMBOL_BOUNDARY_CODE && diagnostic.code != "E0641"
+        diagnostic.code != INCOMPLETE_GRAPH_CODE && diagnostic.code != "E0641"
     }));
     assert!(diagnostics
         .iter()

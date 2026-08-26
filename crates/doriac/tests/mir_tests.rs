@@ -176,6 +176,9 @@ fn debug_contents(source: &str) -> String {
 
 fn conditional_program(condition: Condition, then_status: i64, else_status: i64) -> Program {
     Program {
+        sources: vec![doriac::mir::SourceUnit::standalone("<test>", "")],
+        packages: vec![doriac::mir::PackageUnit::standalone()],
+        selected_target: doriac::mir::SelectedTarget::standalone("<test>"),
         source: doriac::source::SourceFile::new("<test>", ""),
         compilation_context: doriac::names::CompilationContext::standalone("<test>"),
         namespace: None,
@@ -232,6 +235,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
             entry_block: BlockId(0),
             closure: None,
         }],
+        selected_entry: Some(FunctionId(0)),
         entry: FunctionId(0),
     }
 }
@@ -865,6 +869,9 @@ fn interprets_multiple_echoes_without_newline() {
 #[test]
 fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
     let program = Program {
+        sources: vec![doriac::mir::SourceUnit::standalone("<test>", "")],
+        packages: vec![doriac::mir::PackageUnit::standalone()],
+        selected_target: doriac::mir::SelectedTarget::standalone("<test>"),
         source: doriac::source::SourceFile::new("<test>", ""),
         compilation_context: doriac::names::CompilationContext::standalone("<test>"),
         namespace: None,
@@ -915,6 +922,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
             entry_block: BlockId(0),
             closure: None,
         }],
+        selected_entry: Some(FunctionId(0)),
         entry: FunctionId(0),
     };
 
@@ -1538,6 +1546,9 @@ fn interpreter_preserves_void_fallthrough_after_final_else_if() {
 #[test]
 fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
     let program = Program {
+        sources: vec![doriac::mir::SourceUnit::standalone("<test>", "")],
+        packages: vec![doriac::mir::PackageUnit::standalone()],
+        selected_target: doriac::mir::SelectedTarget::standalone("<test>"),
         source: doriac::source::SourceFile::new("<test>", ""),
         compilation_context: doriac::names::CompilationContext::standalone("<test>"),
         namespace: None,
@@ -1571,6 +1582,7 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
             entry_block: BlockId(0),
             closure: None,
         }],
+        selected_entry: Some(FunctionId(0)),
         entry: FunctionId(0),
     };
 
@@ -3029,6 +3041,9 @@ fn stage_11f_debug_target_handles_all_examples() {
 #[test]
 fn explicitly_limited_interpreter_can_bound_call_frames() {
     let program = Program {
+        sources: vec![doriac::mir::SourceUnit::standalone("<test>", "")],
+        packages: vec![doriac::mir::PackageUnit::standalone()],
+        selected_target: doriac::mir::SelectedTarget::standalone("<test>"),
         source: doriac::source::SourceFile::new("<test>", ""),
         compilation_context: doriac::names::CompilationContext::standalone("<test>"),
         namespace: None,
@@ -3076,6 +3091,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
             entry_block: BlockId(0),
             closure: None,
         }],
+        selected_entry: Some(FunctionId(0)),
         entry: FunctionId(0),
     };
 

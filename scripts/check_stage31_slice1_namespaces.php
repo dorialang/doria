@@ -45,8 +45,6 @@ function check_stage31_slice1_namespaces(string $root): array
         'tests' => 'crates/doriac/tests/stage31_namespace_tests.rs',
         'fixture' => 'examples/native/main_stage31_namespaces.doria',
         'manifest' => 'crates/doriac/tests/fixtures/native_parity_examples.txt',
-        'pendingImport' => 'examples/future/stage31_slice2_external_import.doria',
-        'pendingInclude' => 'examples/future/stage31_slice2_include.doria',
     ];
     $files = [];
     foreach ($paths as $key => $path) {
@@ -62,9 +60,10 @@ function check_stage31_slice1_namespaces(string $root): array
             'Complete',
             'Stage 31 Slice 1',
             'Stage 31 Slice 2',
-            'Next',
+            'Complete',
             'Stage 31',
-            'In Progress',
+            'Stage 32',
+            'Next',
             'Stage 33',
             'Not Implemented',
             'E0641',
@@ -103,8 +102,11 @@ function check_stage31_slice1_namespaces(string $root): array
         'self.namespace.as_ref()',
         'edition_prelude(self.context.edition)',
         'if source_name.contains',
-        'Include Resolution Awaits Stage 31 Slice 2',
-        'External Symbol Resolution Awaits Stage 31 Slice 2',
+        '"E0681"',
+    ]);
+    $forbid($paths['names'], $files['names'], [
+        'EXTERNAL_SYMBOL_BOUNDARY_CODE',
+        'INCLUDE_BOUNDARY_CODE',
     ]);
     $require($paths['lib'], $files['lib'], [
         'resolve_program_for_ide',
@@ -128,10 +130,7 @@ function check_stage31_slice1_namespaces(string $root): array
         'use Doria\Std\Io\IoError;',
     ]);
     $require($paths['manifest'], $files['manifest'], ['main_stage31_namespaces']);
-    $require($paths['pendingImport'], $files['pendingImport'], ['use Acme\Domain\User;']);
-    $require($paths['pendingInclude'], $files['pendingInclude'], ['include "generated/routes.doria";']);
-
-    $forbid($paths['lib'], $files['lib'], ['Baton.toml', 'parse_build_plan']);
+    $forbid($paths['lib'], $files['lib'], ['Baton.toml']);
     $forbid($paths['hir'], $files['hir'], ['Item::Include', 'IncludeDecl']);
     $forbid($paths['mir'], $files['mir'], ['Statement::Include', 'IncludeDecl']);
     $forbid($paths['php'], $files['php'], ['spl_autoload_register']);

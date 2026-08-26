@@ -11,8 +11,9 @@ use serde_json::{json, Value};
 
 use crate::backend::{BackendError, BackendOutput, CompileOptions};
 use crate::diagnostics::Diagnostic;
+use crate::names::CompilationContext;
 use crate::source::SourceFile;
-use crate::{codegen_native, lowering, mir_lowering, semantics};
+use crate::{codegen_native, lowering, mir_lowering};
 
 pub const REPORT_SCHEMA_VERSION: u64 = 1;
 
@@ -36,17 +37,17 @@ pub fn compile_native(
     let started = Instant::now();
     let ast = crate::parse_source_file(&source)?;
     let parse = started.elapsed();
+    let ast_item_count = ast.items.len();
 
     let started = Instant::now();
-    crate::compiler_known_io::validate_reserved_identities(&ast)?;
-    let augmented_ast = crate::compiler_known_io::augment_program(&ast);
-    let semantic_info = semantics::analyze_program(&augmented_ast)?;
+    let context = CompilationContext::standalone(source.path.clone());
+    let prepared = crate::prepare_parsed_source(&source, context.clone(), ast)?;
+    let semantic_info = crate::analyze_prepared_source(&prepared, &source)?;
     let semantic = started.elapsed();
 
     let started = Instant::now();
-    let mut hir = lowering::lower_program_with_semantics(&augmented_ast, semantic_info)?;
-    hir.source_path = source.path.clone();
-    hir.source_text = source.text.clone();
+    let hir = lowering::lower_program_with_semantics(&prepared.resolved, semantic_info)?;
+    let hir = crate::complete_standalone_hir(hir, source.clone(), &context);
     let hir_lowering = started.elapsed();
     let started = Instant::now();
     let (mir, structure) = mir_lowering::lower_program_with_metrics(&hir)?;
@@ -63,7 +64,6 @@ pub fn compile_native(
             .line_count()
             .saturating_sub(usize::from(text.ends_with('\n')))
     };
-    let ast_item_count = ast.items.len();
     let output_size = bytes.len();
     let runtime_artifact_bytes = fs::metadata(&native.runtime_artifact)
         .ok()

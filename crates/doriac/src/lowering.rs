@@ -39,8 +39,16 @@ pub fn lower_program_with_semantics(
         return Err(diagnostics);
     }
     apply_checked_error_semantics(&mut items, &semantic_info);
+    apply_global_identities(&mut items, &semantic_info);
 
     Ok(hir::Program {
+        sources: Vec::new(),
+        packages: Vec::new(),
+        selected_target: hir::SelectedTarget {
+            package: semantic_info.compilation_context.package.clone(),
+            kind: crate::build_plan::TargetKind::Binary,
+            entry_source: Some(semantic_info.compilation_context.source.clone()),
+        },
         source_path: String::new(),
         source_text: String::new(),
         namespace: program
@@ -53,6 +61,51 @@ pub fn lower_program_with_semantics(
         items,
         semantic_info,
     })
+}
+
+fn apply_global_identities(
+    items: &mut [hir::Item],
+    semantic_info: &crate::semantics::SemanticInfo,
+) {
+    for item in items {
+        let (span, global_id, source_identity, package) = match item {
+            hir::Item::Class(value) => (
+                value.span,
+                &mut value.global_id,
+                &mut value.source_identity,
+                &mut value.package,
+            ),
+            hir::Item::Enum(value) => (
+                value.span,
+                &mut value.global_id,
+                &mut value.source_identity,
+                &mut value.package,
+            ),
+            hir::Item::Function(value) => (
+                value.span,
+                &mut value.global_id,
+                &mut value.source_identity,
+                &mut value.package,
+            ),
+            hir::Item::Constant(value) => (
+                value.span,
+                &mut value.global_id,
+                &mut value.source_identity,
+                &mut value.package,
+            ),
+            hir::Item::Statement(_) => continue,
+        };
+        if let Some(context) = semantic_info.compilation_contexts.get(&span.source) {
+            *source_identity = context.source.clone();
+            *package = context.package.clone();
+        }
+        *global_id = semantic_info
+            .global_symbols
+            .declarations
+            .iter()
+            .find(|declaration| declaration.declaration_span == span)
+            .map(|declaration| declaration.id.clone());
+    }
 }
 
 fn apply_checked_error_semantics(
@@ -85,13 +138,13 @@ fn apply_function_checked_error_semantics(
 ) {
     function.checked_effects = semantic_info
         .callable_effective_checked_effects
-        .get(&function.span.start)
+        .get(&function.span)
         .cloned()
         .unwrap_or_default();
     if let Some(throws) = &mut function.throws {
         if let Some(effects) = semantic_info
             .callable_effective_checked_effects
-            .get(&function.span.start)
+            .get(&function.span)
         {
             for (entry, effect) in throws.entries.iter_mut().zip(effects) {
                 entry.resolved = effect.clone();
@@ -117,10 +170,7 @@ fn apply_statement_checked_error_semantics(
     match statement {
         hir::Stmt::Block(block) => apply_block_checked_error_semantics(block, semantic_info),
         hir::Stmt::Throw(statement) => {
-            if let Some(error_type) = semantic_info
-                .throw_error_types
-                .get(&(statement.span.start, statement.span.end))
-            {
+            if let Some(error_type) = semantic_info.throw_error_types.get(&statement.span) {
                 statement.error_type = error_type.clone();
             }
             apply_expr_checked_error_semantics(&mut statement.expr, semantic_info);
@@ -128,10 +178,7 @@ fn apply_statement_checked_error_semantics(
         hir::Stmt::Try(statement) => {
             apply_block_checked_error_semantics(&mut statement.body, semantic_info);
             for catch in &mut statement.catches {
-                if let Some(error_type) = semantic_info
-                    .catch_error_types
-                    .get(&(catch.span.start, catch.span.end))
-                {
+                if let Some(error_type) = semantic_info.catch_error_types.get(&catch.span) {
                     catch.error_type = error_type.clone();
                 }
                 apply_block_checked_error_semantics(&mut catch.body, semantic_info);
@@ -141,7 +188,7 @@ fn apply_statement_checked_error_semantics(
             }
             statement.uncovered_effects = semantic_info
                 .try_uncovered_effects
-                .get(&(statement.span.start, statement.span.end))
+                .get(&statement.span)
                 .cloned()
                 .unwrap_or_default();
         }
@@ -254,10 +301,7 @@ fn apply_expr_checked_error_semantics(
         span,
     } = expression.clone()
     {
-        if let Some(plan) = semantic_info
-            .list_algorithm_calls
-            .get(&(span.start, span.end))
-        {
+        if let Some(plan) = semantic_info.list_algorithm_calls.get(&span) {
             let kind = match plan.kind {
                 crate::semantics::ListAlgorithmKind::Map => hir::ListAlgorithmKind::Map,
                 crate::semantics::ListAlgorithmKind::Filter => hir::ListAlgorithmKind::Filter,
@@ -284,7 +328,7 @@ fn apply_expr_checked_error_semantics(
             }));
         } else if semantic_info
             .callable_value_calls
-            .get(&(span.start, span.end))
+            .get(&span)
             .is_some_and(|call| {
                 call.target_kind == crate::semantics::CallableValueTargetKind::Property
             })
@@ -434,6 +478,11 @@ fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
 
 fn lower_enum(enum_decl: &ast::EnumDecl) -> hir::EnumDecl {
     hir::EnumDecl {
+        global_id: None,
+        source_identity: crate::names::SourceIdentity("<unknown>".to_string()),
+        package: crate::names::PackageIdentity::Standalone,
+        access: enum_decl.access,
+        access_span: enum_decl.access_span,
         name: enum_decl.name.clone(),
         type_params: enum_decl
             .type_params
@@ -475,6 +524,11 @@ fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
         type_params: &class_decl.type_params,
     };
     hir::ClassDecl {
+        global_id: None,
+        source_identity: crate::names::SourceIdentity("<unknown>".to_string()),
+        package: crate::names::PackageIdentity::Standalone,
+        access: class_decl.access,
+        access_span: class_decl.access_span,
         name: class_decl.name.clone(),
         type_params: class_decl
             .type_params
@@ -512,7 +566,7 @@ fn lower_property(
     class_name: Option<ClassContext<'_>>,
 ) -> hir::PropertyDecl {
     hir::PropertyDecl {
-        access: property.access.clone(),
+        access: property.access,
         is_static: property.is_static,
         writable: property.writable,
         ty: lower_type_ref(&property.ty, class_name),
@@ -530,7 +584,11 @@ fn lower_constant(
     class_name: Option<ClassContext<'_>>,
 ) -> hir::ConstDecl {
     hir::ConstDecl {
-        access: constant.access.clone(),
+        global_id: None,
+        source_identity: crate::names::SourceIdentity("<unknown>".to_string()),
+        package: crate::names::PackageIdentity::Standalone,
+        access: constant.access,
+        access_span: constant.access_span,
         ty: constant
             .ty
             .as_ref()
@@ -546,7 +604,11 @@ fn lower_function(
     class_name: Option<ClassContext<'_>>,
 ) -> hir::FunctionDecl {
     hir::FunctionDecl {
-        access: function.access.clone(),
+        global_id: None,
+        source_identity: crate::names::SourceIdentity("<unknown>".to_string()),
+        package: crate::names::PackageIdentity::Standalone,
+        access: function.access,
+        access_span: function.access_span,
         writable_this: function.writable_this,
         is_static: function.is_static,
         name: function.name.clone(),
@@ -604,7 +666,7 @@ fn lower_type_param(
 
 fn lower_param(param: &ast::Param, class_name: Option<ClassContext<'_>>) -> hir::Param {
     hir::Param {
-        promoted_access: param.promoted_access.clone(),
+        promoted_access: param.promoted_access,
         take: param.take,
         writable: param.writable,
         ty: lower_type_ref(&param.ty, class_name),

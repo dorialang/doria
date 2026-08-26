@@ -183,7 +183,9 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30 — Complete',
         'E0641 is historical and remains reserved',
         'Stage 31 Slice 1 — Complete',
-        'Stage 31 Slice 2 — Next',
+        'Stage 31 Slice 2 — Complete',
+        'Stage 31 — Complete',
+        'Stage 32 — Next',
     ]);
     $forbid($pipelinePath, $pipeline, [
         'Stage 30 Closure Authority Proposal — In Review',
@@ -244,7 +246,7 @@ function check_stage30_closure_authority(string $root): array
         'pub struct ClosureId',
         'pub struct BindingResolution',
         'pub declarations_by_id: HashMap<BindingId, BindingDeclaration>',
-        'pub uses_by_span: HashMap<(usize, usize), BindingId>',
+        'pub uses_by_span: HashMap<Span, BindingId>',
     ]);
     $require($astPath, $ast, ['CallableCall {']);
     $require($parserPath, $parser, [

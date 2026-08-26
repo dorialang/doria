@@ -8,6 +8,7 @@ use crate::mir;
 use crate::numeric::{FloatType, IntegerType};
 
 pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
+    validate_graph_metadata(program)?;
     validate_error_metadata(program)?;
     validate_closure_metadata(program)?;
     for (index, definition) in program.enums.iter().enumerate() {
@@ -145,15 +146,38 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
         }
     }
 
-    let entry = program
-        .functions
-        .get(program.entry.0)
-        .ok_or_else(|| malformed_mir("entry function does not exist"))?;
-    if entry.id != program.entry {
-        return Err(malformed_mir(
-            "entry FunctionId does not match its table slot",
-        ));
+    if let Some(entry_id) = program.selected_entry {
+        if program.entry != entry_id {
+            return Err(malformed_mir(
+                "the compatibility entry does not match the selected graph entry",
+            ));
+        }
+        let entry = program
+            .functions
+            .get(entry_id.0)
+            .ok_or_else(|| malformed_mir("entry function does not exist"))?;
+        if entry.id != entry_id {
+            return Err(malformed_mir(
+                "entry FunctionId does not match its table slot",
+            ));
+        }
+        validate_entry(program, entry)?;
     }
+
+    for (index, function) in program.functions.iter().enumerate() {
+        if function.id != mir::FunctionId(index) {
+            return Err(malformed_mir(format!(
+                "function table slot {index} contains function{}",
+                function.id.0
+            )));
+        }
+        validate_method_identity(program, function)?;
+        validate_function(program, function)?;
+    }
+    Ok(())
+}
+
+fn validate_entry(program: &mir::Program, entry: &mir::Function) -> Result<(), BackendError> {
     // Decision 0099: the entry takes either no parameters or exactly one
     // borrowed `List<string>` of program arguments, which the entry glue owns
     // for the duration of the call.
@@ -211,15 +235,264 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
         ));
     }
 
-    for (index, function) in program.functions.iter().enumerate() {
-        if function.id != mir::FunctionId(index) {
+    Ok(())
+}
+
+fn validate_graph_metadata(program: &mir::Program) -> Result<(), BackendError> {
+    let mut source_ids = HashSet::new();
+    let mut source_identities = HashSet::new();
+    let mut packages = HashSet::new();
+    for package in &program.packages {
+        if !packages.insert(package.identity.clone()) {
             return Err(malformed_mir(format!(
-                "function table slot {index} contains function{}",
-                function.id.0
+                "package `{}` appears more than once",
+                package.identity.display_name()
             )));
         }
-        validate_method_identity(program, function)?;
-        validate_function(program, function)?;
+    }
+    for package in &program.packages {
+        for dependency in package
+            .normal_dependencies
+            .iter()
+            .chain(&package.development_dependencies)
+        {
+            if !packages.contains(dependency) {
+                return Err(malformed_mir(format!(
+                    "package `{}` references missing dependency `{}`",
+                    package.identity.display_name(),
+                    dependency.display_name()
+                )));
+            }
+        }
+    }
+    for source in &program.sources {
+        if !source_ids.insert(source.id) {
+            return Err(malformed_mir(format!(
+                "source{} appears more than once",
+                source.id.0
+            )));
+        }
+        if source.source.id != source.id {
+            return Err(malformed_mir(format!(
+                "source{} does not match its source-file identity",
+                source.id.0
+            )));
+        }
+        if !source_identities.insert(source.identity.clone()) {
+            return Err(malformed_mir(format!(
+                "source identity `{}` appears more than once",
+                source.identity.0
+            )));
+        }
+        if !packages.contains(&source.package) {
+            return Err(malformed_mir(format!(
+                "source `{}` belongs to missing package `{}`",
+                source.identity.0,
+                source.package.display_name()
+            )));
+        }
+    }
+    validate_global_graph_facts(program)?;
+    if !packages.contains(&program.selected_target.package) {
+        return Err(malformed_mir("selected target package does not exist"));
+    }
+    let selected_source = program
+        .selected_target
+        .entry_source
+        .as_ref()
+        .map(|identity| {
+            program
+                .sources
+                .iter()
+                .find(|source| &source.identity == identity)
+                .ok_or_else(|| malformed_mir("selected entry source does not exist"))
+        });
+    match program.selected_target.kind {
+        crate::build_plan::TargetKind::Binary => {
+            let selected_source = selected_source
+                .ok_or_else(|| malformed_mir("binary graph has no selected entry source"))??;
+            if program.selected_entry.is_none() {
+                return Err(malformed_mir("binary graph has no selected entry function"));
+            }
+            let entry = program
+                .selected_entry
+                .and_then(|entry| program.functions.get(entry.0))
+                .ok_or_else(|| malformed_mir("selected entry function does not exist"))?;
+            if entry.source_span.source != selected_source.id {
+                return Err(malformed_mir(
+                    "selected entry function belongs to the wrong source",
+                ));
+            }
+        }
+        crate::build_plan::TargetKind::Library => {
+            if program.selected_target.entry_source.is_some() || program.selected_entry.is_some() {
+                return Err(malformed_mir("library graph carries a process entry"));
+            }
+        }
+    }
+    let validate_source = |span: crate::source::Span, kind: &str| {
+        if span.source == crate::compiler_known_io::SYNTHETIC_SOURCE_ID {
+            return Ok(());
+        }
+        let source = program
+            .sources
+            .iter()
+            .find(|source| source.id == span.source)
+            .ok_or_else(|| malformed_mir(format!("{kind} references a missing source")))?;
+        if !source.active {
+            return Err(malformed_mir(format!(
+                "{kind} references an inactive source"
+            )));
+        }
+        Ok(())
+    };
+    for function in &program.functions {
+        validate_source(function.source_span, "function")?;
+    }
+    for class in &program.classes {
+        validate_source(class.source_span, "class")?;
+    }
+    for definition in &program.enums {
+        validate_source(definition.source_span, "enum")?;
+    }
+    for property in &program.statics {
+        validate_source(property.source_span, "static property")?;
+    }
+    for origin in &program.error_origins {
+        validate_source(origin.span, "Error origin")?;
+    }
+    for closure in &program.closure_descriptors {
+        validate_source(closure.source_span, "closure")?;
+    }
+    Ok(())
+}
+
+fn validate_global_graph_facts(program: &mir::Program) -> Result<(), BackendError> {
+    use crate::ast::MemberAccess;
+    use crate::names::{GlobalReferenceRole, GlobalSymbolOwner};
+
+    let sources = program
+        .sources
+        .iter()
+        .map(|source| (source.identity.clone(), source))
+        .collect::<HashMap<_, _>>();
+    let packages = program
+        .packages
+        .iter()
+        .map(|package| (package.identity.clone(), package))
+        .collect::<HashMap<_, _>>();
+    let mut declarations = HashMap::new();
+    let mut qualified_names = HashSet::new();
+    for declaration in &program.global_symbols.declarations {
+        let source = sources.get(&declaration.source_identity).ok_or_else(|| {
+            malformed_mir(format!(
+                "global declaration `{}` references a missing source",
+                declaration.qualified_name
+            ))
+        })?;
+        if declaration.name_span.source != source.id
+            || declaration.declaration_span.source != source.id
+        {
+            return Err(malformed_mir(format!(
+                "global declaration `{}` carries a span from the wrong source",
+                declaration.qualified_name
+            )));
+        }
+        let GlobalSymbolOwner::Package(owner) = &declaration.id.owner else {
+            return Err(malformed_mir(format!(
+                "user declaration `{}` has a compiler-known owner",
+                declaration.qualified_name
+            )));
+        };
+        if owner != &source.package {
+            return Err(malformed_mir(format!(
+                "global declaration `{}` belongs to the wrong package",
+                declaration.qualified_name
+            )));
+        }
+        if declaration.id.qualified_name != declaration.qualified_name {
+            return Err(malformed_mir(format!(
+                "global declaration `{}` does not match its symbol identity",
+                declaration.qualified_name
+            )));
+        }
+        if declarations
+            .insert(declaration.id.clone(), declaration)
+            .is_some()
+            || !qualified_names.insert(declaration.qualified_name.as_str())
+        {
+            return Err(malformed_mir(format!(
+                "global identity `{}` appears more than once",
+                declaration.qualified_name
+            )));
+        }
+    }
+
+    let compiler_known = program
+        .global_symbols
+        .compiler_known
+        .iter()
+        .map(|fact| fact.id.clone())
+        .collect::<HashSet<_>>();
+    for reference in &program.global_symbols.references {
+        let source = sources.get(&reference.source_identity).ok_or_else(|| {
+            malformed_mir(format!(
+                "global reference `{}` references a missing source",
+                reference.source_spelling
+            ))
+        })?;
+        if reference.source_span.source != source.id {
+            return Err(malformed_mir(format!(
+                "global reference `{}` carries a span from the wrong source",
+                reference.source_spelling
+            )));
+        }
+        let Some(declaration) = declarations.get(&reference.symbol_id) else {
+            if compiler_known.contains(&reference.symbol_id) {
+                continue;
+            }
+            return Err(malformed_mir(format!(
+                "global reference `{}` has no declaration",
+                reference.symbol_id.qualified_name
+            )));
+        };
+        let GlobalSymbolOwner::Package(owner) = &declaration.id.owner else {
+            continue;
+        };
+        if owner == &source.package {
+            continue;
+        }
+        let source_package = packages
+            .get(&source.package)
+            .ok_or_else(|| malformed_mir("global reference belongs to a missing package"))?;
+        let development = source.scope == crate::build_plan::SourceScope::Development
+            || source.generated_for == Some(crate::build_plan::GeneratedFor::Development);
+        let directly_visible = source_package.normal_dependencies.contains(owner)
+            || (development && source_package.development_dependencies.contains(owner));
+        if !directly_visible {
+            return Err(malformed_mir(format!(
+                "global reference `{}` crosses a non-direct package edge",
+                reference.symbol_id.qualified_name
+            )));
+        }
+        if declaration.access == MemberAccess::Internal {
+            return Err(malformed_mir(format!(
+                "global reference `{}` crosses an internal package boundary",
+                reference.symbol_id.qualified_name
+            )));
+        }
+    }
+
+    if let Some(unresolved) = program.global_symbols.unresolved.first() {
+        let subject = if unresolved.role == GlobalReferenceRole::Include {
+            "include"
+        } else {
+            "global reference"
+        };
+        return Err(malformed_mir(format!(
+            "unresolved {subject} `{}` remains in MIR",
+            unresolved.source_spelling
+        )));
     }
     Ok(())
 }
@@ -326,8 +599,11 @@ fn validate_closure_metadata(program: &mir::Program) -> Result<(), BackendError>
                 descriptor.id.0
             )));
         }
+        let source = program
+            .source_for_span(descriptor.source_span)
+            .ok_or_else(|| malformed_mir("closure descriptor references a missing source"))?;
         if descriptor.source_span.start > descriptor.source_span.end
-            || descriptor.source_span.end > program.source.text.len()
+            || descriptor.source_span.end > source.text.len()
             || descriptor.debug_identity.is_empty()
         {
             return Err(malformed_mir(format!(
@@ -434,7 +710,10 @@ fn validate_error_metadata(program: &mir::Program) -> Result<(), BackendError> {
                 origin.id.0
             )));
         }
-        if origin.span.start > origin.span.end || origin.span.end > program.source.text.len() {
+        let source = program
+            .source_for_span(origin.span)
+            .ok_or_else(|| malformed_mir("Error origin references a missing source"))?;
+        if origin.span.start > origin.span.end || origin.span.end > source.text.len() {
             return Err(malformed_mir(format!(
                 "Error origin#{} is outside the source file",
                 origin.id.0

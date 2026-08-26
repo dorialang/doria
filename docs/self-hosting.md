@@ -83,6 +83,12 @@ Do not attempt full self-hosting before Doria has:
 
 Avoid creating a huge Doria compiler rewrite too early. That would slow the project down and hide design problems instead of exposing them.
 
+Stage 31 now satisfies four prerequisites in that list: multi-file compilation,
+namespace identity, package-aware source graphs, and source-aware cross-file
+diagnostics. This is meaningful bootstrap progress, not a declaration that
+Doria is ready for a full compiler port. The remaining language, library,
+testing, and long-term IR requirements still govern that decision.
+
 ---
 
 ## 4. Bootstrapping stages
@@ -317,7 +323,7 @@ Do these before attempting Doria-written compiler modules:
 2. Implement real semantic TypeId / TypeKind support.
 3. Implement assignment compatibility checking.
 4. Expand basic return checking into path-sensitive control-flow checks.
-5. Complete multi-file namespace and package-graph compilation.
+5. Preserve multi-file namespace and package-graph compilation with durable parity tests.
 6. Design Doria-owned string interpolation.
 7. Design error handling for compiler-style code.
 8. Stabilize Doria IR enough to print and compare it in tests.

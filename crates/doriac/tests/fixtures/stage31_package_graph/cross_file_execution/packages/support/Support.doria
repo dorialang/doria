@@ -1,0 +1,7 @@
+class Support
+{
+    function message(): string
+    {
+        return "support";
+    }
+}

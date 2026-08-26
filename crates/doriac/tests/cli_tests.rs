@@ -693,6 +693,123 @@ fn compile_rejects_explicit_output_that_would_overwrite_input() {
     let _ = fs::remove_dir_all(temp_dir);
 }
 
+#[test]
+fn build_plan_compiler_settings_cannot_be_overridden_even_with_default_values() {
+    let target = Command::new(doriac_bin())
+        .args([
+            "compile",
+            "--build-plan",
+            "missing-plan.json",
+            "--target",
+            "native",
+        ])
+        .output()
+        .expect("doriac binary should run");
+    assert_failure_contains(
+        "build-plan target override",
+        target,
+        "cannot override compiler settings from a build plan",
+    );
+
+    let release = Command::new(doriac_bin())
+        .args(["compile", "--build-plan", "missing-plan.json", "--release"])
+        .output()
+        .expect("doriac binary should run");
+    assert_failure_contains(
+        "build-plan profile override",
+        release,
+        "cannot override compiler settings from a build plan",
+    );
+}
+
+#[test]
+fn build_plan_cli_checks_dumps_compiles_and_runs_one_graph() {
+    let temp_dir = temp_dir_path("build-plan-cli");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    fs::write(
+        temp_dir.join("main.doria"),
+        "function main(): int { return answer(); }",
+    )
+    .expect("entry source should be writable");
+    fs::write(
+        temp_dir.join("helpers.doria"),
+        "function answer(): int { return 42; }",
+    )
+    .expect("helper source should be writable");
+    let plan_path = temp_dir.join("plan.json");
+    let plan = serde_json::json!({
+        "schemaVersion": 1,
+        "edition": "2026",
+        "rootPackage": "acme/application",
+        "selectedTarget": {
+            "package": "acme/application",
+            "name": "application",
+            "kind": "binary",
+            "entrySource": "acme/application:main.doria",
+            "activeScopes": ["main"]
+        },
+        "packages": [{
+            "identity": "acme/application",
+            "root": ".",
+            "namespaceMappings": [{"prefix": "", "path": "", "scope": "main"}],
+            "sources": [
+                {
+                    "identity": "acme/application:main.doria",
+                    "path": "main.doria",
+                    "scope": "main",
+                    "origin": "entry"
+                },
+                {
+                    "identity": "acme/application:helpers.doria",
+                    "path": "helpers.doria",
+                    "scope": "main",
+                    "origin": "explicit"
+                }
+            ],
+            "dependencies": []
+        }],
+        "compiler": {"target": "native", "nativeProfile": "fast", "targetTriple": null}
+    });
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&plan).expect("serialize plan"),
+    )
+    .expect("plan should be writable");
+
+    for command in ["check", "ast", "hir", "mir"] {
+        let output = Command::new(doriac_bin())
+            .current_dir(&temp_dir)
+            .args([command, "--build-plan", "plan.json"])
+            .output()
+            .expect("doriac build-plan command should run");
+        assert_success(&format!("build-plan {command}"), output);
+    }
+
+    let output_path = native_output_name("application");
+    let compile = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args([
+            "compile",
+            "--build-plan",
+            "plan.json",
+            "--out",
+            &output_path,
+        ])
+        .output()
+        .expect("doriac build-plan compile should run");
+    assert_success("build-plan compile", compile);
+    assert!(temp_dir.join(&output_path).is_file());
+
+    let run = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["run", "--build-plan", "plan.json"])
+        .output()
+        .expect("doriac build-plan run should run");
+    assert_eq!(run.status.code(), Some(42), "{run:?}");
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
 fn doriac_bin() -> &'static str {
     env!("CARGO_BIN_EXE_doriac")
 }

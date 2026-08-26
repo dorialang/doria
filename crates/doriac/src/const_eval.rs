@@ -266,7 +266,7 @@ impl Evaluator {
                     key: ConstKey::TopLevel(decl.name.clone()),
                     annotation: decl.ty.clone(),
                     initializer: decl.initializer.clone(),
-                    access: decl.access.clone(),
+                    access: decl.access,
                     writable: false,
                     span: decl.span,
                 }),
@@ -280,7 +280,7 @@ impl Evaluator {
                                 },
                                 annotation: decl.ty.clone(),
                                 initializer: decl.initializer.clone(),
-                                access: decl.access.clone(),
+                                access: decl.access,
                                 writable: false,
                                 span: decl.span,
                             }),
@@ -303,7 +303,7 @@ impl Evaluator {
                                     },
                                     annotation: Some(property.ty.clone()),
                                     initializer: initializer.clone(),
-                                    access: property.access.clone(),
+                                    access: property.access,
                                     writable: property.writable,
                                     span: property.span,
                                 });
@@ -678,9 +678,9 @@ impl Evaluator {
         let declaration = self
             .nodes
             .get(key)
-            .map(|node| (node.access.clone(), node.writable))
+            .map(|node| (node.access, node.writable))
             .or_else(|| match self.states.get(key) {
-                Some(State::Done(value)) => Some((value.access.clone(), value.writable)),
+                Some(State::Done(value)) => Some((value.access, value.writable)),
                 Some(State::Visiting(_) | State::Failed) | None => None,
             });
         let Some((access, writable)) = declaration else {

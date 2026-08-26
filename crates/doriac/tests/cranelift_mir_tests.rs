@@ -449,6 +449,9 @@ fn rejects_malformed_block_id() {
 
 fn void_program() -> Program {
     Program {
+        sources: vec![doriac::mir::SourceUnit::standalone("<test>", "")],
+        packages: vec![doriac::mir::PackageUnit::standalone()],
+        selected_target: doriac::mir::SelectedTarget::standalone("<test>"),
         source: doriac::source::SourceFile::new("<test>", ""),
         compilation_context: doriac::names::CompilationContext::standalone("<test>"),
         namespace: None,
@@ -482,6 +485,7 @@ fn void_program() -> Program {
             entry_block: BlockId(0),
             closure: None,
         }],
+        selected_entry: Some(FunctionId(0)),
         entry: FunctionId(0),
     }
 }

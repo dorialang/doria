@@ -4,6 +4,7 @@ use crate::ast::ClosureCaptureMode;
 use crate::hir::{self, ClassMember, Expr, Item, Stmt};
 use crate::mir;
 use crate::ownership::CaptureAcquisitionKind;
+use crate::source::Span;
 use crate::symbols::{BindingId, BorrowSource, ClosureId, LexicalOwner};
 use crate::types::{FunctionTypeParameterMode, ResolvedType};
 
@@ -32,11 +33,10 @@ pub(crate) struct PhpClosurePlan {
     pub(crate) closures: HashMap<ClosureId, hir::ClosureExpression>,
     pub(crate) semantic_closures: HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
     pub(crate) ownership: HashMap<ClosureId, crate::ownership::ClosureOwnershipInfo>,
-    pub(crate) callable_value_calls:
-        HashMap<(usize, usize), crate::semantics::CallableValueCallInfo>,
-    pub(crate) property_write_types: HashMap<(usize, usize), ResolvedType>,
-    pub(crate) callables: HashMap<usize, PhpCallablePlan>,
-    pub(crate) call_targets: HashMap<(usize, usize), usize>,
+    pub(crate) callable_value_calls: HashMap<Span, crate::semantics::CallableValueCallInfo>,
+    pub(crate) property_write_types: HashMap<Span, ResolvedType>,
+    pub(crate) callables: HashMap<Span, PhpCallablePlan>,
+    pub(crate) call_targets: HashMap<Span, Span>,
 }
 
 #[derive(Debug, Clone)]
@@ -211,12 +211,12 @@ impl PhpClosurePlan {
 
     pub(crate) fn callable_at(&self, span: crate::source::Span) -> Option<&PhpCallablePlan> {
         self.call_targets
-            .get(&(span.start, span.end))
+            .get(&span)
             .and_then(|target| self.callables.get(target))
     }
 
-    pub(crate) fn callable_definition(&self, start: usize) -> Option<&PhpCallablePlan> {
-        self.callables.get(&start)
+    pub(crate) fn callable_definition(&self, span: Span) -> Option<&PhpCallablePlan> {
+        self.callables.get(&span)
     }
 
     pub(crate) fn function_type(&self, id: mir::FunctionTypeId) -> &mir::FunctionType {
@@ -559,11 +559,7 @@ fn mark_callable_parameter_homes(
     program: &hir::Program,
     cells: &mut HashSet<BindingId>,
 ) {
-    let Some(borrow) = program
-        .semantic_info
-        .return_borrows
-        .get(&function.span.start)
-    else {
+    let Some(borrow) = program.semantic_info.return_borrows.get(&function.span) else {
         return;
     };
     let BorrowSource::Parameter(index) = borrow.source else {
@@ -579,8 +575,8 @@ fn mark_callable_parameter_homes(
 
 fn mark_call_argument_places(
     program: &hir::Program,
-    callables: &HashMap<usize, PhpCallablePlan>,
-    call_targets: &HashMap<(usize, usize), usize>,
+    callables: &HashMap<Span, PhpCallablePlan>,
+    call_targets: &HashMap<Span, Span>,
     cells: &mut HashSet<BindingId>,
 ) {
     for item in &program.items {
@@ -620,8 +616,8 @@ fn mark_call_argument_places(
 fn visit_block_calls(
     block: &hir::Block,
     program: &hir::Program,
-    callables: &HashMap<usize, PhpCallablePlan>,
-    call_targets: &HashMap<(usize, usize), usize>,
+    callables: &HashMap<Span, PhpCallablePlan>,
+    call_targets: &HashMap<Span, Span>,
     cells: &mut HashSet<BindingId>,
 ) {
     for statement in &block.statements {
@@ -632,8 +628,8 @@ fn visit_block_calls(
 fn visit_statement_calls(
     statement: &Stmt,
     program: &hir::Program,
-    callables: &HashMap<usize, PhpCallablePlan>,
-    call_targets: &HashMap<(usize, usize), usize>,
+    callables: &HashMap<Span, PhpCallablePlan>,
+    call_targets: &HashMap<Span, Span>,
     cells: &mut HashSet<BindingId>,
 ) {
     match statement {
@@ -734,8 +730,8 @@ fn visit_statement_calls(
 fn visit_expr_calls(
     expr: &Expr,
     program: &hir::Program,
-    callables: &HashMap<usize, PhpCallablePlan>,
-    call_targets: &HashMap<(usize, usize), usize>,
+    callables: &HashMap<Span, PhpCallablePlan>,
+    call_targets: &HashMap<Span, Span>,
     cells: &mut HashSet<BindingId>,
 ) {
     match expr {
@@ -743,7 +739,7 @@ fn visit_expr_calls(
             if let Some(ResolvedType::Function(function_type)) = program
                 .semantic_info
                 .callable_value_calls
-                .get(&(call.span.start, call.span.end))
+                .get(&call.span)
                 .map(|call| &call.function_type)
             {
                 mark_mode_arguments(&call.args, &function_type.parameters, program, cells);
@@ -772,7 +768,7 @@ fn visit_expr_calls(
         | Expr::StaticCall { args, span, .. }
         | Expr::New { args, span, .. } => {
             if let Some(callable) = call_targets
-                .get(&(span.start, span.end))
+                .get(span)
                 .and_then(|target| callables.get(target))
             {
                 mark_callable_arguments(args, callable, program, cells);
@@ -848,17 +844,17 @@ fn visit_expr_calls(
 fn collect_callable_plans(
     program: &hir::Program,
     cells: &HashSet<BindingId>,
-) -> HashMap<usize, PhpCallablePlan> {
+) -> HashMap<Span, PhpCallablePlan> {
     let mut callables = HashMap::new();
     for item in &program.items {
         match item {
             Item::Function(function) => {
-                callables.insert(function.span.start, callable_plan(function, program, cells));
+                callables.insert(function.span, callable_plan(function, program, cells));
             }
             Item::Class(class) => {
                 for member in &class.members {
                     if let ClassMember::Method(method) = member {
-                        callables.insert(method.span.start, callable_plan(method, program, cells));
+                        callables.insert(method.span, callable_plan(method, program, cells));
                     }
                 }
             }
@@ -889,12 +885,12 @@ fn callable_plan(
     }
 }
 
-fn collect_call_targets(program: &hir::Program) -> HashMap<(usize, usize), usize> {
+fn collect_call_targets(program: &hir::Program) -> HashMap<Span, Span> {
     let functions = program
         .items
         .iter()
         .filter_map(|item| match item {
-            Item::Function(function) => Some((function.name.clone(), function.span.start)),
+            Item::Function(function) => Some((function.name.clone(), function.span)),
             _ => None,
         })
         .collect::<HashMap<_, _>>();
@@ -908,7 +904,7 @@ fn collect_call_targets(program: &hir::Program) -> HashMap<(usize, usize), usize
         .flat_map(|class| {
             class.members.iter().filter_map(|member| match member {
                 ClassMember::Method(method) => {
-                    Some(((class.name.clone(), method.name.clone()), method.span.start))
+                    Some(((class.name.clone(), method.name.clone()), method.span))
                 }
                 _ => None,
             })
@@ -989,7 +985,7 @@ pub(crate) fn binding_used_at(
         .semantic_info
         .binding_resolution
         .uses_by_span
-        .get(&(span.start, span.end))
+        .get(&span)
         .copied()
 }
 

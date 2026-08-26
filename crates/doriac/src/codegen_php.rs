@@ -87,19 +87,19 @@ function __doria_safe_error_message(string $message): string
 
 function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
 {
-    global $__doria_source_path, $__doria_source_text;
     $type = $caught->descriptor->typeName;
     $origin = $caught->origin;
+    [$sourcePath, $sourceText, $sourceOffset] = __doria_source_location($origin);
     $line = __doria_source_line($origin);
-    $before = substr($__doria_source_text, 0, max(0, $origin));
+    $before = substr($sourceText, 0, max(0, $sourceOffset));
     $lineStart = strrpos($before, "\n");
     $lineStart = $lineStart === false ? 0 : $lineStart + 1;
-    $lineEnd = strpos($__doria_source_text, "\n", max(0, $origin));
-    $lineEnd = $lineEnd === false ? strlen($__doria_source_text) : $lineEnd;
-    $lineText = rtrim(substr($__doria_source_text, $lineStart, $lineEnd - $lineStart), "\r");
-    $markerOffset = max(0, $origin - $lineStart);
+    $lineEnd = strpos($sourceText, "\n", max(0, $sourceOffset));
+    $lineEnd = $lineEnd === false ? strlen($sourceText) : $lineEnd;
+    $lineText = rtrim(substr($sourceText, $lineStart, $lineEnd - $lineStart), "\r");
+    $markerOffset = max(0, $sourceOffset - $lineStart);
     $message = "Error[R1000]: Unhandled " . $type . "\n\nWhere\n" .
-        $__doria_source_path . " · line " . $line . " · " .
+        $sourcePath . " · line " . $line . " · " .
         $caught->error->__doriaErrorCallable() . "\n\n" .
         $lineText . "\n" . str_repeat(" ", $markerOffset) . "^\n" .
         "This Error Was First Thrown Here\n\nWhy\n  " .
@@ -865,11 +865,26 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
     }
     output.push_str(PHP_STAGE26_COLLECTION_HELPERS);
     emit_php_closure_runtime(&closure_plan, mir, &mut output);
-    output.push_str(&format!(
-        "$__doria_source_path = {};\n$__doria_source_text = hex2bin({});\n",
-        emit_php_string_literal(&program.source_path),
-        emit_php_string_literal(&hex_bytes(program.source_text.as_bytes())),
-    ));
+    output.push_str("$__doria_sources = [\n");
+    if program.sources.is_empty() {
+        output.push_str(&format!(
+            "    0 => [{}, hex2bin({})],\n",
+            emit_php_string_literal(&program.source_path),
+            emit_php_string_literal(&hex_bytes(program.source_text.as_bytes())),
+        ));
+    } else {
+        let mut sources = program.sources.iter().collect::<Vec<_>>();
+        sources.sort_by_key(|source| source.id);
+        for source in sources {
+            output.push_str(&format!(
+                "    {} => [{}, hex2bin({})],\n",
+                source.id.0,
+                emit_php_string_literal(&source.display_path),
+                emit_php_string_literal(&hex_bytes(source.source.text.as_bytes())),
+            ));
+        }
+    }
+    output.push_str("];\n");
     output.push_str("$__doria_catalogue = [\n");
     for entry in doria_diagnostic_catalogue::RUNTIME_CATALOGUE
         .iter()
@@ -903,7 +918,7 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
             Item::Function(function) => output.push_str(&format!(
                 "    {} => {},\n",
                 emit_php_string_literal(&function.name),
-                function.span.start,
+                php_source_location(function.span, function.span.start),
             )),
             Item::Class(class) => {
                 for member in &class.members {
@@ -911,7 +926,7 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
                         output.push_str(&format!(
                             "    {} => {},\n",
                             emit_php_string_literal(&format!("{}::{}", class.name, function.name)),
-                            function.span.start,
+                            php_source_location(function.span, function.span.start),
                         ));
                     }
                 }
@@ -936,10 +951,19 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
     output.push_str("];\n\n");
     emit_checked_io_message_vocabulary(&mut output);
     output.push_str(
-        r#"function __doria_source_line(int $offset): int
+        r#"function __doria_source_location(int $location): array
 {
-    global $__doria_source_text;
-    return substr_count(substr($__doria_source_text, 0, max(0, $offset)), "\n") + 1;
+    global $__doria_sources;
+    $sourceId = intdiv($location, 4294967296);
+    $offset = $location % 4294967296;
+    [$path, $text] = $__doria_sources[$sourceId] ?? ["<unknown>", ""];
+    return [$path, $text, $offset];
+}
+
+function __doria_source_line(int $location): int
+{
+    [, $text, $offset] = __doria_source_location($location);
+    return substr_count(substr($text, 0, max(0, $offset)), "\n") + 1;
 }
 
 function __doria_panic(
@@ -950,12 +974,15 @@ function __doria_panic(
     ?string $callable = null,
 )
 {
-    global $__doria_catalogue, $__doria_source_path, $__doria_source_text, $__doria_function_spans, $__doria_generated_closure_frames, $__doria_panicking;
+    global $__doria_catalogue, $__doria_function_spans, $__doria_generated_closure_frames, $__doria_panicking;
     if (!isset($__doria_catalogue[$code])) { $code = "P1001"; }
     [$title, $label, $why] = $__doria_catalogue[$code];
+    [$sourcePath, $sourceText, $sourceStart] = __doria_source_location($start);
+    [, , $sourceEnd] = __doria_source_location($end);
     $line = __doria_source_line($start);
     $helperFunctions = [
         "__doria_panic",
+        "__doria_source_location",
         "__doria_source_line",
         "__doria_read_line",
         "__doria_read_file",
@@ -988,15 +1015,15 @@ function __doria_panic(
             : $frames[0]["function"];
     }
     @fwrite(STDERR, "Panic[" . $code . "]: " . $title . "\n\nWhere\n");
-    @fwrite(STDERR, $__doria_source_path . " · line " . $line . " · " . $function . "\n\n");
-    $before = substr($__doria_source_text, 0, max(0, $start));
+    @fwrite(STDERR, $sourcePath . " · line " . $line . " · " . $function . "\n\n");
+    $before = substr($sourceText, 0, max(0, $sourceStart));
     $lineStart = strrpos($before, "\n");
     $lineStart = $lineStart === false ? 0 : $lineStart + 1;
-    $lineEnd = strpos($__doria_source_text, "\n", max(0, $start));
-    $lineEnd = $lineEnd === false ? strlen($__doria_source_text) : $lineEnd;
-    $lineText = rtrim(substr($__doria_source_text, $lineStart, $lineEnd - $lineStart), "\r");
-    $prefix = substr($__doria_source_text, $lineStart, max(0, $start - $lineStart));
-    $selected = substr($__doria_source_text, max(0, $start), max(1, $end - $start));
+    $lineEnd = strpos($sourceText, "\n", max(0, $sourceStart));
+    $lineEnd = $lineEnd === false ? strlen($sourceText) : $lineEnd;
+    $lineText = rtrim(substr($sourceText, $lineStart, $lineEnd - $lineStart), "\r");
+    $prefix = substr($sourceText, $lineStart, max(0, $sourceStart - $lineStart));
+    $selected = substr($sourceText, max(0, $sourceStart), max(1, $sourceEnd - $sourceStart));
     $prefixWidth = preg_match_all('/\X/u', $prefix, $unused);
     $markerWidth = preg_match_all('/\X/u', $selected, $unused);
     if ($prefixWidth === false) { $prefixWidth = strlen($prefix); }
@@ -1014,9 +1041,10 @@ function __doria_panic(
             ? $frame["class"] . "::" . $frame["function"]
             : $frame["function"];
         $frameOffset = $index === 0 ? $start : ($__doria_function_spans[$name] ?? $start);
+        [$framePath] = __doria_source_location($frameOffset);
         @fwrite(
             STDERR,
-            "\n" . $name . " · " . $__doria_source_path . ":" . __doria_source_line($frameOffset)
+            "\n" . $name . " · " . $framePath . ":" . __doria_source_line($frameOffset)
         );
     }
     @fwrite(STDERR, "\n\nProcess Exited With Status 101\n");
@@ -2383,7 +2411,7 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             validate_expr(scrutinee, semantic_info)?;
             let info = semantic_info
                 .matches
-                .get(&(span.start, span.end))
+                .get(span)
                 .ok_or_else(|| BackendError::new("checked match has no semantic plan"))?;
             for (arm, arm_info) in arms.iter().zip(&info.arms) {
                 match (&arm.pattern, &arm_info.pattern) {
@@ -2509,7 +2537,7 @@ fn emit_call_argument_values(
             } else if parameter.is_some_and(|parameter| parameter.take)
                 && scopes
                     .expression_types
-                    .get(&(argument.value.span().start, argument.value.span().end))
+                    .get(&argument.value.span())
                     .is_some_and(resolved_is_function_type)
             {
                 emit_owned_expr(&argument.value, scopes)
@@ -2734,16 +2762,16 @@ struct PhpNameScopes {
     payload_unit_cases: HashSet<(String, String)>,
     payload_top_constants: HashSet<String>,
     payload_class_constants: HashSet<(String, String)>,
-    payload_enum_expressions: HashSet<(usize, usize)>,
+    payload_enum_expressions: HashSet<Span>,
     payload_case_tags: HashMap<crate::enums::EnumCaseId, u32>,
-    matches: HashMap<(usize, usize), MatchSemanticInfo>,
-    whens: HashMap<(usize, usize), WhenSemanticInfo>,
-    given_preludes: HashMap<(usize, usize), GivenSemanticInfo>,
-    expression_types: HashMap<(usize, usize), ResolvedType>,
-    type_test_types: HashMap<(usize, usize), ResolvedType>,
-    mixed_box_plans: HashMap<(usize, usize), crate::semantics::MixedBoxPlan>,
-    throw_error_types: HashMap<(usize, usize), ResolvedType>,
-    catch_error_types: HashMap<(usize, usize), ResolvedType>,
+    matches: HashMap<Span, MatchSemanticInfo>,
+    whens: HashMap<Span, WhenSemanticInfo>,
+    given_preludes: HashMap<Span, GivenSemanticInfo>,
+    expression_types: HashMap<Span, ResolvedType>,
+    type_test_types: HashMap<Span, ResolvedType>,
+    mixed_box_plans: HashMap<Span, crate::semantics::MixedBoxPlan>,
+    throw_error_types: HashMap<Span, ResolvedType>,
+    catch_error_types: HashMap<Span, ResolvedType>,
     const_evaluation: Evaluation,
     closure_plan: Rc<PhpClosurePlan>,
     binding_places: Vec<HashMap<BindingId, PhpBindingPlace>>,
@@ -2779,7 +2807,7 @@ impl PhpNameScopes {
         payload_unit_cases: HashSet<(String, String)>,
         payload_top_constants: HashSet<String>,
         payload_class_constants: HashSet<(String, String)>,
-        payload_enum_expressions: HashSet<(usize, usize)>,
+        payload_enum_expressions: HashSet<Span>,
         closure_plan: Rc<PhpClosurePlan>,
     ) -> Self {
         Self {
@@ -2852,8 +2880,7 @@ impl PhpNameScopes {
     }
 
     fn is_payload_enum_expression(&self, expr: &Expr) -> bool {
-        self.payload_enum_expressions
-            .contains(&(expr.span().start, expr.span().end))
+        self.payload_enum_expressions.contains(&expr.span())
     }
 
     fn push(&mut self) {
@@ -2919,7 +2946,7 @@ impl PhpNameScopes {
         self.closure_plan
             .binding_resolution
             .uses_by_span
-            .get(&(span.start, span.end))
+            .get(&span)
             .copied()
     }
 
@@ -3350,7 +3377,7 @@ fn emit_class(
         let ClassMember::Method(method) = member else {
             continue;
         };
-        let callable_plan = scopes.closure_plan.callable_definition(method.span.start);
+        let callable_plan = scopes.closure_plan.callable_definition(method.span);
         for (index, parameter) in method.params.iter().enumerate() {
             let Some(access) = parameter.promoted_access.as_ref() else {
                 continue;
@@ -3826,7 +3853,7 @@ fn emit_function(
     let mut scopes = shared_scopes.expression_scope();
     let callable_plan = scopes
         .closure_plan
-        .callable_definition(function.span.start)
+        .callable_definition(function.span)
         .cloned();
     for (index, param) in function.params.iter().enumerate() {
         scopes.declare_unmangled(&param.name);
@@ -4107,7 +4134,7 @@ fn emit_statement(
             let owns_function = decl.ty.as_ref().is_some_and(resolved_type_ref_is_function)
                 || scopes
                     .expression_types
-                    .get(&(decl.initializer.span().start, decl.initializer.span().end))
+                    .get(&decl.initializer.span())
                     .is_some_and(resolved_is_function_type);
             let initializer = if owns_function {
                 emit_owned_expr(&decl.initializer, scopes)
@@ -4117,9 +4144,7 @@ fn emit_statement(
             let binding_is_mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
                 || (decl.ty.is_none()
                     && matches!(
-                        scopes
-                            .expression_types
-                            .get(&(decl.initializer.span().start, decl.initializer.span().end)),
+                        scopes.expression_types.get(&decl.initializer.span()),
                         Some(ResolvedType::Mixed)
                     ));
             if decl.bindings.len() == 1 {
@@ -4214,8 +4239,8 @@ fn emit_statement(
                 &format!(
                     "__doria_write_stdout(__doria_display({}), {}, {}, {});",
                     emit_expr(expr, scopes),
-                    span.start,
-                    span.end,
+                    php_source_location(*span, span.start),
+                    php_source_location(*span, span.end),
                     scopes.callable_identity(),
                 ),
             );
@@ -4224,7 +4249,7 @@ fn emit_statement(
             if let Some(expr) = expr {
                 let owns_result = scopes
                     .expression_types
-                    .get(&(expr.span().start, expr.span().end))
+                    .get(&expr.span())
                     .is_some_and(resolved_is_function_type);
                 if owns_result || scopes.has_owned_function_cells() {
                     let result = scopes.fresh_temp("__doria_return");
@@ -4322,16 +4347,14 @@ fn emit_throw_statement(
     indent: usize,
     scopes: &PhpNameScopes,
 ) {
-    debug_assert!(scopes
-        .throw_error_types
-        .contains_key(&(statement.span.start, statement.span.end)));
+    debug_assert!(scopes.throw_error_types.contains_key(&statement.span));
     writeln(
         output,
         indent,
         &format!(
             "__doria_throw({}, {}, {});",
             emit_expr(&statement.expr, scopes),
-            statement.span.start.saturating_add(1),
+            php_source_location(statement.span, statement.span.start.saturating_add(1),),
             scopes.callable_identity(),
         ),
     );
@@ -4359,7 +4382,7 @@ fn emit_try_statement(
         for (index, clause) in statement.catches.iter().enumerate() {
             let error_type = scopes
                 .catch_error_types
-                .get(&(clause.span.start, clause.span.end))
+                .get(&clause.span)
                 .unwrap_or(&clause.error_type);
             let condition = match error_type {
                 ResolvedType::Error => {
@@ -4463,8 +4486,8 @@ fn emit_panic(
         indent,
         &format!(
             "__doria_panic(\"P1000\", {}, {}, {}, {});",
-            span.start,
-            span.end,
+            php_source_location(span, span.start),
+            php_source_location(span, span.end),
             emit_expr(message, scopes),
             scopes.callable_identity(),
         ),
@@ -4508,9 +4531,7 @@ fn emit_for_initializer(initializer: &ForInitializer, scopes: &mut PhpNameScopes
             let binding_is_mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
                 || (decl.ty.is_none()
                     && matches!(
-                        scopes
-                            .expression_types
-                            .get(&(decl.initializer.span().start, decl.initializer.span().end)),
+                        scopes.expression_types.get(&decl.initializer.span()),
                         Some(ResolvedType::Mixed)
                     ));
             if decl.bindings.len() == 1 {
@@ -4579,11 +4600,11 @@ fn assignment_target_is_function(target: &Expr, scopes: &PhpNameScopes) -> bool 
         Expr::PropertyAccess { span, .. } => scopes
             .closure_plan
             .property_write_types
-            .get(&(span.start, span.end))
+            .get(span)
             .is_some_and(resolved_is_function_type),
         _ => scopes
             .expression_types
-            .get(&(target.span().start, target.span().end))
+            .get(&target.span())
             .is_some_and(resolved_is_function_type),
     }
 }
@@ -4776,7 +4797,7 @@ fn emit_given_setup(
 ) -> Vec<String> {
     let info = scopes
         .given_preludes
-        .get(&(given.span.start, given.span.end))
+        .get(&given.span)
         .cloned()
         .expect("checked given prelude must have a semantic plan");
     let predicate_indices = info
@@ -4985,10 +5006,7 @@ fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
 }
 
 fn emit_mixed_box_plan(expr: &Expr, emitted: String, scopes: &PhpNameScopes) -> String {
-    let Some(plan) = scopes
-        .mixed_box_plans
-        .get(&(expr.span().start, expr.span().end))
-    else {
+    let Some(plan) = scopes.mixed_box_plans.get(&expr.span()) else {
         return emitted;
     };
     let helper = if plan.nullable_target {
@@ -5069,7 +5087,7 @@ fn emit_callable_call(call: &CallableCall, scopes: &PhpNameScopes) -> String {
     let call_info = scopes
         .closure_plan
         .callable_value_calls
-        .get(&(call.span.start, call.span.end))
+        .get(&call.span)
         .expect("checked callable call must have semantic metadata");
     let function_type = match &call_info.function_type {
         ResolvedType::Function(function_type) => Some(function_type),
@@ -5092,7 +5110,7 @@ fn emit_callable_call(call: &CallableCall, scopes: &PhpNameScopes) -> String {
             crate::types::FunctionTypeParameterMode::Take
                 if scopes
                     .expression_types
-                    .get(&(argument.value.span().start, argument.value.span().end))
+                    .get(&argument.value.span())
                     .is_some_and(resolved_is_function_type) =>
             {
                 emit_owned_expr(&argument.value, scopes)
@@ -5159,7 +5177,7 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             if scopes.is_mixed_binding(name)
                 && scopes
                     .expression_types
-                    .get(&(span.start, span.end))
+                    .get(span)
                     .is_some_and(|ty| !is_mixed_storage_type(ty))
             {
                 format!("__doria_mixed_value({value})")
@@ -5220,9 +5238,7 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             null_safe: false,
             ..
         } if matches!(
-            scopes
-                .expression_types
-                .get(&(object.span().start, object.span().end)),
+            scopes.expression_types.get(&object.span()),
             Some(ResolvedType::List(_))
         ) && matches!(property.as_str(), "count" | "isEmpty") =>
         {
@@ -5250,9 +5266,7 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             null_safe: false,
             ..
         } if matches!(
-            scopes
-                .expression_types
-                .get(&(object.span().start, object.span().end)),
+            scopes.expression_types.get(&object.span()),
             Some(ResolvedType::List(_))
         ) && method == "add" =>
         {
@@ -5347,11 +5361,11 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             let value = emit_expr(expr, scopes);
             let source_type = scopes
                 .expression_types
-                .get(&(expr.span().start, expr.span().end))
+                .get(&expr.span())
                 .expect("checked type test must preserve its source type");
             let exact_type = scopes
                 .type_test_types
-                .get(&(span.start, span.end))
+                .get(span)
                 .expect("checked type test must preserve its resolved exact type");
             let test = php_exact_type_test_for_source(&value, source_type, exact_type);
             format!("({test})")
@@ -5471,7 +5485,7 @@ fn emit_when_expression(
 ) -> String {
     scopes
         .whens
-        .get(&(span.start, span.end))
+        .get(&span)
         .expect("checked when expression must have a semantic plan");
     let captures = scopes.captured_php_names();
     let capture_list = if captures.is_empty() {
@@ -5544,7 +5558,7 @@ fn emit_match_expression(
 ) -> String {
     let info = scopes
         .matches
-        .get(&(span.start, span.end))
+        .get(&span)
         .expect("checked match must have a semantic plan");
     let temporary = scopes.expression_temp("__doriaMatch", span);
     let captures = scopes.captured_php_names();
@@ -6025,8 +6039,8 @@ fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNam
         }
     }
     if name == "printf" {
-        emitted.insert(0, span.end.to_string());
-        emitted.insert(0, span.start.to_string());
+        emitted.insert(0, php_source_location(span, span.end).to_string());
+        emitted.insert(0, php_source_location(span, span.start).to_string());
         emitted.insert(2, scopes.callable_identity());
     } else if matches!(
         name,
@@ -6035,8 +6049,8 @@ fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNam
         if name == "read_line" && emitted.is_empty() {
             emitted.push("\"\"".to_string());
         }
-        emitted.push(format!("start: {}", span.start));
-        emitted.push(format!("end: {}", span.end));
+        emitted.push(format!("start: {}", php_source_location(span, span.start)));
+        emitted.push(format!("end: {}", php_source_location(span, span.end)));
         emitted.push(format!("callable: {}", scopes.callable_identity()));
     }
     format!("{helper}({})", emitted.join(", "))
@@ -6050,6 +6064,11 @@ fn hex_bytes(bytes: &[u8]) -> String {
         output.push(DIGITS[(byte & 0x0f) as usize] as char);
     }
     output
+}
+
+fn php_source_location(span: Span, offset: usize) -> u64 {
+    (u64::from(span.source.0) << 32)
+        | (u64::try_from(offset).expect("source offsets fit in u64") & 0xffff_ffff)
 }
 
 fn php_format_from_plan(pieces: &[FormatPiece]) -> String {

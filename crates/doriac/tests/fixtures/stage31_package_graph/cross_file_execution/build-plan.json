@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "edition": "2026",
+  "rootPackage": "acme/application",
+  "selectedTarget": {
+    "package": "acme/application",
+    "name": "application",
+    "kind": "binary",
+    "entrySource": "acme/application:main.doria",
+    "activeScopes": ["main"]
+  },
+  "packages": [
+    {
+      "identity": "acme/application",
+      "root": "packages/application",
+      "namespaceMappings": [
+        { "prefix": "", "path": "", "scope": "main", "generatedFor": null }
+      ],
+      "sources": [
+        {
+          "identity": "acme/application:main.doria",
+          "path": "main.doria",
+          "scope": "main",
+          "origin": "entry",
+          "generatedFor": null
+        }
+      ],
+      "dependencies": [
+        { "package": "acme/support", "kind": "normal" }
+      ]
+    },
+    {
+      "identity": "acme/support",
+      "root": "packages/support",
+      "namespaceMappings": [
+        { "prefix": "", "path": "", "scope": "main", "generatedFor": null }
+      ],
+      "sources": [
+        {
+          "identity": "acme/support:Support.doria",
+          "path": "Support.doria",
+          "scope": "main",
+          "origin": "autoload",
+          "generatedFor": null
+        }
+      ],
+      "dependencies": []
+    }
+  ],
+  "compiler": {
+    "target": "debug",
+    "nativeProfile": null,
+    "targetTriple": null
+  }
+}

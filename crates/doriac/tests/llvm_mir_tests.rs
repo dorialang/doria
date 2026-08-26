@@ -588,6 +588,9 @@ function main(): void throws Doria\Std\Io\IoError
 #[test]
 fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
     let program = Program {
+        sources: vec![doriac::mir::SourceUnit::standalone("llvm-test.doria", "")],
+        packages: vec![doriac::mir::PackageUnit::standalone()],
+        selected_target: doriac::mir::SelectedTarget::standalone("llvm-test.doria"),
         source: doriac::source::SourceFile::new("llvm-test.doria", ""),
         compilation_context: doriac::names::CompilationContext::standalone("llvm-test.doria"),
         namespace: None,
@@ -650,6 +653,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 closure: None,
             },
         ],
+        selected_entry: Some(FunctionId(0)),
         entry: FunctionId(0),
     };
 

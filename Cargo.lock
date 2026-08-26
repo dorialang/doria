@@ -274,6 +274,7 @@ dependencies = [
  "doria-unicode",
  "inkwell",
  "ryu",
+ "serde",
  "serde_json",
  "unicode-width",
 ]

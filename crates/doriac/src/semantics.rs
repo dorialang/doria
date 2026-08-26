@@ -47,6 +47,9 @@ pub struct SemanticInfo {
     /// Compiler inputs that own this semantic analysis. Namespace and package
     /// identity deliberately remain independent.
     pub compilation_context: crate::names::CompilationContext,
+    /// Source-local contexts for graph compilation. The standalone context
+    /// above remains the selected-entry compatibility view.
+    pub compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
     /// Canonical global declaration/reference facts produced before checking.
     pub global_symbols: crate::names::GlobalSymbolFacts,
     /// Canonical integer type for every integer-valued source expression.
@@ -54,40 +57,40 @@ pub struct SemanticInfo {
     /// Spans are stable across AST-to-HIR structural lowering, so the MIR
     /// lowering pass can consume semantic decisions without re-parsing type
     /// names or guessing contextual literal types.
-    pub integer_expression_types: HashMap<(usize, usize), IntegerType>,
+    pub integer_expression_types: HashMap<Span, IntegerType>,
     /// Canonical width for every floating-point-valued source expression.
-    pub float_expression_types: HashMap<(usize, usize), FloatType>,
+    pub float_expression_types: HashMap<Span, FloatType>,
     /// Resolved semantic type for checked expressions, independent of backend layout.
-    pub expression_types: HashMap<(usize, usize), ResolvedType>,
+    pub expression_types: HashMap<Span, ResolvedType>,
     /// Concrete transport plan at each value-to-`mixed` boundary.
     ///
     /// Compatibility backends use this semantic fact to preserve Doria's exact
     /// runtime identity instead of reconstructing it from a host value after
     /// width, signedness, or nominal identity has been erased.
-    pub mixed_box_plans: HashMap<(usize, usize), MixedBoxPlan>,
+    pub mixed_box_plans: HashMap<Span, MixedBoxPlan>,
     /// Resolved enum case for each unit/backed case expression.
-    pub enum_case_values: HashMap<(usize, usize), EnumValue>,
+    pub enum_case_values: HashMap<Span, EnumValue>,
     /// Resolved payload-enum construction for each checked case call.
-    pub enum_case_constructions: HashMap<(usize, usize), EnumCaseId>,
+    pub enum_case_constructions: HashMap<Span, EnumCaseId>,
     /// Resolved concrete target for each checked `is` expression.
-    pub type_test_types: HashMap<(usize, usize), ResolvedType>,
+    pub type_test_types: HashMap<Span, ResolvedType>,
     /// Fully checked match plans consumed by backend-independent MIR lowering.
-    pub matches: HashMap<(usize, usize), MatchSemanticInfo>,
+    pub matches: HashMap<Span, MatchSemanticInfo>,
     /// Fully checked value type for each `when` expression.
-    pub whens: HashMap<(usize, usize), WhenSemanticInfo>,
+    pub whens: HashMap<Span, WhenSemanticInfo>,
     /// Source-order statement classification for each `given` prelude.
-    pub given_preludes: HashMap<(usize, usize), GivenSemanticInfo>,
+    pub given_preludes: HashMap<Span, GivenSemanticInfo>,
     /// Compiler-resolved callable target for each user-defined call expression.
-    pub call_targets: HashMap<(usize, usize), CallableTarget>,
+    pub call_targets: HashMap<Span, CallableTarget>,
     /// Concrete generic arguments selected for each checked user-defined call.
     ///
     /// The argument enum is intentionally kinded: Stage 24 supplies only type
     /// arguments, while future compile-time value parameters can add another
     /// variant without changing specialization identity.
-    pub generic_call_specializations: HashMap<(usize, usize), GenericSpecialization>,
+    pub generic_call_specializations: HashMap<Span, GenericSpecialization>,
     /// Calls to compiler-known `Displayable::toString` through a constrained
     /// type parameter. MIR specializes these directly for each concrete type.
-    pub(crate) constrained_display_calls: HashSet<(usize, usize)>,
+    pub(crate) constrained_display_calls: HashSet<Span>,
     /// Stable nominal class identities and the total Stage 19 property order.
     pub classes: Vec<ClassSemanticInfo>,
     /// Stable nominal enum identities and declaration-order case metadata.
@@ -98,7 +101,7 @@ pub struct SemanticInfo {
     pub parameter_defaults:
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
     /// Elided class-result borrows keyed by callable source span.
-    pub return_borrows: HashMap<usize, ReturnBorrow>,
+    pub return_borrows: HashMap<Span, ReturnBorrow>,
     /// Flow facts at checked source uses, consumed by MIR lowering so
     /// statically selected nullable paths stay selected after lowering.
     pub(crate) flow_facts: crate::narrowing::FactsByUse,
@@ -108,35 +111,35 @@ pub struct SemanticInfo {
     /// The selected clause-free program entrypoint receives it from the checked
     /// effects that escape its body. Source syntax remains in the AST/HIR
     /// `throws` field and is never synthesized for inferred effects.
-    pub callable_effective_checked_effects: HashMap<usize, Vec<ResolvedType>>,
+    pub callable_effective_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     /// Exact checked effects produced at each source operation.
     pub(crate) checked_effect_sites: crate::checked_effects::EffectSiteMap,
     /// Resolved owned Error type transferred by each `throw` statement.
-    pub throw_error_types: HashMap<(usize, usize), ResolvedType>,
+    pub throw_error_types: HashMap<Span, ResolvedType>,
     /// Protected effects left after catch coverage for each `try` statement.
-    pub try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
+    pub try_uncovered_effects: HashMap<Span, Vec<ResolvedType>>,
     /// Resolved catch type for each catch clause.
-    pub catch_error_types: HashMap<(usize, usize), ResolvedType>,
+    pub catch_error_types: HashMap<Span, ResolvedType>,
     /// Canonical structural function types resolved from authored type syntax.
-    pub function_types_by_span: HashMap<(usize, usize), FunctionTypeSemanticInfo>,
+    pub function_types_by_span: HashMap<Span, FunctionTypeSemanticInfo>,
     /// Stable lexical binding declarations and source-use resolutions.
     pub binding_resolution: BindingResolution,
     /// Fully checked closure plans keyed by stable source-derived identity.
     pub closures: HashMap<ClosureId, ClosureSemanticInfo>,
     /// Semantically checked indirect-call plans, still blocked from execution.
-    pub callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
+    pub callable_value_calls: HashMap<Span, CallableValueCallInfo>,
     /// Fully specialized compiler-known `List<T>` algorithm calls.
     ///
     /// HIR and MIR consume this plan directly. Backends must not recover the
     /// contract from a method-name string.
-    pub list_algorithm_calls: HashMap<(usize, usize), ListAlgorithmCallInfo>,
+    pub list_algorithm_calls: HashMap<Span, ListAlgorithmCallInfo>,
     /// Backend-independent capture acquisition, provenance, escape, and
     /// invocation-consumption plans proven by Stage 30c.
     pub closure_ownership: HashMap<ClosureId, crate::ownership::ClosureOwnershipInfo>,
     /// Backend-independent classification of each checked instance-property write.
-    pub property_writes: HashMap<(usize, usize), PropertyWriteSemanticInfo>,
+    pub property_writes: HashMap<Span, PropertyWriteSemanticInfo>,
     /// Object-path expressions proven to carry ordinary writable access.
-    pub(crate) writable_object_paths: HashSet<(usize, usize)>,
+    pub(crate) writable_object_paths: HashSet<Span>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -479,27 +482,23 @@ pub enum ResolvedMatchPattern {
 
 impl SemanticInfo {
     pub fn integer_type(&self, span: Span) -> Option<IntegerType> {
-        self.integer_expression_types
-            .get(&(span.start, span.end))
-            .copied()
+        self.integer_expression_types.get(&span).copied()
     }
 
     pub fn float_type(&self, span: Span) -> Option<FloatType> {
-        self.float_expression_types
-            .get(&(span.start, span.end))
-            .copied()
+        self.float_expression_types.get(&span).copied()
     }
 
     pub fn expression_type(&self, span: Span) -> Option<&ResolvedType> {
-        self.expression_types.get(&(span.start, span.end))
+        self.expression_types.get(&span)
     }
 
     pub fn type_test_type(&self, span: Span) -> Option<&ResolvedType> {
-        self.type_test_types.get(&(span.start, span.end))
+        self.type_test_types.get(&span)
     }
 
     pub fn call_target(&self, span: Span) -> Option<&CallableTarget> {
-        self.call_targets.get(&(span.start, span.end))
+        self.call_targets.get(&span)
     }
 }
 
@@ -513,7 +512,7 @@ pub fn analyze_program(program: &Program) -> DiagnosticResult<SemanticInfo> {
 }
 
 pub fn analyze_program_for_ide(program: &Program) -> SemanticAnalysis {
-    analyze_program_for_ide_with_source(program, None)
+    analyze_program_for_ide_with_sources(program, &HashMap::new())
 }
 
 pub fn analyze_program_with_source<'source>(
@@ -532,11 +531,57 @@ pub fn analyze_program_for_ide_with_source<'source>(
     program: &'source Program,
     source_text: Option<&'source str>,
 ) -> SemanticAnalysis {
+    let mut sources = HashMap::new();
+    if let Some(source_text) = source_text {
+        sources.insert(crate::source::SourceId::default(), source_text);
+    }
+    analyze_program_for_ide_with_sources(program, &sources)
+}
+
+pub fn analyze_program_with_sources<'source>(
+    program: &'source Program,
+    source_texts: &HashMap<crate::source::SourceId, &'source str>,
+) -> DiagnosticResult<SemanticInfo> {
+    let analysis = analyze_program_for_ide_with_sources(program, source_texts);
+    if analysis.diagnostics.is_empty() {
+        Ok(analysis.info)
+    } else {
+        Err(analysis.diagnostics)
+    }
+}
+
+pub fn analyze_program_for_ide_with_sources<'source>(
+    program: &'source Program,
+    source_texts: &HashMap<crate::source::SourceId, &'source str>,
+) -> SemanticAnalysis {
+    analyze_program_for_ide_with_graph_context(
+        program,
+        source_texts,
+        crate::names::CompilationContext::default(),
+        HashMap::new(),
+        crate::names::GlobalSymbolFacts::default(),
+    )
+}
+
+pub fn analyze_program_for_ide_with_graph_context<'source>(
+    program: &'source Program,
+    source_texts: &HashMap<crate::source::SourceId, &'source str>,
+    compilation_context: crate::names::CompilationContext,
+    compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
+    global_symbols: crate::names::GlobalSymbolFacts,
+) -> SemanticAnalysis {
     let (const_evaluation, const_diagnostics) = match crate::const_eval::evaluate_program(program) {
         Ok(evaluation) => (evaluation, Vec::new()),
         Err(diagnostics) => (crate::const_eval::Evaluation::default(), diagnostics),
     };
-    let mut checker = Checker::new(program, const_evaluation, source_text);
+    let mut checker = Checker::new(
+        program,
+        const_evaluation,
+        source_texts,
+        compilation_context,
+        compilation_contexts,
+        global_symbols,
+    );
     checker.diagnostics.extend(const_diagnostics);
     checker.check();
     let constructor_analysis = crate::constructor_init::check_program(
@@ -595,8 +640,9 @@ pub fn analyze_program_for_ide_with_source<'source>(
     let enums = collect_ordered_enum_semantics(&checker);
     SemanticAnalysis {
         info: SemanticInfo {
-            compilation_context: crate::names::CompilationContext::default(),
-            global_symbols: crate::names::GlobalSymbolFacts::default(),
+            compilation_context: checker.compilation_context,
+            compilation_contexts: checker.compilation_contexts,
+            global_symbols: checker.global_symbols,
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
             expression_types: checker.expression_types,
@@ -807,12 +853,12 @@ fn collect_ordered_class_semantics(
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SemanticCallableInstance {
-    declaration: usize,
+    declaration: Span,
     bindings: Vec<(String, TypeId)>,
 }
 
 impl SemanticCallableInstance {
-    fn new(declaration: usize, bindings: HashMap<String, TypeId>) -> Self {
+    fn new(declaration: Span, bindings: HashMap<String, TypeId>) -> Self {
         let mut bindings = bindings.into_iter().collect::<Vec<_>>();
         bindings.sort_by(|left, right| left.0.cmp(&right.0));
         Self {
@@ -847,12 +893,12 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
     for item in &program.items {
         match item {
             Item::Function(function) => {
-                declarations.insert(function.span.start, (function, None));
+                declarations.insert(function.span, (function, None));
             }
             Item::Class(class) => {
                 for member in &class.members {
                     if let ClassMember::Method(method) = member {
-                        declarations.insert(method.span.start, (method, Some(class)));
+                        declarations.insert(method.span, (method, Some(class)));
                     }
                 }
             }
@@ -978,7 +1024,10 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
         }
 
         for (span, pending) in &calls {
-            if span.0 < function.span.start || span.1 > function.span.end {
+            if span.source != function.span.source
+                || span.start < function.span.start
+                || span.end > function.span.end
+            {
                 continue;
             }
             let bindings = pending
@@ -1021,7 +1070,7 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
                     .any(|diagnostic| diagnostic.code == "E0539" && diagnostic.message == message)
                 {
                     checker.diagnostics.push(
-                        Diagnostic::new("E0539", message, Span::new(span.0, span.1)).with_help(
+                        Diagnostic::new("E0539", message, *span).with_help(
                             "keep recursive generic calls at the same concrete type, or move the type-changing step outside the recursion",
                         ),
                     );
@@ -1252,61 +1301,64 @@ pub(crate) fn trait_declaration_diagnostic(trait_decl: &TraitDecl) -> Diagnostic
 
 struct Checker<'program> {
     program: &'program Program,
-    source_text: Option<&'program str>,
+    source_texts: HashMap<crate::source::SourceId, &'program str>,
+    compilation_context: crate::names::CompilationContext,
+    compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
+    global_symbols: crate::names::GlobalSymbolFacts,
     classes: HashMap<String, ClassInfo>,
     enums: HashMap<String, EnumDefinition>,
     functions: HashMap<String, FunctionInfo>,
-    function_signatures: HashMap<usize, FunctionInfo>,
+    function_signatures: HashMap<Span, FunctionInfo>,
     types: TypeRegistry,
     diagnostics: Vec<Diagnostic>,
-    integer_expression_types: HashMap<(usize, usize), IntegerType>,
-    float_expression_types: HashMap<(usize, usize), FloatType>,
-    expression_types: HashMap<(usize, usize), ResolvedType>,
-    mixed_box_plans: HashMap<(usize, usize), MixedBoxPlan>,
-    enum_case_values: HashMap<(usize, usize), EnumValue>,
-    enum_case_constructions: HashMap<(usize, usize), EnumCaseId>,
-    type_test_types: HashMap<(usize, usize), ResolvedType>,
-    matches: HashMap<(usize, usize), MatchSemanticInfo>,
-    whens: HashMap<(usize, usize), WhenSemanticInfo>,
-    given_preludes: HashMap<(usize, usize), GivenSemanticInfo>,
-    call_targets: HashMap<(usize, usize), CallableTarget>,
-    generic_call_specializations: HashMap<(usize, usize), GenericSpecialization>,
-    constrained_display_calls: HashSet<(usize, usize)>,
-    pending_generic_calls: HashMap<(usize, usize), PendingGenericCall>,
+    integer_expression_types: HashMap<Span, IntegerType>,
+    float_expression_types: HashMap<Span, FloatType>,
+    expression_types: HashMap<Span, ResolvedType>,
+    mixed_box_plans: HashMap<Span, MixedBoxPlan>,
+    enum_case_values: HashMap<Span, EnumValue>,
+    enum_case_constructions: HashMap<Span, EnumCaseId>,
+    type_test_types: HashMap<Span, ResolvedType>,
+    matches: HashMap<Span, MatchSemanticInfo>,
+    whens: HashMap<Span, WhenSemanticInfo>,
+    given_preludes: HashMap<Span, GivenSemanticInfo>,
+    call_targets: HashMap<Span, CallableTarget>,
+    generic_call_specializations: HashMap<Span, GenericSpecialization>,
+    constrained_display_calls: HashSet<Span>,
+    pending_generic_calls: HashMap<Span, PendingGenericCall>,
     type_parameter_scopes: Vec<HashMap<String, Vec<TypeRef>>>,
     class_instantiations: HashSet<ClassType<TypeId>>,
     class_instantiation_templates: HashMap<String, HashSet<ClassType<TypeId>>>,
-    callable_class_instantiation_templates: HashMap<usize, HashSet<ClassType<TypeId>>>,
-    current_callable: Option<usize>,
-    integer_literals: HashMap<(usize, usize), u128>,
-    negative_integer_literals: HashMap<(usize, usize), u128>,
-    negated_integer_literal_operands: HashSet<(usize, usize)>,
+    callable_class_instantiation_templates: HashMap<Span, HashSet<ClassType<TypeId>>>,
+    current_callable: Option<Span>,
+    integer_literals: HashMap<Span, u128>,
+    negative_integer_literals: HashMap<Span, u128>,
+    negated_integer_literal_operands: HashSet<Span>,
     const_evaluation: crate::const_eval::Evaluation,
     parameter_defaults:
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
     flow_facts: crate::narrowing::FactsByUse,
-    contextual_expression_types: HashMap<(usize, usize), TypeId>,
+    contextual_expression_types: HashMap<Span, TypeId>,
     when_contexts: Vec<WhenCheckContext>,
     active_loop_depth: usize,
     finalizer_boundaries: Vec<FinalizerBoundary>,
     effect_scopes: Vec<CheckedEffectSet>,
     class_initializer_effects: HashMap<String, CheckedEffectSet>,
-    callable_effective_checked_effects: HashMap<usize, Vec<ResolvedType>>,
+    callable_effective_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     checked_effect_sites: crate::checked_effects::EffectSiteMap,
-    throw_error_types: HashMap<(usize, usize), ResolvedType>,
-    try_uncovered_effects: HashMap<(usize, usize), Vec<ResolvedType>>,
-    catch_error_types: HashMap<(usize, usize), ResolvedType>,
-    function_types_by_span: HashMap<(usize, usize), FunctionTypeSemanticInfo>,
+    throw_error_types: HashMap<Span, ResolvedType>,
+    try_uncovered_effects: HashMap<Span, Vec<ResolvedType>>,
+    catch_error_types: HashMap<Span, ResolvedType>,
+    function_types_by_span: HashMap<Span, FunctionTypeSemanticInfo>,
     binding_resolution: BindingResolution,
     binding_ids: HashMap<(usize, usize, BindingKind, LexicalOwner, String), BindingId>,
     next_binding_id: usize,
     current_lexical_owner: LexicalOwner,
     closures: HashMap<ClosureId, ClosureSemanticInfo>,
-    closure_types: HashMap<(usize, usize), TypeId>,
-    callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>,
-    list_algorithm_calls: HashMap<(usize, usize), ListAlgorithmCallInfo>,
-    property_writes: HashMap<(usize, usize), PropertyWriteSemanticInfo>,
-    writable_object_paths: HashSet<(usize, usize)>,
+    closure_types: HashMap<Span, TypeId>,
+    callable_value_calls: HashMap<Span, CallableValueCallInfo>,
+    list_algorithm_calls: HashMap<Span, ListAlgorithmCallInfo>,
+    property_writes: HashMap<Span, PropertyWriteSemanticInfo>,
+    writable_object_paths: HashSet<Span>,
     active_closures: Vec<ActiveClosure>,
     initializing_bindings: Vec<HashMap<String, Span>>,
 }
@@ -1726,7 +1778,7 @@ struct CollectionMethodCall<'a> {
 #[derive(Debug, Clone)]
 struct PendingGenericCall {
     callee: String,
-    declaration: usize,
+    declaration: Span,
     type_params: Vec<TypeParamInfo>,
     bindings: HashMap<String, TypeId>,
     return_ty: TypeId,
@@ -1865,11 +1917,17 @@ impl<'program> Checker<'program> {
     fn new(
         program: &'program Program,
         const_evaluation: crate::const_eval::Evaluation,
-        source_text: Option<&'program str>,
+        source_texts: &HashMap<crate::source::SourceId, &'program str>,
+        compilation_context: crate::names::CompilationContext,
+        compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
+        global_symbols: crate::names::GlobalSymbolFacts,
     ) -> Self {
         Self {
             program,
-            source_text,
+            source_texts: source_texts.clone(),
+            compilation_context,
+            compilation_contexts,
+            global_symbols,
             classes: HashMap::new(),
             enums: HashMap::new(),
             functions: HashMap::new(),
@@ -2096,7 +2154,7 @@ impl<'program> Checker<'program> {
                         let signature =
                             self.resolve_function_signature(method, Some(&class_decl.name));
                         self.function_signatures
-                            .insert(method.span.start, signature.clone());
+                            .insert(method.span, signature.clone());
 
                         self.check_lifecycle_declaration_shape(method);
 
@@ -2135,7 +2193,7 @@ impl<'program> Checker<'program> {
                                 method.name.clone(),
                                 MethodInfo {
                                     declaration: signature.declaration,
-                                    access: method.access.clone(),
+                                    access: method.access,
                                     receiver_mode: (!method.is_static).then_some(
                                         if method.writable_this
                                             && LifecycleMethod::from_method_name(&method.name)
@@ -2986,7 +3044,7 @@ impl<'program> Checker<'program> {
 
             let signature = self.resolve_function_signature(function, None);
             self.function_signatures
-                .insert(function.span.start, signature.clone());
+                .insert(function.span, signature.clone());
             if self.functions.contains_key(&function.name) {
                 self.diagnostics.push(Diagnostic::new(
                     "E0308",
@@ -3006,14 +3064,14 @@ impl<'program> Checker<'program> {
         declaring_class: Option<&str>,
     ) -> FunctionInfo {
         self.check_function_type_parameter_declarations(function, declaring_class);
-        let previous_callable = self.current_callable.replace(function.span.start);
+        let previous_callable = self.current_callable.replace(function.span);
         self.type_parameter_scopes
             .push(type_parameter_scope(&function.type_params));
         let params = self.resolve_param_infos(function, declaring_class);
         let return_ty = self.resolve_function_return_type(function, declaring_class);
         let checked_effects = self.resolve_throws_clause(function, declaring_class);
         self.callable_effective_checked_effects.insert(
-            function.span.start,
+            function.span,
             checked_effects
                 .iter()
                 .map(|effect| self.types.resolved(*effect))
@@ -3044,7 +3102,7 @@ impl<'program> Checker<'program> {
             .flatten();
 
         FunctionInfo {
-            declaration: function.span.start,
+            declaration: function.span,
             type_params: function
                 .type_params
                 .iter()
@@ -3385,8 +3443,7 @@ impl<'program> Checker<'program> {
         for _ in 0..callables.len().max(1) {
             let mut changed = false;
             for (function, declaring_class) in &callables {
-                let Some(signature) = self.function_signatures.get(&function.span.start).cloned()
-                else {
+                let Some(signature) = self.function_signatures.get(&function.span).cloned() else {
                     continue;
                 };
                 if !self.type_can_return_borrow(signature.return_ty) {
@@ -3481,7 +3538,7 @@ impl<'program> Checker<'program> {
         declaring_class: Option<&str>,
         borrow: Option<ReturnBorrow>,
     ) {
-        if let Some(signature) = self.function_signatures.get_mut(&function.span.start) {
+        if let Some(signature) = self.function_signatures.get_mut(&function.span) {
             signature.return_borrow = borrow;
         }
         if let Some(class_name) = declaring_class {
@@ -3660,7 +3717,7 @@ impl<'program> Checker<'program> {
             return false;
         }
 
-        let Some(signature) = self.function_signatures.get(&function.span.start).cloned() else {
+        let Some(signature) = self.function_signatures.get(&function.span).cloned() else {
             return false;
         };
         let inferred = self.infer_unannotated_move_return_type(function, &signature.params, None);
@@ -3669,7 +3726,7 @@ impl<'program> Checker<'program> {
             return false;
         }
 
-        if let Some(signature) = self.function_signatures.get_mut(&function.span.start) {
+        if let Some(signature) = self.function_signatures.get_mut(&function.span) {
             signature.return_ty = inferred;
         }
         if let Some(function_info) = self.functions.get_mut(&function.name) {
@@ -3688,7 +3745,7 @@ impl<'program> Checker<'program> {
             return false;
         }
 
-        let Some(signature) = self.function_signatures.get(&method.span.start).cloned() else {
+        let Some(signature) = self.function_signatures.get(&method.span).cloned() else {
             return false;
         };
         let method_context = MethodContext {
@@ -3711,7 +3768,7 @@ impl<'program> Checker<'program> {
             return false;
         }
 
-        if let Some(signature) = self.function_signatures.get_mut(&method.span.start) {
+        if let Some(signature) = self.function_signatures.get_mut(&method.span) {
             signature.return_ty = inferred;
         }
         if let Some(method_info) = self
@@ -4378,7 +4435,7 @@ impl<'program> Checker<'program> {
         info.properties.insert(
             property.name.clone(),
             PropertyInfo {
-                access: property.access.clone(),
+                access: property.access,
                 writable: property.writable,
                 ty,
                 init_state: if property.initializer.is_some() {
@@ -4426,7 +4483,7 @@ impl<'program> Checker<'program> {
         info.static_properties.insert(
             property.name.clone(),
             StaticPropertyInfo {
-                access: property.access.clone(),
+                access: property.access,
                 writable: property.writable,
                 ty,
             },
@@ -4461,7 +4518,7 @@ impl<'program> Checker<'program> {
         info.constants.insert(
             constant.name.clone(),
             ConstantInfo {
-                access: constant.access.clone(),
+                access: constant.access,
                 ty,
             },
         );
@@ -4482,10 +4539,7 @@ impl<'program> Checker<'program> {
         info.properties.insert(
             param.name.clone(),
             PropertyInfo {
-                access: param
-                    .promoted_access
-                    .clone()
-                    .unwrap_or(MemberAccess::External),
+                access: param.promoted_access.unwrap_or(MemberAccess::External),
                 writable: param.writable,
                 ty,
                 init_state: PropertyInitState::PromotedParameter,
@@ -4571,7 +4625,7 @@ impl<'program> Checker<'program> {
         if let Some(source_span) = source_span {
             self.binding_resolution
                 .declaration_by_span
-                .insert((source_span.start, source_span.end), id);
+                .insert(source_span, id);
         }
         if !scopes.declare(name.clone(), binding) {
             self.diagnostics.push(Diagnostic::new(
@@ -4643,7 +4697,7 @@ impl<'program> Checker<'program> {
     }
 
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
-        let previous_callable = self.current_callable.replace(function.span.start);
+        let previous_callable = self.current_callable.replace(function.span);
         let previous_owner = std::mem::replace(
             &mut self.current_lexical_owner,
             LexicalOwner::Callable(function.span.start),
@@ -4809,7 +4863,7 @@ impl<'program> Checker<'program> {
     }
 
     fn is_accepted_program_entrypoint(&self, function: &FunctionDecl) -> bool {
-        let Some(signature) = self.function_signatures.get(&function.span.start) else {
+        let Some(signature) = self.function_signatures.get(&function.span) else {
             return false;
         };
         if !crate::names::source_name_is(&function.name, "main")
@@ -4817,7 +4871,7 @@ impl<'program> Checker<'program> {
             || self
                 .functions
                 .get(&function.name)
-                .is_none_or(|entry| entry.declaration != function.span.start)
+                .is_none_or(|entry| entry.declaration != function.span)
             || !matches!(
                 self.types.kind(signature.return_ty),
                 TypeKind::Integer(IntegerType::Int64) | TypeKind::Void
@@ -4850,12 +4904,12 @@ impl<'program> Checker<'program> {
             .map(|effect| self.types.resolved(*effect))
             .collect::<Vec<_>>();
         self.callable_effective_checked_effects
-            .insert(function.span.start, resolved.clone());
-        if let Some(signature) = self.function_signatures.get_mut(&function.span.start) {
+            .insert(function.span, resolved.clone());
+        if let Some(signature) = self.function_signatures.get_mut(&function.span) {
             signature.checked_effects = effects.clone();
         }
         if let Some(signature) = self.functions.get_mut(&function.name) {
-            if signature.declaration == function.span.start {
+            if signature.declaration == function.span {
                 signature.checked_effects = effects;
             }
         }
@@ -5173,7 +5227,7 @@ impl<'program> Checker<'program> {
 
     fn current_function_signature(&mut self, function: &FunctionDecl) -> FunctionInfo {
         self.function_signatures
-            .get(&function.span.start)
+            .get(&function.span)
             .cloned()
             .unwrap_or_else(|| self.resolve_function_signature(function, None))
     }
@@ -5717,10 +5771,8 @@ impl<'program> Checker<'program> {
             );
             return;
         }
-        self.throw_error_types.insert(
-            (statement.span.start, statement.span.end),
-            self.types.resolved(error_type),
-        );
+        self.throw_error_types
+            .insert(statement.span, self.types.resolved(error_type));
         self.record_checked_effects([error_type], statement.span);
     }
 
@@ -5774,10 +5826,8 @@ impl<'program> Checker<'program> {
                 );
                 continue;
             }
-            self.catch_error_types.insert(
-                (catch.span.start, catch.span.end),
-                self.types.resolved(catch_type),
-            );
+            self.catch_error_types
+                .insert(catch.span, self.types.resolved(catch_type));
             if seen_catches.contains(&catch_type) {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -5879,7 +5929,7 @@ impl<'program> Checker<'program> {
         }
 
         self.try_uncovered_effects.insert(
-            (statement.span.start, statement.span.end),
+            statement.span,
             uncovered
                 .ordered
                 .iter()
@@ -6453,7 +6503,7 @@ impl<'program> Checker<'program> {
             }
         }
         self.given_preludes.insert(
-            (given.span.start, given.span.end),
+            given.span,
             GivenSemanticInfo {
                 predicate_statement_indices,
             },
@@ -6778,8 +6828,7 @@ impl<'program> Checker<'program> {
 
     fn record_expected_expression_type(&mut self, expr: &Expr, expected: TypeId) {
         let span = expr.span();
-        self.contextual_expression_types
-            .insert((span.start, span.end), expected);
+        self.contextual_expression_types.insert(span, expected);
         if let Expr::Grouped { expr, .. } = expr {
             self.record_expected_expression_type(expr, expected);
         }
@@ -6875,10 +6924,7 @@ impl<'program> Checker<'program> {
     ) {
         let bool_ty = self.types.intern(TypeKind::Bool);
         let void = self.types.intern(TypeKind::Void);
-        let expected_result = self
-            .contextual_expression_types
-            .get(&(span.start, span.end))
-            .copied();
+        let expected_result = self.contextual_expression_types.get(&span).copied();
         let make_callback = |checker: &mut Self, invocation_mode, parameters, return_type| {
             checker
                 .types
@@ -7342,10 +7388,8 @@ impl<'program> Checker<'program> {
                         Self::unsigned_integer_literal_magnitude(expr),
                         Self::unsigned_integer_literal_span(expr),
                     ) {
-                        self.negative_integer_literals
-                            .insert((span.start, span.end), magnitude);
-                        self.negated_integer_literal_operands
-                            .insert((operand_span.start, operand_span.end));
+                        self.negative_integer_literals.insert(*span, magnitude);
+                        self.negated_integer_literal_operands.insert(operand_span);
                     }
                 }
                 self.check_expr(expr, scopes, method_context);
@@ -7395,8 +7439,7 @@ impl<'program> Checker<'program> {
             Expr::String { .. } | Expr::Bool { .. } | Expr::Null { .. } => {}
             Expr::Int { value, span } => {
                 if let Some(magnitude) = parse_decimal_magnitude(value) {
-                    self.integer_literals
-                        .insert((span.start, span.end), magnitude);
+                    self.integer_literals.insert(*span, magnitude);
                 } else {
                     self.report_integer_literal_range(*span, IntegerType::Int64);
                 }
@@ -7412,7 +7455,7 @@ impl<'program> Checker<'program> {
     ) {
         self.binding_resolution
             .uses_by_span
-            .insert((span.start, span.end), binding.id);
+            .insert(span, binding.id);
         let Some(active) = self.active_closures.last_mut() else {
             return;
         };
@@ -7705,7 +7748,7 @@ impl<'program> Checker<'program> {
         self.record_checked_effects(function.checked_effects.iter().copied(), span);
         let resolved_function = self.types.resolved(callee_ty);
         self.callable_value_calls.insert(
-            (span.start, span.end),
+            span,
             CallableValueCallInfo {
                 function_type: resolved_function,
                 invocation_mode: function.invocation_mode,
@@ -7755,7 +7798,7 @@ impl<'program> Checker<'program> {
         outer_scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
-        let key = (closure.span.start, closure.span.end);
+        let key = closure.span;
         let closure_id = ClosureId::from_span(closure.span);
         let previous_owner = std::mem::replace(
             &mut self.current_lexical_owner,
@@ -8231,6 +8274,7 @@ impl<'program> Checker<'program> {
             .collect();
         let function = FunctionDecl {
             access: MemberAccess::External,
+            access_span: None,
             writable_this: false,
             writable_span: None,
             is_static: true,
@@ -8425,7 +8469,7 @@ impl<'program> Checker<'program> {
         clause: &ClosureCaptureClause,
         capture_span: Span,
     ) -> Option<Span> {
-        let clause_text = self.source_text?.get(clause.span.start..clause.span.end)?;
+        let clause_text = self.source_slice(clause.span)?;
         if contains_comment(clause_text) {
             return None;
         }
@@ -8437,12 +8481,12 @@ impl<'program> Checker<'program> {
             .iter()
             .position(|capture| capture.span == capture_span)?;
         let removal = if let Some(next) = clause.captures.get(index + 1) {
-            Span::new(capture_span.start, next.span.start)
+            Span::in_source(capture_span.source, capture_span.start, next.span.start)
         } else {
             let previous = clause.captures.get(index.checked_sub(1)?)?;
-            Span::new(previous.span.end, capture_span.end)
+            Span::in_source(capture_span.source, previous.span.end, capture_span.end)
         };
-        let text = self.source_text?.get(removal.start..removal.end)?;
+        let text = self.source_slice(removal)?;
         (!contains_comment(text)).then_some(removal)
     }
 
@@ -8453,7 +8497,8 @@ impl<'program> Checker<'program> {
     ) -> Option<FixEdit> {
         let last = clause.captures.last()?;
         let tail = self
-            .source_text?
+            .source_texts
+            .get(&last.span.source)?
             .get(last.span.end..clause.close_span.start)?;
         if contains_comment(tail) {
             return None;
@@ -8465,7 +8510,7 @@ impl<'program> Checker<'program> {
         };
         Some(FixEdit {
             source: DiagnosticSource::Current,
-            span: Span::new(offset, offset),
+            span: Span::in_source(last.span.source, offset, offset),
             replacement: format!(", {insertion}"),
         })
     }
@@ -8593,7 +8638,7 @@ impl<'program> Checker<'program> {
         };
         let ty = self.types.intern(TypeKind::Function(semantic));
         self.function_types_by_span.insert(
-            (function.span.start, function.span.end),
+            function.span,
             FunctionTypeSemanticInfo {
                 ty: self.types.resolved(ty),
                 authored_checked_effects: authored_checked_effects
@@ -8660,10 +8705,7 @@ impl<'program> Checker<'program> {
             );
         }
 
-        let expected = self
-            .contextual_expression_types
-            .get(&(span.start, span.end))
-            .copied();
+        let expected = self.contextual_expression_types.get(span).copied();
         let mut resolved_arms = Vec::with_capacity(arms.len());
         let mut result_ty = expected;
         let mut seen_default = false;
@@ -8927,10 +8969,10 @@ impl<'program> Checker<'program> {
             shape_valid = false;
         }
         self.expression_types
-            .insert((span.start, span.end), self.types.resolved(result_ty));
+            .insert(*span, self.types.resolved(result_ty));
         if shape_valid || !resolved_arms.is_empty() {
             self.matches.insert(
-                (span.start, span.end),
+                *span,
                 MatchSemanticInfo {
                     scrutinee_type: self.types.resolved(scrutinee_ty),
                     result_type: self.types.resolved(result_ty),
@@ -9063,7 +9105,7 @@ impl<'program> Checker<'program> {
         collect_return_expression_spans(block, &mut return_spans);
         let mut inferred = None;
         for span in return_spans.into_iter().flatten() {
-            let Some(ty) = self.expression_types.get(&(span.start, span.end)).cloned() else {
+            let Some(ty) = self.expression_types.get(&span).cloned() else {
                 continue;
             };
             let ty = self.types.intern_resolved(&ty);
@@ -9124,10 +9166,7 @@ impl<'program> Checker<'program> {
                     .with_title("When Cannot Produce Void"),
             );
         }
-        let contextual = self
-            .contextual_expression_types
-            .get(&(span.start, span.end))
-            .copied();
+        let contextual = self.contextual_expression_types.get(&span).copied();
         let expected = explicit.or(contextual);
         self.when_contexts.push(WhenCheckContext {
             expected,
@@ -9189,9 +9228,9 @@ impl<'program> Checker<'program> {
             );
         }
         self.expression_types
-            .insert((span.start, span.end), self.types.resolved(result));
+            .insert(span, self.types.resolved(result));
         self.whens.insert(
-            (span.start, span.end),
+            span,
             WhenSemanticInfo {
                 result_type: self.types.resolved(result),
             },
@@ -9422,10 +9461,8 @@ impl<'program> Checker<'program> {
                                 BindingOwnership::Owned
                             },
                         );
-                        self.expression_types.insert(
-                            (binding.span.start, binding.span.end),
-                            self.types.resolved(field.ty),
-                        );
+                        self.expression_types
+                            .insert(binding.span, self.types.resolved(field.ty));
                         bindings.push(MatchBindingSemanticInfo {
                             name: binding.name.clone(),
                             ty: self.types.resolved(field.ty),
@@ -9502,8 +9539,7 @@ impl<'program> Checker<'program> {
                         BindingOwnership::Owned
                     },
                 );
-                self.expression_types
-                    .insert((binding.span.start, binding.span.end), resolved.clone());
+                self.expression_types.insert(binding.span, resolved.clone());
                 bindings.push(MatchBindingSemanticInfo {
                     name: binding.name.clone(),
                     ty: resolved.clone(),
@@ -9931,27 +9967,23 @@ impl<'program> Checker<'program> {
 
     fn check_pending_integer_literal_ranges(&mut self) {
         let mut literals = Vec::new();
-        for ((start, end), magnitude) in &self.integer_literals {
-            if self
-                .negated_integer_literal_operands
-                .contains(&(*start, *end))
-            {
+        for (span, magnitude) in &self.integer_literals {
+            if self.negated_integer_literal_operands.contains(span) {
                 continue;
             }
-            literals.push((*start, *end, *magnitude, false));
+            literals.push((*span, *magnitude, false));
         }
         literals.extend(
             self.negative_integer_literals
                 .iter()
-                .map(|((start, end), magnitude)| (*start, *end, *magnitude, true)),
+                .map(|(span, magnitude)| (*span, *magnitude, true)),
         );
-        literals.sort_unstable_by_key(|(start, end, _, _)| (*start, *end));
+        literals.sort_unstable_by_key(|(span, _, _)| *span);
 
-        for (start, end, magnitude, negative) in literals {
-            let span = Span { start, end };
+        for (span, magnitude, negative) in literals {
             let target = self
                 .integer_expression_types
-                .get(&(start, end))
+                .get(&span)
                 .copied()
                 .unwrap_or(IntegerType::Int64);
             if IntegerValue::from_literal(target, magnitude, negative).is_none() {
@@ -9990,8 +10022,7 @@ impl<'program> Checker<'program> {
     }
 
     fn record_integer_expression_type(&mut self, expr: &Expr, integer: IntegerType) {
-        self.integer_expression_types
-            .insert((expr.span().start, expr.span().end), integer);
+        self.integer_expression_types.insert(expr.span(), integer);
         match expr {
             Expr::Grouped { expr, .. }
             | Expr::Unary {
@@ -10067,8 +10098,7 @@ impl<'program> Checker<'program> {
     }
 
     fn record_float_expression_type(&mut self, expr: &Expr, float: FloatType) {
-        self.float_expression_types
-            .insert((expr.span().start, expr.span().end), float);
+        self.float_expression_types.insert(expr.span(), float);
         self.check_float_literal_range(expr, float);
         if let Expr::Grouped { expr, .. } = expr {
             self.record_float_expression_type(expr, float);
@@ -10120,8 +10150,7 @@ impl<'program> Checker<'program> {
             } => {
                 self.contextualize_float_literals(left, target);
                 self.contextualize_float_literals(right, target);
-                self.float_expression_types
-                    .insert((expr.span().start, expr.span().end), target);
+                self.float_expression_types.insert(expr.span(), target);
             }
             _ => {}
         }
@@ -11432,7 +11461,7 @@ impl<'program> Checker<'program> {
                             PropertyWriteKind::Replace
                         };
                         self.property_writes.insert(
-                            (target.span().start, target.span().end),
+                            target.span(),
                             PropertyWriteSemanticInfo {
                                 kind,
                                 class_name: class_name.clone(),
@@ -11699,7 +11728,7 @@ impl<'program> Checker<'program> {
         };
 
         self.call_targets.insert(
-            (span.start, span.end),
+            span,
             CallableTarget::Function {
                 name: name.to_string(),
             },
@@ -12025,8 +12054,7 @@ impl<'program> Checker<'program> {
                 && args.is_empty()
                 && self.type_parameter_has_constraint(&parameter, "Displayable")
             {
-                self.constrained_display_calls
-                    .insert((span.start, span.end));
+                self.constrained_display_calls.insert(span);
                 return;
             }
             self.diagnostics.push(
@@ -12067,7 +12095,7 @@ impl<'program> Checker<'program> {
             unreachable!("interned class type must resolve as a class");
         };
         self.call_targets.insert(
-            (span.start, span.end),
+            span,
             CallableTarget::Method {
                 class_type: resolved_class_type,
                 method_name: method.to_string(),
@@ -12087,7 +12115,7 @@ impl<'program> Checker<'program> {
         }
 
         if matches!(method_info.access, MemberAccess::Internal)
-            && !self.can_access_internal_member(&class_name, method_context)
+            && !self.can_access_internal_member(&class_name, span, method_context)
         {
             self.diagnostics.push(Diagnostic::new(
                 "E0307",
@@ -12604,7 +12632,7 @@ impl<'program> Checker<'program> {
             ClassType::new(class_name, Vec::new())
         };
         self.call_targets.insert(
-            (access.span.start, access.span.end),
+            access.span,
             CallableTarget::Method {
                 class_type: target_class,
                 method_name: access.member.to_string(),
@@ -12627,7 +12655,7 @@ impl<'program> Checker<'program> {
         }
 
         if matches!(method_info.access, MemberAccess::Internal)
-            && !self.can_access_internal_member(class_name, method_context)
+            && !self.can_access_internal_member(class_name, access.span, method_context)
         {
             self.diagnostics.push(Diagnostic::new(
                 "E0307",
@@ -12677,10 +12705,7 @@ impl<'program> Checker<'program> {
             "List and Dictionary use bracket literals. `::from` is reserved for collection types that have no literal form.",
         );
 
-        let expected = self
-            .contextual_expression_types
-            .get(&(access.span.start, access.span.end))
-            .copied();
+        let expected = self.contextual_expression_types.get(&access.span).copied();
         let direct_literal = match args {
             [Argument {
                 name: None,
@@ -12783,12 +12808,12 @@ impl<'program> Checker<'program> {
         let member_access = class_info
             .constants
             .get(access.member)
-            .map(|constant| constant.access.clone())
+            .map(|constant| constant.access)
             .or_else(|| {
                 class_info
                     .static_properties
                     .get(access.member)
-                    .map(|property| property.access.clone())
+                    .map(|property| property.access)
             });
         let Some(member_access) = member_access else {
             self.diagnostics.push(Diagnostic::new(
@@ -12799,7 +12824,7 @@ impl<'program> Checker<'program> {
             return;
         };
         if member_access == MemberAccess::Internal
-            && !self.can_access_internal_member(class_name, method_context)
+            && !self.can_access_internal_member(class_name, access.span, method_context)
         {
             self.diagnostics.push(Diagnostic::new(
                 "E0307",
@@ -12855,7 +12880,7 @@ impl<'program> Checker<'program> {
             return;
         }
         self.enum_case_values.insert(
-            (access.span.start, access.span.end),
+            access.span,
             EnumValue {
                 enum_id: definition.id,
                 case_id: case.id,
@@ -12914,8 +12939,7 @@ impl<'program> Checker<'program> {
                 scopes,
                 method_context,
             );
-            self.enum_case_constructions
-                .insert((access.span.start, access.span.end), case.id);
+            self.enum_case_constructions.insert(access.span, case.id);
             return;
         }
         let parentheses = Span::new(access.member_span.end, access.span.end);
@@ -13064,12 +13088,12 @@ impl<'program> Checker<'program> {
         let access = class_info
             .constants
             .get(member)
-            .map(|constant| constant.access.clone())
+            .map(|constant| constant.access)
             .or_else(|| {
                 class_info
                     .static_properties
                     .get(member)
-                    .map(|property| property.access.clone())
+                    .map(|property| property.access)
             });
         let Some(access) = access else {
             self.diagnostics.push(Diagnostic::new(
@@ -13080,7 +13104,7 @@ impl<'program> Checker<'program> {
             return;
         };
         if access == MemberAccess::Internal
-            && !self.can_access_internal_member(class_name, method_context)
+            && !self.can_access_internal_member(class_name, span, method_context)
         {
             self.diagnostics.push(Diagnostic::new(
                 "E0307",
@@ -13220,7 +13244,7 @@ impl<'program> Checker<'program> {
         };
 
         if matches!(constructor.access, MemberAccess::Internal)
-            && !self.can_access_internal_member(class_name, method_context)
+            && !self.can_access_internal_member(class_name, span, method_context)
         {
             self.diagnostics.push(Diagnostic::new(
                 "E0307",
@@ -13462,7 +13486,7 @@ impl<'program> Checker<'program> {
         );
         let specialized = MethodInfo {
             declaration: method.declaration,
-            access: method.access.clone(),
+            access: method.access,
             receiver_mode: method.receiver_mode,
             return_borrow: method.return_borrow,
             is_static: method.is_static,
@@ -13498,7 +13522,7 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
         return_ty: TypeId,
-        declaration: usize,
+        declaration: Span,
         initial_bindings: &HashMap<String, TypeId>,
     ) -> HashMap<String, TypeId> {
         let param_names = params
@@ -13530,7 +13554,7 @@ impl<'program> Checker<'program> {
             );
         }
 
-        let key = (span.start, span.end);
+        let key = span;
         self.pending_generic_calls.insert(
             key,
             PendingGenericCall {
@@ -13799,7 +13823,7 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn publish_generic_specialization(&mut self, key: (usize, usize)) {
+    fn publish_generic_specialization(&mut self, key: Span) {
         let Some(pending) = self.pending_generic_calls.get(&key) else {
             return;
         };
@@ -13819,12 +13843,7 @@ impl<'program> Checker<'program> {
         let callee = pending.callee.clone();
         let type_params = pending.type_params.clone();
         let bindings = pending.bindings.clone();
-        self.check_generic_type_constraints(
-            &callee,
-            &type_params,
-            &bindings,
-            Span::new(key.0, key.1),
-        );
+        self.check_generic_type_constraints(&callee, &type_params, &bindings, key);
         self.generic_call_specializations
             .insert(key, GenericSpecialization { arguments });
     }
@@ -13837,10 +13856,10 @@ impl<'program> Checker<'program> {
         let key = match expr {
             Expr::FunctionCall { span, .. }
             | Expr::MethodCall { span, .. }
-            | Expr::StaticCall { span, .. } => (span.start, span.end),
+            | Expr::StaticCall { span, .. } => span,
             _ => return,
         };
-        let Some(pending) = self.pending_generic_calls.get(&key).cloned() else {
+        let Some(pending) = self.pending_generic_calls.get(key).cloned() else {
             return;
         };
         let mut bindings = pending.bindings;
@@ -13851,14 +13870,14 @@ impl<'program> Checker<'program> {
             expr.span(),
             &mut bindings,
         );
-        if let Some(call) = self.pending_generic_calls.get_mut(&key) {
+        if let Some(call) = self.pending_generic_calls.get_mut(key) {
             call.bindings = bindings;
         }
-        self.publish_generic_specialization(key);
+        self.publish_generic_specialization(*key);
     }
 
     fn generic_call_result_type(&mut self, span: Span, fallback: TypeId) -> TypeId {
-        let key = (span.start, span.end);
+        let key = span;
         let Some(pending) = self.pending_generic_calls.get(&key).cloned() else {
             return fallback;
         };
@@ -13897,7 +13916,7 @@ impl<'program> Checker<'program> {
                         "cannot infer type parameter{plural} {missing} for {}",
                         pending.callee
                     ),
-                    Span::new(span.0, span.1),
+                    *span,
                 )
                 .with_help(
                     "bind the result through a typed declaration so the expected type determines the missing generic argument",
@@ -13997,7 +14016,7 @@ impl<'program> Checker<'program> {
             && !(nullable_target && matches!(self.types.kind(value), TypeKind::Null))
         {
             self.mixed_box_plans.insert(
-                (value_expr.span().start, value_expr.span().end),
+                value_expr.span(),
                 MixedBoxPlan {
                     source_type: self.types.resolved(value),
                     nullable_target,
@@ -14052,8 +14071,7 @@ impl<'program> Checker<'program> {
         let writable =
             self.object_path_access(expr, scopes, method_context) == ObjectPathAccess::Writable;
         if writable {
-            self.writable_object_paths
-                .insert((expr.span().start, expr.span().end));
+            self.writable_object_paths.insert(expr.span());
         }
         writable
     }
@@ -14221,8 +14239,7 @@ impl<'program> Checker<'program> {
             _ => ObjectPathAccess::Readonly,
         };
         if access == ObjectPathAccess::Writable {
-            self.writable_object_paths
-                .insert((expr.span().start, expr.span().end));
+            self.writable_object_paths.insert(expr.span());
         }
         access
     }
@@ -14372,7 +14389,7 @@ impl<'program> Checker<'program> {
 
         let property_info = self.specialize_property_for_class(&property_info, &class_type);
         if matches!(property_info.access, MemberAccess::Internal)
-            && !self.can_access_internal_member(&class_name, method_context)
+            && !self.can_access_internal_member(&class_name, span, method_context)
         {
             self.diagnostics.push(Diagnostic::new(
                 "E0306",
@@ -14387,11 +14404,26 @@ impl<'program> Checker<'program> {
     fn can_access_internal_member(
         &self,
         declaring_class: &str,
+        use_span: Span,
         method_context: Option<&MethodContext>,
     ) -> bool {
-        method_context
-            .map(|context| context.class_name == declaring_class)
-            .unwrap_or(false)
+        if method_context.is_some_and(|context| context.class_name == declaring_class) {
+            return true;
+        }
+        let using_package = self
+            .compilation_contexts
+            .get(&use_span.source)
+            .map(|context| &context.package)
+            .unwrap_or(&self.compilation_context.package);
+        self.global_symbols
+            .declarations
+            .iter()
+            .find(|declaration| declaration.qualified_name == declaring_class)
+            .and_then(|declaration| match &declaration.id.owner {
+                crate::names::GlobalSymbolOwner::Package(package) => Some(package),
+                crate::names::GlobalSymbolOwner::CompilerKnown(_) => None,
+            })
+            .is_some_and(|declaring_package| declaring_package == using_package)
     }
 
     fn type_parameter_has_constraint(&self, parameter: &str, required: &str) -> bool {
@@ -16002,19 +16034,15 @@ impl<'program> Checker<'program> {
         let ty = self.infer_expr_type_unrecorded(expr, scopes, method_context);
         match self.types.kind(ty) {
             TypeKind::Integer(integer) => {
-                self.integer_expression_types
-                    .insert((expr.span().start, expr.span().end), *integer);
+                self.integer_expression_types.insert(expr.span(), *integer);
             }
             TypeKind::Float(float) => {
-                self.float_expression_types
-                    .insert((expr.span().start, expr.span().end), *float);
+                self.float_expression_types.insert(expr.span(), *float);
             }
             _ => {}
         }
-        self.expression_types.insert(
-            (expr.span().start, expr.span().end),
-            self.types.resolved(ty),
-        );
+        self.expression_types
+            .insert(expr.span(), self.types.resolved(ty));
         ty
     }
 
@@ -16027,12 +16055,12 @@ impl<'program> Checker<'program> {
         match expr {
             Expr::Closure(closure) => self
                 .closure_types
-                .get(&(closure.span.start, closure.span.end))
+                .get(&closure.span)
                 .copied()
                 .unwrap_or_else(|| self.types.unknown()),
             Expr::CallableCall { span, .. } => self
                 .callable_value_calls
-                .get(&(span.start, span.end))
+                .get(span)
                 .map(|call| call.return_type.clone())
                 .map(|ty| self.types.intern_resolved(&ty))
                 .unwrap_or_else(|| self.types.unknown()),
@@ -16042,7 +16070,7 @@ impl<'program> Checker<'program> {
             Expr::Int { span, .. } => {
                 let integer = self
                     .integer_expression_types
-                    .get(&(span.start, span.end))
+                    .get(span)
                     .copied()
                     .unwrap_or(IntegerType::Int64);
                 self.types.intern(TypeKind::Integer(integer))
@@ -16050,7 +16078,7 @@ impl<'program> Checker<'program> {
             Expr::Float { span, .. } => {
                 let float = self
                     .float_expression_types
-                    .get(&(span.start, span.end))
+                    .get(span)
                     .copied()
                     .unwrap_or(FloatType::Float64);
                 self.types.intern(TypeKind::Float(float))
@@ -16189,10 +16217,10 @@ impl<'program> Checker<'program> {
                 span,
                 ..
             } => {
-                if let Some(call) = self.callable_value_calls.get(&(span.start, span.end)) {
+                if let Some(call) = self.callable_value_calls.get(span) {
                     return self.types.intern_resolved(&call.return_type.clone());
                 }
-                if let Some(call) = self.list_algorithm_calls.get(&(span.start, span.end)) {
+                if let Some(call) = self.list_algorithm_calls.get(span) {
                     return self.types.intern_resolved(&call.result_type.clone());
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
@@ -16443,19 +16471,15 @@ impl<'program> Checker<'program> {
             Expr::Range { .. } => self.types.unknown(),
             Expr::Match { span, .. } => self
                 .expression_types
-                .get(&(span.start, span.end))
+                .get(span)
                 .cloned()
                 .map(|ty| self.types.intern_resolved(&ty))
                 .unwrap_or_else(|| self.types.unknown()),
             Expr::When(when) => self
                 .whens
-                .get(&(when.span.start, when.span.end))
+                .get(&when.span)
                 .map(|info| info.result_type.clone())
-                .or_else(|| {
-                    self.expression_types
-                        .get(&(when.span.start, when.span.end))
-                        .cloned()
-                })
+                .or_else(|| self.expression_types.get(&when.span).cloned())
                 .map(|ty| self.types.intern_resolved(&ty))
                 .unwrap_or_else(|| self.types.unknown()),
         }
@@ -17379,7 +17403,9 @@ impl<'program> Checker<'program> {
     }
 
     fn source_slice(&self, span: Span) -> Option<&str> {
-        self.source_text?.get(span.start..span.end)
+        self.source_texts
+            .get(&span.source)?
+            .get(span.start..span.end)
     }
 
     fn check_compiler_known_property(
@@ -18103,7 +18129,7 @@ impl<'program> Checker<'program> {
             .map(|effect| self.types.resolved(*effect))
             .collect();
         self.list_algorithm_calls.insert(
-            (span.start, span.end),
+            span,
             ListAlgorithmCallInfo {
                 kind,
                 receiver_type: self.types.resolved(receiver_ty),
@@ -18666,7 +18692,7 @@ impl<'program> Checker<'program> {
         span: Span,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
-        match self.flow_facts.get(&(span.start, span.end)).cloned() {
+        match self.flow_facts.get(&span).cloned() {
             Some(crate::narrowing::Fact::NonNull) => match self.types.kind(declared_ty) {
                 TypeKind::Nullable(inner) => *inner,
                 _ => fallback_ty,
@@ -18785,7 +18811,7 @@ impl<'program> Checker<'program> {
             method_context.map(|context| context.class_name.as_str()),
         );
         self.type_test_types
-            .insert((span.start, span.end), self.types.resolved(tested));
+            .insert(span, self.types.resolved(tested));
         if ty.nullable
             || !matches!(
                 self.types.kind(tested),

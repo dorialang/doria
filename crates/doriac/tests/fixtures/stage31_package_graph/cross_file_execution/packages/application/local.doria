@@ -1,0 +1,4 @@
+internal function localMessage(): string
+{
+    return "local";
+}

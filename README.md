@@ -173,6 +173,12 @@ or grouped imports. Qualified names are exact and absolute whenever they contain
 `\`; unqualified names resolve through explicit imports, the current namespace,
 and the documented edition prelude. Package source discovery and `include`
 operate at compile time; Doria source loading is never lowered to runtime PHP.
+`doriac` accepts a strict versioned JSON build plan containing the selected
+target, explicit source inventory, package graph, source scopes, namespace
+mappings, and compiler profile. Every active source is checked as one package
+compilation graph, while `internal` remains visible only inside its package.
+The compiler-facing format and CLI forms are documented in
+[`docs/build-plan-schema.md`](docs/build-plan-schema.md).
 
 Baton is the accepted project and package tool for Doria. Its current PHP
 bootstrap reads manifest schema 1 only: one binary target with an explicit

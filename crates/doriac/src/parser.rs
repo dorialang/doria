@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::lexer::{Lexer, StringQuoteKind, Token, TokenKind};
-use crate::source::{NameSegmentRef, QualifiedNameRef, SourceFile, Span};
+use crate::source::{NameSegmentRef, QualifiedNameRef, SourceFile, SourceId, Span};
 use crate::string_literal::{decode_escape, interpolation_close};
 use crate::types::{
     FunctionInvocationMode, FunctionTypeEffectRef, FunctionTypeParameterMode,
@@ -10,6 +10,7 @@ use crate::types::{
 
 pub struct Parser {
     tokens: Vec<Token>,
+    source_id: SourceId,
     current: usize,
     pending_type_argument_close: Option<Span>,
     qualified_names: Vec<QualifiedNameRef>,
@@ -26,13 +27,21 @@ struct ParserCheckpoint {
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
+        let source_id = tokens
+            .first()
+            .map_or_else(SourceId::default, |token| token.span.source);
         Self {
             tokens,
+            source_id,
             current: 0,
             pending_type_argument_close: None,
             qualified_names: Vec::new(),
             diagnostics: Vec::new(),
         }
+    }
+
+    fn span(&self, start: usize, end: usize) -> Span {
+        Span::in_source(self.source_id, start, end)
     }
 
     pub fn parse_program(mut self) -> DiagnosticResult<Program> {
@@ -162,7 +171,7 @@ impl Parser {
             name,
             keyword_span,
             semicolon_span,
-            span: Span::new(keyword_span.start, semicolon_span.end),
+            span: self.span(keyword_span.start, semicolon_span.end),
         })
     }
 
@@ -259,7 +268,7 @@ impl Parser {
                         target: entry_target,
                         as_span,
                         alias,
-                        span: Span::new(entry_start, entry_end),
+                        span: self.span(entry_start, entry_end),
                     });
                 }
                 if self.match_kind(&TokenKind::Comma) {
@@ -312,12 +321,12 @@ impl Parser {
                 target,
                 as_span,
                 alias,
-                span: Span::new(entry_start, entry_end),
+                span: self.span(entry_start, entry_end),
             });
         }
 
         let semicolon_span = self.expect_directive_semicolon("import")?;
-        let span = Span::new(keyword_span.start, semicolon_span.end);
+        let span = self.span(keyword_span.start, semicolon_span.end);
         Some(UseDecl {
             keyword_span,
             prefix,
@@ -412,19 +421,25 @@ impl Parser {
             quote,
             literal_span: literal.span,
             semicolon_span,
-            span: Span::new(keyword_span.start, semicolon_span.end),
+            span: self.span(keyword_span.start, semicolon_span.end),
         })
     }
 
     fn parse_item(&mut self) -> Option<Item> {
         if self.match_kind(&TokenKind::Class) {
-            self.parse_class().map(Item::Class)
+            self.parse_class(MemberAccess::External, self.previous().span.start)
+                .map(Item::Class)
         } else if self.match_kind(&TokenKind::Enum) {
-            self.parse_enum().map(Item::Enum)
+            self.parse_enum(MemberAccess::External, self.previous().span.start)
+                .map(Item::Enum)
         } else if self.match_kind(&TokenKind::Interface) {
-            self.parse_interface().map(Item::Interface)
+            self.parse_interface(MemberAccess::External, self.previous().span.start)
+                .map(Item::Interface)
         } else if self.match_kind(&TokenKind::Trait) {
-            self.parse_trait().map(Item::Trait)
+            self.parse_trait(MemberAccess::External, self.previous().span.start)
+                .map(Item::Trait)
+        } else if self.match_kind(&TokenKind::Internal) {
+            self.parse_internal_item(self.previous().span)
         } else if self.check(&TokenKind::Function)
             && self
                 .tokens
@@ -443,8 +458,45 @@ impl Parser {
         }
     }
 
-    fn parse_enum(&mut self) -> Option<EnumDecl> {
-        let start = self.previous().span.start;
+    fn parse_internal_item(&mut self, internal_span: Span) -> Option<Item> {
+        if self.match_kind(&TokenKind::Class) {
+            self.parse_class(MemberAccess::Internal, internal_span.start)
+                .map(Item::Class)
+        } else if self.match_kind(&TokenKind::Enum) {
+            self.parse_enum(MemberAccess::Internal, internal_span.start)
+                .map(Item::Enum)
+        } else if self.match_kind(&TokenKind::Interface) {
+            self.parse_interface(MemberAccess::Internal, internal_span.start)
+                .map(Item::Interface)
+        } else if self.match_kind(&TokenKind::Trait) {
+            self.parse_trait(MemberAccess::Internal, internal_span.start)
+                .map(Item::Trait)
+        } else if self.check(&TokenKind::Function)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(Self::is_callable_name_token)
+        {
+            self.advance();
+            self.parse_function(MemberAccess::Internal, None, None, internal_span)
+                .map(Item::Function)
+        } else if self.match_kind(&TokenKind::Const) {
+            self.parse_const_decl(MemberAccess::Internal, internal_span.start)
+                .map(Item::Constant)
+        } else {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "`internal` at file scope must modify a type, function, or constant declaration",
+                    internal_span,
+                )
+                .with_title("Internal Declaration Is Incomplete"),
+            );
+            None
+        }
+    }
+
+    fn parse_enum(&mut self, access: MemberAccess, start: usize) -> Option<EnumDecl> {
         let name = self.expect_type_declaration_name("expected enum name")?;
         let name_span = self.previous().span;
         let type_params = self.parse_type_params()?;
@@ -480,7 +532,7 @@ impl Parser {
                 name_span,
                 payload,
                 backing_value,
-                span: Span::new(case_start, end),
+                span: self.span(case_start, end),
             });
         }
 
@@ -489,12 +541,14 @@ impl Parser {
             .span
             .end;
         Some(EnumDecl {
+            access,
+            access_span: self.access_span(&access, start),
             name,
             name_span,
             type_params,
             backing_type,
             cases,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -510,7 +564,7 @@ impl Parser {
             fields.push(EnumPayloadField {
                 ty,
                 name,
-                span: Span::new(start, name_span.end),
+                span: self.span(start, name_span.end),
             });
             if !self.match_kind(&TokenKind::Comma) {
                 break;
@@ -520,8 +574,7 @@ impl Parser {
         Some(fields)
     }
 
-    fn parse_class(&mut self) -> Option<ClassDecl> {
-        let start = self.previous().span.start;
+    fn parse_class(&mut self, access: MemberAccess, start: usize) -> Option<ClassDecl> {
         let name = self.expect_type_declaration_name("expected class name")?;
         let name_span = self.previous().span;
         let type_params = self.parse_type_params()?;
@@ -530,7 +583,7 @@ impl Parser {
             let parent = self.expect_qualified_name("expected parent class after `extends`")?;
             (
                 Some(parent),
-                Some(Span::new(parent_start, self.previous().span.end)),
+                Some(self.span(parent_start, self.previous().span.end)),
             )
         } else {
             (None, None)
@@ -563,6 +616,8 @@ impl Parser {
             .end;
 
         Some(ClassDecl {
+            access,
+            access_span: self.access_span(&access, start),
             name,
             name_span,
             type_params,
@@ -570,12 +625,11 @@ impl Parser {
             parent_span,
             implements,
             members,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
-    fn parse_trait(&mut self) -> Option<TraitDecl> {
-        let start = self.previous().span.start;
+    fn parse_trait(&mut self, access: MemberAccess, start: usize) -> Option<TraitDecl> {
         let name = self.expect_type_declaration_name("expected trait name")?;
         let name_span = self.previous().span;
         self.expect(TokenKind::LeftBrace, "expected `{` after trait name")?;
@@ -594,10 +648,12 @@ impl Parser {
             .span
             .end;
         Some(TraitDecl {
+            access,
+            access_span: self.access_span(&access, start),
             name,
             name_span,
             members,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -646,7 +702,7 @@ impl Parser {
             self.advance();
             let start = self.previous().span.start;
             return self
-                .parse_function(access, writable_span, static_span, Span::new(start, start))
+                .parse_function(access, writable_span, static_span, self.span(start, start))
                 .map(ClassMember::Method);
         }
 
@@ -673,7 +729,7 @@ impl Parser {
             ty,
             name,
             initializer,
-            span: Span::new(start.min(name_span.start), end),
+            span: self.span(start.min(name_span.start), end),
         }))
     }
 
@@ -701,11 +757,12 @@ impl Parser {
             .end;
         Some(ConstDecl {
             access,
+            access_span: self.access_span(&access, start),
             ty,
             name,
             name_span,
             initializer,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -750,9 +807,10 @@ impl Parser {
         };
 
         let body = self.parse_block()?;
-        let span = Span::new(start, body.span.end);
+        let span = self.span(start, body.span.end);
         Some(FunctionDecl {
             access,
+            access_span: self.access_span(&access, start_span.start),
             writable_this: writable_span.is_some(),
             writable_span,
             is_static: static_span.is_some(),
@@ -774,7 +832,7 @@ impl Parser {
         loop {
             let start = self.peek().span.start;
             let ty = self.parse_type_ref()?;
-            let span = Span::new(start, self.previous().span.end);
+            let span = self.span(start, self.previous().span.end);
             entries.push(ThrowsEntry { ty, span });
             if !self.match_kind(&TokenKind::Comma) {
                 break;
@@ -784,7 +842,7 @@ impl Parser {
         Some(ThrowsClause {
             keyword_span,
             entries,
-            span: Span::new(keyword_span.start, end),
+            span: self.span(keyword_span.start, end),
         })
     }
 
@@ -830,7 +888,7 @@ impl Parser {
                 name,
                 constraints,
                 default_type,
-                span: Span::new(start, end),
+                span: self.span(start, end),
             });
 
             if self.pending_type_argument_close.take().is_some() {
@@ -846,8 +904,7 @@ impl Parser {
         Some(params)
     }
 
-    fn parse_interface(&mut self) -> Option<InterfaceDecl> {
-        let start = self.previous().span.start;
+    fn parse_interface(&mut self, access: MemberAccess, start: usize) -> Option<InterfaceDecl> {
         let name = self.expect_identifier("expected interface name")?;
         let name_span = self.previous().span;
         self.expect(TokenKind::LeftBrace, "expected `{` after interface name")?;
@@ -884,10 +941,16 @@ impl Parser {
         }
 
         Some(InterfaceDecl {
+            access,
+            access_span: self.access_span(&access, start),
             name,
             name_span,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
+    }
+
+    fn access_span(&self, access: &MemberAccess, start: usize) -> Option<Span> {
+        matches!(access, MemberAccess::Internal).then(|| self.span(start, start + "internal".len()))
     }
 
     fn parse_param(&mut self, is_constructor: bool) -> Option<Param> {
@@ -902,7 +965,7 @@ impl Parser {
         }
 
         let access = self.parse_member_access();
-        let ownership_modifier_insert = Span::new(self.peek().span.start, self.peek().span.start);
+        let ownership_modifier_insert = self.span(self.peek().span.start, self.peek().span.start);
         let mut take_span = None;
         let mut writable_span = None;
         while self.check(&TokenKind::Take) || self.check(&TokenKind::Writable) {
@@ -944,7 +1007,7 @@ impl Parser {
             ty,
             name,
             default,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -970,7 +1033,7 @@ impl Parser {
             )?
             .span;
         let expression = self.parse_expression()?;
-        let span = Span::new(keyword_span.start, expression.span().end);
+        let span = self.span(keyword_span.start, expression.span().end);
         Some(Expr::Closure(Box::new(ClosureExpression {
             form: ClosureForm::Arrow,
             keyword_span,
@@ -992,12 +1055,12 @@ impl Parser {
             let colon_span = self.previous().span;
             let return_start = self.peek().span.start;
             let return_type = self.parse_type_ref()?;
-            let return_span = Span::new(return_start, self.previous().span.end);
+            let return_span = self.span(return_start, self.previous().span.end);
             Some(ClosureReturnType {
                 colon_span,
                 ty: return_type,
                 type_span: return_span,
-                span: Span::new(colon_span.start, return_span.end),
+                span: self.span(colon_span.start, return_span.end),
             })
         } else {
             self.diagnostics.push(
@@ -1025,7 +1088,7 @@ impl Parser {
             return None;
         }
         let block = self.parse_block()?;
-        let span = Span::new(keyword_span.start, block.span.end);
+        let span = self.span(keyword_span.start, block.span.end);
         Some(Expr::Closure(Box::new(ClosureExpression {
             form: ClosureForm::AnonymousBlock,
             keyword_span,
@@ -1065,7 +1128,7 @@ impl Parser {
 
     fn parse_closure_parameter(&mut self) -> Option<ClosureParameter> {
         let start = self.peek().span.start;
-        let ownership_modifier_insert = Span::new(start, start);
+        let ownership_modifier_insert = self.span(start, start);
         let mut take_span = None;
         let mut writable_span = None;
         while self.check(&TokenKind::Take) || self.check(&TokenKind::Writable) {
@@ -1103,13 +1166,13 @@ impl Parser {
                 type_span: ownership_modifier_insert,
                 name,
                 name_span,
-                span: Span::new(start, name_span.end),
+                span: self.span(start, name_span.end),
             });
         }
 
         let type_start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
-        let type_span = Span::new(type_start, self.previous().span.end);
+        let type_span = self.span(type_start, self.previous().span.end);
         let (name, name_span) = self.expect_variable("expected closure parameter variable name")?;
         if self.match_kind(&TokenKind::Equals) {
             let equals = self.previous().span;
@@ -1132,7 +1195,7 @@ impl Parser {
             type_span,
             name,
             name_span,
-            span: Span::new(start, name_span.end),
+            span: self.span(start, name_span.end),
         })
     }
 
@@ -1285,7 +1348,7 @@ impl Parser {
             modifier_span,
             name,
             name_span,
-            span: Span::new(start, name_span.end),
+            span: self.span(start, name_span.end),
         })
     }
 
@@ -1311,7 +1374,7 @@ impl Parser {
 
         Some(Block {
             statements,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -1373,7 +1436,7 @@ impl Parser {
                 .end;
             return Some(Stmt::Echo {
                 expr,
-                span: Span::new(start, end),
+                span: self.span(start, end),
             });
         }
 
@@ -1390,7 +1453,7 @@ impl Parser {
                 .end;
             return Some(Stmt::Return {
                 expr,
-                span: Span::new(start, end),
+                span: self.span(start, end),
             });
         }
 
@@ -1411,7 +1474,7 @@ impl Parser {
                 .span;
             return Some(Stmt::Throw(ThrowStmt {
                 keyword_span,
-                span: Span::new(keyword_span.start, semicolon_span.end),
+                span: self.span(keyword_span.start, semicolon_span.end),
                 expr,
                 semicolon_span,
             }));
@@ -1494,7 +1557,7 @@ impl Parser {
                         ty: Some(ty),
                         bindings,
                         initializer,
-                        span: Span::new(start, end),
+                        span: self.span(start, end),
                     }));
                 }
             }
@@ -1520,7 +1583,7 @@ impl Parser {
                 target: expr,
                 op,
                 value,
-                span: Span::new(start, end),
+                span: self.span(start, end),
             }));
         }
 
@@ -1532,7 +1595,7 @@ impl Parser {
             .span
             .end;
         Some(Stmt::Expr {
-            span: Span::new(expr.span().start, end),
+            span: self.span(expr.span().start, end),
             expr,
         })
     }
@@ -1546,7 +1609,7 @@ impl Parser {
             self.expect(TokenKind::LeftParen, "expected `(` after `catch`")?;
             let type_start = self.peek().span.start;
             let ty = self.parse_type_ref()?;
-            let ty_span = Span::new(type_start, self.previous().span.end);
+            let ty_span = self.span(type_start, self.previous().span.end);
             let binding = if let Some((name, span)) = self.consume_variable() {
                 Some(CatchBinding { name, span })
             } else {
@@ -1554,7 +1617,7 @@ impl Parser {
             };
             self.expect(TokenKind::RightParen, "expected `)` after catch type")?;
             let catch_body = self.parse_block()?;
-            let span = Span::new(catch_keyword.start, catch_body.span.end);
+            let span = self.span(catch_keyword.start, catch_body.span.end);
             catches.push(CatchClause {
                 keyword_span: catch_keyword,
                 ty,
@@ -1569,7 +1632,7 @@ impl Parser {
             let finally_body = self.parse_block()?;
             Some(TryFinally {
                 keyword_span: finally_keyword,
-                span: Span::new(finally_keyword.start, finally_body.span.end),
+                span: self.span(finally_keyword.start, finally_body.span.end),
                 body: finally_body,
             })
         } else {
@@ -1607,7 +1670,7 @@ impl Parser {
             body,
             catches,
             finally,
-            span: Span::new(keyword_span.start, end),
+            span: self.span(keyword_span.start, end),
         })
     }
 
@@ -1643,7 +1706,7 @@ impl Parser {
             ty: None,
             bindings,
             initializer,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -1724,7 +1787,7 @@ impl Parser {
 
         self.restore_checkpoint(checkpoint);
 
-        (parsed.is_some() && followed_by_binding).then(|| Span::new(start, end))
+        (parsed.is_some() && followed_by_binding).then(|| self.span(start, end))
     }
 
     fn reject_additional_group_initializer(&mut self) -> bool {
@@ -1789,10 +1852,10 @@ impl Parser {
             .end;
         match kind {
             TokenKind::Break => Some(Stmt::Break {
-                span: Span::new(start, end),
+                span: self.span(start, end),
             }),
             TokenKind::Continue => Some(Stmt::Continue {
-                span: Span::new(start, end),
+                span: self.span(start, end),
             }),
             _ => unreachable!("loop-control parser called for non-loop-control token"),
         }
@@ -1845,7 +1908,7 @@ impl Parser {
             then_block,
             else_branch,
             finally,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -1872,7 +1935,7 @@ impl Parser {
             condition,
             body,
             finally,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -1898,7 +1961,7 @@ impl Parser {
             let semicolon = self.previous().span;
             (Some(semicolon), None, semicolon.end)
         } else {
-            let insertion = Span::new(condition_end, condition_end);
+            let insertion = self.span(condition_end, condition_end);
             self.diagnostics.push(
                 Diagnostic::new("P0018", "expected `;` after do-while condition", insertion)
                     .with_help("terminate `do ... while` with `;` when no `finally` clause follows")
@@ -1912,7 +1975,7 @@ impl Parser {
             condition,
             semicolon_span,
             finally,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -1939,7 +2002,7 @@ impl Parser {
                 .span
                 .end;
             return Some(Stmt::Expr {
-                span: Span::new(start, end),
+                span: self.span(start, end),
                 expr,
             });
         }
@@ -1969,7 +2032,7 @@ impl Parser {
     fn parse_given_prelude(&mut self, start: usize) -> Option<GivenPrelude> {
         let block = self.parse_block()?;
         Some(GivenPrelude {
-            span: Span::new(start, block.span.end),
+            span: self.span(start, block.span.end),
             block,
         })
     }
@@ -2014,7 +2077,7 @@ impl Parser {
                 .span
                 .end;
             Some(ForInitializer::Assignment(Assignment {
-                span: Span::new(target.span().start, end),
+                span: self.span(target.span().start, end),
                 target,
                 op,
                 value,
@@ -2037,7 +2100,7 @@ impl Parser {
 
         self.expect(TokenKind::RightParen, "expected `)` after for clauses")?;
         let body = self.parse_block()?;
-        let span = Span::new(start, body.span.end);
+        let span = self.span(start, body.span.end);
         Some(ForStmt {
             initializer,
             condition,
@@ -2049,26 +2112,30 @@ impl Parser {
 
     fn parse_for_increment(&mut self) -> Option<ForIncrement> {
         if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
-            return self.parse_pre_increment(false).map(ForIncrement::Increment);
+            return self
+                .parse_pre_increment(false)
+                .map(Box::new)
+                .map(ForIncrement::Increment);
         }
 
         let target = self.parse_expression()?;
         if self.check(&TokenKind::PlusPlus) || self.check(&TokenKind::MinusMinus) {
             return self
                 .parse_post_increment(target, false)
+                .map(Box::new)
                 .map(ForIncrement::Increment);
         }
 
         if let Some(op) = self.parse_assignment_op() {
             let start = target.span().start;
             let value = self.parse_expression()?;
-            let span = Span::new(start, value.span().end);
-            return Some(ForIncrement::Assignment(Assignment {
+            let span = self.span(start, value.span().end);
+            return Some(ForIncrement::Assignment(Box::new(Assignment {
                 target,
                 op,
                 value,
                 span,
-            }));
+            })));
         }
 
         self.error(
@@ -2108,7 +2175,7 @@ impl Parser {
             target,
             op,
             position: IncrementPosition::Pre,
-            span: Span::new(token.span.start, end),
+            span: self.span(token.span.start, end),
         })
     }
 
@@ -2134,7 +2201,7 @@ impl Parser {
             token.span.end
         };
         Some(IncrementStmt {
-            span: Span::new(target.span().start, end),
+            span: self.span(target.span().start, end),
             target,
             op,
             position: IncrementPosition::Post,
@@ -2155,7 +2222,7 @@ impl Parser {
         };
         self.expect(TokenKind::RightParen, "expected `)` after foreach bindings")?;
         let body = self.parse_block()?;
-        let span = Span::new(start, body.span.end);
+        let span = self.span(start, body.span.end);
         Some(Stmt::Foreach(ForeachStmt {
             iterable,
             key,
@@ -2394,7 +2461,7 @@ impl Parser {
                     let argument_list_start = self.previous().span.start;
                     let args = self.parse_argument_list_after_open()?;
                     let argument_list_span =
-                        Span::new(argument_list_start, self.previous().span.end);
+                        self.span(argument_list_start, self.previous().span.end);
                     let span = expr.span().merge(self.previous().span);
                     expr = Expr::MethodCall {
                         object: Box::new(expr),
@@ -2431,7 +2498,7 @@ impl Parser {
                 expr = Expr::Index {
                     collection: Box::new(expr),
                     index: Box::new(index),
-                    span: Span::new(start, end),
+                    span: self.span(start, end),
                 };
                 continue;
             }
@@ -2446,7 +2513,7 @@ impl Parser {
                         expr = Expr::FunctionCall {
                             name,
                             args,
-                            span: Span::new(span.start, close_span.end),
+                            span: self.span(span.start, close_span.end),
                         };
                     }
                     callee => {
@@ -2589,7 +2656,7 @@ impl Parser {
                     .end;
                 Some(Expr::Grouped {
                     expr: Box::new(expr),
-                    span: Span::new(start, end),
+                    span: self.span(start, end),
                 })
             }
             _ => {
@@ -2639,7 +2706,7 @@ impl Parser {
                 pattern,
                 guard,
                 value,
-                span: Span::new(arm_start, arm_end),
+                span: self.span(arm_start, arm_end),
             });
             if !self.match_kind(&TokenKind::Comma) {
                 break;
@@ -2654,7 +2721,7 @@ impl Parser {
             mode,
             arms,
             origin: MatchOrigin::Match,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -2727,7 +2794,7 @@ impl Parser {
                 name,
                 "expected enum-name segment after namespace separator",
             )?;
-            let qualifier_span = Span::new(qualifier_token.span.start, self.previous().span.end);
+            let qualifier_span = self.span(qualifier_token.span.start, self.previous().span.end);
             if self.match_kind(&TokenKind::DoubleColon) {
                 let case_token = self.advance().clone();
                 let TokenKind::Identifier(case) = case_token.kind else {
@@ -2789,7 +2856,7 @@ impl Parser {
                     case,
                     case_span: case_token.span,
                     bindings,
-                    span: Span::new(qualifier_token.span.start, end),
+                    span: self.span(qualifier_token.span.start, end),
                 });
             }
             self.current = enum_case_checkpoint;
@@ -2805,10 +2872,8 @@ impl Parser {
                             name,
                             span: binding_span,
                         },
-                        span: Span::new(
-                            self.tokens[checkpoint.current].span.start,
-                            binding_span.end,
-                        ),
+                        span: self
+                            .span(self.tokens[checkpoint.current].span.start, binding_span.end),
                     });
                 }
             }
@@ -2833,7 +2898,7 @@ impl Parser {
             TokenKind::Identifier(name) => (name, None),
             TokenKind::Variable(name) => (
                 name,
-                Some(Span::new(token.span.start, token.span.start + 1)),
+                Some(self.span(token.span.start, token.span.start + 1)),
             ),
             _ => {
                 self.error("expected member name after `::`", token.span);
@@ -2844,7 +2909,7 @@ impl Parser {
         if self.match_kind(&TokenKind::LeftParen) {
             let argument_list_start = self.previous().span.start;
             let args = self.parse_argument_list_after_open()?;
-            let argument_list_span = Span::new(argument_list_start, self.previous().span.end);
+            let argument_list_span = self.span(argument_list_start, self.previous().span.end);
             Some(Expr::StaticCall {
                 qualifier,
                 qualifier_span,
@@ -2853,7 +2918,7 @@ impl Parser {
                 member_sigil_span,
                 args,
                 argument_list_span,
-                span: Span::new(start, self.previous().span.end),
+                span: self.span(start, self.previous().span.end),
             })
         } else {
             Some(Expr::StaticMember {
@@ -2862,7 +2927,7 @@ impl Parser {
                 member,
                 member_span: token.span,
                 member_sigil_span,
-                span: Span::new(start, token.span.end),
+                span: self.span(start, token.span.end),
             })
         }
     }
@@ -2915,20 +2980,20 @@ impl Parser {
             let Some(close) = interpolation_close(&raw, open) else {
                 self.error(
                     "unterminated string interpolation",
-                    Span::new(span.start + 1 + open, span.end.saturating_sub(1)),
+                    self.span(span.start + 1 + open, span.end.saturating_sub(1)),
                 );
                 return None;
             };
             if !text.is_empty() {
                 parts.push(InterpolatedStringPart::Text {
                     value: std::mem::take(&mut text),
-                    span: Span::new(span.start + 1 + text_start, span.start + 1 + open),
+                    span: self.span(span.start + 1 + text_start, span.start + 1 + open),
                 });
             }
 
             let inner_start = open + 1;
             let inner = &raw[inner_start..close];
-            let inner_span = Span::new(span.start + 1 + inner_start, span.start + 1 + close);
+            let inner_span = self.span(span.start + 1 + inner_start, span.start + 1 + close);
             if inner.trim().is_empty() {
                 self.error("empty string interpolation", inner_span);
                 return None;
@@ -2947,7 +3012,7 @@ impl Parser {
         if !text.is_empty() {
             parts.push(InterpolatedStringPart::Text {
                 value: text,
-                span: Span::new(span.start + 1 + text_start, span.start + 1 + raw.len()),
+                span: self.span(span.start + 1 + text_start, span.start + 1 + raw.len()),
             });
         }
         Some(Expr::InterpolatedString { parts, span })
@@ -2960,7 +3025,7 @@ impl Parser {
         open_offset: usize,
         string_span: Span,
     ) -> Option<Expr> {
-        let opening_brace_span = Span::new(
+        let opening_brace_span = self.span(
             string_span.start + 1 + open_offset,
             string_span.start + 2 + open_offset,
         );
@@ -3102,7 +3167,7 @@ impl Parser {
         }
 
         let next = self.peek().clone();
-        let span = Span::new(start, next.span.end);
+        let span = self.span(start, next.span.end);
         if matches!(next.kind, TokenKind::Writable) {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -3133,13 +3198,13 @@ impl Parser {
     fn parse_new(&mut self, start: usize, shared: bool) -> Option<Expr> {
         let type_start = self.peek().span.start;
         let class_type = self.parse_type_ref()?;
-        let type_span = Span::new(type_start, self.previous().span.end);
+        let type_span = self.span(type_start, self.previous().span.end);
         if class_type.nullable || class_type.name == "[]" {
             self.error("`new` requires a non-nullable class type", type_span);
         }
         self.expect(TokenKind::LeftParen, "expected `(` after class name")?;
         let args = self.parse_argument_list_after_open()?;
-        let span = Span::new(start, self.previous().span.end);
+        let span = self.span(start, self.previous().span.end);
         Some(Expr::New {
             class_type,
             args,
@@ -3164,7 +3229,7 @@ impl Parser {
                 return Some(Expr::ArrayRepeat {
                     value: Box::new(first),
                     count: Box::new(count),
-                    span: Span::new(start, end),
+                    span: self.span(start, end),
                 });
             }
 
@@ -3205,7 +3270,7 @@ impl Parser {
             .end;
         Some(Expr::Array {
             elements,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })
     }
 
@@ -3329,7 +3394,7 @@ impl Parser {
             result_type,
             branches,
             finally,
-            span: Span::new(start, end),
+            span: self.span(start, end),
         })))
     }
 
@@ -3476,13 +3541,13 @@ impl Parser {
                         ownership_mode,
                         ownership_modifier_span,
                         ty: TypeRef::unknown(),
-                        type_span: Span::new(self.peek().span.start, self.peek().span.start),
-                        span: Span::new(start, self.peek().span.start),
+                        type_span: self.span(self.peek().span.start, self.peek().span.start),
+                        span: self.span(start, self.peek().span.start),
                     });
                 } else {
                     let type_start = self.peek().span.start;
                     let ty = self.parse_type_ref_inner()?;
-                    let type_span = Span::new(type_start, self.previous().span.end);
+                    let type_span = self.span(type_start, self.previous().span.end);
                     if ty
                         .function
                         .as_ref()
@@ -3493,7 +3558,7 @@ impl Parser {
                             ty.function.as_ref().unwrap().span,
                         );
                     }
-                    let span = Span::new(start, type_span.end);
+                    let span = self.span(start, type_span.end);
                     if let Some((_name, name_span)) = self.consume_variable() {
                         self.diagnostics.push(
                             Diagnostic::new(
@@ -3534,7 +3599,7 @@ impl Parser {
         let colon_span = self.previous().span;
         let return_start = self.peek().span.start;
         let return_type = self.parse_type_ref_inner()?;
-        let return_type_span = Span::new(return_start, self.previous().span.end);
+        let return_type_span = self.span(return_start, self.previous().span.end);
         if return_type
             .function
             .as_ref()
@@ -3550,7 +3615,7 @@ impl Parser {
             .as_ref()
             .map(|clause| clause.span.end)
             .unwrap_or(return_type_span.end);
-        let span = Span::new(keyword_span.start, end);
+        let span = self.span(keyword_span.start, end);
         Some(TypeRef::function(FunctionTypeRef {
             keyword_span,
             invocation_mode,
@@ -3591,7 +3656,7 @@ impl Parser {
         loop {
             let start = self.peek().span.start;
             let ty = self.parse_type_ref_inner()?;
-            let type_span = Span::new(start, self.previous().span.end);
+            let type_span = self.span(start, self.previous().span.end);
             entries.push(FunctionTypeEffectRef {
                 ty,
                 type_span,
@@ -3619,7 +3684,7 @@ impl Parser {
         Some(Some(FunctionTypeThrowsRef {
             keyword_span,
             entries,
-            span: Span::new(keyword_span.start, end),
+            span: self.span(keyword_span.start, end),
         }))
     }
 
@@ -3798,7 +3863,7 @@ impl Parser {
         if self.check(&TokenKind::ShiftRight) {
             let span = self.advance().span;
             let split = span.start + 1;
-            self.pending_type_argument_close = Some(Span::new(split, span.end));
+            self.pending_type_argument_close = Some(self.span(split, span.end));
             return Some(());
         }
 
@@ -4079,7 +4144,7 @@ impl Parser {
         if self.check(&TokenKind::Semicolon) {
             return Some(self.advance().span);
         }
-        let insertion = Span::new(self.peek().span.start, self.peek().span.start);
+        let insertion = self.span(self.peek().span.start, self.peek().span.start);
         self.diagnostics.push(
             Diagnostic::new("P0001", format!("expected `;` after {subject}"), insertion)
                 .with_title("Directive Semicolon Is Missing")

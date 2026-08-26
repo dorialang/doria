@@ -83,7 +83,7 @@ pub struct ClosureOwnershipInfo {
 pub(crate) struct OwnershipAnalysis {
     pub(crate) diagnostics: Vec<Diagnostic>,
     pub(crate) closures: HashMap<ClosureId, ClosureOwnershipInfo>,
-    pub(crate) return_borrows: HashMap<usize, ReturnBorrow>,
+    pub(crate) return_borrows: HashMap<Span, ReturnBorrow>,
 }
 
 #[derive(Debug, Clone)]
@@ -192,10 +192,7 @@ fn returned_closure_provenance(
         sources: &mut HashMap<BindingId, Vec<Expr>>,
     ) {
         for binding in &declaration.bindings {
-            if let Some(id) = binding_resolution
-                .declaration_by_span
-                .get(&(binding.span.start, binding.span.end))
-            {
+            if let Some(id) = binding_resolution.declaration_by_span.get(&binding.span) {
                 sources
                     .entry(*id)
                     .or_default()
@@ -215,7 +212,7 @@ fn returned_closure_provenance(
         let Expr::Variable { span, .. } = ungroup_expr(&assignment.target) else {
             return;
         };
-        if let Some(id) = binding_resolution.uses_by_span.get(&(span.start, span.end)) {
+        if let Some(id) = binding_resolution.uses_by_span.get(span) {
             sources
                 .entry(*id)
                 .or_default()
@@ -370,9 +367,7 @@ fn returned_closure_provenance(
                 ))
             }
             Expr::Variable { span, .. } => {
-                let id = *binding_resolution
-                    .uses_by_span
-                    .get(&(span.start, span.end))?;
+                let id = *binding_resolution.uses_by_span.get(span)?;
                 if !visiting.insert(id) {
                     return Some(ReturnedClosureProvenance::Invalid);
                 }
@@ -925,20 +920,18 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
 }
 
 pub(crate) struct OwnershipAnalysisContext<'a> {
-    pub(crate) inferred_move_returns: &'a HashSet<usize>,
-    pub(crate) return_borrows: &'a HashMap<usize, ReturnBorrow>,
-    pub(crate) resolved_types: &'a HashMap<(usize, usize), crate::types::ResolvedType>,
+    pub(crate) inferred_move_returns: &'a HashSet<Span>,
+    pub(crate) return_borrows: &'a HashMap<Span, ReturnBorrow>,
+    pub(crate) resolved_types: &'a HashMap<Span, crate::types::ResolvedType>,
     pub(crate) flow_facts: &'a FactsByUse,
     pub(crate) move_enum_names: &'a HashSet<String>,
-    pub(crate) given_preludes: &'a HashMap<(usize, usize), crate::semantics::GivenSemanticInfo>,
+    pub(crate) given_preludes: &'a HashMap<Span, crate::semantics::GivenSemanticInfo>,
     pub(crate) checked_effect_sites: &'a crate::checked_effects::EffectSiteMap,
     pub(crate) catch_error_types: &'a crate::checked_effects::CatchTypeMap,
     pub(crate) binding_resolution: &'a BindingResolution,
     pub(crate) closures: &'a HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
-    pub(crate) callable_value_calls:
-        &'a HashMap<(usize, usize), crate::semantics::CallableValueCallInfo>,
-    pub(crate) list_algorithm_calls:
-        &'a HashMap<(usize, usize), crate::semantics::ListAlgorithmCallInfo>,
+    pub(crate) callable_value_calls: &'a HashMap<Span, crate::semantics::CallableValueCallInfo>,
+    pub(crate) list_algorithm_calls: &'a HashMap<Span, crate::semantics::ListAlgorithmCallInfo>,
 }
 
 pub(crate) fn check_program_with_inferred_move_returns(
@@ -999,7 +992,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                     returned_closure_provenance(function, closures, binding_resolution)
                 {
                     function_signature.return_borrow = Some(borrow);
-                    resolved_return_borrows.insert(function.span.start, borrow);
+                    resolved_return_borrows.insert(function.span, borrow);
                 }
                 signatures.insert(function.name.clone(), function_signature);
             }
@@ -1055,7 +1048,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                 returned_closure_provenance(method, closures, binding_resolution)
                             {
                                 method_signature.return_borrow = Some(borrow);
-                                resolved_return_borrows.insert(method.span.start, borrow);
+                                resolved_return_borrows.insert(method.span, borrow);
                             }
                             methods.insert(
                                 (class.name.clone(), method.name.clone()),
@@ -1643,13 +1636,13 @@ fn signature(
     function: &ast::FunctionDecl,
     classes: &HashSet<String>,
     move_enum_names: &HashSet<String>,
-    inferred_move_returns: &HashSet<usize>,
-    return_borrows: &HashMap<usize, ReturnBorrow>,
+    inferred_move_returns: &HashSet<Span>,
+    return_borrows: &HashMap<Span, ReturnBorrow>,
     receiver_class: Option<&str>,
     enclosing_type_params: &[ast::TypeParamDecl],
 ) -> Signature {
     let return_borrow = return_borrows
-        .get(&function.span.start)
+        .get(&function.span)
         .copied()
         .or_else(|| {
             function_return_borrow_in_context(function, enclosing_type_params, &mut |_| None)
@@ -1709,7 +1702,7 @@ fn signature(
                 ))
                 && return_borrow.is_none()
         }) || (function.return_type.is_none()
-            && inferred_move_returns.contains(&function.span.start)),
+            && inferred_move_returns.contains(&function.span)),
         return_borrow,
         receiver: receiver_class.map(|_| {
             if function.writable_this {
@@ -1851,10 +1844,10 @@ struct Checker<'a> {
     enum_cases: HashMap<(String, String), Signature>,
     properties: HashMap<(String, String), PropertyInfo>,
     static_properties: HashMap<(String, String), bool>,
-    inferred_move_returns: HashSet<usize>,
-    return_borrows: HashMap<usize, ReturnBorrow>,
-    resolved_types: &'a HashMap<(usize, usize), crate::types::ResolvedType>,
-    given_preludes: &'a HashMap<(usize, usize), crate::semantics::GivenSemanticInfo>,
+    inferred_move_returns: HashSet<Span>,
+    return_borrows: HashMap<Span, ReturnBorrow>,
+    resolved_types: &'a HashMap<Span, crate::types::ResolvedType>,
+    given_preludes: &'a HashMap<Span, crate::semantics::GivenSemanticInfo>,
     checked_effect_sites: &'a crate::checked_effects::EffectSiteMap,
     catch_error_types: &'a crate::checked_effects::CatchTypeMap,
     exception_scopes: Vec<ExceptionScope>,
@@ -1870,8 +1863,8 @@ struct Checker<'a> {
     flow_facts: &'a FactsByUse,
     binding_resolution: &'a BindingResolution,
     closures: &'a HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
-    callable_value_calls: &'a HashMap<(usize, usize), crate::semantics::CallableValueCallInfo>,
-    list_algorithm_calls: &'a HashMap<(usize, usize), crate::semantics::ListAlgorithmCallInfo>,
+    callable_value_calls: &'a HashMap<Span, crate::semantics::CallableValueCallInfo>,
+    list_algorithm_calls: &'a HashMap<Span, crate::semantics::ListAlgorithmCallInfo>,
     next_binding_id: usize,
     diagnostics: Vec<Diagnostic>,
     closure_ownership: HashMap<ClosureId, ClosureOwnershipInfo>,
@@ -1890,7 +1883,7 @@ impl Checker<'_> {
     fn canonical_binding_id(&self, span: Span) -> Option<BindingId> {
         self.binding_resolution
             .declaration_by_span
-            .get(&(span.start, span.end))
+            .get(&span)
             .copied()
     }
 
@@ -2006,7 +1999,7 @@ impl Checker<'_> {
             })
             .then(|| {
                 self.return_borrows
-                    .get(&function.span.start)
+                    .get(&function.span)
                     .copied()
                     .or_else(|| {
                         function_return_borrow_in_context(
@@ -2083,7 +2076,7 @@ impl Checker<'_> {
             ) || type_ref_mentions_potential_move_parameter(ty, &self.current_type_params, &[]))
                 && self.current_return_borrow.is_none()
         }) || (function.return_type.is_none()
-            && self.inferred_move_returns.contains(&function.span.start));
+            && self.inferred_move_returns.contains(&function.span));
         self.check_block(&function.body, &mut scopes, return_move_type, false);
         self.current_return_borrow = previous_return_borrow;
         self.current_type_params = previous_type_params;
@@ -2993,7 +2986,7 @@ impl Checker<'_> {
                 for catch in &statement.catches {
                     let catch_type = self
                         .catch_error_types
-                        .get(&(catch.span.start, catch.span.end))
+                        .get(&catch.span)
                         .expect("checked catch type");
                     let mut caught_states = Vec::new();
                     let mut remaining = Vec::new();
@@ -3126,7 +3119,7 @@ impl Checker<'_> {
     ) -> Vec<&'a Expr> {
         let predicate_indices = self
             .given_preludes
-            .get(&(given.span.start, given.span.end))
+            .get(&given.span)
             .map(|info| {
                 info.predicate_statement_indices
                     .iter()
@@ -3335,7 +3328,7 @@ impl Checker<'_> {
             match increment {
                 ast::ForIncrement::Assignment(assignment) => {
                     let _ = self.check_statement(
-                        &Stmt::Assignment(assignment.clone()),
+                        &Stmt::Assignment((**assignment).clone()),
                         scopes,
                         return_move_type,
                     );
@@ -3742,7 +3735,7 @@ impl Checker<'_> {
                 .is_some_and(|borrow| borrow.writable),
             Expr::CallableCall { span, .. } => self
                 .callable_value_calls
-                .get(&(span.start, span.end))
+                .get(span)
                 .and_then(|call| non_null_function_type(&call.function_type))
                 .and_then(|function| function.return_borrow)
                 .is_some_and(|borrow| borrow.writable),
@@ -3797,7 +3790,7 @@ impl Checker<'_> {
                     })
             }
             Expr::CallableCall { args, span, .. } => {
-                let call = self.callable_value_calls.get(&(span.start, span.end))?;
+                let call = self.callable_value_calls.get(span)?;
                 let function = non_null_function_type(&call.function_type)?;
                 let borrow = function.return_borrow?;
                 let crate::types::FunctionBorrowSource::Parameter(index) = borrow.source;
@@ -4434,13 +4427,9 @@ impl Checker<'_> {
                 null_safe,
                 ..
             } => {
-                if self
-                    .callable_value_calls
-                    .get(&(span.start, span.end))
-                    .is_some_and(|call| {
-                        call.target_kind == crate::semantics::CallableValueTargetKind::Property
-                    })
-                {
+                if self.callable_value_calls.get(span).is_some_and(|call| {
+                    call.target_kind == crate::semantics::CallableValueTargetKind::Property
+                }) {
                     let property = Expr::PropertyAccess {
                         object: object.clone(),
                         property: method.clone(),
@@ -4778,11 +4767,7 @@ impl Checker<'_> {
         span: Span,
         scopes: &mut Scopes,
     ) -> bool {
-        let Some(call) = self
-            .callable_value_calls
-            .get(&(span.start, span.end))
-            .cloned()
-        else {
+        let Some(call) = self.callable_value_calls.get(&span).cloned() else {
             return false;
         };
         let function_type = non_null_function_type(&call.function_type).cloned();
@@ -4920,10 +4905,7 @@ impl Checker<'_> {
         borrowed: bool,
         scopes: &mut Scopes,
     ) {
-        let Some(ty) = self
-            .resolved_types
-            .get(&(binding.span.start, binding.span.end))
-        else {
+        let Some(ty) = self.resolved_types.get(&binding.span) else {
             return;
         };
         let canonical_id = self.canonical_binding_id(binding.span);
@@ -5276,7 +5258,7 @@ impl Checker<'_> {
 
     fn flow_fact(&self, expr: &Expr) -> Option<&Fact> {
         let expr = ungroup_expr(expr);
-        self.flow_facts.get(&(expr.span().start, expr.span().end))
+        self.flow_facts.get(&expr.span())
     }
 
     fn activate_borrow(&mut self, expr: &Expr, mode: UseMode, scopes: &Scopes) {
@@ -5953,7 +5935,7 @@ impl Checker<'_> {
                 .is_some_and(|signature| signature.return_borrow.is_some()),
             Expr::CallableCall { span, .. } => self
                 .callable_value_calls
-                .get(&(span.start, span.end))
+                .get(span)
                 .and_then(|call| non_null_function_type(&call.function_type))
                 .is_some_and(|function| function.return_borrow.is_some()),
             Expr::Binary {
@@ -6205,11 +6187,7 @@ impl Checker<'_> {
         span: Span,
         scopes: &mut Scopes,
     ) {
-        if let Some(plan) = self
-            .list_algorithm_calls
-            .get(&(span.start, span.end))
-            .cloned()
-        {
+        if let Some(plan) = self.list_algorithm_calls.get(&span).cloned() {
             let borrow_depth = self.active_borrows.len();
             self.use_expr(object, scopes, UseMode::Read);
             self.activate_place_input_borrows(object, scopes);
@@ -6306,8 +6284,7 @@ impl Checker<'_> {
     }
 
     fn resolved_type(&self, expr: &Expr) -> Option<&crate::types::ResolvedType> {
-        self.resolved_types
-            .get(&(expr.span().start, expr.span().end))
+        self.resolved_types.get(&expr.span())
     }
 
     fn call_arg_mode(&self, signature: &Signature, index: usize, arg: &Expr) -> UseMode {

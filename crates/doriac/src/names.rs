@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::ast::*;
 use crate::builtins::{is_reserved_intrinsic_name, Builtin};
@@ -6,8 +6,6 @@ use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::source::{QualifiedNameRef, Span};
 use crate::types::{SharedHandleKind, TypeArgumentRef, TypeRef};
 
-pub const EXTERNAL_SYMBOL_BOUNDARY_CODE: &str = "E0671";
-pub const INCLUDE_BOUNDARY_CODE: &str = "E0672";
 pub const NAMESPACE_NAMING_CODE: &str = "E0675";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -40,6 +38,7 @@ pub enum PackageIdentity {
     Standalone,
     Named(String),
     SyntheticTooling(String),
+    CompilerKnown,
 }
 
 impl PackageIdentity {
@@ -72,6 +71,7 @@ impl PackageIdentity {
         match self {
             Self::Standalone => "standalone",
             Self::Named(name) | Self::SyntheticTooling(name) => name,
+            Self::CompilerKnown => "compiler-known",
         }
     }
 }
@@ -137,7 +137,7 @@ pub enum GlobalSymbolKind {
     CompilerKnownIntrinsic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GlobalReferenceRole {
     Type,
     Value,
@@ -170,6 +170,7 @@ pub struct GlobalSymbolDeclaration {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GlobalSymbolReference {
     pub symbol_id: GlobalSymbolId,
+    pub source_identity: SourceIdentity,
     pub source_span: Span,
     pub role: GlobalReferenceRole,
     pub source_spelling: String,
@@ -178,6 +179,7 @@ pub struct GlobalSymbolReference {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportFact {
+    pub source_identity: SourceIdentity,
     pub alias: String,
     pub target: String,
     pub alias_span: Span,
@@ -186,6 +188,7 @@ pub struct ImportFact {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceFact {
+    pub source_identity: SourceIdentity,
     pub name: QualifiedNameRef,
     pub keyword_span: Span,
     pub semicolon_span: Span,
@@ -209,6 +212,10 @@ pub struct CompilerKnownSymbolFact {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GlobalSymbolFacts {
+    /// Every source-local namespace declaration in a graph. `namespace` and
+    /// `namespace_declaration` remain compatibility views for standalone
+    /// callers and the selected entry source.
+    pub namespaces: Vec<NamespaceFact>,
     pub namespace: Option<String>,
     pub namespace_declaration: Option<NamespaceFact>,
     pub declarations: Vec<GlobalSymbolDeclaration>,
@@ -220,6 +227,7 @@ pub struct GlobalSymbolFacts {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnresolvedGlobalReference {
+    pub source_identity: SourceIdentity,
     pub source_span: Span,
     pub role: GlobalReferenceRole,
     pub source_spelling: String,
@@ -404,6 +412,107 @@ pub fn resolve_program_for_ide(
     Resolver::new(program, context).resolve()
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct NameResolutionEnvironment {
+    pub declarations: BTreeMap<String, GlobalSymbolDeclaration>,
+    pub visible_packages: BTreeSet<String>,
+    pub direct_normal_dependencies: BTreeSet<String>,
+    pub direct_development_dependencies: BTreeSet<String>,
+    pub dependency_paths: BTreeMap<String, Vec<String>>,
+    pub complete: bool,
+    pub includes_resolved: bool,
+}
+
+pub fn resolve_program_in_graph_for_ide(
+    program: &Program,
+    context: &CompilationContext,
+    environment: &NameResolutionEnvironment,
+) -> ResolutionAnalysis {
+    Resolver::new_in_graph(program, context, environment).resolve()
+}
+
+pub fn graph_declaration_headers(
+    program: &Program,
+    context: &CompilationContext,
+) -> Vec<GlobalSymbolDeclaration> {
+    let namespace = program
+        .namespace
+        .as_ref()
+        .map(|value| value.name.canonical());
+    let canonical = |name: &str| {
+        if name.contains('\\') || namespace.is_none() {
+            name.to_string()
+        } else {
+            format!("{}\\{name}", namespace.as_deref().unwrap())
+        }
+    };
+    program
+        .items
+        .iter()
+        .filter_map(|item| {
+            let (name, name_span, declaration_span, kind, access) = match item {
+                Item::Class(value) => (
+                    value.name.as_str(),
+                    value.name_span,
+                    value.span,
+                    GlobalSymbolKind::Class,
+                    value.access,
+                ),
+                Item::Enum(value) => (
+                    value.name.as_str(),
+                    value.name_span,
+                    value.span,
+                    GlobalSymbolKind::Enum,
+                    value.access,
+                ),
+                Item::Interface(value) => (
+                    value.name.as_str(),
+                    value.name_span,
+                    value.span,
+                    GlobalSymbolKind::Interface,
+                    value.access,
+                ),
+                Item::Trait(value) => (
+                    value.name.as_str(),
+                    value.name_span,
+                    value.span,
+                    GlobalSymbolKind::Trait,
+                    value.access,
+                ),
+                Item::Function(value) => (
+                    value.name.as_str(),
+                    value.name_span,
+                    value.span,
+                    GlobalSymbolKind::Function,
+                    value.access,
+                ),
+                Item::Constant(value) => (
+                    value.name.as_str(),
+                    value.name_span,
+                    value.span,
+                    GlobalSymbolKind::Constant,
+                    value.access,
+                ),
+                Item::Statement(_) => return None,
+            };
+            let qualified_name = canonical(name);
+            Some(GlobalSymbolDeclaration {
+                id: GlobalSymbolId {
+                    owner: GlobalSymbolOwner::Package(context.package.clone()),
+                    qualified_name: qualified_name.clone(),
+                },
+                kind,
+                source_name: name.to_string(),
+                qualified_name,
+                name_span,
+                declaration_span,
+                source_identity: context.source.clone(),
+                access,
+            })
+        })
+        .collect()
+}
+
 struct DeclarationRecord {
     id: GlobalSymbolId,
     kind: GlobalSymbolKind,
@@ -423,6 +532,7 @@ struct Resolver<'a> {
     references: Vec<GlobalSymbolReference>,
     unresolved: Vec<UnresolvedGlobalReference>,
     external_causes: HashSet<String>,
+    environment: Option<&'a NameResolutionEnvironment>,
 }
 
 impl<'a> Resolver<'a> {
@@ -440,7 +550,18 @@ impl<'a> Resolver<'a> {
             references: Vec::new(),
             unresolved: Vec::new(),
             external_causes: HashSet::new(),
+            environment: None,
         }
+    }
+
+    fn new_in_graph(
+        authored: &'a Program,
+        context: &'a CompilationContext,
+        environment: &'a NameResolutionEnvironment,
+    ) -> Self {
+        let mut resolver = Self::new(authored, context);
+        resolver.environment = Some(environment);
+        resolver
     }
 
     fn resolve(mut self) -> ResolutionAnalysis {
@@ -448,23 +569,33 @@ impl<'a> Resolver<'a> {
         self.collect_declarations();
         self.collect_imports();
         for include in &self.authored.includes {
+            if self
+                .environment
+                .is_some_and(|environment| environment.includes_resolved)
+            {
+                continue;
+            }
             self.unresolved.push(UnresolvedGlobalReference {
+                source_identity: self.context.source.clone(),
                 source_span: include.literal_span,
                 role: GlobalReferenceRole::Include,
                 source_spelling: include.value.clone(),
                 import_alias: None,
             });
             self.diagnostics.push(
-                Diagnostic::unsupported_stage(
-                    INCLUDE_BOUNDARY_CODE,
-                    "include syntax is accepted; source resolution lands in Stage 31 Slice 2",
+                Diagnostic::new(
+                    "E0681",
+                    format!(
+                        "included source `{}` is not available in this partial compilation graph",
+                        include.value
+                    ),
                     include.span,
                 )
-                .with_title("Include Resolution Awaits Stage 31 Slice 2")
+                .with_kind(crate::diagnostics::DiagnosticKind::CompilerInput)
+                .with_title("Included Source Is Not In The Current Compilation Graph")
                 .with_explanation(
-                    "The compiler does not emit a runtime include. Slice 2 resolves this path relative to the including source, enforces package containment, and includes each canonical source once.",
-                )
-                .with_help("keep this include unchanged while the package compilation graph is implemented"),
+                    "Source-text compiler APIs do not own a filesystem inventory. Supply a build plan or an in-memory graph that contains the included source.",
+                ),
             );
         }
         let mut program = self.authored.clone();
@@ -481,7 +612,7 @@ impl<'a> Resolver<'a> {
                 name_span: declaration.name_span,
                 declaration_span: declaration.declaration_span,
                 source_identity: self.context.source.clone(),
-                access: declaration.access.clone(),
+                access: declaration.access,
             })
             .collect();
         let mut imports = self.imports.into_values().collect::<Vec<_>>();
@@ -490,9 +621,23 @@ impl<'a> Resolver<'a> {
             resolved: ResolvedProgram {
                 program,
                 facts: GlobalSymbolFacts {
+                    namespaces: self
+                        .authored
+                        .namespace
+                        .as_ref()
+                        .map(|namespace| NamespaceFact {
+                            source_identity: self.context.source.clone(),
+                            name: namespace.name.clone(),
+                            keyword_span: namespace.keyword_span,
+                            semicolon_span: namespace.semicolon_span,
+                            declaration_span: namespace.span,
+                        })
+                        .into_iter()
+                        .collect(),
                     namespace: self.namespace,
                     namespace_declaration: self.authored.namespace.as_ref().map(|namespace| {
                         NamespaceFact {
+                            source_identity: self.context.source.clone(),
                             name: namespace.name.clone(),
                             keyword_span: namespace.keyword_span,
                             semicolon_span: namespace.semicolon_span,
@@ -549,42 +694,42 @@ impl<'a> Resolver<'a> {
                     value.name_span,
                     value.span,
                     GlobalSymbolKind::Class,
-                    MemberAccess::External,
+                    value.access,
                 )),
                 Item::Enum(value) => Some((
                     value.name.as_str(),
                     value.name_span,
                     value.span,
                     GlobalSymbolKind::Enum,
-                    MemberAccess::External,
+                    value.access,
                 )),
                 Item::Interface(value) => Some((
                     value.name.as_str(),
                     value.name_span,
                     value.span,
                     GlobalSymbolKind::Interface,
-                    MemberAccess::External,
+                    value.access,
                 )),
                 Item::Trait(value) => Some((
                     value.name.as_str(),
                     value.name_span,
                     value.span,
                     GlobalSymbolKind::Trait,
-                    MemberAccess::External,
+                    value.access,
                 )),
                 Item::Function(value) => Some((
                     value.name.as_str(),
                     value.name_span,
                     value.span,
                     GlobalSymbolKind::Function,
-                    value.access.clone(),
+                    value.access,
                 )),
                 Item::Constant(value) => Some((
                     value.name.as_str(),
                     value.name_span,
                     value.span,
                     GlobalSymbolKind::Constant,
-                    value.access.clone(),
+                    value.access,
                 )),
                 Item::Statement(_) => None,
             };
@@ -722,12 +867,13 @@ impl<'a> Resolver<'a> {
                     continue;
                 }
                 imported_targets.insert(target.clone(), entry.target.span);
-                if !self.declarations.contains_key(&target)
+                if !self.has_symbol(&target)
                     && !crate::compiler_known_io::is_canonical_type(&target)
                 {
                     self.imports.insert(
                         alias.clone(),
                         ImportFact {
+                            source_identity: self.context.source.clone(),
                             alias,
                             target: target.clone(),
                             alias_span,
@@ -742,10 +888,14 @@ impl<'a> Resolver<'a> {
                     );
                     continue;
                 }
+                if !self.check_graph_visibility(&target, entry.target.span) {
+                    continue;
+                }
                 let symbol = self
                     .symbol_id(&target)
                     .expect("known import target has an identity");
                 self.references.push(GlobalSymbolReference {
+                    source_identity: self.context.source.clone(),
                     symbol_id: symbol,
                     source_span: entry.target.span,
                     role: GlobalReferenceRole::ImportTarget,
@@ -755,6 +905,7 @@ impl<'a> Resolver<'a> {
                 self.imports.insert(
                     alias.clone(),
                     ImportFact {
+                        source_identity: self.context.source.clone(),
                         alias,
                         target,
                         alias_span,
@@ -773,6 +924,7 @@ impl<'a> Resolver<'a> {
         import_alias: Option<String>,
     ) {
         self.unresolved.push(UnresolvedGlobalReference {
+            source_identity: self.context.source.clone(),
             source_span: span,
             role,
             source_spelling: name.to_string(),
@@ -781,24 +933,54 @@ impl<'a> Resolver<'a> {
         if !self.external_causes.insert(name.to_string()) {
             return;
         }
+        if let Some(environment) = self.environment {
+            let (kind, title, explanation) = if environment.complete {
+                (
+                    crate::diagnostics::DiagnosticKind::Language,
+                    "Qualified Symbol Is Unknown",
+                    "The complete compilation graph contains no declaration with this qualified name.",
+                )
+            } else {
+                (
+                    crate::diagnostics::DiagnosticKind::CompilerInput,
+                    "Symbol Is Not In The Current Compilation Graph",
+                    "The compiler input did not provide the source that owns this qualified declaration.",
+                )
+            };
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0681",
+                    format!("qualified symbol `{name}` is not available in this compilation graph"),
+                    span,
+                )
+                .with_kind(kind)
+                .with_title(title)
+                .with_explanation(explanation),
+            );
+            return;
+        }
         self.diagnostics.push(
-            Diagnostic::unsupported_stage(
-                EXTERNAL_SYMBOL_BOUNDARY_CODE,
-                format!(
-                    "qualified name `{name}` is valid Doria, but the current single-source compiler has no package compilation graph"
-                ),
+            Diagnostic::new(
+                "E0681",
+                format!("qualified symbol `{name}` is not available in this partial compilation graph"),
                 span,
             )
-            .with_title("External Symbol Resolution Awaits Stage 31 Slice 2")
+            .with_kind(crate::diagnostics::DiagnosticKind::CompilerInput)
+            .with_title("Symbol Is Not In The Current Compilation Graph")
             .with_explanation(
-                "Stage 31 Slice 2 indexes build-plan sources and direct dependencies. This source name does not require rewriting.",
-            )
-            .with_help("keep the qualified name unchanged until the package graph is supplied"),
+                "The compiler input did not provide the source that owns this qualified declaration.",
+            ),
         );
     }
 
     fn symbol_id(&self, canonical: &str) -> Option<GlobalSymbolId> {
         if let Some(declaration) = self.declarations.get(canonical) {
+            return Some(declaration.id.clone());
+        }
+        if let Some(declaration) = self
+            .environment
+            .and_then(|environment| environment.declarations.get(canonical))
+        {
             return Some(declaration.id.clone());
         }
         if crate::compiler_known_io::is_canonical_type(canonical) {
@@ -852,7 +1034,7 @@ impl<'a> Resolver<'a> {
                 || source_name.to_string(),
                 |namespace| format!("{namespace}\\{source_name}"),
             );
-            if self.declarations.contains_key(&current_namespace) {
+            if self.has_symbol(&current_namespace) {
                 (current_namespace, None)
             } else if edition_prelude(self.context.edition)
                 .iter()
@@ -870,7 +1052,11 @@ impl<'a> Resolver<'a> {
             }
             return None;
         };
+        if !self.check_graph_visibility(&canonical, span) {
+            return None;
+        }
         self.references.push(GlobalSymbolReference {
+            source_identity: self.context.source.clone(),
             symbol_id,
             source_span: span,
             role,
@@ -878,6 +1064,87 @@ impl<'a> Resolver<'a> {
             import_alias: alias,
         });
         Some(canonical)
+    }
+
+    fn has_symbol(&self, canonical: &str) -> bool {
+        self.declarations.contains_key(canonical)
+            || self
+                .environment
+                .is_some_and(|environment| environment.declarations.contains_key(canonical))
+    }
+
+    fn check_graph_visibility(&mut self, canonical: &str, span: Span) -> bool {
+        let Some(environment) = self.environment else {
+            return true;
+        };
+        let Some(declaration) = environment.declarations.get(canonical) else {
+            return true;
+        };
+        let GlobalSymbolOwner::Package(owner) = &declaration.id.owner else {
+            return true;
+        };
+        if owner == &self.context.package {
+            return true;
+        }
+        let owner_name = owner.display_name();
+        if !environment.visible_packages.contains(owner_name) {
+            let mut diagnostic = if environment
+                .direct_development_dependencies
+                .contains(owner_name)
+            {
+                Diagnostic::new(
+                    "E0682",
+                    format!(
+                        "symbol `{canonical}` belongs to development dependency `{owner_name}`, which is not visible from this source scope"
+                    ),
+                    span,
+                )
+                .with_title("Development Dependency Is Not Visible")
+                .with_explanation(
+                    "Main and generated-main sources may use only normal dependencies. Development dependencies are visible only to development surfaces.",
+                )
+            } else {
+                Diagnostic::new(
+                    "E0682",
+                    format!(
+                        "symbol `{canonical}` belongs to package `{owner_name}`, which is not a direct dependency of `{}`",
+                        self.context.package.display_name()
+                    ),
+                    span,
+                )
+                .with_title("Dependency Symbol Is Not Directly Visible")
+                .with_explanation(
+                    "Doria package visibility includes the declaring package and its direct active dependencies, not transitive dependencies.",
+                )
+                .with_help(
+                    "declare the owning package as a direct dependency in the project package configuration",
+                )
+            };
+            if let Some(path) = environment.dependency_paths.get(owner_name) {
+                diagnostic = diagnostic.with_note(format!(
+                    "the package is present through dependency path `{}`",
+                    path.join(" -> ")
+                ));
+            }
+            self.diagnostics.push(diagnostic);
+            return false;
+        }
+        if declaration.access == MemberAccess::Internal {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0682",
+                    format!(
+                        "package-internal declaration `{canonical}` from `{owner_name}` is inaccessible to `{}`",
+                        self.context.package.display_name()
+                    ),
+                    span,
+                )
+                .with_title("Package-Internal Declaration Is Inaccessible")
+                .with_related(declaration.name_span, "the internal declaration is here"),
+            );
+            return false;
+        }
+        true
     }
 
     fn occurrence_span(&self, source_name: &str, within: Span) -> Span {

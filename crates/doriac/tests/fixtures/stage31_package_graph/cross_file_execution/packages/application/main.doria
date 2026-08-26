@@ -1,0 +1,7 @@
+include "local.doria";
+
+function main(): void
+{
+    let $support = new Support();
+    echo localMessage() . " " . $support->message() . "\n";
+}

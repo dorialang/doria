@@ -1,4 +1,4 @@
-# 0002 Default-accessible internal members
+# 0002 Default-accessible and package-internal declarations
 
 Status: Accepted
 
@@ -6,7 +6,10 @@ Status: Accepted
 
 Class members are externally accessible by default. Doria does not use `public`, `protected`, or `private` member visibility modifiers.
 
-`internal` marks implementation details and controls API surface. `writable` controls mutation.
+`internal` marks implementation details and controls API surface. It is
+accessible throughout the declaring package and inaccessible to other
+packages. This applies to top-level declarations, constructors, methods,
+properties, and class constants. `writable` controls mutation.
 
 ## Notes
 

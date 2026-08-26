@@ -15,7 +15,7 @@ use crate::source::Span;
 #[derive(Debug, Default)]
 pub(crate) struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
-    pub property_writes: HashMap<(usize, usize), PropertyWriteKind>,
+    pub property_writes: HashMap<Span, PropertyWriteKind>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,8 +244,10 @@ fn transfer_action(properties: &[Property], action: &NodeAction, state: &mut Sta
         NodeAction::Statement(Stmt::Assignment(assignment)) => {
             transfer_assignment(properties, state, &assignment.target, &assignment.op)
         }
-        NodeAction::ForInitializer(ForInitializer::Assignment(assignment))
-        | NodeAction::ForIncrement(ForIncrement::Assignment(assignment)) => {
+        NodeAction::ForInitializer(ForInitializer::Assignment(assignment)) => {
+            transfer_assignment(properties, state, &assignment.target, &assignment.op)
+        }
+        NodeAction::ForIncrement(ForIncrement::Assignment(assignment)) => {
             transfer_assignment(properties, state, &assignment.target, &assignment.op)
         }
         _ => {}
@@ -445,7 +447,7 @@ fn apply_assignment(
     if !matches!(site.operation, AssignOp::Assign) {
         analysis
             .property_writes
-            .insert((site.span.start, site.span.end), PropertyWriteKind::Replace);
+            .insert(site.span, PropertyWriteKind::Replace);
         observe_property(
             class,
             properties,
@@ -461,9 +463,7 @@ fn apply_assignment(
         InitState::Initialized => PropertyWriteKind::Replace,
         InitState::MaybeInitialized => PropertyWriteKind::InitializeOrReplace,
     };
-    analysis
-        .property_writes
-        .insert((site.span.start, site.span.end), write_kind);
+    analysis.property_writes.insert(site.span, write_kind);
     if property.writable {
         state.properties[index] = InitState::Initialized;
         return;

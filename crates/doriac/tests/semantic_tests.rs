@@ -1505,7 +1505,8 @@ function create(): Person
 }
 "#,
     ] {
-        assert_diagnostic_code(source, "E0307");
+        doriac::check_source("test.doria", source)
+            .expect("same-package internal constructor access should succeed");
     }
 }
 
@@ -2191,18 +2192,6 @@ echo "Hello, {$person->name}";
         ),
         (
             r#"
-class Secret
-{
-    internal string $value = "hidden";
-}
-
-let $secret = new Secret();
-echo "Secret: {$secret->value}";
-"#,
-            "E0306",
-        ),
-        (
-            r#"
 class Person {}
 
 let $person = new Person();
@@ -2372,7 +2361,7 @@ fn reports_external_qualified_type_names_as_slice_two_boundaries() {
 
     assert!(diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == "E0671"));
+        .any(|diagnostic| diagnostic.code == "E0681"));
     assert!(diagnostics
         .iter()
         .all(|diagnostic| !diagnostic.code.starts_with('P')));
@@ -2391,7 +2380,7 @@ echo "{Vendor\Lib\LABEL}";
 
     let qualified_name_diagnostics = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.code == "E0671")
+        .filter(|diagnostic| diagnostic.code == "E0681")
         .count();
     assert_eq!(qualified_name_diagnostics, 2, "{diagnostics:#?}");
     assert!(diagnostics
@@ -3592,161 +3581,49 @@ class Parser
 }
 
 #[test]
-fn rejects_external_access_to_internal_property() {
-    let err = doriac::check_source(
+fn allows_same_package_access_to_internal_members() {
+    doriac::check_source(
         "test.doria",
         r#"
 class Person
 {
-    internal string $secret;
-}
+    internal string $secret = "Hello";
 
-let $person = new Person();
-echo $person->secret;
-"#,
-    )
-    .expect_err("semantic check should fail");
+    internal function __construct()
+    {
+    }
 
-    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0306"));
-}
-
-#[test]
-fn rejects_external_call_to_internal_method() {
-    let err = doriac::check_source(
-        "test.doria",
-        r#"
-class Person
-{
     internal function message(): string
     {
-        return "Hello";
+        return $this->secret;
     }
-}
 
-let $person = new Person();
-echo $person->message();
-"#,
-    )
-    .expect_err("semantic check should fail");
-
-    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
-}
-
-#[test]
-fn rejects_external_static_call_to_internal_method() {
-    let err = doriac::check_source(
-        "test.doria",
-        r#"
-class Person
-{
-    internal static function message(): string
+    internal static function staticMessage(): string
     {
         return "Hello";
     }
 }
 
-echo Person::message();
-"#,
-    )
-    .expect_err("semantic check should fail");
-
-    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
-}
-
-#[test]
-fn rejects_free_function_access_to_internal_property() {
-    let err = doriac::check_source(
-        "test.doria",
-        r#"
-class Person
+function reveal(Person $person): string
 {
-    internal string $secret;
-}
-
-function reveal(Person $person): void
-{
-    echo $person->secret;
-}
-"#,
-    )
-    .expect_err("semantic check should fail");
-
-    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0306"));
-}
-
-#[test]
-fn rejects_free_function_call_to_internal_method() {
-    let err = doriac::check_source(
-        "test.doria",
-        r#"
-class Person
-{
-    internal function message(): string
-    {
-        return "Hello";
-    }
-}
-
-function reveal(Person $person): void
-{
-    echo $person->message();
-}
-"#,
-    )
-    .expect_err("semantic check should fail");
-
-    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
-}
-
-#[test]
-fn rejects_other_class_access_to_internal_property() {
-    let err = doriac::check_source(
-        "test.doria",
-        r#"
-class Person
-{
-    internal string $secret;
+    return $person->secret . $person->message() . Person::staticMessage();
 }
 
 class Inspector
 {
-    function reveal(Person $person): void
+    function reveal(Person $person): string
     {
-        echo $person->secret;
+        return $person->secret . $person->message() . Person::staticMessage();
     }
 }
+
+let $person = new Person();
+let $inspector = new Inspector();
+string $direct = reveal($person);
+string $throughClass = $inspector->reveal($person);
 "#,
     )
-    .expect_err("semantic check should fail");
-
-    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0306"));
-}
-
-#[test]
-fn rejects_other_class_call_to_internal_method() {
-    let err = doriac::check_source(
-        "test.doria",
-        r#"
-class Person
-{
-    internal function message(): string
-    {
-        return "Hello";
-    }
-}
-
-class Inspector
-{
-    function reveal(Person $person): void
-    {
-        echo $person->message();
-    }
-}
-"#,
-    )
-    .expect_err("semantic check should fail");
-
-    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0307"));
+    .expect("same-package internal member access should succeed");
 }
 
 #[test]

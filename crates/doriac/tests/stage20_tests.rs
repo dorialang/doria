@@ -416,7 +416,7 @@ function main(): void throws Doria\Std\Io\IoError
 }
 
 #[test]
-fn internal_access_is_limited_to_the_declaring_class_for_every_member_kind() {
+fn internal_access_is_package_wide_for_every_member_kind() {
     doriac::check_source(
         "same-class.doria",
         r#"
@@ -438,33 +438,16 @@ class Vault
     )
     .expect("a class may access its own internal members");
 
-    for (source, code) in [
-        (
-            "class Vault { internal int $secret = 1; } function main(): void { let $vault = new Vault(); echo $vault->secret; }",
-            "E0306",
-        ),
-        (
-            "class Vault { internal function reveal(): int { return 1; } } function expose(Vault $vault): int { return $vault->reveal(); }",
-            "E0307",
-        ),
-        (
-            "class Vault { internal static function reveal(): int { return 1; } } function main(): void { echo Vault::reveal(); }",
-            "E0307",
-        ),
-        (
-            "class Vault { internal const CODE = 1; } class Other { function expose(): int { return Vault::CODE; } }",
-            "E0307",
-        ),
-        (
-            "class Vault { internal static int $value = 1; } function main(): void { echo Vault::value; }",
-            "E0307",
-        ),
-        (
-            "class Vault { internal function __construct() {} } function main(): void { let $vault = new Vault(); }",
-            "E0307",
-        ),
+    for source in [
+        "class Vault { internal int $secret = 1; } function main(): int { let $vault = new Vault(); return $vault->secret; }",
+        "class Vault { internal function reveal(): int { return 1; } } function expose(Vault $vault): int { return $vault->reveal(); }",
+        "class Vault { internal static function reveal(): int { return 1; } } function main(): int { return Vault::reveal(); }",
+        "class Vault { internal const CODE = 1; } class Other { function expose(): int { return Vault::CODE; } }",
+        "class Vault { internal static int $value = 1; } function main(): int { return Vault::value; }",
+        "class Vault { internal function __construct() {} } function main(): void { let $vault = new Vault(); }",
     ] {
-        assert_diagnostic(source, code);
+        doriac::check_source("same-package.doria", source)
+            .expect("the declaring package may access every internal member kind");
     }
 }
 
@@ -927,7 +910,7 @@ function main(): void {}
 }
 
 #[test]
-fn self_access_preserves_internal_and_writable_rules() {
+fn self_access_preserves_package_internal_and_writable_rules() {
     doriac::check_source(
         "self-internal.doria",
         r#"
@@ -951,10 +934,11 @@ function main(): void throws Doria\Std\Io\IoError { echo Vault::reveal(); }
         "class Counter { static int $value = 1; static function change(): void { self::value = 2; } }",
         "E0202",
     );
-    assert_diagnostic(
-        "class Vault { internal static function secret(): int { return 1; } } function main(): void { echo Vault::secret(); }",
-        "E0307",
-    );
+    doriac::check_source(
+        "same-package.doria",
+        "class Vault { internal static function secret(): int { return 1; } } function main(): int { return Vault::secret(); }",
+    )
+    .expect("the declaring package may access an internal static method");
 }
 
 #[test]

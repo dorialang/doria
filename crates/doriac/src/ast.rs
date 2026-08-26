@@ -74,6 +74,8 @@ pub enum Item {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumDecl {
+    pub access: MemberAccess,
+    pub access_span: Option<Span>,
     pub name: String,
     pub name_span: Span,
     pub type_params: Vec<TypeParamDecl>,
@@ -100,6 +102,8 @@ pub struct EnumPayloadField {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraitDecl {
+    pub access: MemberAccess,
+    pub access_span: Option<Span>,
     pub name: String,
     pub name_span: Span,
     pub members: Vec<ClassMember>,
@@ -108,6 +112,8 @@ pub struct TraitDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct InterfaceDecl {
+    pub access: MemberAccess,
+    pub access_span: Option<Span>,
     pub name: String,
     pub name_span: Span,
     pub span: Span,
@@ -115,6 +121,8 @@ pub struct InterfaceDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassDecl {
+    pub access: MemberAccess,
+    pub access_span: Option<Span>,
     pub name: String,
     pub name_span: Span,
     pub type_params: Vec<TypeParamDecl>,
@@ -132,7 +140,7 @@ pub enum ClassMember {
     Constant(ConstDecl),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemberAccess {
     External,
     Internal,
@@ -152,6 +160,7 @@ pub struct PropertyDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConstDecl {
     pub access: MemberAccess,
+    pub access_span: Option<Span>,
     pub ty: Option<TypeRef>,
     pub name: String,
     pub name_span: Span,
@@ -162,6 +171,7 @@ pub struct ConstDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionDecl {
     pub access: MemberAccess,
+    pub access_span: Option<Span>,
     pub writable_this: bool,
     pub writable_span: Option<Span>,
     pub is_static: bool,
@@ -395,8 +405,8 @@ pub enum ForInitializer {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ForIncrement {
-    Increment(IncrementStmt),
-    Assignment(Assignment),
+    Increment(Box<IncrementStmt>),
+    Assignment(Box<Assignment>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

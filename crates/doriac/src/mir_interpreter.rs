@@ -14404,16 +14404,7 @@ impl Interpreter<'_> {
         };
         let diagnostic =
             Diagnostic::runtime_error(descriptor.type_name.clone(), message, span, outcome);
-        let rendered = crate::diagnostics::render_diagnostics(
-            &self.program.source,
-            std::slice::from_ref(&diagnostic),
-            RenderOptions {
-                format: DiagnosticFormat::Human,
-                color: ColorChoice::Never,
-                context_lines: 0,
-                ..RenderOptions::default()
-            },
-        );
+        let rendered = render_runtime_diagnostic(self.program, &diagnostic);
         let mut stderr = self.stderr.clone();
         stderr.extend_from_slice(rendered.as_bytes());
         stderr.push(b'\n');
@@ -14613,16 +14604,7 @@ impl Interpreter<'_> {
                 diagnostic.notes.push(message);
             }
         }
-        let rendered = crate::diagnostics::render_diagnostics(
-            &self.program.source,
-            std::slice::from_ref(&diagnostic),
-            RenderOptions {
-                format: DiagnosticFormat::Human,
-                color: ColorChoice::Never,
-                context_lines: 0,
-                ..RenderOptions::default()
-            },
-        );
+        let rendered = render_runtime_diagnostic(self.program, &diagnostic);
         let mut stderr = Vec::new();
         stderr.extend_from_slice(&self.stderr);
         stderr.extend_from_slice(rendered.as_bytes());
@@ -14634,6 +14616,33 @@ impl Interpreter<'_> {
             runtime_diagnostic: Some(diagnostic),
         }
     }
+}
+
+fn render_runtime_diagnostic(program: &mir::Program, diagnostic: &Diagnostic) -> String {
+    let sources = crate::source_map::SourceMap::from_ordered_records(
+        program
+            .sources
+            .iter()
+            .map(|source| crate::source_map::SourceRecord {
+                identity: source.identity.clone(),
+                package: source.package.clone(),
+                display_path: source.display_path.clone(),
+                canonical_path: None,
+                content_fingerprint: String::new(),
+                source: source.source.clone(),
+            })
+            .collect(),
+    );
+    crate::diagnostics::render_diagnostics_with_source_map(
+        &sources,
+        std::slice::from_ref(diagnostic),
+        RenderOptions {
+            format: DiagnosticFormat::Human,
+            color: ColorChoice::Never,
+            context_lines: 0,
+            ..RenderOptions::default()
+        },
+    )
 }
 
 fn string_panic_event(

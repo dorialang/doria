@@ -170,6 +170,10 @@ impl<'source> Lexer<'source> {
         }
     }
 
+    fn span(&self, start: usize, end: usize) -> Span {
+        Span::in_source(self.source.id, start, end)
+    }
+
     pub fn lex(mut self) -> DiagnosticResult<Vec<Token>> {
         let mut tokens = Vec::new();
 
@@ -405,7 +409,7 @@ impl<'source> Lexer<'source> {
 
         tokens.push(Token {
             kind: TokenKind::Eof,
-            span: Span::new(self.index, self.index),
+            span: self.span(self.index, self.index),
         });
 
         if self.diagnostics.is_empty() {
@@ -430,7 +434,7 @@ impl<'source> Lexer<'source> {
 
         Token {
             kind: TokenKind::Variable(name.to_string()),
-            span: Span::new(start, self.index),
+            span: self.span(start, self.index),
         }
     }
 
@@ -520,7 +524,7 @@ impl<'source> Lexer<'source> {
 
         Token {
             kind,
-            span: Span::new(start, self.index),
+            span: self.span(start, self.index),
         }
     }
 
@@ -545,7 +549,7 @@ impl<'source> Lexer<'source> {
             } else {
                 TokenKind::IntLiteral(value)
             },
-            span: Span::new(start, self.index),
+            span: self.span(start, self.index),
         }
     }
 
@@ -568,7 +572,7 @@ impl<'source> Lexer<'source> {
                         raw: self.source.text[content_start..self.index - 1].to_string(),
                         quote: quote_kind,
                     },
-                    span: Span::new(start, self.index),
+                    span: self.span(start, self.index),
                 };
             }
 
@@ -618,7 +622,7 @@ impl<'source> Lexer<'source> {
                 raw: self.source.text[content_start..self.index].to_string(),
                 quote: quote_kind,
             },
-            span: Span::new(start, self.index),
+            span: self.span(start, self.index),
         }
     }
 
@@ -663,18 +667,18 @@ impl<'source> Lexer<'source> {
     fn token(&self, kind: TokenKind, start: usize) -> Token {
         Token {
             kind,
-            span: Span::new(start, self.index),
+            span: self.span(start, self.index),
         }
     }
 
     fn error(&mut self, message: impl Into<String>, start: usize, end: usize) {
         self.diagnostics
-            .push(Diagnostic::new("L0001", message, Span::new(start, end)));
+            .push(Diagnostic::new("L0001", message, self.span(start, end)));
     }
 
     fn unexpected_character(&mut self, message: impl Into<String>, start: usize, end: usize) {
         self.diagnostics.push(
-            Diagnostic::new("L0001", message, Span::new(start, end))
+            Diagnostic::new("L0001", message, self.span(start, end))
                 .with_title("Unexpected Character")
                 .with_primary_label("This Character Is Not Valid Doria Syntax")
                 .with_explanation("This character does not begin any token in Doria source code.")
@@ -690,7 +694,7 @@ impl<'source> Lexer<'source> {
         end: usize,
     ) {
         self.diagnostics
-            .push(Diagnostic::new("L0002", message, Span::new(start, end)).with_help(help));
+            .push(Diagnostic::new("L0002", message, self.span(start, end)).with_help(help));
     }
 
     fn advance(&mut self) -> u8 {
