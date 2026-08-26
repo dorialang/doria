@@ -94,6 +94,12 @@ pub struct CompilationGraph {
 }
 
 #[derive(Debug, Clone)]
+pub struct GraphLoadFailure {
+    pub diagnostics: Vec<Diagnostic>,
+    pub source_map: Box<SourceMap>,
+}
+
+#[derive(Debug, Clone)]
 pub struct GraphSemanticAnalysis {
     pub authored_sources: BTreeMap<String, Program>,
     pub resolved_program: Program,
@@ -126,6 +132,13 @@ pub fn load_compilation_graph(
     document: &BuildPlanDocument,
     provider: &impl SourceProvider,
 ) -> DiagnosticResult<CompilationGraph> {
+    load_compilation_graph_detailed(document, provider).map_err(|failure| failure.diagnostics)
+}
+
+pub fn load_compilation_graph_detailed(
+    document: &BuildPlanDocument,
+    provider: &impl SourceProvider,
+) -> Result<CompilationGraph, GraphLoadFailure> {
     load_compilation_graph_inner(document, provider, GraphLoadOptions::default(), None)
 }
 
@@ -143,6 +156,7 @@ pub fn load_compilation_graph_with_completeness(
         },
         None,
     )
+    .map_err(|failure| failure.diagnostics)
 }
 
 pub fn load_compilation_graph_with_options(
@@ -151,6 +165,7 @@ pub fn load_compilation_graph_with_options(
     options: GraphLoadOptions,
 ) -> DiagnosticResult<CompilationGraph> {
     load_compilation_graph_inner(document, provider, options, None)
+        .map_err(|failure| failure.diagnostics)
 }
 
 pub(crate) fn load_compilation_graph_with_session(
@@ -160,6 +175,7 @@ pub(crate) fn load_compilation_graph_with_session(
     session: &mut crate::incremental::CompilationSession,
 ) -> DiagnosticResult<CompilationGraph> {
     load_compilation_graph_inner(document, provider, options, Some(session))
+        .map_err(|failure| failure.diagnostics)
 }
 
 fn load_compilation_graph_inner(
@@ -167,8 +183,13 @@ fn load_compilation_graph_inner(
     provider: &impl SourceProvider,
     options: GraphLoadOptions,
     mut session: Option<&mut crate::incremental::CompilationSession>,
-) -> DiagnosticResult<CompilationGraph> {
-    crate::build_plan::validate_build_plan(&document.plan)?;
+) -> Result<CompilationGraph, GraphLoadFailure> {
+    crate::build_plan::validate_build_plan(&document.plan).map_err(|diagnostics| {
+        GraphLoadFailure {
+            diagnostics,
+            source_map: Box::default(),
+        }
+    })?;
     let active_scopes = document
         .plan
         .selected_target
@@ -225,7 +246,10 @@ fn load_compilation_graph_inner(
     }
     validate_package_cycles(&document.plan.packages, &active_scopes, &mut diagnostics);
     if !diagnostics.is_empty() {
-        return Err(diagnostics);
+        return Err(GraphLoadFailure {
+            diagnostics,
+            source_map: Box::default(),
+        });
     }
 
     let package_specs = document
@@ -274,7 +298,10 @@ fn load_compilation_graph_inner(
         }
     }
     if !diagnostics.is_empty() {
-        return Err(diagnostics);
+        return Err(GraphLoadFailure {
+            diagnostics,
+            source_map: Box::new(pending_source_map(&pending)),
+        });
     }
 
     let mut include_edges = Vec::new();
@@ -319,17 +346,24 @@ fn load_compilation_graph_inner(
                 include_path: &include.value,
             }) {
                 Ok(provided) => {
-                    let included_identity = pending
+                    let existing_identity = pending
                         .values()
                         .find(|candidate| same_canonical_source(candidate, &provided))
-                        .map(|candidate| candidate.identity.clone())
-                        .unwrap_or_else(|| {
-                            SourceIdentity(format!(
-                                "{}:{}",
-                                source.package.display_name(),
-                                provided.package_relative_path
-                            ))
-                        });
+                        .map(|candidate| candidate.identity.clone());
+                    let included_identity = existing_identity.clone().unwrap_or_else(|| {
+                        SourceIdentity(format!(
+                            "{}:{}",
+                            source.package.display_name(),
+                            provided.package_relative_path
+                        ))
+                    });
+                    if existing_identity.is_none() && pending.contains_key(&included_identity.0) {
+                        diagnostics.push(plan_input(format!(
+                            "included source `{}` resolves to source identity `{}`, which is already assigned to a different canonical file",
+                            provided.display_path, included_identity.0
+                        )));
+                        continue;
+                    }
                     include_edges.push(IncludeEdge {
                         including: source.identity.clone(),
                         included: included_identity.clone(),
@@ -365,7 +399,10 @@ fn load_compilation_graph_inner(
         }
     }
     if !diagnostics.is_empty() {
-        return Err(diagnostics);
+        return Err(GraphLoadFailure {
+            diagnostics,
+            source_map: Box::new(pending_source_map(&pending)),
+        });
     }
 
     include_edges.sort_by(|left, right| {
@@ -379,16 +416,15 @@ fn load_compilation_graph_inner(
         left.including == right.including && left.included == right.included
     });
 
+    let source_map = pending_source_map(&pending);
     let mut sources = BTreeMap::new();
-    let mut records = Vec::new();
-    let source_ids = stable_source_ids(pending.keys());
     for (identity, pending_source) in pending {
-        let id = source_ids[&identity];
-        let source_file = SourceFile::with_id(
-            id,
-            pending_source.provided.display_path.clone(),
-            pending_source.provided.text.clone(),
-        );
+        let source_file = source_map
+            .get(&pending_source.identity)
+            .expect("pending source has a source-map record")
+            .source
+            .clone();
+        let id = source_file.id;
         let authored = if let Some(cached) = session.as_deref_mut().and_then(|session| {
             session.cached_for_source(&identity, &pending_source.provided.content_fingerprint, id)
         }) {
@@ -403,7 +439,13 @@ fn load_compilation_graph_inner(
             cached
         } else {
             let parsed = crate::parse_source_file(&source_file).map_err(|source_diagnostics| {
-                retarget_diagnostics(source_diagnostics, &pending_source.provided.display_path)
+                GraphLoadFailure {
+                    diagnostics: retarget_diagnostics(
+                        source_diagnostics,
+                        &pending_source.provided.display_path,
+                    ),
+                    source_map: Box::new(source_map.clone()),
+                }
             })?;
             if let Some(session) = session.as_deref_mut() {
                 session.record_parsed_source(
@@ -425,18 +467,6 @@ fn load_compilation_graph_inner(
             options.project_structure,
             &mut diagnostics,
         );
-        records.push(SourceRecord {
-            identity: pending_source.identity.clone(),
-            package: pending_source.package.clone(),
-            display_path: pending_source.provided.display_path.clone(),
-            canonical_path: pending_source
-                .provided
-                .canonical_path
-                .as_ref()
-                .map(|path| path.display().to_string()),
-            content_fingerprint: pending_source.provided.content_fingerprint.clone(),
-            source: source_file.clone(),
-        });
         sources.insert(
             identity,
             GraphSource {
@@ -457,7 +487,10 @@ fn load_compilation_graph_inner(
         );
     }
     if !diagnostics.is_empty() {
-        return Err(diagnostics);
+        return Err(GraphLoadFailure {
+            diagnostics,
+            source_map: Box::new(source_map),
+        });
     }
     for edge in &mut include_edges {
         if let Some(including) = sources.get(&edge.including.0) {
@@ -475,12 +508,40 @@ fn load_compilation_graph_inner(
         build_plan: document.plan.clone(),
         completeness: options.completeness,
         packages,
-        source_map: SourceMap::from_ordered_records(records),
+        source_map,
         sources,
         include_edges,
         selected_entry,
         fingerprint,
     })
+}
+
+fn pending_source_map(pending: &BTreeMap<String, PendingSource>) -> SourceMap {
+    let source_ids = stable_source_ids(pending.keys());
+    SourceMap::from_ordered_records(
+        pending
+            .iter()
+            .map(|(identity, pending_source)| {
+                let source = SourceFile::with_id(
+                    source_ids[identity],
+                    pending_source.provided.display_path.clone(),
+                    pending_source.provided.text.clone(),
+                );
+                SourceRecord {
+                    identity: pending_source.identity.clone(),
+                    package: pending_source.package.clone(),
+                    display_path: pending_source.provided.display_path.clone(),
+                    canonical_path: pending_source
+                        .provided
+                        .canonical_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    content_fingerprint: pending_source.provided.content_fingerprint.clone(),
+                    source,
+                }
+            })
+            .collect(),
+    )
 }
 
 fn stable_source_ids<'a>(

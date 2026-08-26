@@ -4,7 +4,7 @@ use doriac::build_plan::{
     SourceScope, TargetKind,
 };
 use doriac::compilation_graph::{
-    analyze_compilation_graph_for_ide, load_compilation_graph,
+    analyze_compilation_graph_for_ide, load_compilation_graph, load_compilation_graph_detailed,
     load_compilation_graph_with_completeness, GraphCompleteness, GraphLoadOptions,
     ProjectStructureAuthority,
 };
@@ -947,6 +947,94 @@ fn include_once_loads_a_recursive_source_once() {
         "{:#?}",
         analysis.diagnostics
     );
+}
+
+#[test]
+fn included_source_identity_cannot_alias_a_different_inventoried_file() {
+    let entry = "acme/application:main.doria";
+    let mut occupied = source("acme/application", "occupied.doria", SourceOrigin::Explicit);
+    occupied.identity = "acme/application:included.doria".to_string();
+    let document = plan(
+        vec![package(
+            "acme/application",
+            vec![
+                source("acme/application", "main.doria", SourceOrigin::Entry),
+                occupied,
+            ],
+            Vec::new(),
+        )],
+        entry,
+    );
+    let mut provider = InMemorySourceProvider::new();
+    provider.insert(
+        "acme/application",
+        "main.doria",
+        "include \"included.doria\"; function main(): int { return answer(); }",
+    );
+    provider.insert(
+        "acme/application",
+        "occupied.doria",
+        "function occupied(): int { return 1; }",
+    );
+    provider.insert(
+        "acme/application",
+        "included.doria",
+        "function answer(): int { return 42; }",
+    );
+
+    let failure = load_compilation_graph_detailed(&document, &provider)
+        .expect_err("one source identity must never name two canonical inputs");
+    assert!(failure.diagnostics.iter().any(|diagnostic| {
+        diagnostic
+            .message
+            .contains("acme/application:included.doria")
+            && diagnostic
+                .message
+                .contains("already assigned to a different canonical file")
+    }));
+    assert!(failure
+        .source_map
+        .by_path("acme/application:main.doria")
+        .is_some());
+}
+
+#[test]
+fn selected_entry_top_level_statements_lower_before_main() {
+    let entry = "acme/application:main.doria";
+    let document = plan(
+        vec![package(
+            "acme/application",
+            vec![source(
+                "acme/application",
+                "main.doria",
+                SourceOrigin::Entry,
+            )],
+            Vec::new(),
+        )],
+        entry,
+    );
+    let mut provider = InMemorySourceProvider::new();
+    provider.insert(
+        "acme/application",
+        "main.doria",
+        r#"class Counter
+{
+    static writable int $value = 0;
+}
+
+Counter::value = 42;
+
+function main(): int
+{
+    return Counter::value;
+}
+"#,
+    );
+
+    let graph = load_compilation_graph(&document, &provider).expect("valid entry prelude");
+    let mir = doriac::lower_compilation_graph_to_mir(&graph).expect("entry prelude MIR");
+    let output = doriac::mir_interpreter::interpret(&mir).expect("entry prelude execution");
+    assert_eq!(output.exit_status, 42);
 }
 
 #[test]

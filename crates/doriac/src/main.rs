@@ -9,11 +9,11 @@ use std::time::Instant;
 
 use doriac::backend::{BackendOutput, BackendTarget, CompileOptions, NativeProfile};
 use doriac::diagnostics::{
-    ColorChoice, Diagnostic, DiagnosticFormat, DiagnosticSource, RenderOptions, RuntimeFact,
-    RuntimeFactValue, RuntimeOutcomeDetails, RuntimeOutcomeFrame, RuntimeOutcomeOrigin,
-    TerminationBehavior,
+    ColorChoice, Diagnostic, DiagnosticFormat, DiagnosticSource, LabelRole, RenderOptions,
+    RuntimeFact, RuntimeFactValue, RuntimeOutcomeDetails, RuntimeOutcomeFrame,
+    RuntimeOutcomeOrigin, TerminationBehavior,
 };
-use doriac::source::Span;
+use doriac::source::{SourceFile, SourceId, Span};
 
 #[derive(Debug)]
 enum CliError {
@@ -353,6 +353,16 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
             || default_build_plan_output_path(&graph.build_plan, target),
             PathBuf::from,
         );
+        validate_compile_destinations(
+            std::iter::once(Path::new(plan_path)).chain(graph.sources.values().map(|source| {
+                source
+                    .canonical_path
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(&source.display_path))
+            })),
+            &out_path,
+            None,
+        )?;
         write_backend_output(&out_path, output)?;
         println!("{}", out_path.display());
         return Ok(());
@@ -365,7 +375,7 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
         None => default_output_path(input, target)?,
     };
     validate_compile_destinations(
-        Path::new(input),
+        std::iter::once(Path::new(input)),
         &out_path,
         performance_report.as_deref().map(Path::new),
     )?;
@@ -524,14 +534,54 @@ fn load_cli_graph(
             CliError::diagnostics(path.to_string(), plan_text.clone(), diagnostics, options)
         },
     )?;
-    let graph = doriac::compilation_graph::load_compilation_graph(
+    let graph = doriac::compilation_graph::load_compilation_graph_detailed(
         &document,
         &doriac::source_provider::FileSystemSourceProvider,
     )
-    .map_err(|diagnostics| {
-        CliError::diagnostics(path.to_string(), plan_text, diagnostics, options)
-    })?;
+    .map_err(|failure| graph_load_error(path, plan_text, failure, options))?;
     Ok((document, graph))
+}
+
+fn graph_load_error(
+    path: &str,
+    plan_text: String,
+    mut failure: doriac::compilation_graph::GraphLoadFailure,
+    options: RenderOptions,
+) -> CliError {
+    let plan_source_id = SourceId(u32::MAX);
+    for diagnostic in &mut failure.diagnostics {
+        let primary_is_plan = diagnostic.labels.iter().any(|label| {
+            label.role == LabelRole::Primary && label.source == DiagnosticSource::Current
+        });
+        for label in &mut diagnostic.labels {
+            if label.source == DiagnosticSource::Current {
+                label.source = DiagnosticSource::Path(path.to_string());
+                label.span.source = plan_source_id;
+            }
+        }
+        for fix in &mut diagnostic.fixes {
+            for edit in &mut fix.edits {
+                if edit.source == DiagnosticSource::Current {
+                    edit.source = DiagnosticSource::Path(path.to_string());
+                    edit.span.source = plan_source_id;
+                }
+            }
+        }
+        if primary_is_plan {
+            diagnostic.span.source = plan_source_id;
+        }
+    }
+    failure.source_map.insert(doriac::source_map::SourceRecord {
+        identity: doriac::names::SourceIdentity(format!("!build-plan:{path}")),
+        package: doriac::names::PackageIdentity::SyntheticTooling("build-plan".to_string()),
+        display_path: path.to_string(),
+        canonical_path: fs::canonicalize(path)
+            .ok()
+            .map(|path| path.display().to_string()),
+        content_fingerprint: String::new(),
+        source: SourceFile::with_id(plan_source_id, path, plan_text),
+    });
+    CliError::graph_diagnostics(*failure.source_map, failure.diagnostics, options)
 }
 
 fn backend_target_for_plan(
@@ -661,27 +711,32 @@ fn default_output_path(input: &str, target: BackendTarget) -> Result<PathBuf, St
     Ok(PathBuf::from(file_name))
 }
 
-fn validate_compile_destinations(
-    input_path: &Path,
+fn validate_compile_destinations<'a>(
+    input_paths: impl IntoIterator<Item = &'a Path>,
     output_path: &Path,
     performance_report_path: Option<&Path>,
 ) -> Result<(), String> {
-    if paths_alias(input_path, output_path)? {
-        return Err(format!(
-            "output path `{}` would overwrite input `{}`; pass --out <file> to choose a different output path",
-            output_path.display(),
-            input_path.display()
-        ));
+    let input_paths = input_paths.into_iter().collect::<Vec<_>>();
+    for input_path in &input_paths {
+        if paths_alias(input_path, output_path)? {
+            return Err(format!(
+                "output path `{}` would overwrite input `{}`; pass --out <file> to choose a different output path",
+                output_path.display(),
+                input_path.display()
+            ));
+        }
     }
     let Some(report_path) = performance_report_path else {
         return Ok(());
     };
-    if paths_alias(report_path, input_path)? {
-        return Err(format!(
-            "performance report path `{}` would overwrite input `{}`; choose a separate report path",
-            report_path.display(),
-            input_path.display()
-        ));
+    for input_path in input_paths {
+        if paths_alias(report_path, input_path)? {
+            return Err(format!(
+                "performance report path `{}` would overwrite input `{}`; choose a separate report path",
+                report_path.display(),
+                input_path.display()
+            ));
+        }
     }
     if paths_alias(report_path, output_path)? {
         return Err(format!(

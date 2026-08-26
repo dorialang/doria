@@ -1344,12 +1344,7 @@ fn lower_program_impl(
                     }
                 }
             }
-            hir::Item::Statement(statement) => {
-                return Err(vec![unsupported(
-                    stmt_span(statement),
-                    "top-level executable statements are not supported by native compilation",
-                )]);
-            }
+            hir::Item::Statement(_) => {}
             hir::Item::Enum(_) | hir::Item::Constant(_) => {}
         }
     }
@@ -1379,6 +1374,18 @@ fn lower_program_impl(
             "native programs require exactly one top-level `main` function",
         )]);
     }
+    let selected_entry_statements = selected_entry_source.map_or_else(Vec::new, |source| {
+        program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                hir::Item::Statement(statement) if stmt_span(statement).source == source => {
+                    Some(statement.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
 
     let instances =
         collect_callable_instances(program, &declarations, &class_ids, &program.semantic_info)?;
@@ -1390,8 +1397,11 @@ fn lower_program_impl(
         let declaration = declarations[instance.declaration];
         let function = declaration.function;
         let substitutions = type_substitutions(declaration, &instance.arguments)?;
+        let entry_body = main_indices
+            .contains(&instance.declaration)
+            .then(|| entry_process_body(function, &selected_entry_statements));
         intern_block_collection_types(
-            &function.body,
+            entry_body.as_ref().unwrap_or(&function.body),
             &class_ids,
             &mut collection_registry,
             &substitutions,
@@ -1492,8 +1502,14 @@ fn lower_program_impl(
             declaration.class,
             &program.semantic_info,
         );
+        let entry_body = main_indices
+            .contains(&instance.declaration)
+            .then(|| entry_process_body(declaration.function, &selected_entry_statements));
         instance_closure_plans.push(build_closure_plans(
-            collect_closure_expressions(Some(&declaration.function.body), std::iter::empty()),
+            collect_closure_expressions(
+                Some(entry_body.as_ref().unwrap_or(&declaration.function.body)),
+                std::iter::empty(),
+            ),
             &mut ClosurePlanBuildContext {
                 containing_name: &containing_name,
                 first_function_id: instances.len(),
@@ -1586,6 +1602,11 @@ fn lower_program_impl(
             inputs,
             declaration.class,
             declaration.receiver,
+            if main_indices.contains(&instance.declaration) {
+                selected_entry_statements.as_slice()
+            } else {
+                &[]
+            },
             metrics.as_deref_mut(),
         )?);
     }
@@ -2873,6 +2894,7 @@ fn lower_function(
     inputs: FunctionLoweringInputs<'_>,
     class: Option<ClassId>,
     receiver: Option<ClassId>,
+    entry_prelude: &[hir::Stmt],
     metrics: Option<&mut StructuralMetrics>,
 ) -> DiagnosticResult<mir::Function> {
     let mut context = LoweringContext::new(&inputs);
@@ -2912,6 +2934,11 @@ fn lower_function(
         });
     }
 
+    if !entry_prelude.is_empty() {
+        context.push_scope();
+        lower_statement_sequence(entry_prelude, signature.return_type, &mut context)?;
+        context.push_scope();
+    }
     lower_function_body(
         &function.body,
         &function.name,
@@ -2958,6 +2985,24 @@ fn lower_function(
         blocks,
         entry_block: mir::BlockId(0),
     })
+}
+
+fn entry_process_body(function: &hir::FunctionDecl, prelude: &[hir::Stmt]) -> hir::Block {
+    let mut statements = Vec::with_capacity(prelude.len() + function.body.statements.len());
+    statements.extend_from_slice(prelude);
+    statements.extend_from_slice(&function.body.statements);
+    hir::Block {
+        statements,
+        span: Span::in_source(
+            function.span.source,
+            prelude
+                .first()
+                .map_or(function.body.span.start, |statement| {
+                    stmt_span(statement).start
+                }),
+            function.body.span.end,
+        ),
+    }
 }
 
 fn lower_closure_function(
