@@ -3302,6 +3302,11 @@ fn php_backend_executes_checked_errors_with_doria_descriptor_dispatch() {
             include_str!("../../../examples/native/main_checked_error_constructor.doria"),
             "caught constructor\n",
         ),
+        (
+            "ambient-io-fallible-finalizers.doria",
+            include_str!("../../../examples/native/main_ambient_io_fallible_finalizers.doria"),
+            "normal body normal\nreturn\nwhen\nbreak\ncontinue\nerror\nouter finalizer\nlocal handled return 42\n",
+        ),
     ];
 
     let Ok(version) = Command::new("php").arg("--version").output() else {
@@ -3352,6 +3357,47 @@ fn php_backend_executes_checked_errors_with_doria_descriptor_dispatch() {
             String::from_utf8_lossy(&run.stderr)
         );
     }
+}
+
+#[test]
+fn php_backend_preserves_ambient_effects_through_callbacks_and_list_algorithms() {
+    let source = include_str!("../../../examples/native/main_ambient_io_callbacks.doria");
+    let php = doriac::compile_source_to_php("ambient-io-callbacks.doria", source)
+        .expect("ambient callbacks should compile for PHP compatibility output");
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+
+    let script = format!(
+        "{}\nmain();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated ambient callback PHP should execute");
+
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout,
+        include_bytes!("fixtures/native_io/main_ambient_io_callbacks/expected_stdout")
+    );
+    assert!(
+        run.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 #[test]

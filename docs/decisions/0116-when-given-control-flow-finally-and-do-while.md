@@ -208,9 +208,12 @@ locals leave scope before it. The finalizer's own locals are scoped to its block
 
 ## `finally` Transfer Restrictions
 
-A transfer inside `finally` is forbidden when it escapes the finalizer, replaces
-the pending outcome, or cancels it. Nested control flow wholly contained inside
-the finalizer remains legal.
+Source `return`, `when` yield, `break`, and `continue` inside `finally` remain
+forbidden when they escape the finalizer, replace the pending outcome, or cancel
+it. Decision 0123 amends the checked-error case: a checked Error may escape a
+finalizer and supersedes the pending structured exit after its owned payload is
+dropped exactly once. Nested control flow wholly contained inside the finalizer
+remains legal.
 
 ## `finally` Cleanup Order
 
@@ -244,10 +247,13 @@ routing through those regions.
 A checked-error exit identifies crossed regions exactly as return and loop
 exits do. Its pending payload belongs in a typed synthetic local acquired
 before ordinary cleanup; crossed regions run before propagation continues. A
-matching catch consumes that pending route and stops propagation. A finalizer
-cannot replace or cancel the pending error. Fatal panic remains a separate
-abort-only edge and bypasses every region. Checked errors are neither panic nor
-ordinary return values.
+matching catch consumes that pending route and stops propagation. Decision 0123
+supersedes this record's former prohibition on replacement: an Error escaping a
+finalizer replaces the pending normal completion, return, `when` result, loop
+transfer, or earlier Error. Same-try sibling catches do not catch that
+replacement; finalizer-local and outer catches may. Fatal panic remains a
+separate abort-only edge and bypasses every region. Checked errors are neither
+panic nor ordinary return values.
 
 ## MIR And Structured Exit Regions
 

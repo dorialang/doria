@@ -53,7 +53,7 @@ function check_inferred_main_effects(string $root): array
 
     $require($decisionPath, $decision, [
         '**Entrypoint inference amendment accepted:** 2026-08-18',
-        'Reusable callables declare checked effects; the selected program entrypoint',
+        'Reusable callables declare required checked effects; exact canonical ambient',
         'Source syntax and effective effects are separate facts',
         'MIR and every backend select this ABI from the effective semantic effect set',
         'status 70',
@@ -68,7 +68,7 @@ function check_inferred_main_effects(string $root): array
     ]);
     $require($readmePath, $readme, [
         "function main(): void\n{",
-        'the selected program entrypoint infers what escapes it',
+        'The selected program entrypoint infers what escapes it',
     ]);
     foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
         $require($path, $contents, [

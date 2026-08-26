@@ -41,12 +41,33 @@ final class __DoriaErrorDescriptor
 
 final class __DoriaCheckedError extends Exception
 {
+    private bool $__doriaLive = true;
+
     public function __construct(
-        public __DoriaErrorValue $error,
+        private __DoriaErrorValue $error,
         public __DoriaErrorDescriptor $descriptor,
         public int $origin,
     ) {
         parent::__construct("");
+    }
+
+    public function error(): __DoriaErrorValue
+    {
+        return $this->error;
+    }
+
+    public function takeError(): __DoriaErrorValue
+    {
+        $this->__doriaLive = false;
+        return $this->error;
+    }
+
+    public function __destruct()
+    {
+        if ($this->__doriaLive && function_exists("__doria_drop_value")) {
+            __doria_drop_value($this->error);
+        }
+        $this->__doriaLive = false;
     }
 }
 
@@ -100,10 +121,10 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
     $markerOffset = max(0, $sourceOffset - $lineStart);
     $message = "Error[R1000]: Unhandled " . $type . "\n\nWhere\n" .
         $sourcePath . " · line " . $line . " · " .
-        $caught->error->__doriaErrorCallable() . "\n\n" .
+        $caught->error()->__doriaErrorCallable() . "\n\n" .
         $lineText . "\n" . str_repeat(" ", $markerOffset) . "^\n" .
         "This Error Was First Thrown Here\n\nWhy\n  " .
-        __doria_safe_error_message($caught->error->message) .
+        __doria_safe_error_message($caught->error()->message) .
         "\n\nProcess Exited With Status 70\n";
     @fwrite(STDERR, $message);
     unset($caught);
@@ -3982,10 +4003,15 @@ fn emit_function(
             );
         }
         if param.promoted_access.is_some() && uses_cell {
+            let value = if param.take && resolved_type_ref_is_function(&param.ty) {
+                format!("__doria_take_cell(${})", param.name)
+            } else {
+                format!("${}->value", param.name)
+            };
             writeln(
                 output,
                 body_indent,
-                &format!("$this->{0} = ${0}->value;", param.name),
+                &format!("$this->{} = {value};", param.name),
             );
         }
         if resolved_type_ref_is_function(&param.ty) && param.take {
@@ -4409,7 +4435,7 @@ fn emit_try_statement(
             writeln(
                 output,
                 indent + 2,
-                &format!("${binding} = ${caught}->error;"),
+                &format!("${binding} = ${caught}->takeError();"),
             );
             for body_statement in &clause.body.statements {
                 emit_statement(body_statement, output, indent + 2, scopes);

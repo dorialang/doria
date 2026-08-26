@@ -202,6 +202,8 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
             parameter_modes: Vec::new(),
             return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(DEFAULT_INT))),
             return_borrow: None,
+            required_checked_effects: Vec::new(),
+            ambient_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: vec![Local {
                 id: LocalId(0),
@@ -895,6 +897,8 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
             parameter_modes: Vec::new(),
             return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(DEFAULT_INT))),
             return_borrow: None,
+            required_checked_effects: Vec::new(),
+            ambient_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: vec![Local {
                 id: LocalId(0),
@@ -1572,6 +1576,8 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
             parameter_modes: Vec::new(),
             return_type: ReturnType::Void,
             return_borrow: None,
+            required_checked_effects: Vec::new(),
+            ambient_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: Vec::new(),
             blocks: vec![BasicBlock {
@@ -3067,6 +3073,8 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
             parameter_modes: Vec::new(),
             return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(DEFAULT_INT))),
             return_borrow: None,
+            required_checked_effects: Vec::new(),
+            ambient_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: vec![Local {
                 id: LocalId(0),

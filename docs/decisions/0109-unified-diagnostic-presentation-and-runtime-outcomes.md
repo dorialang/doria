@@ -110,6 +110,12 @@ existing diagnostic and runtime-outcome model. R1000 is `runtimeError`, status
 70, and `propagateWithCleanup`; it carries no call path. The private V3 transport
 adds runtime Error outcomes while retaining V2 panic decoding during transition.
 
+Decision 0123 makes the two exact canonical I/O Error identities ambient only
+at the source catch-or-declare boundary. They remain concrete checked runtime
+outcomes under this decision: an unhandled ambient I/O Error is still R1000,
+status 70, after ordinary checked cleanup. Ambient does not mean panic,
+unchecked failure, erased identity, or best-effort reporting.
+
 ## Consequences
 
 - No public or compiler-facing panic report, checked-error report, runtime

@@ -410,6 +410,8 @@ fn rejects_mixed_width_float_binary_operands() {
         parameter_modes: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: Vec::new(),
         blocks: vec![BasicBlock {
@@ -475,6 +477,8 @@ fn void_program() -> Program {
             parameter_modes: Vec::new(),
             return_type: ReturnType::Void,
             return_borrow: None,
+            required_checked_effects: Vec::new(),
+            ambient_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: Vec::new(),
             blocks: vec![BasicBlock {

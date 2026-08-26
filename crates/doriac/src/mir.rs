@@ -365,6 +365,9 @@ pub struct Function {
     pub parameter_modes: Vec<FunctionParameterMode>,
     pub return_type: ReturnType,
     pub return_borrow: Option<ReturnBorrow>,
+    pub required_checked_effects: Vec<CheckedEffect>,
+    pub ambient_checked_effects: Vec<CheckedEffect>,
+    /// Complete runtime profile: required union ambient.
     pub checked_effects: Vec<CheckedEffect>,
     pub locals: Vec<Local>,
     pub blocks: Vec<BasicBlock>,
@@ -382,6 +385,8 @@ impl PartialEq for Function {
             && self.parameter_modes == other.parameter_modes
             && self.return_type == other.return_type
             && self.return_borrow == other.return_borrow
+            && self.required_checked_effects == other.required_checked_effects
+            && self.ambient_checked_effects == other.ambient_checked_effects
             && self.checked_effects == other.checked_effects
             && self.locals == other.locals
             && self.blocks == other.blocks
@@ -417,8 +422,27 @@ pub struct FunctionType {
     pub invocation_mode: FunctionInvocationMode,
     pub parameters: Vec<FunctionParameter>,
     pub return_type: ReturnType,
+    /// Structural source identity contains required effects only.
     pub checked_effects: Vec<CheckedEffect>,
+    /// Uniform runtime capability for the two canonical ambient I/O Errors.
+    pub ambient_checked_effects: Vec<CheckedEffect>,
     pub return_borrow: Option<ReturnBorrow>,
+}
+
+impl FunctionType {
+    pub fn has_checked_transport(&self) -> bool {
+        !self.checked_effects.is_empty() || !self.ambient_checked_effects.is_empty()
+    }
+
+    pub fn complete_checked_effects(&self) -> Vec<CheckedEffect> {
+        let mut complete = self.checked_effects.clone();
+        for effect in &self.ambient_checked_effects {
+            if !complete.contains(effect) {
+                complete.push(*effect);
+            }
+        }
+        complete
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4223,6 +4247,9 @@ pub struct ListAlgorithmPlan {
     pub callback: LocalId,
     pub callback_type: FunctionTypeId,
     pub callback_access: FunctionInvocationMode,
+    pub required_checked_effects: Vec<CheckedEffect>,
+    pub ambient_checked_effects: Vec<CheckedEffect>,
+    /// Complete runtime transport profile: required plus ambient effects.
     pub checked_effects: Vec<CheckedEffect>,
     pub output: Option<LocalId>,
     pub accumulator: Option<LocalId>,
@@ -4264,6 +4291,26 @@ pub struct FinalizerExitPlan {
     pub kind: StructuredExitKind,
     pub source: BlockId,
     pub continuation: BlockId,
+    /// Owned payload that must be destroyed if this pending exit is replaced
+    /// by a checked Error raised by the finalizer.
+    pub superseded_payload: Option<LocalId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FinalizerReplacementCasePlan {
+    pub pending_exit: usize,
+    pub entry: BlockId,
+    pub dropped_payload: Option<LocalId>,
+}
+
+/// One checked failure path originating in a source finalizer. The replacement
+/// Error is acquired before dispatching on the pending exit, then each case
+/// destroys that exit's owned payload and forwards the replacement outward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinalizerReplacementPlan {
+    pub source: BlockId,
+    pub replacement_error: LocalId,
+    pub cases: Vec<FinalizerReplacementCasePlan>,
 }
 
 /// Validation identity for one source `finally`. Execution uses the ordinary
@@ -4279,6 +4326,7 @@ pub struct FinalizerRegionPlan {
     pub discriminator: LocalId,
     pub body_blocks: Vec<BlockId>,
     pub exits: Vec<FinalizerExitPlan>,
+    pub replacements: Vec<FinalizerReplacementPlan>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5441,6 +5489,13 @@ impl fmt::Display for Function {
             }
         }
         writeln!(formatter, "): {} {{", self.return_type)?;
+        if !self.required_checked_effects.is_empty() || !self.ambient_checked_effects.is_empty() {
+            writeln!(
+                formatter,
+                "effects required {:?} ambient {:?} complete {:?}",
+                self.required_checked_effects, self.ambient_checked_effects, self.checked_effects
+            )?;
+        }
         if !self.locals.is_empty() {
             writeln!(formatter, "locals:")?;
             for local in &self.locals {
@@ -5479,6 +5534,9 @@ impl fmt::Display for FunctionType {
         write!(formatter, "): {}", self.return_type)?;
         if !self.checked_effects.is_empty() {
             write!(formatter, " throws {:?}", self.checked_effects)?;
+        }
+        if !self.ambient_checked_effects.is_empty() {
+            write!(formatter, " ambient {:?}", self.ambient_checked_effects)?;
         }
         if let Some(return_borrow) = self.return_borrow {
             write!(formatter, " borrow {:?}", return_borrow)?;
@@ -7177,7 +7235,7 @@ impl fmt::Display for ControlFlowPlan {
             ),
             Self::Finalizer(plan) => write!(
                 formatter,
-                "finalizer{} {:?} block{}..block{} exits [{}]",
+                "finalizer{} {:?} block{}..block{} exits [{}] replacements [{}]",
                 plan.id.0,
                 plan.attachment,
                 plan.entry.0,
@@ -7186,7 +7244,29 @@ impl fmt::Display for ControlFlowPlan {
                     .iter()
                     .map(|exit| format!("{:?}:block{}", exit.kind, exit.source.0))
                     .collect::<Vec<_>>()
-                    .join(", ")
+                    .join(", "),
+                plan.replacements
+                    .iter()
+                    .map(|replacement| format!(
+                        "block{} error local{} cases [{}]",
+                        replacement.source.0,
+                        replacement.replacement_error.0,
+                        replacement
+                            .cases
+                            .iter()
+                            .map(|case| format!(
+                                "{}:block{} drop {}",
+                                case.pending_exit,
+                                case.entry.0,
+                                case.dropped_payload
+                                    .map(|local| format!("local{}", local.0))
+                                    .unwrap_or_else(|| "none".to_string())
+                            ))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
             Self::ListAlgorithm(plan) => write!(
                 formatter,

@@ -183,6 +183,8 @@ pub struct FunctionDecl {
     /// Effective semantic checked effects used by callable compatibility,
     /// executable IR, ABI selection, and backend lowering.
     pub checked_effects: Vec<ResolvedType>,
+    pub required_checked_effects: Vec<ResolvedType>,
+    pub ambient_checked_effects: Vec<ResolvedType>,
     pub body: Block,
     pub span: Span,
 }
@@ -486,6 +488,8 @@ pub struct ListAlgorithmCall {
     pub callback_type: ResolvedType,
     pub callback_access: ListCallbackAccess,
     pub checked_effects: Vec<ResolvedType>,
+    pub required_checked_effects: Vec<ResolvedType>,
+    pub ambient_checked_effects: Vec<ResolvedType>,
     pub receiver_span: Span,
     pub callback_span: Span,
     pub span: Span,

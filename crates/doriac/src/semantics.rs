@@ -161,6 +161,7 @@ pub struct PropertyWriteSemanticInfo {
 pub struct FunctionTypeSemanticInfo {
     pub ty: ResolvedType,
     pub authored_checked_effects: Vec<ResolvedType>,
+    pub ambient_checked_effects: Vec<ResolvedType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -195,6 +196,8 @@ pub struct ClosureSemanticInfo {
     pub captures: Vec<CaptureSemanticInfo>,
     pub inferred_invocation_mode: FunctionInvocationMode,
     pub inferred_checked_effects: Vec<ResolvedType>,
+    pub required_checked_effects: Vec<ResolvedType>,
+    pub ambient_checked_effects: Vec<ResolvedType>,
     pub inferred_return_type: ResolvedType,
     pub execution_boundary_span: Span,
 }
@@ -211,6 +214,8 @@ pub struct CallableValueCallInfo {
     pub invocation_mode: FunctionInvocationMode,
     pub return_type: ResolvedType,
     pub checked_effects: Vec<ResolvedType>,
+    pub required_checked_effects: Vec<ResolvedType>,
+    pub ambient_checked_effects: Vec<ResolvedType>,
     pub target_kind: CallableValueTargetKind,
 }
 
@@ -237,6 +242,8 @@ pub struct ListAlgorithmCallInfo {
     pub callback_type: ResolvedType,
     pub callback_access: ListCallbackAccess,
     pub checked_effects: Vec<ResolvedType>,
+    pub required_checked_effects: Vec<ResolvedType>,
+    pub ambient_checked_effects: Vec<ResolvedType>,
     pub source_span: Span,
     pub receiver_span: Span,
     pub callback_span: Span,
@@ -574,6 +581,20 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
         Ok(evaluation) => (evaluation, Vec::new()),
         Err(diagnostics) => (crate::const_eval::Evaluation::default(), diagnostics),
     };
+    // Discover ambient I/O through the complete direct-call graph before the
+    // diagnostic pass. This preserves forward-call precision without making
+    // source order part of a callable's runtime Error transport.
+    let mut discovery = Checker::new(
+        program,
+        const_evaluation.clone(),
+        source_texts,
+        compilation_context.clone(),
+        compilation_contexts.clone(),
+        global_symbols.clone(),
+    );
+    discovery.check();
+    let ambient_effect_seed = discovery.inferred_ambient_effects();
+
     let mut checker = Checker::new(
         program,
         const_evaluation,
@@ -582,6 +603,7 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
         compilation_contexts,
         global_symbols,
     );
+    checker.ambient_effect_seed = ambient_effect_seed;
     checker.diagnostics.extend(const_diagnostics);
     checker.check();
     let constructor_analysis = crate::constructor_init::check_program(
@@ -1343,6 +1365,9 @@ struct Checker<'program> {
     finalizer_boundaries: Vec<FinalizerBoundary>,
     effect_scopes: Vec<CheckedEffectSet>,
     class_initializer_effects: HashMap<String, CheckedEffectSet>,
+    callable_observed_checked_effects: HashMap<Span, Vec<ResolvedType>>,
+    callable_dependencies: HashMap<Span, Vec<Span>>,
+    ambient_effect_seed: HashMap<Span, Vec<ResolvedType>>,
     callable_effective_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     checked_effect_sites: crate::checked_effects::EffectSiteMap,
     throw_error_types: HashMap<Span, ResolvedType>,
@@ -1418,6 +1443,14 @@ impl CheckedEffectSet {
     fn extend(&mut self, effects: impl IntoIterator<Item = TypeId>) {
         for effect in effects {
             self.insert(effect);
+        }
+    }
+}
+
+fn extend_type_ids(target: &mut Vec<TypeId>, effects: impl IntoIterator<Item = TypeId>) {
+    for effect in effects {
+        if !target.contains(&effect) {
+            target.push(effect);
         }
     }
 }
@@ -1965,6 +1998,9 @@ impl<'program> Checker<'program> {
             finalizer_boundaries: Vec::new(),
             effect_scopes: Vec::new(),
             class_initializer_effects: HashMap::new(),
+            callable_observed_checked_effects: HashMap::new(),
+            callable_dependencies: HashMap::new(),
+            ambient_effect_seed: HashMap::new(),
             callable_effective_checked_effects: HashMap::new(),
             checked_effect_sites: HashMap::new(),
             throw_error_types: HashMap::new(),
@@ -1991,6 +2027,7 @@ impl<'program> Checker<'program> {
         self.collect_enums();
         self.collect_classes();
         self.collect_functions();
+        self.apply_ambient_effect_seed();
         self.infer_return_borrow_signatures();
         self.infer_unannotated_move_return_signatures();
 
@@ -2036,6 +2073,82 @@ impl<'program> Checker<'program> {
         }
         self.report_unresolved_generic_calls();
         self.check_pending_integer_literal_ranges();
+    }
+
+    fn inferred_ambient_effects(&self) -> HashMap<Span, Vec<ResolvedType>> {
+        let mut ambient = HashMap::<Span, Vec<ResolvedType>>::new();
+        for (callable, effects) in self
+            .callable_effective_checked_effects
+            .iter()
+            .chain(self.callable_observed_checked_effects.iter())
+        {
+            let target = ambient.entry(*callable).or_default();
+            for effect in effects {
+                if crate::checked_effects::is_ambient_io_effect(effect) && !target.contains(effect)
+                {
+                    target.push(effect.clone());
+                }
+            }
+        }
+
+        loop {
+            let mut changed = false;
+            for (caller, callees) in &self.callable_dependencies {
+                let inherited = callees
+                    .iter()
+                    .flat_map(|callee| ambient.get(callee).into_iter().flatten())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let target = ambient.entry(*caller).or_default();
+                for effect in inherited {
+                    if !target.contains(&effect) {
+                        target.push(effect);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        ambient
+    }
+
+    fn apply_ambient_effect_seed(&mut self) {
+        if self.ambient_effect_seed.is_empty() {
+            return;
+        }
+        let seeds = self.ambient_effect_seed.clone();
+        for (declaration, effects) in seeds {
+            let ids = effects
+                .iter()
+                .map(|effect| self.types.intern_resolved(effect))
+                .collect::<Vec<_>>();
+            if let Some(signature) = self.function_signatures.get_mut(&declaration) {
+                extend_type_ids(&mut signature.checked_effects, ids.iter().copied());
+            }
+            for signature in self.functions.values_mut() {
+                if signature.declaration == declaration {
+                    extend_type_ids(&mut signature.checked_effects, ids.iter().copied());
+                }
+            }
+            for class in self.classes.values_mut() {
+                for method in class.methods.values_mut() {
+                    if method.declaration == declaration {
+                        extend_type_ids(&mut method.checked_effects, ids.iter().copied());
+                    }
+                }
+            }
+            let effective = self
+                .callable_effective_checked_effects
+                .entry(declaration)
+                .or_default();
+            for effect in effects {
+                if !effective.contains(&effect) {
+                    effective.push(effect);
+                }
+            }
+        }
     }
 
     fn predeclare_classes(&mut self) {
@@ -4848,6 +4961,14 @@ impl<'program> Checker<'program> {
         );
         self.check_missing_final_return(function, &return_context);
         let body_effects = self.effect_scopes.pop().expect("callable effect scope");
+        self.callable_observed_checked_effects.insert(
+            function.span,
+            body_effects
+                .ordered
+                .iter()
+                .map(|effect| self.types.resolved(*effect))
+                .collect(),
+        );
         if function.throws.is_none() && self.is_accepted_program_entrypoint(function) {
             self.set_inferred_entrypoint_effects(function, &body_effects);
         } else {
@@ -4898,7 +5019,13 @@ impl<'program> Checker<'program> {
         function: &FunctionDecl,
         observed: &CheckedEffectSet,
     ) {
-        let effects = observed.ordered.clone();
+        let seeded = self
+            .function_signatures
+            .get(&function.span)
+            .map(|signature| signature.checked_effects.clone())
+            .unwrap_or_default();
+        let mut effects = observed.ordered.clone();
+        extend_type_ids(&mut effects, seeded);
         let resolved = effects
             .iter()
             .map(|effect| self.types.resolved(*effect))
@@ -4939,7 +5066,18 @@ impl<'program> Checker<'program> {
             .ordered
             .iter()
             .copied()
-            .filter(|effect| !Self::checked_error_type_covers(&self.types, declared, *effect))
+            .filter(|effect| {
+                function.name == "__destruct"
+                    || !crate::checked_effects::is_ambient_io_effect(&self.types.resolved(*effect))
+            })
+            // The effective signature includes inferred ambient transport for
+            // ABI lowering. Destructors still cannot let any checked Error
+            // escape, so that runtime profile must never count as an authored
+            // declaration satisfying the lifecycle boundary.
+            .filter(|effect| {
+                function.name == "__destruct"
+                    || !Self::checked_error_type_covers(&self.types, declared, *effect)
+            })
             .collect::<Vec<_>>();
         if uncovered.is_empty() {
             return;
@@ -5027,21 +5165,28 @@ impl<'program> Checker<'program> {
         );
     }
 
-    fn report_finally_checked_effects(&mut self, effects: CheckedEffectSet, span: Span) {
-        for effect in effects.ordered {
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0632",
-                    format!(
-                        "checked error `{}` cannot escape `finally`",
-                        self.types.display(effect)
-                    ),
-                    span,
-                )
-                .with_title("Checked Error Cannot Escape Finally")
-                .with_help("catch the checked error inside `finally`"),
-            );
+    fn record_callable_dependency(&mut self, callee: Span) {
+        let Some(caller) = self.current_callable else {
+            return;
+        };
+        let dependencies = self.callable_dependencies.entry(caller).or_default();
+        if !dependencies.contains(&callee) {
+            dependencies.push(callee);
         }
+    }
+
+    fn complete_function_value_effects(&mut self, required: &[TypeId], span: Span) -> Vec<TypeId> {
+        let mut complete = required.to_vec();
+        for name in [
+            crate::compiler_known_io::IO_ERROR,
+            crate::compiler_known_io::INVALID_UTF8_ERROR,
+        ] {
+            let effect = self.resolve_type_ref(&TypeRef::named(name), span);
+            if !complete.contains(&effect) {
+                complete.push(effect);
+            }
+        }
+        complete
     }
 
     fn check_parameter_default_support(
@@ -5925,7 +6070,7 @@ impl<'program> Checker<'program> {
                 .pop()
                 .expect("checked try finalizer boundary");
             let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
-            self.report_finally_checked_effects(finalizer_effects, finally.span);
+            self.record_checked_effects(finalizer_effects.ordered, finally.span);
         }
 
         self.try_uncovered_effects.insert(
@@ -6542,7 +6687,7 @@ impl<'program> Checker<'program> {
             .pop()
             .expect("checked finalizer boundary");
         let finalizer_effects = self.effect_scopes.pop().expect("finally effect scope");
-        self.report_finally_checked_effects(finalizer_effects, finally.span);
+        self.record_checked_effects(finalizer_effects.ordered, finally.span);
         self.active_loop_depth = loop_depth;
     }
 
@@ -7745,19 +7890,25 @@ impl<'program> Checker<'program> {
             }
         }
 
-        self.record_checked_effects(function.checked_effects.iter().copied(), span);
+        let complete_effects =
+            self.complete_function_value_effects(&function.checked_effects, span);
+        self.record_checked_effects(complete_effects.iter().copied(), span);
         let resolved_function = self.types.resolved(callee_ty);
+        let resolved_effects = complete_effects
+            .iter()
+            .map(|effect| self.types.resolved(*effect))
+            .collect::<Vec<_>>();
+        let effect_profile =
+            crate::checked_effects::CheckedEffectProfile::classify(resolved_effects.clone());
         self.callable_value_calls.insert(
             span,
             CallableValueCallInfo {
                 function_type: resolved_function,
                 invocation_mode: function.invocation_mode,
                 return_type: self.types.resolved(function.return_type),
-                checked_effects: function
-                    .checked_effects
-                    .iter()
-                    .map(|effect| self.types.resolved(*effect))
-                    .collect(),
+                checked_effects: resolved_effects,
+                required_checked_effects: effect_profile.required,
+                ambient_checked_effects: effect_profile.ambient,
                 target_kind,
             },
         );
@@ -8165,7 +8316,20 @@ impl<'program> Checker<'program> {
         self.report_missing_captures(closure, &active);
         self.report_unused_captures(closure, &active);
 
-        let mut normalized_effects = inferred_effects.ordered.clone();
+        let inferred_resolved_effects = inferred_effects
+            .ordered
+            .iter()
+            .map(|effect| self.types.resolved(*effect))
+            .collect::<Vec<_>>();
+        let _ = self.complete_function_value_effects(&[], closure.span);
+        let effect_profile = crate::checked_effects::CheckedEffectProfile::classify(
+            inferred_resolved_effects.clone(),
+        );
+        let mut normalized_effects = effect_profile
+            .required
+            .iter()
+            .map(|effect| self.types.intern_resolved(effect))
+            .collect::<Vec<_>>();
         normalized_effects.sort_by_key(|effect| self.types.display(*effect));
         normalized_effects.dedup();
         let return_borrow = self
@@ -8213,11 +8377,9 @@ impl<'program> Checker<'program> {
                 execution_function_type: self.types.resolved(execution_ty),
                 captures: capture_info,
                 inferred_invocation_mode: invocation_mode,
-                inferred_checked_effects: inferred_effects
-                    .ordered
-                    .iter()
-                    .map(|effect| self.types.resolved(*effect))
-                    .collect(),
+                inferred_checked_effects: inferred_resolved_effects,
+                required_checked_effects: effect_profile.required,
+                ambient_checked_effects: effect_profile.ambient,
                 inferred_return_type: self.types.resolved(inferred_return),
                 execution_boundary_span: closure.span,
             },
@@ -8520,6 +8682,7 @@ impl<'program> Checker<'program> {
         function: &FunctionTypeRef,
         declaring_class: Option<&str>,
     ) -> TypeId {
+        let _ = self.complete_function_value_effects(&[], function.span);
         let parameters = function
             .parameters
             .iter()
@@ -8542,6 +8705,7 @@ impl<'program> Checker<'program> {
 
         let mut authored_checked_effects = Vec::new();
         let mut checked_effects = Vec::new();
+        let mut ambient_checked_effects = Vec::new();
         let mut saw_error = false;
         if let Some(clause) = &function.throws_clause {
             for entry in &clause.entries {
@@ -8606,7 +8770,12 @@ impl<'program> Checker<'program> {
                 }
                 saw_error = matches!(self.types.kind(effect), TypeKind::Error);
                 authored_checked_effects.push(effect);
-                checked_effects.push(effect);
+                let resolved = self.types.resolved(effect);
+                if crate::checked_effects::is_ambient_io_effect(&resolved) {
+                    ambient_checked_effects.push(resolved);
+                } else {
+                    checked_effects.push(effect);
+                }
             }
         }
         checked_effects.sort_by_key(|effect| self.types.display(*effect));
@@ -8645,6 +8814,7 @@ impl<'program> Checker<'program> {
                     .into_iter()
                     .map(|effect| self.types.resolved(effect))
                     .collect(),
+                ambient_checked_effects,
             },
         );
         ty
@@ -11733,6 +11903,7 @@ impl<'program> Checker<'program> {
                 name: name.to_string(),
             },
         );
+        self.record_callable_dependency(function_info.declaration);
         let function_info = self.instantiate_generic_call(
             &format!("function `{name}`"),
             &function_info,
@@ -11914,7 +12085,8 @@ impl<'program> Checker<'program> {
             Builtin::ReadStdinBytes | Builtin::Panic => {}
         }
         if self.diagnostics.len() == diagnostics_before {
-            self.record_compiler_known_effects(builtin.checked_error_types(), span);
+            self.record_compiler_known_effects(builtin.required_error_types(), span);
+            self.record_compiler_known_effects(builtin.ambient_error_types(), span);
         }
     }
 
@@ -12101,6 +12273,7 @@ impl<'program> Checker<'program> {
                 method_name: method.to_string(),
             },
         );
+        self.record_callable_dependency(method_info.declaration);
         if method_info.is_static {
             self.diagnostics.push(Diagnostic::new(
                 "E0487",
@@ -12638,6 +12811,7 @@ impl<'program> Checker<'program> {
                 method_name: access.member.to_string(),
             },
         );
+        self.record_callable_dependency(method_info.declaration);
         if self.check_direct_lifecycle_method_call(class_name, access.member, access.span) {
             return;
         }
@@ -13253,6 +13427,18 @@ impl<'program> Checker<'program> {
             ));
         }
 
+        let class_type_id = self.types.intern(TypeKind::Class(class_type.clone()));
+        let ResolvedType::Class(resolved_class_type) = self.types.resolved(class_type_id) else {
+            unreachable!("interned constructor class type must resolve as a class");
+        };
+        self.call_targets.insert(
+            span,
+            CallableTarget::Method {
+                class_type: resolved_class_type,
+                method_name: "__construct".to_string(),
+            },
+        );
+        self.record_callable_dependency(constructor.declaration);
         let constructor = self.specialize_method_for_class(&constructor, class_type);
         let diagnostics_before = self.diagnostics.len();
         self.check_call_arguments(
@@ -18122,12 +18308,15 @@ impl<'program> Checker<'program> {
             _ => unreachable!("recognized List algorithm"),
         };
 
-        self.record_checked_effects(function.checked_effects.iter().copied(), span);
-        let checked_effects = function
-            .checked_effects
+        let complete_effects =
+            self.complete_function_value_effects(&function.checked_effects, span);
+        self.record_checked_effects(complete_effects.iter().copied(), span);
+        let checked_effects = complete_effects
             .iter()
             .map(|effect| self.types.resolved(*effect))
-            .collect();
+            .collect::<Vec<_>>();
+        let effect_profile =
+            crate::checked_effects::CheckedEffectProfile::classify(checked_effects.clone());
         self.list_algorithm_calls.insert(
             span,
             ListAlgorithmCallInfo {
@@ -18139,6 +18328,8 @@ impl<'program> Checker<'program> {
                 callback_type: self.types.resolved(callback_ty),
                 callback_access,
                 checked_effects,
+                required_checked_effects: effect_profile.required,
+                ambient_checked_effects: effect_profile.ambient,
                 source_span: span,
                 receiver_span: receiver.span(),
                 callback_span: callback.span(),

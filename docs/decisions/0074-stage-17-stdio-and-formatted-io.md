@@ -103,9 +103,11 @@ before returning `null`.
 
 A closed stdout pipe during the prompt write or flush is the permanent
 decision-0091 carve-out: the process exits immediately with status 0, emits no
-panic and no runtime diagnostic, and does not go on to read stdin. Other
-prompt-output and flush failures remain status-101 runtime panics until checked
-errors land, reported through the Decision 0109 runtime-outcome foundation.
+panic and no runtime diagnostic, and does not go on to read stdin. Other prompt
+output and flush failures migrated at Stage 29 to canonical checked I/O Errors.
+Decision 0123 makes those exact Errors ambient at the source catch-or-declare
+boundary while preserving checked transport, catchability, cleanup, and R1000
+status 70 through the Decision 0109 runtime-outcome foundation.
 
 `read_line` reads stdin synchronously. It removes one LF or one CRLF line ending and no other
 whitespace. Empty lines return a non-null empty string. EOF after bytes returns the final line;
@@ -122,9 +124,10 @@ NUL. Failures panic with stable messages: `failed to read file`, `file contained
 without a newline. An ordinary program write to a standard stream that reports a closed pipe exits
 immediately with status 0 and no panic or stack trace; this decision-0091 carve-out does not apply
 to panic diagnostics, file writes, or other standard-stream errors. A panic remains fatal with
-status 101 even if its diagnostic sink is unavailable. Other I/O errors are fatal status-101
-panics until checked errors land at Stage 29. At that stage these free functions migrate to
-declared `throws` signatures,
+status 101 even if its diagnostic sink is unavailable. Other I/O errors migrated
+at Stage 29 to canonical checked Errors. Decision 0123 makes the two canonical
+I/O identities ambient, so these free functions do not require source `throws`
+declarations,
 except that a closed standard-stream pipe during ordinary program output remains a clean exit and
 is never thrown; `null` from
 `read_line` remains EOF only. The future checked-error form of `read_line` covers failures from

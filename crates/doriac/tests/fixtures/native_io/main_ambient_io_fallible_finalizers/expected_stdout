@@ -1,0 +1,8 @@
+normal body normal
+return
+when
+break
+continue
+error
+outer finalizer
+local handled return 42

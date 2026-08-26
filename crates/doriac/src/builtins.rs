@@ -115,49 +115,19 @@ impl Builtin {
     pub const fn signature(self) -> &'static str {
         match self {
             Self::Panic => "panic(string $message)",
-            Self::ReadLine => concat!(
-                "read_line(string $prompt = \"\"): ?string throws ",
-                "Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error"
-            ),
+            Self::ReadLine => "read_line(string $prompt = \"\"): ?string",
             Self::Sprintf => "sprintf(string $format, ...): string",
-            Self::Printf => "printf(string $format, ...): void throws Doria\\Std\\Io\\IoError",
-            Self::ReadFile => concat!(
-                "read_file(string $path): string throws ",
-                "Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error"
-            ),
-            Self::WriteFile => concat!(
-                "write_file(string $path, string $contents): void throws ",
-                "Doria\\Std\\Io\\IoError"
-            ),
-            Self::AppendFile => concat!(
-                "append_file(string $path, string $contents): void throws ",
-                "Doria\\Std\\Io\\IoError"
-            ),
-            Self::WriteStderr => concat!(
-                "write_stderr(string $value): void throws ",
-                "Doria\\Std\\Io\\IoError"
-            ),
-            Self::ReadFileBytes => concat!(
-                "read_file_bytes(string $path): Bytes throws ",
-                "Doria\\Std\\Io\\IoError"
-            ),
-            Self::WriteFileBytes => concat!(
-                "write_file_bytes(string $path, Bytes $contents): void throws ",
-                "Doria\\Std\\Io\\IoError"
-            ),
-            Self::AppendFileBytes => concat!(
-                "append_file_bytes(string $path, Bytes $contents): void throws ",
-                "Doria\\Std\\Io\\IoError"
-            ),
-            Self::ReadStdinBytes => "read_stdin_bytes(): Bytes throws Doria\\Std\\Io\\IoError",
-            Self::WriteStdoutBytes => concat!(
-                "write_stdout_bytes(Bytes $contents): void throws ",
-                "Doria\\Std\\Io\\IoError"
-            ),
-            Self::WriteStderrBytes => concat!(
-                "write_stderr_bytes(Bytes $contents): void throws ",
-                "Doria\\Std\\Io\\IoError"
-            ),
+            Self::Printf => "printf(string $format, ...): void",
+            Self::ReadFile => "read_file(string $path): string",
+            Self::WriteFile => "write_file(string $path, string $contents): void",
+            Self::AppendFile => "append_file(string $path, string $contents): void",
+            Self::WriteStderr => "write_stderr(string $value): void",
+            Self::ReadFileBytes => "read_file_bytes(string $path): Bytes",
+            Self::WriteFileBytes => "write_file_bytes(string $path, Bytes $contents): void",
+            Self::AppendFileBytes => "append_file_bytes(string $path, Bytes $contents): void",
+            Self::ReadStdinBytes => "read_stdin_bytes(): Bytes",
+            Self::WriteStdoutBytes => "write_stdout_bytes(Bytes $contents): void",
+            Self::WriteStderrBytes => "write_stderr_bytes(Bytes $contents): void",
         }
     }
 
@@ -241,6 +211,16 @@ impl Builtin {
             | Self::WriteStderrBytes => &[crate::compiler_known_io::IO_ERROR],
         }
     }
+
+    /// Compiler-owned ambient runtime effects. Source signatures deliberately
+    /// omit these while checked transport and catch dispatch retain them.
+    pub const fn ambient_error_types(self) -> &'static [&'static str] {
+        self.checked_error_types()
+    }
+
+    pub const fn required_error_types(self) -> &'static [&'static str] {
+        &[]
+    }
 }
 
 #[cfg(test)]
@@ -286,10 +266,15 @@ mod tests {
         );
         assert_eq!(
             Builtin::ReadLine.signature(),
-            concat!(
-                "read_line(string $prompt = \"\"): ?string throws ",
-                "Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error"
-            )
+            "read_line(string $prompt = \"\"): ?string"
+        );
+        assert!(Builtin::ReadLine.required_error_types().is_empty());
+        assert_eq!(
+            Builtin::ReadLine.ambient_error_types(),
+            &[
+                crate::compiler_known_io::IO_ERROR,
+                crate::compiler_known_io::INVALID_UTF8_ERROR
+            ]
         );
     }
 }

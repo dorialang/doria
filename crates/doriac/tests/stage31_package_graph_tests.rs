@@ -1494,3 +1494,75 @@ fn multi_source_graph_emits_through_all_enabled_backends_without_runtime_include
         );
     }
 }
+
+#[test]
+fn ambient_and_finalizer_effects_flow_across_source_graphs() {
+    let entry = "acme/application:main.doria";
+    let document = plan(
+        vec![package(
+            "acme/application",
+            vec![
+                source("acme/application", "main.doria", SourceOrigin::Entry),
+                source(
+                    "acme/application",
+                    "CleanupError.doria",
+                    SourceOrigin::Explicit,
+                ),
+            ],
+            Vec::new(),
+        )],
+        entry,
+    );
+    let mut provider = InMemorySourceProvider::new();
+    provider.insert(
+        "acme/application",
+        "main.doria",
+        r#"
+function main(): void
+{
+    try { run(); } catch (CleanupError $error) { echo "outer {$error->message}\n"; }
+}
+"#,
+    );
+    provider.insert(
+        "acme/application",
+        "CleanupError.doria",
+        r#"
+class CleanupError implements Error
+{
+    function __construct(string $message) {}
+}
+
+function writeMarker(): void
+{
+    echo "helper ";
+}
+
+function run(): void throws CleanupError
+{
+    try { writeMarker(); } finally { throw new CleanupError("cleanup"); }
+}
+"#,
+    );
+
+    let graph = load_compilation_graph(&document, &provider).expect("valid ambient graph");
+    let mir = doriac::lower_compilation_graph_to_mir(&graph)
+        .expect("cross-file ambient and finalizer effects should lower");
+    let profile = |name: &str| {
+        mir.functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("{name} should exist in graph MIR"))
+    };
+    assert!(profile("writeMarker").required_checked_effects.is_empty());
+    assert_eq!(profile("writeMarker").ambient_checked_effects.len(), 1);
+    assert_eq!(profile("run").required_checked_effects.len(), 1);
+    assert_eq!(profile("run").ambient_checked_effects.len(), 1);
+    assert!(profile("main").required_checked_effects.is_empty());
+    assert_eq!(profile("main").ambient_checked_effects.len(), 1);
+
+    let interpreted = doriac::mir_interpreter::interpret(&mir)
+        .expect("cross-file ambient finalizer fixture should execute");
+    assert_eq!(interpreted.stdout, b"helper outer cleanup\n");
+    assert_eq!(interpreted.exit_status, 0);
+}

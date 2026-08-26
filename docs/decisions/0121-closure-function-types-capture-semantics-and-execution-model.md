@@ -154,12 +154,15 @@ Function types use Decision 0119's `throws` vocabulary:
 function(string): Record throws ParseError, StorageError
 ```
 
-The normalized checked-effect set is part of structural identity. Source order
-is preserved for display, documentation, hovers, signatures, and diagnostics;
-semantic comparison uses the normalized set. Closure bodies infer checked
-effects after local catch subtraction. There is no closure-expression `throws`
-annotation. The selected entrypoint's existing inference rule does not grant
-general named-callable inference.
+The normalized required checked-effect set is part of structural identity.
+Decision 0123 excludes the two exact ambient canonical I/O identities from that
+identity while retaining them in the callable's complete runtime effect profile
+and checked ABI transport. Source order is preserved for display,
+documentation, hovers, signatures, and diagnostics; semantic comparison uses
+the normalized required set. Closure bodies infer checked effects after local
+catch subtraction. There is no closure-expression `throws` annotation. The
+selected entrypoint's existing inference rule does not grant general
+named-callable inference.
 
 ### 5. Structural Identity And Compatibility
 
@@ -168,7 +171,8 @@ A semantic function type contains:
 - parameter count, value types, and ownership modes;
 - invocation mode;
 - return type;
-- normalized checked-effect set;
+- normalized required checked-effect set, plus a non-structural ambient runtime
+  effect profile;
 - nullability;
 - monomorphized enclosing generic identities; and
 - compiler-proven return-borrow provenance where existing elision can express

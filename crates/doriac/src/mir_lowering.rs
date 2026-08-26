@@ -83,6 +83,41 @@ impl CollectionRegistry {
     }
 }
 
+fn checked_effect_for_resolved(
+    effect: &ResolvedType,
+    class_ids: &ClassIds,
+    collections: &CollectionRegistry,
+) -> Option<mir::CheckedEffect> {
+    match effect {
+        ResolvedType::Error => Some(mir::CheckedEffect::Any),
+        ResolvedType::Class(class) => class_ids
+            .get(class)
+            .and_then(|class| collections.error_descriptor_ids.get(class))
+            .copied()
+            .map(mir::CheckedEffect::Concrete),
+        _ => None,
+    }
+}
+
+fn ambient_mir_checked_effects(
+    class_ids: &ClassIds,
+    collections: &CollectionRegistry,
+) -> Option<Vec<mir::CheckedEffect>> {
+    [
+        crate::compiler_known_io::IO_ERROR,
+        crate::compiler_known_io::INVALID_UTF8_ERROR,
+    ]
+    .iter()
+    .map(|name| {
+        checked_effect_for_resolved(
+            &ResolvedType::Class(ClassType::new((*name).to_string(), Vec::new())),
+            class_ids,
+            collections,
+        )
+    })
+    .collect()
+}
+
 fn collection_comparator(ty: mir::Type) -> Option<mir::CollectionComparator> {
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(integer)) if integer.is_signed() => Some(
@@ -119,6 +154,8 @@ struct FunctionSignature {
     parameter_owns: Vec<bool>,
     method_class: Option<ClassId>,
     receiver_mode: Option<mir::ReceiverMode>,
+    required_checked_effects: Vec<mir::CheckedEffect>,
+    ambient_checked_effects: Vec<mir::CheckedEffect>,
     checked_effects: Vec<mir::CheckedEffect>,
 }
 
@@ -1976,16 +2013,9 @@ fn intern_resolved_collection_types(
                 let checked_effects = function
                     .checked_effects
                     .iter()
-                    .map(|effect| match effect {
-                        ResolvedType::Error => Some(mir::CheckedEffect::Any),
-                        ResolvedType::Class(class) => class_ids
-                            .get(class)
-                            .and_then(|class| collections.error_descriptor_ids.get(class))
-                            .copied()
-                            .map(mir::CheckedEffect::Concrete),
-                        _ => None,
-                    })
+                    .map(|effect| checked_effect_for_resolved(effect, class_ids, collections))
                     .collect::<Option<Vec<_>>>()?;
+                let ambient_checked_effects = ambient_mir_checked_effects(class_ids, collections)?;
                 let id = mir::FunctionTypeId(collections.function_types.len());
                 collections.function_types.push(mir::FunctionType {
                     id,
@@ -2003,6 +2033,7 @@ fn intern_resolved_collection_types(
                     parameters,
                     return_type,
                     checked_effects,
+                    ambient_checked_effects,
                     return_borrow: function.return_borrow.map(|borrow| mir::ReturnBorrow {
                         source: match borrow.source {
                             crate::types::FunctionBorrowSource::Parameter(index) => {
@@ -2549,6 +2580,35 @@ fn collect_function_signature(
         parameter_owns,
         method_class: None,
         receiver_mode: None,
+        required_checked_effects: function
+            .required_checked_effects
+            .iter()
+            .filter_map(
+                |effect| match substitute_resolved_type(effect, substitutions) {
+                    ResolvedType::Error => Some(mir::CheckedEffect::Any),
+                    ResolvedType::Class(class) => class_ids
+                        .get(&class)
+                        .and_then(|class| error_descriptor_ids.get(class))
+                        .copied()
+                        .map(mir::CheckedEffect::Concrete),
+                    _ => None,
+                },
+            )
+            .collect(),
+        ambient_checked_effects: function
+            .ambient_checked_effects
+            .iter()
+            .filter_map(
+                |effect| match substitute_resolved_type(effect, substitutions) {
+                    ResolvedType::Class(class) => class_ids
+                        .get(&class)
+                        .and_then(|class| error_descriptor_ids.get(class))
+                        .copied()
+                        .map(mir::CheckedEffect::Concrete),
+                    _ => None,
+                },
+            )
+            .collect(),
         checked_effects: function
             .checked_effects
             .iter()
@@ -2637,6 +2697,9 @@ fn resolved_type_ref_with_substitutions(
                     .iter()
                     .map(|effect| resolved_type_ref_with_substitutions(&effect.ty, substitutions))
                     .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .filter(|effect| !crate::checked_effects::is_ambient_io_effect(effect))
+                    .collect()
             } else {
                 Vec::new()
             },
@@ -2980,6 +3043,8 @@ fn lower_function(
             .collect(),
         return_type: signature.return_type,
         return_borrow: signature.return_borrow,
+        required_checked_effects: signature.required_checked_effects,
+        ambient_checked_effects: signature.ambient_checked_effects,
         checked_effects: signature.checked_effects,
         locals,
         blocks,
@@ -3100,7 +3165,7 @@ fn lower_closure_function(
         params.push(local);
     }
 
-    if !definition.checked_effects.is_empty() {
+    if definition.has_checked_transport() {
         let error = context.declare_routed_error();
         let propagation = context.create_block();
         context.terminate_block(propagation, mir::Terminator::PropagateError { error });
@@ -3122,7 +3187,7 @@ fn lower_closure_function(
             lower_function_body(block, "closure", definition.return_type, &mut context)?
         }
     }
-    if !definition.checked_effects.is_empty() {
+    if definition.has_checked_transport() {
         context.pop_error_target();
     }
     let (locals, blocks) = context.finish(metrics);
@@ -3149,7 +3214,9 @@ fn lower_closure_function(
         .collect(),
         return_type: definition.return_type,
         return_borrow: definition.return_borrow,
-        checked_effects: definition.checked_effects,
+        required_checked_effects: definition.checked_effects.clone(),
+        ambient_checked_effects: definition.ambient_checked_effects.clone(),
+        checked_effects: definition.complete_checked_effects(),
         locals,
         blocks,
         entry_block: mir::BlockId(0),
@@ -5146,6 +5213,7 @@ enum StructuredExit {
     },
     WhenYield {
         result: mir::LocalId,
+        transfer: bool,
         destination: mir::BlockId,
     },
     FunctionReturn {
@@ -5185,6 +5253,7 @@ struct RoutedExit {
     cleanup_depth: usize,
 }
 
+#[derive(Clone, Copy)]
 struct FinalizerExitBuilder {
     route: RoutedExit,
     source: mir::BlockId,
@@ -5198,6 +5267,13 @@ struct FinalizerRegionBuilder {
     discriminator: mir::LocalId,
     scope_depth: usize,
     exits: Vec<FinalizerExitBuilder>,
+    replacements: Vec<mir::FinalizerReplacementPlan>,
+}
+
+#[derive(Clone, Copy)]
+struct ExecutingFinalizer {
+    region: mir::FinalizerRegionId,
+    error_target_depth: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -5244,6 +5320,7 @@ struct LoweringContext<'semantic> {
     finalizer_regions: Vec<FinalizerRegionBuilder>,
     active_finalizers: Vec<mir::FinalizerRegionId>,
     lexical_finalizers: Vec<mir::FinalizerRegionId>,
+    executing_finalizers: Vec<ExecutingFinalizer>,
     error_targets: Vec<ErrorTarget>,
     return_borrow: Option<mir::ReturnBorrow>,
 }
@@ -5343,6 +5420,21 @@ fn drop_obligation_for_owned_local(local: mir::LocalId, ty: mir::Type) -> DropOb
     }
 }
 
+fn drop_obligation_for_pending_payload(
+    local: mir::LocalId,
+    ty: mir::Type,
+    transfers_ownership: bool,
+) -> Option<DropObligation> {
+    if !transfers_ownership {
+        return None;
+    }
+    if matches!(ty, mir::Type::String | mir::Type::NullableString) {
+        return Some(DropObligation::String(local));
+    }
+    ty.has_move_ownership()
+        .then(|| drop_obligation_for_owned_local(local, ty))
+}
+
 impl<'semantic> LoweringContext<'semantic> {
     fn new(inputs: &FunctionLoweringInputs<'semantic>) -> Self {
         Self {
@@ -5378,6 +5470,7 @@ impl<'semantic> LoweringContext<'semantic> {
             finalizer_regions: Vec::new(),
             active_finalizers: Vec::new(),
             lexical_finalizers: Vec::new(),
+            executing_finalizers: Vec::new(),
             error_targets: Vec::new(),
             return_borrow: None,
         }
@@ -5698,6 +5791,7 @@ impl<'semantic> LoweringContext<'semantic> {
             discriminator,
             scope_depth,
             exits: Vec::new(),
+            replacements: Vec::new(),
         });
         self.active_finalizers.push(id);
         self.lexical_finalizers.push(id);
@@ -5758,6 +5852,18 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn route_checked_error(&mut self, source: mir::LocalId) {
+        let escaping_finalizer = self
+            .executing_finalizers
+            .iter()
+            .rposition(|boundary| self.error_targets.len() <= boundary.error_target_depth);
+        if let Some(index) = escaping_finalizer {
+            self.replace_finalizer_pending_exit(source, index);
+            return;
+        }
+        self.route_checked_error_outward(source);
+    }
+
+    fn route_checked_error_outward(&mut self, source: mir::LocalId) {
         let target = self
             .current_error_target()
             .expect("checked source has a semantic propagation target");
@@ -5781,6 +5887,120 @@ impl<'semantic> LoweringContext<'semantic> {
             },
             self.local_scopes.len(),
         );
+    }
+
+    fn replace_finalizer_pending_exit(&mut self, source: mir::LocalId, executing_index: usize) {
+        let executing = self.executing_finalizers.remove(executing_index);
+        let target = self
+            .current_error_target()
+            .expect("fallible finalizer has an enclosing checked-error target");
+        let exits = self.finalizer_regions[executing.region.0].exits.clone();
+        assert!(
+            !exits.is_empty(),
+            "an executing finalizer must have a pending incoming outcome"
+        );
+
+        // Keep the replacement separate from the enclosing Error carrier. The
+        // carrier may still own the earlier pending Error, which must survive
+        // until after the replacement has been acquired.
+        let replacement_error = self.declare_routed_error();
+        self.push_statement(mir::Statement::AssignLocal {
+            target: replacement_error,
+            value: mir::Rvalue::Error(mir::ErrorExpression::Local {
+                local: source,
+                transfer: true,
+            }),
+        });
+        let source_block = self.current_block();
+        let case_entries = exits
+            .iter()
+            .map(|_| self.create_block())
+            .collect::<Vec<_>>();
+
+        let mut dispatch = source_block;
+        for (index, entry) in case_entries.iter().copied().enumerate() {
+            self.current_block = Some(dispatch);
+            if index + 1 == case_entries.len() {
+                self.terminate_current(mir::Terminator::Jump(entry));
+            } else {
+                let next = self.create_block();
+                self.terminate_current(mir::Terminator::Branch {
+                    condition: finalizer_discriminator_condition(
+                        self.finalizer_regions[executing.region.0].discriminator,
+                        index as i128,
+                    ),
+                    then_block: entry,
+                    else_block: next,
+                });
+                dispatch = next;
+            }
+        }
+
+        let statement_temporaries = self.statement_owned_locals.clone();
+        let mut cases = Vec::with_capacity(exits.len());
+        for (pending_exit, (exit, entry)) in exits
+            .iter()
+            .copied()
+            .zip(case_entries.iter().copied())
+            .enumerate()
+        {
+            self.statement_owned_locals = statement_temporaries.clone();
+            self.current_block = Some(entry);
+            let dropped_payload = match exit.route.exit {
+                StructuredExit::FunctionReturn { value: Some(value) } => {
+                    drop_obligation_for_pending_payload(value.local, value.ty, value.transfer).map(
+                        |obligation| {
+                            self.emit_drop_obligations(&[obligation]);
+                            value.local
+                        },
+                    )
+                }
+                StructuredExit::WhenYield {
+                    result, transfer, ..
+                } => {
+                    let local = &self.locals[result.0];
+                    drop_obligation_for_pending_payload(result, local.ty, transfer).map(
+                        |obligation| {
+                            self.emit_drop_obligations(&[obligation]);
+                            result
+                        },
+                    )
+                }
+                StructuredExit::CheckedError { error, .. } => {
+                    self.emit_drop_obligations(&[DropObligation::Error(error)]);
+                    Some(error)
+                }
+                StructuredExit::Normal { .. }
+                | StructuredExit::FunctionReturn { value: None }
+                | StructuredExit::Break { .. }
+                | StructuredExit::Continue { .. } => None,
+            };
+            if replacement_error != target.error {
+                self.push_statement(mir::Statement::AssignLocal {
+                    target: target.error,
+                    value: mir::Rvalue::Error(mir::ErrorExpression::Local {
+                        local: replacement_error,
+                        transfer: true,
+                    }),
+                });
+            }
+            self.route_checked_error(target.error);
+            cases.push(mir::FinalizerReplacementCasePlan {
+                pending_exit,
+                entry,
+                dropped_payload,
+            });
+        }
+        self.statement_owned_locals = statement_temporaries;
+        self.executing_finalizers.insert(executing_index, executing);
+        self.finalizer_regions[executing.region.0]
+            .replacements
+            .push(mir::FinalizerReplacementPlan {
+                source: source_block,
+                replacement_error,
+                cases,
+            });
+        self.current_block = None;
     }
 
     fn declare_user_local(&mut self, name: &str, writable: bool, ty: mir::Type) -> mir::LocalId {
@@ -6646,7 +6866,20 @@ fn finish_finalizer_region_block(
 
     let body_block_start = context.blocks.len();
     let entry = context.finalizer_regions[region_id.0].entry;
-    let fallthrough = lower_scoped_block(finally, entry, return_type, context)?;
+    context.executing_finalizers.push(ExecutingFinalizer {
+        region: region_id,
+        error_target_depth: context.error_targets.len(),
+    });
+    let fallthrough = lower_scoped_block(finally, entry, return_type, context);
+    let executing = context
+        .executing_finalizers
+        .pop()
+        .expect("finalizer body requires an execution boundary");
+    assert_eq!(
+        executing.region, region_id,
+        "finalizers must finish execution inside-out"
+    );
+    let fallthrough = fallthrough?;
     let lexical = context
         .lexical_finalizers
         .pop()
@@ -6658,7 +6891,7 @@ fn finish_finalizer_region_block(
         context.terminate_block(block, mir::Terminator::Jump(completion));
     }
 
-    let (parent, attachment, activation, discriminator, scope_depth, exits) = {
+    let (parent, attachment, activation, discriminator, scope_depth, exits, replacements) = {
         let region = &mut context.finalizer_regions[region_id.0];
         (
             region.parent,
@@ -6667,6 +6900,7 @@ fn finish_finalizer_region_block(
             region.discriminator,
             region.scope_depth,
             std::mem::take(&mut region.exits),
+            std::mem::take(&mut region.replacements),
         )
     };
 
@@ -6705,10 +6939,26 @@ fn finish_finalizer_region_block(
 
     let mut exit_plans = Vec::with_capacity(exits.len());
     for (exit, continuation) in exits.into_iter().zip(continuations) {
+        let superseded_payload = match exit.route.exit {
+            StructuredExit::FunctionReturn { value: Some(value) } => {
+                drop_obligation_for_pending_payload(value.local, value.ty, value.transfer)
+                    .map(|_| value.local)
+            }
+            StructuredExit::WhenYield {
+                result, transfer, ..
+            } => drop_obligation_for_pending_payload(result, context.locals[result.0].ty, transfer)
+                .map(|_| result),
+            StructuredExit::CheckedError { error, .. } => Some(error),
+            StructuredExit::Normal { .. }
+            | StructuredExit::FunctionReturn { value: None }
+            | StructuredExit::Break { .. }
+            | StructuredExit::Continue { .. } => None,
+        };
         exit_plans.push(mir::FinalizerExitPlan {
             kind: exit.route.exit.plan_kind(),
             source: exit.source,
             continuation,
+            superseded_payload,
         });
         context.current_block = Some(continuation);
         let mut route = exit.route;
@@ -6732,6 +6982,7 @@ fn finish_finalizer_region_block(
                 discriminator,
                 body_blocks,
                 exits: exit_plans,
+                replacements,
             }),
         ));
     context.current_block = None;
@@ -10156,6 +10407,8 @@ fn string_intrinsic_signature(
         parameter_owns: vec![false; count],
         method_class: None,
         receiver_mode: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
     })
 }
@@ -10555,6 +10808,7 @@ fn lower_when_yield(
         RoutedExit {
             exit: StructuredExit::WhenYield {
                 result: target.result_local,
+                transfer: target.transfer,
                 destination: target.merge_block,
             },
             target_finalizer_depth: target.finalizer_depth,
@@ -14156,7 +14410,7 @@ fn materialize_indirect_call(
         }
     };
 
-    if definition.checked_effects.is_empty() {
+    if !definition.has_checked_transport() {
         let continuation = context.create_block();
         context.terminate_current(mir::Terminator::IndirectCall {
             callee,
@@ -14931,7 +15185,7 @@ fn materialize_list_algorithm_call(
         transfer: false,
     };
     let mut callback_failure = None;
-    if function.checked_effects.is_empty() {
+    if !function.has_checked_transport() {
         context.terminate_current(mir::Terminator::IndirectCall {
             callee,
             function_type,
@@ -15049,7 +15303,9 @@ fn materialize_list_algorithm_call(
                     hir::ListCallbackAccess::Readonly => mir::FunctionInvocationMode::Readonly,
                     hir::ListCallbackAccess::Writable => mir::FunctionInvocationMode::Writable,
                 },
-                checked_effects: function.checked_effects.clone(),
+                required_checked_effects: function.checked_effects.clone(),
+                ambient_checked_effects: function.ambient_checked_effects.clone(),
+                checked_effects: function.complete_checked_effects(),
                 output,
                 accumulator,
                 count,
@@ -15609,6 +15865,8 @@ fn lower_payload_enum_expression(
                 parameter_types,
                 method_class: None,
                 receiver_mode: None,
+                required_checked_effects: Vec::new(),
+                ambient_checked_effects: Vec::new(),
                 checked_effects: Vec::new(),
             };
             let fields = lower_call_args_with_ownership(
