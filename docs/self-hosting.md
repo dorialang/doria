@@ -73,7 +73,7 @@ Do not attempt full self-hosting before Doria has:
 - assignment compatibility checking
 - basic return type checking
 - path-sensitive control-flow checks for required returns
-- modules or namespaces
+- multi-file package compilation
 - enough collection support
 - enough string support
 - file I/O
@@ -317,7 +317,7 @@ Do these before attempting Doria-written compiler modules:
 2. Implement real semantic TypeId / TypeKind support.
 3. Implement assignment compatibility checking.
 4. Expand basic return checking into path-sensitive control-flow checks.
-5. Design modules/namespaces.
+5. Complete multi-file namespace and package-graph compilation.
 6. Design Doria-owned string interpolation.
 7. Design error handling for compiler-style code.
 8. Stabilize Doria IR enough to print and compare it in tests.

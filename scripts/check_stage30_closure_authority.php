@@ -137,7 +137,7 @@ function check_stage30_closure_authority(string $root): array
         'It is not normative authority',
         'Stages 30a through 30h and Stage 30 are complete',
         'E0641 is historical and reserved',
-        'Stage 31 is next',
+        'Stage 31 Slice 1 is complete; Slice 2 is next',
     ]);
     $forbid($proposalPath, $proposal, [
         '**In Review.**',
@@ -182,7 +182,8 @@ function check_stage30_closure_authority(string $root): array
         'Stage 30g List Algorithms — Complete',
         'Stage 30 — Complete',
         'E0641 is historical and remains reserved',
-        'Stage 31 — Next',
+        'Stage 31 Slice 1 — Complete',
+        'Stage 31 Slice 2 — Next',
     ]);
     $forbid($pipelinePath, $pipeline, [
         'Stage 30 Closure Authority Proposal — In Review',

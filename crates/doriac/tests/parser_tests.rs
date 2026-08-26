@@ -153,8 +153,8 @@ class Child extends Vendor\Base implements Vendor\Contracts\Printable
         program
             .namespace
             .as_ref()
-            .map(|namespace| namespace.name.as_str()),
-        Some("Vendor\\App")
+            .map(|namespace| namespace.name.canonical()),
+        Some("Vendor\\App".to_string())
     );
     let Item::Class(class) = &program.items[0] else {
         panic!("expected class declaration");

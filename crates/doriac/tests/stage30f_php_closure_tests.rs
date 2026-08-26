@@ -50,8 +50,7 @@ fn generated_script(name: &str, php: &str) -> PathBuf {
         "doria-stage30f-{name}-{}-{nonce}.php",
         std::process::id()
     ));
-    fs::write(&path, format!("{php}\nmain();\n"))
-        .expect("generated Stage 30f PHP should be writable");
+    fs::write(&path, php).expect("generated Stage 30f PHP should be writable");
     path
 }
 

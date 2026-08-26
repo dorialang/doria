@@ -54,6 +54,9 @@ pub struct ClosureEnvironmentFieldId(pub usize);
 #[derive(Debug, Clone)]
 pub struct Program {
     pub source: SourceFile,
+    pub compilation_context: crate::names::CompilationContext,
+    pub namespace: Option<String>,
+    pub global_symbols: crate::names::GlobalSymbolFacts,
     pub classes: Vec<Class>,
     pub enums: Vec<EnumDefinition>,
     pub collection_types: Vec<CollectionType>,
@@ -70,6 +73,8 @@ pub struct Program {
 impl PartialEq for Program {
     fn eq(&self, other: &Self) -> bool {
         self.classes == other.classes
+            && self.compilation_context == other.compilation_context
+            && self.namespace == other.namespace
             && self.enums == other.enums
             && self.collection_types == other.collection_types
             && self.statics == other.statics

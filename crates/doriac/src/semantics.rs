@@ -44,6 +44,11 @@ pub struct MixedBoxPlan {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SemanticInfo {
+    /// Compiler inputs that own this semantic analysis. Namespace and package
+    /// identity deliberately remain independent.
+    pub compilation_context: crate::names::CompilationContext,
+    /// Canonical global declaration/reference facts produced before checking.
+    pub global_symbols: crate::names::GlobalSymbolFacts,
     /// Canonical integer type for every integer-valued source expression.
     ///
     /// Spans are stable across AST-to-HIR structural lowering, so the MIR
@@ -590,6 +595,8 @@ pub fn analyze_program_for_ide_with_source<'source>(
     let enums = collect_ordered_enum_semantics(&checker);
     SemanticAnalysis {
         info: SemanticInfo {
+            compilation_context: crate::names::CompilationContext::default(),
+            global_symbols: crate::names::GlobalSymbolFacts::default(),
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
             expression_types: checker.expression_types,
@@ -1922,13 +1929,6 @@ impl<'program> Checker<'program> {
     }
 
     fn check(&mut self) {
-        if let Some(namespace) = &self.program.namespace {
-            self.diagnostics.push(Diagnostic::new(
-                "E0475",
-                "namespace declarations are accepted syntax but namespace resolution is not available in this compiler version",
-                namespace.span,
-            ));
-        }
         self.predeclare_classes();
         self.collect_enums();
         self.collect_classes();
@@ -1986,7 +1986,12 @@ impl<'program> Checker<'program> {
                 continue;
             };
 
-            if let Some(message) = Self::reserved_type_name_message(&class_decl.name) {
+            let source_name = class_decl
+                .name
+                .rsplit('\\')
+                .next()
+                .unwrap_or(class_decl.name.as_str());
+            if let Some(message) = Self::reserved_type_name_message(source_name) {
                 self.diagnostics
                     .push(Diagnostic::new("E0309", message, class_decl.span));
                 continue;
@@ -2198,7 +2203,12 @@ impl<'program> Checker<'program> {
             .collect::<Vec<_>>();
 
         for declaration in &declarations {
-            if let Some(message) = Self::reserved_type_name_message(&declaration.name) {
+            let source_name = declaration
+                .name
+                .rsplit('\\')
+                .next()
+                .unwrap_or(declaration.name.as_str());
+            if let Some(message) = Self::reserved_type_name_message(source_name) {
                 self.diagnostics.push(
                     Diagnostic::new("E0561", message, declaration.span)
                         .with_title("Type Name Collision"),
@@ -2259,16 +2269,25 @@ impl<'program> Checker<'program> {
             let Some(mut definition) = self.enums.get(&declaration.name).cloned() else {
                 continue;
             };
-            if !Self::uses_pascal_case(&declaration.name) {
+            let source_name = declaration
+                .name
+                .rsplit('\\')
+                .next()
+                .unwrap_or(declaration.name.as_str());
+            if !Self::uses_pascal_case(source_name) {
                 let mut diagnostic = Diagnostic::new(
                     "E0563",
-                    format!("enum name `{}` must use PascalCase", declaration.name),
+                    format!("enum name `{source_name}` must use PascalCase"),
                     declaration.name_span,
                 )
                 .with_title("Enum Name Must Use PascalCase");
-                if let Some(replacement) = Self::safe_pascal_case_fix(&declaration.name) {
-                    let collides = non_enum_types.contains(replacement.as_str())
-                        || self.enums.contains_key(&replacement);
+                if let Some(replacement) = Self::safe_pascal_case_fix(source_name) {
+                    let canonical_replacement = declaration.name.rsplit_once('\\').map_or_else(
+                        || replacement.clone(),
+                        |(namespace, _)| format!("{namespace}\\{replacement}"),
+                    );
+                    let collides = non_enum_types.contains(canonical_replacement.as_str())
+                        || self.enums.contains_key(&canonical_replacement);
                     if !collides {
                         diagnostic = diagnostic.with_fix(declaration.name_span, replacement);
                     }
@@ -2926,9 +2945,13 @@ impl<'program> Checker<'program> {
             let Item::Function(function) = item else {
                 continue;
             };
-
-            if function
+            let source_name = function
                 .name
+                .rsplit('\\')
+                .next()
+                .unwrap_or(function.name.as_str());
+
+            if source_name
                 .get(.."__doria_".len())
                 .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__doria_"))
             {
@@ -2943,7 +2966,7 @@ impl<'program> Checker<'program> {
                 continue;
             }
 
-            if function.name == "print" {
+            if source_name == "print" {
                 self.diagnostics.push(
                     Diagnostic::new(
                         "E0310",
@@ -2955,7 +2978,7 @@ impl<'program> Checker<'program> {
                 continue;
             }
 
-            if let Some(message) = Self::reserved_callable_name_message(&function.name) {
+            if let Some(message) = Self::reserved_callable_name_message(source_name) {
                 self.diagnostics
                     .push(Diagnostic::new("E0310", message, function.span));
                 continue;
@@ -2998,27 +3021,27 @@ impl<'program> Checker<'program> {
         );
         self.type_parameter_scopes.pop();
         self.current_callable = previous_callable;
-        let return_borrow = matches!(
-            self.types.kind(return_ty),
-            TypeKind::Class(_) | TypeKind::TypeParameter(_)
-        )
-        .then(|| {
-            let enclosing_type_params = declaring_class
-                .and_then(|class_name| {
-                    self.program.items.iter().find_map(|item| match item {
-                        Item::Class(class) if class.name == class_name => Some(&class.type_params),
-                        _ => None,
+        let return_borrow = self
+            .type_can_return_borrow(return_ty)
+            .then(|| {
+                let enclosing_type_params = declaring_class
+                    .and_then(|class_name| {
+                        self.program.items.iter().find_map(|item| match item {
+                            Item::Class(class) if class.name == class_name => {
+                                Some(&class.type_params)
+                            }
+                            _ => None,
+                        })
                     })
-                })
-                .map(Vec::as_slice)
-                .unwrap_or_default();
-            crate::ownership::function_return_borrow_in_context(
-                function,
-                enclosing_type_params,
-                &mut |_| None,
-            )
-        })
-        .flatten();
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                crate::ownership::function_return_borrow_in_context(
+                    function,
+                    enclosing_type_params,
+                    &mut |_| None,
+                )
+            })
+            .flatten();
 
         FunctionInfo {
             declaration: function.span.start,
@@ -3366,17 +3389,7 @@ impl<'program> Checker<'program> {
                 else {
                     continue;
                 };
-                let class_return = match self.types.kind(signature.return_ty) {
-                    TypeKind::Class(_) | TypeKind::TypeParameter(_) => true,
-                    TypeKind::Nullable(inner) => {
-                        matches!(
-                            self.types.kind(*inner),
-                            TypeKind::Class(_) | TypeKind::TypeParameter(_)
-                        )
-                    }
-                    _ => false,
-                };
-                if !class_return {
+                if !self.type_can_return_borrow(signature.return_ty) {
                     continue;
                 }
                 let mut scopes = ScopeStack::new();
@@ -4689,7 +4702,7 @@ impl<'program> Checker<'program> {
         }
         self.effect_scopes.push(body_effects);
         if method_context.is_none()
-            && function.name == "main"
+            && crate::names::source_name_is(&function.name, "main")
             && !matches!(
                 self.types.kind(signature.return_ty),
                 TypeKind::Integer(IntegerType::Int64) | TypeKind::Void | TypeKind::Unknown
@@ -4708,7 +4721,7 @@ impl<'program> Checker<'program> {
             );
         }
 
-        if method_context.is_none() && function.name == "main" {
+        if method_context.is_none() && crate::names::source_name_is(&function.name, "main") {
             self.check_entry_parameters(function);
         }
         let return_context = self.return_context_for_function(function, method_context.as_ref());
@@ -4799,11 +4812,11 @@ impl<'program> Checker<'program> {
         let Some(signature) = self.function_signatures.get(&function.span.start) else {
             return false;
         };
-        if function.name != "main"
+        if !crate::names::source_name_is(&function.name, "main")
             || !function.type_params.is_empty()
             || self
                 .functions
-                .get("main")
+                .get(&function.name)
                 .is_none_or(|entry| entry.declaration != function.span.start)
             || !matches!(
                 self.types.kind(signature.return_ty),
@@ -7289,16 +7302,11 @@ impl<'program> Checker<'program> {
                     }
                     return;
                 }
-                let qualified = class_name.contains('\\')
-                    && !crate::compiler_known_io::is_canonical_type(class_name);
                 let is_current_class = class_name == "self"
                     && class_type.arguments.is_empty()
                     && method_context.is_some();
-                let class_exists =
-                    !qualified && (is_current_class || self.classes.contains_key(class_name));
-                if qualified {
-                    self.report_deferred_qualified_name(class_name, *span);
-                } else if !class_exists {
+                let class_exists = is_current_class || self.classes.contains_key(class_name);
+                if !class_exists {
                     self.diagnostics.push(Diagnostic::new(
                         "E0305",
                         format!("unknown class `{class_name}`"),
@@ -7372,9 +7380,7 @@ impl<'program> Checker<'program> {
             Expr::When(_) => self.check_when_expression(expr, scopes, method_context),
             Expr::Float { .. } => self.check_float_literal_range(expr, FloatType::Float64),
             Expr::Identifier { name, span } => {
-                if name.contains('\\') {
-                    self.report_deferred_qualified_name(name, *span);
-                } else if !self
+                if !self
                     .const_evaluation
                     .values
                     .contains_key(&crate::const_eval::ConstKey::TopLevel(name.clone()))
@@ -8119,8 +8125,12 @@ impl<'program> Checker<'program> {
         let mut normalized_effects = inferred_effects.ordered.clone();
         normalized_effects.sort_by_key(|effect| self.types.display(*effect));
         normalized_effects.dedup();
-        let return_borrow =
-            self.infer_closure_return_borrow(closure, &closure_scopes, closure_method_context);
+        let return_borrow = self
+            .type_can_return_borrow(inferred_return)
+            .then(|| {
+                self.infer_closure_return_borrow(closure, &closure_scopes, closure_method_context)
+            })
+            .flatten();
         let semantic = SemanticFunctionType {
             invocation_mode,
             parameters,
@@ -8226,6 +8236,7 @@ impl<'program> Checker<'program> {
             is_static: true,
             static_span: None,
             name: "<closure>".to_string(),
+            name_span: closure.keyword_span,
             type_params,
             params: parameters,
             return_type: closure
@@ -10871,6 +10882,14 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn type_can_return_borrow(&self, ty: TypeId) -> bool {
+        match self.types.kind(ty) {
+            TypeKind::Nullable(inner) => self.type_can_return_borrow(*inner),
+            TypeKind::Class(_) | TypeKind::TypeParameter(_) => true,
+            _ => false,
+        }
+    }
+
     fn type_is_symbolic(&self, ty: TypeId) -> bool {
         match self.types.kind(ty) {
             TypeKind::TypeParameter(_) => true,
@@ -11571,10 +11590,6 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
-        if name.contains('\\') {
-            self.report_deferred_qualified_name(name, span);
-            return;
-        }
         if name == "print" {
             self.diagnostics.push(
                 Diagnostic::new("E0462", "Doria does not support `print`; use `echo`", span)
@@ -12340,10 +12355,6 @@ impl<'program> Checker<'program> {
             return;
         };
         let class_name = class_name.as_str();
-        if class_name.contains('\\') && !crate::compiler_known_io::is_canonical_type(class_name) {
-            self.report_deferred_qualified_name(class_name, access.span);
-            return;
-        }
         if let Some(definition) = self.enums.get(class_name).cloned() {
             self.check_enum_case_call(&definition, access, args, scopes, method_context);
             return;
@@ -12757,10 +12768,6 @@ impl<'program> Checker<'program> {
             return;
         };
         let class_name = class_name.as_str();
-        if class_name.contains('\\') && !crate::compiler_known_io::is_canonical_type(class_name) {
-            self.report_deferred_qualified_name(class_name, access.span);
-            return;
-        }
         if let Some(definition) = self.enums.get(class_name).cloned() {
             self.check_enum_case_member(&definition, access);
             return;
@@ -13046,10 +13053,6 @@ impl<'program> Checker<'program> {
         span: Span,
         method_context: Option<&MethodContext>,
     ) {
-        if class_name.contains('\\') && !crate::compiler_known_io::is_canonical_type(class_name) {
-            self.report_deferred_qualified_name(class_name, span);
-            return;
-        }
         let Some(class_info) = self.classes.get(class_name) else {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
@@ -14494,16 +14497,6 @@ impl<'program> Checker<'program> {
         }
     }
 
-    fn report_deferred_qualified_name(&mut self, name: &str, span: Span) {
-        self.diagnostics.push(Diagnostic::new(
-            "E0475",
-            format!(
-                "qualified name `{name}` is accepted syntax but namespace resolution is not available in this compiler version"
-            ),
-            span,
-        ));
-    }
-
     fn resolve_type_ref(&mut self, ty: &TypeRef, span: Span) -> TypeId {
         self.resolve_type_ref_in_position(ty, span, TypePosition::Value, None)
     }
@@ -14597,13 +14590,6 @@ impl<'program> Checker<'program> {
                 ),
                 span,
             ));
-            return self.types.unknown();
-        }
-        if ty.name.contains('\\') && !crate::compiler_known_io::is_canonical_type(&ty.name) {
-            for arg in ty.type_arguments() {
-                self.resolve_type_ref_in_position(arg, span, TypePosition::Value, declaring_class);
-            }
-            self.report_deferred_qualified_name(&ty.name, span);
             return self.types.unknown();
         }
         if ty.nullable {

@@ -2339,19 +2339,18 @@ fn reserves_displayable_and_defers_general_interfaces() {
 }
 
 #[test]
-fn reports_stable_semantic_gaps_for_accepted_class_workflow_syntax() {
+fn resolves_same_file_class_workflow_names_before_later_stage_boundaries() {
     let diagnostics = doriac::check_source(
         "test.doria",
         r#"
 namespace Vendor\App;
-class Child extends Vendor\Base implements Vendor\Contracts\Printable {}
+class Base {}
+interface Printable {}
+class Child extends Base implements Printable {}
 "#,
     )
-    .expect_err("namespace, inheritance, and general conformance are not implemented yet");
+    .expect_err("inheritance and interface conformance are not implemented yet");
 
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == "E0475" && diagnostic.message.contains("namespace")));
     assert!(diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "E0476" && diagnostic.message.contains("extends")));
@@ -2364,23 +2363,23 @@ class Child extends Vendor\Base implements Vendor\Contracts\Printable {}
 }
 
 #[test]
-fn reports_qualified_type_names_as_semantic_coverage() {
+fn reports_external_qualified_type_names_as_slice_two_boundaries() {
     let diagnostics = doriac::check_source(
         "test.doria",
         "function accept(Vendor\\Contracts\\Input $input): void {}",
     )
-    .expect_err("qualified-name resolution is not implemented yet");
+    .expect_err("external qualified names require the package graph");
 
     assert!(diagnostics
         .iter()
-        .any(|diagnostic| diagnostic.code == "E0475" && diagnostic.message.contains("namespace")));
+        .any(|diagnostic| diagnostic.code == "E0671"));
     assert!(diagnostics
         .iter()
         .all(|diagnostic| !diagnostic.code.starts_with('P')));
 }
 
 #[test]
-fn reports_qualified_bare_identifiers_as_semantic_coverage() {
+fn reports_external_qualified_values_as_slice_two_boundaries() {
     let diagnostics = doriac::check_source(
         "test.doria",
         r#"
@@ -2388,11 +2387,11 @@ let $value = Vendor\Lib\VALUE;
 echo "{Vendor\Lib\LABEL}";
 "#,
     )
-    .expect_err("qualified-name resolution is not implemented yet");
+    .expect_err("external qualified names require the package graph");
 
     let qualified_name_diagnostics = diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.code == "E0475")
+        .filter(|diagnostic| diagnostic.code == "E0671")
         .count();
     assert_eq!(qualified_name_diagnostics, 2, "{diagnostics:#?}");
     assert!(diagnostics
@@ -3446,7 +3445,6 @@ function f(): int
     .expect_err("semantic check should fail");
 
     assert!(err.iter().any(|diagnostic| diagnostic.code == "E0308"));
-    assert!(err.iter().any(|diagnostic| diagnostic.code == "E0404"));
 }
 
 #[test]

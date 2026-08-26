@@ -1,0 +1,7 @@
+namespace Acme\Application;
+
+include "generated/routes.doria";
+
+function main(): void
+{
+}

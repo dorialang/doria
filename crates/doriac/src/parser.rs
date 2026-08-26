@@ -1,7 +1,7 @@
 use crate::ast::*;
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::lexer::{Lexer, StringQuoteKind, Token, TokenKind};
-use crate::source::{SourceFile, Span};
+use crate::source::{NameSegmentRef, QualifiedNameRef, SourceFile, Span};
 use crate::string_literal::{decode_escape, interpolation_close};
 use crate::types::{
     FunctionInvocationMode, FunctionTypeEffectRef, FunctionTypeParameterMode,
@@ -12,6 +12,7 @@ pub struct Parser {
     tokens: Vec<Token>,
     current: usize,
     pending_type_argument_close: Option<Span>,
+    qualified_names: Vec<QualifiedNameRef>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -19,6 +20,7 @@ pub struct Parser {
 struct ParserCheckpoint {
     current: usize,
     pending_type_argument_close: Option<Span>,
+    qualified_names_len: usize,
     diagnostics_len: usize,
 }
 
@@ -28,27 +30,79 @@ impl Parser {
             tokens,
             current: 0,
             pending_type_argument_close: None,
+            qualified_names: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
 
     pub fn parse_program(mut self) -> DiagnosticResult<Program> {
+        let mut namespace_seen = false;
         let namespace = if self.match_kind(&TokenKind::Namespace) {
+            namespace_seen = true;
             self.parse_namespace()
         } else {
             None
         };
+        let mut imports = Vec::new();
+        let mut includes = Vec::new();
         let mut items = Vec::new();
 
         while !self.is_at_end() {
-            match self.parse_item() {
-                Some(item) => items.push(item),
-                None => self.synchronize(),
+            if self.match_kind(&TokenKind::Namespace) {
+                let keyword_span = self.previous().span;
+                let duplicate = namespace_seen;
+                namespace_seen = true;
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        if duplicate {
+                            "a Doria file may declare only one namespace"
+                        } else {
+                            "a namespace declaration must appear before every other source item"
+                        },
+                        keyword_span,
+                    )
+                    .with_title(if duplicate {
+                        "Namespace Declaration Is Duplicated"
+                    } else {
+                        "Namespace Declaration Is Not First"
+                    })
+                    .with_help(
+                        "keep one semicolon-form namespace declaration at the start of the file",
+                    ),
+                );
+                let _ = self.parse_namespace();
+            } else if self.is_php_include_migration() {
+                self.parse_php_include_migration();
+            } else if self.check(&TokenKind::Use) && !self.is_contextual_use_call() {
+                self.advance();
+                if let Some(import) = self.parse_use_decl() {
+                    imports.push(import);
+                } else {
+                    self.synchronize();
+                }
+            } else if self.match_kind(&TokenKind::Include) {
+                if let Some(include) = self.parse_include_decl() {
+                    includes.push(include);
+                } else {
+                    self.synchronize();
+                }
+            } else {
+                match self.parse_item() {
+                    Some(item) => items.push(item),
+                    None => self.synchronize(),
+                }
             }
         }
 
         if self.diagnostics.is_empty() {
-            Ok(Program { namespace, items })
+            Ok(Program {
+                namespace,
+                imports,
+                includes,
+                qualified_names: self.qualified_names,
+                items,
+            })
         } else {
             Err(self.diagnostics)
         }
@@ -58,6 +112,7 @@ impl Parser {
         ParserCheckpoint {
             current: self.current,
             pending_type_argument_close: self.pending_type_argument_close,
+            qualified_names_len: self.qualified_names.len(),
             diagnostics_len: self.diagnostics.len(),
         }
     }
@@ -65,22 +120,299 @@ impl Parser {
     fn restore_checkpoint(&mut self, checkpoint: ParserCheckpoint) {
         self.current = checkpoint.current;
         self.pending_type_argument_close = checkpoint.pending_type_argument_close;
+        self.qualified_names
+            .truncate(checkpoint.qualified_names_len);
         self.diagnostics.truncate(checkpoint.diagnostics_len);
     }
 
     fn parse_namespace(&mut self) -> Option<NamespaceDecl> {
-        let start = self.previous().span.start;
-        let name = self.expect_qualified_name("expected namespace name")?;
-        let end = self
-            .expect(
-                TokenKind::Semicolon,
-                "expected `;` after namespace declaration",
-            )?
-            .span
-            .end;
+        let keyword_span = self.previous().span;
+        if self.check(&TokenKind::Semicolon) || self.is_at_end() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "a namespace declaration requires a non-empty qualified name",
+                    self.peek().span,
+                )
+                .with_title("Namespace Name Is Missing"),
+            );
+            return None;
+        }
+        let name = self.expect_qualified_name_ref("expected namespace name")?;
+        if self.check(&TokenKind::Backslash) {
+            self.report_incomplete_qualified_name("namespace name");
+            return None;
+        }
+        if self.check(&TokenKind::LeftBrace) {
+            let brace = self.advance().span;
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "Doria namespace declarations use semicolon form",
+                    brace,
+                )
+                .with_title("Braced Namespace Is Not Supported")
+                .with_help("end the namespace declaration with `;`"),
+            );
+            return None;
+        }
+        let semicolon_span = self.expect_directive_semicolon("namespace declaration")?;
+        self.qualified_names.push(name.clone());
         Some(NamespaceDecl {
             name,
-            span: Span::new(start, end),
+            keyword_span,
+            semicolon_span,
+            span: Span::new(keyword_span.start, semicolon_span.end),
+        })
+    }
+
+    fn parse_use_decl(&mut self) -> Option<UseDecl> {
+        let keyword_span = self.previous().span;
+        if self.check(&TokenKind::Function) || self.check(&TokenKind::Const) {
+            let rejected = self.advance().clone();
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "Doria has one import operation for all global declarations",
+                    rejected.span,
+                )
+                .with_title("Import Kind Is Not Supported")
+                .with_help("remove the import kind after `use`"),
+            );
+        }
+        if self.check(&TokenKind::Semicolon) || self.is_at_end() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "a `use` declaration requires a qualified import target",
+                    self.peek().span,
+                )
+                .with_title("Import Target Is Missing"),
+            );
+            return None;
+        }
+        let target = self.parse_qualified_name_ref("expected import target")?;
+        let mut prefix = None;
+        let mut group_separator_span = None;
+        let mut group_open_span = None;
+        let mut group_close_span = None;
+        let mut comma_spans = Vec::new();
+        let mut entries = Vec::new();
+
+        if self.check(&TokenKind::Backslash)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::LeftBrace))
+        {
+            let separator = self.advance().span;
+            group_separator_span = Some(separator);
+            prefix = Some(target);
+            group_open_span = Some(self.advance().span);
+            if self.check(&TokenKind::RightBrace) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "a grouped import must contain at least one entry",
+                        self.peek().span,
+                    )
+                    .with_title("Import Group Is Empty"),
+                );
+            }
+            while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+                if self.match_kind(&TokenKind::Comma) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "P0001",
+                            "a grouped import cannot contain an empty entry",
+                            self.previous().span,
+                        )
+                        .with_title("Import Group Has An Empty Entry"),
+                    );
+                    comma_spans.push(self.previous().span);
+                    continue;
+                }
+                if self.match_kind(&TokenKind::Star) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "P0001",
+                            "wildcard imports can silently change meaning when a package adds a declaration",
+                            self.previous().span,
+                        )
+                        .with_title("Wildcard Import Is Not Supported")
+                        .with_help("import each required declaration explicitly"),
+                    );
+                } else {
+                    let entry_target =
+                        self.parse_qualified_name_ref("expected grouped import entry")?;
+                    if self.check(&TokenKind::Backslash) {
+                        self.report_incomplete_qualified_name("grouped import entry");
+                        return None;
+                    }
+                    let entry_start = entry_target.span.start;
+                    let (as_span, alias) = self.parse_optional_import_alias()?;
+                    let entry_end = alias
+                        .as_ref()
+                        .map_or(entry_target.span.end, |alias| alias.span.end);
+                    self.qualified_names.push(entry_target.clone());
+                    entries.push(UseEntry {
+                        target: entry_target,
+                        as_span,
+                        alias,
+                        span: Span::new(entry_start, entry_end),
+                    });
+                }
+                if self.match_kind(&TokenKind::Comma) {
+                    comma_spans.push(self.previous().span);
+                    if self.check(&TokenKind::RightBrace) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            }
+            if !self.check(&TokenKind::RightBrace) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "expected `}` after grouped import",
+                        self.peek().span,
+                    )
+                    .with_title("Import Group Is Not Closed"),
+                );
+                return None;
+            }
+            group_close_span = Some(self.advance().span);
+        } else {
+            if self.match_kind(&TokenKind::Backslash) {
+                let separator = self.previous().span;
+                if self.match_kind(&TokenKind::Star) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "P0001",
+                            "wildcard imports can silently change meaning when a package adds a declaration",
+                            self.previous().span,
+                        )
+                        .with_title("Wildcard Import Is Not Supported")
+                        .with_help("import each required declaration explicitly"),
+                    );
+                } else {
+                    let _ = separator;
+                    self.report_incomplete_qualified_name_after_separator("import target");
+                    return None;
+                }
+            }
+            let entry_start = target.span.start;
+            let (as_span, alias) = self.parse_optional_import_alias()?;
+            let entry_end = alias
+                .as_ref()
+                .map_or(target.span.end, |alias| alias.span.end);
+            self.qualified_names.push(target.clone());
+            entries.push(UseEntry {
+                target,
+                as_span,
+                alias,
+                span: Span::new(entry_start, entry_end),
+            });
+        }
+
+        let semicolon_span = self.expect_directive_semicolon("import")?;
+        let span = Span::new(keyword_span.start, semicolon_span.end);
+        Some(UseDecl {
+            keyword_span,
+            prefix,
+            group_separator_span,
+            group_open_span,
+            entries,
+            group_close_span,
+            comma_spans,
+            semicolon_span,
+            span,
+        })
+    }
+
+    fn parse_optional_import_alias(&mut self) -> Option<(Option<Span>, Option<NameRef>)> {
+        if !self.match_kind(&TokenKind::As) {
+            return Some((None, None));
+        }
+        let as_span = self.previous().span;
+        let TokenKind::Identifier(text) = self.peek().kind.clone() else {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "expected an identifier after `as`",
+                    self.peek().span,
+                )
+                .with_title("Import Alias Is Missing"),
+            );
+            return None;
+        };
+        self.advance();
+        let span = self.previous().span;
+        Some((Some(as_span), Some(NameRef { text, span })))
+    }
+
+    fn parse_include_decl(&mut self) -> Option<IncludeDecl> {
+        let keyword_span = self.previous().span;
+        if self.is_at_end() || self.check(&TokenKind::Semicolon) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "`include` requires one non-interpolated string literal path",
+                    self.peek().span,
+                )
+                .with_title("Include Path Is Missing"),
+            );
+            return None;
+        }
+        let literal = self.advance().clone();
+        let TokenKind::StringLiteral { value, raw, quote } = literal.kind else {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "`include` requires one non-interpolated string literal path",
+                    literal.span,
+                )
+                .with_title("Include Path Must Be A Literal"),
+            );
+            return None;
+        };
+        if matches!(quote, StringQuoteKind::Double)
+            && raw.char_indices().any(|(index, character)| {
+                character == '{'
+                    && (index == 0 || !raw[..index].ends_with('\\'))
+                    && interpolation_close(&raw, index).is_some()
+            })
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "an include path cannot contain string interpolation",
+                    literal.span,
+                )
+                .with_title("Include Path Must Be Constant"),
+            );
+        }
+        if is_remote_include_path(&value) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "Doria include paths name same-package source files, not remote URLs",
+                    literal.span,
+                )
+                .with_title("Remote Include Is Not Supported")
+                .with_help("use the package dependency model for external source"),
+            );
+        }
+        let semicolon_span = self.expect_directive_semicolon("include directive")?;
+        Some(IncludeDecl {
+            keyword_span,
+            raw,
+            value,
+            quote,
+            literal_span: literal.span,
+            semicolon_span,
+            span: Span::new(keyword_span.start, semicolon_span.end),
         })
     }
 
@@ -97,7 +429,7 @@ impl Parser {
             && self
                 .tokens
                 .get(self.current + 1)
-                .is_some_and(|token| matches!(token.kind, TokenKind::Identifier(_)))
+                .is_some_and(Self::is_callable_name_token)
         {
             self.advance();
             self.parse_function(MemberAccess::External, None, None, self.previous().span)
@@ -191,6 +523,7 @@ impl Parser {
     fn parse_class(&mut self) -> Option<ClassDecl> {
         let start = self.previous().span.start;
         let name = self.expect_type_declaration_name("expected class name")?;
+        let name_span = self.previous().span;
         let type_params = self.parse_type_params()?;
         let (parent, parent_span) = if self.match_kind(&TokenKind::Extends) {
             let parent_start = self.previous().span.start;
@@ -231,6 +564,7 @@ impl Parser {
 
         Some(ClassDecl {
             name,
+            name_span,
             type_params,
             parent,
             parent_span,
@@ -243,6 +577,7 @@ impl Parser {
     fn parse_trait(&mut self) -> Option<TraitDecl> {
         let start = self.previous().span.start;
         let name = self.expect_type_declaration_name("expected trait name")?;
+        let name_span = self.previous().span;
         self.expect(TokenKind::LeftBrace, "expected `{` after trait name")?;
 
         let mut members = Vec::new();
@@ -260,12 +595,34 @@ impl Parser {
             .end;
         Some(TraitDecl {
             name,
+            name_span,
             members,
             span: Span::new(start, end),
         })
     }
 
     fn parse_class_member(&mut self) -> Option<ClassMember> {
+        if self.check(&TokenKind::Use) || self.check(&TokenKind::Include) {
+            let token = self.advance().clone();
+            let (title, message) = if matches!(token.kind, TokenKind::Use) {
+                (
+                    "Import Is Not At File Scope",
+                    "`use` imports are valid only at file scope",
+                )
+            } else {
+                (
+                    "Include Is Not At File Scope",
+                    "`include` is valid only at file scope",
+                )
+            };
+            self.diagnostics
+                .push(Diagnostic::new("P0001", message, token.span).with_title(title));
+            while !self.check(&TokenKind::Semicolon) && !self.is_at_end() {
+                self.advance();
+            }
+            self.match_kind(&TokenKind::Semicolon);
+            return None;
+        }
         let access = self.parse_member_access();
         if self.match_kind(&TokenKind::Const) {
             let start = self.previous().span.start;
@@ -284,7 +641,7 @@ impl Parser {
             && self
                 .tokens
                 .get(self.current + 1)
-                .is_some_and(|token| matches!(token.kind, TokenKind::Identifier(_)))
+                .is_some_and(Self::is_callable_name_token)
         {
             self.advance();
             let start = self.previous().span.start;
@@ -332,6 +689,7 @@ impl Parser {
             Some(self.parse_type_ref()?)
         };
         let name = self.expect_identifier("expected constant name")?;
+        let name_span = self.previous().span;
         self.expect(TokenKind::Equals, "expected `=` after constant name")?;
         let initializer = self.parse_expression()?;
         let end = self
@@ -345,6 +703,7 @@ impl Parser {
             access,
             ty,
             name,
+            name_span,
             initializer,
             span: Span::new(start, end),
         })
@@ -358,7 +717,8 @@ impl Parser {
         start_span: Span,
     ) -> Option<FunctionDecl> {
         let start = start_span.start;
-        let name = self.expect_identifier("expected function name")?;
+        let name = self.expect_callable_name("expected function name")?;
+        let name_span = self.previous().span;
         let type_params = self.parse_type_params()?;
         self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
 
@@ -398,6 +758,7 @@ impl Parser {
             is_static: static_span.is_some(),
             static_span,
             name,
+            name_span,
             type_params,
             params,
             return_type,
@@ -488,6 +849,7 @@ impl Parser {
     fn parse_interface(&mut self) -> Option<InterfaceDecl> {
         let start = self.previous().span.start;
         let name = self.expect_identifier("expected interface name")?;
+        let name_span = self.previous().span;
         self.expect(TokenKind::LeftBrace, "expected `{` after interface name")?;
 
         let mut depth = 1_usize;
@@ -497,8 +859,23 @@ impl Parser {
                 self.error("expected `}` after interface body", self.peek().span);
                 return None;
             }
-            let token = self.advance();
+            let token = self.advance().clone();
             end = token.span.end;
+            if matches!(token.kind, TokenKind::Use | TokenKind::Include) {
+                let (title, message) = if matches!(token.kind, TokenKind::Use) {
+                    (
+                        "Import Is Not At File Scope",
+                        "`use` imports are valid only at file scope",
+                    )
+                } else {
+                    (
+                        "Include Is Not At File Scope",
+                        "`include` is valid only at file scope",
+                    )
+                };
+                self.diagnostics
+                    .push(Diagnostic::new("P0001", message, token.span).with_title(title));
+            }
             match token.kind {
                 TokenKind::LeftBrace => depth += 1,
                 TokenKind::RightBrace => depth -= 1,
@@ -508,6 +885,7 @@ impl Parser {
 
         Some(InterfaceDecl {
             name,
+            name_span,
             span: Span::new(start, end),
         })
     }
@@ -763,7 +1141,7 @@ impl Parser {
             let keyword_span = self.previous().span;
             return self.parse_closure_capture_clause(keyword_span).map(Some);
         }
-        if matches!(&self.peek().kind, TokenKind::Identifier(name) if name == "use")
+        if self.check(&TokenKind::Use)
             && self
                 .tokens
                 .get(self.current + 1)
@@ -938,6 +1316,31 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Option<Stmt> {
+        if self.check(&TokenKind::Use) && !self.is_contextual_use_call() {
+            self.advance();
+            let span = self.previous().span;
+            self.diagnostics.push(
+                Diagnostic::new("P0001", "`use` imports are valid only at file scope", span)
+                    .with_title("Import Is Not At File Scope"),
+            );
+            while !self.check(&TokenKind::Semicolon) && !self.is_at_end() {
+                self.advance();
+            }
+            self.match_kind(&TokenKind::Semicolon);
+            return None;
+        }
+        if self.match_kind(&TokenKind::Include) {
+            let span = self.previous().span;
+            self.diagnostics.push(
+                Diagnostic::new("P0001", "`include` is valid only at file scope", span)
+                    .with_title("Include Is Not At File Scope"),
+            );
+            while !self.check(&TokenKind::Semicolon) && !self.is_at_end() {
+                self.advance();
+            }
+            self.match_kind(&TokenKind::Semicolon);
+            return None;
+        }
         if self.check(&TokenKind::LeftBrace) {
             return self.parse_block().map(Stmt::Block);
         }
@@ -1984,8 +2387,8 @@ impl Parser {
                 None
             };
             if let Some(null_safe) = null_safe {
-                let property =
-                    self.expect_identifier("expected property or method name after member access")?;
+                let property = self
+                    .expect_member_name("expected property or method name after member access")?;
                 let member_span = self.previous().span;
                 if self.match_kind(&TokenKind::LeftParen) {
                     let argument_list_start = self.previous().span.start;
@@ -2090,6 +2493,18 @@ impl Parser {
         }
         let token = self.advance().clone();
         match token.kind {
+            TokenKind::Backslash => {
+                self.report_leading_namespace_separator(token.span);
+                let name_token = self.advance().clone();
+                let TokenKind::Identifier(name) = name_token.kind else {
+                    self.error(
+                        "expected name after leading namespace separator",
+                        name_token.span,
+                    );
+                    return None;
+                };
+                self.parse_named_primary(name, name_token.span)
+            }
             TokenKind::Throw => {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -2112,25 +2527,8 @@ impl Parser {
                     })
                 }
             }
-            TokenKind::Identifier(name) => {
-                let name = self.finish_qualified_name(
-                    name,
-                    "expected name segment after namespace separator",
-                )?;
-                let name_span = Span::new(token.span.start, self.previous().span.end);
-                if self.match_kind(&TokenKind::DoubleColon) {
-                    self.parse_scoped_access(
-                        StaticQualifier::Class(name),
-                        name_span,
-                        token.span.start,
-                    )
-                } else {
-                    Some(Expr::Identifier {
-                        name,
-                        span: name_span,
-                    })
-                }
-            }
+            TokenKind::Identifier(name) => self.parse_named_primary(name, token.span),
+            TokenKind::Use => self.parse_named_primary("use".to_string(), token.span),
             TokenKind::SelfType if self.match_kind(&TokenKind::DoubleColon) => {
                 self.parse_scoped_access(StaticQualifier::SelfType, token.span, token.span.start)
             }
@@ -2320,6 +2718,9 @@ impl Parser {
         }
 
         let enum_case_checkpoint = self.current;
+        if self.match_kind(&TokenKind::Backslash) {
+            self.report_leading_namespace_separator(self.previous().span);
+        }
         if let TokenKind::Identifier(name) = self.peek().kind.clone() {
             let qualifier_token = self.advance().clone();
             let name = self.finish_qualified_name(
@@ -3237,6 +3638,12 @@ impl Parser {
     fn parse_type_ref_inner(&mut self) -> Option<TypeRef> {
         let nullable = self.match_kind(&TokenKind::Question);
         let token = self.advance().clone();
+        let token = if matches!(token.kind, TokenKind::Backslash) {
+            self.report_leading_namespace_separator(token.span);
+            self.advance().clone()
+        } else {
+            token
+        };
         let mut ty = if matches!(token.kind, TokenKind::Function) {
             self.parse_function_type_ref(token.span)?
         } else if matches!(token.kind, TokenKind::LeftParen) {
@@ -3280,30 +3687,39 @@ impl Parser {
                 TypeRef::grouped(inner, token.span, close_span)
             }
         } else {
-            let name = match token.kind {
-                TokenKind::Void => "void".to_string(),
-                TokenKind::IntType => "int".to_string(),
-                TokenKind::Int8Type => "int8".to_string(),
-                TokenKind::Int16Type => "int16".to_string(),
-                TokenKind::Int32Type => "int32".to_string(),
-                TokenKind::Int64Type => "int64".to_string(),
-                TokenKind::UInt8Type => "uint8".to_string(),
-                TokenKind::UInt16Type => "uint16".to_string(),
-                TokenKind::UInt32Type => "uint32".to_string(),
-                TokenKind::UInt64Type => "uint64".to_string(),
-                TokenKind::FloatType => "float".to_string(),
-                TokenKind::Float32Type => "float32".to_string(),
-                TokenKind::Float64Type => "float64".to_string(),
-                TokenKind::StringType => "string".to_string(),
-                TokenKind::BoolType => "bool".to_string(),
-                TokenKind::Null => "null".to_string(),
-                TokenKind::Object => "object".to_string(),
-                TokenKind::Resource => "resource".to_string(),
-                TokenKind::SelfType => "self".to_string(),
-                TokenKind::Identifier(name) => self.finish_qualified_name(
-                    name,
-                    "expected type-name segment after namespace separator",
-                )?,
+            let (name, source_name) = match token.kind {
+                TokenKind::Void => ("void".to_string(), None),
+                TokenKind::IntType => ("int".to_string(), None),
+                TokenKind::Int8Type => ("int8".to_string(), None),
+                TokenKind::Int16Type => ("int16".to_string(), None),
+                TokenKind::Int32Type => ("int32".to_string(), None),
+                TokenKind::Int64Type => ("int64".to_string(), None),
+                TokenKind::UInt8Type => ("uint8".to_string(), None),
+                TokenKind::UInt16Type => ("uint16".to_string(), None),
+                TokenKind::UInt32Type => ("uint32".to_string(), None),
+                TokenKind::UInt64Type => ("uint64".to_string(), None),
+                TokenKind::FloatType => ("float".to_string(), None),
+                TokenKind::Float32Type => ("float32".to_string(), None),
+                TokenKind::Float64Type => ("float64".to_string(), None),
+                TokenKind::StringType => ("string".to_string(), None),
+                TokenKind::BoolType => ("bool".to_string(), None),
+                TokenKind::Null => ("null".to_string(), None),
+                TokenKind::Object => ("object".to_string(), None),
+                TokenKind::Resource => ("resource".to_string(), None),
+                TokenKind::SelfType => ("self".to_string(), None),
+                TokenKind::Identifier(name) => {
+                    let source_name = self.finish_qualified_name_ref(name, token.span)?;
+                    if self.check(&TokenKind::Backslash) {
+                        self.error(
+                            "expected type-name segment after namespace separator",
+                            self.peek().span,
+                        );
+                        return None;
+                    }
+                    let canonical = source_name.canonical();
+                    self.qualified_names.push(source_name.clone());
+                    (canonical, Some(source_name))
+                }
                 other => {
                     self.error(
                         format!("expected type name, found `{}`", token_name(&other)),
@@ -3343,11 +3759,15 @@ impl Parser {
                 self.expect_type_argument_close()?;
             }
 
-            if arguments.is_empty() {
+            let mut ty = if arguments.is_empty() {
                 TypeRef::named(name)
             } else {
                 TypeRef::generic_with_arguments(name, arguments)
+            };
+            if let Some(source_name) = source_name {
+                ty = ty.with_source_name(source_name);
             }
+            ty
         };
 
         while self.pending_type_argument_close.is_none() && self.match_kind(&TokenKind::LeftBracket)
@@ -3496,6 +3916,34 @@ impl Parser {
         }
     }
 
+    fn expect_callable_name(&mut self, message: &str) -> Option<String> {
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Identifier(name) => Some(name),
+            TokenKind::Use => Some("use".to_string()),
+            _ => {
+                self.error(message, token.span);
+                None
+            }
+        }
+    }
+
+    fn expect_member_name(&mut self, message: &str) -> Option<String> {
+        self.expect_callable_name(message)
+    }
+
+    fn is_callable_name_token(token: &Token) -> bool {
+        matches!(token.kind, TokenKind::Identifier(_) | TokenKind::Use)
+    }
+
+    fn is_contextual_use_call(&self) -> bool {
+        self.check(&TokenKind::Use)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::LeftParen))
+    }
+
     fn expect_type_declaration_name(&mut self, message: &str) -> Option<String> {
         let token = self.advance().clone();
         match token.kind {
@@ -3508,17 +3956,169 @@ impl Parser {
         }
     }
 
-    fn expect_qualified_name(&mut self, message: &str) -> Option<String> {
-        let first = self.expect_identifier(message)?;
-        self.finish_qualified_name(first, "expected name segment after namespace separator")
+    fn expect_qualified_name_ref(&mut self, message: &str) -> Option<QualifiedNameRef> {
+        self.parse_qualified_name_ref(message)
     }
 
-    fn finish_qualified_name(&mut self, mut name: String, message: &str) -> Option<String> {
-        while self.match_kind(&TokenKind::Backslash) {
-            name.push('\\');
-            name.push_str(&self.expect_identifier(message)?);
+    fn parse_qualified_name_ref(&mut self, message: &str) -> Option<QualifiedNameRef> {
+        if self.match_kind(&TokenKind::Backslash) {
+            self.report_leading_namespace_separator(self.previous().span);
+        }
+        let first = self.expect_identifier(message)?;
+        let first_span = self.previous().span;
+        self.finish_qualified_name_ref(first, first_span)
+    }
+
+    fn expect_qualified_name(&mut self, message: &str) -> Option<String> {
+        let name = self.parse_qualified_name_ref(message)?;
+        let canonical = name.canonical();
+        self.qualified_names.push(name);
+        Some(canonical)
+    }
+
+    fn finish_qualified_name(&mut self, first: String, message: &str) -> Option<String> {
+        let first_span = self.previous().span;
+        let name = self.finish_qualified_name_ref(first, first_span)?;
+        if self.check(&TokenKind::Backslash) {
+            self.error(message, self.peek().span);
+            return None;
+        }
+        let canonical = name.canonical();
+        self.qualified_names.push(name);
+        Some(canonical)
+    }
+
+    fn finish_qualified_name_ref(
+        &mut self,
+        first: String,
+        first_span: Span,
+    ) -> Option<QualifiedNameRef> {
+        let mut name = QualifiedNameRef::unqualified(first, first_span);
+        while self.check(&TokenKind::Backslash)
+            && self
+                .tokens
+                .get(self.current + 1)
+                .is_some_and(|token| matches!(token.kind, TokenKind::Identifier(_)))
+        {
+            let separator = self.advance().span;
+            let segment =
+                self.expect_identifier("expected name segment after namespace separator")?;
+            let segment_span = self.previous().span;
+            name.separator_spans.push(separator);
+            name.segments.push(NameSegmentRef {
+                text: segment,
+                span: segment_span,
+            });
+            name.span = name.span.merge(segment_span);
         }
         Some(name)
+    }
+
+    fn parse_named_primary(&mut self, first: String, first_span: Span) -> Option<Expr> {
+        let source_name = self.finish_qualified_name_ref(first, first_span)?;
+        if self.check(&TokenKind::Backslash) {
+            self.report_incomplete_qualified_name("expression name");
+            return None;
+        }
+        let name = source_name.canonical();
+        let name_span = source_name.span;
+        self.qualified_names.push(source_name);
+        if self.match_kind(&TokenKind::DoubleColon) {
+            self.parse_scoped_access(StaticQualifier::Class(name), name_span, name_span.start)
+        } else {
+            Some(Expr::Identifier {
+                name,
+                span: name_span,
+            })
+        }
+    }
+
+    fn report_leading_namespace_separator(&mut self, separator: Span) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "P0001",
+                "qualified Doria names do not use a leading namespace separator",
+                separator,
+            )
+            .with_title("Leading Namespace Separator Is Not Supported")
+            .with_help("remove the leading namespace separator")
+            .with_fix(separator, ""),
+        );
+    }
+
+    fn report_incomplete_qualified_name(&mut self, subject: &str) {
+        let separator = self.advance().span;
+        self.report_incomplete_qualified_name_after_separator_at(subject, separator);
+    }
+
+    fn report_incomplete_qualified_name_after_separator(&mut self, subject: &str) {
+        self.report_incomplete_qualified_name_after_separator_at(subject, self.previous().span);
+    }
+
+    fn report_incomplete_qualified_name_after_separator_at(
+        &mut self,
+        subject: &str,
+        separator: Span,
+    ) {
+        let (title, message) = if self.check(&TokenKind::Backslash) {
+            (
+                "Qualified Name Has An Empty Segment",
+                format!("{subject} contains an empty name segment"),
+            )
+        } else {
+            (
+                "Qualified Name Has A Trailing Separator",
+                format!("{subject} must not end with a namespace separator"),
+            )
+        };
+        self.diagnostics
+            .push(Diagnostic::new("P0001", message, separator).with_title(title));
+    }
+
+    fn expect_directive_semicolon(&mut self, subject: &str) -> Option<Span> {
+        if self.check(&TokenKind::Semicolon) {
+            return Some(self.advance().span);
+        }
+        let insertion = Span::new(self.peek().span.start, self.peek().span.start);
+        self.diagnostics.push(
+            Diagnostic::new("P0001", format!("expected `;` after {subject}"), insertion)
+                .with_title("Directive Semicolon Is Missing")
+                .with_fix(insertion, ";"),
+        );
+        None
+    }
+
+    fn is_php_include_migration(&self) -> bool {
+        matches!(
+            self.tokens.get(self.current).map(|token| &token.kind),
+            Some(TokenKind::Identifier(name))
+                if matches!(name.as_str(), "require" | "require_once" | "include_once")
+        ) && matches!(
+            self.tokens.get(self.current + 1).map(|token| &token.kind),
+            Some(TokenKind::StringLiteral { .. })
+        ) && matches!(
+            self.tokens.get(self.current + 2).map(|token| &token.kind),
+            Some(TokenKind::Semicolon)
+        )
+    }
+
+    fn parse_php_include_migration(&mut self) {
+        let token = self.advance().clone();
+        let TokenKind::Identifier(name) = token.kind else {
+            unreachable!("migration lookahead requires an identifier")
+        };
+        self.advance();
+        self.advance();
+        self.diagnostics.push(
+            Diagnostic::new(
+                "P0001",
+                format!("Doria does not support PHP `{name}`; source composition uses `include`"),
+                token.span,
+            )
+            .with_title("Use Doria Include Syntax")
+            .with_help("replace the PHP source-composition keyword with `include`")
+            .with_fix(token.span, "include"),
+        );
     }
 
     fn expect_variable(&mut self, message: &str) -> Option<(String, Span)> {
@@ -3601,6 +4201,8 @@ impl Parser {
                 | TokenKind::Interface
                 | TokenKind::Trait
                 | TokenKind::Namespace
+                | TokenKind::Use
+                | TokenKind::Include
                 | TokenKind::Function
                 | TokenKind::Const
                 | TokenKind::Let
@@ -3634,6 +4236,8 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Trait => "trait",
         TokenKind::Implements => "implements",
         TokenKind::Namespace => "namespace",
+        TokenKind::Use => "use",
+        TokenKind::Include => "include",
         TokenKind::Extends => "extends",
         TokenKind::Function => "function",
         TokenKind::Fn => "fn",
@@ -3757,4 +4361,15 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::DoubleColon => "::",
         TokenKind::Eof => "end of file",
     }
+}
+
+fn is_remote_include_path(path: &str) -> bool {
+    let Some((scheme, _)) = path.split_once("://") else {
+        return false;
+    };
+    !scheme.is_empty()
+        && scheme.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_alphabetic()
+                || (index > 0 && matches!(byte, b'0'..=b'9' | b'+' | b'-' | b'.'))
+        })
 }

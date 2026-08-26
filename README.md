@@ -168,6 +168,12 @@ Fatal panic remains a distinct cleanup-free status-101 outcome.
 
 Official language-server and editor integrations are developed separately in [`dorialang/doria-language-server`](https://github.com/dorialang/doria-language-server), which consumes reusable `doriac` frontend services without duplicating compiler semantics.
 
+Doria source may declare one file-wide namespace and use individual, aliased,
+or grouped imports. Qualified names are exact and absolute whenever they contain
+`\`; unqualified names resolve through explicit imports, the current namespace,
+and the documented edition prelude. Package source discovery and `include`
+operate at compile time; Doria source loading is never lowered to runtime PHP.
+
 Baton is the accepted project and package tool for Doria. Its current PHP
 bootstrap reads manifest schema 1 only: one binary target with an explicit
 entry file and no autoload, dependencies, lockfile, or workspace. Decision

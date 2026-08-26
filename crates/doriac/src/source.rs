@@ -1,7 +1,54 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct NameSegmentRef {
+    pub text: String,
+    pub span: Span,
+}
+
+/// A source-preserving Doria name. Separators are retained independently so
+/// diagnostics and editor tooling never need to reconstruct authored syntax
+/// from a flattened semantic name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QualifiedNameRef {
+    pub segments: Vec<NameSegmentRef>,
+    pub separator_spans: Vec<Span>,
+    pub span: Span,
+}
+
+impl QualifiedNameRef {
+    pub fn unqualified(text: impl Into<String>, span: Span) -> Self {
+        Self {
+            segments: vec![NameSegmentRef {
+                text: text.into(),
+                span,
+            }],
+            separator_spans: Vec::new(),
+            span,
+        }
+    }
+
+    pub fn canonical(&self) -> String {
+        self.segments
+            .iter()
+            .map(|segment| segment.text.as_str())
+            .collect::<Vec<_>>()
+            .join("\\")
+    }
+
+    pub fn is_qualified(&self) -> bool {
+        !self.separator_spans.is_empty()
+    }
+
+    pub fn final_segment(&self) -> &NameSegmentRef {
+        self.segments
+            .last()
+            .expect("a parsed qualified name has at least one segment")
+    }
 }
 
 impl Span {

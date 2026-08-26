@@ -3,10 +3,10 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-14
 - **Date:** 2026-08-14
-- **Implementation status:** Scheduled for Stage 31 and Stage 33; not implemented
-- **Current pipeline:** Stage 29 — Checked errors end-to-end — Complete;
-  pre-Stage-30 closure grammar — Complete; Decision 0121 authority — Accepted;
-  Stage 30a callable grammar completion — Next
+- **Implementation status:** Stage 31 Slice 1 implemented; Stage 31 Slice 2 next;
+  Stage 31 In Progress, Not Complete; Stage 33 Scheduled, Not Implemented
+- **Current pipeline:** Stage 30 — Complete; Stage 31 Slice 1 — Complete;
+  Stage 31 Slice 2 — Next; E0641 — Historical And Reserved
 - **Scope:** Package source discovery, file layout, compilation inputs, package
   visibility, and the Baton-to-compiler boundary
 - **Amends:** Decision 0028
@@ -84,10 +84,11 @@ formatting intrinsic family, byte I/O intrinsics, and `panic`. Library objects
 such as the future `Doria\Std\Io` stream types remain ordinary namespaced
 declarations rather than intrinsics.
 
-Decision 0119 permits the compiler to recognize only the exact canonical
-`Doria\Std\Io` checked-error identities before general namespaces execute. This
-is a bounded bootstrap exception for Stage 29 Slice 3, not a temporary short
-alias or a second namespace mechanism.
+Decision 0119 originally permitted the compiler to recognize only the exact
+canonical `Doria\Std\Io` checked-error identities before general namespaces
+executed. Stage 31 Slice 1 now resolves those identities through the same
+general resolver as every other global name. They remain compiler-known and
+reserved, with no temporary short aliases or second namespace mechanism.
 
 ## Manifest Source Mappings
 
@@ -305,11 +306,12 @@ Stage 33 Slice 1 implements Baton manifest schema 2, schema 1 compatibility,
 autoload and autoload-dev discovery, scopes, targets, and single-package build
 plans. Decision 0118 owns the rest of Stage 33.
 
-Stage 29 is complete. Its six exact compiler-known `Doria\Std\Io` identities
-are a bounded exception that does not provide general namespace resolution or
-short aliases. The pre-Stage-30 closure grammar slice is complete. Stage 30
-closure semantics is next; Stage 31 is scheduled, not implemented, and this
-accepted authority does not start it.
+Stage 30 is complete. Stage 31 Slice 1 implements source-preserving qualified
+names, namespace/import/include grammar, same-file canonical resolution, the
+edition prelude, compiler package/source context, and namespace-aware backend
+execution. Stage 31 Slice 2 is next and still owns the package compilation
+graph. Stage 31 remains in progress, not complete. Stage 33 remains scheduled
+and not implemented.
 
 ## Safe Deferrals
 
@@ -333,6 +335,8 @@ accepted authority does not start it.
 
 ## Non-Goals
 
-This decision does not implement namespaces, `use`, `include`, multi-file
-compilation, build plans, package visibility, manifest schema 2, dependency
-resolution, workspaces, or a package registry.
+This decision does not by itself implement its subject. Stage 31 Slice 1 now
+implements namespace and `use` semantics plus `include` grammar, but it does not
+implement multi-file compilation, include resolution, build plans,
+cross-package visibility, manifest schema 2, dependency resolution, workspaces,
+or a package registry.

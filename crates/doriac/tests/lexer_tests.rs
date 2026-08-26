@@ -61,6 +61,42 @@ class Child extends Vendor\Base implements Vendor\Contracts\Printable {}"#,
 }
 
 #[test]
+fn lexes_import_and_include_keywords_without_crossing_identifier_boundaries() {
+    let kinds = token_kinds(
+        r#"use include uses useful includePath use_value include2 $use $include
+"use" 'include' // use
+/* include */"#,
+    );
+
+    assert!(matches!(kinds[0], TokenKind::Use));
+    assert!(matches!(kinds[1], TokenKind::Include));
+    for (index, expected) in [
+        (2, "uses"),
+        (3, "useful"),
+        (4, "includePath"),
+        (5, "use_value"),
+        (6, "include2"),
+    ] {
+        assert!(
+            matches!(&kinds[index], TokenKind::Identifier(name) if name == expected),
+            "expected identifier `{expected}`, got {:?}",
+            kinds[index]
+        );
+    }
+    assert!(matches!(&kinds[7], TokenKind::Variable(name) if name == "use"));
+    assert!(matches!(&kinds[8], TokenKind::Variable(name) if name == "include"));
+    assert!(matches!(
+        &kinds[9],
+        TokenKind::StringLiteral { value, .. } if value == "use"
+    ));
+    assert!(matches!(
+        &kinds[10],
+        TokenKind::StringLiteral { value, .. } if value == "include"
+    ));
+    assert!(matches!(kinds[11], TokenKind::Eof));
+}
+
+#[test]
 fn lexes_string_quote_kinds() {
     let kinds = token_kinds(r#"'{}' "{}""#);
     assert!(matches!(

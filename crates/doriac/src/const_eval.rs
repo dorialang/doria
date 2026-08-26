@@ -328,7 +328,9 @@ impl Evaluator {
             | ConstKey::Class { name, .. }
             | ConstKey::Static { name, .. } => name,
         };
-        if !matches!(&node.key, ConstKey::Static { .. }) && !is_screaming_snake_case(name) {
+        let declared_name = name.rsplit('\\').next().unwrap_or(name);
+        if !matches!(&node.key, ConstKey::Static { .. }) && !is_screaming_snake_case(declared_name)
+        {
             self.diagnostics.push(
                 Diagnostic::new(
                     "E0490",

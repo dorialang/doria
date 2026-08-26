@@ -450,6 +450,9 @@ fn rejects_malformed_block_id() {
 fn void_program() -> Program {
     Program {
         source: doriac::source::SourceFile::new("<test>", ""),
+        compilation_context: doriac::names::CompilationContext::standalone("<test>"),
+        namespace: None,
+        global_symbols: doriac::names::GlobalSymbolFacts::default(),
         enums: vec![],
         classes: vec![],
         collection_types: vec![],

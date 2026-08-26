@@ -105,7 +105,7 @@ $pipeline = $read('docs/notes/current-pipeline.md');
 $decision = $read('docs/decisions/0106-shared-ownership-types-and-api.md');
 $audit = $read('docs/notes/stage-25a-final-integration-audit.md');
 foreach ([
-    [$plan, '4. final integration and LSP/editor sweep — implemented'],
+    [$plan, '**Slice 4 — Final integration and LSP/editor sweep — Implemented.**'],
     [$plan, 'Stage 25a is complete'],
     [$pipeline, 'Stage 25a Slices 1 through 4 are implemented'],
     [$pipeline, 'Stage 25a is complete'],
