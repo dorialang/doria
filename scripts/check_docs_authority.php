@@ -20,6 +20,7 @@ require_once __DIR__ . '/check_stage30h_closure_completion.php';
 require_once __DIR__ . '/check_inferred_main_effects.php';
 require_once __DIR__ . '/check_constructor_owned_property_writes.php';
 require_once __DIR__ . '/check_stage31_slice1_namespaces.php';
+require_once __DIR__ . '/check_stage31_slice2_package_graph.php';
 
 $root = dirname(__DIR__);
 $failures = check_stream_io_completeness($root);
@@ -34,6 +35,7 @@ array_push($failures, ...check_stage30e_native_closure_execution($root));
 array_push($failures, ...check_stage30g_list_algorithms($root));
 array_push($failures, ...check_stage30h_closure_completion($root));
 array_push($failures, ...check_inferred_main_effects($root));
+array_push($failures, ...check_stage31_slice2_package_graph($root));
 array_push($failures, ...check_constructor_owned_property_writes($root));
 array_push($failures, ...check_stage31_slice1_namespaces($root));
 

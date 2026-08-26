@@ -5,7 +5,8 @@ use doriac::build_plan::{
 };
 use doriac::compilation_graph::{
     analyze_compilation_graph_for_ide, load_compilation_graph,
-    load_compilation_graph_with_completeness, GraphCompleteness,
+    load_compilation_graph_with_completeness, GraphCompleteness, GraphLoadOptions,
+    ProjectStructureAuthority,
 };
 use doriac::source_provider::InMemorySourceProvider;
 use std::process::Command;
@@ -113,6 +114,69 @@ fn unknown_schema_version_is_rejected_before_schema_one_fields() {
         diagnostics[0].title,
         "Build Plan Schema Version Is Unsupported"
     );
+}
+
+#[test]
+fn partial_tooling_graphs_do_not_fabricate_project_structure_authority() {
+    let entry = "acme/application:open/app.doria";
+    let document = plan(
+        vec![package(
+            "acme/application",
+            vec![
+                source("acme/application", "open/app.doria", SourceOrigin::Entry),
+                source(
+                    "acme/application",
+                    "open/model.doria",
+                    SourceOrigin::Explicit,
+                ),
+            ],
+            Vec::new(),
+        )],
+        entry,
+    );
+    let mut provider = InMemorySourceProvider::new();
+    provider.insert(
+        "acme/application",
+        "open/app.doria",
+        r#"namespace Acme\App;
+function inspect(Acme\Model\User $user): void {}
+function main(): void { inspect(new Acme\Model\User()); }
+"#,
+    );
+    provider.insert(
+        "acme/application",
+        "open/model.doria",
+        "namespace Acme\\Model; class User {}",
+    );
+
+    let strict = load_compilation_graph(&document, &provider)
+        .expect_err("an authoritative build plan must enforce source layout");
+    assert!(strict.iter().any(|diagnostic| diagnostic.code == "E0680"));
+
+    let mut session = doriac::incremental::CompilationSession::new();
+    let update = session
+        .load_graph_with_options(
+            &document,
+            &provider,
+            GraphLoadOptions {
+                completeness: GraphCompleteness::Partial,
+                project_structure: ProjectStructureAuthority::Unavailable,
+            },
+        )
+        .expect("open-document tooling graph");
+    assert_eq!(update.graph.completeness, GraphCompleteness::Partial);
+    assert_eq!(update.facts.parsed_sources.len(), 2);
+    let analysis = session.analyze_graph(&update.graph);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    assert!(analysis.semantic_dependency_edges.iter().any(|edge| {
+        edge.source.0 == entry
+            && edge.target.0 == "acme/application:open/model.doria"
+            && edge.symbol.qualified_name == "Acme\\Model\\User"
+    }));
 }
 
 #[test]

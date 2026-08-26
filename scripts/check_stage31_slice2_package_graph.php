@@ -94,8 +94,11 @@ function check_stage31_slice2_package_graph(string $root): array
     $require($paths['graph'], $files['graph'], [
         'pub struct CompilationGraph',
         'pub struct GraphSource',
+        'pub struct GraphLoadOptions',
+        'pub enum ProjectStructureAuthority',
         'pub struct IncludeEdge',
         'pub fn load_compilation_graph',
+        'pub fn load_compilation_graph_with_options',
         'pub fn analyze_compilation_graph_for_ide',
         'validate_package_cycles',
         'validate_source_shape',
@@ -115,6 +118,7 @@ function check_stage31_slice2_package_graph(string $root): array
     ]);
     $require($paths['incremental'], $files['incremental'], [
         'pub struct CompilationSession',
+        'load_graph_with_options',
         'body_only_changed_sources',
         'reused_declaration_indexes',
         'semantic_dependency_fingerprint',
@@ -147,6 +151,7 @@ function check_stage31_slice2_package_graph(string $root): array
         'package_internal_members_are_rejected_across_packages',
         'library_graph_lowers_without_a_process_entry',
         'graph_identity_is_independent_of_source_inventory_order',
+        'partial_tooling_graphs_do_not_fabricate_project_structure_authority',
     ]);
     $require($paths['parity'], $files['parity'], ['package_graph_executes_identically_across_all_enabled_backends']);
     $require($paths['manifest'], $files['manifest'], ['cross_file_execution']);

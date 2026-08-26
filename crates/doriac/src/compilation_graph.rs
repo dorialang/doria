@@ -27,6 +27,27 @@ pub enum GraphCompleteness {
     Partial,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectStructureAuthority {
+    Authoritative,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GraphLoadOptions {
+    pub completeness: GraphCompleteness,
+    pub project_structure: ProjectStructureAuthority,
+}
+
+impl Default for GraphLoadOptions {
+    fn default() -> Self {
+        Self {
+            completeness: GraphCompleteness::Complete,
+            project_structure: ProjectStructureAuthority::Authoritative,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageNode {
     pub identity: PackageIdentity,
@@ -105,7 +126,7 @@ pub fn load_compilation_graph(
     document: &BuildPlanDocument,
     provider: &impl SourceProvider,
 ) -> DiagnosticResult<CompilationGraph> {
-    load_compilation_graph_inner(document, provider, GraphCompleteness::Complete, None)
+    load_compilation_graph_inner(document, provider, GraphLoadOptions::default(), None)
 }
 
 pub fn load_compilation_graph_with_completeness(
@@ -113,26 +134,38 @@ pub fn load_compilation_graph_with_completeness(
     provider: &impl SourceProvider,
     completeness: GraphCompleteness,
 ) -> DiagnosticResult<CompilationGraph> {
-    load_compilation_graph_inner(document, provider, completeness, None)
+    load_compilation_graph_inner(
+        document,
+        provider,
+        GraphLoadOptions {
+            completeness,
+            ..GraphLoadOptions::default()
+        },
+        None,
+    )
+}
+
+pub fn load_compilation_graph_with_options(
+    document: &BuildPlanDocument,
+    provider: &impl SourceProvider,
+    options: GraphLoadOptions,
+) -> DiagnosticResult<CompilationGraph> {
+    load_compilation_graph_inner(document, provider, options, None)
 }
 
 pub(crate) fn load_compilation_graph_with_session(
     document: &BuildPlanDocument,
     provider: &impl SourceProvider,
+    options: GraphLoadOptions,
     session: &mut crate::incremental::CompilationSession,
 ) -> DiagnosticResult<CompilationGraph> {
-    load_compilation_graph_inner(
-        document,
-        provider,
-        GraphCompleteness::Complete,
-        Some(session),
-    )
+    load_compilation_graph_inner(document, provider, options, Some(session))
 }
 
 fn load_compilation_graph_inner(
     document: &BuildPlanDocument,
     provider: &impl SourceProvider,
-    completeness: GraphCompleteness,
+    options: GraphLoadOptions,
     mut session: Option<&mut crate::incremental::CompilationSession>,
 ) -> DiagnosticResult<CompilationGraph> {
     crate::build_plan::validate_build_plan(&document.plan)?;
@@ -389,6 +422,7 @@ fn load_compilation_graph_inner(
                 .expect("source package exists"),
             &pending_source,
             &authored,
+            options.project_structure,
             &mut diagnostics,
         );
         records.push(SourceRecord {
@@ -439,7 +473,7 @@ fn load_compilation_graph_inner(
     let fingerprint = graph_fingerprint(&document.plan, &sources, &include_edges);
     Ok(CompilationGraph {
         build_plan: document.plan.clone(),
-        completeness,
+        completeness: options.completeness,
         packages,
         source_map: SourceMap::from_ordered_records(records),
         sources,
@@ -974,6 +1008,7 @@ fn validate_source_shape(
     package: &Package,
     source: &PendingSource,
     authored: &Program,
+    project_structure: ProjectStructureAuthority,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     let is_entry = plan.selected_target.entry_source.as_deref() == Some(&source.identity.0);
@@ -981,7 +1016,10 @@ fn validate_source_shape(
         .items
         .iter()
         .any(|item| matches!(item, Item::Statement(_)));
-    if has_statements && (!is_entry || plan.selected_target.kind == TargetKind::Library) {
+    if project_structure == ProjectStructureAuthority::Authoritative
+        && has_statements
+        && (!is_entry || plan.selected_target.kind == TargetKind::Library)
+    {
         diagnostics.push(
             source_language(
                 "E0683",
@@ -1017,7 +1055,9 @@ fn validate_source_shape(
             .with_title("Included Source Contains Executable Statements"),
         );
     }
-    validate_layout(package, source, authored, is_entry, diagnostics);
+    if project_structure == ProjectStructureAuthority::Authoritative {
+        validate_layout(package, source, authored, is_entry, diagnostics);
+    }
 }
 
 fn validate_layout(

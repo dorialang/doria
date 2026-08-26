@@ -72,9 +72,22 @@ impl CompilationSession {
         document: &BuildPlanDocument,
         provider: &impl SourceProvider,
     ) -> DiagnosticResult<CompilationUpdate> {
+        self.load_graph_with_options(
+            document,
+            provider,
+            crate::compilation_graph::GraphLoadOptions::default(),
+        )
+    }
+
+    pub fn load_graph_with_options(
+        &mut self,
+        document: &BuildPlanDocument,
+        provider: &impl SourceProvider,
+        options: crate::compilation_graph::GraphLoadOptions,
+    ) -> DiagnosticResult<CompilationUpdate> {
         self.begin_update();
         let graph = crate::compilation_graph::load_compilation_graph_with_session(
-            document, provider, self,
+            document, provider, options, self,
         )?;
         self.finish_update(&graph);
         Ok(CompilationUpdate {
