@@ -50,9 +50,9 @@ function check_performance_foundation(string $root): array
         'docs/doria-end-to-end-plan.md' => [
             'Decision 0112: performance baseline, provenance, and regression measurement',
             'Stage 26b — Performance Baseline Foundation — Complete; All Three Slices Complete.',
-            'Stage 26b Slice 1 — Complete',
-            'Stage 26b Slice 2 — Complete',
-            'Stage 26b Slice 3 — Complete',
+            '**Slice 1 — Complete:** Supplies the strict manifest/report and compiler-report foundation.',
+            '**Slice 2 — Complete:** Supplies deterministic scaling',
+            '**Slice 3 — Complete:** Supplies comparative peers',
             'Measurement Status: Pending Available Runner',
             'Decision 0113 Slice 2 — Complete',
             'Decision 0113 Slice 3 — Complete',

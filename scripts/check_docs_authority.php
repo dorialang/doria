@@ -629,6 +629,33 @@ $namingAuthority = file_get_contents($root . '/' . $namingAuthorityPath);
 if ($namingAuthority === false) {
     $failures[] = "{$namingAuthorityPath}: unable to read naming authority";
 } else {
+    $stageListStart = strpos($namingAuthority, '## 13. Phased roadmap with stages and acceptance criteria');
+    $stageListEnd = $stageListStart === false
+        ? false
+        : strpos($namingAuthority, "\n## 14.", $stageListStart);
+    if ($stageListStart === false || $stageListEnd === false) {
+        $failures[] = "{$namingAuthorityPath}: unable to locate the phased stage list";
+    } else {
+        $stageList = substr($namingAuthority, $stageListStart, $stageListEnd - $stageListStart);
+        $stageLines = preg_split('/\R/', $stageList) ?: [];
+        foreach ($stageLines as $index => $line) {
+            if (preg_match('/^- \*\*(?:Stage|Decision)\b/', $line) !== 1) {
+                continue;
+            }
+            $titleEnd = strpos($line, '**', 3);
+            $remainder = $titleEnd === false ? '' : substr($line, $titleEnd + 2);
+            if (preg_match('/\*\*(?:Slice \d+|Corrective Beat\b|[^*]+:)\*\*/', $remainder) === 1) {
+                add_failure(
+                    $failures,
+                    $namingAuthorityPath,
+                    substr_count(substr($namingAuthority, 0, $stageListStart), "\n") + $index + 1,
+                    'stage subsections must use indented bullets instead of inline bold sections',
+                    $line
+                );
+            }
+        }
+    }
+
     foreach (['Int::wrappingAdd', '->isEmpty', '->retryAfter', '->findById', '->tenantId'] as $example) {
         if (!str_contains($namingAuthority, $example)) {
             $failures[] = "{$namingAuthorityPath}: missing required corrected naming example {$example}";

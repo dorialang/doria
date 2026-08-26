@@ -379,6 +379,7 @@ Prompt checklist before implementation:
 
 - Markdown tables are whitespace-padded so every pipe aligns: cells pad to the column's maximum width, and separator dashes fill that width plus two. Editing one cell means re-padding the whole table.
 - Match the surrounding section before writing into it. Measure the length and structure of the units already there; a bullet five times the length of its neighbours is wrong even when every word is true.
+- In the end-to-end plan's stage list, a stage with slices, corrective beats, or other named subsections uses one parent-stage bullet followed by one indented bullet per subsection. Do not compress several subsections into one wall-of-text paragraph.
 - The end-to-end plan's decision-record list holds one short clause per subject, separated by ` · `, with no bold and no trailing period before the separator.
 - Use American spelling: behavior, labeled, favor.
 - Project spellings: Fibonacci, Mojibake, Multithreaded.
