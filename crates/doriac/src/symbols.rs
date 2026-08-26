@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ast::MemberAccess;
 use crate::numeric::IntegerValue;
-use crate::source::Span;
+use crate::source::{SourceId, Span};
 use crate::types::{ResolvedType, TypeId, TypeRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -10,6 +10,7 @@ pub struct BindingId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ClosureId {
+    pub source: SourceId,
     pub start: usize,
     pub end: usize,
 }
@@ -17,6 +18,7 @@ pub struct ClosureId {
 impl ClosureId {
     pub const fn from_span(span: Span) -> Self {
         Self {
+            source: span.source,
             start: span.start,
             end: span.end,
         }
@@ -71,8 +73,8 @@ pub struct BindingDeclaration {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BindingResolution {
     pub declarations_by_id: HashMap<BindingId, BindingDeclaration>,
-    pub uses_by_span: HashMap<(usize, usize), BindingId>,
-    pub declaration_by_span: HashMap<(usize, usize), BindingId>,
+    pub uses_by_span: HashMap<Span, BindingId>,
+    pub declaration_by_span: HashMap<Span, BindingId>,
     pub closure_owners: HashMap<ClosureId, LexicalOwner>,
     pub lexical_parents: HashMap<LexicalOwner, LexicalOwner>,
 }
@@ -210,7 +212,7 @@ pub struct ParamInfo {
 
 #[derive(Debug, Clone)]
 pub struct FunctionInfo {
-    pub declaration: usize,
+    pub declaration: Span,
     pub type_params: Vec<TypeParamInfo>,
     pub params: Vec<ParamInfo>,
     pub return_ty: TypeId,
@@ -220,7 +222,7 @@ pub struct FunctionInfo {
 
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
-    pub declaration: usize,
+    pub declaration: Span,
     pub access: MemberAccess,
     pub receiver_mode: Option<ReceiverMode>,
     pub return_borrow: Option<ReturnBorrow>,

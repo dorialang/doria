@@ -350,7 +350,7 @@ lower through closure-aware HIR and structural MIR, checked indirect calls reuse
 this decision's Error model, and the debug interpreter, Cranelift, LLVM, and PHP
 compatibility backend execute the supported surface. List algorithm calls carry
 their callback's exact checked effects and use the same propagation and cleanup
-model. Stage 30 and Stage 31 Slice 1 are complete; Stage 31 Slice 2 is next.
+model. Stages 30 and 31 are complete; Stage 32 is next.
 
 ## Explicit Exclusions
 

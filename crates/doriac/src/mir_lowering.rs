@@ -398,7 +398,7 @@ fn collect_closure_expressions<'a>(
     for expression in expressions {
         visit_expr(expression, &mut closures);
     }
-    closures.sort_by_key(|closure| (closure.span.start, closure.span.end));
+    closures.sort_by_key(|closure| closure.span);
     closures
 }
 
@@ -576,7 +576,7 @@ impl CallableDecl<'_> {
 }
 
 fn specialize_callable_instance(
-    span: &(usize, usize),
+    span: &Span,
     specialization: &GenericSpecialization,
     substitutions: &HashMap<String, ResolvedType>,
     functions: &HashMap<String, usize>,
@@ -588,7 +588,7 @@ fn specialize_callable_instance(
         return Err(vec![Diagnostic::new(
             "I2401",
             "checked generic call has no callable target",
-            Span::new(span.0, span.1),
+            *span,
         )]);
     };
     let declaration = match target {
@@ -612,7 +612,7 @@ fn specialize_callable_instance(
         vec![Diagnostic::new(
             "I2401",
             "checked generic call has no callable declaration",
-            Span::new(span.0, span.1),
+            *span,
         )]
     })?;
     let arguments = specialization
@@ -624,7 +624,7 @@ fn specialize_callable_instance(
         return Err(vec![Diagnostic::new(
             "I2401",
             "generic specialization retained an unresolved type parameter",
-            Span::new(span.0, span.1),
+            *span,
         )]);
     }
     Ok(CallableInstance {
@@ -701,7 +701,10 @@ fn collect_callable_instances(
                     continue;
                 };
                 for (span, specialization) in &calls {
-                    if span.0 < initializer.span().start || span.1 > initializer.span().end {
+                    if span.source != initializer.span().source
+                        || span.start < initializer.span().start
+                        || span.end > initializer.span().end
+                    {
                         continue;
                     }
                     let target = specialize_callable_instance(
@@ -731,8 +734,9 @@ fn collect_callable_instances(
         let callable = declarations[instance.declaration];
         let substitutions = type_substitutions(callable, &instance.arguments)?;
         for (span, specialization) in &calls {
-            let in_function =
-                span.0 >= callable.function.span.start && span.1 <= callable.function.span.end;
+            let in_function = span.source == callable.function.span.source
+                && span.start >= callable.function.span.start
+                && span.end <= callable.function.span.end;
             if !in_function {
                 continue;
             }
@@ -754,7 +758,7 @@ fn collect_callable_instances(
                         format!(
                             "generic specialization of `{name}` recursively expands its type arguments and has no finite monomorphization"
                         ),
-                        Span::new(span.0, span.1),
+                        **span,
                     )
                     .with_help(
                         "keep recursive generic calls at the same concrete type, or move the type-changing step outside the recursion",
@@ -1142,9 +1146,9 @@ fn lower_program_impl(
         .throw_error_types
         .keys()
         .chain(program.semantic_info.checked_effect_sites.keys())
-        .map(|(start, end)| Span::new(*start, *end))
+        .copied()
         .collect::<Vec<_>>();
-    origin_spans.sort_by_key(|span| (span.start, span.end));
+    origin_spans.sort_by_key(|span| *span);
     origin_spans.dedup();
     let error_origins = origin_spans
         .iter()
@@ -1159,7 +1163,7 @@ fn lower_program_impl(
         .collect::<Vec<_>>();
     let error_origin_ids = error_origins
         .iter()
-        .map(|origin| ((origin.span.start, origin.span.end), origin.id))
+        .map(|origin| (origin.span, origin.id))
         .collect::<HashMap<_, _>>();
     let mut collection_registry =
         CollectionRegistry::with_error_descriptors(error_descriptor_ids.clone());
@@ -1232,6 +1236,7 @@ fn lower_program_impl(
                 id,
                 class: class_id,
                 name: property.name.clone(),
+                source_span: property.span,
                 ty,
                 writable: property.writable,
                 initializer,
@@ -1339,26 +1344,28 @@ fn lower_program_impl(
                     }
                 }
             }
-            hir::Item::Statement(statement) => {
-                return Err(vec![unsupported(
-                    stmt_span(statement),
-                    "top-level executable statements are not supported by native compilation",
-                )]);
-            }
+            hir::Item::Statement(_) => {}
             hir::Item::Enum(_) | hir::Item::Constant(_) => {}
         }
     }
 
+    let selected_entry_source = program.selected_entry_source_id().or_else(|| {
+        (program.selected_target.kind == crate::build_plan::TargetKind::Binary)
+            .then_some(crate::source::SourceId(0))
+    });
     let main_indices = declarations
         .iter()
         .enumerate()
         .filter_map(|(index, declaration)| {
             (declaration.is_top_level()
+                && selected_entry_source == Some(declaration.function.span.source)
                 && crate::names::source_name_is(&declaration.function.name, "main"))
             .then_some(index)
         })
         .collect::<Vec<_>>();
-    if main_indices.len() != 1 {
+    if program.selected_target.kind == crate::build_plan::TargetKind::Binary
+        && main_indices.len() != 1
+    {
         let span = main_indices
             .get(1)
             .map_or_else(Span::default, |index| declarations[*index].function.span);
@@ -1367,6 +1374,18 @@ fn lower_program_impl(
             "native programs require exactly one top-level `main` function",
         )]);
     }
+    let selected_entry_statements = selected_entry_source.map_or_else(Vec::new, |source| {
+        program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                hir::Item::Statement(statement) if stmt_span(statement).source == source => {
+                    Some(statement.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
 
     let instances =
         collect_callable_instances(program, &declarations, &class_ids, &program.semantic_info)?;
@@ -1378,14 +1397,20 @@ fn lower_program_impl(
         let declaration = declarations[instance.declaration];
         let function = declaration.function;
         let substitutions = type_substitutions(declaration, &instance.arguments)?;
+        let entry_body = main_indices
+            .contains(&instance.declaration)
+            .then(|| entry_process_body(function, &selected_entry_statements));
         intern_block_collection_types(
-            &function.body,
+            entry_body.as_ref().unwrap_or(&function.body),
             &class_ids,
             &mut collection_registry,
             &substitutions,
         );
         for (span, ty) in &program.semantic_info.expression_types {
-            if span.0 >= function.span.start && span.1 <= function.span.end {
+            if span.source == function.span.source
+                && span.start >= function.span.start
+                && span.end <= function.span.end
+            {
                 let specialized = substitute_resolved_type(ty, &substitutions);
                 let _ = intern_resolved_collection_types(
                     &specialized,
@@ -1395,7 +1420,10 @@ fn lower_program_impl(
             }
         }
         for (span, ty) in &program.semantic_info.type_test_types {
-            if span.0 >= function.span.start && span.1 <= function.span.end {
+            if span.source == function.span.source
+                && span.start >= function.span.start
+                && span.end <= function.span.end
+            {
                 let specialized = substitute_resolved_type(ty, &substitutions);
                 let _ = intern_resolved_collection_types(
                     &specialized,
@@ -1416,8 +1444,7 @@ fn lower_program_impl(
             },
             SignatureOptions {
                 lifecycle: matches!(function.name.as_str(), "__construct" | "__destruct"),
-                is_entry: declaration.is_top_level()
-                    && crate::names::source_name_is(&function.name, "main"),
+                is_entry: main_indices.contains(&instance.declaration),
             },
         )?;
         signature.method_class = declaration.class;
@@ -1457,8 +1484,14 @@ fn lower_program_impl(
         let _ = intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
     }
 
-    let source =
-        crate::source::SourceFile::new(program.source_path.clone(), program.source_text.clone());
+    let source = program
+        .selected_entry_source_id()
+        .and_then(|id| program.source(id))
+        .or_else(|| program.sources.first().map(|source| &source.source))
+        .cloned()
+        .unwrap_or_else(|| {
+            crate::source::SourceFile::new(program.source_path.clone(), program.source_text.clone())
+        });
     let mut closure_descriptors = Vec::new();
     let mut closure_environment_layouts = Vec::new();
     let mut instance_closure_plans = Vec::with_capacity(instances.len());
@@ -1469,12 +1502,20 @@ fn lower_program_impl(
             declaration.class,
             &program.semantic_info,
         );
+        let entry_body = main_indices
+            .contains(&instance.declaration)
+            .then(|| entry_process_body(declaration.function, &selected_entry_statements));
         instance_closure_plans.push(build_closure_plans(
-            collect_closure_expressions(Some(&declaration.function.body), std::iter::empty()),
+            collect_closure_expressions(
+                Some(entry_body.as_ref().unwrap_or(&declaration.function.body)),
+                std::iter::empty(),
+            ),
             &mut ClosurePlanBuildContext {
                 containing_name: &containing_name,
                 first_function_id: instances.len(),
-                source: &source,
+                source: program
+                    .source(declaration.function.span.source)
+                    .unwrap_or(&source),
                 semantic_info: &program.semantic_info,
                 substitutions,
                 class_ids: &class_ids,
@@ -1504,7 +1545,9 @@ fn lower_program_impl(
             &mut ClosurePlanBuildContext {
                 containing_name: &containing_name,
                 first_function_id: instances.len(),
-                source: &source,
+                source: program
+                    .source(initializer.expression.span().source)
+                    .unwrap_or(&source),
                 semantic_info: &program.semantic_info,
                 substitutions: &initializer.type_substitutions,
                 class_ids: &class_ids,
@@ -1515,13 +1558,16 @@ fn lower_program_impl(
         )?;
     }
 
-    let entry = signatures
-        .get(&FunctionInstanceKey {
-            name: declarations[main_indices[0]].function.name.clone(),
-            arguments: Vec::new(),
-        })
-        .expect("exactly one collected main signature")
-        .id;
+    let selected_entry = main_indices.first().map(|index| {
+        signatures
+            .get(&FunctionInstanceKey {
+                name: declarations[*index].function.name.clone(),
+                arguments: Vec::new(),
+            })
+            .expect("selected main has a collected signature")
+            .id
+    });
+    let entry = selected_entry.unwrap_or(mir::FunctionId(usize::MAX));
     let mut functions = Vec::with_capacity(instances.len());
     for (((instance, signature), substitutions), closure_plans) in instances
         .iter()
@@ -1556,6 +1602,11 @@ fn lower_program_impl(
             inputs,
             declaration.class,
             declaration.receiver,
+            if main_indices.contains(&instance.declaration) {
+                selected_entry_statements.as_slice()
+            } else {
+                &[]
+            },
             metrics.as_deref_mut(),
         )?);
     }
@@ -1682,9 +1733,22 @@ fn lower_program_impl(
                         .then_some(mir::FunctionId(index))
                 })
             };
+            let source_span = program
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    hir::Item::Class(declaration)
+                        if declaration.name == class.declaration_name =>
+                    {
+                        Some(declaration.span)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
             Ok(mir::Class {
                 id: class.id,
                 name: class.name.clone(),
+                source_span,
                 properties,
                 layout,
                 constructor: lifecycle("__construct"),
@@ -1700,9 +1764,20 @@ fn lower_program_impl(
         .enums
         .iter()
         .map(|enum_info| {
+            let source_span = program
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    hir::Item::Enum(declaration) if declaration.name == enum_info.name => {
+                        Some(declaration.span)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
             Ok(mir::EnumDefinition {
                 id: enum_info.id,
                 name: enum_info.name.clone(),
+                source_span,
                 backing_type: enum_info.backing_type,
                 cases: enum_info
                     .cases
@@ -1751,6 +1826,35 @@ fn lower_program_impl(
         ..
     } = collection_registry;
     Ok(mir::Program {
+        sources: program
+            .sources
+            .iter()
+            .map(|source| mir::SourceUnit {
+                id: source.id,
+                identity: source.identity.clone(),
+                package: source.package.clone(),
+                display_path: source.display_path.clone(),
+                scope: source.scope,
+                origin: source.origin,
+                generated_for: source.generated_for,
+                active: source.active,
+                source: source.source.clone(),
+            })
+            .collect(),
+        packages: program
+            .packages
+            .iter()
+            .map(|package| mir::PackageUnit {
+                identity: package.identity.clone(),
+                normal_dependencies: package.normal_dependencies.clone(),
+                development_dependencies: package.development_dependencies.clone(),
+            })
+            .collect(),
+        selected_target: mir::SelectedTarget {
+            package: program.selected_target.package.clone(),
+            kind: program.selected_target.kind,
+            entry_source: program.selected_target.entry_source.clone(),
+        },
         source,
         compilation_context: program.semantic_info.compilation_context.clone(),
         namespace: program
@@ -1768,12 +1872,15 @@ fn lower_program_impl(
         closure_descriptors,
         closure_environment_layouts,
         functions,
+        selected_entry,
         entry,
     })
 }
 
 fn error_origin_callable(program: &hir::Program, origin: Span) -> Option<String> {
-    let contains = |outer: Span| origin.start >= outer.start && origin.end <= outer.end;
+    let contains = |outer: Span| {
+        origin.source == outer.source && origin.start >= outer.start && origin.end <= outer.end
+    };
     program
         .items
         .iter()
@@ -2428,7 +2535,7 @@ fn collect_function_signature(
         return_type,
         return_borrow: semantic_info
             .return_borrows
-            .get(&function.span.start)
+            .get(&function.span)
             .copied()
             .map(mir_return_borrow),
         parameter_types,
@@ -2776,7 +2883,7 @@ struct FunctionLoweringInputs<'a> {
     enum_types: &'a HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
     type_substitutions: &'a HashMap<String, crate::types::ResolvedType>,
     error_descriptor_ids: &'a HashMap<ClassId, mir::ErrorDescriptorId>,
-    error_origin_ids: &'a HashMap<(usize, usize), mir::ErrorOriginId>,
+    error_origin_ids: &'a HashMap<Span, mir::ErrorOriginId>,
     closure_plans: &'a HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
     closure_environment_layouts: &'a [mir::ClosureEnvironmentLayout],
 }
@@ -2787,6 +2894,7 @@ fn lower_function(
     inputs: FunctionLoweringInputs<'_>,
     class: Option<ClassId>,
     receiver: Option<ClassId>,
+    entry_prelude: &[hir::Stmt],
     metrics: Option<&mut StructuralMetrics>,
 ) -> DiagnosticResult<mir::Function> {
     let mut context = LoweringContext::new(&inputs);
@@ -2826,6 +2934,11 @@ fn lower_function(
         });
     }
 
+    if !entry_prelude.is_empty() {
+        context.push_scope();
+        lower_statement_sequence(entry_prelude, signature.return_type, &mut context)?;
+        context.push_scope();
+    }
     lower_function_body(
         &function.body,
         &function.name,
@@ -2872,6 +2985,24 @@ fn lower_function(
         blocks,
         entry_block: mir::BlockId(0),
     })
+}
+
+fn entry_process_body(function: &hir::FunctionDecl, prelude: &[hir::Stmt]) -> hir::Block {
+    let mut statements = Vec::with_capacity(prelude.len() + function.body.statements.len());
+    statements.extend_from_slice(prelude);
+    statements.extend_from_slice(&function.body.statements);
+    hir::Block {
+        statements,
+        span: Span::in_source(
+            function.span.source,
+            prelude
+                .first()
+                .map_or(function.body.span.start, |statement| {
+                    stmt_span(statement).start
+                }),
+            function.body.span.end,
+        ),
+    }
 }
 
 fn lower_closure_function(
@@ -3244,7 +3375,7 @@ fn lower_throw_statement(
     });
     let origin = context
         .error_origin_ids
-        .get(&(statement.span.start, statement.span.end))
+        .get(&statement.span)
         .copied()
         .expect("checked throw has deterministic origin metadata");
     context.push_statement(mir::Statement::EnsureErrorOrigin { error, origin });
@@ -3989,7 +4120,7 @@ fn lower_given_setup<'a>(
     let info = context
         .semantic_info
         .given_preludes
-        .get(&(given.span.start, given.span.end))
+        .get(&given.span)
         .ok_or_else(|| {
             vec![Diagnostic::new(
                 "I2802",
@@ -5095,13 +5226,13 @@ struct LoweringContext<'semantic> {
     enum_types: HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
     type_substitutions: HashMap<String, crate::types::ResolvedType>,
     error_descriptor_ids: HashMap<ClassId, mir::ErrorDescriptorId>,
-    error_origin_ids: HashMap<(usize, usize), mir::ErrorOriginId>,
+    error_origin_ids: HashMap<Span, mir::ErrorOriginId>,
     closure_plans: HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
     current_class: Option<ClassId>,
     locals: Vec<mir::Local>,
     replaceable_writable_parameters: HashSet<mir::LocalId>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
-    materialized_collection_places: HashMap<(usize, usize), mir::LocalId>,
+    materialized_collection_places: HashMap<Span, mir::LocalId>,
     scope_owned_locals: Vec<Vec<DropObligation>>,
     statement_owned_locals: Vec<Vec<DropObligation>>,
     temp_counter: usize,
@@ -5977,10 +6108,8 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn call_target_class_id(&self, span: Span) -> Option<ClassId> {
-        let CallableTarget::Method { class_type, .. } = self
-            .semantic_info
-            .call_targets
-            .get(&(span.start, span.end))?
+        let CallableTarget::Method { class_type, .. } =
+            self.semantic_info.call_targets.get(&span)?
         else {
             return None;
         };
@@ -6144,7 +6273,7 @@ impl<'semantic> LoweringContext<'semantic> {
     fn specialization_arguments(&self, span: Span) -> Vec<GenericArgument> {
         self.semantic_info
             .generic_call_specializations
-            .get(&(span.start, span.end))
+            .get(&span)
             .map(|specialization| {
                 specialization
                     .arguments
@@ -6224,9 +6353,7 @@ impl<'semantic> LoweringContext<'semantic> {
             hir::Expr::Grouped { expr, .. } => return self.flow_fact(expr),
             expr => expr,
         };
-        self.semantic_info
-            .flow_facts
-            .get(&(expr.span().start, expr.span().end))
+        self.semantic_info.flow_facts.get(&expr.span())
     }
 
     fn exact_mixed_local(&self, expr: &hir::Expr) -> Option<(mir::LocalId, mir::Type)> {
@@ -7272,11 +7399,7 @@ fn semantic_property_write(
     context: &LoweringContext,
 ) -> DiagnosticResult<(mir::PropertyWriteKind, Span)> {
     let span = unparenthesized_place(expr).span();
-    let Some(info) = context
-        .semantic_info
-        .property_writes
-        .get(&(span.start, span.end))
-    else {
+    let Some(info) = context.semantic_info.property_writes.get(&span) else {
         return Err(vec![unsupported(
             span,
             "checked property write has no semantic initialize/replace classification",
@@ -7771,7 +7894,7 @@ fn lower_string_expression(
                 && context
                     .semantic_info
                     .constrained_display_calls
-                    .contains(&(span.start, span.end))
+                    .contains(span)
             {
                 return lower_display_string_expression(object, context);
             }
@@ -10688,7 +10811,7 @@ fn lower_match_rvalue(
     let info = context
         .semantic_info
         .matches
-        .get(&(span.start, span.end))
+        .get(span)
         .cloned()
         .ok_or_else(|| {
             vec![Diagnostic::new(
@@ -10871,17 +10994,13 @@ fn lower_when_rvalue(
     let given = &when.given;
     let branches = &when.branches;
     let span = when.span;
-    let info = context
-        .semantic_info
-        .whens
-        .get(&(span.start, span.end))
-        .ok_or_else(|| {
-            vec![Diagnostic::new(
-                "I2803",
-                "checked `when` expression has no semantic result plan",
-                span,
-            )]
-        })?;
+    let info = context.semantic_info.whens.get(&span).ok_or_else(|| {
+        vec![Diagnostic::new(
+            "I2803",
+            "checked `when` expression has no semantic result plan",
+            span,
+        )]
+    })?;
     let result_type = context
         .mir_resolved_type(&info.result_type)
         .ok_or_else(|| {
@@ -12925,7 +13044,7 @@ fn lower_enum_expression(
     if let Some(value) = context
         .semantic_info
         .enum_case_values
-        .get(&(expr.span().start, expr.span().end))
+        .get(&expr.span())
         .copied()
     {
         if value.enum_id != enum_id {
@@ -13966,7 +14085,7 @@ fn materialize_indirect_call(
     let info = context
         .semantic_info
         .callable_value_calls
-        .get(&(call.span.start, call.span.end))
+        .get(&call.span)
         .expect("checked callable-value call has semantic metadata");
     let resolved = substitute_resolved_type(&info.function_type, &context.type_substitutions);
     let mir::Type::Function(function_type) = context
@@ -14491,7 +14610,7 @@ fn materialize_checked_io(
     context.current_block = Some(failure);
     let origin = context
         .error_origin_ids
-        .get(&(span.start, span.end))
+        .get(&span)
         .copied()
         .expect("checked I/O has deterministic origin metadata");
     context.push_statement(mir::Statement::EnsureErrorOrigin { error, origin });
@@ -15321,7 +15440,7 @@ fn lower_payload_enum_expression(
     if let Some(case) = context
         .semantic_info
         .enum_case_values
-        .get(&(expr.span().start, expr.span().end))
+        .get(&expr.span())
         .copied()
     {
         if case.enum_id != ty.id {
@@ -15428,7 +15547,7 @@ fn lower_payload_enum_expression(
         if let Some(case) = context
             .semantic_info
             .enum_case_constructions
-            .get(&(span.start, span.end))
+            .get(span)
             .copied()
         {
             if case.enum_id != ty.id {
@@ -15736,7 +15855,7 @@ fn lower_nullable_payload_enum_expression(
     if context
         .semantic_info
         .enum_case_constructions
-        .contains_key(&(expr.span().start, expr.span().end))
+        .contains_key(&expr.span())
     {
         return lower_payload_enum_expression(expr, ty, transfer, context)
             .map(mir::NullablePayloadEnumExpression::Value);
@@ -15872,7 +15991,7 @@ fn lower_mixed_expression(
     if let Some(case) = context
         .semantic_info
         .enum_case_constructions
-        .get(&(expr.span().start, expr.span().end))
+        .get(&expr.span())
         .copied()
     {
         if let Some(ty) = context.enum_types.get(&case.enum_id).copied() {
@@ -16959,7 +17078,7 @@ fn materialize_nested_collection_places(
 
             let place = unparenthesized_place(collection);
             if collection_place_is_borrowed(place) {
-                let key = (place.span().start, place.span().end);
+                let key = place.span();
                 if !context.materialized_collection_places.contains_key(&key) {
                     let mir::Type::Collection(collection_type) = context.expression_type(place)?
                     else {
@@ -17111,7 +17230,7 @@ fn lower_collection_local(
     let expr = unparenthesized_place(expr);
     if let Some(local) = context
         .materialized_collection_places
-        .get(&(expr.span().start, expr.span().end))
+        .get(&expr.span())
         .copied()
     {
         let mir::Type::Collection(collection) = context.local_type(local) else {
@@ -17148,7 +17267,7 @@ fn lower_collection_local(
         });
         context
             .materialized_collection_places
-            .insert((expr.span().start, expr.span().end), local);
+            .insert(expr.span(), local);
         return Ok((local, collection));
     }
     match expr {
@@ -17626,7 +17745,7 @@ fn materialize_collection_place_as(
         }
         context
             .materialized_collection_places
-            .insert((expr.span().start, expr.span().end), local);
+            .insert(expr.span(), local);
         return Ok(());
     }
     let borrowed = collection_place_is_borrowed(expr);
@@ -17642,7 +17761,7 @@ fn materialize_collection_place_as(
     });
     context
         .materialized_collection_places
-        .insert((expr.span().start, expr.span().end), local);
+        .insert(expr.span(), local);
     Ok(())
 }
 
@@ -20842,7 +20961,7 @@ fn lower_property_place(
                 let writable = context
                     .semantic_info
                     .writable_object_paths
-                    .contains(&(object.span().start, object.span().end));
+                    .contains(&object.span());
                 let owner = if value.owned_temporary_class().is_some() {
                     context.declare_owned_temp(mir::Type::Class(class))
                 } else {

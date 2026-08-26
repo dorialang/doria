@@ -69,12 +69,11 @@ discovery, namespace-prefix mappings, main/development/generated scopes, hybrid
 strict layout, deterministic package compilation graphs, incremental ownership,
 and top-level entry rules. Decision 0118 accepts schema 2 and the dependency,
 lockfile, workspace, cache, and offline model. This authority does not begin
-implementation by itself. Stage 31 Slice 1 is now complete: namespace/import
-syntax, same-file canonical resolution, the edition prelude, compiler context,
-and include grammar are implemented. Stage 31 Slice 2 is next and still owns
-the multi-file package graph and include resolution. Stage 31 remains in
-progress, not complete; Stage 33 remains scheduled in three slices. Stage 30 is
-complete and E0641 remains historical and reserved.
+implementation by itself. Both Stage 31 slices are complete: namespace/import
+syntax, canonical resolution, the edition prelude, compiler context, build-plan
+package graphs, include resolution, package visibility, and multi-source
+lowering are implemented. Stage 32 is next; Stage 33 remains scheduled in three
+slices. Stage 30 is complete and E0641 remains historical and reserved.
 
 ## Proposed deliverable path
 `docs/notes/plan-open-questions-audit.md` (this file), under "supporting context" per `docs/information-architecture.md`. Not a decision record — every item is a stop-and-ask for Andrew.

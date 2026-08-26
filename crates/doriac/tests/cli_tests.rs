@@ -693,6 +693,212 @@ fn compile_rejects_explicit_output_that_would_overwrite_input() {
     let _ = fs::remove_dir_all(temp_dir);
 }
 
+#[test]
+fn build_plan_compiler_settings_cannot_be_overridden_even_with_default_values() {
+    let target = Command::new(doriac_bin())
+        .args([
+            "compile",
+            "--build-plan",
+            "missing-plan.json",
+            "--target",
+            "native",
+        ])
+        .output()
+        .expect("doriac binary should run");
+    assert_failure_contains(
+        "build-plan target override",
+        target,
+        "cannot override compiler settings from a build plan",
+    );
+
+    let release = Command::new(doriac_bin())
+        .args(["compile", "--build-plan", "missing-plan.json", "--release"])
+        .output()
+        .expect("doriac binary should run");
+    assert_failure_contains(
+        "build-plan profile override",
+        release,
+        "cannot override compiler settings from a build plan",
+    );
+}
+
+#[test]
+fn build_plan_cli_checks_dumps_compiles_and_runs_one_graph() {
+    let temp_dir = temp_dir_path("build-plan-cli");
+    write_build_plan_fixture(&temp_dir, "function main(): int { return answer(); }");
+    let plan_path = temp_dir.join("plan.json");
+    assert!(plan_path.is_file());
+
+    for command in ["check", "ast", "hir", "mir"] {
+        let output = Command::new(doriac_bin())
+            .current_dir(&temp_dir)
+            .args([command, "--build-plan", "plan.json"])
+            .output()
+            .expect("doriac build-plan command should run");
+        assert_success(&format!("build-plan {command}"), output);
+    }
+
+    let output_path = native_output_name("application");
+    let compile = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args([
+            "compile",
+            "--build-plan",
+            "plan.json",
+            "--out",
+            &output_path,
+        ])
+        .output()
+        .expect("doriac build-plan compile should run");
+    assert_success("build-plan compile", compile);
+    assert!(temp_dir.join(&output_path).is_file());
+
+    let run = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["run", "--build-plan", "plan.json"])
+        .output()
+        .expect("doriac build-plan run should run");
+    assert_eq!(run.status.code(), Some(42), "{run:?}");
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn build_plan_compile_never_overwrites_plan_or_source_inputs() {
+    let temp_dir = temp_dir_path("build-plan-overwrite-guard");
+    write_build_plan_fixture(&temp_dir, "function main(): int { return answer(); }");
+
+    for protected in ["plan.json", "helpers.doria"] {
+        let before = fs::read(temp_dir.join(protected)).expect("protected input is readable");
+        let output = Command::new(doriac_bin())
+            .current_dir(&temp_dir)
+            .args(["compile", "--build-plan", "plan.json", "--out", protected])
+            .output()
+            .expect("doriac build-plan compile should run");
+        assert_failure_contains(
+            "build-plan overwrite guard",
+            output,
+            "would overwrite input",
+        );
+        assert_eq!(
+            fs::read(temp_dir.join(protected)).expect("protected input remains readable"),
+            before
+        );
+    }
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn build_plan_load_failures_render_the_authored_source() {
+    let temp_dir = temp_dir_path("build-plan-source-diagnostic");
+    write_build_plan_fixture(&temp_dir, "function main(: int { return 0; }");
+
+    let output = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["check", "--build-plan", "plan.json"])
+        .output()
+        .expect("doriac build-plan check should run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("diagnostic output should be UTF-8");
+    assert!(
+        stderr.contains("acme/application:main.doria · line 1"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("function main(: int"), "{stderr}");
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
+fn build_plan_structure_failures_render_the_plan_source() {
+    let temp_dir = temp_dir_path("build-plan-structure-diagnostic");
+    write_build_plan_fixture(
+        &temp_dir,
+        "include \"included.doria\"; function main(): int { return answer(); }",
+    );
+    fs::write(
+        temp_dir.join("included.doria"),
+        "function answer(): int { return 42; }",
+    )
+    .expect("included source should be writable");
+    let plan_path = temp_dir.join("plan.json");
+    let mut plan: serde_json::Value =
+        serde_json::from_slice(&fs::read(&plan_path).expect("build plan should be readable"))
+            .expect("build plan should be valid JSON");
+    plan["packages"][0]["sources"][1]["identity"] =
+        serde_json::Value::String("acme/application:included.doria".to_string());
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&plan).expect("serialize plan"),
+    )
+    .expect("build plan should be writable");
+
+    let output = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["check", "--build-plan", "plan.json"])
+        .output()
+        .expect("doriac build-plan check should run");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).expect("diagnostic output should be UTF-8");
+    assert!(stderr.contains("plan.json · line 1"), "{stderr}");
+    assert!(
+        stderr.contains("already assigned to a different canonical file"),
+        "{stderr}"
+    );
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+fn write_build_plan_fixture(temp_dir: &PathBuf, main_source: &str) {
+    fs::create_dir_all(temp_dir).expect("temp directory should be created");
+    fs::write(temp_dir.join("main.doria"), main_source).expect("entry source should be writable");
+    fs::write(
+        temp_dir.join("helpers.doria"),
+        "function answer(): int { return 42; }",
+    )
+    .expect("helper source should be writable");
+    let plan_path = temp_dir.join("plan.json");
+    let plan = serde_json::json!({
+        "schemaVersion": 1,
+        "edition": "2026",
+        "rootPackage": "acme/application",
+        "selectedTarget": {
+            "package": "acme/application",
+            "name": "application",
+            "kind": "binary",
+            "entrySource": "acme/application:main.doria",
+            "activeScopes": ["main"]
+        },
+        "packages": [{
+            "identity": "acme/application",
+            "root": ".",
+            "namespaceMappings": [{"prefix": "", "path": "", "scope": "main"}],
+            "sources": [
+                {
+                    "identity": "acme/application:main.doria",
+                    "path": "main.doria",
+                    "scope": "main",
+                    "origin": "entry"
+                },
+                {
+                    "identity": "acme/application:helpers.doria",
+                    "path": "helpers.doria",
+                    "scope": "main",
+                    "origin": "explicit"
+                }
+            ],
+            "dependencies": []
+        }],
+        "compiler": {"target": "native", "nativeProfile": "fast", "targetTriple": null}
+    });
+    fs::write(
+        &plan_path,
+        serde_json::to_vec_pretty(&plan).expect("serialize plan"),
+    )
+    .expect("plan should be writable");
+}
+
 fn doriac_bin() -> &'static str {
     env!("CARGO_BIN_EXE_doriac")
 }

@@ -3959,19 +3959,6 @@ function main(): void
             "unsupported native string interpolation for Stage 8",
         ),
         (
-            "top-level statement",
-            r#"
-echo 0;
-
-function main(): int
-{
-    return 0;
-}
-"#,
-            "B0001",
-            "unsupported top-level item",
-        ),
-        (
             "class",
             r#"
 class Person

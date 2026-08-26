@@ -10,7 +10,7 @@ pub struct GivenSemanticInfo {
     pub predicate_statement_indices: Vec<usize>,
 }
 
-pub type GivenSemanticInfoMap = HashMap<(usize, usize), GivenSemanticInfo>;
+pub type GivenSemanticInfoMap = HashMap<Span, GivenSemanticInfo>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub usize);
@@ -248,14 +248,12 @@ impl Builder<'_> {
                     NodeAction::Statement(Stmt::Throw(statement.clone())),
                     &incoming,
                 );
-                let has_checked_effect =
-                    self.checked_effect_sites
-                        .iter()
-                        .any(|((start, end), effects)| {
-                            statement.span.start <= *start
-                                && *end <= statement.span.end
-                                && !effects.is_empty()
-                        });
+                let has_checked_effect = self.checked_effect_sites.iter().any(|(span, effects)| {
+                    statement.span.source == span.source
+                        && statement.span.start <= span.start
+                        && span.end <= statement.span.end
+                        && !effects.is_empty()
+                });
                 if has_checked_effect {
                     self.connect_checked_effects(statement.span, &incoming, Some(value));
                 } else {
@@ -270,10 +268,10 @@ impl Builder<'_> {
                 Vec::new()
             }
             Stmt::Try(statement) => {
-                let precise_catches = statement.catches.iter().all(|catch| {
-                    self.catch_error_types
-                        .contains_key(&(catch.span.start, catch.span.end))
-                });
+                let precise_catches = statement
+                    .catches
+                    .iter()
+                    .all(|catch| self.catch_error_types.contains_key(&catch.span));
                 let catch_entries = if precise_catches {
                     statement
                         .catches
@@ -301,11 +299,7 @@ impl Builder<'_> {
                             .iter()
                             .zip(&catch_entries)
                             .map(|(catch, entry)| {
-                                (
-                                    self.catch_error_types[&(catch.span.start, catch.span.end)]
-                                        .clone(),
-                                    *entry,
-                                )
+                                (self.catch_error_types[&catch.span].clone(), *entry)
                             })
                             .collect(),
                         catch_finalizer_depth: self.finalizers.len(),
@@ -517,7 +511,7 @@ impl Builder<'_> {
     ) -> GivenFlow {
         let predicate_indices = self
             .given_preludes
-            .get(&(given.span.start, given.span.end))
+            .get(&given.span)
             .map(|info| info.predicate_statement_indices.as_slice())
             .unwrap_or_default()
             .to_vec();
@@ -747,8 +741,12 @@ impl Builder<'_> {
         let sites = self
             .checked_effect_sites
             .iter()
-            .filter(|((start, end), _)| action_span.start <= *start && *end <= action_span.end)
-            .map(|((start, end), effects)| (Span::new(*start, *end), effects.clone()))
+            .filter(|(span, _)| {
+                action_span.source == span.source
+                    && action_span.start <= span.start
+                    && span.end <= action_span.end
+            })
+            .map(|(span, effects)| (*span, effects.clone()))
             .collect::<Vec<_>>();
         for (site_span, effects) in sites {
             let completed = completed_action.filter(|_| {

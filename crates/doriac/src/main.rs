@@ -9,11 +9,11 @@ use std::time::Instant;
 
 use doriac::backend::{BackendOutput, BackendTarget, CompileOptions, NativeProfile};
 use doriac::diagnostics::{
-    ColorChoice, Diagnostic, DiagnosticFormat, DiagnosticSource, RenderOptions, RuntimeFact,
-    RuntimeFactValue, RuntimeOutcomeDetails, RuntimeOutcomeFrame, RuntimeOutcomeOrigin,
-    TerminationBehavior,
+    ColorChoice, Diagnostic, DiagnosticFormat, DiagnosticSource, LabelRole, RenderOptions,
+    RuntimeFact, RuntimeFactValue, RuntimeOutcomeDetails, RuntimeOutcomeFrame,
+    RuntimeOutcomeOrigin, TerminationBehavior,
 };
-use doriac::source::Span;
+use doriac::source::{SourceFile, SourceId, Span};
 
 #[derive(Debug)]
 enum CliError {
@@ -21,6 +21,11 @@ enum CliError {
     Diagnostics {
         path: String,
         text: String,
+        diagnostics: Vec<Diagnostic>,
+        options: RenderOptions,
+    },
+    GraphDiagnostics {
+        sources: Box<doriac::source_map::SourceMap>,
         diagnostics: Vec<Diagnostic>,
         options: RenderOptions,
     },
@@ -41,6 +46,18 @@ impl CliError {
         }
     }
 
+    fn graph_diagnostics(
+        sources: doriac::source_map::SourceMap,
+        diagnostics: Vec<Diagnostic>,
+        options: RenderOptions,
+    ) -> Self {
+        Self::GraphDiagnostics {
+            sources: Box::new(sources),
+            diagnostics,
+            options,
+        }
+    }
+
     fn emit(self) {
         match self {
             Self::Message(message) => eprintln!("Error: {message}"),
@@ -52,6 +69,22 @@ impl CliError {
             } => {
                 let rendered =
                     doriac::render_diagnostics_with_options(path, text, &diagnostics, options);
+                if options.format == DiagnosticFormat::Json {
+                    println!("{rendered}");
+                } else {
+                    eprintln!("{rendered}");
+                }
+            }
+            Self::GraphDiagnostics {
+                sources,
+                diagnostics,
+                options,
+            } => {
+                let rendered = doriac::diagnostics::render_diagnostics_with_source_map(
+                    &sources,
+                    &diagnostics,
+                    options,
+                );
                 if options.format == DiagnosticFormat::Json {
                     println!("{rendered}");
                 } else {
@@ -112,6 +145,30 @@ fn run() -> Result<ExitCode, CliError> {
     match command {
         "check" => {
             let (args, options) = parse_diagnostic_options(&args[1..])?;
+            if let Some(plan_path) = build_plan_argument(&args)? {
+                let (_, graph) = load_cli_graph(plan_path, options)?;
+                let analysis = doriac::analyze_compilation_graph_for_ide(&graph);
+                if analysis.diagnostics.is_empty() {
+                    if options.format == DiagnosticFormat::Json {
+                        println!(
+                            "{}",
+                            doriac::diagnostics::render_diagnostics_with_source_map(
+                                &graph.source_map,
+                                &[],
+                                options,
+                            )
+                        );
+                    } else {
+                        println!("OK");
+                    }
+                    return Ok(ExitCode::SUCCESS);
+                }
+                return Err(CliError::graph_diagnostics(
+                    graph.source_map,
+                    analysis.diagnostics,
+                    options,
+                ));
+            }
             let input = args
                 .first()
                 .ok_or_else(|| "missing input file".to_string())?;
@@ -207,14 +264,22 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
         .chain(args.iter().map(OsString::from))
         .collect::<Vec<_>>();
     let (args, diagnostic_options) = parse_diagnostic_options(args)?;
-    let input = args
-        .first()
-        .ok_or_else(|| "missing input file".to_string())?;
+    let plan_path = build_plan_argument(&args)?;
+    let input = if plan_path.is_some() {
+        None
+    } else {
+        Some(
+            args.first()
+                .ok_or_else(|| "missing input file".to_string())?
+                .as_str(),
+        )
+    };
     let mut target = BackendTarget::Native;
+    let mut target_override = false;
     let mut release = false;
     let mut out = None::<String>;
     let mut performance_report = None::<String>;
-    let mut index = 1;
+    let mut index = if plan_path.is_some() { 2 } else { 1 };
     while index < args.len() {
         match args[index].as_str() {
             "--target" => {
@@ -223,6 +288,7 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
                     .ok_or_else(|| "missing value for --target".to_string())?
                     .clone();
                 target = BackendTarget::from_str(&target_value)?;
+                target_override = true;
                 index += 2;
             }
             "--out" => {
@@ -267,7 +333,41 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
         .into());
     }
 
+    if plan_path.is_some() && (release || target_override) {
+        return Err(
+            "--target and --release cannot override compiler settings from a build plan".into(),
+        );
+    }
+
     let source_load_started = Instant::now();
+    if let Some(plan_path) = plan_path {
+        if performance_report.is_some() {
+            return Err("--performance-report is not available with --build-plan".into());
+        }
+        let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
+        let output = doriac::compile_compilation_graph(&graph).map_err(|diagnostics| {
+            CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
+        })?;
+        let target = backend_target_for_plan(&graph.build_plan)?;
+        let out_path = out.map_or_else(
+            || default_build_plan_output_path(&graph.build_plan, target),
+            PathBuf::from,
+        );
+        validate_compile_destinations(
+            std::iter::once(Path::new(plan_path)).chain(graph.sources.values().map(|source| {
+                source
+                    .canonical_path
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(&source.display_path))
+            })),
+            &out_path,
+            None,
+        )?;
+        write_backend_output(&out_path, output)?;
+        println!("{}", out_path.display());
+        return Ok(());
+    }
+    let input = input.expect("source input exists without a build plan");
     let (path, text) = read_source(input)?;
     let source_load = source_load_started.elapsed();
     let out_path = match out {
@@ -275,7 +375,7 @@ fn compile_command(executable: &OsStr, args: &[String]) -> Result<(), CliError> 
         None => default_output_path(input, target)?,
     };
     validate_compile_destinations(
-        Path::new(input),
+        std::iter::once(Path::new(input)),
         &out_path,
         performance_report.as_deref().map(Path::new),
     )?;
@@ -407,8 +507,114 @@ fn performance_report_error(
     )
 }
 
+fn build_plan_argument(args: &[String]) -> Result<Option<&str>, String> {
+    if args.first().map(String::as_str) != Some("--build-plan") {
+        return Ok(None);
+    }
+    args.get(1)
+        .map(String::as_str)
+        .map(Some)
+        .ok_or_else(|| "missing value for --build-plan".to_string())
+}
+
+fn load_cli_graph(
+    path: &str,
+    options: RenderOptions,
+) -> Result<
+    (
+        doriac::build_plan::BuildPlanDocument,
+        doriac::compilation_graph::CompilationGraph,
+    ),
+    CliError,
+> {
+    let plan_text = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read build plan `{path}`: {error}"))?;
+    let document = doriac::build_plan::parse_build_plan_document(path, plan_text.clone()).map_err(
+        |diagnostics| {
+            CliError::diagnostics(path.to_string(), plan_text.clone(), diagnostics, options)
+        },
+    )?;
+    let graph = doriac::compilation_graph::load_compilation_graph_detailed(
+        &document,
+        &doriac::source_provider::FileSystemSourceProvider,
+    )
+    .map_err(|failure| graph_load_error(path, plan_text, failure, options))?;
+    Ok((document, graph))
+}
+
+fn graph_load_error(
+    path: &str,
+    plan_text: String,
+    mut failure: doriac::compilation_graph::GraphLoadFailure,
+    options: RenderOptions,
+) -> CliError {
+    let plan_source_id = SourceId(u32::MAX);
+    for diagnostic in &mut failure.diagnostics {
+        let primary_is_plan = diagnostic.labels.iter().any(|label| {
+            label.role == LabelRole::Primary && label.source == DiagnosticSource::Current
+        });
+        for label in &mut diagnostic.labels {
+            if label.source == DiagnosticSource::Current {
+                label.source = DiagnosticSource::Path(path.to_string());
+                label.span.source = plan_source_id;
+            }
+        }
+        for fix in &mut diagnostic.fixes {
+            for edit in &mut fix.edits {
+                if edit.source == DiagnosticSource::Current {
+                    edit.source = DiagnosticSource::Path(path.to_string());
+                    edit.span.source = plan_source_id;
+                }
+            }
+        }
+        if primary_is_plan {
+            diagnostic.span.source = plan_source_id;
+        }
+    }
+    failure.source_map.insert(doriac::source_map::SourceRecord {
+        identity: doriac::names::SourceIdentity(format!("!build-plan:{path}")),
+        package: doriac::names::PackageIdentity::SyntheticTooling("build-plan".to_string()),
+        display_path: path.to_string(),
+        canonical_path: fs::canonicalize(path)
+            .ok()
+            .map(|path| path.display().to_string()),
+        content_fingerprint: String::new(),
+        source: SourceFile::with_id(plan_source_id, path, plan_text),
+    });
+    CliError::graph_diagnostics(*failure.source_map, failure.diagnostics, options)
+}
+
+fn backend_target_for_plan(
+    plan: &doriac::build_plan::BuildPlan,
+) -> Result<BackendTarget, CliError> {
+    match plan.compiler.target {
+        doriac::build_plan::CompilerTarget::Debug => Ok(BackendTarget::Debug),
+        doriac::build_plan::CompilerTarget::Native => Ok(BackendTarget::Native),
+        doriac::build_plan::CompilerTarget::Php => Ok(BackendTarget::Php),
+    }
+}
+
+fn default_build_plan_output_path(
+    plan: &doriac::build_plan::BuildPlan,
+    target: BackendTarget,
+) -> PathBuf {
+    let mut path = PathBuf::from(&plan.selected_target.name);
+    let extension = default_output_extension(target);
+    if !extension.is_empty() {
+        path.set_extension(extension);
+    }
+    path
+}
+
 fn ast_command(args: &[String]) -> Result<(), CliError> {
     let (args, diagnostic_options) = parse_diagnostic_options(args)?;
+    if let Some(plan_path) = build_plan_argument(&args)? {
+        let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
+        for (identity, source) in &graph.sources {
+            println!("Source {identity}\n{:#?}", source.authored);
+        }
+        return Ok(());
+    }
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
@@ -422,6 +628,14 @@ fn ast_command(args: &[String]) -> Result<(), CliError> {
 
 fn hir_command(args: &[String]) -> Result<(), CliError> {
     let (args, diagnostic_options) = parse_diagnostic_options(args)?;
+    if let Some(plan_path) = build_plan_argument(&args)? {
+        let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
+        let hir = doriac::lower_compilation_graph(&graph).map_err(|diagnostics| {
+            CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
+        })?;
+        println!("{hir:#?}");
+        return Ok(());
+    }
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
@@ -435,6 +649,14 @@ fn hir_command(args: &[String]) -> Result<(), CliError> {
 
 fn mir_command(args: &[String]) -> Result<(), CliError> {
     let (args, diagnostic_options) = parse_diagnostic_options(args)?;
+    if let Some(plan_path) = build_plan_argument(&args)? {
+        let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
+        let mir = doriac::lower_compilation_graph_to_mir(&graph).map_err(|diagnostics| {
+            CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
+        })?;
+        print!("{mir}");
+        return Ok(());
+    }
     let input = args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
@@ -489,27 +711,32 @@ fn default_output_path(input: &str, target: BackendTarget) -> Result<PathBuf, St
     Ok(PathBuf::from(file_name))
 }
 
-fn validate_compile_destinations(
-    input_path: &Path,
+fn validate_compile_destinations<'a>(
+    input_paths: impl IntoIterator<Item = &'a Path>,
     output_path: &Path,
     performance_report_path: Option<&Path>,
 ) -> Result<(), String> {
-    if paths_alias(input_path, output_path)? {
-        return Err(format!(
-            "output path `{}` would overwrite input `{}`; pass --out <file> to choose a different output path",
-            output_path.display(),
-            input_path.display()
-        ));
+    let input_paths = input_paths.into_iter().collect::<Vec<_>>();
+    for input_path in &input_paths {
+        if paths_alias(input_path, output_path)? {
+            return Err(format!(
+                "output path `{}` would overwrite input `{}`; pass --out <file> to choose a different output path",
+                output_path.display(),
+                input_path.display()
+            ));
+        }
     }
     let Some(report_path) = performance_report_path else {
         return Ok(());
     };
-    if paths_alias(report_path, input_path)? {
-        return Err(format!(
-            "performance report path `{}` would overwrite input `{}`; choose a separate report path",
-            report_path.display(),
-            input_path.display()
-        ));
+    for input_path in input_paths {
+        if paths_alias(report_path, input_path)? {
+            return Err(format!(
+                "performance report path `{}` would overwrite input `{}`; choose a separate report path",
+                report_path.display(),
+                input_path.display()
+            ));
+        }
     }
     if paths_alias(report_path, output_path)? {
         return Err(format!(
@@ -743,6 +970,47 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
     };
     let compiler_args = utf8_cli_arguments(compiler_args)?;
     let (compiler_args, diagnostic_options) = parse_diagnostic_options(&compiler_args)?;
+    let plan_path = build_plan_argument(&compiler_args)?;
+    if let Some(plan_path) = plan_path {
+        if compiler_args.len() != 2 {
+            return Err("build-plan run accepts no compiler overrides".into());
+        }
+        let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
+        if graph.build_plan.selected_target.kind != doriac::build_plan::TargetKind::Binary {
+            return Err("running a build plan requires a selected binary target".into());
+        }
+        if graph.build_plan.compiler.target != doriac::build_plan::CompilerTarget::Native {
+            return Err("running a build plan requires compiler.target `native`".into());
+        }
+        let output = doriac::compile_compilation_graph(&graph).map_err(|diagnostics| {
+            CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
+        })?;
+        let (status, runtime_payload) = execute_native_output(plan_path, output, program_args)?;
+        if let Some(payload) = runtime_payload {
+            let fallback_path = graph
+                .selected_entry
+                .as_ref()
+                .and_then(|entry| graph.sources.get(&entry.0))
+                .map(|source| source.display_path.as_str())
+                .unwrap_or(plan_path);
+            let diagnostic = decode_runtime_outcome(&payload, fallback_path)?;
+            let options = RenderOptions {
+                context_lines: 0,
+                ..diagnostic_options
+            };
+            let rendered = doriac::diagnostics::render_diagnostics_with_source_map(
+                &graph.source_map,
+                &[diagnostic],
+                options,
+            );
+            if options.format == DiagnosticFormat::Json {
+                println!("{rendered}");
+            } else {
+                eprintln!("{rendered}");
+            }
+        }
+        return Ok(exit_code_from_status(status)?);
+    }
     let input = compiler_args
         .first()
         .ok_or_else(|| "missing input file".to_string())?;
@@ -771,26 +1039,7 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
         CliError::diagnostics(path.clone(), text.clone(), diagnostics, diagnostic_options)
     })?;
 
-    let temp_path = temp_run_executable_path(input);
-    let outcome_path = temp_path.with_extension("doria-outcome");
-    write_backend_output(&temp_path, output)
-        .map_err(|error| format!("failed to write temp native executable: {error}"))?;
-
-    let status = Command::new(&temp_path)
-        .env("DORIA_RUNTIME_OUTCOME_V2", &outcome_path)
-        .env("DORIA_RUNTIME_OUTCOME_V3", &outcome_path)
-        .args(program_args)
-        .status()
-        .map_err(|error| {
-            format!(
-                "failed to run native executable `{}`: {error}",
-                temp_path.display()
-            )
-        })?;
-
-    let runtime_payload = fs::read(&outcome_path).ok();
-    let _ = fs::remove_file(&outcome_path);
-    let _ = fs::remove_file(&temp_path);
+    let (status, runtime_payload) = execute_native_output(input, output, program_args)?;
     let runtime_diagnostic = runtime_payload
         .map(|payload| decode_runtime_outcome(&payload, &path))
         .transpose()?;
@@ -808,6 +1057,32 @@ fn run_command(args: &[OsString]) -> Result<ExitCode, CliError> {
         }
     }
     Ok(exit_code_from_status(status)?)
+}
+
+fn execute_native_output(
+    input: &str,
+    output: BackendOutput,
+    program_args: &[OsString],
+) -> Result<(ExitStatus, Option<Vec<u8>>), CliError> {
+    let temp_path = temp_run_executable_path(input);
+    let outcome_path = temp_path.with_extension("doria-outcome");
+    write_backend_output(&temp_path, output)
+        .map_err(|error| format!("failed to write temp native executable: {error}"))?;
+    let status = Command::new(&temp_path)
+        .env("DORIA_RUNTIME_OUTCOME_V2", &outcome_path)
+        .env("DORIA_RUNTIME_OUTCOME_V3", &outcome_path)
+        .args(program_args)
+        .status()
+        .map_err(|error| {
+            format!(
+                "failed to run native executable `{}`: {error}",
+                temp_path.display()
+            )
+        });
+    let runtime_payload = fs::read(&outcome_path).ok();
+    let _ = fs::remove_file(&outcome_path);
+    let _ = fs::remove_file(&temp_path);
+    Ok((status?, runtime_payload))
 }
 
 fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnostic, CliError> {
@@ -1178,7 +1453,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac ast <source.doria> [diagnostic options]\n    doriac hir <source.doria> [diagnostic options]\n    doriac mir <source.doria> [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac check --build-plan <plan.json> [diagnostic options]\n    doriac ast|hir|mir <source.doria> [diagnostic options]\n    doriac ast|hir|mir --build-plan <plan.json> [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac compile --build-plan <plan.json> [--out <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n    doriac run --build-plan <plan.json> [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
         doriac::TOOLCHAIN_VERSION
     );
 }
@@ -1287,6 +1562,9 @@ mod tests {
             Err(CliError::Message(message)) => message,
             Err(CliError::Diagnostics { .. }) => {
                 panic!("transport decoding must not create a compilation diagnostic")
+            }
+            Err(CliError::GraphDiagnostics { .. }) => {
+                panic!("transport decoding must not create a graph diagnostic")
             }
             Ok(_) => panic!("malformed transport unexpectedly decoded"),
         }

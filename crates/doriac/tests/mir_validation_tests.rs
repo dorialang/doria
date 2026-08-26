@@ -2618,6 +2618,7 @@ fn shared_validator_rejects_owned_nullable_class_statics() {
         id: StaticId(0),
         class: ClassId(0),
         name: "cached".to_string(),
+        source_span: Default::default(),
         ty: Type::NullableClass(ClassId(1)),
         writable: false,
         initializer: StaticValue::Null,
@@ -5772,8 +5773,60 @@ fn display_spec() -> FormatSpec {
     }
 }
 
+#[test]
+fn shared_validator_keeps_compiler_known_origins_separate_from_authored_sources() {
+    let mut compiler_known = valid_void_program();
+    let mut helper = compiler_known.functions[0].clone();
+    helper.id = FunctionId(1);
+    helper.name = "compilerKnownHelper".to_string();
+    helper.source_span =
+        doriac::source::Span::in_source(doriac::compiler_known_io::SYNTHETIC_SOURCE_ID, 0, 1);
+    compiler_known.functions.push(helper);
+    doriac::mir_validation::validate_program(&compiler_known)
+        .expect("reserved compiler-known origins do not require a fake source unit");
+
+    let mut missing_authored = valid_void_program();
+    let mut helper = missing_authored.functions[0].clone();
+    helper.id = FunctionId(1);
+    helper.name = "missingAuthoredHelper".to_string();
+    helper.source_span = doriac::source::Span::in_source(doriac::source::SourceId(900), 0, 1);
+    missing_authored.functions.push(helper);
+    assert_malformed(&missing_authored, "function references a missing source");
+}
+
+#[test]
+fn shared_validator_rejects_malformed_compilation_graph_tables() {
+    let valid = valid_void_program();
+
+    let mut duplicate_source = valid.clone();
+    duplicate_source
+        .sources
+        .push(duplicate_source.sources[0].clone());
+    assert_malformed(&duplicate_source, "source0 appears more than once");
+
+    let mut missing_package = valid.clone();
+    missing_package.packages.clear();
+    assert_malformed(&missing_package, "belongs to missing package");
+
+    let mut missing_entry_source = valid.clone();
+    missing_entry_source.selected_target.entry_source = Some(doriac::names::SourceIdentity(
+        "standalone:missing.doria".to_string(),
+    ));
+    assert_malformed(
+        &missing_entry_source,
+        "selected entry source does not exist",
+    );
+
+    let mut library_with_entry = valid;
+    library_with_entry.selected_target.kind = doriac::build_plan::TargetKind::Library;
+    assert_malformed(&library_with_entry, "library graph carries a process entry");
+}
+
 fn valid_void_program() -> Program {
     Program {
+        sources: vec![doriac::mir::SourceUnit::standalone("<test>", "")],
+        packages: vec![doriac::mir::PackageUnit::standalone()],
+        selected_target: doriac::mir::SelectedTarget::standalone("<test>"),
         enums: Vec::new(),
         source: doriac::source::SourceFile::new("<test>", ""),
         compilation_context: doriac::names::CompilationContext::standalone("<test>"),
@@ -5807,6 +5860,7 @@ fn valid_void_program() -> Program {
             entry_block: BlockId(0),
             closure: None,
         }],
+        selected_entry: Some(FunctionId(0)),
         entry: FunctionId(0),
     }
 }
@@ -5818,6 +5872,7 @@ fn class_program() -> Program {
         .map(|id| Class {
             id,
             name: format!("Class{}", id.0),
+            source_span: Default::default(),
             properties: vec![],
             layout: compute_class_layout(id, [], 8),
             constructor: None,

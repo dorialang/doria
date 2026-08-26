@@ -126,6 +126,7 @@ three execution paths.
 | Decision 0113 Slice 4 collection clear | Covered | Covered | Covered | Covered | All seven named collections clear in place, invalidate old membership state, survive double clear, and preserve reuse order through one validated MIR statement and runtime reset contract. |
 | Stage 30g `List<T>` algorithms | Covered | Covered | Covered | Covered for supported values | `map`, Copy-only `filter`, and writable-accumulator `reduce` use compiler-owned semantic/HIR plans and explicit validated MIR traversal; durable fixtures cover writable callback state, Move results/accumulators, exact checked effects, reverse partial cleanup, source preservation, and explicit PHP loops without host higher-order functions. |
 | Stage 30h closure completion | Covered | Covered | Covered | Covered for supported values | The completion fixtures cover explicit writable `$this`, typed-array/List/Dictionary/SortedDictionary/Deque storage, nullable callable coalescing, borrowed/taken/returned/replaced `mixed` function values, and exact destructor cleanup; E0641 is historical and reserved. |
+| Stage 31 multi-file package graphs | Covered | Covered | Covered | Covered | The schema-1 package-graph manifest executes cross-file calls, a direct dependency, package-wide `internal`, and compile-time include-once through one validated multi-source MIR. No backend performs runtime include, autoload, namespace lookup, or package lookup. |
 | Stage 29 Slice 2 checked errors | Covered | Covered | Covered | Covered where lifecycle semantics permit | Two-word Error carriers, direct throw, checked calls, exact and catch-all dispatch, optional bindings, rethrow, nested handlers, structured finalizers, failed construction, ordinary Error values, `mixed`, supported collections, and first-origin preservation use one validated MIR contract. |
 | Stage 29 Slice 3 checked I/O and R1000 | Covered | Covered | Covered | Covered | Canonical I/O error facts, UTF-8 byte facts, built-in effects, first-origin construction, status-70 entry handling, cleanup, and private/standalone outcome reporting preserve exact stdout, stderr, status, files, and structured outcomes. |
 | Runtime panic diagnostic outcome | Covered | Covered | Covered | Covered | Catalogued `P` code, Title Case title, precise Doria source label, `Why`, `Call Path`, stderr bytes, and status 101 remain exact across the durable manifest. |
@@ -214,7 +215,7 @@ front-to-back iteration across the interpreter, Cranelift, and LLVM. The Stage
 independent writable bindings, shared immutable strings, and nullable empty
 move bindings across the same three execution paths.
 
-Status: Passed through Stage 29 Slice 3; Stage 29 is complete. Checked errors and
+Status: Passed through Stage 31 Slice 2; Stages 29 through 31 are complete. Checked errors and
 checked I/O are registered in the durable manifest and agree across the MIR
 interpreter, Cranelift, and LLVM on stdout, stderr, status, files, origins, and
 destructor output. PHP compatibility executes the supported subset using Doria

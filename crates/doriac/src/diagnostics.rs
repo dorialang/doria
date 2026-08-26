@@ -38,6 +38,7 @@ impl DiagnosticSeverity {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticKind {
     Language,
+    CompilerInput,
     UnsupportedDevelopmentSurface,
     Backend,
     ExternalTool,
@@ -50,6 +51,7 @@ impl DiagnosticKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Language => "language",
+            Self::CompilerInput => "compilerInput",
             Self::UnsupportedDevelopmentSurface => "unsupportedDevelopmentSurface",
             Self::Backend => "backend",
             Self::ExternalTool => "externalTool",
@@ -567,6 +569,17 @@ impl Diagnostic {
         self
     }
 
+    pub fn with_primary_source(mut self, source: DiagnosticSource) -> Self {
+        if let Some(primary) = self
+            .labels
+            .iter_mut()
+            .find(|label| label.role == LabelRole::Primary)
+        {
+            primary.source = source;
+        }
+        self
+    }
+
     pub fn with_cause(mut self, cause_id: impl Into<String>) -> Self {
         self.cause_id = Some(cause_id.into());
         self
@@ -717,14 +730,35 @@ pub fn render_diagnostics(
     let prepared = prepare_diagnostics(diagnostics);
     let prepared = prepared.iter().collect::<Vec<_>>();
     match options.format {
-        DiagnosticFormat::Human => render_human(source, &prepared, options),
-        DiagnosticFormat::Concise => render_concise(source, &prepared),
-        DiagnosticFormat::Json => diagnostics_json(source, &prepared),
+        DiagnosticFormat::Human => render_human(source, None, &prepared, options),
+        DiagnosticFormat::Concise => render_concise(source, None, &prepared),
+        DiagnosticFormat::Json => diagnostics_json(source, None, &prepared),
+    }
+}
+
+pub fn render_diagnostics_with_source_map(
+    sources: &crate::source_map::SourceMap,
+    diagnostics: &[Diagnostic],
+    options: RenderOptions,
+) -> String {
+    let fallback = sources
+        .iter()
+        .next()
+        .map(|record| &record.source)
+        .cloned()
+        .unwrap_or_else(|| SourceFile::new("<source unavailable>", ""));
+    let prepared = prepare_diagnostics(diagnostics);
+    let prepared = prepared.iter().collect::<Vec<_>>();
+    match options.format {
+        DiagnosticFormat::Human => render_human(&fallback, Some(sources), &prepared, options),
+        DiagnosticFormat::Concise => render_concise(&fallback, Some(sources), &prepared),
+        DiagnosticFormat::Json => diagnostics_json(&fallback, Some(sources), &prepared),
     }
 }
 
 fn render_human(
     source: &SourceFile,
+    sources: Option<&crate::source_map::SourceMap>,
     diagnostics: &[&Diagnostic],
     options: RenderOptions,
 ) -> String {
@@ -760,7 +794,7 @@ fn render_human(
             block.push_str("\n\nWhere\n");
             render_label(
                 &mut block,
-                source,
+                diagnostic_source_file(sources, source, &primary.source, primary.span),
                 primary,
                 options,
                 diagnostic
@@ -777,7 +811,13 @@ fn render_human(
             block.push_str("\n\nRelated");
             for label in related {
                 block.push('\n');
-                render_label(&mut block, source, label, options, None);
+                render_label(
+                    &mut block,
+                    diagnostic_source_file(sources, source, &label.source, label.span),
+                    label,
+                    options,
+                    None,
+                );
             }
         }
         if let Some(explanation) = &diagnostic.explanation {
@@ -804,7 +844,8 @@ fn render_human(
                 fix.title
             ));
             for edit in &fix.edits {
-                let location = display_location(source, &edit.source, edit.span.start);
+                let edit_source = diagnostic_source_file(sources, source, &edit.source, edit.span);
+                let location = display_location(edit_source, &edit.source, edit.span.start);
                 block.push_str(&format!(
                     "\n{location} · Replace With `{}`",
                     edit.replacement
@@ -833,11 +874,13 @@ fn render_human(
             if !outcome.path.is_empty() {
                 block.push_str("\n\nCall Path");
                 for frame in &outcome.path {
-                    let (line, _) = display_line_col(source, frame.span.start, 4);
+                    let frame_source =
+                        diagnostic_source_file(sources, source, &frame.source, frame.span);
+                    let (line, _) = display_line_col(frame_source, frame.span.start, 4);
                     block.push_str(&format!(
                         "\n{} · {}:{}",
                         frame.function,
-                        source_name(&frame.source, source),
+                        source_name(&frame.source, frame_source),
                         line
                     ));
                 }
@@ -989,7 +1032,11 @@ fn push_prose_section(
     rendered.pop();
 }
 
-fn render_concise(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String {
+fn render_concise(
+    source: &SourceFile,
+    sources: Option<&crate::source_map::SourceMap>,
+    diagnostics: &[&Diagnostic],
+) -> String {
     let mut lines = diagnostics
         .iter()
         .map(|diagnostic| {
@@ -999,8 +1046,10 @@ fn render_concise(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String {
                 .find(|label| label.role == LabelRole::Primary)
                 .or_else(|| diagnostic.labels.first());
             let (path, line, col) = primary.map_or((source.path.as_str(), 1, 1), |label| {
-                let (line, col) = display_line_col(source, label.span.start, 4);
-                (source_name(&label.source, source), line, col)
+                let label_source =
+                    diagnostic_source_file(sources, source, &label.source, label.span);
+                let (line, col) = display_line_col(label_source, label.span.start, 4);
+                (source_name(&label.source, label_source), line, col)
             });
             format!(
                 "{path}:{line}:{col}: {}[{}]: {}{}",
@@ -1046,7 +1095,11 @@ fn terminal_safe_runtime_text(
     String::from_utf8(bytes).expect("terminal-safe runtime text remains valid UTF-8")
 }
 
-fn diagnostics_json(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String {
+fn diagnostics_json(
+    source: &SourceFile,
+    sources: Option<&crate::source_map::SourceMap>,
+    diagnostics: &[&Diagnostic],
+) -> String {
     let summary = DiagnosticSummary::from_diagnostics(diagnostics);
     let values = diagnostics
         .iter()
@@ -1059,10 +1112,16 @@ fn diagnostics_json(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String 
                 "message": diagnostic.message,
                 "explanation": diagnostic.explanation,
                 "labels": diagnostic.labels.iter().map(|label| {
-                    let (line, column) = display_line_col(source, label.span.start, 4);
-                    let (end_line, end_column) = display_line_col(source, label.span.end, 4);
+                    let label_source = diagnostic_source_file(
+                        sources,
+                        source,
+                        &label.source,
+                        label.span,
+                    );
+                    let (line, column) = display_line_col(label_source, label.span.start, 4);
+                    let (end_line, end_column) = display_line_col(label_source, label.span.end, 4);
                     serde_json::json!({
-                        "source": source_name(&label.source, source),
+                        "source": source_name(&label.source, label_source),
                         "role": label.role.as_str(),
                         "message": label.message,
                         "span": {
@@ -1080,11 +1139,19 @@ fn diagnostics_json(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String 
                 "fixes": diagnostic.fixes.iter().map(|fix| serde_json::json!({
                     "title": fix.title,
                     "applicability": fix.applicability.as_str(),
-                    "edits": fix.edits.iter().map(|edit| serde_json::json!({
-                        "source": source_name(&edit.source, source),
-                        "span": { "start": edit.span.start, "end": edit.span.end },
-                        "replacement": edit.replacement,
-                    })).collect::<Vec<_>>(),
+                    "edits": fix.edits.iter().map(|edit| {
+                        let edit_source = diagnostic_source_file(
+                            sources,
+                            source,
+                            &edit.source,
+                            edit.span,
+                        );
+                        serde_json::json!({
+                            "source": source_name(&edit.source, edit_source),
+                            "span": { "start": edit.span.start, "end": edit.span.end },
+                            "replacement": edit.replacement,
+                        })
+                    }).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>(),
                 "causeId": diagnostic.cause_id,
                 "developmentOnly": diagnostic.development_only,
@@ -1098,13 +1165,19 @@ fn diagnostics_json(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String 
                     serde_json::json!({
                         "processStatus": outcome.process_status,
                         "terminationBehavior": outcome.termination_behavior.as_str(),
-                        "origin": runtime_origin_json(source, &outcome.origin),
+                        "origin": runtime_origin_json(source, sources, &outcome.origin),
                         "pathKind": if outcome.path.is_empty() { "none" } else { "callPath" },
                         "frames": outcome.path.iter().map(|frame| {
-                            let (line, column) = display_line_col(source, frame.span.start, 4);
+                            let frame_source = diagnostic_source_file(
+                                sources,
+                                source,
+                                &frame.source,
+                                frame.span,
+                            );
+                            let (line, column) = display_line_col(frame_source, frame.span.start, 4);
                             serde_json::json!({
                                 "function": frame.function,
-                                "source": source_name(&frame.source, source),
+                                "source": source_name(&frame.source, frame_source),
                                 "span": {
                                     "start": frame.span.start,
                                     "end": frame.span.end,
@@ -1138,11 +1211,16 @@ fn diagnostics_json(source: &SourceFile, diagnostics: &[&Diagnostic]) -> String 
     })
 }
 
-fn runtime_origin_json(source: &SourceFile, origin: &RuntimeOutcomeOrigin) -> serde_json::Value {
-    let (line, column) = display_line_col(source, origin.span.start, 4);
-    let (end_line, end_column) = display_line_col(source, origin.span.end, 4);
+fn runtime_origin_json(
+    source: &SourceFile,
+    sources: Option<&crate::source_map::SourceMap>,
+    origin: &RuntimeOutcomeOrigin,
+) -> serde_json::Value {
+    let origin_source = diagnostic_source_file(sources, source, &origin.source, origin.span);
+    let (line, column) = display_line_col(origin_source, origin.span.start, 4);
+    let (end_line, end_column) = display_line_col(origin_source, origin.span.end, 4);
     serde_json::json!({
-        "source": source_name(&origin.source, source),
+        "source": source_name(&origin.source, origin_source),
         "function": origin.function,
         "span": {
             "start": origin.span.start,
@@ -1256,6 +1334,25 @@ fn source_name<'a>(source: &'a DiagnosticSource, current: &'a SourceFile) -> &'a
         DiagnosticSource::Path(path) => path,
         DiagnosticSource::Unavailable => "<source unavailable>",
     }
+}
+
+fn diagnostic_source_file<'a>(
+    sources: Option<&'a crate::source_map::SourceMap>,
+    fallback: &'a SourceFile,
+    identity: &DiagnosticSource,
+    span: Span,
+) -> &'a SourceFile {
+    let Some(sources) = sources else {
+        return fallback;
+    };
+    sources
+        .by_id(span.source)
+        .or_else(|| match identity {
+            DiagnosticSource::Path(path) => sources.by_path(path),
+            DiagnosticSource::Current | DiagnosticSource::Unavailable => None,
+        })
+        .map(|record| &record.source)
+        .unwrap_or(fallback)
 }
 
 fn display_location(source: &SourceFile, identity: &DiagnosticSource, offset: usize) -> String {

@@ -14,6 +14,8 @@ pub const IO_ERROR_REASON: &str = "Doria\\Std\\Io\\IoErrorReason";
 pub const UTF8_INPUT_SOURCE: &str = "Doria\\Std\\Io\\Utf8InputSource";
 pub const IO_ERROR: &str = "Doria\\Std\\Io\\IoError";
 pub const INVALID_UTF8_ERROR: &str = "Doria\\Std\\Io\\InvalidUtf8Error";
+pub const SYNTHETIC_SOURCE_ID: crate::source::SourceId = crate::source::SourceId(0x7fff_ffff);
+pub const SYNTHETIC_SOURCE_IDENTITY: &str = "<compiler-known:stdio>";
 
 pub const CANONICAL_TYPES: [&str; 6] = [
     IO_OPERATION,
@@ -233,7 +235,7 @@ pub fn resolved_facts_use_canonical_io(facts: &GlobalSymbolFacts) -> bool {
 /// normal classes and enums.
 pub fn augment_program(program: &Program) -> Program {
     let mut augmented = program.clone();
-    let synthetic = |index| Span::new(usize::MAX / 2 + index, usize::MAX / 2 + index + 1);
+    let synthetic = |index| Span::in_source(SYNTHETIC_SOURCE_ID, index, index + 1);
     augmented.items.extend([
         unit_enum(
             IO_OPERATION,
@@ -304,6 +306,8 @@ fn unit_enum(name: &str, cases: &[&str], span: Span) -> Item {
 
 fn payload_enum(name: &str, cases: &[(&str, Option<(&str, &str)>)], span: Span) -> Item {
     Item::Enum(EnumDecl {
+        access: MemberAccess::External,
+        access_span: None,
         name: name.to_string(),
         name_span: span,
         type_params: Vec::new(),
@@ -350,6 +354,8 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
         })
         .collect();
     Item::Class(ClassDecl {
+        access: MemberAccess::External,
+        access_span: None,
         name: name.to_string(),
         name_span: span,
         type_params: Vec::new(),
@@ -358,6 +364,7 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
         implements: vec!["Error".to_string()],
         members: vec![ClassMember::Method(FunctionDecl {
             access: MemberAccess::External,
+            access_span: None,
             writable_this: false,
             writable_span: None,
             is_static: false,

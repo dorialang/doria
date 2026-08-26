@@ -2,7 +2,7 @@
 
 Status: Accepted
 
-Implementation note: `docs/decisions/0031-stage-7b-break-continue.md` implements the first compiler and native smoke slice for `break;` and `continue;`. Stage 31 Slice 1 implements namespace syntax, semantic `use` imports, same-file canonical resolution, and source-preserving `include` grammar. Stage 31 Slice 2 remains responsible for multi-file package graphs and include resolution. Structured `declare` remains future work.
+Implementation note: `docs/decisions/0031-stage-7b-break-continue.md` implements the first compiler and native smoke slice for `break;` and `continue;`. Stage 31 Slice 1 implements namespace syntax, semantic `use` imports, same-file canonical resolution, and source-preserving `include` grammar. Stage 31 Slice 2 implements multi-file package graphs and compile-time include resolution. Structured `declare` remains future work.
 
 Phase F amendment: Decision 0117 is the complete accepted authority for
 compile-time `autoload`, hybrid strict source layout, package compilation
@@ -29,7 +29,7 @@ The following remain evaluation-only and are not accepted for implementation by 
 - C/C++-style textual preprocessor directives copied as syntax
 - textual macro substitution such as `#define` and `#undef`
 
-This record originally settled language design only. Its namespace, `use`, and `include` grammar is now partially implemented by Stage 31 Slice 1; the remaining implementation boundaries are stated above.
+This record originally settled language design only. Its namespace, `use`, and compile-time `include` behavior is implemented by Stage 31; the remaining implementation boundaries are stated above.
 
 ## Categories
 
@@ -275,13 +275,16 @@ Textual macros are dangerous for Doria because:
 
 Doria source should remain parseable, typed, and semantically checked by `doriac`. If a directive changes compilation, it should do so through structured compiler semantics, not arbitrary token substitution.
 
+## Implementation Status
+
+Stage 31 implements multi-file namespace indexing, external import resolution,
+and compile-time include path resolution with include-once composition. Decision
+0117 owns the complete package-graph and source-layout contract.
+
 ## Non-goals
 
-This decision itself did not implement, and later work still has not implemented where noted:
+This decision does not implement:
 
-- multi-file namespace indexing (Stage 31 Slice 2)
-- external import resolution (Stage 31 Slice 2)
-- include path resolution and include-once composition (Stage 31 Slice 2)
 - `declare`
 - `goto`
 - preprocessor directives

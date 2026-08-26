@@ -17,7 +17,7 @@ pub enum Fact {
     Exact(TypeRef),
 }
 
-pub type FactsByUse = HashMap<(usize, usize), Fact>;
+pub type FactsByUse = HashMap<Span, Fact>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct BindingId(usize);
@@ -37,7 +37,7 @@ enum CallExecution {
 
 #[derive(Default)]
 struct Resolution {
-    uses: HashMap<(usize, usize), BindingId>,
+    uses: HashMap<Span, BindingId>,
     declarations: HashMap<usize, BindingId>,
     declaration_types: HashMap<BindingId, Option<TypeRef>>,
     declaration_callable_modes: HashMap<BindingId, ParamModes>,
@@ -1529,9 +1529,9 @@ fn collect_expr(
     facts: &mut FactsByUse,
 ) -> State {
     if let Expr::Variable { span, .. } = expr {
-        if let Some(binding) = resolution.uses.get(&(span.start, span.end)) {
+        if let Some(binding) = resolution.uses.get(span) {
             if let Some(fact) = state.facts.get(binding) {
-                facts.insert((span.start, span.end), fact.clone());
+                facts.insert(*span, fact.clone());
             }
         }
         return state.clone();
@@ -1787,7 +1787,7 @@ fn variable_binding(expr: &Expr, resolution: &Resolution) -> Option<BindingId> {
     let Expr::Variable { span, .. } = ungroup(expr) else {
         return None;
     };
-    resolution.uses.get(&(span.start, span.end)).copied()
+    resolution.uses.get(span).copied()
 }
 
 fn callable_parameter_modes(expr: &Expr, arity: usize, resolution: &Resolution) -> ParamModes {
@@ -2223,7 +2223,7 @@ impl Resolver {
                 .find_map(|scope| scope.get(name))
                 .copied()
             {
-                self.resolution.uses.insert((span.start, span.end), binding);
+                self.resolution.uses.insert(*span, binding);
             }
             return;
         }

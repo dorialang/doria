@@ -501,17 +501,20 @@ fn declare_error_metadata<'ctx>(
     );
     let mut origins = Vec::with_capacity(program.error_origins.len());
     for origin in &program.error_origins {
+        let doria_source = program
+            .source_for_span(origin.span)
+            .unwrap_or(&program.source);
         let prefix = format!("__doria_error_origin_{}", origin.id.0);
         let path = define_bytes(
             context,
             module,
-            program.source.path.as_bytes(),
+            doria_source.path.as_bytes(),
             &format!("{prefix}_path"),
         );
         let source = define_bytes(
             context,
             module,
-            program.source.text.as_bytes(),
+            doria_source.text.as_bytes(),
             &format!("{prefix}_source"),
         );
         let callable = define_bytes(
@@ -522,11 +525,9 @@ fn declare_error_metadata<'ctx>(
         );
         let initializer = origin_type.const_named_struct(&[
             path.into(),
-            word.const_int(program.source.path.len() as u64, false)
-                .into(),
+            word.const_int(doria_source.path.len() as u64, false).into(),
             source.into(),
-            word.const_int(program.source.text.len() as u64, false)
-                .into(),
+            word.const_int(doria_source.text.len() as u64, false).into(),
             word.const_int(origin.span.start as u64, false).into(),
             word.const_int(origin.span.end as u64, false).into(),
             callable.into(),
@@ -836,16 +837,19 @@ fn define_function<'ctx>(
         function.name.as_bytes(),
         &format!("__doria_function_name_{}", function.id.0),
     );
+    let doria_source = program
+        .source_for_span(function.source_span)
+        .unwrap_or(&program.source);
     let source_path = define_bytes(
         context,
         module,
-        program.source.path.as_bytes(),
+        doria_source.path.as_bytes(),
         &format!("__doria_source_path_{}", function.id.0),
     );
     let source_text = define_bytes(
         context,
         module,
-        program.source.text.as_bytes(),
+        doria_source.text.as_bytes(),
         &format!("__doria_source_text_{}", function.id.0),
     );
     let frame_values: [BasicValueEnum<'ctx>; 11] = [
@@ -856,11 +860,11 @@ fn define_function<'ctx>(
             .into(),
         source_path.into(),
         usize_type
-            .const_int(program.source.path.len() as u64, false)
+            .const_int(doria_source.path.len() as u64, false)
             .into(),
         source_text.into(),
         usize_type
-            .const_int(program.source.text.len() as u64, false)
+            .const_int(doria_source.text.len() as u64, false)
             .into(),
         usize_type
             .const_int(function.source_span.start as u64, false)
@@ -1307,28 +1311,31 @@ fn define_process_main<'ctx>(
         runtime_args.push(argv.into());
     }
     if integer_entry {
+        let doria_source = program
+            .source_for_span(entry.source_span)
+            .unwrap_or(&program.source);
         let source_path = define_bytes(
             context,
             module,
-            program.source.path.as_bytes(),
+            doria_source.path.as_bytes(),
             "__doria_process_source_path",
         );
         let source_text = define_bytes(
             context,
             module,
-            program.source.text.as_bytes(),
+            doria_source.text.as_bytes(),
             "__doria_process_source_text",
         );
         runtime_args.push(source_path.into());
         runtime_args.push(
             usize_type
-                .const_int(program.source.path.len() as u64, false)
+                .const_int(doria_source.path.len() as u64, false)
                 .into(),
         );
         runtime_args.push(source_text.into());
         runtime_args.push(
             usize_type
-                .const_int(program.source.text.len() as u64, false)
+                .const_int(doria_source.text.len() as u64, false)
                 .into(),
         );
         runtime_args.push(

@@ -1,4 +1,6 @@
-use crate::source::Span;
+use crate::build_plan::{GeneratedFor, SourceOrigin, SourceScope, TargetKind};
+use crate::names::{GlobalSymbolId, PackageIdentity, SourceIdentity};
+use crate::source::{SourceFile, SourceId, Span};
 use crate::types::{ResolvedType, TypeRef};
 
 pub use crate::ast::{
@@ -14,11 +16,61 @@ use crate::symbols::ClosureId;
 /// before backend output. A lower native-oriented IR may come later.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
+    pub sources: Vec<SourceUnit>,
+    pub packages: Vec<PackageUnit>,
+    pub selected_target: SelectedTarget,
+    /// Compatibility view for standalone consumers. Graph consumers use
+    /// `sources`; this is the selected entry source, or the first source for a
+    /// library graph.
     pub source_path: String,
     pub source_text: String,
     pub namespace: Option<NamespaceDecl>,
     pub items: Vec<Item>,
     pub semantic_info: crate::semantics::SemanticInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceUnit {
+    pub id: SourceId,
+    pub identity: SourceIdentity,
+    pub package: PackageIdentity,
+    pub display_path: String,
+    pub scope: SourceScope,
+    pub origin: SourceOrigin,
+    pub generated_for: Option<GeneratedFor>,
+    pub active: bool,
+    pub source: SourceFile,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageUnit {
+    pub identity: PackageIdentity,
+    pub normal_dependencies: Vec<PackageIdentity>,
+    pub development_dependencies: Vec<PackageIdentity>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedTarget {
+    pub package: PackageIdentity,
+    pub kind: TargetKind,
+    pub entry_source: Option<SourceIdentity>,
+}
+
+impl Program {
+    pub fn source(&self, id: SourceId) -> Option<&SourceFile> {
+        self.sources
+            .iter()
+            .find(|source| source.id == id)
+            .map(|source| &source.source)
+    }
+
+    pub fn selected_entry_source_id(&self) -> Option<SourceId> {
+        let identity = self.selected_target.entry_source.as_ref()?;
+        self.sources
+            .iter()
+            .find(|source| &source.identity == identity)
+            .map(|source| source.id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -39,6 +91,11 @@ pub enum Item {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnumDecl {
+    pub global_id: Option<GlobalSymbolId>,
+    pub source_identity: SourceIdentity,
+    pub package: PackageIdentity,
+    pub access: MemberAccess,
+    pub access_span: Option<Span>,
     pub name: String,
     pub type_params: Vec<TypeParamDecl>,
     pub backing_type: Option<TypeRef>,
@@ -63,6 +120,11 @@ pub struct EnumPayloadField {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ClassDecl {
+    pub global_id: Option<GlobalSymbolId>,
+    pub source_identity: SourceIdentity,
+    pub package: PackageIdentity,
+    pub access: MemberAccess,
+    pub access_span: Option<Span>,
     pub name: String,
     pub type_params: Vec<TypeParamDecl>,
     pub parent: Option<String>,
@@ -92,7 +154,11 @@ pub struct PropertyDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConstDecl {
+    pub global_id: Option<GlobalSymbolId>,
+    pub source_identity: SourceIdentity,
+    pub package: PackageIdentity,
     pub access: MemberAccess,
+    pub access_span: Option<Span>,
     pub ty: Option<TypeRef>,
     pub name: String,
     pub initializer: Expr,
@@ -101,7 +167,11 @@ pub struct ConstDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct FunctionDecl {
+    pub global_id: Option<GlobalSymbolId>,
+    pub source_identity: SourceIdentity,
+    pub package: PackageIdentity,
     pub access: MemberAccess,
+    pub access_span: Option<Span>,
     pub writable_this: bool,
     pub is_static: bool,
     pub name: String,

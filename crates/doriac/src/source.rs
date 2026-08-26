@@ -1,5 +1,9 @@
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct SourceId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Span {
+    pub source: SourceId,
     pub start: usize,
     pub end: usize,
 }
@@ -53,11 +57,21 @@ impl QualifiedNameRef {
 
 impl Span {
     pub fn new(start: usize, end: usize) -> Self {
-        Self { start, end }
+        Self::in_source(SourceId::default(), start, end)
+    }
+
+    pub fn in_source(source: SourceId, start: usize, end: usize) -> Self {
+        Self { source, start, end }
+    }
+
+    pub fn at(self, start: usize, end: usize) -> Self {
+        Self::in_source(self.source, start, end)
     }
 
     pub fn merge(self, other: Span) -> Span {
+        debug_assert_eq!(self.source, other.source);
         Span {
+            source: self.source,
             start: self.start.min(other.start),
             end: self.end.max(other.end),
         }
@@ -66,6 +80,7 @@ impl Span {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SourceFile {
+    pub id: SourceId,
     pub path: String,
     pub text: String,
     line_starts: Vec<usize>,
@@ -73,6 +88,10 @@ pub struct SourceFile {
 
 impl SourceFile {
     pub fn new(path: impl Into<String>, text: impl Into<String>) -> Self {
+        Self::with_id(SourceId::default(), path, text)
+    }
+
+    pub fn with_id(id: SourceId, path: impl Into<String>, text: impl Into<String>) -> Self {
         let text = text.into();
         let mut line_starts = vec![0];
         for (index, byte) in text.bytes().enumerate() {
@@ -82,6 +101,7 @@ impl SourceFile {
         }
 
         Self {
+            id,
             path: path.into(),
             text,
             line_starts,

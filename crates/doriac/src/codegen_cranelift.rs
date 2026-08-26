@@ -668,6 +668,9 @@ fn define_static_data(
         ids.push(id);
     }
     for origin in &program.error_origins {
+        let doria_source = program
+            .source_for_span(origin.span)
+            .unwrap_or(&program.source);
         let symbol = format!("__doria_error_origin_{}", origin.id.0);
         let id = module
             .declare_data(&symbol, Linkage::Local, false, false)
@@ -678,7 +681,7 @@ fn define_static_data(
             .declare_data(&format!("{symbol}_path"), Linkage::Local, false, false)
             .map_err(|error| backend_failure(error.to_string()))?;
         let mut path = DataDescription::new();
-        path.define(program.source.path.as_bytes().to_vec().into_boxed_slice());
+        path.define(doria_source.path.as_bytes().to_vec().into_boxed_slice());
         module
             .define_data(path_id, &path)
             .map_err(|error| backend_failure(error.to_string()))?;
@@ -686,7 +689,7 @@ fn define_static_data(
             .declare_data(&format!("{symbol}_source"), Linkage::Local, false, false)
             .map_err(|error| backend_failure(error.to_string()))?;
         let mut source = DataDescription::new();
-        source.define(program.source.text.as_bytes().to_vec().into_boxed_slice());
+        source.define(doria_source.text.as_bytes().to_vec().into_boxed_slice());
         module
             .define_data(source_id, &source)
             .map_err(|error| backend_failure(error.to_string()))?;
@@ -700,9 +703,9 @@ fn define_static_data(
             .map_err(|error| backend_failure(error.to_string()))?;
         let mut bytes = Vec::with_capacity(pointer_bytes * 8);
         append_target_word(&mut bytes, 0, pointer_bytes);
-        append_target_word(&mut bytes, program.source.path.len() as u64, pointer_bytes);
+        append_target_word(&mut bytes, doria_source.path.len() as u64, pointer_bytes);
         append_target_word(&mut bytes, 0, pointer_bytes);
-        append_target_word(&mut bytes, program.source.text.len() as u64, pointer_bytes);
+        append_target_word(&mut bytes, doria_source.text.len() as u64, pointer_bytes);
         append_target_word(&mut bytes, origin.span.start as u64, pointer_bytes);
         append_target_word(&mut bytes, origin.span.end as u64, pointer_bytes);
         append_target_word(&mut bytes, 0, pointer_bytes);
@@ -943,15 +946,18 @@ fn define_function(
             frame_slot,
             (pointer_bytes * 2) as i32,
         );
+        let doria_source = program
+            .source_for_span(function.source_span)
+            .unwrap_or(&program.source);
         let source_path = define_named_data(
             &mut builder,
-            program.source.path.as_bytes(),
+            doria_source.path.as_bytes(),
             module,
             &format!("__doria_source_path_{}", function.id.0),
         )?;
         let source_text = define_named_data(
             &mut builder,
-            program.source.text.as_bytes(),
+            doria_source.text.as_bytes(),
             module,
             &format!("__doria_source_text_{}", function.id.0),
         )?;
@@ -961,14 +967,14 @@ fn define_function(
                 4,
                 builder
                     .ins()
-                    .iconst(pointer_type, program.source.path.len() as i64),
+                    .iconst(pointer_type, doria_source.path.len() as i64),
             ),
             (5, source_text),
             (
                 6,
                 builder
                     .ins()
-                    .iconst(pointer_type, program.source.text.len() as i64),
+                    .iconst(pointer_type, doria_source.text.len() as i64),
             ),
             (
                 7,
@@ -1810,15 +1816,18 @@ fn define_process_main(
             runtime_args.extend([argc, argv]);
         }
         if integer_entry {
+            let doria_source = program
+                .source_for_span(entry.source_span)
+                .unwrap_or(&program.source);
             let source_path = define_named_data(
                 &mut builder,
-                program.source.path.as_bytes(),
+                doria_source.path.as_bytes(),
                 module,
                 "__doria_process_source_path",
             )?;
             let source_text = define_named_data(
                 &mut builder,
-                program.source.text.as_bytes(),
+                doria_source.text.as_bytes(),
                 module,
                 "__doria_process_source_text",
             )?;
@@ -1826,11 +1835,11 @@ fn define_process_main(
                 source_path,
                 builder
                     .ins()
-                    .iconst(pointer_type, program.source.path.len() as i64),
+                    .iconst(pointer_type, doria_source.path.len() as i64),
                 source_text,
                 builder
                     .ins()
-                    .iconst(pointer_type, program.source.text.len() as i64),
+                    .iconst(pointer_type, doria_source.text.len() as i64),
                 builder
                     .ins()
                     .iconst(pointer_type, entry.source_span.start as i64),

@@ -1,8 +1,0 @@
-namespace Acme\Application;
-
-use Acme\Domain\User;
-
-function describe(User $user): string
-{
-    return $user->name;
-}

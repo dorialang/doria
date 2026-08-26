@@ -3,10 +3,11 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-14
 - **Date:** 2026-08-14
-- **Implementation status:** Stage 31 Slice 1 implemented; Stage 31 Slice 2 next;
-  Stage 31 In Progress, Not Complete; Stage 33 Scheduled, Not Implemented
+- **Implementation status:** Stage 31 Slices 1 and 2 implemented; Stage 31
+  Complete; Stage 33 Scheduled, Not Implemented
 - **Current pipeline:** Stage 30 — Complete; Stage 31 Slice 1 — Complete;
-  Stage 31 Slice 2 — Next; E0641 — Historical And Reserved
+  Stage 31 Slice 2 — Complete; Stage 31 — Complete; Stage 32 — Next;
+  E0641, E0671, And E0672 — Historical And Reserved
 - **Scope:** Package source discovery, file layout, compilation inputs, package
   visibility, and the Baton-to-compiler boundary
 - **Amends:** Decision 0028
@@ -267,6 +268,53 @@ including:
 Exact reversible JSON field names follow implementation conventions, but none
 of these facts may remain implicit.
 
+Schema 1 is now the exact compiler-owned contract:
+
+```json
+{
+  "schemaVersion": 1,
+  "edition": "2026",
+  "rootPackage": "acme/application",
+  "selectedTarget": {
+    "package": "acme/application",
+    "name": "application",
+    "kind": "binary",
+    "entrySource": "acme/application:main.doria",
+    "activeScopes": ["main"]
+  },
+  "packages": [
+    {
+      "identity": "acme/application",
+      "root": ".",
+      "namespaceMappings": [
+        { "prefix": "Acme\\", "path": "src", "scope": "main", "generatedFor": null }
+      ],
+      "sources": [
+        {
+          "identity": "acme/application:main.doria",
+          "path": "src/main.doria",
+          "scope": "main",
+          "origin": "entry",
+          "generatedFor": null
+        }
+      ],
+      "dependencies": []
+    }
+  ],
+  "compiler": {
+    "target": "native",
+    "nativeProfile": "fast",
+    "targetTriple": null
+  }
+}
+```
+
+The parser rejects unknown schema versions and unknown schema-1 fields. Source
+inventory is explicit and authoritative; `doriac` does not scan directories or
+parse `Baton.toml`. Binary targets identify one active entry source, while
+library targets identify none. Compiler target and profile are plan-owned and
+cannot be overridden by CLI flags.
+
 `doriac` owns parsing, declaration indexing, namespace and `use` resolution,
 type checking, `internal` and direct-dependency visibility, duplicate-symbol
 diagnostics, MIR, code generation, and compiler caches.
@@ -285,8 +333,12 @@ manager.
 
 Baton caches manifest parsing, dependency resolution, source fetching,
 autoload discovery, source inventory, workspace graphs, and generated source
-inventory. `doriac` caches lexing, parsing, declaration indexing, semantic and
-type analysis, MIR, backend artifacts, and semantic dependency invalidation.
+inventory. `doriac` now provides an in-memory compilation session with stable
+build-plan, graph, target, source-content, source-context, declaration-surface,
+semantic-dependency, and backend-input fingerprints. It reuses unchanged parsed
+syntax and declaration indexes, and invalidates through compiler-owned semantic
+and include dependency edges. MIR and backend rebuilding remains conservative.
+Persistent compiler cache storage is not part of Stage 31.
 
 The versioned build plan and build receipt are the boundary. Baton does not
 duplicate a semantic symbol index, and `doriac` does not rediscover packages.
@@ -309,9 +361,11 @@ plans. Decision 0118 owns the rest of Stage 33.
 Stage 30 is complete. Stage 31 Slice 1 implements source-preserving qualified
 names, namespace/import/include grammar, same-file canonical resolution, the
 edition prelude, compiler package/source context, and namespace-aware backend
-execution. Stage 31 Slice 2 is next and still owns the package compilation
-graph. Stage 31 remains in progress, not complete. Stage 33 remains scheduled
-and not implemented.
+execution. Stage 31 Slice 2 implements the versioned build plan, complete
+package graph, package-wide visibility, strict source layout, include-once,
+multi-source diagnostics and lowering, backend execution, and in-memory
+incremental inputs. Stage 31 is complete. Stage 32 is next. Stage 33 remains
+scheduled and not implemented.
 
 ## Safe Deferrals
 
@@ -335,8 +389,6 @@ and not implemented.
 
 ## Non-Goals
 
-This decision does not by itself implement its subject. Stage 31 Slice 1 now
-implements namespace and `use` semantics plus `include` grammar, but it does not
-implement multi-file compilation, include resolution, build plans,
-cross-package visibility, manifest schema 2, dependency resolution, workspaces,
-or a package registry.
+Stage 31 implements the compiler-owned portions of this decision. Baton manifest
+schema 2, autoload discovery, dependency resolution, lockfiles, workspaces,
+processors, package caches, and registry behavior remain Stage 33 work.

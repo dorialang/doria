@@ -98,7 +98,7 @@ function check_stage30c_ownership(string $root): array
     ]);
     $require($semanticsPath, $semantics, [
         'pub closure_ownership: HashMap<ClosureId, crate::ownership::ClosureOwnershipInfo>',
-        'pub callable_value_calls: HashMap<(usize, usize), CallableValueCallInfo>',
+        'pub callable_value_calls: HashMap<Span, CallableValueCallInfo>',
     ]);
     $require($constructorPath, $constructor, ['Expr::Closure(closure)', 'report_incomplete_this(']);
     foreach (range(54, 63) as $suffix) {
