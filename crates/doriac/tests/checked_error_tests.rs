@@ -1286,6 +1286,51 @@ function main(): void
 }
 
 #[test]
+fn top_level_ambient_effects_do_not_create_source_obligations() {
+    let source = r#"
+echo "direct";
+
+function writeMessage(string $message): void
+{
+    echo $message;
+}
+
+writeMessage("helper");
+
+let $callback = function (): void {
+    echo "closure";
+};
+$callback();
+"#;
+
+    doriac::check_source("top_level_ambient.doria", source)
+        .expect("top-level ambient I/O remains runtime-checked without source boilerplate");
+}
+
+#[test]
+fn top_level_nonambient_effects_still_require_handling() {
+    let source = format!(
+        r#"
+{}
+
+function fail(): void throws Failure
+{{
+    throw new Failure("required");
+}}
+
+fail();
+"#,
+        error_class("Failure")
+    );
+
+    let diagnostics = doriac::check_source("top_level_required.doria", source)
+        .expect_err("top-level required errors still need an explicit handling boundary");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0630" && diagnostic.message.contains("`Failure`")
+    }));
+}
+
+#[test]
 fn only_exact_compiler_known_io_errors_are_ambient() {
     let source = format!(
         r#"

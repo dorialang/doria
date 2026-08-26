@@ -5139,10 +5139,16 @@ impl<'program> Checker<'program> {
             scope.extend(effects);
             return;
         }
-        if effects.is_empty() {
+        let required = effects
+            .into_iter()
+            .filter(|effect| {
+                !crate::checked_effects::is_ambient_io_effect(&self.types.resolved(*effect))
+            })
+            .collect::<Vec<_>>();
+        if required.is_empty() {
             return;
         }
-        let displays = effects
+        let displays = required
             .iter()
             .map(|effect| self.types.display(*effect))
             .collect::<Vec<_>>();
