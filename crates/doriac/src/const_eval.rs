@@ -42,6 +42,14 @@ impl ConstValue {
 }
 
 impl Evaluation {
+    pub fn enum_case_name(&self, value: EnumValue) -> Option<(&str, &str)> {
+        self.enum_cases
+            .iter()
+            .find_map(|((enum_name, case_name), candidate)| {
+                (*candidate == value).then_some((enum_name.as_str(), case_name.as_str()))
+            })
+    }
+
     pub fn payload_case_name(&self, enum_id: EnumId, case_id: EnumCaseId) -> Option<(&str, &str)> {
         self.payload_cases
             .iter()
@@ -136,6 +144,58 @@ pub fn evaluate_parameter_default(
     };
     let value = evaluator.evaluate_expr(expr, Some(expected), &requester)?;
     evaluator.diagnostics.is_empty().then_some(value.value)
+}
+
+pub fn evaluate_attribute_value(
+    evaluation: &Evaluation,
+    expr: &Expr,
+    expected: &TypeRef,
+    declaring_class: Option<&str>,
+) -> DiagnosticResult<ConstValue> {
+    let Some(expected) = const_type_with_enums(expected, &evaluation.enum_names) else {
+        return Err(vec![Diagnostic::new(
+            "E0692",
+            format!("type `{expected}` is not compatible with attribute metadata"),
+            expr.span(),
+        )
+        .with_title("Attribute Schema Type Is Not Metadata Compatible")]);
+    };
+    let requester = EvaluationRequester::parameter_default(declaring_class);
+    let mut evaluator = Evaluator {
+        nodes: HashMap::new(),
+        states: evaluation
+            .values
+            .iter()
+            .map(|(key, value)| (key.clone(), State::Done(value.clone())))
+            .collect(),
+        stack: Vec::new(),
+        diagnostics: Vec::new(),
+        enum_cases: evaluation.enum_cases.clone(),
+        enum_names: evaluation.enum_names.clone(),
+        payload_cases: evaluation.payload_cases.clone(),
+    };
+    let value = evaluator.evaluate_expr(expr, Some(expected), &requester);
+    if let Some(value) = value.filter(|_| evaluator.diagnostics.is_empty()) {
+        Ok(value.value)
+    } else {
+        for diagnostic in &mut evaluator.diagnostics {
+            if diagnostic.code == "E0485" {
+                diagnostic.code = "E0693";
+                diagnostic.title = "Attribute Argument Must Be Const Evaluable".to_string();
+            }
+        }
+        if evaluator.diagnostics.is_empty() {
+            evaluator.diagnostics.push(
+                Diagnostic::new(
+                    "E0693",
+                    "attribute argument must be a compile-time constant expression",
+                    expr.span(),
+                )
+                .with_title("Attribute Argument Must Be Const Evaluable"),
+            );
+        }
+        Err(evaluator.diagnostics)
+    }
 }
 
 #[derive(Clone)]
@@ -980,6 +1040,17 @@ impl Evaluator {
         span: Span,
         requester: &EvaluationRequester,
     ) -> Option<TypedValue> {
+        let is_integer_conversion =
+            method == "from" && IntegerType::from_companion_name(class_name).is_some();
+        let is_scalar_conversion = matches!(
+            (class_name, method),
+            ("Int", "toFloat") | ("Float", "toInt")
+        );
+        if !is_integer_conversion && !is_scalar_conversion {
+            self.unavailable(requester, span, "call");
+            return None;
+        }
+
         let [argument] = args else {
             self.invalid(span, "constant conversion expects exactly one argument");
             return None;
@@ -1045,8 +1116,7 @@ impl Evaluator {
                     None
                 });
         }
-        self.unavailable(requester, span, "call");
-        None
+        unreachable!("recognized constant conversions return from their matching branch")
     }
 
     fn unavailable(&mut self, requester: &EvaluationRequester, span: Span, operation: &str) {

@@ -1,5 +1,6 @@
 pub mod arg_binding;
 pub mod ast;
+pub mod attributes;
 pub mod backend;
 pub mod build_plan;
 pub mod builtins;
@@ -193,6 +194,18 @@ pub fn lower_source(
     let source = SourceFile::new(path, text);
     let context = CompilationContext::standalone(source.path.clone());
     lower_source_file_with_context(source, context)
+}
+
+pub fn metadata_source(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<attributes::AttributeMetadataDocumentV1> {
+    let path = path.into();
+    let text = text.into();
+    let fingerprint =
+        runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes());
+    let hir = lower_source(path, text)?;
+    Ok(attributes::metadata_document(&hir, fingerprint))
 }
 
 pub fn lower_source_with_context(
@@ -420,6 +433,23 @@ pub fn lower_compilation_graph(
             });
     }
     Ok(hir)
+}
+
+pub fn metadata_compilation_graph(
+    graph: &compilation_graph::CompilationGraph,
+) -> DiagnosticResult<attributes::AttributeMetadataDocumentV1> {
+    let hir = lower_compilation_graph(graph)?;
+    Ok(attributes::metadata_document(
+        &hir,
+        graph.fingerprint.clone(),
+    ))
+}
+
+pub fn metadata_build_plan_file(
+    path: impl AsRef<Path>,
+) -> DiagnosticResult<attributes::AttributeMetadataDocumentV1> {
+    let (_, graph) = load_build_plan_file(path)?;
+    metadata_compilation_graph(&graph)
 }
 
 pub fn lower_build_plan_file(path: impl AsRef<Path>) -> DiagnosticResult<hir::Program> {

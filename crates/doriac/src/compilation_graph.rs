@@ -623,6 +623,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         imports: Vec::new(),
         includes: Vec::new(),
         qualified_names: Vec::new(),
+        attributes: Vec::new(),
         items: Vec::new(),
     };
     let mut facts = GlobalSymbolFacts::default();
@@ -663,6 +664,9 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         combined
             .qualified_names
             .extend(resolved.program.qualified_names.iter().cloned());
+        combined
+            .attributes
+            .extend(resolved.program.attributes.iter().cloned());
         combined
             .items
             .extend(resolved.program.items.iter().cloned());

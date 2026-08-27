@@ -26,6 +26,9 @@ pub struct Program {
     pub source_text: String,
     pub namespace: Option<NamespaceDecl>,
     pub items: Vec<Item>,
+    /// Typed compiler/tooling metadata. Runtime MIR lowering never consumes
+    /// this table, so attributes cannot alter Doria runtime identity or layout.
+    pub attribute_metadata: crate::attributes::AttributeSemanticInfo,
     pub semantic_info: crate::semantics::SemanticInfo,
 }
 

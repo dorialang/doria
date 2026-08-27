@@ -362,7 +362,8 @@ this decision's Error model, and the debug interpreter, Cranelift, LLVM, and PHP
 compatibility backend execute the supported surface. List algorithm calls carry
 their callback's required structural effects and complete runtime profile,
 including ambient I/O, through the same propagation and cleanup model. Stages
-30 and 31 and the Decision 0123 corrective beat are complete; Stage 32 is next.
+30 through 32 and the Decision 0123 corrective beat are complete; Stage 33
+Slice 1 is next.
 
 ## Explicit Exclusions
 

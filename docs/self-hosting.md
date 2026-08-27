@@ -9,6 +9,13 @@ This is called **self-hosting** or **bootstrapping**.
 
 The goal is not to abandon Rust immediately. Rust is the practical bootstrap language that lets Doria get a reliable compiler, tests, diagnostics, and backend experiments quickly. Over time, Doria should become capable enough to express compiler code, and pieces of `doriac` should be ported into Doria in controlled stages.
 
+Before compiler self-hosting begins, Decision 0124 requires the production
+Baton project/package tool to be parity-ported from its disposable PHP UX
+bootstrap into the clean Doria-native `dorialang/baton` repository. That
+transition is a substantial tooling proof and a prerequisite to Stage 45, but
+it is not itself a port of `doriac`; the compiler self-hosting sequence below
+still begins with the lexer.
+
 ---
 
 ## 1. Why self-hosting matters

@@ -1,6 +1,11 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::*;
+use crate::attributes::{
+    AttributeApplication, AttributeAuthoredArgument, AttributeBoundArgument,
+    AttributeClassIdentity, AttributeClassSchema, AttributeSchemaParameter, AttributeSemanticInfo,
+    AttributeTarget,
+};
 use crate::builtins::{is_reserved_intrinsic_name, php_function_suggestion, Builtin};
 use crate::class_layout::{ClassId, PropertyId};
 use crate::collection_diagnostics::{
@@ -52,6 +57,9 @@ pub struct SemanticInfo {
     pub compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
     /// Canonical global declaration/reference facts produced before checking.
     pub global_symbols: crate::names::GlobalSymbolFacts,
+    /// Fully resolved, type-checked, const-evaluated compiler metadata.
+    /// Runtime lowering deliberately ignores this table.
+    pub attributes: AttributeSemanticInfo,
     /// Canonical integer type for every integer-valued source expression.
     ///
     /// Spans are stable across AST-to-HIR structural lowering, so the MIR
@@ -630,6 +638,7 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
     checker.ambient_effect_seed = ambient_effect_seed;
     checker.diagnostics.extend(const_diagnostics);
     checker.check();
+    checker.check_attributes();
     let constructor_analysis = crate::constructor_init::check_program(
         program,
         &checker.given_preludes,
@@ -689,6 +698,7 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
             compilation_context: checker.compilation_context,
             compilation_contexts: checker.compilation_contexts,
             global_symbols: checker.global_symbols,
+            attributes: checker.attributes,
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
             expression_types: checker.expression_types,
@@ -1421,8 +1431,23 @@ struct Checker<'program> {
     list_algorithm_calls: HashMap<Span, ListAlgorithmCallInfo>,
     property_writes: HashMap<Span, PropertyWriteSemanticInfo>,
     writable_object_paths: HashSet<Span>,
+    attributes: AttributeSemanticInfo,
     active_closures: Vec<ActiveClosure>,
     initializing_bindings: Vec<HashMap<String, Span>>,
+}
+
+#[derive(Clone)]
+struct AttributeSchemaDraft {
+    schema: AttributeClassSchema,
+    parameters: Vec<AttributeSchemaParameterDraft>,
+    declaring_class: Option<String>,
+}
+
+#[derive(Clone)]
+struct AttributeSchemaParameterDraft {
+    declaration: Param,
+    ty: TypeId,
+    default_value: Option<crate::attributes::AttributeValue>,
 }
 
 #[derive(Debug, Clone)]
@@ -2055,6 +2080,7 @@ impl<'program> Checker<'program> {
             list_algorithm_calls: HashMap::new(),
             property_writes: HashMap::new(),
             writable_object_paths: HashSet::new(),
+            attributes: AttributeSemanticInfo::default(),
             active_closures: Vec::new(),
             initializing_bindings: Vec::new(),
         }
@@ -2112,6 +2138,756 @@ impl<'program> Checker<'program> {
         }
         self.report_unresolved_generic_calls();
         self.check_pending_integer_literal_ranges();
+    }
+
+    fn check_attributes(&mut self) {
+        let attachments = self.program.attributes.clone();
+        let mut schemas = HashMap::<String, AttributeSchemaDraft>::new();
+        for name in ["Attribute", "Test", "PHPExport"] {
+            let schema = AttributeClassSchema {
+                identity: AttributeClassIdentity::CompilerKnown(name.to_string()),
+                canonical_name: name.to_string(),
+                source: None,
+                package: crate::names::PackageIdentity::CompilerKnown,
+                declaration_span: None,
+                parameters: Vec::new(),
+            };
+            schemas.insert(
+                name.to_string(),
+                AttributeSchemaDraft {
+                    schema,
+                    parameters: Vec::new(),
+                    declaring_class: None,
+                },
+            );
+        }
+
+        // Schema discovery is deliberately complete before application binding,
+        // so forward and cross-file attribute classes behave like every other
+        // Stage 31 global declaration.
+        for attachment in &attachments {
+            for group in &attachment.groups {
+                for attribute in &group.attributes {
+                    if attribute.canonical_name.as_deref() != Some("Attribute") {
+                        continue;
+                    }
+                    self.collect_attribute_schema(attachment, attribute, &mut schemas);
+                }
+            }
+        }
+
+        let mut applications = Vec::new();
+        for attachment in &attachments {
+            let Some(target) = self.resolve_attribute_target(&attachment.target) else {
+                continue;
+            };
+            let (source, package) = self.attribute_context(attachment.target.target_span);
+            let mut application_ordinal = 0usize;
+            for (group_ordinal, group) in attachment.groups.iter().enumerate() {
+                for attribute in &group.attributes {
+                    let current_ordinal = application_ordinal;
+                    application_ordinal += 1;
+                    let Some(canonical_name) = attribute.canonical_name.as_deref() else {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0686",
+                                format!("unknown attribute class `{}`", attribute.name.canonical()),
+                                attribute.name.span,
+                            )
+                            .with_title("Unknown Attribute Class"),
+                        );
+                        continue;
+                    };
+                    if canonical_name == "Attribute" {
+                        continue;
+                    }
+                    let Some(schema) = schemas.get(canonical_name).cloned() else {
+                        let is_class = self.global_symbols.declarations.iter().any(|declaration| {
+                            declaration.qualified_name == canonical_name
+                                && declaration.kind == crate::names::GlobalSymbolKind::Class
+                        });
+                        let (code, title, message) = if is_class {
+                            (
+                                "E0687",
+                                "Class Is Not Marked As An Attribute",
+                                format!(
+                                    "class `{canonical_name}` must be marked with `#[Attribute]` before it can be applied"
+                                ),
+                            )
+                        } else {
+                            (
+                                "E0686",
+                                "Unknown Attribute Class",
+                                format!("unknown attribute class `{canonical_name}`"),
+                            )
+                        };
+                        self.diagnostics.push(
+                            Diagnostic::new(code, message, attribute.name.span).with_title(title),
+                        );
+                        continue;
+                    };
+                    if let Some(application) = self.bind_attribute_application(
+                        attribute,
+                        &schema,
+                        target.clone(),
+                        source.clone(),
+                        package.clone(),
+                        group_ordinal,
+                        current_ordinal,
+                    ) {
+                        applications.push(application);
+                    }
+                }
+            }
+        }
+
+        let mut schema_values = schemas
+            .into_values()
+            .map(|draft| draft.schema)
+            .collect::<Vec<_>>();
+        schema_values.sort_by(|left, right| left.canonical_name.cmp(&right.canonical_name));
+        applications.sort_by(|left, right| {
+            (
+                left.source.0.as_str(),
+                left.span.start,
+                left.group_ordinal,
+                left.application_ordinal,
+            )
+                .cmp(&(
+                    right.source.0.as_str(),
+                    right.span.start,
+                    right.group_ordinal,
+                    right.application_ordinal,
+                ))
+        });
+        self.attributes = AttributeSemanticInfo {
+            schemas: schema_values,
+            applications,
+        };
+    }
+
+    fn collect_attribute_schema(
+        &mut self,
+        attachment: &AttributeAttachment,
+        marker: &AttributeRef,
+        schemas: &mut HashMap<String, AttributeSchemaDraft>,
+    ) {
+        if attachment.target.kind != AttributeTargetKind::Class {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0688",
+                    "`#[Attribute]` may mark only a class declaration",
+                    marker.span,
+                )
+                .with_title("Attribute Marker Is Only Valid On A Class"),
+            );
+            return;
+        }
+        if marker
+            .argument_list
+            .as_ref()
+            .is_some_and(|arguments| !arguments.arguments.is_empty())
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0689",
+                    "`#[Attribute]` does not accept arguments",
+                    marker.span,
+                )
+                .with_title("Attribute Marker Does Not Accept Arguments"),
+            );
+            return;
+        }
+        let Some(class_decl) = self.program.items.iter().find_map(|item| match item {
+            Item::Class(class_decl) if class_decl.span == attachment.target.target_span => {
+                Some(class_decl.clone())
+            }
+            _ => None,
+        }) else {
+            return;
+        };
+        let Some(global_id) = self.global_id_for_declaration_span(class_decl.span) else {
+            return;
+        };
+        let diagnostics_before = self.diagnostics.len();
+        if !class_decl.type_params.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0690",
+                    format!("attribute class `{}` cannot be generic", class_decl.name),
+                    class_decl.span,
+                )
+                .with_title("Attribute Class Cannot Be Generic"),
+            );
+        }
+        let constructor = class_decl.members.iter().find_map(|member| match member {
+            ClassMember::Method(method) if method.name == "__construct" => Some(method.clone()),
+            _ => None,
+        });
+        let parameters = constructor
+            .as_ref()
+            .map_or_else(Vec::new, |constructor| constructor.params.clone());
+        let mut parameter_drafts = Vec::with_capacity(parameters.len());
+        let mut schema_parameters = Vec::with_capacity(parameters.len());
+        for (index, param) in parameters.into_iter().enumerate() {
+            if param.writable || param.take {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0691",
+                        format!(
+                            "attribute schema parameter `${}` must be readonly",
+                            param.name
+                        ),
+                        param.span,
+                    )
+                    .with_title("Attribute Schema Parameter Must Be Readonly"),
+                );
+            }
+            let ty = self.resolve_type_ref_with_class(
+                &param.ty,
+                param.span,
+                Some(class_decl.name.as_str()),
+            );
+            if !self.attribute_metadata_type_is_compatible(ty, &mut HashSet::new()) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0692",
+                        format!(
+                            "attribute schema parameter `${}` has unsupported metadata type `{}`",
+                            param.name,
+                            self.types.display(ty)
+                        ),
+                        param.span,
+                    )
+                    .with_title("Attribute Schema Type Is Not Metadata Compatible"),
+                );
+            }
+            let default_value = param.default.as_ref().and_then(|default| {
+                let scopes = ScopeStack::new();
+                let diagnostics_before_default = self.diagnostics.len();
+                self.check_expr_assignable(
+                    ty,
+                    default,
+                    &scopes,
+                    None,
+                    AssignmentDestination::Parameter {
+                        name: param.name.clone(),
+                    },
+                );
+                if self.diagnostics.len() != diagnostics_before_default {
+                    return None;
+                }
+                match crate::const_eval::evaluate_attribute_value(
+                    &self.const_evaluation,
+                    default,
+                    &param.ty,
+                    Some(class_decl.name.as_str()),
+                ) {
+                    Ok(value) => {
+                        let converted = crate::attributes::attribute_value_from_const(
+                            self.types.resolved(ty),
+                            value,
+                            &self.const_evaluation,
+                        );
+                        if converted.is_none() {
+                            self.diagnostics.push(
+                                Diagnostic::new(
+                                    "E0696",
+                                    "attribute default could not be represented as typed metadata",
+                                    default.span(),
+                                )
+                                .with_title("Attribute Default Is Not Const Evaluable"),
+                            );
+                        }
+                        converted
+                    }
+                    Err(mut diagnostics) => {
+                        for diagnostic in &mut diagnostics {
+                            if diagnostic.code == "E0693" {
+                                diagnostic.code = "E0696";
+                                diagnostic.title =
+                                    "Attribute Default Is Not Const Evaluable".to_string();
+                            }
+                        }
+                        self.diagnostics.extend(diagnostics);
+                        None
+                    }
+                }
+            });
+            schema_parameters.push(AttributeSchemaParameter {
+                index,
+                name: param.name.clone(),
+                ty: self.types.resolved(ty),
+                has_default: param.default.is_some(),
+                span: param.span,
+            });
+            parameter_drafts.push(AttributeSchemaParameterDraft {
+                declaration: param,
+                ty,
+                default_value,
+            });
+        }
+        if self.diagnostics.len() != diagnostics_before {
+            return;
+        }
+        let (source, package) = self.attribute_context(class_decl.span);
+        let canonical_name = global_id.qualified_name.clone();
+        schemas.insert(
+            canonical_name.clone(),
+            AttributeSchemaDraft {
+                schema: AttributeClassSchema {
+                    identity: AttributeClassIdentity::User(global_id),
+                    canonical_name,
+                    source: Some(source),
+                    package,
+                    declaration_span: Some(class_decl.span),
+                    parameters: schema_parameters,
+                },
+                parameters: parameter_drafts,
+                declaring_class: Some(class_decl.name),
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_attribute_application(
+        &mut self,
+        attribute: &AttributeRef,
+        schema: &AttributeSchemaDraft,
+        target: AttributeTarget,
+        source: crate::names::SourceIdentity,
+        package: crate::names::PackageIdentity,
+        group_ordinal: usize,
+        application_ordinal: usize,
+    ) -> Option<AttributeApplication> {
+        let args = attribute
+            .argument_list
+            .as_ref()
+            .map_or(&[][..], |arguments| arguments.arguments.as_slice());
+        let param_names = schema
+            .parameters
+            .iter()
+            .map(|parameter| parameter.declaration.name.as_str())
+            .collect::<Vec<_>>();
+        let param_has_default = schema
+            .parameters
+            .iter()
+            .map(|parameter| parameter.declaration.default.is_some())
+            .collect::<Vec<_>>();
+        let arg_names = args
+            .iter()
+            .map(|argument| argument.name.as_ref().map(|name| name.text.as_str()))
+            .collect::<Vec<_>>();
+        let bound =
+            crate::arg_binding::bind_arguments(&param_names, &param_has_default, &arg_names);
+        let diagnostics_before = self.diagnostics.len();
+        if bound.overflow > 0 {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0695",
+                    format!(
+                        "attribute `{}` accepts at most {} arguments, but {} were supplied",
+                        schema.schema.canonical_name,
+                        schema.parameters.len(),
+                        args.len()
+                    ),
+                    attribute.span,
+                )
+                .with_title("Too Many Attribute Arguments"),
+            );
+        }
+        for &argument_index in &bound.unknown {
+            let name = args[argument_index]
+                .name
+                .as_ref()
+                .expect("unknown named attribute argument has a name");
+            let mut diagnostic = Diagnostic::new(
+                "E0516",
+                format!(
+                    "attribute `{}` has no parameter named `{}`",
+                    schema.schema.canonical_name, name.text
+                ),
+                name.span,
+            )
+            .with_title("Unknown Named Argument");
+            if let Some(suggestion) =
+                crate::arg_binding::unambiguous_name_suggestion(&name.text, &param_names)
+            {
+                diagnostic = diagnostic.with_help(format!("Did you mean `{suggestion}`?"));
+            }
+            self.diagnostics.push(diagnostic);
+        }
+        for &argument_index in &bound.duplicate {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0517",
+                    "attribute argument was already supplied",
+                    args[argument_index].span,
+                )
+                .with_title("Duplicate Named Argument"),
+            );
+        }
+        if !bound.missing.is_empty() {
+            let missing = bound
+                .missing
+                .iter()
+                .map(|index| format!("`${}`", schema.parameters[*index].declaration.name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0518",
+                    format!("attribute application is missing required argument {missing}"),
+                    attribute.span,
+                )
+                .with_title("Missing Required Argument"),
+            );
+        }
+        if self.diagnostics.len() != diagnostics_before {
+            return None;
+        }
+
+        let mut evaluated_args = vec![None; args.len()];
+        let scopes = ScopeStack::new();
+        for (argument_index, argument) in args.iter().enumerate() {
+            let parameter_index = bound.arg_to_param[argument_index]
+                .expect("valid attribute binding maps every authored argument");
+            let parameter = &schema.parameters[parameter_index];
+            let diagnostics_before_argument = self.diagnostics.len();
+            self.check_expr_assignable(
+                parameter.ty,
+                &argument.value,
+                &scopes,
+                None,
+                AssignmentDestination::Parameter {
+                    name: parameter.declaration.name.clone(),
+                },
+            );
+            if self.diagnostics.len() != diagnostics_before_argument {
+                continue;
+            }
+            match crate::const_eval::evaluate_attribute_value(
+                &self.const_evaluation,
+                &argument.value,
+                &parameter.declaration.ty,
+                schema.declaring_class.as_deref(),
+            ) {
+                Ok(value) => {
+                    evaluated_args[argument_index] = crate::attributes::attribute_value_from_const(
+                        self.types.resolved(parameter.ty),
+                        value,
+                        &self.const_evaluation,
+                    );
+                    if evaluated_args[argument_index].is_none() {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0693",
+                                "attribute argument could not be represented as typed metadata",
+                                argument.span,
+                            )
+                            .with_title("Attribute Argument Must Be Const Evaluable"),
+                        );
+                    }
+                }
+                Err(diagnostics) => self.diagnostics.extend(diagnostics),
+            }
+        }
+        if self.diagnostics.len() != diagnostics_before {
+            return None;
+        }
+
+        let authored_arguments = args
+            .iter()
+            .enumerate()
+            .map(|(index, argument)| AttributeAuthoredArgument {
+                index,
+                name: argument.name.as_ref().map(|name| name.text.clone()),
+                span: argument.span,
+                bound_parameter_index: bound.arg_to_param[index]
+                    .expect("valid attribute binding maps every argument"),
+            })
+            .collect::<Vec<_>>();
+        let mut bound_arguments = Vec::with_capacity(schema.parameters.len());
+        for (parameter_index, parameter) in schema.parameters.iter().enumerate() {
+            let (value, authored_argument_index, defaulted) =
+                if let Some(argument_index) = bound.param_to_arg[parameter_index] {
+                    (
+                        evaluated_args[argument_index]
+                            .clone()
+                            .expect("valid attribute argument was evaluated"),
+                        Some(argument_index),
+                        false,
+                    )
+                } else {
+                    (
+                        parameter
+                            .default_value
+                            .clone()
+                            .expect("binder omits only a validated defaulted parameter"),
+                        None,
+                        true,
+                    )
+                };
+            bound_arguments.push(AttributeBoundArgument {
+                parameter_index,
+                parameter_name: parameter.declaration.name.clone(),
+                ty: self.types.resolved(parameter.ty),
+                value,
+                defaulted,
+                authored_argument_index,
+            });
+        }
+        let target_key = target.canonical_key();
+        let identity = format!(
+            "{}#{target_key}:{group_ordinal}:{application_ordinal}",
+            source.0
+        );
+        Some(AttributeApplication {
+            identity,
+            class_identity: schema.schema.identity.clone(),
+            canonical_class_name: schema.schema.canonical_name.clone(),
+            target,
+            source,
+            package,
+            group_ordinal,
+            application_ordinal,
+            authored_arguments,
+            bound_arguments,
+            span: attribute.span,
+        })
+    }
+
+    fn attribute_metadata_type_is_compatible(
+        &self,
+        ty: TypeId,
+        visiting: &mut HashSet<EnumId>,
+    ) -> bool {
+        match self.types.kind(ty) {
+            TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::String | TypeKind::Bool => true,
+            TypeKind::Nullable(inner) => {
+                self.attribute_metadata_type_is_compatible(*inner, visiting)
+            }
+            TypeKind::Enum(enum_type) => {
+                if !visiting.insert(enum_type.id) {
+                    return false;
+                }
+                let compatible = self.enums.get(&enum_type.name).is_some_and(|definition| {
+                    definition.cases.iter().all(|case| {
+                        case.payload.iter().all(|field| {
+                            self.attribute_metadata_type_is_compatible(field.ty, visiting)
+                        })
+                    })
+                });
+                visiting.remove(&enum_type.id);
+                compatible
+            }
+            TypeKind::Void
+            | TypeKind::Bytes
+            | TypeKind::Null
+            | TypeKind::Mixed
+            | TypeKind::Error
+            | TypeKind::TypedArray(_)
+            | TypeKind::Unknown
+            | TypeKind::Heterogeneous
+            | TypeKind::EmptyCollection
+            | TypeKind::TypeParameter(_)
+            | TypeKind::Function(_)
+            | TypeKind::Class(_)
+            | TypeKind::List(_)
+            | TypeKind::Dictionary(_, _)
+            | TypeKind::SortedDictionary(_, _)
+            | TypeKind::Set(_)
+            | TypeKind::SortedSet(_)
+            | TypeKind::PriorityQueue(_)
+            | TypeKind::Deque(_)
+            | TypeKind::SharedHandle(_, _) => false,
+        }
+    }
+
+    fn attribute_context(
+        &self,
+        span: Span,
+    ) -> (crate::names::SourceIdentity, crate::names::PackageIdentity) {
+        let context = self
+            .compilation_contexts
+            .get(&span.source)
+            .unwrap_or(&self.compilation_context);
+        (context.source.clone(), context.package.clone())
+    }
+
+    fn global_id_for_declaration_span(&self, span: Span) -> Option<crate::names::GlobalSymbolId> {
+        self.global_symbols
+            .declarations
+            .iter()
+            .find(|declaration| declaration.declaration_span == span)
+            .map(|declaration| declaration.id.clone())
+    }
+
+    fn resolve_attribute_target(&self, syntax: &AttributeTargetSyntax) -> Option<AttributeTarget> {
+        if matches!(
+            syntax.kind,
+            AttributeTargetKind::Class
+                | AttributeTargetKind::Enum
+                | AttributeTargetKind::Interface
+                | AttributeTargetKind::Trait
+                | AttributeTargetKind::Function
+                | AttributeTargetKind::Constant
+        ) {
+            return self
+                .global_id_for_declaration_span(syntax.target_span)
+                .map(|declaration| AttributeTarget::GlobalDeclaration {
+                    declaration,
+                    kind: syntax.kind,
+                });
+        }
+
+        for item in &self.program.items {
+            match item {
+                Item::Class(class_decl) => {
+                    let Some(class_id) = self.global_id_for_declaration_span(class_decl.span)
+                    else {
+                        continue;
+                    };
+                    for member in &class_decl.members {
+                        match member {
+                            ClassMember::Property(property)
+                                if property.span == syntax.target_span =>
+                            {
+                                return Some(AttributeTarget::ClassMember {
+                                    class: class_id,
+                                    kind: syntax.kind,
+                                    name: property.name.clone(),
+                                    span: property.span,
+                                });
+                            }
+                            ClassMember::Constant(constant)
+                                if constant.span == syntax.target_span =>
+                            {
+                                return Some(AttributeTarget::ClassMember {
+                                    class: class_id,
+                                    kind: syntax.kind,
+                                    name: constant.name.clone(),
+                                    span: constant.span,
+                                });
+                            }
+                            ClassMember::Method(method) => {
+                                if method.span == syntax.target_span {
+                                    return Some(AttributeTarget::ClassMember {
+                                        class: class_id.clone(),
+                                        kind: syntax.kind,
+                                        name: method.name.clone(),
+                                        span: method.span,
+                                    });
+                                }
+                                if let Some((index, parameter)) = method
+                                    .params
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, parameter)| parameter.span == syntax.target_span)
+                                {
+                                    return Some(AttributeTarget::CallableParameter {
+                                        callable: format!("{}::{}", class_decl.name, method.name),
+                                        parameter_index: index,
+                                        parameter_name: parameter.name.clone(),
+                                        roles: syntax.roles.clone(),
+                                        span: parameter.span,
+                                    });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Item::Trait(trait_decl) => {
+                    let Some(trait_id) = self.global_id_for_declaration_span(trait_decl.span)
+                    else {
+                        continue;
+                    };
+                    for member in &trait_decl.members {
+                        let (span, name) = match member {
+                            ClassMember::Property(property) => {
+                                (property.span, property.name.as_str())
+                            }
+                            ClassMember::Constant(constant) => {
+                                (constant.span, constant.name.as_str())
+                            }
+                            ClassMember::Method(method) => {
+                                if let Some((index, parameter)) = method
+                                    .params
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, parameter)| parameter.span == syntax.target_span)
+                                {
+                                    return Some(AttributeTarget::CallableParameter {
+                                        callable: format!("{}::{}", trait_decl.name, method.name),
+                                        parameter_index: index,
+                                        parameter_name: parameter.name.clone(),
+                                        roles: syntax.roles.clone(),
+                                        span: parameter.span,
+                                    });
+                                }
+                                (method.span, method.name.as_str())
+                            }
+                        };
+                        if span == syntax.target_span {
+                            return Some(AttributeTarget::ClassMember {
+                                class: trait_id.clone(),
+                                kind: syntax.kind,
+                                name: name.to_string(),
+                                span,
+                            });
+                        }
+                    }
+                }
+                Item::Function(function) => {
+                    if let Some((index, parameter)) = function
+                        .params
+                        .iter()
+                        .enumerate()
+                        .find(|(_, parameter)| parameter.span == syntax.target_span)
+                    {
+                        return Some(AttributeTarget::CallableParameter {
+                            callable: function.name.clone(),
+                            parameter_index: index,
+                            parameter_name: parameter.name.clone(),
+                            roles: syntax.roles.clone(),
+                            span: parameter.span,
+                        });
+                    }
+                }
+                Item::Enum(enum_decl) => {
+                    let Some(enum_id) = self.global_id_for_declaration_span(enum_decl.span) else {
+                        continue;
+                    };
+                    for (case_index, case) in enum_decl.cases.iter().enumerate() {
+                        if case.span == syntax.target_span {
+                            return Some(AttributeTarget::EnumCase {
+                                enumeration: enum_id.clone(),
+                                case_index,
+                                case_name: case.name.clone(),
+                                span: case.span,
+                            });
+                        }
+                        if let Some((field_index, field)) = case
+                            .payload
+                            .iter()
+                            .enumerate()
+                            .find(|(_, field)| field.span == syntax.target_span)
+                        {
+                            return Some(AttributeTarget::EnumPayloadField {
+                                enumeration: enum_id.clone(),
+                                case_index,
+                                field_index,
+                                field_name: field.name.clone(),
+                                span: field.span,
+                            });
+                        }
+                    }
+                }
+                Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {}
+            }
+        }
+        None
     }
 
     fn inferred_ambient_effects(&self) -> HashMap<Span, Vec<ResolvedType>> {

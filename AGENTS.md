@@ -43,6 +43,13 @@ Doria may eventually include a PHP-to-Doria migration converter, but that conver
 
 The accepted project-tool name is Baton. Baton is the planned user-facing project, package, build, and application orchestration tool. `doriac` remains the compiler.
 
+`dorialang/baton-php` is a disposable UX and distribution bootstrap. It exists
+to exercise and freeze Baton's observable contracts, not to become the
+permanent product implementation. Production Baton is rewritten in Doria in
+the clean `dorialang/baton` repository, parity-gated against the bootstrap, and
+ships without a Baton PHAR, Composer, or a private PHP runtime. No unsuffixed
+toolchain release may ship before that native cutover is complete.
+
 ## Repositories and roles
 
 - `doria` is the compiler repository and the subject of these instructions.

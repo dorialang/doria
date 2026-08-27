@@ -62,7 +62,8 @@ E0641 — Historical And Reserved
 Stage 31 Slice 1 — Complete
 Stage 31 Slice 2 — Complete
 Stage 31 — Complete
-Stage 32 — Next
+Stage 32 — Complete
+Stage 33 Slice 1 — Next
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping

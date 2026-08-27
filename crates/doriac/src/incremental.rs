@@ -420,6 +420,26 @@ fn source_context_fingerprint(
 
 fn declaration_fingerprint(source: &crate::compilation_graph::GraphSource) -> String {
     let mut surface = String::new();
+    for attachment in &source.authored.attributes {
+        surface.push_str("attribute-target:");
+        surface.push_str(&format!("{:?}", attachment.target.kind));
+        surface.push(':');
+        surface.push_str(&attachment.target.target_span.start.to_string());
+        surface.push(':');
+        for role in &attachment.target.roles {
+            surface.push_str(&format!("{role:?},"));
+        }
+        for group in &attachment.groups {
+            surface.push_str(
+                source
+                    .source
+                    .text
+                    .get(group.span.start..group.span.end)
+                    .unwrap_or(""),
+            );
+        }
+        surface.push('|');
+    }
     for item in &source.authored.items {
         append_item_signature(&mut surface, item, &source.source.text);
     }

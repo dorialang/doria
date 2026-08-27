@@ -184,17 +184,40 @@ compilation graph, while `internal` remains visible only inside its package.
 The compiler-facing format and CLI forms are documented in
 [`docs/build-plan-schema.md`](docs/build-plan-schema.md).
 
-Baton is the accepted project and package tool for Doria. Its current PHP
-bootstrap reads manifest schema 1 only: one binary target with an explicit
-entry file and no autoload, dependencies, lockfile, or workspace. Decision
-0118's accepted target adds schema 2, where `Baton.toml` will describe
-package identity, targets, compile-time `autoload` mappings, dependencies,
-development dependencies, and explicit processors. Baton will resolve that
-project into a versioned build plan for `doriac`; Doria executables will never
-search for or load source files at runtime. Package versions will use SemVer,
-deterministic dependency resolution will be recorded in JSON `Baton.lock`, and
-workspaces will share one lockfile without merging package `internal`
-boundaries.
+Doria attributes are typed compiler metadata with no runtime reflection:
+
+```doria
+#[Attribute]
+class Route
+{
+    function __construct(string $path) {}
+}
+
+#[Route(path: "/posts")]
+#[Test]
+function routeCanBeMatched(): void
+{
+}
+```
+
+Attribute arguments reuse ordinary named/default argument binding and the
+bounded constant evaluator. Applying an attribute executes no constructor or
+other Doria code. `#[Test]` is metadata for future Baton orchestration, while
+`#[PHPExport]` remains metadata for the later PHP bridge. Use `doriac metadata`
+or `doriac metadata --build-plan` to inspect deterministic typed metadata.
+The compiler validates the versioned processor protocol but executes no processor
+and writes no generated source. See
+[`docs/attribute-metadata-protocol.md`](docs/attribute-metadata-protocol.md).
+
+Baton is the accepted project and package tool for Doria. It is the Doria-native project and package tool
+maintained in the `dorialang/baton` repository. The current bootstrap reads manifest schema 1 only; the
+accepted target adds schema 2 with package identity, targets, compile-time `autoload`
+mappings, dependencies, development dependencies, and explicit processors. Baton
+produces a versioned build plan for `doriac`. Compiled executables will never search for or load source files at runtime.
+Package versions use SemVer, deterministic resolution is recorded in JSON
+`Baton.lock`, and each workspace has one root lockfile without merging package
+`internal` boundaries. Production toolchains ship the native Baton executable
+and require no Baton PHP runtime or Composer payload.
 
 The CLI supports human, concise, and versioned JSON diagnostics. Human and
 concise output go to stderr; JSON goes to stdout for tools:

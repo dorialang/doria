@@ -11,7 +11,110 @@ pub struct Program {
     /// value references. Semantic facts attach canonical identities to these
     /// spans without editor tooling searching source text.
     pub qualified_names: Vec<QualifiedNameRef>,
+    /// Source-preserving attributes attached to declaration targets. Keeping
+    /// attachments in one ordered table lets tooling inspect every supported
+    /// target without duplicating the authored application for promoted
+    /// constructor parameters.
+    pub attributes: Vec<AttributeAttachment>,
     pub items: Vec<Item>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeGroup {
+    pub open_span: Span,
+    pub attributes: Vec<AttributeRef>,
+    pub comma_spans: Vec<Span>,
+    pub close_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeRef {
+    pub name: QualifiedNameRef,
+    /// Canonical identity selected by name resolution. Authored segments stay
+    /// untouched for editor ranges and source-preserving AST consumers.
+    pub canonical_name: Option<String>,
+    pub argument_list: Option<AttributeArgumentList>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeArgumentList {
+    pub open_paren_span: Span,
+    pub arguments: Vec<Argument>,
+    pub comma_spans: Vec<Span>,
+    pub close_paren_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeAttachment {
+    pub groups: Vec<AttributeGroup>,
+    pub target: AttributeTargetSyntax,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttributeTargetSyntax {
+    pub kind: AttributeTargetKind,
+    pub target_span: Span,
+    pub name_span: Span,
+    pub roles: Vec<AttributeTargetRole>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AttributeTargetKind {
+    Class,
+    Enum,
+    Interface,
+    Trait,
+    Function,
+    Constant,
+    Property,
+    Method,
+    Constructor,
+    Destructor,
+    ClassConstant,
+    Parameter,
+    EnumCase,
+    EnumPayloadField,
+}
+
+impl AttributeTargetKind {
+    pub const fn protocol_name(self) -> &'static str {
+        match self {
+            Self::Class => "class",
+            Self::Enum => "enum",
+            Self::Interface => "interface",
+            Self::Trait => "trait",
+            Self::Function => "function",
+            Self::Constant => "constant",
+            Self::Property => "property",
+            Self::Method => "method",
+            Self::Constructor => "constructor",
+            Self::Destructor => "destructor",
+            Self::ClassConstant => "classConstant",
+            Self::Parameter => "parameter",
+            Self::EnumCase => "enumCase",
+            Self::EnumPayloadField => "enumPayloadField",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AttributeTargetRole {
+    Declaration,
+    Parameter,
+    PromotedProperty,
+}
+
+impl AttributeTargetRole {
+    pub const fn protocol_name(self) -> &'static str {
+        match self {
+            Self::Declaration => "declaration",
+            Self::Parameter => "parameter",
+            Self::PromotedProperty => "promotedProperty",
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

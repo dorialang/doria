@@ -149,9 +149,11 @@ is:
 The evaluator forbids function and method calls, constructors, property reads,
 mutable static reads, runtime values, allocation with observable identity, I/O,
 environment/time/random access, mutation, loops, and panic as a compile-time
-programming mechanism. Attributes may reuse evaluated values at Stage 32, but
-attribute metadata, constant evaluation, and any future general compile-time
-execution remain separate concepts.
+programming mechanism. Stage 32 attributes reuse these evaluated values under
+Decision 0125's metadata-compatible type allowlist. Attribute metadata,
+constant evaluation, and any future general compile-time execution remain
+separate concepts; Stage 32 adds no const function, constructor execution, I/O,
+or arbitrary compile-time interpreter.
 
 Declaration order does not affect meaning. The compiler builds one dependency
 graph for constants and static initializers, permits forward references, and

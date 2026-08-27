@@ -13,6 +13,50 @@ fn php_function_name(name: &str) -> String {
 }
 
 #[test]
+fn stage32_attributes_are_metadata_only_in_php_output() {
+    let source = include_str!("../../../examples/native/main_stage32_attributes.doria");
+    let php = doriac::compile_source_to_php("main_stage32_attributes.doria", source)
+        .expect("attributed source should compile to PHP");
+    for forbidden in [
+        "#[",
+        "PHPExport",
+        "attribute registry",
+        "test registry",
+        "new Route(",
+    ] {
+        assert!(
+            !php.contains(forbidden),
+            "unexpected PHP output: {forbidden}"
+        );
+    }
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\n{}();",
+        php.strip_prefix("<?php").expect("generated PHP header"),
+        php_function_name("main")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("attributed PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"Stage 32 metadata only\n");
+}
+
+#[test]
 fn emits_php_for_simple_program() {
     let php = doriac::compile_source_to_php(
         "test.doria",

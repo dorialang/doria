@@ -22,6 +22,8 @@ require_once __DIR__ . '/check_constructor_owned_property_writes.php';
 require_once __DIR__ . '/check_stage31_slice1_namespaces.php';
 require_once __DIR__ . '/check_stage31_slice2_package_graph.php';
 require_once __DIR__ . '/check_ambient_io_and_fallible_finalizers.php';
+require_once __DIR__ . '/check_baton_native_transition.php';
+require_once __DIR__ . '/check_stage32_attributes.php';
 
 $root = dirname(__DIR__);
 $failures = check_stream_io_completeness($root);
@@ -40,6 +42,8 @@ array_push($failures, ...check_stage31_slice2_package_graph($root));
 array_push($failures, ...check_constructor_owned_property_writes($root));
 array_push($failures, ...check_stage31_slice1_namespaces($root));
 array_push($failures, ...check_ambient_io_and_fallible_finalizers($root));
+array_push($failures, ...check_baton_native_transition($root));
+array_push($failures, ...check_stage32_attributes($root));
 
 // Keys are "path:line:number". Keep this empty unless the repository contains
 // a verified decision-shaped token that is not a citation. Every entry requires

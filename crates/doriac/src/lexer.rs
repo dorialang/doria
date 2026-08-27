@@ -145,6 +145,7 @@ pub enum TokenKind {
     RightBrace,
     LeftBracket,
     RightBracket,
+    AttributeOpen,
     Semicolon,
     Colon,
     Comma,
@@ -186,6 +187,7 @@ impl<'source> Lexer<'source> {
             let start = self.index;
             let token = match self.advance() {
                 b'$' => self.lex_variable(start),
+                b'#' if self.match_byte(b'[') => self.token(TokenKind::AttributeOpen, start),
                 b'a'..=b'z' | b'A'..=b'Z' | b'_' => self.lex_identifier(start),
                 b'0'..=b'9' => self.lex_number(start),
                 b'"' | b'\'' => self.lex_string(start),
@@ -639,7 +641,7 @@ impl<'source> Lexer<'source> {
                 continue;
             }
 
-            if self.peek() == Some(b'#') {
+            if self.peek() == Some(b'#') && self.peek_next() != Some(b'[') {
                 while !matches!(self.peek(), None | Some(b'\n')) {
                     self.advance();
                 }
