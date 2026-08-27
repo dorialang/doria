@@ -1,0 +1,30 @@
+enum HttpMethod
+{
+    case Get;
+    case Post;
+}
+
+#[Attribute]
+class Route
+{
+    function __construct(
+        string $path,
+        HttpMethod $method = HttpMethod::Get,
+    ) {
+        panic("attribute constructors are not metadata evaluation");
+    }
+}
+
+#[Route(path: "/posts", method: HttpMethod::Post)]
+#[Route(path: "/health")]
+#[Test]
+#[PHPExport]
+function attributedMessage(): string
+{
+    return "Stage 32 metadata only";
+}
+
+function main(): void
+{
+    echo attributedMessage() . "\n";
+}

@@ -59,6 +59,7 @@ pub fn lower_program_with_semantics(
                 span: namespace.span,
             }),
         items,
+        attribute_metadata: semantic_info.attributes.clone(),
         semantic_info,
     })
 }

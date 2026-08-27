@@ -1,0 +1,5 @@
+function misplaced(): void
+{
+    #[Test]
+    let $value = 1;
+}

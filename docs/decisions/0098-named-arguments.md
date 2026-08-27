@@ -34,7 +34,11 @@ Named arguments were left as "a separate future slice" across SPEC and deferred 
 - Because parameter names are API, an `override` method and an interface implementation **should** keep parameter names compatible with the parent/interface for named-argument callers to remain sound. Whether this is enforced or linted is settled with the inheritance (Stage 34) and interfaces/traits (Stage 35) decisions; this record reserves the requirement so those stages design against it rather than discovering it.
 
 ### Attributes reuse this syntax (Stage 32)
-- Stage 32 attributes **do not invent a second named-argument system.** They reuse this call-site syntax and binding, adding only attribute-specific constant-evaluation restrictions (attribute arguments are const-evaluated, no runtime work). `#[Route(path: "/x", method: "GET")]` is the same `name: value` grammar.
+- Stage 32 attributes **do not invent a second named-argument system.** Decision
+  0125 implements them on this same source-order argument representation and
+  binder, adding only metadata type checking and bounded constant evaluation.
+  `#[Route(path: "/x", method: HttpMethod::Get)]` uses the same `name: value`
+  grammar. The application executes no runtime work.
 
 ### Variadics remain deferred
 - 0095 deferred spread/variadic user parameters "to the named-arguments slice." **This record keeps variadics deferred as a separate slice, not part of Stage 23a.** Variadic collection (`...$rest`) is a distinct feature whose interaction with named arguments is intricate (a named argument must not be swept into a positional rest), and named arguments deliver their full value — middle-default skipping, self-documenting calls, DDO binding — without it. Variadics reopen when a concrete need is scheduled; they are not v1.0-blocking.

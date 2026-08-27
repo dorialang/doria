@@ -42,6 +42,9 @@ fn doria_files_under(root: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(root).expect("example directory should be readable") {
         let path = entry.expect("example entry should be readable").path();
         if path.is_dir() {
+            if path.file_name().and_then(|name| name.to_str()) == Some("errors") {
+                continue;
+            }
             doria_files_under(&path, files);
         } else if path.extension().and_then(|extension| extension.to_str()) == Some("doria") {
             files.push(path);

@@ -59,6 +59,102 @@ fn version_json_exposes_the_baton_compiler_contract() {
 }
 
 #[test]
+fn metadata_command_is_deterministic_for_standalone_and_build_plan_inputs() {
+    let temp_dir = temp_dir_path("stage32-metadata");
+    fs::create_dir_all(&temp_dir).expect("temp directory should be created");
+    let source = r#"#[Attribute]
+class Route { function __construct(string $path) {} }
+#[Route(path: "/")]
+#[Test]
+function main(): void {}
+"#;
+    fs::write(temp_dir.join("main.doria"), source).expect("source should be writable");
+
+    let standalone = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["metadata", "main.doria"])
+        .output()
+        .expect("doriac metadata should run");
+    assert_success("standalone metadata", standalone.clone());
+    assert!(standalone.stderr.is_empty());
+    let standalone_json: serde_json::Value =
+        serde_json::from_slice(&standalone.stdout).expect("standalone metadata should be JSON");
+    assert_eq!(standalone_json["schemaVersion"], 1);
+    assert_eq!(standalone_json["applications"].as_array().unwrap().len(), 2);
+
+    let plan = serde_json::json!({
+        "schemaVersion": 1,
+        "edition": "2026",
+        "rootPackage": "acme/application",
+        "selectedTarget": {
+            "package": "acme/application",
+            "name": "application",
+            "kind": "binary",
+            "entrySource": "acme/application:main.doria",
+            "activeScopes": ["main"]
+        },
+        "packages": [{
+            "identity": "acme/application",
+            "root": ".",
+            "namespaceMappings": [{
+                "prefix": "",
+                "path": "",
+                "scope": "main",
+                "generatedFor": null
+            }],
+            "sources": [{
+                "identity": "acme/application:main.doria",
+                "path": "main.doria",
+                "scope": "main",
+                "origin": "entry",
+                "generatedFor": null
+            }],
+            "dependencies": []
+        }],
+        "compiler": {
+            "target": "native",
+            "nativeProfile": "fast",
+            "targetTriple": null
+        }
+    });
+    fs::write(
+        temp_dir.join("plan.json"),
+        serde_json::to_vec_pretty(&plan).unwrap(),
+    )
+    .expect("build plan should be writable");
+    let build_plan = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["metadata", "--build-plan", "plan.json"])
+        .output()
+        .expect("build-plan metadata should run");
+    assert_success("build-plan metadata", build_plan.clone());
+    assert!(build_plan.stderr.is_empty());
+    let build_plan_json: serde_json::Value =
+        serde_json::from_slice(&build_plan.stdout).expect("build-plan metadata should be JSON");
+    assert_eq!(build_plan_json["selectedTarget"]["kind"], "binary");
+    assert_eq!(build_plan_json["applications"].as_array().unwrap().len(), 2);
+
+    fs::write(
+        temp_dir.join("main.doria"),
+        "#[Missing] function main(): void {}",
+    )
+    .expect("invalid source should be writable");
+    let invalid = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["metadata", "--build-plan", "plan.json"])
+        .output()
+        .expect("invalid metadata invocation should run");
+    assert!(!invalid.status.success());
+    assert!(
+        invalid.stdout.is_empty(),
+        "blocking diagnostics emit no JSON"
+    );
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("E0686"));
+
+    let _ = fs::remove_dir_all(temp_dir);
+}
+
+#[test]
 fn check_json_exposes_static_identity_fix_ranges() {
     let temp_dir = temp_dir_path("check-json-static-fix");
     fs::create_dir_all(&temp_dir).expect("temp directory should be created");

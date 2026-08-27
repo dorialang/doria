@@ -1,0 +1,41 @@
+enum HttpMethod
+{
+    case Get;
+    case Post;
+}
+
+#[Attribute]
+class Route
+{
+    function __construct(
+        string $path,
+        HttpMethod $method = HttpMethod::Get,
+    ) {}
+}
+
+#[Attribute]
+class Label
+{
+    function __construct(string $name) {}
+}
+
+#[Label("http")]
+enum Response
+{
+    #[Label(name: "success")]
+    case Success(#[Label("payload")] string $body);
+}
+
+#[Route(path: "/posts", method: HttpMethod::Post)]
+#[Route(path: "/health")]
+#[Test]
+#[PHPExport]
+function handle(#[Label("request-id")] string $requestId): string
+{
+    return $requestId;
+}
+
+function main(): void
+{
+    echo handle("stage-32") . "\n";
+}

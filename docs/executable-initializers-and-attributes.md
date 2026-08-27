@@ -3,9 +3,14 @@
 > Documentation role: supporting design note.
 > Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
 
-Doria has syntax familiar to developers coming from PHP-like and C-like languages, but it should not inherit PHP's restrictions around property default values or attribute arguments.
+Doria has syntax familiar to developers coming from PHP-like and C-like
+languages, but its initializer and metadata rules are defined by Doria rather
+than PHP.
 
-In PHP, property initializers and attribute arguments are limited to constant values or constant expressions. Doria should allow richer, typed, compiler-checked expressions in both places.
+Instance property initializers are executable per-object initialization.
+Attributes are a separate compiler/tooling metadata surface whose Stage 32
+arguments use bounded typed constant evaluation. Decision 0125 settles that
+separation.
 
 This document records the intended Doria direction.
 
@@ -32,7 +37,8 @@ class Office
 
 The `$manager` property should be initialized with a fresh `Person` object for each `Office` instance.
 
-Doria should also allow expressive metadata/decorator-style configuration:
+Doria may eventually grow a richer metadata-expression tier for configuration
+such as:
 
 ```doria
 #[Module(
@@ -54,30 +60,31 @@ class PostsModule
 }
 ```
 
-This is deliberately more capable than PHP attributes.
+This `Module(imports: [...])` example is **future direction**, not accepted
+Stage 32 source. Collections, object construction, and static factories are not
+current metadata values.
 
 ---
 
 ## 2. Design principle
 
-The rule should be:
+The rules are:
 
 ```text
-Doria initializers and attributes may contain Doria expressions, not only constant literals.
+Instance property initializers are executable construction-time expressions.
+Attribute arguments are typed, bounded constant metadata expressions.
 ```
-
-However, this does not mean every arbitrary expression should be allowed everywhere immediately.
 
 Doria should define expression contexts carefully:
 
 ```text
 1. Runtime property initializer expressions.
 2. Static/module initializer expressions.
-3. Attribute metadata expressions.
+3. Stage 32 constant attribute metadata expressions.
 4. Future compile-time/evaluable expressions.
 ```
 
-Each context may have different restrictions.
+Each context has its own restrictions. One context does not widen another.
 
 ---
 
@@ -196,98 +203,99 @@ Do not design native code generation around PHP's initialization model.
 
 ---
 
-## 6. Attribute expression syntax
+## 6. Stage 32 attribute syntax
 
-Doria attributes should support named arguments, arrays/lists, dictionaries, class references, object construction, and static factory calls.
-
-Examples:
+Stage 32 implements adjacent `#[...]` groups before declarations:
 
 ```doria
-#[Route(method: HttpMethod::Post, path: "/posts")]
-function createPost(): Response
+#[Attribute]
+class Route
 {
-    // ...
+    function __construct(
+        string $path,
+        HttpMethod $method = HttpMethod::Get,
+    ) {
+    }
 }
-```
 
-```doria
-#[Module(
-    imports: [
-        ORMModule::forRoot(
-            type: "mysql",
-            host: "localhost",
-            port: 3306,
-            username: "root",
-            password: "root",
-            database: "test",
-            entities: [],
-            synchronize: true,
-        )
-    ]
-)]
-class PostsModule
+#[Authenticated, Route(path: "/posts"),]
+#[Test]
+function createPost(): void
 {
 }
 ```
 
-This means the parser needs attribute syntax:
+Attributes reuse ordinary source-order positional and named arguments. Several
+applications may share one group, several groups may target one declaration,
+and trailing commas are accepted. Qualified names such as
+`#[Acme\Metadata\Route(...)]` use the ordinary namespace/package resolver.
 
-```text
-#[AttributeName(...)]
-```
+`#[` must be adjacent. `# comment` and `# [Route]` remain comments.
 
-and named arguments:
-
-```text
-name: expression
-```
-
-inside calls and attribute argument lists.
+Supported targets are global type/function/constant declarations, class and
+trait members, callable parameters, enum cases, and enum payload fields. Stage
+32 does not place attributes on statements, locals, expressions, closures,
+generic parameters, return types, or throws entries.
 
 ---
 
-## 7. Attribute evaluation model
+## 7. Attribute classes and values
 
-Doria should not blindly run arbitrary code at compile time by default.
+`#[Attribute]` marks a non-generic class as a schema. Its constructor parameter
+list defines names, types, order, and defaults:
 
-Recommended model:
+```doria
+#[Attribute]
+class Cache
+{
+    function __construct(string $key, int $seconds = 60) {}
+}
 
-```text
-- Attribute expressions are parsed, type-checked, and stored as structured metadata.
-- Some attribute expressions may be evaluated at compile time only if they are explicitly allowed to be compile-time safe.
-- Other attribute expressions may lower to module initialization or framework metadata registration code.
+#[Cache(key: "posts", seconds: 30)]
+function loadPosts(): void
+{
+}
 ```
 
-This keeps Doria expressive without making compilation depend on arbitrary side effects.
+Schema parameters are readonly. Applying the attribute does not instantiate the
+class or execute its constructor body. User schemas follow package visibility;
+an `internal` schema remains package-internal.
 
-Future options:
+Accepted values are the bounded Decision 0084 constant tier: exact numerics,
+`bool`, `string`, compatible nullable values, top-level and class constants,
+typed constant operations and numeric conversions, and compatible unit,
+backed, or payload enums.
+
+These are rejected as Stage 32 metadata values:
 
 ```text
-1. Pure metadata expressions only.
-2. `const` constructors and `const` static methods allowed in attributes.
-3. `comptime` expressions allowed in attributes.
-4. Runtime metadata factories lowered by the backend.
+runtime locals and parameters
+property or mutable-static reads
+function, method, and static-factory calls
+constructors and closures
+I/O, panic, time, randomness, and environment access
+objects, collections, typed arrays, Bytes, mixed, and shared handles
 ```
 
-The exact policy is not settled yet.
+An invalid application creates no partial metadata record. Attributes
+contribute no checked effects and perform no side effects.
 
 ---
 
-## 8. Attribute restrictions to decide later
+## 8. Metadata and runtime boundary
 
-Open questions:
+The compiler resolves and type-checks attribute schemas and applications once,
+then stores canonical typed facts in semantic information and HIR. Metadata
+retains source/package identities, target identities, authored order, bound
+parameter order, defaults, exact values, and source spans.
 
-```text
-- Should attribute expressions be pure?
-- Should they be allowed to perform I/O?
-- Should they be evaluated by the compiler, by generated module initialization code, or by reflection at runtime?
-- Should functions used in attributes require a marker such as `const`, `pure`, or `comptime`?
-- Should attribute objects be required to be immutable?
-- How should attribute metadata be represented in native binaries?
-- How should PHP backend output represent Doria attributes that PHP cannot express directly?
-```
+MIR contains no attribute operation. The interpreter, Cranelift, LLVM, and PHP
+compatibility backend create no runtime attribute object, reflection table,
+metadata registry, test runner, or export bridge. Attribute-bearing source
+executes like the equivalent source without metadata.
 
-Until these questions are settled, implement parsing and AST/Doria IR representation first, not full evaluation.
+`#[Test]` and `#[PHPExport]` are compiler-known metadata markers only. Baton test
+orchestration begins in Stage 33; PHP bridge semantics begin in Stage 41.
 
 ---
 
@@ -326,19 +334,8 @@ class Office
 }
 ```
 
-For attributes, the PHP backend may need to generate metadata registration code instead of PHP attributes.
-
-Example direction:
-
-```php
-DoriaMetadata::register(PostsModule::class, [
-    new Module(imports: [
-        ORMModule::forRoot(...)
-    ]),
-]);
-```
-
-The exact PHP lowering can wait. The important rule is:
+For Stage 32 attributes, PHP emits no PHP attribute and no metadata registration
+code. Metadata remains compiler/tooling data. The important rule is:
 
 ```text
 Doria semantics come first. PHP output adapts to Doria, not the other way around.
@@ -346,55 +343,29 @@ Doria semantics come first. PHP output adapts to Doria, not the other way around
 
 ---
 
-## 10. Parser and AST implications
+## 10. Parser and AST model
 
-Needed parser additions:
+The parser uses a first-class adjacent attribute-opening token. Source-preserving
+groups retain qualified names, delimiters, arguments, argument names, commas,
+trailing commas, group spans, and authored order. Attribute applications reuse
+the same `Argument` representation and binding service as calls; there is no
+second named-argument model.
 
-```text
-- Attribute lists before classes, functions, methods, properties, parameters, and possibly modules.
-- Named arguments using `name: expr`.
-- Object construction and static calls inside property initializers.
-- Object construction and static calls inside attribute arguments.
-```
-
-Needed AST additions:
-
-```text
-Attribute
-AttributeArg
-CallArg
-PropertyInitializer
-```
-
-A possible shape:
-
-```rust
-pub struct Attribute {
-    pub name: Path,
-    pub args: Vec<CallArg>,
-    pub span: Span,
-}
-
-pub enum CallArg {
-    Positional(Expr),
-    Named { name: String, value: Expr, span: Span },
-}
-```
-
-Function calls, static calls, constructor calls, and attributes should share the same argument representation so named arguments are not duplicated in the AST design.
+The parser deliberately recovers malformed or misplaced groups to the next
+declaration. It never treats an attribute as an expression statement.
 
 ---
 
-## 11. Type-checking implications
+## 11. Type checking
 
-The checker must eventually verify:
+The checker verifies:
 
 ```text
 - Property initializer expression type is assignable to property type.
 - Attribute class or metadata constructor exists.
 - Attribute argument names exist.
 - Attribute argument expression types match expected parameter types.
-- Attribute expressions obey the chosen evaluation policy.
+- Attribute values belong to the bounded constant metadata tier.
 ```
 
 Example:
@@ -406,46 +377,35 @@ class Office
 }
 ```
 
-Example:
-
-```doria
-#[Module(imports: "not a list")]
-class PostsModule
-{
-}
-```
-
-should fail if `imports` expects a `List<ModuleImport>` or equivalent.
+Unsupported metadata types are rejected at the schema. Wrong argument types are
+diagnosed before const-evaluation consequences. Named/default binding uses the
+same causal diagnostics as ordinary calls.
 
 ---
 
-## 12. Near-term implementation plan
+## 12. Metadata command and processor protocol
 
-Implement in this order:
+`doriac metadata` supports standalone source and complete build plans. It emits
+strict deterministic schema-version-1 JSON and no backend artifact.
 
-```text
-1. Add parser support for attributes without semantic evaluation.
-2. Add AST support for attributes and named arguments.
-3. Add parser support for named call arguments generally.
-4. Keep property initializers in AST/Doria IR as expressions.
-5. Add semantic checks that property initializer type matches property type once TypeId/TypeKind exists.
-6. Add PHP backend lowering for simple `new` property initializers into constructors.
-7. Add a metadata representation for attributes in Doria IR.
-8. Decide attribute evaluation policy before executing attribute expressions.
-```
-
-Do not let the PHP backend block the language design.
+Stage 32 also defines strict typed processor request and response models. They
+validate compiler/graph identity, typed metadata, processor diagnostics,
+content hashes, generated scopes, and normalized package-relative generated
+paths. The compiler executes no processor and writes no generated source.
+Decision 0118 and Stage 33 Slice 3 own explicit Baton orchestration.
 
 ---
 
-## 13. Settled direction
+## 13. Settled and future direction
 
 Settled:
 
 ```text
 - Doria should allow object construction in instance property initializers.
-- Doria should allow richer attribute expressions than PHP.
+- Doria attributes are typed compiler/tooling metadata, not PHP attributes.
 - Instance property initializers should run per object construction, not be shared across instances.
+- Stage 32 attribute arguments use bounded constant evaluation only.
+- Attribute applications execute no Doria code and add no runtime metadata.
 - PHP backend limitations must not restrict Doria syntax.
 - Constructor-rooted writable paths follow Decision 0122 rather than PHP's
   object model.
@@ -453,11 +413,14 @@ Settled:
   general property move-out remains separate.
 ```
 
-Open:
+Future, requiring separate authority:
 
 ```text
-- Exact compile-time vs runtime evaluation policy for attributes.
-- Whether attribute expressions require `const`, `pure`, or `comptime` functions.
-- Exact PHP backend lowering for attributes.
-- Exact native metadata representation.
+- Richer collection, object, class-reference, or factory metadata values.
+- Any `const` function, `const` constructor, or general `comptime` facility.
+- Target masks, repeatability declarations, and attribute inheritance.
+- Runtime reflection.
+- Processor execution and generated-source rounds through Baton.
 ```
+
+Decision 0125 is authoritative for the implemented Stage 32 surface.

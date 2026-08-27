@@ -14,6 +14,7 @@ pub struct Parser {
     current: usize,
     pending_type_argument_close: Option<Span>,
     qualified_names: Vec<QualifiedNameRef>,
+    attributes: Vec<AttributeAttachment>,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -22,6 +23,7 @@ struct ParserCheckpoint {
     current: usize,
     pending_type_argument_close: Option<Span>,
     qualified_names_len: usize,
+    attributes_len: usize,
     diagnostics_len: usize,
 }
 
@@ -36,6 +38,7 @@ impl Parser {
             current: 0,
             pending_type_argument_close: None,
             qualified_names: Vec::new(),
+            attributes: Vec::new(),
             diagnostics: Vec::new(),
         }
     }
@@ -110,6 +113,7 @@ impl Parser {
                 imports,
                 includes,
                 qualified_names: self.qualified_names,
+                attributes: self.attributes,
                 items,
             })
         } else {
@@ -122,6 +126,7 @@ impl Parser {
             current: self.current,
             pending_type_argument_close: self.pending_type_argument_close,
             qualified_names_len: self.qualified_names.len(),
+            attributes_len: self.attributes.len(),
             diagnostics_len: self.diagnostics.len(),
         }
     }
@@ -131,6 +136,7 @@ impl Parser {
         self.pending_type_argument_close = checkpoint.pending_type_argument_close;
         self.qualified_names
             .truncate(checkpoint.qualified_names_len);
+        self.attributes.truncate(checkpoint.attributes_len);
         self.diagnostics.truncate(checkpoint.diagnostics_len);
     }
 
@@ -426,7 +432,8 @@ impl Parser {
     }
 
     fn parse_item(&mut self) -> Option<Item> {
-        if self.match_kind(&TokenKind::Class) {
+        let attributes = self.parse_attribute_groups()?;
+        let item = if self.match_kind(&TokenKind::Class) {
             self.parse_class(MemberAccess::External, self.previous().span.start)
                 .map(Item::Class)
         } else if self.match_kind(&TokenKind::Enum) {
@@ -455,10 +462,290 @@ impl Parser {
                 .map(Item::Constant)
         } else {
             self.parse_statement().map(Item::Statement)
+        };
+        if let Some(item) = &item {
+            if matches!(item, Item::Statement(_)) && !attributes.is_empty() {
+                self.reject_attribute_target(&attributes, "statements and local declarations");
+            } else {
+                self.attach_item_attributes(attributes, item);
+            }
+        }
+        item
+    }
+
+    fn parse_attribute_groups(&mut self) -> Option<Vec<AttributeGroup>> {
+        let mut groups = Vec::new();
+        while self.match_kind(&TokenKind::AttributeOpen) {
+            let open_span = self.previous().span;
+            let mut attributes = Vec::new();
+            let mut comma_spans = Vec::new();
+            if self.check(&TokenKind::RightBracket) {
+                let close_span = self.advance().span;
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "an attribute group cannot be empty",
+                        open_span.merge(close_span),
+                    )
+                    .with_title("Empty Attribute Group"),
+                );
+                continue;
+            }
+
+            loop {
+                if self.check(&TokenKind::Comma) {
+                    let comma = self.advance().span;
+                    self.diagnostics.push(
+                        Diagnostic::new("P0001", "expected an attribute name", comma)
+                            .with_title("Missing Attribute Name"),
+                    );
+                    comma_spans.push(comma);
+                    continue;
+                }
+                let name = self.parse_qualified_name_ref("expected attribute name")?;
+                self.qualified_names.push(name.clone());
+                let argument_list = if self.match_kind(&TokenKind::LeftParen) {
+                    Some(self.parse_attribute_argument_list(self.previous().span)?)
+                } else {
+                    None
+                };
+                let end = argument_list
+                    .as_ref()
+                    .map_or(name.span.end, |list| list.span.end);
+                attributes.push(AttributeRef {
+                    span: self.span(name.span.start, end),
+                    name,
+                    canonical_name: None,
+                    argument_list,
+                });
+
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+                comma_spans.push(self.previous().span);
+                if self.check(&TokenKind::RightBracket) {
+                    break;
+                }
+            }
+
+            let close_span = if self.check(&TokenKind::RightBracket) {
+                self.advance().span
+            } else {
+                let insertion = self.span(self.peek().span.start, self.peek().span.start);
+                self.diagnostics.push(
+                    Diagnostic::new("P0001", "expected `]` after attribute group", insertion)
+                        .with_title("Missing Attribute Closing Bracket")
+                        .with_fix(insertion, "]"),
+                );
+                insertion
+            };
+            groups.push(AttributeGroup {
+                open_span,
+                attributes,
+                comma_spans,
+                close_span,
+                span: open_span.merge(close_span),
+            });
+        }
+        Some(groups)
+    }
+
+    fn parse_attribute_argument_list(
+        &mut self,
+        open_paren_span: Span,
+    ) -> Option<AttributeArgumentList> {
+        let mut arguments = Vec::new();
+        let mut comma_spans = Vec::new();
+        let mut last_named_span = None;
+        if !self.check(&TokenKind::RightParen) {
+            loop {
+                if self.check(&TokenKind::Comma) {
+                    let comma = self.advance().span;
+                    self.diagnostics.push(
+                        Diagnostic::new("P0001", "expected an attribute argument", comma)
+                            .with_title("Missing Attribute Argument"),
+                    );
+                    comma_spans.push(comma);
+                    continue;
+                }
+                let is_named = matches!(self.peek().kind, TokenKind::Identifier(_))
+                    && self
+                        .tokens
+                        .get(self.current + 1)
+                        .is_some_and(|token| matches!(token.kind, TokenKind::Colon));
+                let argument = if is_named {
+                    let name_token = self.advance().clone();
+                    let TokenKind::Identifier(name) = name_token.kind.clone() else {
+                        unreachable!("attribute named argument must start with an identifier")
+                    };
+                    self.advance();
+                    if self.check(&TokenKind::Comma) || self.check(&TokenKind::RightParen) {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "P0001",
+                                "expected a value after attribute argument name",
+                                self.peek().span,
+                            )
+                            .with_title("Missing Attribute Argument"),
+                        );
+                        return None;
+                    }
+                    let value = self.parse_expression()?;
+                    last_named_span = Some(name_token.span);
+                    Argument {
+                        span: name_token.span.merge(value.span()),
+                        name: Some(ArgumentName {
+                            text: name,
+                            span: name_token.span,
+                        }),
+                        value,
+                    }
+                } else {
+                    let value = self.parse_expression()?;
+                    if let Some(named_span) = last_named_span {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0515",
+                                "a positional argument cannot follow a named argument",
+                                value.span(),
+                            )
+                            .with_help(
+                                "once an attribute uses a named argument, every following argument must also be named",
+                            )
+                            .with_related(named_span, "named argument appears here"),
+                        );
+                    }
+                    Argument {
+                        span: value.span(),
+                        name: None,
+                        value,
+                    }
+                };
+                arguments.push(argument);
+                if !self.match_kind(&TokenKind::Comma) {
+                    break;
+                }
+                comma_spans.push(self.previous().span);
+                if self.check(&TokenKind::RightParen) {
+                    break;
+                }
+            }
+        }
+        let close_paren_span = self
+            .expect(
+                TokenKind::RightParen,
+                "expected `)` after attribute arguments",
+            )?
+            .span;
+        Some(AttributeArgumentList {
+            open_paren_span,
+            arguments,
+            comma_spans,
+            close_paren_span,
+            span: open_paren_span.merge(close_paren_span),
+        })
+    }
+
+    fn attach_item_attributes(&mut self, groups: Vec<AttributeGroup>, item: &Item) {
+        let (kind, target_span, name_span) = match item {
+            Item::Class(value) => (AttributeTargetKind::Class, value.span, value.name_span),
+            Item::Enum(value) => (AttributeTargetKind::Enum, value.span, value.name_span),
+            Item::Interface(value) => (AttributeTargetKind::Interface, value.span, value.name_span),
+            Item::Trait(value) => (AttributeTargetKind::Trait, value.span, value.name_span),
+            Item::Function(value) => (AttributeTargetKind::Function, value.span, value.name_span),
+            Item::Constant(value) => (AttributeTargetKind::Constant, value.span, value.name_span),
+            Item::Statement(_) => return,
+        };
+        self.attach_attributes(
+            groups,
+            kind,
+            target_span,
+            name_span,
+            vec![AttributeTargetRole::Declaration],
+        );
+    }
+
+    fn attach_member_attributes(&mut self, groups: Vec<AttributeGroup>, member: &ClassMember) {
+        let (kind, target_span, name_span) = match member {
+            ClassMember::Property(value) => (AttributeTargetKind::Property, value.span, value.span),
+            ClassMember::Method(value) => {
+                let kind = match value.name.as_str() {
+                    "__construct" => AttributeTargetKind::Constructor,
+                    "__destruct" => AttributeTargetKind::Destructor,
+                    _ => AttributeTargetKind::Method,
+                };
+                (kind, value.span, value.name_span)
+            }
+            ClassMember::Constant(value) => (
+                AttributeTargetKind::ClassConstant,
+                value.span,
+                value.name_span,
+            ),
+        };
+        self.attach_attributes(
+            groups,
+            kind,
+            target_span,
+            name_span,
+            vec![AttributeTargetRole::Declaration],
+        );
+    }
+
+    fn attach_attributes(
+        &mut self,
+        groups: Vec<AttributeGroup>,
+        kind: AttributeTargetKind,
+        target_span: Span,
+        name_span: Span,
+        roles: Vec<AttributeTargetRole>,
+    ) {
+        if groups.is_empty() {
+            return;
+        }
+        self.attributes.push(AttributeAttachment {
+            groups,
+            target: AttributeTargetSyntax {
+                kind,
+                target_span,
+                name_span,
+                roles,
+            },
+        });
+    }
+
+    fn reject_attribute_target(&mut self, groups: &[AttributeGroup], target: &str) {
+        if let Some(group) = groups.first() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    format!("attributes are not valid on {target}"),
+                    group.span,
+                )
+                .with_title("Attribute Is Not Valid On This Target"),
+            );
         }
     }
 
+    fn reject_attribute_after_modifier(&mut self, modifier_span: Span) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "P0001",
+                "an attribute must precede declaration modifiers",
+                self.peek().span,
+            )
+            .with_title("Attribute Must Precede Declaration Modifiers")
+            .with_related(
+                modifier_span,
+                "the declaration modifier appears before this attribute",
+            ),
+        );
+    }
+
     fn parse_internal_item(&mut self, internal_span: Span) -> Option<Item> {
+        if self.check(&TokenKind::AttributeOpen) {
+            self.reject_attribute_after_modifier(internal_span);
+            let _ = self.parse_attribute_groups();
+        }
         if self.match_kind(&TokenKind::Class) {
             self.parse_class(MemberAccess::Internal, internal_span.start)
                 .map(Item::Class)
@@ -509,6 +796,7 @@ impl Parser {
 
         let mut cases = Vec::new();
         while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            let attributes = self.parse_attribute_groups()?;
             let case_start = self.peek().span.start;
             self.expect(TokenKind::Case, "expected `case` in enum body")?;
             let name = self.expect_identifier("expected enum case name")?;
@@ -527,13 +815,21 @@ impl Parser {
                 .expect(TokenKind::Semicolon, "expected `;` after enum case")?
                 .span
                 .end;
-            cases.push(EnumCaseDecl {
+            let declaration = EnumCaseDecl {
                 name,
                 name_span,
                 payload,
                 backing_value,
                 span: self.span(case_start, end),
-            });
+            };
+            self.attach_attributes(
+                attributes,
+                AttributeTargetKind::EnumCase,
+                declaration.span,
+                declaration.name_span,
+                vec![AttributeTargetRole::Declaration],
+            );
+            cases.push(declaration);
         }
 
         let end = self
@@ -558,14 +854,23 @@ impl Parser {
             return Some(fields);
         }
         loop {
+            let attributes = self.parse_attribute_groups()?;
             let start = self.peek().span.start;
             let ty = self.parse_type_ref()?;
             let (name, name_span) = self.expect_variable("expected enum payload variable")?;
-            fields.push(EnumPayloadField {
+            let field = EnumPayloadField {
                 ty,
                 name,
                 span: self.span(start, name_span.end),
-            });
+            };
+            self.attach_attributes(
+                attributes,
+                AttributeTargetKind::EnumPayloadField,
+                field.span,
+                name_span,
+                vec![AttributeTargetRole::Declaration],
+            );
+            fields.push(field);
             if !self.match_kind(&TokenKind::Comma) {
                 break;
             }
@@ -658,6 +963,7 @@ impl Parser {
     }
 
     fn parse_class_member(&mut self) -> Option<ClassMember> {
+        let attributes = self.parse_attribute_groups()?;
         if self.check(&TokenKind::Use) || self.check(&TokenKind::Include) {
             let token = self.advance().clone();
             let (title, message) = if matches!(token.kind, TokenKind::Use) {
@@ -680,11 +986,19 @@ impl Parser {
             return None;
         }
         let access = self.parse_member_access();
+        if self.check(&TokenKind::AttributeOpen) {
+            self.reject_attribute_after_modifier(self.peek().span);
+            let _ = self.parse_attribute_groups();
+        }
         if self.match_kind(&TokenKind::Const) {
             let start = self.previous().span.start;
-            return self
+            let member = self
                 .parse_const_decl(access, start)
                 .map(ClassMember::Constant);
+            if let Some(member) = &member {
+                self.attach_member_attributes(attributes, member);
+            }
+            return member;
         }
         let static_span = self
             .match_kind(&TokenKind::Static)
@@ -693,6 +1007,10 @@ impl Parser {
         let writable_span = self
             .match_kind(&TokenKind::Writable)
             .then(|| self.previous().span);
+        if self.check(&TokenKind::AttributeOpen) {
+            self.reject_attribute_after_modifier(self.peek().span);
+            let _ = self.parse_attribute_groups();
+        }
         if self.check(&TokenKind::Function)
             && self
                 .tokens
@@ -701,9 +1019,13 @@ impl Parser {
         {
             self.advance();
             let start = self.previous().span.start;
-            return self
+            let member = self
                 .parse_function(access, writable_span, static_span, self.span(start, start))
                 .map(ClassMember::Method);
+            if let Some(member) = &member {
+                self.attach_member_attributes(attributes, member);
+            }
+            return member;
         }
 
         let start = self.peek().span.start;
@@ -722,7 +1044,7 @@ impl Parser {
             .span
             .end;
 
-        Some(ClassMember::Property(PropertyDecl {
+        let member = ClassMember::Property(PropertyDecl {
             access,
             is_static: static_span.is_some(),
             writable: writable_span.is_some(),
@@ -730,7 +1052,18 @@ impl Parser {
             name,
             initializer,
             span: self.span(start.min(name_span.start), end),
-        }))
+        });
+        self.attach_attributes(
+            attributes,
+            AttributeTargetKind::Property,
+            match &member {
+                ClassMember::Property(property) => property.span,
+                _ => unreachable!("the member was just constructed as a property"),
+            },
+            name_span,
+            vec![AttributeTargetRole::Declaration],
+        );
+        Some(member)
     }
 
     fn parse_const_decl(&mut self, access: MemberAccess, start: usize) -> Option<ConstDecl> {
@@ -954,6 +1287,7 @@ impl Parser {
     }
 
     fn parse_param(&mut self, is_constructor: bool) -> Option<Param> {
+        let attributes = self.parse_attribute_groups()?;
         let start = self.peek().span.start;
         if !is_constructor && self.check(&TokenKind::Internal) {
             let span = self.advance().span;
@@ -980,6 +1314,10 @@ impl Parser {
                 _ => unreachable!("modifier loop accepts only take/writable"),
             }
         }
+        if self.check(&TokenKind::AttributeOpen) {
+            self.reject_attribute_after_modifier(self.peek().span);
+            let _ = self.parse_attribute_groups();
+        }
         let ty = self.parse_type_ref()?;
         if self.match_kind(&TokenKind::Ampersand) {
             self.error(
@@ -997,7 +1335,7 @@ impl Parser {
 
         let end = default.as_ref().map(Expr::span).unwrap_or(name_span).end;
 
-        Some(Param {
+        let param = Param {
             promoted_access: is_constructor.then_some(access),
             take: take_span.is_some(),
             take_span,
@@ -1008,7 +1346,19 @@ impl Parser {
             name,
             default,
             span: self.span(start, end),
-        })
+        };
+        let mut roles = vec![AttributeTargetRole::Parameter];
+        if is_constructor {
+            roles.push(AttributeTargetRole::PromotedProperty);
+        }
+        self.attach_attributes(
+            attributes,
+            AttributeTargetKind::Parameter,
+            param.span,
+            name_span,
+            roles,
+        );
+        Some(param)
     }
 
     fn parse_arrow_closure(&mut self, keyword_span: Span) -> Option<Expr> {
@@ -1379,6 +1729,11 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> Option<Stmt> {
+        if self.check(&TokenKind::AttributeOpen) {
+            let attributes = self.parse_attribute_groups()?;
+            self.reject_attribute_target(&attributes, "statements and local declarations");
+            return self.parse_statement();
+        }
         if self.check(&TokenKind::Use) && !self.is_contextual_use_call() {
             self.advance();
             let span = self.previous().span;
@@ -4283,7 +4638,8 @@ impl Parser {
                 | TokenKind::Given
                 | TokenKind::For
                 | TokenKind::Foreach
-                | TokenKind::Internal => return,
+                | TokenKind::Internal
+                | TokenKind::AttributeOpen => return,
                 _ => {
                     self.advance();
                 }
@@ -4419,6 +4775,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::RightBrace => "}",
         TokenKind::LeftBracket => "[",
         TokenKind::RightBracket => "]",
+        TokenKind::AttributeOpen => "#[",
         TokenKind::Semicolon => ";",
         TokenKind::Colon => ":",
         TokenKind::Comma => ",",

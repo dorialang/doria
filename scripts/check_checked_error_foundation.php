@@ -119,7 +119,8 @@ $require($decisionPath, $decision, [
     'pre-Stage-30 closure grammar slice is complete',
     'checked indirect calls reuse',
     'debug interpreter, Cranelift, LLVM, and PHP',
-    '30 and 31 and the Decision 0123 corrective beat are complete; Stage 32 is next',
+    '30 through 32 and the Decision 0123 corrective beat are complete; Stage 33',
+    'Slice 1 is next',
 ]);
 
 foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {

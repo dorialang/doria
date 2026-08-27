@@ -1,0 +1,44 @@
+class Unmarked {}
+
+class Factory
+{
+    static function create(): string
+    {
+        return "runtime";
+    }
+}
+
+#[Attribute]
+class GenericAttribute<T> {}
+
+#[Attribute]
+class Route
+{
+    function __construct(string $path) {}
+}
+
+function runtimePath(): string
+{
+    return "/runtime";
+}
+
+#[Unmarked]
+function unmarkedClass(): void {}
+
+#[Route(unknown: "/wrong-name")]
+function wrongArgumentName(): void {}
+
+#[Route(runtimePath())]
+function runtimeCall(): void {}
+
+#[Route(read_file("route.txt"))]
+function ioCall(): void {}
+
+#[Route(new Unmarked())]
+function objectConstruction(): void {}
+
+#[Route(Factory::create())]
+function staticFactory(): void {}
+
+#[Route(["runtime"])]
+function collectionLiteral(): void {}

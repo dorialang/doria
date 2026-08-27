@@ -194,6 +194,7 @@ fn run() -> Result<ExitCode, CliError> {
         "ast" => ast_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "hir" => hir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "mir" => mir_command(&args[1..]).map(|()| ExitCode::SUCCESS),
+        "metadata" => metadata_command(&args[1..]).map(|()| ExitCode::SUCCESS),
         "compile" => compile_command(&executable, &args[1..]).map(|()| ExitCode::SUCCESS),
         command if command.ends_with(".doria") || Path::new(command).is_file() => Err(format!(
             "unknown command `{command}`\n\n\
@@ -623,6 +624,36 @@ fn ast_command(args: &[String]) -> Result<(), CliError> {
         CliError::diagnostics(path, text, diagnostics, diagnostic_options)
     })?;
     println!("{ast:#?}");
+    Ok(())
+}
+
+fn metadata_command(args: &[String]) -> Result<(), CliError> {
+    let (args, diagnostic_options) = parse_diagnostic_options(args)?;
+    let document = if let Some(plan_path) = build_plan_argument(&args)? {
+        if args.len() != 2 {
+            return Err(format!("unknown metadata option `{}`", args[2]).into());
+        }
+        let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
+        doriac::metadata_compilation_graph(&graph).map_err(|diagnostics| {
+            CliError::graph_diagnostics(graph.source_map.clone(), diagnostics, diagnostic_options)
+        })?
+    } else {
+        let input = args
+            .first()
+            .ok_or_else(|| "missing input file".to_string())?;
+        if let Some(option) = args.get(1) {
+            return Err(format!("unknown metadata option `{option}`").into());
+        }
+        let (path, text) = read_source(input)?;
+        doriac::metadata_source(path.clone(), text.clone()).map_err(|diagnostics| {
+            CliError::diagnostics(path, text, diagnostics, diagnostic_options)
+        })?
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&document)
+            .map_err(|error| format!("failed to encode attribute metadata: {error}"))?
+    );
     Ok(())
 }
 
@@ -1453,7 +1484,7 @@ fn direct_executable_hint(path: &Path) -> String {
 
 fn print_help() {
     println!(
-        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac check --build-plan <plan.json> [diagnostic options]\n    doriac ast|hir|mir <source.doria> [diagnostic options]\n    doriac ast|hir|mir --build-plan <plan.json> [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac compile --build-plan <plan.json> [--out <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n    doriac run --build-plan <plan.json> [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
+        "doriac {}\n\nUSAGE:\n    doriac check <source.doria> [diagnostic options]\n    doriac check --build-plan <plan.json> [diagnostic options]\n    doriac ast|hir|mir <source.doria> [diagnostic options]\n    doriac ast|hir|mir --build-plan <plan.json> [diagnostic options]\n    doriac metadata <source.doria> [diagnostic options]\n    doriac metadata --build-plan <plan.json> [diagnostic options]\n    doriac compile <source.doria> [--release] [--out <file>] [--performance-report <file>] [diagnostic options]\n    doriac compile <source.doria> --target php [--out <file>] [diagnostic options]\n    doriac compile --build-plan <plan.json> [--out <file>] [diagnostic options]\n    doriac run <source.doria> [--release] [diagnostic options] [-- <program args>...]\n    doriac run --build-plan <plan.json> [diagnostic options] [-- <program args>...]\n\nDIAGNOSTIC OPTIONS:\n    --diagnostic-format human|concise|json    default: human\n    --diagnostic-color auto|always|never      default: auto; NO_COLOR disables auto color\n\nHuman and concise diagnostics are written to stderr. Versioned JSON diagnostics are written to stdout.\n\nNATIVE PROFILES:\n    fast       default Cranelift profile for rapid local feedback\n    release    LLVM optimized profile selected with --release\n\nTARGETS:\n    native    default target for standalone executables\n    php       compatibility and inspection backend\n    debug     MIR interpreter debug artifact\n    wasm      planned WebAssembly backend",
         doriac::TOOLCHAIN_VERSION
     );
 }

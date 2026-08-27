@@ -279,8 +279,10 @@ Stage 33 has three implementation slices:
 3. Workspaces, development dependencies, graph commands, incremental inventory,
    `baton test`, explicit processors, generated sources, and Phase F closure.
 
-Stage 32 owns typed attribute metadata and the processor protocol, not automatic
-package processor orchestration. Stage 33 Slice 3 performs that orchestration.
+Stage 32 implements typed attribute metadata and the strict processor protocol
+under Decision 0125, not automatic package processor orchestration. Stage 33
+Slice 3 performs explicit orchestration, validates responses, writes generated
+sources under the build directory, and inserts them into the compiler graph.
 
 All three Stage 33 slices run in `dorialang/baton-php` to validate and freeze
 the public contract. They do not promote PHP into Baton's permanent product
@@ -289,8 +291,8 @@ identity. Decision 0124's Pre-Stage-45 transition creates the clean
 transfers production release assembly, removes the private PHP payload from
 archives, and blocks the unsuffixed `2026.03.1` release until cutover.
 
-Stage 31 is complete. Stage 32 is next. Stage 33 remains scheduled, not
-implemented, and does not move before Stage 32. The native port remains after
+Stages 31 and 32 are complete. Stage 33 Slice 1 is next. Stage 33 is scheduled, not implemented.
+The native port remains after
 Stage 44 so it can consume the accepted filesystem, process, FFI, and network
 foundations.
 

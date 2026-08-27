@@ -111,6 +111,7 @@ pub enum CompilerSymbolIdentity {
     Prelude(String),
     Intrinsic(String),
     StandardIo(String),
+    Attribute(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -135,6 +136,7 @@ pub enum GlobalSymbolKind {
     Constant,
     CompilerKnownType,
     CompilerKnownIntrinsic,
+    CompilerKnownAttribute,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -153,6 +155,7 @@ pub enum GlobalReferenceRole {
     ImportTarget,
     ImportAliasUse,
     Include,
+    AttributeClass,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +203,7 @@ pub enum CompilerKnownProvenance {
     EditionPrelude(Edition),
     Intrinsic,
     StandardIo,
+    Attribute,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -390,6 +394,21 @@ pub const EDITION_2026_PRELUDE: &[PreludeEntry] = &[
 pub const fn edition_prelude(edition: Edition) -> &'static [PreludeEntry] {
     match edition {
         Edition::Doria2026 => EDITION_2026_PRELUDE,
+    }
+}
+
+pub const COMPILER_KNOWN_ATTRIBUTES: [&str; 3] = ["Attribute", "Test", "PHPExport"];
+
+pub fn is_compiler_known_attribute(name: &str) -> bool {
+    COMPILER_KNOWN_ATTRIBUTES.contains(&name)
+}
+
+pub fn compiler_known_attribute_id(name: &str) -> GlobalSymbolId {
+    GlobalSymbolId {
+        owner: GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::Attribute(
+            name.to_string(),
+        )),
+        qualified_name: name.to_string(),
     }
 }
 
@@ -973,6 +992,41 @@ impl<'a> Resolver<'a> {
         );
     }
 
+    fn report_unknown_attribute(&mut self, name: &str, span: Span) {
+        self.unresolved.push(UnresolvedGlobalReference {
+            source_identity: self.context.source.clone(),
+            source_span: span,
+            role: GlobalReferenceRole::AttributeClass,
+            source_spelling: name.to_string(),
+            import_alias: None,
+        });
+        if !self.external_causes.insert(format!("attribute:{name}")) {
+            return;
+        }
+        let (kind, title, explanation) = match self.environment {
+            Some(environment) if environment.complete => (
+                crate::diagnostics::DiagnosticKind::Language,
+                "Unknown Attribute Class",
+                "The complete compilation graph contains no visible attribute class with this name.",
+            ),
+            Some(_) | None => (
+                crate::diagnostics::DiagnosticKind::CompilerInput,
+                "Attribute Class Is Not In The Current Compilation Graph",
+                "The compiler input may be missing the source or dependency that declares this attribute class.",
+            ),
+        };
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0686",
+                format!("attribute class `{name}` is not available in this compilation graph"),
+                span,
+            )
+            .with_kind(kind)
+            .with_title(title)
+            .with_explanation(explanation),
+        );
+    }
+
     fn symbol_id(&self, canonical: &str) -> Option<GlobalSymbolId> {
         if let Some(declaration) = self.declarations.get(canonical) {
             return Some(declaration.id.clone());
@@ -1009,6 +1063,9 @@ impl<'a> Resolver<'a> {
                 )),
                 qualified_name: canonical.to_string(),
             });
+        }
+        if is_compiler_known_attribute(canonical) {
+            return Some(compiler_known_attribute_id(canonical));
         }
         None
     }
@@ -1161,8 +1218,51 @@ impl<'a> Resolver<'a> {
     }
 
     fn normalize_program(&mut self, program: &mut Program) {
+        self.normalize_attributes(&mut program.attributes);
         for item in &mut program.items {
             self.normalize_item(item);
+        }
+    }
+
+    fn normalize_attributes(&mut self, attachments: &mut [AttributeAttachment]) {
+        for attachment in attachments {
+            for group in &mut attachment.groups {
+                for attribute in &mut group.attributes {
+                    let source_name = attribute.name.canonical();
+                    let source_span = attribute.name.span;
+                    if !attribute.name.is_qualified() && is_compiler_known_attribute(&source_name) {
+                        let symbol_id = compiler_known_attribute_id(&source_name);
+                        self.references.push(GlobalSymbolReference {
+                            source_identity: self.context.source.clone(),
+                            symbol_id,
+                            source_span,
+                            role: GlobalReferenceRole::AttributeClass,
+                            source_spelling: source_name.clone(),
+                            import_alias: None,
+                        });
+                        attribute.canonical_name = Some(source_name);
+                    } else {
+                        let unresolved_before = self.unresolved.len();
+                        if let Some(resolved) = self.resolve_name(
+                            &source_name,
+                            source_span,
+                            GlobalReferenceRole::AttributeClass,
+                            false,
+                        ) {
+                            attribute.canonical_name = Some(resolved);
+                        } else if self.unresolved.len() == unresolved_before {
+                            let candidate = self.namespace.as_ref().map_or_else(
+                                || source_name.clone(),
+                                |namespace| format!("{namespace}\\{source_name}"),
+                            );
+                            self.report_unknown_attribute(&candidate, source_span);
+                        }
+                    }
+                    if let Some(arguments) = &mut attribute.argument_list {
+                        self.normalize_arguments(&mut arguments.arguments);
+                    }
+                }
+            }
         }
     }
 
@@ -1774,6 +1874,14 @@ pub fn compiler_known_symbol_facts(edition: Edition) -> Vec<CompilerKnownSymbolF
             provenance: CompilerKnownProvenance::StandardIo,
         }
     }));
+    facts.extend(
+        COMPILER_KNOWN_ATTRIBUTES.map(|name| CompilerKnownSymbolFact {
+            id: compiler_known_attribute_id(name),
+            kind: GlobalSymbolKind::CompilerKnownAttribute,
+            source_name: name.to_string(),
+            provenance: CompilerKnownProvenance::Attribute,
+        }),
+    );
     facts
 }
 

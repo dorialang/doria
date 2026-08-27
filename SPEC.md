@@ -1799,43 +1799,64 @@ The current type foundation resolves explicit annotations, reports unknown type 
 
 ## 11. Attributes and metadata expressions
 
-Doria should support attribute syntax using `#[...]`.
-
-Unlike PHP attributes, Doria attributes should eventually allow richer typed expressions, including static factory calls and named arguments.
-
-Example:
+Doria implements typed declaration attributes using adjacent `#[...]` syntax:
 
 ```doria
-#[Module(
-    imports: [
-        ORMModule::forRoot(
-            type: "mysql",
-            host: "localhost",
-            port: 3306,
-            username: "root",
-            password: "root",
-            database: "test",
-            entities: [],
-            synchronize: true,
-        )
-    ]
-)]
-class PostsModule
+#[Attribute]
+class Route
+{
+    function __construct(
+        string $path,
+        HttpMethod $method = HttpMethod::Get,
+    ) {
+    }
+}
+
+#[Route(path: "/posts", method: HttpMethod::Post)]
+#[Test]
+function createPost(): void
 {
 }
 ```
 
-The intended direction is:
+Ordinary `# comment` and `# [Route]` text remain line comments. An attribute
+group may contain several comma-separated applications and may use a trailing
+comma. Several groups may precede one target. Groups must appear before all
+declaration modifiers.
 
-```text
-- Attribute expressions are parsed and type-checked by Doria.
-- Attribute arguments may use named arguments.
-- Attribute expressions may include literals, lists, dictionaries, class/static references, object construction, and static factory calls.
-- The exact compile-time vs runtime evaluation policy is not settled yet.
-- Doria should avoid blindly executing arbitrary side-effecting code at compile time.
-```
+Attributes are accepted on global type/function/constant declarations, class
+and trait members, callable parameters, enum cases, and enum payload fields.
+They are not accepted on statements, locals, expressions, closures, generic
+parameters, return types, or throws entries. A promoted constructor parameter
+is one authored target with parameter and promoted-property roles.
 
-See `docs/executable-initializers-and-attributes.md` for the detailed design notes.
+`#[Attribute]` marks a non-generic class as an attribute schema. Its constructor
+parameters define the schema and must be readonly metadata-compatible values.
+`#[Test]` and `#[PHPExport]` are compiler-known zero-argument metadata markers.
+Stage 32 runs no tests and exports no PHP bridge.
+
+Attribute applications resolve through the ordinary package graph and reuse
+the named/default argument binder. Arguments are type-checked and evaluated by
+the bounded constant evaluator. Supported metadata includes exact numeric
+types, `bool`, `string`, compatible nullable values, constants, and compatible
+unit, backed, or payload enums. Runtime calls, I/O, constructors, static
+factories, closures, objects, collections, typed arrays, `Bytes`, `mixed`, and
+shared handles are not metadata values.
+
+Applying an attribute executes no constructor or other Doria code. Typed
+metadata is retained in semantic information and HIR, while MIR and every
+runtime backend remain metadata-free. Doria has no runtime attribute reflection.
+
+`doriac metadata` and `doriac metadata --build-plan` emit deterministic strict
+schema-version-1 JSON. The compiler also defines a strict versioned processor
+request/response protocol, but Stage 32 executes no processor and writes no
+generated source. Baton orchestration begins in Stage 33; PHP bridge semantics
+remain Stage 41 work.
+
+Decision 0125 is authoritative. See
+`docs/attribute-metadata-protocol.md` for the protocol reference and
+`docs/executable-initializers-and-attributes.md` for the separate property
+initializer model and future richer metadata-expression direction.
 
 ## 12. PHP interop and migration
 
