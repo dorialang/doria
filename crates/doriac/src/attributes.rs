@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path};
 
 use serde::{Deserialize, Serialize};
@@ -238,6 +238,7 @@ pub struct MetadataSourceV1 {
     pub identity: String,
     pub package: String,
     pub display_path: String,
+    pub byte_length: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -345,6 +346,7 @@ pub struct AttributeProcessorRequestV1 {
     pub graph_fingerprint: String,
     pub processor_package: String,
     pub selected_target: MetadataTargetV1,
+    pub sources: Vec<MetadataSourceV1>,
     pub attribute_classes: Vec<MetadataAttributeClassV1>,
     pub applications: Vec<MetadataApplicationV1>,
 }
@@ -363,6 +365,7 @@ impl AttributeProcessorRequestV1 {
             graph_fingerprint: document.graph_fingerprint.clone(),
             processor_package,
             selected_target: document.selected_target.clone(),
+            sources: document.sources.clone(),
             attribute_classes: document.attribute_classes.clone(),
             applications: document.applications.clone(),
         })
@@ -387,6 +390,18 @@ pub fn validate_processor_request(request: &AttributeProcessorRequestV1) -> Diag
     }
     if let Err(mut package_diagnostics) = validate_processor_package(&request.processor_package) {
         diagnostics.append(&mut package_diagnostics);
+    }
+    let mut source_identities = HashSet::new();
+    for source in &request.sources {
+        if source.identity.is_empty()
+            || source.package.is_empty()
+            || source.display_path.is_empty()
+            || !source_identities.insert(source.identity.as_str())
+        {
+            diagnostics.push(protocol_diagnostic(
+                "attribute processor request contains an invalid or duplicate source inventory entry",
+            ));
+        }
     }
     for application in &request.applications {
         for argument in &application.bound_arguments {
@@ -423,7 +438,7 @@ pub fn parse_processor_request_json(bytes: &[u8]) -> DiagnosticResult<AttributeP
 
 pub fn parse_processor_response_json(
     bytes: &[u8],
-    expected_graph_fingerprint: &str,
+    request: &AttributeProcessorRequestV1,
     handwritten_sources: &[String],
 ) -> DiagnosticResult<AttributeProcessorResponseV1> {
     let response =
@@ -432,7 +447,7 @@ pub fn parse_processor_response_json(
                 "invalid attribute processor response JSON: {error}"
             ))]
         })?;
-    validate_processor_response(&response, expected_graph_fingerprint, handwritten_sources)?;
+    validate_processor_response(&response, request, handwritten_sources)?;
     Ok(response)
 }
 
@@ -501,7 +516,7 @@ impl From<GeneratedFor> for GeneratedForV1 {
 
 pub fn validate_processor_response(
     response: &AttributeProcessorResponseV1,
-    expected_graph_fingerprint: &str,
+    request: &AttributeProcessorRequestV1,
     handwritten_sources: &[String],
 ) -> DiagnosticResult<()> {
     let mut diagnostics = Vec::new();
@@ -511,7 +526,7 @@ pub fn validate_processor_response(
             response.schema_version
         )));
     }
-    if response.graph_fingerprint != expected_graph_fingerprint {
+    if response.graph_fingerprint != request.graph_fingerprint {
         diagnostics.push(protocol_diagnostic(
             "attribute processor response graph fingerprint does not match the request",
         ));
@@ -521,6 +536,11 @@ pub fn validate_processor_response(
         .iter()
         .map(|path| path.to_ascii_lowercase())
         .collect::<HashSet<_>>();
+    let source_lengths = request
+        .sources
+        .iter()
+        .map(|source| (source.identity.as_str(), source.byte_length))
+        .collect::<HashMap<_, _>>();
     let mut exact = HashSet::new();
     let mut folded = HashSet::new();
     for source in &response.generated_sources {
@@ -579,6 +599,20 @@ pub fn validate_processor_response(
                 "processor diagnostic `{}` is missing required structured information",
                 diagnostic.code
             )));
+        }
+        for label in &diagnostic.labels {
+            match source_lengths.get(label.source.as_str()) {
+                Some(byte_length) if label.byte_end <= *byte_length => {}
+                Some(_) => diagnostics.push(protocol_diagnostic(format!(
+                    "processor diagnostic `{}` has a label outside source `{}`",
+                    diagnostic.code, label.source
+                ))),
+                None if !label.source.is_empty() => diagnostics.push(protocol_diagnostic(format!(
+                    "processor diagnostic `{}` refers to unknown source `{}`",
+                    diagnostic.code, label.source
+                ))),
+                None => {}
+            }
         }
         if contains_unsafe_terminal_text(&diagnostic.code)
             || contains_unsafe_terminal_text(&diagnostic.title)
@@ -665,6 +699,11 @@ fn validate_generated_path(value: &str) -> Result<(), String> {
         .join("/");
     if normalized != value {
         return Err(format!("generated source path `{value}` is not normalized"));
+    }
+    if path.extension().and_then(|extension| extension.to_str()) != Some("doria") {
+        return Err(format!(
+            "generated source path `{value}` must name a `.doria` source file"
+        ));
     }
     Ok(())
 }
@@ -921,6 +960,7 @@ pub fn metadata_document(
             identity: public_source_identity(&source.identity.0),
             package: source.package.display_name().to_string(),
             display_path: public_display_path(&source.display_path),
+            byte_length: source.source.text.len(),
         })
         .collect::<Vec<_>>();
     sources.sort_by(|left, right| {
@@ -1098,6 +1138,33 @@ fn public_display_path(path: &str) -> String {
 mod tests {
     use super::*;
 
+    fn processor_request(sources: Vec<MetadataSourceV1>) -> AttributeProcessorRequestV1 {
+        AttributeProcessorRequestV1 {
+            schema_version: ATTRIBUTE_PROCESSOR_SCHEMA_VERSION,
+            edition: "2026".to_string(),
+            compiler_revision: "revision".to_string(),
+            graph_fingerprint: "graph".to_string(),
+            processor_package: "acme/routes".to_string(),
+            selected_target: MetadataTargetV1 {
+                package: "acme/application".to_string(),
+                kind: "binary".to_string(),
+                entry_source: None,
+            },
+            sources,
+            attribute_classes: Vec::new(),
+            applications: Vec::new(),
+        }
+    }
+
+    fn processor_source(identity: &str, byte_length: usize) -> MetadataSourceV1 {
+        MetadataSourceV1 {
+            identity: identity.to_string(),
+            package: "acme/application".to_string(),
+            display_path: "main.doria".to_string(),
+            byte_length,
+        }
+    }
+
     #[test]
     fn processor_response_rejects_unsafe_and_colliding_outputs() {
         let contents = "function generated(): void {}".to_string();
@@ -1127,7 +1194,9 @@ mod tests {
                 },
             ],
         };
-        let diagnostics = validate_processor_response(&response, "graph", &[]).unwrap_err();
+        let diagnostics =
+            validate_processor_response(&response, &processor_request(Vec::new()), &[])
+                .unwrap_err();
         assert!(diagnostics
             .iter()
             .any(|diagnostic| diagnostic.message.contains("collides by case")));
@@ -1161,6 +1230,7 @@ mod tests {
                 "kind": "binary",
                 "entrySource": "acme/application:main.doria"
             },
+            "sources": [],
             "attributeClasses": [],
             "applications": []
         }"#;
@@ -1200,7 +1270,8 @@ mod tests {
                 "contentHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
             }]
         }"#;
-        let diagnostics = parse_processor_response_json(response.as_bytes(), "graph", &[])
+        let request = processor_request(vec![processor_source("acme/application:main.doria", 20)]);
+        let diagnostics = parse_processor_response_json(response.as_bytes(), &request, &[])
             .expect_err("unsafe response must be rejected");
         assert!(diagnostics
             .iter()
@@ -1211,5 +1282,75 @@ mod tests {
         assert!(diagnostics.iter().any(|diagnostic| diagnostic
             .message
             .contains("missing required structured information")));
+    }
+
+    #[test]
+    fn processor_response_accepts_only_doria_source_outputs() {
+        let response = AttributeProcessorResponseV1 {
+            schema_version: ATTRIBUTE_PROCESSOR_SCHEMA_VERSION,
+            graph_fingerprint: "graph".to_string(),
+            diagnostics: Vec::new(),
+            generated_sources: ["Baton.toml", "Cargo.toml", "generated/program.bin"]
+                .into_iter()
+                .map(|relative_path| GeneratedSourceV1 {
+                    relative_path: relative_path.to_string(),
+                    generated_for: GeneratedForV1::Main,
+                    contents: String::new(),
+                    content_hash: crate::runtime_digest::sha256_hex(b""),
+                })
+                .collect(),
+        };
+
+        let diagnostics =
+            validate_processor_response(&response, &processor_request(Vec::new()), &[])
+                .expect_err("non-source processor outputs must be rejected");
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.message.contains("`.doria` source file"))
+                .count(),
+            3
+        );
+    }
+
+    #[test]
+    fn processor_diagnostic_labels_are_bounded_by_the_request_source_inventory() {
+        let response = AttributeProcessorResponseV1 {
+            schema_version: ATTRIBUTE_PROCESSOR_SCHEMA_VERSION,
+            graph_fingerprint: "graph".to_string(),
+            diagnostics: vec![ProcessorDiagnosticV1 {
+                code: "ROUTE001".to_string(),
+                title: "Invalid Route".to_string(),
+                severity: ProcessorDiagnosticSeverityV1::Error,
+                message: "invalid route".to_string(),
+                labels: vec![
+                    ProcessorDiagnosticLabelV1 {
+                        source: "made-up.doria".to_string(),
+                        byte_start: 0,
+                        byte_end: 1,
+                        message: "unknown source".to_string(),
+                    },
+                    ProcessorDiagnosticLabelV1 {
+                        source: "acme/application:main.doria".to_string(),
+                        byte_start: 5,
+                        byte_end: 11,
+                        message: "outside source".to_string(),
+                    },
+                ],
+                explanation: None,
+                help: None,
+            }],
+            generated_sources: Vec::new(),
+        };
+        let request = processor_request(vec![processor_source("acme/application:main.doria", 10)]);
+
+        let diagnostics = validate_processor_response(&response, &request, &[])
+            .expect_err("invented and out-of-bounds labels must be rejected");
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("unknown source `made-up.doria`")));
+        assert!(diagnostics.iter().any(|diagnostic| diagnostic
+            .message
+            .contains("label outside source `acme/application:main.doria`")));
     }
 }

@@ -237,17 +237,19 @@ Stage 32 defines strict Serde models for schema-version-1 processor requests and
 responses. Unknown fields and unknown schema versions are rejected.
 
 A request carries compiler and graph identity, processor package identity,
-selected target, attribute schemas, applications, typed values, and source
-location facts. Future Baton orchestration supplies processor selection and
-package identity; `doriac` does not parse `Baton.toml` or discover processors.
+selected target, the exact source inventory and byte lengths, attribute schemas,
+applications, typed values, and source location facts. Future Baton orchestration
+supplies processor selection and package identity; `doriac` does not parse
+`Baton.toml` or discover processors.
 
 A response may contain structured processor diagnostics and proposed UTF-8
-generated sources for `main` or `development`. Every response must answer the
-request graph fingerprint. Generated paths must be normalized package-relative
-paths and may not be absolute, drive-qualified, URLs, empty, dot paths,
-traversals, duplicates, case collisions, handwritten-source replacements,
-commands, binary artifacts, environment mutations, dependency edits, or
-manifest edits. Content hashes are verified.
+`.doria` sources for `main` or `development`. Every response must answer the
+request graph fingerprint. Diagnostic labels must name a source in that request
+and remain within its byte length. Generated paths must be normalized
+package-relative `.doria` paths and may not be absolute, drive-qualified, URLs,
+empty, dot paths, traversals, duplicates, case collisions, handwritten-source
+replacements, commands, binary artifacts, environment mutations, dependency
+edits, or manifest edits. Content hashes are verified.
 
 Processor diagnostics use processor-owned codes, Title Case titles, bounded
 structured fields, source-identified labels, and safe text. They cannot claim a
