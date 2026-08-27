@@ -4,6 +4,7 @@ pub mod backend;
 pub mod build_plan;
 pub mod builtins;
 mod checked_effects;
+pub use checked_effects::{CheckedEffectClass, CheckedEffectProfile};
 pub mod class_layout;
 pub mod codegen_cranelift;
 #[cfg(feature = "llvm-backend")]

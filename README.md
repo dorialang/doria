@@ -92,7 +92,7 @@ runtime access-check cost.
 - **One word, one meaning.** `use` imports. `uses` composes traits. `with` captures in closures. No keyword in Doria ever has two jobs.
 - **A standard library with one voice.** Type-specific operations live on companions such as `String::startsWith`, while cross-domain capabilities use fully worded free functions such as `read_line`. Each operation has one canonical spelling.
 - **Unicode text with explicit units.** `$text->length` counts what a reader sees as graphemes, `$text->byteLength` reports UTF-8 storage, and String search, slicing, casing, splitting, and padding use deterministic Unicode rules on every native backend.
-- **Honest defaults.** Booleans print as `true` and `false`. Integer overflow is an error, not a wraparound. Format strings are checked at compile time. Reusable callables declare checked errors with `throws`; the selected program entrypoint infers what escapes it. `try`/`catch` handling remains statically checked.
+- **Honest defaults.** Booleans print as `true` and `false`. Integer overflow is an error, not a wraparound. Format strings are checked at compile time. Reusable callables declare required checked errors with `throws`; canonical I/O failures propagate ambiently and remain catchable. The selected program entrypoint infers what escapes it, and `try`/`catch` handling remains statically checked.
 - **Small language, sharp edges filed off.** Where a familiar construct is a known footgun, Doria deliberately does the safer thing instead.
 - **Purpose-shaped collections.** Insertion-ordered dictionaries and sets sit
   beside ascending sorted variants, a min-first priority queue, and one deque
@@ -153,15 +153,19 @@ string $message = given {
 
 Base `do ... while` and control-flow `finally` are executable. `finally` attaches
 to `if`, `when`, `while`, and `do ... while`, runs once for each normal or
-structured exit, and preserves Doria's abort-only rule that fatal panic runs no
-cleanup.
+structured exit, and may propagate a checked Error. A failing finalizer replaces
+the pending nonfatal outcome and destroys any superseded owned payload exactly
+once; an outer catch may recover, while a sibling catch on the same `try` cannot.
+Fatal panic remains abort-only and runs no cleanup.
 
 Doria parses, checks, and executes explicit `Error` conformance, `throw`,
 source-ordered `throws`, and `try`/`catch`/`finally`. Handled errors use one
 backend-independent MIR and deterministic cleanup model across the interpreter,
 Cranelift, LLVM, and the PHP compatibility backend. Text, file, and standard-
-device I/O expose canonical checked errors under `Doria\Std\Io`; an Error that
-escapes `main` is reported as `R1000` after cleanup and exits with status 70.
+device I/O expose exactly the ambient checked errors
+`Doria\Std\Io\IoError` and `Doria\Std\Io\InvalidUtf8Error`. They do not
+require source `throws`, but remain exact and explicitly catchable. An Error
+that escapes `main` is reported as `R1000` after cleanup and exits with status 70.
 Fatal panic remains a distinct cleanup-free status-101 outcome.
 
 ## Tooling

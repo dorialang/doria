@@ -102,7 +102,7 @@ $require($decisionPath, $decision, [
     'matches every checked error',
     'unable to match any',
     'protected effect are unreachable',
-    'No checked error may escape finally',
+    'Decision 0123 supersedes the original restriction on throwing finalizers',
     'Cleanup is not transactional',
     'ordinary `__destruct` does not run',
     'StructuredExitKind::CheckedError',
@@ -119,7 +119,7 @@ $require($decisionPath, $decision, [
     'pre-Stage-30 closure grammar slice is complete',
     'checked indirect calls reuse',
     'debug interpreter, Cranelift, LLVM, and PHP',
-    'Stages 30 and 31 are complete; Stage 32 is next',
+    '30 and 31 and the Decision 0123 corrective beat are complete; Stage 32 is next',
 ]);
 
 foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
@@ -216,7 +216,8 @@ $require($semanticsPath, $semantics, [
     'Duplicate Catch',
     'Catch After Error Is Unreachable',
     'Catch Cannot Match An Error From This Try',
-    'Checked Error Cannot Escape Finally',
+    'ambient_effect_seed',
+    'callable_observed_checked_effects',
     'Constant Initializer Cannot Throw',
     'Static Initializer Cannot Throw',
     'Implicit Constructor Cannot Hide A Throwing Initializer',
@@ -256,7 +257,9 @@ $require($validationPath, $validation, [
 ]);
 $require($phpPath, $php, [
     'final class __DoriaCheckedError extends Exception',
-    'public __DoriaErrorDescriptor $descriptor',
+    'private bool $__doriaLive = true',
+    'public function takeError(): __DoriaErrorValue',
+    '__doria_drop_value($this->error)',
     '__doriaEnsureErrorOrigin',
     'catch (__DoriaCheckedError',
 ]);
@@ -266,7 +269,10 @@ $require($testsPath, $tests, [
     'direct_throw_requires_an_owned_explicit_error_value',
     'catches_subtract_only_protected_effects_and_catch_bodies_are_independent',
     'construction_effects_cannot_hide_in_initialization',
-    'checked_errors_cannot_escape_finally_or_static_initialization',
+    'checked_errors_escape_finally_but_not_static_initialization',
+    'canonical_io_is_ambient_in_source_but_retained_in_hir_and_mir',
+    'fallible_finalizers_escape_same_try_catches_and_reach_outer_catches',
+    'finalizer_error_replaces_pending_return_and_earlier_error',
     'checked_error_scopes_and_optional_bindings_follow_lexical_blocks',
     'stage29_slice3_executes_handled_and_escaping_main_errors',
     'nonthrowing programs must remain executable',

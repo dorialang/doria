@@ -206,18 +206,42 @@ pub fn validate_reserved_identities(program: &Program) -> DiagnosticResult<()> {
 /// Returns whether executable source syntax needs the compiler-known I/O family.
 ///
 /// The central name resolver owns canonical type identity. This narrow token
-/// pass exists only for `echo` and compiler intrinsics whose checked effects
-/// require the synthetic semantic declarations.
+/// pass covers I/O operations and structural callable syntax. Structural
+/// callables use one ambient-capable indirect ABI even when a particular value
+/// is ambient-free, so their MIR profiles also need the canonical descriptors.
 pub fn source_uses_io_intrinsics(source: &SourceFile) -> DiagnosticResult<bool> {
     let tokens = Lexer::new(source).lex()?;
-    Ok(tokens.iter().any(|token| {
-        matches!(token.kind, TokenKind::Echo)
+    Ok(tokens.iter().enumerate().any(|(index, token)| {
+        matches!(token.kind, TokenKind::Echo | TokenKind::Fn)
+            || starts_structural_function_type(&tokens, index)
             || match &token.kind {
                 TokenKind::Identifier(name) => crate::builtins::Builtin::from_name(name)
                     .is_some_and(|builtin| !builtin.checked_error_types().is_empty()),
                 _ => false,
             }
     }))
+}
+
+fn starts_structural_function_type(tokens: &[crate::lexer::Token], index: usize) -> bool {
+    if !tokens
+        .get(index)
+        .is_some_and(|token| matches!(token.kind, TokenKind::Function))
+    {
+        return false;
+    }
+    let next = index + 1;
+    if tokens
+        .get(next)
+        .is_some_and(|token| matches!(token.kind, TokenKind::LeftParen))
+    {
+        return true;
+    }
+    matches!(
+        tokens.get(next).map(|token| &token.kind),
+        Some(TokenKind::Writable | TokenKind::Once | TokenKind::Take | TokenKind::Readonly)
+    ) && tokens
+        .get(next + 1)
+        .is_some_and(|token| matches!(token.kind, TokenKind::LeftParen))
 }
 
 pub fn resolved_facts_use_canonical_io(facts: &GlobalSymbolFacts) -> bool {
@@ -383,4 +407,33 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
         })],
         span,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_uses_io_intrinsics;
+    use crate::source::SourceFile;
+
+    #[test]
+    fn structural_callable_syntax_requests_canonical_io_transport_symbols() {
+        for source in [
+            "function invoke(function(): void $callback): void {}",
+            "function invoke(function writable(): void $callback): void {}",
+            "function invoke(function once(): void $callback): void {}",
+            "function main(): void { let $callback = function (): void {}; }",
+            "function main(): void { let $callback = fn() => 1; }",
+        ] {
+            assert!(
+                source_uses_io_intrinsics(&SourceFile::new("callable.doria", source))
+                    .expect("callable source should lex"),
+                "{source}"
+            );
+        }
+
+        assert!(!source_uses_io_intrinsics(&SourceFile::new(
+            "plain.doria",
+            "function helper(): void {}"
+        ))
+        .expect("plain function source should lex"));
+    }
 }

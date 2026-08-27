@@ -534,10 +534,11 @@ class Implicit {{ string $value = value(); }}
 }
 
 #[test]
-fn checked_errors_cannot_escape_finally_or_static_initialization() {
+fn checked_errors_escape_finally_but_not_static_initialization() {
     let failure = error_class("Failure");
-    assert_code(
-        &format!(
+    doriac::check_source(
+        "checked_error.doria",
+        format!(
             r#"
 {failure}
 function f(): void throws Failure
@@ -546,17 +547,18 @@ function f(): void throws Failure
 }}
 "#
         ),
-        "E0632",
-    );
-    assert_code(
+    )
+    .expect("a checked Error may escape a finalizer through its callable contract");
+    doriac::check_source(
+        "checked_error.doria",
         r#"
-function main(): void throws Doria\Std\Io\IoError
+function main(): void
 {
     if (true) {} finally { echo "cleanup"; }
 }
 "#,
-        "E0632",
-    );
+    )
+    .expect("ambient I/O may propagate from a finalizer without source boilerplate");
     assert_code(
         &format!(
             r#"
@@ -1223,4 +1225,543 @@ fn ide_analysis_uses_the_compiler_known_io_pipeline_without_exposing_synthetic_i
         1,
         "synthetic declarations stay compiler-owned"
     );
+}
+
+#[test]
+fn canonical_io_is_ambient_in_source_but_retained_in_hir_and_mir() {
+    let source = r#"
+function writeMessage(string $message): void
+{
+    echo $message;
+}
+
+function forward(string $message): void
+{
+    writeMessage($message);
+}
+
+function main(): void
+{
+    forward("ambient");
+}
+"#;
+
+    doriac::check_source("ambient_io.doria", source)
+        .expect("canonical I/O must not create a source throws obligation");
+    let hir = doriac::lower_source("ambient_io.doria", source)
+        .expect("ambient I/O should retain a runtime profile in HIR");
+    for name in ["writeMessage", "forward", "main"] {
+        let function = hir.items.iter().find_map(|item| match item {
+            hir::Item::Function(function) if function.name == name => Some(function),
+            _ => None,
+        });
+        let function = function.unwrap_or_else(|| panic!("{name} should exist in HIR"));
+        assert!(function.required_checked_effects.is_empty());
+        assert_eq!(
+            function
+                .ambient_checked_effects
+                .iter()
+                .map(|effect| match effect {
+                    doriac::types::ResolvedType::Class(class) => class.name.clone(),
+                    other => panic!("expected concrete ambient Error, got {other:?}"),
+                })
+                .collect::<Vec<_>>(),
+            ["Doria\\Std\\Io\\IoError"]
+        );
+        assert_eq!(function.checked_effects.len(), 1);
+    }
+
+    let mir = doriac::lower_source_to_mir("ambient_io.doria", source)
+        .expect("ambient I/O should retain checked transport in MIR");
+    for name in ["writeMessage", "forward", "main"] {
+        let function = mir
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("{name} should exist in MIR"));
+        assert!(function.required_checked_effects.is_empty());
+        assert_eq!(function.ambient_checked_effects.len(), 1);
+        assert_eq!(function.checked_effects, function.ambient_checked_effects);
+    }
+}
+
+#[test]
+fn ambient_effect_fixpoint_preserves_catch_coverage_through_call_chains() {
+    let source = r#"
+function writeMessage(): void
+{
+    echo "handled";
+}
+
+function recover(): void
+{
+    try {
+        writeMessage();
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
+function forward(): void
+{
+    recover();
+}
+
+function main(): void
+{
+    forward();
+}
+"#;
+
+    let hir = doriac::lower_source("ambient_catch_fixpoint.doria", source)
+        .expect("a locally caught ambient effect must not escape its callable");
+    let ambient_count = |name: &str| {
+        hir.items
+            .iter()
+            .find_map(|item| match item {
+                hir::Item::Function(function) if function.name == name => {
+                    Some(function.ambient_checked_effects.len())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} should exist in HIR"))
+    };
+    assert_eq!(ambient_count("writeMessage"), 1);
+    assert_eq!(ambient_count("recover"), 0);
+    assert_eq!(ambient_count("forward"), 0);
+    assert_eq!(ambient_count("main"), 0);
+
+    let unreachable = source.replace(
+        "forward();\n}",
+        "try { forward(); } catch (Doria\\Std\\Io\\IoError) {}\n}",
+    );
+    let diagnostics = doriac::check_source("ambient_catch_unreachable.doria", &unreachable)
+        .expect_err("a caller cannot catch an ambient effect already handled by its callee");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0629"));
+}
+
+#[test]
+fn ambient_property_initializers_use_the_implicit_constructor_transport() {
+    let source = r#"
+function initialValue(): string
+{
+    echo "init";
+    return "ready";
+}
+
+class Report
+{
+    string $value = initialValue();
+}
+
+function main(): void
+{
+    let $report = new Report();
+}
+"#;
+
+    let program = doriac::lower_source_to_mir("ambient_implicit_constructor.doria", source)
+        .expect("ambient-only property initialization must not require a boilerplate constructor");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("the implicit constructor must retain ambient checked transport");
+    assert_eq!(output.stdout, b"init");
+    assert_eq!(output.exit_status, 0);
+}
+
+#[test]
+fn top_level_ambient_effects_do_not_create_source_obligations() {
+    let source = r#"
+echo "direct";
+
+function writeMessage(string $message): void
+{
+    echo $message;
+}
+
+writeMessage("helper");
+
+let $callback = function (): void {
+    echo "closure";
+};
+$callback();
+"#;
+
+    doriac::check_source("top_level_ambient.doria", source)
+        .expect("top-level ambient I/O remains runtime-checked without source boilerplate");
+}
+
+#[test]
+fn top_level_nonambient_effects_still_require_handling() {
+    let source = format!(
+        r#"
+{}
+
+function fail(): void throws Failure
+{{
+    throw new Failure("required");
+}}
+
+fail();
+"#,
+        error_class("Failure")
+    );
+
+    let diagnostics = doriac::check_source("top_level_required.doria", source)
+        .expect_err("top-level required errors still need an explicit handling boundary");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0630" && diagnostic.message.contains("`Failure`")
+    }));
+}
+
+#[test]
+fn only_exact_compiler_known_io_errors_are_ambient() {
+    let source = format!(
+        r#"
+{}
+function fail(): void {{ throw new IoError("user"); }}
+function main(): void {{}}
+"#,
+        error_class("IoError")
+    );
+    let diagnostics = doriac::check_source("user_io_error.doria", source)
+        .expect_err("a user class with the short IoError spelling is still required");
+    assert!(diagnostics.iter().any(|diagnostic| {
+        diagnostic.code == "E0631" && diagnostic.message.contains("`IoError`")
+    }));
+
+    doriac::check_source(
+        "explicit_ambient.doria",
+        r#"
+function helper(): void throws Doria\Std\Io\IoError
+{
+    echo "explicit";
+}
+function main(): void { helper(); }
+"#,
+    )
+    .expect("an explicitly authored ambient throws entry remains accepted");
+}
+
+#[test]
+fn structural_callables_ignore_ambient_identity_but_keep_ambient_transport() {
+    let source = r#"
+function invoke(function(): void $callback): void
+{
+    $callback();
+}
+
+function main(): void
+{
+    function(): void throws Doria\Std\Io\IoError $callback = function (): void {
+        echo "closure";
+    };
+    invoke($callback);
+}
+"#;
+    doriac::check_source("ambient_closure.doria", source)
+        .expect("ambient-only function types have the ordinary structural identity");
+    let mir = doriac::lower_source_to_mir("ambient_closure.doria", source)
+        .expect("ambient callable values need a checked runtime route");
+    assert!(mir
+        .function_types
+        .iter()
+        .all(doriac::mir::FunctionType::has_checked_transport));
+    assert!(mir
+        .function_types
+        .iter()
+        .all(|function| function.checked_effects.is_empty()));
+    assert!(mir
+        .function_types
+        .iter()
+        .all(|function| function.ambient_checked_effects.len() == 2));
+}
+
+#[test]
+fn every_structural_invocation_mode_receives_ambient_transport_without_source_effects() {
+    for (name, source) in [
+        (
+            "readonly",
+            "function accept(function(): void $callback): void {}",
+        ),
+        (
+            "writable",
+            "function accept(function writable(): void $callback): void {}",
+        ),
+        (
+            "once",
+            "function accept(function once(): void $callback): void {}",
+        ),
+    ] {
+        doriac::check_source(format!("{name}_function_type.doria"), source)
+            .unwrap_or_else(|diagnostics| panic!("{name}: {diagnostics:#?}"));
+    }
+}
+
+#[test]
+fn fallible_finalizers_escape_same_try_catches_and_reach_outer_catches() {
+    let source = format!(
+        r#"
+{}
+
+function failCleanup(): void throws CleanupError
+{{
+    throw new CleanupError("cleanup");
+}}
+
+function main(): void
+{{
+    try {{
+        try {{
+            if (false) {{ failCleanup(); }}
+            echo "body ";
+        }} catch (CleanupError) {{
+            echo "wrong ";
+        }} finally {{
+            failCleanup();
+        }}
+    }} catch (CleanupError $error) {{
+        echo "outer {{$error->message}}";
+    }}
+}}
+"#,
+        error_class("CleanupError")
+    );
+
+    let program = doriac::lower_source_to_mir("fallible_finally.doria", &source)
+        .expect("a finalizer Error may flow to an outer catch");
+    let interpreted = doriac::mir_interpreter::interpret(&program)
+        .expect("fallible finalizer source should execute");
+    assert_eq!(interpreted.stdout, b"body outer cleanup");
+    assert_eq!(interpreted.exit_status, 0);
+}
+
+#[test]
+fn finalizer_error_replaces_pending_return_and_earlier_error() {
+    let source = format!(
+        r#"
+{}
+{}
+
+function returnThenFail(): int throws FinalError
+{{
+    try {{
+        return 42;
+    }} finally {{
+        throw new FinalError("return replaced");
+    }}
+}}
+
+function failTwice(): void throws FirstError, FinalError
+{{
+    try {{
+        throw new FirstError("first");
+    }} finally {{
+        throw new FinalError("error replaced");
+    }}
+}}
+
+function main(): void
+{{
+    try {{ int $value = returnThenFail(); }} catch (FinalError $error) {{ echo "{{$error->message}} "; }}
+    try {{ failTwice(); }} catch (FinalError $error) {{ echo $error->message; }}
+}}
+"#,
+        error_class("FirstError"),
+        error_class("FinalError")
+    );
+
+    let program = doriac::lower_source_to_mir("finalizer_precedence.doria", &source)
+        .expect("finalizer replacement must be represented in MIR");
+    let replacements = program
+        .functions
+        .iter()
+        .flat_map(|function| &function.blocks)
+        .flat_map(|block| &block.statements)
+        .filter_map(|statement| match statement {
+            doriac::mir::Statement::ControlFlowPlan(doriac::mir::ControlFlowPlan::Finalizer(
+                plan,
+            )) => Some(plan),
+            _ => None,
+        })
+        .flat_map(|plan| &plan.replacements)
+        .count();
+    assert!(
+        replacements >= 2,
+        "both finalizers should carry replacement plans"
+    );
+
+    let interpreted = doriac::mir_interpreter::interpret(&program)
+        .expect("finalizer replacement should execute through shared MIR");
+    assert_eq!(interpreted.stdout, b"return replaced error replaced");
+    assert_eq!(interpreted.exit_status, 0);
+}
+
+#[test]
+fn every_canonical_io_builtin_is_ambient_at_the_source_boundary() {
+    let source = r#"
+class Device
+{
+    string $label = marker();
+
+    function __construct()
+    {
+        printf("constructed");
+    }
+}
+
+function marker(): string
+{
+    write_stderr("marker");
+    return "device";
+}
+
+function textIo(string $path): void
+{
+    ?string $line = read_line();
+    string $contents = read_file($path);
+    write_file($path, $contents);
+    append_file($path, $line ?? "");
+}
+
+function byteIo(string $path): void
+{
+    Bytes $stdin = read_stdin_bytes();
+    Bytes $file = read_file_bytes($path);
+    write_file_bytes($path, $stdin);
+    append_file_bytes($path, $file);
+    write_stdout_bytes($stdin);
+    write_stderr_bytes($file);
+}
+
+function main(): void
+{
+    let $device = new Device();
+}
+"#;
+
+    doriac::check_source("ambient_builtins.doria", source)
+        .expect("canonical I/O must not require source throws clauses");
+    let hir = doriac::lower_source("ambient_builtins.doria", source)
+        .expect("canonical I/O profiles should lower to HIR");
+    for name in ["marker", "textIo", "byteIo", "main"] {
+        let function = hir.items.iter().find_map(|item| match item {
+            hir::Item::Function(function) if function.name == name => Some(function),
+            _ => None,
+        });
+        let function = function.unwrap_or_else(|| panic!("{name} should exist in HIR"));
+        assert!(function.required_checked_effects.is_empty(), "{name}");
+        assert!(!function.ambient_checked_effects.is_empty(), "{name}");
+        assert_eq!(
+            function.checked_effects, function.ambient_checked_effects,
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn ambient_catches_aliases_and_required_contracts_remain_exact() {
+    doriac::check_source(
+        "ambient_catches.doria",
+        r#"
+use Doria\Std\Io\IoError as OutputError;
+
+function recover(): void
+{
+    try { echo "value"; } catch (OutputError) {}
+    try { read_file("missing"); } catch (Error) {}
+}
+
+function main(): void { recover(); }
+"#,
+    )
+    .expect("ambient effects must remain visible to exact and broad catches");
+
+    let source = format!(
+        r#"
+{}
+
+function fail(): void
+{{
+    echo "before";
+    throw new StorageError("failed");
+}}
+
+function main(): void {{}}
+"#,
+        error_class("StorageError")
+    );
+    let diagnostics = doriac::check_source("required_plus_ambient.doria", source)
+        .expect_err("the nonambient StorageError still requires a contract");
+    let contract = diagnostics
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0631")
+        .expect("missing required-effect diagnostic");
+    assert!(contract.message.contains("StorageError"));
+    assert!(!contract.message.contains("Doria\\Std\\Io\\IoError"));
+    assert!(!contract.message.contains("InvalidUtf8Error"));
+
+    doriac::check_source(
+        "explicit_mixed_contract.doria",
+        format!(
+            r#"
+{}
+function fail(): void throws Doria\Std\Io\IoError, StorageError
+{{
+    echo "before";
+    throw new StorageError("failed");
+}}
+function main(): void {{ try {{ fail(); }} catch (StorageError) {{}} }}
+"#,
+            error_class("StorageError")
+        ),
+    )
+    .expect("explicit ambient entries and required entries may coexist");
+
+    let broad = doriac::check_source(
+        "broad_error.doria",
+        r#"
+function broad(): void throws Error {}
+function caller(): void { broad(); }
+function main(): void {}
+"#,
+    )
+    .expect_err("the broad Error contract must never become ambient");
+    assert!(broad.iter().any(|diagnostic| {
+        diagnostic.code == "E0631" && diagnostic.message.contains("`Error`")
+    }));
+}
+
+#[test]
+fn ambient_io_does_not_relax_destructor_or_static_initializer_boundaries() {
+    let destructor = doriac::check_source(
+        "ambient_destructor.doria",
+        r#"
+class Device
+{
+    function __destruct() { echo "closing"; }
+}
+function main(): void {}
+"#,
+    )
+    .expect_err("destructors must still absorb every checked runtime effect");
+    assert!(destructor
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0631"));
+    assert!(destructor
+        .iter()
+        .all(|diagnostic| diagnostic.code != "E0632"));
+
+    let initializer = doriac::check_source(
+        "ambient_static.doria",
+        r#"
+function marker(): string { echo "marker"; return "value"; }
+class Device { static string $label = marker(); }
+function main(): void {}
+"#,
+    )
+    .expect_err("static initialization remains nonthrowing");
+    assert!(initializer
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0634"));
 }

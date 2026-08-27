@@ -108,6 +108,86 @@ fn shared_validator_rejects_malformed_checked_error_metadata_and_origins() {
 }
 
 #[test]
+fn shared_validator_rejects_malformed_ambient_profiles_and_finalizer_replacement() {
+    let ambient = doriac::lower_source_to_mir(
+        "ambient-profile.doria",
+        r#"
+function helper(): void { echo "ambient"; }
+function main(): void { helper(); }
+"#,
+    )
+    .expect("valid ambient source should lower");
+
+    let mut duplicate_ambient = ambient.clone();
+    let helper = duplicate_ambient
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "helper")
+        .expect("helper should exist");
+    helper
+        .ambient_checked_effects
+        .push(helper.ambient_checked_effects[0]);
+    assert_malformed(
+        &duplicate_ambient,
+        "checked effect set contains a duplicate",
+    );
+
+    let mut incomplete_profile = ambient;
+    let helper = incomplete_profile
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "helper")
+        .expect("helper should exist");
+    helper.checked_effects.clear();
+    assert_malformed(
+        &incomplete_profile,
+        "complete checked effects are not required union ambient",
+    );
+
+    let finalizer = doriac::lower_source_to_mir(
+        "finalizer-replacement.doria",
+        r#"
+class CleanupError implements Error
+{
+    function __construct(string $message) {}
+}
+class Payload {}
+
+function value(): Payload throws CleanupError
+{
+    try { return new Payload(); } finally { throw new CleanupError("cleanup"); }
+}
+
+function main(): void
+{
+    try { let $unused = value(); } catch (CleanupError) {}
+}
+"#,
+    )
+    .expect("valid finalizer replacement source should lower");
+    let mut missing_drop = finalizer;
+    let case = missing_drop
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(mir::ControlFlowPlan::Finalizer(plan)) => plan
+                .replacements
+                .iter_mut()
+                .flat_map(|replacement| &mut replacement.cases)
+                .find(|case| case.dropped_payload.is_some()),
+            _ => None,
+        })
+        .expect("return replacement should carry a pending payload plan");
+    case.dropped_payload = None;
+    assert_malformed(
+        &missing_drop,
+        "disagrees with the pending payload drop plan",
+    );
+}
+
+#[test]
 fn shared_validator_rejects_malformed_checked_calls_catches_and_carrier_ownership() {
     let source = include_str!("../../../examples/native/main_checked_error_catch.doria");
     let valid = doriac::lower_source_to_mir("checked-error-edges.doria", source)
@@ -224,6 +304,8 @@ fn shared_validator_rejects_malformed_checked_calls_catches_and_carrier_ownershi
         .iter_mut()
         .find(|function| function.name == "fail")
         .expect("fail should exist");
+    fail.required_checked_effects.clear();
+    fail.ambient_checked_effects.clear();
     fail.checked_effects.clear();
     assert_malformed(
         &nonthrowing_propagation,
@@ -1826,6 +1908,8 @@ fn shared_validator_rejects_mixed_width_float_binary_operands() {
         parameter_modes: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: Vec::new(),
         blocks: vec![BasicBlock {
@@ -1947,6 +2031,8 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
         parameter_modes: Vec::new(),
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![Local {
             id: LocalId(0),
@@ -2867,6 +2953,8 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
             parameter_modes: vec![FunctionParameterMode::Readonly],
             return_type: ReturnType::Value(Type::String),
             return_borrow: None,
+            required_checked_effects: Vec::new(),
+            ambient_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: vec![parameter],
             blocks: vec![BasicBlock {
@@ -2967,6 +3055,8 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
         parameter_modes: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(1))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(1))],
         blocks: vec![BasicBlock {
@@ -3020,6 +3110,8 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -3099,6 +3191,8 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0)), borrowed_child],
         blocks: vec![BasicBlock {
@@ -3154,6 +3248,8 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![borrowed, class_local(1, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3199,6 +3295,8 @@ fn shared_validator_enforces_writable_class_argument_rules() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![parameter],
         blocks: vec![BasicBlock {
@@ -3284,6 +3382,8 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::String),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3309,6 +3409,8 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![
             Local {
@@ -3403,6 +3505,8 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Bool)),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3427,6 +3531,8 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3447,6 +3553,8 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3503,6 +3611,8 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![
             borrowed,
@@ -3533,6 +3643,8 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::String),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -3606,6 +3718,8 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![
             class_local(0, ClassId(0)),
@@ -3709,6 +3823,8 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Scalar(ScalarType::Integer(IntegerType::Int64))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![writable],
         blocks: vec![BasicBlock {
@@ -3863,6 +3979,8 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -4034,6 +4152,8 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Class(ClassId(1))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(1))],
         blocks: vec![BasicBlock {
@@ -4108,6 +4228,8 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -4396,6 +4518,8 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![receiver, condition],
         blocks: vec![
@@ -4770,6 +4894,8 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::String),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![parameter],
         blocks: vec![BasicBlock {
@@ -4967,6 +5093,8 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(99))],
         blocks: vec![BasicBlock {
@@ -4992,6 +5120,8 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         parameter_modes: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(99))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![],
         blocks: vec![BasicBlock {
@@ -5023,6 +5153,8 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![receiver],
         blocks: vec![BasicBlock {
@@ -5087,6 +5219,8 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![borrowed],
         blocks: vec![BasicBlock {
@@ -5130,6 +5264,8 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -5161,6 +5297,8 @@ fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -5223,6 +5361,8 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -5250,6 +5390,8 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -5306,6 +5448,8 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0)), class_local(1, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -5418,6 +5562,8 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
         parameter_modes: vec![],
         return_type: ReturnType::Value(Type::Class(ClassId(0))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![class_local(0, ClassId(0))],
         blocks: vec![BasicBlock {
@@ -5536,6 +5682,8 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -5638,6 +5786,8 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::SharedReference(ClassId(1))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![Local {
             id: LocalId(0),
@@ -5720,6 +5870,8 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Value(Type::NullableSharedReference(ClassId(1))),
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![Local {
             id: LocalId(0),
@@ -5850,6 +6002,8 @@ fn valid_void_program() -> Program {
             parameter_modes: Vec::new(),
             return_type: ReturnType::Void,
             return_borrow: None,
+            required_checked_effects: Vec::new(),
+            ambient_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: Vec::new(),
             blocks: vec![BasicBlock {
@@ -5950,6 +6104,8 @@ fn class_new_program() -> Program {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -6021,6 +6177,8 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         ],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![
             borrowed_class_local(0, ClassId(0)),
@@ -6044,6 +6202,8 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         parameter_modes: vec![FunctionParameterMode::Readonly],
         return_type: ReturnType::Void,
         return_borrow: None,
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: vec![borrowed_class_local(0, ClassId(1))],
         blocks: vec![BasicBlock {

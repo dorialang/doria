@@ -35,7 +35,7 @@ impl NativeCallableSignaturePlan {
     pub fn indirect(function: &mir::FunctionType) -> Self {
         Self::new(
             function.return_type,
-            !function.checked_effects.is_empty(),
+            function.has_checked_transport(),
             function.return_borrow,
             true,
         )
@@ -396,6 +396,7 @@ mod tests {
             parameters: vec![],
             return_type: mir::ReturnType::Value(mir::Type::Function(mir::FunctionTypeId(1))),
             checked_effects: vec![mir::CheckedEffect::Any],
+            ambient_checked_effects: vec![],
             return_borrow: Some(mir::ReturnBorrow {
                 source: mir::BorrowSource::Parameter(0),
                 writable: false,
@@ -423,6 +424,7 @@ mod tests {
             }],
             return_type: mir::ReturnType::Value(mir::Type::Function(mir::FunctionTypeId(0))),
             checked_effects: vec![],
+            ambient_checked_effects: vec![],
             return_borrow: None,
         };
         let nested_plan = NativeCallableSignaturePlan::indirect(&nested);

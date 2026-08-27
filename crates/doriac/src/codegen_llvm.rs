@@ -554,7 +554,7 @@ fn function_type<'ctx>(
         .iter()
         .map(|_| pointer.into())
         .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
-    let checked = !function.checked_effects.is_empty();
+    let checked = signature_plan.checked;
     for (index, parameter) in function.params.iter().enumerate() {
         let local = local_in(function, *parameter)?;
         let passed_by_pointer = (function.closure.is_some()
@@ -596,7 +596,7 @@ fn indirect_function_type<'ctx>(
         .iter()
         .map(|_| pointer.into())
         .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
-    let checked = !function.checked_effects.is_empty();
+    let checked = signature_plan.checked;
     for parameter in &function.parameters {
         let passed_by_pointer = parameter.mode == mir::FunctionParameterMode::Writable
             || matches!(
@@ -2536,7 +2536,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<(), BackendError> {
         self.set_active_panic_site(span)?;
         let function_type = function_type_in(self.program, function_type_id)?.clone();
-        if !function_type.checked_effects.is_empty() {
+        if function_type.has_checked_transport() {
             return Err(malformed_mir(
                 "throwing function type reached nonthrowing indirect call",
             ));
@@ -2603,7 +2603,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<(), BackendError> {
         self.set_active_panic_site(span)?;
         let function_type = function_type_in(self.program, function_type_id)?.clone();
-        if function_type.checked_effects.is_empty() {
+        if !function_type.has_checked_transport() {
             return Err(malformed_mir(
                 "nonthrowing function type reached checked indirect call",
             ));

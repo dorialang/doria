@@ -1,0 +1,120 @@
+class FirstError implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+class FinalError implements Error
+{
+    function __construct(string $message)
+    {
+    }
+}
+
+function fail(string $message): void throws FinalError
+{
+    throw new FinalError($message);
+}
+
+function replaceNormal(): void throws FinalError
+{
+    if (true) {
+        echo "normal body ";
+    } finally {
+        fail("normal");
+    }
+}
+
+function replaceReturn(): int throws FinalError
+{
+    if (true) {
+        return 42;
+    } finally {
+        fail("return");
+    }
+    return 0;
+}
+
+function replaceWhen(): string throws FinalError
+{
+    return when (true): string {
+        return "selected";
+    } else {
+        return "other";
+    } finally {
+        fail("when");
+    };
+}
+
+function replaceBreak(): void throws FinalError
+{
+    while (true) {
+        if (true) {
+            break;
+        } finally {
+            fail("break");
+        }
+    }
+}
+
+function replaceContinue(): void throws FinalError
+{
+    let writable $running = true;
+    while ($running) {
+        if (true) {
+            $running = false;
+            continue;
+        } finally {
+            fail("continue");
+        }
+    }
+}
+
+function replaceError(): void throws FirstError, FinalError
+{
+    try {
+        throw new FirstError("first");
+    } finally {
+        fail("error");
+    }
+}
+
+function replaceNested(): void throws FirstError, FinalError
+{
+    if (true) {
+        try {
+            throw new FirstError("inner");
+        } finally {
+            fail("inner finalizer");
+        }
+    } finally {
+        fail("outer finalizer");
+    }
+}
+
+function preserveReturnWithLocalCatch(): int
+{
+    if (true) {
+        return 42;
+    } finally {
+        try {
+            fail("handled");
+        } catch (FinalError $error) {
+            echo "local {$error->message} ";
+        }
+    }
+    return 0;
+}
+
+function main(): void
+{
+    try { replaceNormal(); } catch (FinalError $error) { echo "{$error->message}\n"; }
+    try { int $value = replaceReturn(); } catch (FinalError $error) { echo "{$error->message}\n"; }
+    try { string $value = replaceWhen(); } catch (FinalError $error) { echo "{$error->message}\n"; }
+    try { replaceBreak(); } catch (FinalError $error) { echo "{$error->message}\n"; }
+    try { replaceContinue(); } catch (FinalError $error) { echo "{$error->message}\n"; }
+    try { replaceError(); } catch (FinalError $error) { echo "{$error->message}\n"; }
+    try { replaceNested(); } catch (FinalError $error) { echo "{$error->message}\n"; }
+    echo "return " . preserveReturnWithLocalCatch() . "\n";
+}

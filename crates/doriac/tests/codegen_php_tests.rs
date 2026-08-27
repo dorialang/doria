@@ -3,6 +3,15 @@ use doriac::hir;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+fn php_function_name(name: &str) -> String {
+    let encoded = name
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("__DoriaFunction_{encoded}")
+}
+
 #[test]
 fn emits_php_for_simple_program() {
     let php = doriac::compile_source_to_php(
@@ -58,7 +67,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -142,7 +151,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -232,7 +241,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -297,7 +306,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -348,7 +357,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     assert!(!php.contains("$value ??="));
 
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -399,7 +408,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     assert!(!php.contains("Vault::$label ="));
 
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -432,9 +441,10 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     .expect("PHP should lower grouped Copy declarations");
 
     assert!(php.contains("$__doria_grouped_value0 = \"user\";"));
+    let value_call = format!(" = {}();", php_function_name("value"));
     let temporary = php
         .lines()
-        .find(|line| line.trim().ends_with(" = value();"))
+        .find(|line| line.trim().ends_with(&value_call))
         .and_then(|line| line.trim().split_once(" = ").map(|(name, _)| name))
         .expect("grouped initializer temporary");
     assert_ne!(temporary, "$__doria_grouped_value0");
@@ -446,7 +456,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     assert!(!php.contains("$first = $second ="));
 
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -474,9 +484,10 @@ function sample(int $count = 1 + 2, float $ratio = 1.0 / 2.0, bool $ordered = 1 
     )
     .expect("const-evaluable Copy-scalar defaults should lower to PHP literals");
 
-    assert!(php.contains(
-        "function sample(int $count = 3, float $ratio = 0.5, bool $ordered = true): void"
-    ));
+    assert!(php.contains(&format!(
+        "function {}(int $count = 3, float $ratio = 0.5, bool $ordered = true): void",
+        php_function_name("sample")
+    )));
     assert!(!php.contains("$count = 1 + 2"));
     assert!(!php.contains("$ratio = fdiv("));
     assert!(!php.contains("$ordered = __doria_less("));
@@ -523,14 +534,17 @@ function main(): void throws Doria\Std\Io\IoError
     )
     .expect("defaulted cell parameters should lower to PHP");
 
-    assert!(php.contains("function invert(__DoriaCell|bool $value = false): bool"));
+    assert!(php.contains(&format!(
+        "function {}(__DoriaCell|bool $value = false): bool",
+        php_function_name("invert")
+    )));
     assert!(php.contains("public bool $value;"));
     assert!(php.contains("function __construct(__DoriaCell|bool $value = false)"));
     assert!(php.contains("if (!($value instanceof __DoriaCell))"));
     assert!(php.contains("$this->value = $value->value;"));
 
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -654,7 +668,7 @@ function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nexit(main());",
+        "{}\nexit(__DoriaFunction_6d61696e());",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -683,9 +697,15 @@ function identity(int64 $value): int64
     )
     .expect("the exact signed integer subset should remain supported by PHP");
 
-    assert!(php.contains("function isLess(int $left, int $right): bool"));
+    assert!(php.contains(&format!(
+        "function {}(int $left, int $right): bool",
+        php_function_name("isLess")
+    )));
     assert!(php.contains("return __doria_less($left, $right);"));
-    assert!(php.contains("function identity(int $value): int"));
+    assert!(php.contains(&format!(
+        "function {}(int $value): int",
+        php_function_name("identity")
+    )));
 }
 
 #[test]
@@ -828,7 +848,7 @@ function total(): float64
     )
     .expect("PHP should preserve default float arithmetic");
 
-    assert!(php.contains("function total(): float"));
+    assert!(php.contains(&format!("function {}(): float", php_function_name("total"))));
     assert!(php.contains("$value = 1.5 + 2.5;"));
     assert!(php.contains("$value += 1.0;"));
     assert!(!php.contains("float64"));
@@ -893,7 +913,10 @@ function identity(float32 $value): float32
 "#,
     )
     .expect("PHP can carry an already-quantized float32 value without arithmetic");
-    assert!(php.contains("function identity(float $value): float"));
+    assert!(php.contains(&format!(
+        "function {}(float $value): float",
+        php_function_name("identity")
+    )));
 
     let diagnostics = doriac::compile_source_to_php(
         "test.doria",
@@ -911,8 +934,14 @@ fn php_backend_constant_folds_exact_tests_on_concrete_numeric_types() {
         "function narrow(int $value): bool { return $value is int8; } function exact(int8 $value): bool { return $value is int8; }",
     )
     .expect("known concrete Doria types do not need PHP host-type inference");
-    assert!(php.contains("function narrow(int $value): bool\n{\n    return (false);"));
-    assert!(php.contains("function exact(int $value): bool\n{\n    return (true);"));
+    assert!(php.contains(&format!(
+        "function {}(int $value): bool\n{{\n    return (false);",
+        php_function_name("narrow")
+    )));
+    assert!(php.contains(&format!(
+        "function {}(int $value): bool\n{{\n    return (true);",
+        php_function_name("exact")
+    )));
 }
 
 #[test]
@@ -1052,10 +1081,60 @@ function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("function identity(int $value): int"));
+    assert!(php.contains(&format!(
+        "function {}(int $value): int",
+        php_function_name("identity")
+    )));
     assert!(php.contains("return $value;"));
-    assert!(php.contains("function main(): int"));
-    assert!(php.contains("return identity(42);"));
+    assert!(php.contains(&format!("function {}(): int", php_function_name("main"))));
+    assert!(php.contains(&format!("return {}(42);", php_function_name("identity"))));
+}
+
+#[test]
+fn php_backend_mangles_free_functions_away_from_the_host_global_namespace() {
+    let php = doriac::compile_source_to_php(
+        "host-function-collision.doria",
+        r#"
+function log(string $message): void
+{
+    echo "{$message}\n";
+}
+
+function main(): void
+{
+    log("Hello");
+}
+"#,
+    )
+    .expect("Doria function names may overlap PHP built-ins");
+
+    assert!(php.contains("function __DoriaFunction_6c6f67(string $message): void"));
+    assert!(php.contains("__DoriaFunction_6c6f67(\"Hello\")"));
+    assert!(!php.contains("function log("));
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\n__DoriaFunction_6d61696e();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated PHP should execute without redeclaring PHP's log function");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"Hello\n");
 }
 
 #[test]
@@ -1080,8 +1159,11 @@ function main(): int throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("function isAnswer(int $value): bool"));
-    assert!(php.contains("if (isAnswer(42))"));
+    assert!(php.contains(&format!(
+        "function {}(int $value): bool",
+        php_function_name("isAnswer")
+    )));
+    assert!(php.contains(&format!("if ({}(42))", php_function_name("isAnswer"))));
 }
 
 #[test]
@@ -1102,9 +1184,12 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("function greet(string $name): void"));
+    assert!(php.contains(&format!(
+        "function {}(string $name): void",
+        php_function_name("greet")
+    )));
     assert!(php.contains("__doria_display($name)"));
-    assert!(php.contains("greet(\"Doria\");"));
+    assert!(php.contains(&format!("{}(\"Doria\");", php_function_name("greet"))));
 }
 
 #[test]
@@ -1125,10 +1210,10 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("function hello(): void"));
+    assert!(php.contains(&format!("function {}(): void", php_function_name("hello"))));
     assert!(php.contains("__doria_write_stdout(__doria_display(\"Hello Doria!\"), "));
-    assert!(php.contains("function main(): void"));
-    assert!(php.contains("hello();"));
+    assert!(php.contains(&format!("function {}(): void", php_function_name("main"))));
+    assert!(php.contains(&format!("{}();", php_function_name("hello"))));
 }
 
 #[test]
@@ -1318,7 +1403,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -1423,7 +1508,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -1470,7 +1555,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("fatal panic inside finalizers should lower to PHP");
     let panic_script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         panic_php
             .strip_prefix("<?php")
             .expect("generated PHP header")
@@ -1551,7 +1636,7 @@ fn php_fatal_panic_bypasses_every_stage28a_finalizer_entry() {
         let php = doriac::compile_source_to_php(format!("{name}.doria"), source)
             .unwrap_or_else(|diagnostics| panic!("{name} should lower to PHP: {diagnostics:#?}"));
         let script = format!(
-            "{}\nmain();",
+            "{}\n__DoriaFunction_6d61696e();",
             php.strip_prefix("<?php").expect("generated PHP header")
         );
         let run = Command::new("php")
@@ -1689,10 +1774,10 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("compilation should succeed");
 
-    assert!(php.contains("function main(): void"));
+    assert!(php.contains(&format!("function {}(): void", php_function_name("main"))));
     assert!(php.contains("__doria_write_stdout(__doria_display(\"Hello Doria!\"), "));
     assert!(php.contains("return;"));
-    assert!(!php.contains("exit(main())"));
+    assert!(!php.contains("exit(__DoriaFunction_6d61696e())"));
 }
 
 #[test]
@@ -1727,7 +1812,10 @@ function main(): void throws Doria\Std\Io\IoError
     assert!(php.contains("$name__doria1 = __doria_display($name) . __doria_display(\" inner\");"));
     assert!(php.contains("__doria_display($name__doria1)"));
     assert!(php.contains("__doria_write_stdout(__doria_display($name), "));
-    assert!(php.contains("function greet(string $name): string"));
+    assert!(php.contains(&format!(
+        "function {}(string $name): string",
+        php_function_name("greet")
+    )));
     assert!(php.contains("$name__doria1 = \"inner\";"));
     assert!(php.contains("return $name__doria1;"));
     assert!(php.contains("return $name;"));
@@ -1836,7 +1924,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     }
 
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -1892,7 +1980,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     }
 
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -1939,7 +2027,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -2077,7 +2165,10 @@ fn allows_take_on_copy_parameters_in_php() {
     )
     .expect("take on a Copy value is a semantic no-op");
 
-    assert!(php.contains("function identity(int $value): int"));
+    assert!(php.contains(&format!(
+        "function {}(int $value): int",
+        php_function_name("identity")
+    )));
     assert!(!php.contains("take int"));
 }
 
@@ -2196,10 +2287,19 @@ function main(): void
 
     let php = doriac::compile_source_to_php("type-only-function.doria", source)
         .expect("type-only structural function syntax should remain PHP-lowerable");
-    assert!(php.contains("function accept(__DoriaFunctionValue $callback): void"));
+    assert!(php.contains(&format!(
+        "function {}(__DoriaFunctionValue $callback): void",
+        php_function_name("accept")
+    )));
     assert!(php.contains("interface __DoriaFunctionValue"));
-    assert!(!php.contains("function accept(callable $callback)"));
-    assert!(!php.contains("function accept(function $callback)"));
+    assert!(!php.contains(&format!(
+        "function {}(callable $callback)",
+        php_function_name("accept")
+    )));
+    assert!(!php.contains(&format!(
+        "function {}(function $callback)",
+        php_function_name("accept")
+    )));
 }
 
 #[test]
@@ -2408,7 +2508,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("prompted input should lower to PHP");
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let mut child = Command::new("php")
@@ -2458,7 +2558,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         let php = doriac::compile_source_to_php(format!("closed-{name}.doria"), &source)
             .expect("closed-pipe fixture should lower to PHP");
         let script = format!(
-            "{}\nmain();",
+            "{}\n__DoriaFunction_6d61696e();",
             php.strip_prefix("<?php").expect("generated PHP header")
         );
         let mut child = Command::new("php")
@@ -2497,7 +2597,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("closed prompt fixture should lower to PHP");
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let mut child = Command::new("php")
@@ -2536,7 +2636,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("panic fixture should lower to PHP");
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let mut child = Command::new("php")
@@ -2619,7 +2719,11 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
     )
     .expect("Stage 18 expression interpolation should lower to PHP");
 
-    assert!(php.contains("__doria_display(((left() === 20) && (right() === 22)))"));
+    assert!(php.contains(&format!(
+        "__doria_display((({}() === 20) && ({}() === 22)))",
+        php_function_name("left"),
+        php_function_name("right")
+    )));
 
     let Ok(version) = Command::new("php").arg("--version").output() else {
         return;
@@ -2628,7 +2732,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -2678,7 +2782,7 @@ fn php_backend_preserves_the_exact_displayable_contract() {
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -2791,7 +2895,7 @@ function main(): void throws Doria\Std\Io\IoError
     assert!(!php.contains("= Counter::$initial + 1"));
 
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -2889,7 +2993,7 @@ fn php_backend_moves_executable_instance_initializers_into_generated_constructor
 function seed(): int { return 42; }
 class Counter { int $value = seed(); }
 "#,
-            "$this->value = seed();",
+            format!("$this->value = {}();", php_function_name("seed")),
         ),
         (
             "construction-in-property.doria",
@@ -2897,7 +3001,7 @@ class Counter { int $value = seed(); }
 class Person {}
 class Office { Person $manager = new Person(); }
 "#,
-            "$this->manager = new Person();",
+            "$this->manager = new Person();".to_string(),
         ),
     ];
 
@@ -2906,7 +3010,7 @@ class Office { Person $manager = new Person(); }
             .expect("executable property defaults are valid Doria independently of PHP");
         let php = doriac::compile_source_to_php(path, source)
             .expect("the PHP backend should lower executable defaults into a constructor");
-        assert!(php.contains(expected_output), "generated PHP:\n{php}");
+        assert!(php.contains(&expected_output), "generated PHP:\n{php}");
     }
 }
 
@@ -2924,7 +3028,7 @@ fn php_backend_executes_constructor_rooted_and_owned_property_writes() {
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -3243,7 +3347,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")
@@ -3302,6 +3406,11 @@ fn php_backend_executes_checked_errors_with_doria_descriptor_dispatch() {
             include_str!("../../../examples/native/main_checked_error_constructor.doria"),
             "caught constructor\n",
         ),
+        (
+            "ambient-io-fallible-finalizers.doria",
+            include_str!("../../../examples/native/main_ambient_io_fallible_finalizers.doria"),
+            "normal body normal\nreturn\nwhen\nbreak\ncontinue\nerror\nouter finalizer\nlocal handled return 42\n",
+        ),
     ];
 
     let Ok(version) = Command::new("php").arg("--version").output() else {
@@ -3325,7 +3434,7 @@ fn php_backend_executes_checked_errors_with_doria_descriptor_dispatch() {
         assert!(!php.contains("instanceof BuildError"));
 
         let script = format!(
-            "{}\nmain();",
+            "{}\n__DoriaFunction_6d61696e();",
             php.strip_prefix("<?php").expect("generated PHP header")
         );
         let run = Command::new("php")
@@ -3352,6 +3461,113 @@ fn php_backend_executes_checked_errors_with_doria_descriptor_dispatch() {
             String::from_utf8_lossy(&run.stderr)
         );
     }
+}
+
+#[test]
+fn php_finalizer_replacements_drop_and_detach_superseded_errors() {
+    let source = r#"
+class FirstError implements Error
+{
+    function __construct(string $message) {}
+}
+
+class FinalError implements Error
+{
+    function __construct(string $message) {}
+}
+
+function failTwice(): void throws FirstError, FinalError
+{
+    try {
+        throw new FirstError("first");
+    } finally {
+        throw new FinalError("replacement");
+    }
+}
+
+function main(): void {}
+"#;
+    let php = doriac::compile_source_to_php("php-finalizer-replacement.doria", source)
+        .expect("fallible finalizer source should compile for PHP");
+    assert!(php.contains("__doria_detach_checked_error"));
+    let drop_previous = php
+        .find("$previous->dropError();")
+        .expect("the superseded carrier payload must be dropped explicitly");
+    let take_replacement = php
+        .find("$caught->takeError()")
+        .expect("the replacement payload must move into a detached carrier");
+    assert!(drop_previous < take_replacement);
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\ntry {{ __DoriaFunction_6661696c5477696365(); }} catch (__DoriaCheckedError $error) {{ echo $error->getPrevious() === null ? 'detached' : 'chained'; }}",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated replacement PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(stdout, "detached");
+    assert!(
+        run.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
+fn php_backend_preserves_ambient_effects_through_callbacks_and_list_algorithms() {
+    let source = include_str!("../../../examples/native/main_ambient_io_callbacks.doria");
+    let php = doriac::compile_source_to_php("ambient-io-callbacks.doria", source)
+        .expect("ambient callbacks should compile for PHP compatibility output");
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+
+    let script = format!(
+        "{}\n__DoriaFunction_6d61696e();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated ambient callback PHP should execute");
+
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout,
+        include_bytes!("fixtures/native_io/main_ambient_io_callbacks/expected_stdout")
+    );
+    assert!(
+        run.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
 }
 
 #[test]
@@ -3454,7 +3670,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         return;
     }
     let script = format!(
-        "{}\nmain();",
+        "{}\n__DoriaFunction_6d61696e();",
         php.strip_prefix("<?php").expect("generated PHP header")
     );
     let run = Command::new("php")

@@ -372,6 +372,71 @@ fn mir_validation_rejects_corrupt_traversal_results_and_checked_cleanup() {
 }
 
 #[test]
+fn ambient_list_callbacks_keep_checked_transport_and_validate_their_effect_profile() {
+    let source = r#"
+function main(): void
+{
+    List<int> $values = [1, 2];
+    List<int> $mapped = $values->map(function (int $value): int {
+        echo "{$value}";
+        return $value;
+    });
+}
+"#;
+    let program = doriac::lower_source_to_mir("stage30g-ambient.doria", source)
+        .expect("ambient List callback should lower");
+    let plan = algorithm_plans(&program)
+        .into_iter()
+        .find(|plan| plan.kind == ListAlgorithmKind::Map)
+        .expect("ambient map plan should exist");
+    assert!(plan.required_checked_effects.is_empty());
+    assert!(!plan.ambient_checked_effects.is_empty());
+    assert_eq!(plan.checked_effects, plan.ambient_checked_effects);
+    assert!(plan.callback_failure.is_some());
+    let callback = &program.function_types[plan.callback_type.0];
+    assert!(callback.checked_effects.is_empty());
+    assert_eq!(
+        callback.ambient_checked_effects,
+        plan.ambient_checked_effects
+    );
+    assert!(matches!(
+        program
+            .functions
+            .iter()
+            .flat_map(|function| &function.blocks)
+            .find(|block| block.id == plan.body)
+            .map(|block| &block.terminator),
+        Some(mir::Terminator::CheckedIndirectCall { .. })
+    ));
+    doriac::mir_validation::validate_program(&program)
+        .expect("ambient List callback MIR should validate");
+
+    let mut malformed = program;
+    let plan = malformed
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            Statement::ControlFlowPlan(ControlFlowPlan::ListAlgorithm(plan))
+                if plan.kind == ListAlgorithmKind::Map =>
+            {
+                Some(plan)
+            }
+            _ => None,
+        })
+        .expect("ambient map plan should exist");
+    plan.ambient_checked_effects.clear();
+    let error = doriac::mir_validation::validate_program(&malformed)
+        .expect_err("ambient profile loss must be rejected");
+    assert!(
+        error.message.contains("effect profile disagrees"),
+        "{}",
+        error.message
+    );
+}
+
+#[test]
 fn debug_interpreter_executes_shared_list_algorithm_cfg() {
     let output = doriac::compile_source_to_debug("stage30g.doria", valid_source())
         .expect("Stage 30g algorithms should execute through debug MIR");
@@ -473,7 +538,11 @@ function main(): void
         .expect("map should be explicit in HIR");
     assert_eq!(map.kind, hir::ListAlgorithmKind::Map);
     assert_eq!(map.callback_access, hir::ListCallbackAccess::Readonly);
-    assert_eq!(map.checked_effects.len(), 1);
+    assert_eq!(map.required_checked_effects.len(), 1);
+    assert_eq!(map.ambient_checked_effects.len(), 2);
+    let mut complete_effects = map.required_checked_effects.clone();
+    complete_effects.extend(map.ambient_checked_effects.iter().cloned());
+    assert_eq!(map.checked_effects, complete_effects);
     assert_eq!(
         map.result_type,
         doriac::types::ResolvedType::List(Box::new(doriac::types::ResolvedType::String))

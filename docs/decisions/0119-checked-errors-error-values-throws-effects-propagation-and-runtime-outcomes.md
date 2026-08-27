@@ -23,9 +23,12 @@ to define the language retrospectively.
 ## Plain-Language Model
 
 Recoverable failures are ordinary owned values implementing the compiler-known
-`Error` interface. Reusable callables declare every checked error that may
-escape with `throws`. The selected program entrypoint instead infers its exact
-escaping checked effects when the author omits that clause. `throw` transfers
+`Error` interface. Reusable callables declare every required checked error that
+may escape with `throws`. Decision 0123 classifies exactly
+`Doria\Std\Io\IoError` and `Doria\Std\Io\InvalidUtf8Error` as ambient: they do
+not create a source catch-or-declare obligation, although explicit declarations
+remain accepted and source-preserved. The selected program entrypoint infers its
+exact escaping checked effects when the author omits that clause. `throw` transfers
 an owned error into the propagation path. A caller must catch each possible
 error or declare it; source calls to `main` see its inferred effective contract
 and receive no exemption. Checked propagation performs required cleanup but
@@ -173,9 +176,12 @@ catches, every catch after `Error`, and catches proven unable to match any
 protected effect are unreachable. An open `Error` effect keeps concrete catches
 potentially reachable.
 
-An attached finally may contain throwing work only when nested handling absorbs
-every error. No checked error may escape finally and replace a pending return,
-yield, break, continue, normal completion, or checked error.
+Decision 0123 supersedes the original restriction on throwing finalizers. A
+checked Error may escape `finally`; it supersedes a pending return, `when`
+result, break, continue, normal completion, or earlier checked Error after the
+superseded owned payload is dropped exactly once. Same-try sibling catches do
+not cover finalizer effects. A catch nested inside the finalizer or an outer
+catch may handle them.
 
 ## Cleanup, Side Effects, And Failed Construction
 
@@ -249,8 +255,11 @@ Localized host prose is not public API; the optional platform code remains a
 typed fact.
 
 The compiler-owned built-in table is authoritative for I/O effects. `read_line`
-and `read_file` throw both concrete I/O Error types. Text and binary writes,
-`printf`, and `echo` throw `IoError`; `sprintf` remains nonthrowing. EOF is
+and `read_file` may produce both concrete I/O Error types. Text and binary
+writes, `printf`, and `echo` may produce `IoError`; `sprintf` remains
+nonthrowing. Decision 0123 makes exactly those two canonical Error identities
+ambient at the source boundary while retaining their exact HIR/MIR effects,
+checked transport, cleanup, catchability, and R1000 behavior. EOF is
 successful `null`, blank input is `""`, P1206/P1302 remain allocation panics,
 and P1401 through P1407 are historical identities with no ordinary valid route.
 
@@ -263,8 +272,10 @@ function main(): void
 }
 ```
 
-The compiler infers `Doria\Std\Io\IoError` as the effective entrypoint effect.
-Reusable I/O helpers still write that effect in their `throws` clauses.
+The compiler retains `Doria\Std\Io\IoError` as an effective ambient entrypoint
+effect. Reusable I/O helpers do not need to write either ambient identity in a
+`throws` clause. Explicit ambient declarations remain accepted and
+source-preserved.
 
 ## Unhandled `main` Outcome
 
@@ -349,12 +360,13 @@ function-type authority. Stages 30a through 30h are complete: valid closures
 lower through closure-aware HIR and structural MIR, checked indirect calls reuse
 this decision's Error model, and the debug interpreter, Cranelift, LLVM, and PHP
 compatibility backend execute the supported surface. List algorithm calls carry
-their callback's exact checked effects and use the same propagation and cleanup
-model. Stages 30 and 31 are complete; Stage 32 is next.
+their callback's required structural effects and complete runtime profile,
+including ambient I/O, through the same propagation and cleanup model. Stages
+30 and 31 and the Decision 0123 corrective beat are complete; Stage 32 is next.
 
 ## Explicit Exclusions
 
-Stage 29 does not implement general named-callable effect inference,
+Stage 29 does not implement general required named-callable effect inference,
 expression-position throw, bare rethrow, union catches, inheritance/interface
 catch matching, closure effects, namespaces, streams, PHP export conversion,
 native unwinding, reflection, or a second diagnostic/cleanup model. It also
@@ -366,8 +378,9 @@ does not synthesize AST syntax, invent omitted-clause spans, or imply
 
 - The compiler validates and executes handled checked-error programs while
   preserving their exact source-ordered contracts.
-- Reusable callables declare checked effects; the selected program entrypoint
-  infers escaping checked effects when its source clause is absent.
+- Reusable callables declare required checked effects; exact canonical ambient
+  I/O effects propagate automatically. The selected program entrypoint infers
+  escaping checked effects when its source clause is absent.
 - Backends cannot silently define or approximate checked-error semantics.
 - Ownership, cleanup, and diagnostics remain one language-wide model.
 - Stage 30 and Stage 35 must preserve effect-set substitution and extend the

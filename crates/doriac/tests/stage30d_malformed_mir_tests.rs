@@ -101,6 +101,49 @@ fn indirect_call_mut(program: &mut mir::Program) -> &mut Terminator {
         .expect("fixture should invoke a closure")
 }
 
+fn indirect_function_type_mut(terminator: &mut Terminator) -> &mut FunctionTypeId {
+    match terminator {
+        Terminator::IndirectCall { function_type, .. }
+        | Terminator::CheckedIndirectCall { function_type, .. } => function_type,
+        _ => unreachable!("fixture should invoke a closure"),
+    }
+}
+
+fn indirect_args_mut(terminator: &mut Terminator) -> &mut Vec<Rvalue> {
+    match terminator {
+        Terminator::IndirectCall { args, .. } | Terminator::CheckedIndirectCall { args, .. } => {
+            args
+        }
+        _ => unreachable!("fixture should invoke a closure"),
+    }
+}
+
+fn indirect_callee_and_mode_mut(
+    terminator: &mut Terminator,
+) -> (&mut FunctionExpression, &mut FunctionInvocationMode) {
+    match terminator {
+        Terminator::IndirectCall {
+            callee,
+            invocation_mode,
+            ..
+        }
+        | Terminator::CheckedIndirectCall {
+            callee,
+            invocation_mode,
+            ..
+        } => (callee, invocation_mode),
+        _ => unreachable!("fixture should invoke a closure"),
+    }
+}
+
+fn indirect_result_mut(terminator: &mut Terminator) -> &mut Option<mir::LocalId> {
+    match terminator {
+        Terminator::IndirectCall { result, .. }
+        | Terminator::CheckedIndirectCall { result, .. } => result,
+        _ => unreachable!("fixture should invoke a closure"),
+    }
+}
+
 #[test]
 fn rejects_malformed_function_type_and_descriptor_tables() {
     let valid = capturing_program();
@@ -289,32 +332,18 @@ fn rejects_malformed_indirect_call_plans() {
     let valid = capturing_program();
 
     let mut wrong_function_type = valid.clone();
-    let Terminator::IndirectCall { function_type, .. } =
-        indirect_call_mut(&mut wrong_function_type)
-    else {
-        unreachable!()
-    };
-    *function_type = FunctionTypeId(99);
+    *indirect_function_type_mut(indirect_call_mut(&mut wrong_function_type)) = FunctionTypeId(99);
     assert_malformed(&wrong_function_type, "function type#99 does not exist");
 
     let mut wrong_arity = valid.clone();
-    let Terminator::IndirectCall { args, .. } = indirect_call_mut(&mut wrong_arity) else {
-        unreachable!()
-    };
-    args.clear();
+    indirect_args_mut(indirect_call_mut(&mut wrong_arity)).clear();
     assert_malformed(&wrong_arity, "expects 1 arguments, got 0");
 
     let mut once_without_consumption = valid.clone();
     once_without_consumption.function_types[0].invocation_mode = FunctionInvocationMode::Once;
     once_without_consumption.closure_descriptors[0].invocation_mode = FunctionInvocationMode::Once;
-    let Terminator::IndirectCall {
-        callee,
-        invocation_mode,
-        ..
-    } = indirect_call_mut(&mut once_without_consumption)
-    else {
-        unreachable!()
-    };
+    let (callee, invocation_mode) =
+        indirect_callee_and_mode_mut(indirect_call_mut(&mut once_without_consumption));
     *invocation_mode = FunctionInvocationMode::Once;
     let FunctionExpression::Local { transfer, .. } = callee else {
         panic!("fixture should invoke a local carrier")
@@ -326,10 +355,7 @@ fn rejects_malformed_indirect_call_plans() {
     );
 
     let mut wrong_result_shape = valid.clone();
-    let Terminator::IndirectCall { result, .. } = indirect_call_mut(&mut wrong_result_shape) else {
-        unreachable!()
-    };
-    *result = None;
+    *indirect_result_mut(indirect_call_mut(&mut wrong_result_shape)) = None;
     assert_malformed(&wrong_result_shape, "wrong result-slot shape");
 }
 
@@ -343,6 +369,13 @@ fn rejects_checked_and_unchecked_indirect_call_mismatches() {
     checked_nonthrowing.function_types[0]
         .checked_effects
         .clear();
+    checked_nonthrowing.function_types[0]
+        .ambient_checked_effects
+        .clear();
+    let closure = closure_function_mut(&mut checked_nonthrowing);
+    closure.required_checked_effects.clear();
+    closure.ambient_checked_effects.clear();
+    closure.checked_effects.clear();
     assert_malformed(
         &checked_nonthrowing,
         "checked indirect call uses a nonthrowing function type",

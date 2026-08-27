@@ -141,6 +141,10 @@ fn apply_function_checked_error_semantics(
         .get(&function.span)
         .cloned()
         .unwrap_or_default();
+    let profile =
+        crate::checked_effects::CheckedEffectProfile::classify(function.checked_effects.clone());
+    function.required_checked_effects = profile.required;
+    function.ambient_checked_effects = profile.ambient;
     if let Some(throws) = &mut function.throws {
         if let Some(effects) = semantic_info
             .callable_effective_checked_effects
@@ -322,6 +326,8 @@ fn apply_expr_checked_error_semantics(
                 callback_type: plan.callback_type.clone(),
                 callback_access,
                 checked_effects: plan.checked_effects.clone(),
+                required_checked_effects: plan.required_checked_effects.clone(),
+                ambient_checked_effects: plan.ambient_checked_effects.clone(),
                 receiver_span: plan.receiver_span,
                 callback_span: plan.callback_span,
                 span,
@@ -640,6 +646,8 @@ fn lower_function(
             span: throws.span,
         }),
         checked_effects: Vec::new(),
+        required_checked_effects: Vec::new(),
+        ambient_checked_effects: Vec::new(),
         body: lower_block(&function.body, class_name),
         span: function.span,
     }

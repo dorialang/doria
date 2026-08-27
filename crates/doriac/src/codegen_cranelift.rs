@@ -4111,7 +4111,7 @@ fn lower_indirect_call(
 ) -> Result<(), BackendError> {
     set_active_panic_site(builder, span, resources);
     let function_type = function_type_in(resources.program, function_type)?.clone();
-    if !function_type.checked_effects.is_empty() {
+    if function_type.has_checked_transport() {
         return Err(malformed_mir(
             "throwing function type reached nonthrowing indirect call",
         ));
@@ -4171,7 +4171,7 @@ fn lower_checked_indirect_call(
 ) -> Result<(), BackendError> {
     set_active_panic_site(builder, span, resources);
     let function_type = function_type_in(resources.program, function_type)?.clone();
-    if function_type.checked_effects.is_empty() {
+    if !function_type.has_checked_transport() {
         return Err(malformed_mir(
             "nonthrowing function type reached checked indirect call",
         ));

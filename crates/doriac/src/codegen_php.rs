@@ -41,13 +41,53 @@ final class __DoriaErrorDescriptor
 
 final class __DoriaCheckedError extends Exception
 {
+    private bool $__doriaLive = true;
+
     public function __construct(
-        public __DoriaErrorValue $error,
+        private __DoriaErrorValue $error,
         public __DoriaErrorDescriptor $descriptor,
         public int $origin,
     ) {
         parent::__construct("");
     }
+
+    public function error(): __DoriaErrorValue
+    {
+        return $this->error;
+    }
+
+    public function takeError(): __DoriaErrorValue
+    {
+        $this->__doriaLive = false;
+        return $this->error;
+    }
+
+    public function dropError(): void
+    {
+        if ($this->__doriaLive && function_exists("__doria_drop_value")) {
+            __doria_drop_value($this->error);
+        }
+        $this->__doriaLive = false;
+    }
+
+    public function __destruct()
+    {
+        $this->dropError();
+    }
+}
+
+function __doria_detach_checked_error(__DoriaCheckedError $caught): __DoriaCheckedError
+{
+    $previous = $caught->getPrevious();
+    while ($previous instanceof __DoriaCheckedError) {
+        $previous->dropError();
+        $previous = $previous->getPrevious();
+    }
+    return new __DoriaCheckedError(
+        $caught->takeError(),
+        $caught->descriptor,
+        $caught->origin,
+    );
 }
 
 function __doria_error_descriptor(string $typeName): __DoriaErrorDescriptor
@@ -100,10 +140,10 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
     $markerOffset = max(0, $sourceOffset - $lineStart);
     $message = "Error[R1000]: Unhandled " . $type . "\n\nWhere\n" .
         $sourcePath . " · line " . $line . " · " .
-        $caught->error->__doriaErrorCallable() . "\n\n" .
+        $caught->error()->__doriaErrorCallable() . "\n\n" .
         $lineText . "\n" . str_repeat(" ", $markerOffset) . "^\n" .
         "This Error Was First Thrown Here\n\nWhy\n  " .
-        __doria_safe_error_message($caught->error->message) .
+        __doria_safe_error_message($caught->error()->message) .
         "\n\nProcess Exited With Status 70\n";
     @fwrite(STDERR, $message);
     unset($caught);
@@ -917,7 +957,7 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
         match item {
             Item::Function(function) => output.push_str(&format!(
                 "    {} => {},\n",
-                emit_php_string_literal(&function.name),
+                emit_php_string_literal(&php_function_name(&function.name)),
                 php_source_location(function.span, function.span.start),
             )),
             Item::Class(class) => {
@@ -925,8 +965,37 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
                     if let ClassMember::Method(function) = member {
                         output.push_str(&format!(
                             "    {} => {},\n",
-                            emit_php_string_literal(&format!("{}::{}", class.name, function.name)),
+                            emit_php_string_literal(&format!(
+                                "{}::{}",
+                                php_symbol_name(&class.name),
+                                function.name
+                            )),
                             php_source_location(function.span, function.span.start),
+                        ));
+                    }
+                }
+            }
+            Item::Enum(_) | Item::Constant(_) | Item::Statement(_) => {}
+        }
+    }
+    output.push_str("];\n$__doria_function_names = [\n");
+    for item in &program.items {
+        match item {
+            Item::Function(function) => output.push_str(&format!(
+                "    {} => {},\n",
+                emit_php_string_literal(&php_function_name(&function.name)),
+                emit_php_string_literal(&function.name),
+            )),
+            Item::Class(class) => {
+                for member in &class.members {
+                    if let ClassMember::Method(function) = member {
+                        let php_name =
+                            format!("{}::{}", php_symbol_name(&class.name), function.name);
+                        let source_name = format!("{}::{}", class.name, function.name);
+                        output.push_str(&format!(
+                            "    {} => {},\n",
+                            emit_php_string_literal(&php_name),
+                            emit_php_string_literal(&source_name),
                         ));
                     }
                 }
@@ -974,7 +1043,7 @@ function __doria_panic(
     ?string $callable = null,
 )
 {
-    global $__doria_catalogue, $__doria_function_spans, $__doria_generated_closure_frames, $__doria_panicking;
+    global $__doria_catalogue, $__doria_function_spans, $__doria_function_names, $__doria_generated_closure_frames, $__doria_panicking;
     if (!isset($__doria_catalogue[$code])) { $code = "P1001"; }
     [$title, $label, $why] = $__doria_catalogue[$code];
     [$sourcePath, $sourceText, $sourceStart] = __doria_source_location($start);
@@ -1010,9 +1079,10 @@ function __doria_panic(
     }
     $function = $callable ?? "main";
     if ($callable === null && isset($frames[0])) {
-        $function = isset($frames[0]["class"])
+        $phpFunction = isset($frames[0]["class"])
             ? $frames[0]["class"] . "::" . $frames[0]["function"]
             : $frames[0]["function"];
+        $function = $__doria_function_names[$phpFunction] ?? $phpFunction;
     }
     @fwrite(STDERR, "Panic[" . $code . "]: " . $title . "\n\nWhere\n");
     @fwrite(STDERR, $sourcePath . " · line " . $line . " · " . $function . "\n\n");
@@ -1037,10 +1107,11 @@ function __doria_panic(
     }
     @fwrite(STDERR, "\n\nCall Path");
     foreach ($frames as $index => $frame) {
-        $name = isset($frame["class"])
+        $phpName = isset($frame["class"])
             ? $frame["class"] . "::" . $frame["function"]
             : $frame["function"];
-        $frameOffset = $index === 0 ? $start : ($__doria_function_spans[$name] ?? $start);
+        $name = $__doria_function_names[$phpName] ?? $phpName;
+        $frameOffset = $index === 0 ? $start : ($__doria_function_spans[$phpName] ?? $start);
         [$framePath] = __doria_source_location($frameOffset);
         @fwrite(
             STDERR,
@@ -1653,7 +1724,7 @@ function __doria_printf(
         } else {
             "array_slice($_SERVER['argv'] ?? [], 1)".to_string()
         };
-        let invocation = format!("{}({arguments})", php_symbol_name(&entry.name));
+        let invocation = format!("{}({arguments})", php_function_name(&entry.name));
         output.push_str("if (isset($_SERVER['SCRIPT_FILENAME']) && realpath($_SERVER['SCRIPT_FILENAME']) === __FILE__) {\n    ");
         if entry
             .return_type
@@ -3885,7 +3956,7 @@ fn emit_function(
     if is_method {
         output.push_str(&function.name);
     } else {
-        output.push_str(&php_symbol_name(&function.name));
+        output.push_str(&php_function_name(&function.name));
     }
     output.push('(');
     output.push_str(
@@ -3982,10 +4053,15 @@ fn emit_function(
             );
         }
         if param.promoted_access.is_some() && uses_cell {
+            let value = if param.take && resolved_type_ref_is_function(&param.ty) {
+                format!("__doria_take_cell(${})", param.name)
+            } else {
+                format!("${}->value", param.name)
+            };
             writeln(
                 output,
                 body_indent,
-                &format!("$this->{0} = ${0}->value;", param.name),
+                &format!("$this->{} = {value};", param.name),
             );
         }
         if resolved_type_ref_is_function(&param.ty) && param.take {
@@ -4105,6 +4181,39 @@ fn emit_block(block: &Block, output: &mut String, indent: usize, scopes: &mut Ph
     writeln(output, indent, "}");
 }
 
+fn emit_finalizer_error_boundary(
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+    emit_body: impl FnOnce(&mut String, usize, &mut PhpNameScopes),
+) {
+    let forwarded = scopes.fresh_temp("__doria_finalizer_error");
+    let caught = scopes.fresh_temp("__doria_finalizer_caught");
+    writeln(output, indent, &format!("${forwarded} = null;"));
+    writeln(output, indent, "try");
+    writeln(output, indent, "{");
+    emit_body(output, indent + 1, scopes);
+    writeln(output, indent, "}");
+    writeln(
+        output,
+        indent,
+        &format!("catch (__DoriaCheckedError ${caught})"),
+    );
+    writeln(output, indent, "{");
+    writeln(
+        output,
+        indent + 1,
+        &format!("${forwarded} = __doria_detach_checked_error(${caught});"),
+    );
+    writeln(output, indent + 1, &format!("unset(${caught});"));
+    writeln(output, indent, "}");
+    writeln(
+        output,
+        indent,
+        &format!("if (${forwarded} !== null) {{ throw ${forwarded}; }}"),
+    );
+}
+
 fn emit_with_finally(
     finally: &ControlFlowFinally,
     output: &mut String,
@@ -4112,14 +4221,16 @@ fn emit_with_finally(
     scopes: &mut PhpNameScopes,
     emit_body: impl FnOnce(&mut String, usize, &mut PhpNameScopes),
 ) {
-    writeln(output, indent, "try");
-    writeln(output, indent, "{");
-    scopes.push();
-    emit_body(output, indent + 1, scopes);
-    writeln(output, indent, "}");
-    writeln(output, indent, "finally");
-    emit_block(&finally.block, output, indent, scopes);
-    scopes.pop();
+    emit_finalizer_error_boundary(output, indent, scopes, |output, indent, scopes| {
+        writeln(output, indent, "try");
+        writeln(output, indent, "{");
+        scopes.push();
+        emit_body(output, indent + 1, scopes);
+        writeln(output, indent, "}");
+        writeln(output, indent, "finally");
+        emit_block(&finally.block, output, indent, scopes);
+        scopes.pop();
+    });
 }
 
 fn emit_statement(
@@ -4366,6 +4477,21 @@ fn emit_try_statement(
     indent: usize,
     scopes: &mut PhpNameScopes,
 ) {
+    if statement.finally.is_some() {
+        emit_finalizer_error_boundary(output, indent, scopes, |output, indent, scopes| {
+            emit_try_statement_inner(statement, output, indent, scopes);
+        });
+    } else {
+        emit_try_statement_inner(statement, output, indent, scopes);
+    }
+}
+
+fn emit_try_statement_inner(
+    statement: &TryStmt,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
     writeln(output, indent, "try");
     emit_block(&statement.body, output, indent, scopes);
 
@@ -4409,7 +4535,7 @@ fn emit_try_statement(
             writeln(
                 output,
                 indent + 2,
-                &format!("${binding} = ${caught}->error;"),
+                &format!("${binding} = ${caught}->takeError();"),
             );
             for body_statement in &clause.body.statements {
                 emit_statement(body_statement, output, indent + 2, scopes);
@@ -5503,21 +5629,44 @@ fn emit_when_expression(
     let mut when_scopes = scopes.clone();
     when_scopes.push();
     let mut body = String::new();
-    let body_indent = if finally.is_some() { 2 } else { 1 };
-    if finally.is_some() {
-        writeln(&mut body, 1, "try");
-        writeln(&mut body, 1, "{");
+    if let Some(finally) = finally {
+        emit_finalizer_error_boundary(
+            &mut body,
+            1,
+            &mut when_scopes,
+            |body, indent, when_scopes| {
+                writeln(body, indent, "try");
+                writeln(body, indent, "{");
+                emit_when_branches(given, branches, body, indent + 1, when_scopes);
+                writeln(body, indent, "}");
+                writeln(body, indent, "finally");
+                emit_block(&finally.block, body, indent, when_scopes);
+            },
+        );
+    } else {
+        emit_when_branches(given, branches, &mut body, 1, &mut when_scopes);
     }
+    when_scopes.pop();
+    format!("(function(){capture_list} {{\n{body}}})()")
+}
+
+fn emit_when_branches(
+    given: Option<&GivenPrelude>,
+    branches: &[WhenBranch],
+    body: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
     let predicates = given
-        .map(|given| emit_given_setup(given, &mut body, body_indent, &mut when_scopes))
+        .map(|given| emit_given_setup(given, body, indent, scopes))
         .unwrap_or_default();
     let gate = if predicates.is_empty() {
         None
     } else {
-        let gate = when_scopes.fresh_temp("__doria_given_gate");
+        let gate = scopes.fresh_temp("__doria_given_gate");
         writeln(
-            &mut body,
-            body_indent,
+            body,
+            indent,
             &format!(
                 "${gate} = {};",
                 emit_bool_chain(predicates.iter().map(String::as_str))
@@ -5527,27 +5676,20 @@ fn emit_when_expression(
     };
 
     for (index, branch) in branches.iter().enumerate() {
-        write_indent(&mut body, body_indent);
+        write_indent(body, indent);
         if let Some(condition) = &branch.condition {
             body.push_str(if index == 0 { "if (" } else { "else if (" });
             if let Some(gate) = &gate {
                 body.push_str(gate);
                 body.push_str(" && ");
             }
-            body.push_str(&emit_expr(condition, &when_scopes));
+            body.push_str(&emit_expr(condition, scopes));
             body.push_str(")\n");
         } else {
             body.push_str("else\n");
         }
-        emit_block(&branch.block, &mut body, body_indent, &mut when_scopes);
+        emit_block(&branch.block, body, indent, scopes);
     }
-    if let Some(finally) = finally {
-        writeln(&mut body, 1, "}");
-        writeln(&mut body, 1, "finally");
-        emit_block(&finally.block, &mut body, 1, &mut when_scopes);
-    }
-    when_scopes.pop();
-    format!("(function(){capture_list} {{\n{body}}})()")
 }
 
 fn emit_match_expression(
@@ -6019,7 +6161,7 @@ fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNam
         "write_stderr" => "__doria_write_stderr".to_string(),
         "sprintf" => "__doria_sprintf".to_string(),
         "printf" => "__doria_printf".to_string(),
-        _ => php_symbol_name(name),
+        _ => php_function_name(name),
     };
     let mut emitted = emit_call_argument_values(args, span, scopes);
     if matches!(name, "sprintf" | "printf") {
@@ -6183,6 +6325,10 @@ fn php_symbol_name(name: &str) -> String {
         }
         _ => name.to_string(),
     }
+}
+
+fn php_function_name(name: &str) -> String {
+    format!("__DoriaFunction_{}", hex_bytes(name.as_bytes()))
 }
 
 fn escape_php_string(value: &str) -> String {

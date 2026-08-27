@@ -1,6 +1,8 @@
 # Durable executable source of truth for accepted native behavior.
 # Highest covered stage: Stage 29 Slice 3
 examples/native/main_add_overflow_panic.doria
+examples/native/main_ambient_io_callbacks.doria
+examples/native/main_ambient_io_fallible_finalizers.doria
 examples/native/main_arithmetic_42.doria
 examples/native/main_bitwise_42.doria
 examples/native/main_bool_function_42.doria

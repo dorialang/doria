@@ -1,0 +1,51 @@
+class Holder
+{
+    function __construct(take function(): void $callback)
+    {
+    }
+
+    function run(): void
+    {
+        $this->callback();
+    }
+}
+
+function invoke(function(): void $callback): void
+{
+    $callback();
+}
+
+function main(): void
+{
+    function(): void $callback = function (): void {
+        echo "closure ";
+    };
+    invoke($callback);
+
+    let $holder = new Holder(function (): void {
+        echo "property ";
+    });
+    $holder->run();
+
+    List<function(): void> $callbacks = [function (): void {
+        echo "collection ";
+    }];
+    foreach ($callbacks as function(): void $stored) {
+        $stored();
+    }
+
+    List<int> $values = [1, 2];
+    List<int> $mapped = $values->map(function (int $value): int {
+        echo "map {$value} ";
+        return $value;
+    });
+    List<int> $filtered = $mapped->filter(function (int $value): bool {
+        echo "filter {$value} ";
+        return true;
+    });
+    int $sum = $filtered->reduce(0, function (writable int $total, int $value): void {
+        echo "reduce {$value} ";
+        $total = $value;
+    });
+    echo "sum {$sum}\n";
+}

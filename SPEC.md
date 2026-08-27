@@ -126,10 +126,6 @@ exit, from inner to outer when nested. Same-loop `continue` does not run the
 loop finalizer, and fatal panic runs no finalizer. `finally` on `for`, `foreach`,
 `match`, or a bare block is not Doria syntax.
 
-Planned future control flow includes:
-
-- checked `throw` / `throws` error handling.
-
 See Decision 0116 for the current control-flow authority.
 
 ### Source organization and compiler directives
@@ -1132,30 +1128,35 @@ There is no implicit widening, narrowing, or scalar coercion between distinct in
 
 Simple collection literals infer collection element/key/value types when all clear parts match. Clear heterogeneous collection literals, such as `[1, "two"]`, are rejected by typed array and narrow collection alias assignment checks rather than being erased to `Unknown`. The empty literal `[]` stays ambiguous so typed contexts may use it as an empty `T[]`, `List<T>`, or `Dictionary<K, V>`.
 
-### Stage 17 text I/O and checked formatting
+### Text I/O and ambient checked failures
 
 Stage 17 provides these compiler-known built-ins:
 
 ```doria
 read_line(string $prompt = ""): ?string
-    throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 read_file(string $path): string
-    throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 write_file(string $path, string $contents): void
-    throws Doria\Std\Io\IoError
 write_stderr(string $value): void
-    throws Doria\Std\Io\IoError
 ```
 
 The compiler-known `sprintf` returns `string` and remains nonthrowing. `printf`
-returns `void` and throws `Doria\Std\Io\IoError`; every `echo` statement adds
-that same checked effect to its enclosing callable. Each formatting intrinsic
+returns `void`; every `echo` statement carries the ambient
+`Doria\Std\Io\IoError` runtime effect. Each formatting intrinsic
 takes a literal `string $format` first, followed by the typed operands required
 by that format. The intrinsic-only operand tail is not an untyped Doria
 parameter declaration.
 
+Exactly `Doria\Std\Io\IoError` and
+`Doria\Std\Io\InvalidUtf8Error` are ambient checked effects. Authors do not
+need to list them in `throws` or catch them locally, but they remain exact,
+catchable runtime Errors. Explicit ambient `throws` entries remain accepted.
+Unhandled ambient I/O still performs checked cleanup and reports R1000 with
+status 70. Ambient-only differences do not change structural function identity;
+required nonambient Errors still do. Decision 0123 defines the complete effect
+and finalizer model.
+
 The additive text-file spelling is
-`append_file(string $path, string $contents): void throws Doria\Std\Io\IoError`. It is implemented by Stage 23 Slice 2 alongside
+`append_file(string $path, string $contents): void`. It is implemented by Stage 23 Slice 2 alongside
 the binary file tier; `write_file` remains truncate-only.
 
 `read_line` reads UTF-8 text, removes one LF ending and a preceding CR when present, preserves empty lines and final unterminated lines, and returns `null` only when EOF occurs before any bytes. Its return type was the first supported position for the nullable `?T` model now generalized by Decision 0093. A `!= null` guard narrows `?string` to `string`; assigning `null` or another nullable result invalidates that fact, while assigning a known `string` establishes a new non-null fact.
@@ -1163,16 +1164,16 @@ the binary file tier; `write_file` remains truncate-only.
 `read_file` and `write_file` are text-file functions. `read_file` reads an entire file and validates UTF-8 before constructing a `string`; invalid bytes never enter a Doria string. `write_file` creates or truncates a text file and writes the string's exact bytes. `write_stderr` writes exact bytes without adding a newline. An ordinary program write to stdout or stderr that reports a closed pipe exits immediately with status 0 and emits no panic diagnostic or `Call Path`. This exception does not apply to panic diagnostics: a panic remains fatal with status 101 when stderr is unavailable, although its best-effort diagnostic output may be absent. Other I/O failures are checked errors: invalid UTF-8 is `Doria\Std\Io\InvalidUtf8Error`, while file, input, flush, and non-broken-pipe device failures are `Doria\Std\Io\IoError`. `null` from `read_line` means EOF and never signals an error.
 
 Stage 23 Slice 2 binary file I/O is whole-file:
-`read_file_bytes(string $path): Bytes throws Doria\Std\Io\IoError`,
-`write_file_bytes(string $path, Bytes $contents): void throws Doria\Std\Io\IoError`, and
-`append_file_bytes(string $path, Bytes $contents): void throws Doria\Std\Io\IoError`. The write functions borrow `$contents`;
+`read_file_bytes(string $path): Bytes`,
+`write_file_bytes(string $path, Bytes $contents): void`, and
+`append_file_bytes(string $path, Bytes $contents): void`. The write functions borrow `$contents`;
 they do not consume it. Reads and writes preserve exact bytes without UTF-8 validation or newline
 translation. `File` and stream objects, including RAII close and buffered/seekable access, are
 planned after Stage 29. These future tiers do not change the text and EOF contracts.
 
 Binary standard-stream I/O is `read_stdin_bytes(): Bytes`,
 `write_stdout_bytes(Bytes $contents): void`, and `write_stderr_bytes(Bytes $contents): void`;
-each throws `Doria\Std\Io\IoError`.
+each carries ambient `Doria\Std\Io\IoError` at runtime.
 `read_stdin_bytes` slurps to EOF and returns an empty `Bytes` at immediate EOF. Byte output borrows
 its buffer and follows the ordinary closed-pipe clean-exit rule. All Stage 23 I/O intrinsics are
 unshadowable.
@@ -1357,20 +1358,28 @@ readonly, and catch-scoped. Concrete catches match exact concrete Error identity
 in Stage 29; `catch (Error)` catches every checked error. Duplicate catches,
 catches after `Error`, and catches proven unable to match a protected effect are
 unreachable. Catch bodies are independent: sibling catches do not handle an
-error raised by another catch. An error may not escape `finally`.
+error raised by another catch. A checked Error may escape `finally`; a catch on
+that same `try` does not cover it, while a finalizer-local or outer catch may.
+The finalizer Error supersedes any pending nonfatal outcome and destroys a
+superseded owned payload exactly once.
 
-Every callable carries an effective semantic checked-effect set. Direct throws
+Every callable carries required, ambient, and complete semantic checked-effect
+profiles. Direct throws
 and resolved function, method, static, constructor, property-initializer, and
 compiler-known built-in calls contribute effects. Catches remove only effects
 they cover. Ordinary reusable functions, methods, constructors, and generic
-specializations must declare every remaining error. When the selected top-level
+specializations must declare every remaining required error. Exactly
+`Doria\Std\Io\IoError` and `Doria\Std\Io\InvalidUtf8Error` are ambient and do
+not impose that source obligation, but remain in the complete executable
+profile. When the selected top-level
 `main` omits `throws`, its exact remaining set is inferred instead; source calls
 to `main` observe that effective contract. Source syntax remains separate, so
 the AST does not gain a synthetic clause or invented span. A written `main
 throws` remains accepted and incomplete explicit clauses still produce E0631.
-Nonthrowing and narrower effect sets may be used where a wider set is accepted,
-never the reverse. Stage 30 callable types must preserve this law while owning
-closure effect syntax.
+Nonthrowing and narrower required-effect sets may be used where a wider set is
+accepted, never the reverse. Ambient-only differences do not change structural
+function identity, while executable function values retain ambient-capable
+transport.
 
 Checked propagation performs deterministic cleanup through the existing
 structured finalizer regions, but never rolls back completed side effects. A

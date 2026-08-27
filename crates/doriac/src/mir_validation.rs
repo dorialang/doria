@@ -512,6 +512,17 @@ fn validate_closure_metadata(program: &mir::Program) -> Result<(), BackendError>
             validate_type_reference(program, ty)?;
         }
         validate_checked_effects(program, &function_type.checked_effects)?;
+        validate_checked_effects(program, &function_type.ambient_checked_effects)?;
+        validate_ambient_checked_effects(program, &function_type.ambient_checked_effects)?;
+        if function_type
+            .checked_effects
+            .iter()
+            .any(|effect| function_type.ambient_checked_effects.contains(effect))
+        {
+            return Err(malformed_mir(
+                "structural function type includes an ambient effect in required identity",
+            ));
+        }
         if let Some(return_borrow) = function_type.return_borrow {
             match return_borrow.source {
                 mir::BorrowSource::Receiver => {
@@ -640,6 +651,30 @@ fn validate_checked_effects(
         }
         if let mir::CheckedEffect::Concrete(descriptor) = effect {
             error_descriptor_in(program, *descriptor)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_ambient_checked_effects(
+    program: &mir::Program,
+    effects: &[mir::CheckedEffect],
+) -> Result<(), BackendError> {
+    for effect in effects {
+        let mir::CheckedEffect::Concrete(descriptor) = effect else {
+            return Err(malformed_mir(
+                "ambient checked effect must name a concrete compiler-known I/O Error",
+            ));
+        };
+        let descriptor = error_descriptor_in(program, *descriptor)?;
+        if !matches!(
+            descriptor.type_name.as_str(),
+            crate::compiler_known_io::IO_ERROR | crate::compiler_known_io::INVALID_UTF8_ERROR
+        ) {
+            return Err(malformed_mir(format!(
+                "nonambient Error `{}` is marked as ambient",
+                descriptor.type_name
+            )));
         }
     }
     Ok(())
@@ -1047,6 +1082,31 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
         let _ = local;
     }
     validate_checked_effects(program, &function.checked_effects)?;
+    validate_checked_effects(program, &function.required_checked_effects)?;
+    validate_checked_effects(program, &function.ambient_checked_effects)?;
+    validate_ambient_checked_effects(program, &function.ambient_checked_effects)?;
+    if function
+        .required_checked_effects
+        .iter()
+        .any(|effect| function.ambient_checked_effects.contains(effect))
+    {
+        return Err(malformed_mir(format!(
+            "function {} overlaps required and ambient checked effects",
+            function.name
+        )));
+    }
+    let mut complete = function.required_checked_effects.clone();
+    complete.extend(function.ambient_checked_effects.iter().copied());
+    if complete.len() != function.checked_effects.len()
+        || complete
+            .iter()
+            .any(|effect| !function.checked_effects.contains(effect))
+    {
+        return Err(malformed_mir(format!(
+            "function {} complete checked effects are not required union ambient",
+            function.name
+        )));
+    }
     match &function.closure {
         Some(closure) => {
             let descriptor = closure_descriptor_in(program, closure.descriptor)?;
@@ -1056,7 +1116,9 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
                 || descriptor.environment_layout != closure.environment_layout
                 || function.return_type != function_type.return_type
                 || function.return_borrow != function_type.return_borrow
-                || function.checked_effects != function_type.checked_effects
+                || function.required_checked_effects != function_type.checked_effects
+                || function.ambient_checked_effects != function_type.ambient_checked_effects
+                || function.checked_effects != function_type.complete_checked_effects()
                 || function.params.len() != function_type.parameters.len() + 1
                 || function.params.first() != Some(&closure.hidden_environment)
             {
@@ -3265,7 +3327,7 @@ fn validate_indirect_call(
             ))
         }
     }
-    match (definition.checked_effects.is_empty(), call.error) {
+    match (!definition.has_checked_transport(), call.error) {
         (true, None) => {}
         (false, Some(error)) => {
             let error = local_in(caller, error)?;
@@ -9932,10 +9994,12 @@ fn validate_list_algorithm_types(
     let callback = function_type_in(program, plan.callback_type)?;
     if callback.invocation_mode != plan.callback_access
         || matches!(callback.invocation_mode, mir::FunctionInvocationMode::Once)
-        || callback.checked_effects != plan.checked_effects
+        || callback.checked_effects != plan.required_checked_effects
+        || callback.ambient_checked_effects != plan.ambient_checked_effects
+        || callback.complete_checked_effects() != plan.checked_effects
     {
         return Err(malformed_mir(
-            "List algorithm callback mode or checked effects disagree with its function type",
+            "List algorithm callback mode or effect profile disagrees with its function type",
         ));
     }
     let callback_local = local_in(function, plan.callback)?;
@@ -9961,6 +10025,8 @@ fn validate_list_algorithm_types(
             "List algorithm count and index locals must be concrete Doria int traversal state",
         ));
     }
+    validate_checked_effects(program, &plan.required_checked_effects)?;
+    validate_checked_effects(program, &plan.ambient_checked_effects)?;
     validate_checked_effects(program, &plan.checked_effects)?;
 
     match plan.kind {
@@ -10618,6 +10684,7 @@ fn validate_finalizer_plan(
         }
     }
     validate_finalizer_dispatch(function, plan)?;
+    validate_finalizer_replacements(function, plan)?;
     Ok(())
 }
 
@@ -10692,6 +10759,148 @@ fn validate_finalizer_dispatch(
             ));
         }
         dispatch = *else_block;
+    }
+    Ok(())
+}
+
+fn validate_finalizer_replacements(
+    function: &mir::Function,
+    plan: &mir::FinalizerRegionPlan,
+) -> Result<(), BackendError> {
+    let mut sources = HashSet::new();
+    for replacement in &plan.replacements {
+        if !sources.insert(replacement.source)
+            || !plan.body_blocks.contains(&replacement.source)
+            || replacement.cases.len() != plan.exits.len()
+        {
+            return Err(malformed_mir(
+                "finalizer checked replacement has an invalid source or case table",
+            ));
+        }
+        let replacement_error = local_in(function, replacement.replacement_error)?;
+        if replacement_error.ty != mir::Type::Error
+            || !replacement_error.owned
+            || !replacement_error.synthetic
+        {
+            return Err(malformed_mir(
+                "finalizer replacement does not own a synthetic Error carrier",
+            ));
+        }
+        let source = block_in(function, replacement.source)?;
+        let acquisitions = source
+            .statements
+            .iter()
+            .filter(|statement| {
+                matches!(
+                    statement,
+                    mir::Statement::AssignLocal {
+                        target,
+                        value: mir::Rvalue::Error(mir::ErrorExpression::Local {
+                            transfer: true,
+                            ..
+                        }),
+                    } if *target == replacement.replacement_error
+                )
+            })
+            .count();
+        if acquisitions != 1 {
+            return Err(malformed_mir(
+                "finalizer replacement Error is not acquired exactly once before dispatch",
+            ));
+        }
+
+        let mut dispatch = replacement.source;
+        let mut pending_exits = HashSet::new();
+        for (case_index, case) in replacement.cases.iter().enumerate() {
+            if case.pending_exit >= plan.exits.len()
+                || !pending_exits.insert(case.pending_exit)
+                || !plan.body_blocks.contains(&case.entry)
+            {
+                return Err(malformed_mir(
+                    "finalizer replacement case names an invalid pending exit",
+                ));
+            }
+            let pending = &plan.exits[case.pending_exit];
+            if case.dropped_payload != pending.superseded_payload {
+                return Err(malformed_mir(
+                    "finalizer replacement disagrees with the pending payload drop plan",
+                ));
+            }
+
+            let terminator = &block_in(function, dispatch)?.terminator;
+            if case_index + 1 == replacement.cases.len() {
+                if !matches!(terminator, mir::Terminator::Jump(target) if *target == case.entry) {
+                    return Err(malformed_mir(
+                        "finalizer replacement dispatch does not select its final case",
+                    ));
+                }
+            } else {
+                let mir::Terminator::Branch {
+                    condition,
+                    then_block,
+                    else_block,
+                } = terminator
+                else {
+                    return Err(malformed_mir(
+                        "finalizer replacement has a malformed case dispatch",
+                    ));
+                };
+                if *then_block != case.entry
+                    || !is_finalizer_discriminator_condition(
+                        condition,
+                        plan.discriminator,
+                        case.pending_exit as i128,
+                    )
+                {
+                    return Err(malformed_mir(
+                        "finalizer replacement dispatch disagrees with its pending exit",
+                    ));
+                }
+                dispatch = *else_block;
+            }
+
+            let entry = block_in(function, case.entry)?;
+            let drop_count = case.dropped_payload.map_or(0, |payload| {
+                entry
+                    .statements
+                    .iter()
+                    .filter(|statement| statement_drops_local(statement, payload))
+                    .count()
+            });
+            if drop_count != usize::from(case.dropped_payload.is_some()) {
+                return Err(malformed_mir(
+                    "finalizer replacement does not destroy its superseded payload exactly once",
+                ));
+            }
+            let forwards_replacement = entry.statements.iter().any(|statement| {
+                matches!(
+                    statement,
+                    mir::Statement::AssignLocal {
+                        value: mir::Rvalue::Error(mir::ErrorExpression::Local {
+                            local,
+                            transfer: true,
+                        }),
+                        ..
+                    } if *local == replacement.replacement_error
+                )
+            });
+            if !forwards_replacement {
+                return Err(malformed_mir(
+                    "finalizer replacement Error is not forwarded after payload destruction",
+                ));
+            }
+            if cfg_reaches(function, case.entry, plan.entry)? {
+                return Err(malformed_mir(
+                    "checked Error from a finalizer re-enters the same finalizer region",
+                ));
+            }
+            if matches!(entry.terminator, mir::Terminator::Jump(target) if target == pending.continuation)
+            {
+                return Err(malformed_mir(
+                    "finalizer replacement resumes the superseded destination",
+                ));
+            }
+        }
     }
     Ok(())
 }

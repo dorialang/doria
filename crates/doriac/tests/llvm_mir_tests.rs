@@ -72,13 +72,17 @@ function main(): void
     for required in [
         "dr_v1_closure_environment_allocate",
         "dr_v1_closure_environment_free",
-        "closure.call",
+        "closure.checked.call",
     ] {
         assert!(
             escaping_ir.contains(required),
             "escaping closure IR is missing {required}:\n{escaping_ir}"
         );
     }
+    assert!(
+        !escaping_ir.contains("%closure.call ="),
+        "ambient-capable structural callable used the unchecked ABI:\n{escaping_ir}"
+    );
     for forbidden in ["closure_retain", "closure_release", "closure_registry"] {
         assert!(
             !escaping_ir.contains(forbidden),
@@ -615,6 +619,8 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 parameter_modes: Vec::new(),
                 return_type: ReturnType::Void,
                 return_borrow: None,
+                required_checked_effects: Vec::new(),
+                ambient_checked_effects: Vec::new(),
                 checked_effects: Vec::new(),
                 locals: Vec::new(),
                 blocks: vec![BasicBlock {
@@ -635,6 +641,8 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 parameter_modes: Vec::new(),
                 return_type: ReturnType::Value(Type::Scalar(ScalarType::Float(FloatType::Float64))),
                 return_borrow: None,
+                required_checked_effects: Vec::new(),
+                ambient_checked_effects: Vec::new(),
                 checked_effects: Vec::new(),
                 locals: Vec::new(),
                 blocks: vec![BasicBlock {
