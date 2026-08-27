@@ -938,7 +938,7 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
         match item {
             Item::Function(function) => output.push_str(&format!(
                 "    {} => {},\n",
-                emit_php_string_literal(&function.name),
+                emit_php_string_literal(&php_function_name(&function.name)),
                 php_source_location(function.span, function.span.start),
             )),
             Item::Class(class) => {
@@ -946,8 +946,37 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
                     if let ClassMember::Method(function) = member {
                         output.push_str(&format!(
                             "    {} => {},\n",
-                            emit_php_string_literal(&format!("{}::{}", class.name, function.name)),
+                            emit_php_string_literal(&format!(
+                                "{}::{}",
+                                php_symbol_name(&class.name),
+                                function.name
+                            )),
                             php_source_location(function.span, function.span.start),
+                        ));
+                    }
+                }
+            }
+            Item::Enum(_) | Item::Constant(_) | Item::Statement(_) => {}
+        }
+    }
+    output.push_str("];\n$__doria_function_names = [\n");
+    for item in &program.items {
+        match item {
+            Item::Function(function) => output.push_str(&format!(
+                "    {} => {},\n",
+                emit_php_string_literal(&php_function_name(&function.name)),
+                emit_php_string_literal(&function.name),
+            )),
+            Item::Class(class) => {
+                for member in &class.members {
+                    if let ClassMember::Method(function) = member {
+                        let php_name =
+                            format!("{}::{}", php_symbol_name(&class.name), function.name);
+                        let source_name = format!("{}::{}", class.name, function.name);
+                        output.push_str(&format!(
+                            "    {} => {},\n",
+                            emit_php_string_literal(&php_name),
+                            emit_php_string_literal(&source_name),
                         ));
                     }
                 }
@@ -995,7 +1024,7 @@ function __doria_panic(
     ?string $callable = null,
 )
 {
-    global $__doria_catalogue, $__doria_function_spans, $__doria_generated_closure_frames, $__doria_panicking;
+    global $__doria_catalogue, $__doria_function_spans, $__doria_function_names, $__doria_generated_closure_frames, $__doria_panicking;
     if (!isset($__doria_catalogue[$code])) { $code = "P1001"; }
     [$title, $label, $why] = $__doria_catalogue[$code];
     [$sourcePath, $sourceText, $sourceStart] = __doria_source_location($start);
@@ -1031,9 +1060,10 @@ function __doria_panic(
     }
     $function = $callable ?? "main";
     if ($callable === null && isset($frames[0])) {
-        $function = isset($frames[0]["class"])
+        $phpFunction = isset($frames[0]["class"])
             ? $frames[0]["class"] . "::" . $frames[0]["function"]
             : $frames[0]["function"];
+        $function = $__doria_function_names[$phpFunction] ?? $phpFunction;
     }
     @fwrite(STDERR, "Panic[" . $code . "]: " . $title . "\n\nWhere\n");
     @fwrite(STDERR, $sourcePath . " · line " . $line . " · " . $function . "\n\n");
@@ -1058,10 +1088,11 @@ function __doria_panic(
     }
     @fwrite(STDERR, "\n\nCall Path");
     foreach ($frames as $index => $frame) {
-        $name = isset($frame["class"])
+        $phpName = isset($frame["class"])
             ? $frame["class"] . "::" . $frame["function"]
             : $frame["function"];
-        $frameOffset = $index === 0 ? $start : ($__doria_function_spans[$name] ?? $start);
+        $name = $__doria_function_names[$phpName] ?? $phpName;
+        $frameOffset = $index === 0 ? $start : ($__doria_function_spans[$phpName] ?? $start);
         [$framePath] = __doria_source_location($frameOffset);
         @fwrite(
             STDERR,
@@ -1674,7 +1705,7 @@ function __doria_printf(
         } else {
             "array_slice($_SERVER['argv'] ?? [], 1)".to_string()
         };
-        let invocation = format!("{}({arguments})", php_symbol_name(&entry.name));
+        let invocation = format!("{}({arguments})", php_function_name(&entry.name));
         output.push_str("if (isset($_SERVER['SCRIPT_FILENAME']) && realpath($_SERVER['SCRIPT_FILENAME']) === __FILE__) {\n    ");
         if entry
             .return_type
@@ -3906,7 +3937,7 @@ fn emit_function(
     if is_method {
         output.push_str(&function.name);
     } else {
-        output.push_str(&php_symbol_name(&function.name));
+        output.push_str(&php_function_name(&function.name));
     }
     output.push('(');
     output.push_str(
@@ -6045,7 +6076,7 @@ fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNam
         "write_stderr" => "__doria_write_stderr".to_string(),
         "sprintf" => "__doria_sprintf".to_string(),
         "printf" => "__doria_printf".to_string(),
-        _ => php_symbol_name(name),
+        _ => php_function_name(name),
     };
     let mut emitted = emit_call_argument_values(args, span, scopes);
     if matches!(name, "sprintf" | "printf") {
@@ -6209,6 +6240,10 @@ fn php_symbol_name(name: &str) -> String {
         }
         _ => name.to_string(),
     }
+}
+
+fn php_function_name(name: &str) -> String {
+    format!("__DoriaFunction_{}", hex_bytes(name.as_bytes()))
 }
 
 fn escape_php_string(value: &str) -> String {
