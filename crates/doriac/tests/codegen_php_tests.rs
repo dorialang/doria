@@ -3464,6 +3464,72 @@ fn php_backend_executes_checked_errors_with_doria_descriptor_dispatch() {
 }
 
 #[test]
+fn php_finalizer_replacements_drop_and_detach_superseded_errors() {
+    let source = r#"
+class FirstError implements Error
+{
+    function __construct(string $message) {}
+}
+
+class FinalError implements Error
+{
+    function __construct(string $message) {}
+}
+
+function failTwice(): void throws FirstError, FinalError
+{
+    try {
+        throw new FirstError("first");
+    } finally {
+        throw new FinalError("replacement");
+    }
+}
+
+function main(): void {}
+"#;
+    let php = doriac::compile_source_to_php("php-finalizer-replacement.doria", source)
+        .expect("fallible finalizer source should compile for PHP");
+    assert!(php.contains("__doria_detach_checked_error"));
+    let drop_previous = php
+        .find("$previous->dropError();")
+        .expect("the superseded carrier payload must be dropped explicitly");
+    let take_replacement = php
+        .find("$caught->takeError()")
+        .expect("the replacement payload must move into a detached carrier");
+    assert!(drop_previous < take_replacement);
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\ntry {{ __DoriaFunction_6661696c5477696365(); }} catch (__DoriaCheckedError $error) {{ echo $error->getPrevious() === null ? 'detached' : 'chained'; }}",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated replacement PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert_eq!(stdout, "detached");
+    assert!(
+        run.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+}
+
+#[test]
 fn php_backend_preserves_ambient_effects_through_callbacks_and_list_algorithms() {
     let source = include_str!("../../../examples/native/main_ambient_io_callbacks.doria");
     let php = doriac::compile_source_to_php("ambient-io-callbacks.doria", source)

@@ -593,7 +593,31 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
         global_symbols.clone(),
     );
     discovery.check();
-    let ambient_effect_seed = discovery.inferred_ambient_effects();
+    let mut ambient_effect_seed = discovery.inferred_ambient_effects();
+
+    // The first pass deliberately over-approximates transitive ambient effects
+    // so forward and recursive calls have checked transport available. Narrow
+    // that seed to the effects which actually escape each callable after local
+    // catch coverage. Repeating to a fixpoint removes stale effects through
+    // arbitrarily deep call chains without making source order observable.
+    loop {
+        let mut refinement = Checker::new(
+            program,
+            const_evaluation.clone(),
+            source_texts,
+            compilation_context.clone(),
+            compilation_contexts.clone(),
+            global_symbols.clone(),
+        );
+        refinement.ambient_effect_seed = ambient_effect_seed.clone();
+        refinement.check();
+        let refined = refinement.escaping_ambient_effects();
+        if ambient_effect_maps_equal(&ambient_effect_seed, &refined) {
+            ambient_effect_seed = refined;
+            break;
+        }
+        ambient_effect_seed = refined;
+    }
 
     let mut checker = Checker::new(
         program,
@@ -700,6 +724,18 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
         },
         diagnostics: checker.diagnostics,
     }
+}
+
+fn ambient_effect_maps_equal(
+    left: &HashMap<Span, Vec<ResolvedType>>,
+    right: &HashMap<Span, Vec<ResolvedType>>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(callable, effects)| {
+            right.get(callable).is_some_and(|other| {
+                effects.len() == other.len() && effects.iter().all(|effect| other.contains(effect))
+            })
+        })
 }
 
 fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo> {
@@ -1366,6 +1402,7 @@ struct Checker<'program> {
     effect_scopes: Vec<CheckedEffectSet>,
     class_initializer_effects: HashMap<String, CheckedEffectSet>,
     callable_observed_checked_effects: HashMap<Span, Vec<ResolvedType>>,
+    callable_declared_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     callable_dependencies: HashMap<Span, Vec<Span>>,
     ambient_effect_seed: HashMap<Span, Vec<ResolvedType>>,
     callable_effective_checked_effects: HashMap<Span, Vec<ResolvedType>>,
@@ -1999,6 +2036,7 @@ impl<'program> Checker<'program> {
             effect_scopes: Vec::new(),
             class_initializer_effects: HashMap::new(),
             callable_observed_checked_effects: HashMap::new(),
+            callable_declared_checked_effects: HashMap::new(),
             callable_dependencies: HashMap::new(),
             ambient_effect_seed: HashMap::new(),
             callable_effective_checked_effects: HashMap::new(),
@@ -2028,6 +2066,7 @@ impl<'program> Checker<'program> {
         self.collect_classes();
         self.collect_functions();
         self.apply_ambient_effect_seed();
+        self.check_instance_property_initializers();
         self.infer_return_borrow_signatures();
         self.infer_unannotated_move_return_signatures();
 
@@ -2078,7 +2117,7 @@ impl<'program> Checker<'program> {
     fn inferred_ambient_effects(&self) -> HashMap<Span, Vec<ResolvedType>> {
         let mut ambient = HashMap::<Span, Vec<ResolvedType>>::new();
         for (callable, effects) in self
-            .callable_effective_checked_effects
+            .callable_declared_checked_effects
             .iter()
             .chain(self.callable_observed_checked_effects.iter())
         {
@@ -2111,6 +2150,26 @@ impl<'program> Checker<'program> {
                 break;
             }
         }
+        ambient.retain(|_, effects| !effects.is_empty());
+        ambient
+    }
+
+    fn escaping_ambient_effects(&self) -> HashMap<Span, Vec<ResolvedType>> {
+        let mut ambient = HashMap::<Span, Vec<ResolvedType>>::new();
+        for (callable, effects) in self
+            .callable_declared_checked_effects
+            .iter()
+            .chain(self.callable_observed_checked_effects.iter())
+        {
+            let target = ambient.entry(*callable).or_default();
+            for effect in effects {
+                if crate::checked_effects::is_ambient_io_effect(effect) && !target.contains(effect)
+                {
+                    target.push(effect.clone());
+                }
+            }
+        }
+        ambient.retain(|_, effects| !effects.is_empty());
         ambient
     }
 
@@ -3183,13 +3242,14 @@ impl<'program> Checker<'program> {
         let params = self.resolve_param_infos(function, declaring_class);
         let return_ty = self.resolve_function_return_type(function, declaring_class);
         let checked_effects = self.resolve_throws_clause(function, declaring_class);
-        self.callable_effective_checked_effects.insert(
-            function.span,
-            checked_effects
-                .iter()
-                .map(|effect| self.types.resolved(*effect))
-                .collect(),
-        );
+        let resolved_checked_effects = checked_effects
+            .iter()
+            .map(|effect| self.types.resolved(*effect))
+            .collect::<Vec<_>>();
+        self.callable_declared_checked_effects
+            .insert(function.span, resolved_checked_effects.clone());
+        self.callable_effective_checked_effects
+            .insert(function.span, resolved_checked_effects);
         self.type_parameter_scopes.pop();
         self.current_callable = previous_callable;
         let return_borrow = self
@@ -4388,8 +4448,6 @@ impl<'program> Checker<'program> {
                                 "Static Initializer Cannot Throw",
                             );
                         }
-                    } else {
-                        self.check_property_initializer(&class_decl.name, property);
                     }
                 }
                 ClassMember::Constant(constant) => {
@@ -4408,7 +4466,10 @@ impl<'program> Checker<'program> {
         );
         if !has_constructor {
             if let Some(effects) = self.class_initializer_effects.get(&class_decl.name) {
-                if !effects.ordered.is_empty() {
+                let required = effects.ordered.iter().any(|effect| {
+                    !crate::checked_effects::is_ambient_io_effect(&self.types.resolved(*effect))
+                });
+                if required {
                     self.diagnostics.push(
                         Diagnostic::new(
                             "E0635",
@@ -4526,6 +4587,30 @@ impl<'program> Checker<'program> {
                 name: property.name.clone(),
             },
         );
+    }
+
+    fn check_instance_property_initializers(&mut self) {
+        let classes = self
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(class) => Some(class.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for class in classes {
+            self.type_parameter_scopes
+                .push(type_parameter_scope(&class.type_params));
+            for member in &class.members {
+                if let ClassMember::Property(property) = member {
+                    if !property.is_static {
+                        self.check_property_initializer(&class.name, property);
+                    }
+                }
+            }
+            self.type_parameter_scopes.pop();
+        }
     }
 
     fn declare_property(
@@ -13419,6 +13504,14 @@ impl<'program> Checker<'program> {
                     args.len(),
                     span,
                 );
+            }
+            if args.is_empty() {
+                let effects = self
+                    .class_initializer_effects
+                    .get(class_name)
+                    .map(|effects| effects.ordered.clone())
+                    .unwrap_or_default();
+                self.record_checked_effects(effects, span);
             }
             return;
         };

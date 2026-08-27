@@ -1286,6 +1286,90 @@ function main(): void
 }
 
 #[test]
+fn ambient_effect_fixpoint_preserves_catch_coverage_through_call_chains() {
+    let source = r#"
+function writeMessage(): void
+{
+    echo "handled";
+}
+
+function recover(): void
+{
+    try {
+        writeMessage();
+    } catch (Doria\Std\Io\IoError) {
+    }
+}
+
+function forward(): void
+{
+    recover();
+}
+
+function main(): void
+{
+    forward();
+}
+"#;
+
+    let hir = doriac::lower_source("ambient_catch_fixpoint.doria", source)
+        .expect("a locally caught ambient effect must not escape its callable");
+    let ambient_count = |name: &str| {
+        hir.items
+            .iter()
+            .find_map(|item| match item {
+                hir::Item::Function(function) if function.name == name => {
+                    Some(function.ambient_checked_effects.len())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} should exist in HIR"))
+    };
+    assert_eq!(ambient_count("writeMessage"), 1);
+    assert_eq!(ambient_count("recover"), 0);
+    assert_eq!(ambient_count("forward"), 0);
+    assert_eq!(ambient_count("main"), 0);
+
+    let unreachable = source.replace(
+        "forward();\n}",
+        "try { forward(); } catch (Doria\\Std\\Io\\IoError) {}\n}",
+    );
+    let diagnostics = doriac::check_source("ambient_catch_unreachable.doria", &unreachable)
+        .expect_err("a caller cannot catch an ambient effect already handled by its callee");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0629"));
+}
+
+#[test]
+fn ambient_property_initializers_use_the_implicit_constructor_transport() {
+    let source = r#"
+function initialValue(): string
+{
+    echo "init";
+    return "ready";
+}
+
+class Report
+{
+    string $value = initialValue();
+}
+
+function main(): void
+{
+    let $report = new Report();
+}
+"#;
+
+    let program = doriac::lower_source_to_mir("ambient_implicit_constructor.doria", source)
+        .expect("ambient-only property initialization must not require a boilerplate constructor");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("the implicit constructor must retain ambient checked transport");
+    assert_eq!(output.stdout, b"init");
+    assert_eq!(output.exit_status, 0);
+}
+
+#[test]
 fn top_level_ambient_effects_do_not_create_source_obligations() {
     let source = r#"
 echo "direct";

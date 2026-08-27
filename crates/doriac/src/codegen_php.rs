@@ -62,13 +62,32 @@ final class __DoriaCheckedError extends Exception
         return $this->error;
     }
 
-    public function __destruct()
+    public function dropError(): void
     {
         if ($this->__doriaLive && function_exists("__doria_drop_value")) {
             __doria_drop_value($this->error);
         }
         $this->__doriaLive = false;
     }
+
+    public function __destruct()
+    {
+        $this->dropError();
+    }
+}
+
+function __doria_detach_checked_error(__DoriaCheckedError $caught): __DoriaCheckedError
+{
+    $previous = $caught->getPrevious();
+    while ($previous instanceof __DoriaCheckedError) {
+        $previous->dropError();
+        $previous = $previous->getPrevious();
+    }
+    return new __DoriaCheckedError(
+        $caught->takeError(),
+        $caught->descriptor,
+        $caught->origin,
+    );
 }
 
 function __doria_error_descriptor(string $typeName): __DoriaErrorDescriptor
@@ -4162,6 +4181,39 @@ fn emit_block(block: &Block, output: &mut String, indent: usize, scopes: &mut Ph
     writeln(output, indent, "}");
 }
 
+fn emit_finalizer_error_boundary(
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+    emit_body: impl FnOnce(&mut String, usize, &mut PhpNameScopes),
+) {
+    let forwarded = scopes.fresh_temp("__doria_finalizer_error");
+    let caught = scopes.fresh_temp("__doria_finalizer_caught");
+    writeln(output, indent, &format!("${forwarded} = null;"));
+    writeln(output, indent, "try");
+    writeln(output, indent, "{");
+    emit_body(output, indent + 1, scopes);
+    writeln(output, indent, "}");
+    writeln(
+        output,
+        indent,
+        &format!("catch (__DoriaCheckedError ${caught})"),
+    );
+    writeln(output, indent, "{");
+    writeln(
+        output,
+        indent + 1,
+        &format!("${forwarded} = __doria_detach_checked_error(${caught});"),
+    );
+    writeln(output, indent + 1, &format!("unset(${caught});"));
+    writeln(output, indent, "}");
+    writeln(
+        output,
+        indent,
+        &format!("if (${forwarded} !== null) {{ throw ${forwarded}; }}"),
+    );
+}
+
 fn emit_with_finally(
     finally: &ControlFlowFinally,
     output: &mut String,
@@ -4169,14 +4221,16 @@ fn emit_with_finally(
     scopes: &mut PhpNameScopes,
     emit_body: impl FnOnce(&mut String, usize, &mut PhpNameScopes),
 ) {
-    writeln(output, indent, "try");
-    writeln(output, indent, "{");
-    scopes.push();
-    emit_body(output, indent + 1, scopes);
-    writeln(output, indent, "}");
-    writeln(output, indent, "finally");
-    emit_block(&finally.block, output, indent, scopes);
-    scopes.pop();
+    emit_finalizer_error_boundary(output, indent, scopes, |output, indent, scopes| {
+        writeln(output, indent, "try");
+        writeln(output, indent, "{");
+        scopes.push();
+        emit_body(output, indent + 1, scopes);
+        writeln(output, indent, "}");
+        writeln(output, indent, "finally");
+        emit_block(&finally.block, output, indent, scopes);
+        scopes.pop();
+    });
 }
 
 fn emit_statement(
@@ -4418,6 +4472,21 @@ fn emit_throw_statement(
 }
 
 fn emit_try_statement(
+    statement: &TryStmt,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    if statement.finally.is_some() {
+        emit_finalizer_error_boundary(output, indent, scopes, |output, indent, scopes| {
+            emit_try_statement_inner(statement, output, indent, scopes);
+        });
+    } else {
+        emit_try_statement_inner(statement, output, indent, scopes);
+    }
+}
+
+fn emit_try_statement_inner(
     statement: &TryStmt,
     output: &mut String,
     indent: usize,
@@ -5560,21 +5629,44 @@ fn emit_when_expression(
     let mut when_scopes = scopes.clone();
     when_scopes.push();
     let mut body = String::new();
-    let body_indent = if finally.is_some() { 2 } else { 1 };
-    if finally.is_some() {
-        writeln(&mut body, 1, "try");
-        writeln(&mut body, 1, "{");
+    if let Some(finally) = finally {
+        emit_finalizer_error_boundary(
+            &mut body,
+            1,
+            &mut when_scopes,
+            |body, indent, when_scopes| {
+                writeln(body, indent, "try");
+                writeln(body, indent, "{");
+                emit_when_branches(given, branches, body, indent + 1, when_scopes);
+                writeln(body, indent, "}");
+                writeln(body, indent, "finally");
+                emit_block(&finally.block, body, indent, when_scopes);
+            },
+        );
+    } else {
+        emit_when_branches(given, branches, &mut body, 1, &mut when_scopes);
     }
+    when_scopes.pop();
+    format!("(function(){capture_list} {{\n{body}}})()")
+}
+
+fn emit_when_branches(
+    given: Option<&GivenPrelude>,
+    branches: &[WhenBranch],
+    body: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
     let predicates = given
-        .map(|given| emit_given_setup(given, &mut body, body_indent, &mut when_scopes))
+        .map(|given| emit_given_setup(given, body, indent, scopes))
         .unwrap_or_default();
     let gate = if predicates.is_empty() {
         None
     } else {
-        let gate = when_scopes.fresh_temp("__doria_given_gate");
+        let gate = scopes.fresh_temp("__doria_given_gate");
         writeln(
-            &mut body,
-            body_indent,
+            body,
+            indent,
             &format!(
                 "${gate} = {};",
                 emit_bool_chain(predicates.iter().map(String::as_str))
@@ -5584,27 +5676,20 @@ fn emit_when_expression(
     };
 
     for (index, branch) in branches.iter().enumerate() {
-        write_indent(&mut body, body_indent);
+        write_indent(body, indent);
         if let Some(condition) = &branch.condition {
             body.push_str(if index == 0 { "if (" } else { "else if (" });
             if let Some(gate) = &gate {
                 body.push_str(gate);
                 body.push_str(" && ");
             }
-            body.push_str(&emit_expr(condition, &when_scopes));
+            body.push_str(&emit_expr(condition, scopes));
             body.push_str(")\n");
         } else {
             body.push_str("else\n");
         }
-        emit_block(&branch.block, &mut body, body_indent, &mut when_scopes);
+        emit_block(&branch.block, body, indent, scopes);
     }
-    if let Some(finally) = finally {
-        writeln(&mut body, 1, "}");
-        writeln(&mut body, 1, "finally");
-        emit_block(&finally.block, &mut body, 1, &mut when_scopes);
-    }
-    when_scopes.pop();
-    format!("(function(){capture_list} {{\n{body}}})()")
 }
 
 fn emit_match_expression(
