@@ -213,16 +213,35 @@ pub fn source_uses_io_intrinsics(source: &SourceFile) -> DiagnosticResult<bool> 
     let tokens = Lexer::new(source).lex()?;
     Ok(tokens.iter().enumerate().any(|(index, token)| {
         matches!(token.kind, TokenKind::Echo | TokenKind::Fn)
-            || (matches!(token.kind, TokenKind::Function)
-                && tokens
-                    .get(index + 1)
-                    .is_some_and(|next| matches!(next.kind, TokenKind::LeftParen)))
+            || starts_structural_function_type(&tokens, index)
             || match &token.kind {
                 TokenKind::Identifier(name) => crate::builtins::Builtin::from_name(name)
                     .is_some_and(|builtin| !builtin.checked_error_types().is_empty()),
                 _ => false,
             }
     }))
+}
+
+fn starts_structural_function_type(tokens: &[crate::lexer::Token], index: usize) -> bool {
+    if !tokens
+        .get(index)
+        .is_some_and(|token| matches!(token.kind, TokenKind::Function))
+    {
+        return false;
+    }
+    let next = index + 1;
+    if tokens
+        .get(next)
+        .is_some_and(|token| matches!(token.kind, TokenKind::LeftParen))
+    {
+        return true;
+    }
+    matches!(
+        tokens.get(next).map(|token| &token.kind),
+        Some(TokenKind::Writable | TokenKind::Once | TokenKind::Take | TokenKind::Readonly)
+    ) && tokens
+        .get(next + 1)
+        .is_some_and(|token| matches!(token.kind, TokenKind::LeftParen))
 }
 
 pub fn resolved_facts_use_canonical_io(facts: &GlobalSymbolFacts) -> bool {
@@ -399,6 +418,8 @@ mod tests {
     fn structural_callable_syntax_requests_canonical_io_transport_symbols() {
         for source in [
             "function invoke(function(): void $callback): void {}",
+            "function invoke(function writable(): void $callback): void {}",
+            "function invoke(function once(): void $callback): void {}",
             "function main(): void { let $callback = function (): void {}; }",
             "function main(): void { let $callback = fn() => 1; }",
         ] {

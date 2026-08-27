@@ -1394,6 +1394,27 @@ function main(): void
 }
 
 #[test]
+fn every_structural_invocation_mode_receives_ambient_transport_without_source_effects() {
+    for (name, source) in [
+        (
+            "readonly",
+            "function accept(function(): void $callback): void {}",
+        ),
+        (
+            "writable",
+            "function accept(function writable(): void $callback): void {}",
+        ),
+        (
+            "once",
+            "function accept(function once(): void $callback): void {}",
+        ),
+    ] {
+        doriac::check_source(format!("{name}_function_type.doria"), source)
+            .unwrap_or_else(|diagnostics| panic!("{name}: {diagnostics:#?}"));
+    }
+}
+
+#[test]
 fn fallible_finalizers_escape_same_try_catches_and_reach_outer_catches() {
     let source = format!(
         r#"
