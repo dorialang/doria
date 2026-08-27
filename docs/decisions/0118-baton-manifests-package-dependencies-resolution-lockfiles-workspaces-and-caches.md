@@ -3,10 +3,12 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-14
 - **Date:** 2026-08-14
-- **Implementation status:** Scheduled for Stage 33; not implemented
+- **Implementation status:** Scheduled for Stage 33 in the disposable PHP UX
+  bootstrap; Doria-native port and production cutover scheduled Pre-Stage-45
 - **Scope:** Baton's package manifest, dependency resolver, lockfile, workspace,
   processor, cache, and offline contracts
 - **Build-graph dependency:** Decision 0117
+- **Implementation ownership and release gate:** Decision 0124
 
 ## Context
 
@@ -17,6 +19,9 @@ resolution, or workspace semantics.
 
 This decision fixes the target model while preserving schema 1 exactly as it
 exists. No command or manifest behavior is implemented by this record.
+Decision 0124 fixes the implementation sequence: Stage 33 exercises this model
+in the disposable PHP bootstrap, then the mandatory Pre-Stage-45 transition
+ports the frozen behavior to production Doria Baton.
 
 ## Manifest Schema 2
 
@@ -258,10 +263,10 @@ to the network.
 
 ## Commands
 
-Stage 33 adds `install`, `add`, `remove`, `update`, `fetch`, `tree`, and `why`.
-Existing project commands remain `check`, `build`, `run`, and `test`. This
-decision does not add future commands to the PHP bootstrap command registry or
-make current diagnostics suggest unavailable commands.
+Stage 33 adds `install`, `add`, `remove`, `update`, `fetch`, `tree`, and `why` to
+the PHP UX bootstrap. Existing project commands remain `check`, `build`, `run`,
+and `test`. This decision does not add future commands before their owning Stage
+33 slice or make current diagnostics suggest unavailable commands.
 
 ## Stage Ownership
 
@@ -277,9 +282,17 @@ Stage 33 has three implementation slices:
 Stage 32 owns typed attribute metadata and the processor protocol, not automatic
 package processor orchestration. Stage 33 Slice 3 performs that orchestration.
 
-Stage 29 and the pre-Stage-30 closure grammar slice are complete. Stage 30
-closure semantics is next. Stage 33 is scheduled, not implemented, and does not
-move before Stage 32.
+All three Stage 33 slices run in `dorialang/baton-php` to validate and freeze
+the public contract. They do not promote PHP into Baton's permanent product
+identity. Decision 0124's Pre-Stage-45 transition creates the clean
+`dorialang/baton` repository, parity-ports every Stage 33 behavior to Doria,
+transfers production release assembly, removes the private PHP payload from
+archives, and blocks the unsuffixed `2026.03.1` release until cutover.
+
+Stage 31 is complete. Stage 32 is next. Stage 33 remains scheduled, not
+implemented, and does not move before Stage 32. The native port remains after
+Stage 44 so it can consume the accepted filesystem, process, FFI, and network
+foundations.
 
 ## Safe Deferrals
 
@@ -302,7 +315,10 @@ move before Stage 32.
 - Workspaces coordinate resolution without weakening package isolation.
 - The resolver can later accommodate native and binary artifacts without being
   redesigned around Git-only assumptions.
-- The bootstrap remains small and honest until Stage 33 implements this model.
+- The bootstrap remains direct and disposable while Stage 33 implements and
+  exercises this model; permanent abstractions belong to the Doria-native port.
+- The production implementation cannot diverge silently because cutover is
+  gated by one shared observable-behavior suite.
 
 ## Non-Goals
 

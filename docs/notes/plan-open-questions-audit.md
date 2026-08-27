@@ -32,7 +32,7 @@
 
 ## Already settled / correctly scheduled (not open — do not re-decide)
 
-Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Closures are no longer in that list: decision 0120 requires explicit `with` capture lists for arrows and anonymous block functions; the pre-Stage-30 grammar slice is complete and owns accepted lexer/parser/AST syntax under the two-clocks rule, while Stage 30 still owns `$this`, mode validation, callable-effect inference, environment ABI, HIR/MIR, and execution. Checked errors are complete under decision 0119 across all three Stage 29 slices. Namespace/package-graph authority and Baton's manifest/resolver authority are settled by decisions 0117 and 0118. Enums and complete core match are settled by decisions 0114 and 0115. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
+Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Closures are no longer in that list: decision 0120 requires explicit `with` capture lists for arrows and anonymous block functions; the pre-Stage-30 grammar slice is complete and owns accepted lexer/parser/AST syntax under the two-clocks rule, while Stage 30 still owns `$this`, mode validation, callable-effect inference, environment ABI, HIR/MIR, and execution. Checked errors are complete under decision 0119 across all three Stage 29 slices. Namespace/package-graph authority and Baton's manifest/resolver authority are settled by decisions 0117 and 0118; decision 0124 separately settles the PHP UX-bootstrap role, mandatory Pre-Stage-45 Doria-native transition, parity cutover, and unsuffixed `2026.03.1` release blocker. Enums and complete core match are settled by decisions 0114 and 0115. The versioning scheme (§11) is fully specified in-plan. The reflection stance (attributes decision) is decided in principle (compile-time derive = yes; dynamic reflection = no). These are **authoring tasks, not open questions**, and are out of scope for this audit.
 
 ## Open questions (answerable now)
 
@@ -73,7 +73,10 @@ implementation by itself. Both Stage 31 slices are complete: namespace/import
 syntax, canonical resolution, the edition prelude, compiler context, build-plan
 package graphs, include resolution, package visibility, and multi-source
 lowering are implemented. Stage 32 is next; Stage 33 remains scheduled in three
-slices. Stage 30 is complete and E0641 remains historical and reserved.
+slices in the disposable PHP UX bootstrap. Decision 0124 separately binds the
+Pre-Stage-45 Doria-native port, parity and release cutover, and the unsuffixed
+`2026.03.1` blocker. Stage 30 is complete and E0641 remains historical and
+reserved.
 
 ## Proposed deliverable path
 `docs/notes/plan-open-questions-audit.md` (this file), under "supporting context" per `docs/information-architecture.md`. Not a decision record — every item is a stop-and-ask for Andrew.

@@ -93,3 +93,35 @@ Role:
 - Never active in parallel with the end-to-end plan.
 
 Superseded planning documents should be short redirects when their old paths are still useful to preserve. They should not keep large stale bodies below the redirect text.
+
+## Duplication And Drift Control
+
+Documentation is split only when the new file has a distinct authority role
+that the existing hierarchy cannot serve. A smaller context window, a shorter
+prompt, or convenience for one implementation beat is not sufficient reason to
+create another planning document.
+
+The following facts belong together in the master end-to-end plan whenever
+they change sequencing:
+
+- the product target;
+- the temporary implementation or migration state;
+- the owning repository and implementation language;
+- prerequisites and the exact stage or beat;
+- compatibility, cutover, and release gates;
+- what is retired or frozen after transition.
+
+A supporting note may explain one of those facts, but may not be the only place
+that records it. An unnumbered "later", "eventually", "exit strategy", or
+"follow-up" is not scheduled work. If the work is required for the target
+state, the master plan names its owner, position, and acceptance gate.
+
+Before adding or updating a lifecycle rule, sweep the entire workspace for the
+old and new claims, including other Doria repositories. Update the master plan
+and accepted decision first, then every derivative summary. Where drift has
+already caused a divergent product picture, add a mechanical documentation
+check for the load-bearing facts instead of relying only on future memory.
+
+Public target-state documentation may omit temporary machinery, but it must not
+contradict the scheduled cutover or identify a bootstrap implementation as the
+permanent product.
