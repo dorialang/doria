@@ -66,7 +66,8 @@ function check_stage32_attributes(string $root): array
         '**Status:** Accepted',
         '**Implementation Status:** Implemented By Stage 32',
         'Applying an attribute never constructs the class',
-        'Stage 33 Slice 1',
+        'Stage 33 Slices 1 and 2',
+        'Stage 33 Slice 3',
         'Stage 41',
     ]);
     $require($paths['batonDecision'], $files['batonDecision'], ['**Status:** Accepted']);
@@ -79,6 +80,8 @@ function check_stage32_attributes(string $root): array
             'Stage 33 Slice 1',
             'Complete',
             'Stage 33 Slice 2',
+            'Complete',
+            'Stage 33 Slice 3',
             'Next',
             'E0632',
             'E0641',

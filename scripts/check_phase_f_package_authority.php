@@ -34,6 +34,7 @@ $forbid = static function (string $path, string $contents, array $needles) use (
 $namespacePath = 'docs/decisions/0117-namespaces-compile-time-autoloading-hybrid-source-layout-and-package-compilation-graphs.md';
 $batonPath = 'docs/decisions/0118-baton-manifests-package-dependencies-resolution-lockfiles-workspaces-and-caches.md';
 $slice1Path = 'docs/decisions/0126-baton-schema-2-local-package-target-and-selection-spellings.md';
+$slice2Path = 'docs/decisions/0127-baton-dependency-resolution-lockfile-cache-and-offline-semantics.md';
 $planPath = 'docs/doria-end-to-end-plan.md';
 $pipelinePath = 'docs/notes/current-pipeline.md';
 $auditPath = 'docs/notes/plan-open-questions-audit.md';
@@ -46,6 +47,7 @@ $websiteGuidelinesPath = 'docs/website-content-guidelines.md';
 $namespace = $read($namespacePath);
 $baton = $read($batonPath);
 $slice1 = $read($slice1Path);
+$slice2 = $read($slice2Path);
 $plan = $read($planPath);
 $pipeline = $read($pipelinePath);
 $audit = $read($auditPath);
@@ -131,8 +133,9 @@ $require($batonPath, $baton, [
     'global content-addressed dependency cache',
     'Offline mode never reaches the network',
     'Stage 33 has three implementation slices',
-    'Stage 33 Slice 1 are complete',
-    'Stage 33 Slice 2 is next',
+    'Stage 33 Slices 1 and 2 are complete',
+    'Stage 33 Slice 3 is',
+    'next',
     'Stage 33 is in progress and not complete',
 ]);
 $require($slice1Path, $slice1, [
@@ -145,7 +148,25 @@ $require($slice1Path, $slice1, [
     '[[targets.binary]]',
     '--binary <name>',
     '--library',
-    'Stage 33 Slice 2 owns',
+    'Decision 0127 owns the implemented path',
+    'Stage 33 Slice 3 is next',
+]);
+$require($slice2Path, $slice2, [
+    '**Status:** Accepted',
+    '**Implementation Status:** Implemented By Stage 33 Slice 2',
+    '**Amends:** Decisions 0118, 0124, and 0126',
+    '[dependencies]',
+    'Path dependencies are live inputs',
+    'Git dependencies require scoped package',
+    'One resolved graph contains one node for each compiler package identity',
+    '`Baton.lock` uses strict deterministic JSON schema 1',
+    '`baton install`',
+    '`baton add`',
+    '`baton remove`',
+    '`baton update`',
+    '`baton fetch`',
+    'Offline behavior is one resolver-level network policy',
+    'Stage 33 Slice 3 is next',
 ]);
 
 $require($planPath, $plan, [
@@ -167,7 +188,8 @@ $require($pipelinePath, $pipeline, [
     'Stage 31 — Complete',
     'Stage 32 — Complete',
     'Stage 33 Slice 1 — Complete',
-    'Stage 33 Slice 2 — Next',
+    'Stage 33 Slice 2 — Complete',
+    'Stage 33 Slice 3 — Next',
     'Stage 33 — In Progress, Not Complete',
 ]);
 $require($auditPath, $audit, [
@@ -185,15 +207,19 @@ $require($decision0115Path, $decision0115, [
 $require($specPath, $spec, [
     'Decision 0117 defines compile-time autoloading',
     'Decision 0126 fixes schema-2 local/scoped package identity',
+    'Decision 0127 fixes the implemented normal path/Git dependency resolver',
     'The public manifest term `autoload`',
     '`internal` is accessible throughout',
 ]);
 $require($readmePath, $readme, [
-    'Baton is the accepted project and package tool for Doria',
-    'Baton accepts exact schema 1 projects',
-    'schema 2 manifests with local/scoped package identity',
-    'executables will never',
-    'search for or load source files at runtime',
+    "Baton is Doria's accepted project and package tool",
+    'exact schema 1 compatibility',
+    'strict schema 2',
+    'projects with local/scoped package identity',
+    'normal path or Git dependencies',
+    '`Baton.lock` files pin exact Git commits',
+    'neither compiled programs',
+    'nor the compiler search for project source',
 ]);
 $require($websiteGuidelinesPath, $websiteGuidelines, [
     '## Package And Autoload Positioning',
@@ -220,9 +246,13 @@ $forbid($readmePath, $readme, [
     'dependency resolution is recorded in JSON `Baton.lock`',
     'workspaces share one lockfile',
 ]);
+$forbid($planPath, $plan, [
+    'Stage 33 Slice 2 — Next',
+    'Stage 33 Slice 2 is next',
+]);
 
 foreach (['Andrew', 'Lucy', 'Masiye'] as $privateName) {
-    foreach ([$namespacePath => $namespace, $batonPath => $baton, $slice1Path => $slice1] as $path => $contents) {
+    foreach ([$namespacePath => $namespace, $batonPath => $baton, $slice1Path => $slice1, $slice2Path => $slice2] as $path => $contents) {
         if (str_contains($contents, $privateName)) {
             $failures[] = "{$path}: contains private or family name `{$privateName}`";
         }

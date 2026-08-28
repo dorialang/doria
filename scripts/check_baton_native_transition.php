@@ -48,9 +48,9 @@ function check_baton_native_transition(string $root): array
     }
 
     $require($paths['readme'], $files['readme'], [
-        'Doria-native project and package tool',
+        'production implementation will live in the clean',
         '`dorialang/baton`',
-        'require no Baton PHP runtime or Composer payload',
+        'to install PHP or Composer',
     ]);
 
     $require($paths['decision'], $files['decision'], [

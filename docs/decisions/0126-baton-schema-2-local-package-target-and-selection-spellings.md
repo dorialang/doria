@@ -169,11 +169,13 @@ invent an archive format, or create a placeholder artifact. `baton run
 
 ## Slice Boundaries
 
-Stage 33 Slice 1 is complete. Stage 33 Slice 2 owns path and Git dependency
-resolution, package SemVer constraints, one-version conflicts, deterministic
-`Baton.lock`, dependency commands, the global content-addressed cache, and
-offline resolution. Stage 33 Slice 3 owns workspaces, development orchestration,
-tests, processors, generated-source writes, and Phase F closure.
+Stage 33 Slices 1 and 2 are complete. Decision 0127 owns the implemented path
+and Git dependency resolver, package SemVer validation, one-version conflicts,
+strict deterministic `Baton.lock`, dependency commands, global
+content-addressed cache, offline policy, multi-package plans, and receipt
+identities. Stage 33 Slice 3 is next and owns workspaces, development
+orchestration, graph commands, tests, processors, generated-source writes, and
+Phase F closure.
 
 Stage 33 remains in progress and is not complete. The PHP bootstrap remains a
 temporary UX oracle. Decision 0124's Pre-Stage-45 transition must port the
@@ -189,12 +191,13 @@ payload from production archives, and pass parity before the unsuffixed
 - Source discovery is deterministic and secure across supported host filesystems.
 - Schema 1 users retain exact compatibility while new projects use schema 2.
 - A library can be checked before Doria has a public native library artifact.
-- Dependency, workspace, test, and processor behavior is not claimed early.
+- Dependency behavior is implemented without claiming workspace, graph-command,
+  test, or processor behavior early.
 
 ## Invalidated Elsewhere
 
-- `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md`: Slice 1 is
-  complete, Slice 2 is next, and Stage 33 is in progress rather than unimplemented.
+- `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md`: Slices 1
+  and 2 are complete, Slice 3 is next, and Stage 33 remains in progress.
 - Decisions 0117, 0118, and 0124: deferred spellings and implementation status.
 - `SPEC.md` and `README.md`: current Baton schema-2 project behavior.
 - Doria authority guards: decision existence, public spellings, implementation
