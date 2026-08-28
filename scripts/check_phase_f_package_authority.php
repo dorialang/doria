@@ -33,6 +33,7 @@ $forbid = static function (string $path, string $contents, array $needles) use (
 
 $namespacePath = 'docs/decisions/0117-namespaces-compile-time-autoloading-hybrid-source-layout-and-package-compilation-graphs.md';
 $batonPath = 'docs/decisions/0118-baton-manifests-package-dependencies-resolution-lockfiles-workspaces-and-caches.md';
+$slice1Path = 'docs/decisions/0126-baton-schema-2-local-package-target-and-selection-spellings.md';
 $planPath = 'docs/doria-end-to-end-plan.md';
 $pipelinePath = 'docs/notes/current-pipeline.md';
 $auditPath = 'docs/notes/plan-open-questions-audit.md';
@@ -44,6 +45,7 @@ $websiteGuidelinesPath = 'docs/website-content-guidelines.md';
 
 $namespace = $read($namespacePath);
 $baton = $read($batonPath);
+$slice1 = $read($slice1Path);
 $plan = $read($planPath);
 $pipeline = $read($pipelinePath);
 $audit = $read($auditPath);
@@ -129,7 +131,21 @@ $require($batonPath, $baton, [
     'global content-addressed dependency cache',
     'Offline mode never reaches the network',
     'Stage 33 has three implementation slices',
-    'Stage 33 is scheduled, not implemented',
+    'Stage 33 Slice 1 are complete',
+    'Stage 33 Slice 2 is next',
+    'Stage 33 is in progress and not complete',
+]);
+$require($slice1Path, $slice1, [
+    '**Status:** Accepted',
+    '**Implementation Status:** Implemented By Stage 33 Slice 1',
+    '**Amends:** Decisions 0117, 0118, and 0124',
+    'publishable = false',
+    'local/<name>',
+    '[targets.library]',
+    '[[targets.binary]]',
+    '--binary <name>',
+    '--library',
+    'Stage 33 Slice 2 owns',
 ]);
 
 $require($planPath, $plan, [
@@ -150,8 +166,9 @@ $require($pipelinePath, $pipeline, [
     'Stage 31 Slice 2 — Complete',
     'Stage 31 — Complete',
     'Stage 32 — Complete',
-    'Stage 33 Slice 1 — Next',
-    'Stage 33 — Scheduled, Not Implemented',
+    'Stage 33 Slice 1 — Complete',
+    'Stage 33 Slice 2 — Next',
+    'Stage 33 — In Progress, Not Complete',
 ]);
 $require($auditPath, $audit, [
     'Resolved. Decision 0117',
@@ -167,13 +184,14 @@ $require($decision0115Path, $decision0115, [
 ]);
 $require($specPath, $spec, [
     'Decision 0117 defines compile-time autoloading',
+    'Decision 0126 fixes schema-2 local/scoped package identity',
     'The public manifest term `autoload`',
     '`internal` is accessible throughout',
 ]);
 $require($readmePath, $readme, [
     'Baton is the accepted project and package tool for Doria',
-    'bootstrap reads manifest schema 1 only',
-    'accepted target adds schema 2',
+    'Baton accepts exact schema 1 projects',
+    'schema 2 manifests with local/scoped package identity',
     'executables will never',
     'search for or load source files at runtime',
 ]);
@@ -204,7 +222,7 @@ $forbid($readmePath, $readme, [
 ]);
 
 foreach (['Andrew', 'Lucy', 'Masiye'] as $privateName) {
-    foreach ([$namespacePath => $namespace, $batonPath => $baton] as $path => $contents) {
+    foreach ([$namespacePath => $namespace, $batonPath => $baton, $slice1Path => $slice1] as $path => $contents) {
         if (str_contains($contents, $privateName)) {
             $failures[] = "{$path}: contains private or family name `{$privateName}`";
         }

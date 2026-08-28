@@ -77,6 +77,8 @@ function check_stage32_attributes(string $root): array
             'Stage 31',
             'Stage 32',
             'Stage 33 Slice 1',
+            'Complete',
+            'Stage 33 Slice 2',
             'Next',
             'E0632',
             'E0641',

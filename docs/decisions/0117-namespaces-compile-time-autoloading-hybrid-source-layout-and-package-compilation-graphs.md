@@ -4,12 +4,12 @@
 - **Accepted:** 2026-08-14
 - **Date:** 2026-08-14
 - **Implementation status:** Stage 31 Slices 1 and 2 implemented; Stage 31
-  Complete; Stage 33 PHP Product-Contract Work Scheduled, Not Implemented;
+  Complete; Stage 33 Slice 1 Implemented In The PHP Product-Contract Bootstrap;
   Pre-Stage-45
   Doria-Native Baton Transition Scheduled By Decision 0124
 - **Current pipeline:** Stage 30 — Complete; Stage 31 Slice 1 — Complete;
   Stage 31 Slice 2 — Complete; Stage 31 — Complete; Stage 32 — Complete;
-  Stage 33 Slice 1 — Next;
+  Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Next;
   E0641, E0671, And E0672 — Historical And Reserved
 - **Scope:** Package source discovery, file layout, compilation inputs, package
   visibility, and the Baton-to-compiler boundary
@@ -226,14 +226,16 @@ The canonical publishable identity is lowercase `vendor/package`, for example
 package named `acme/http` may expose `Acme\Web`. Neither is derived from the
 other.
 
-An unscoped short name is allowed only for a package explicitly marked local
-and non-publishable. The exact manifest spelling is deferred to Stage 33 Slice
-1 without reopening this rule.
+An unscoped short name is allowed only with explicit `publishable = false`.
+Baton maps it to the reserved synthetic compiler identity `local/<name>` while
+retaining the unscoped manifest name in user-facing output. Decision 0126 owns
+the exact spelling without reopening package/namespace separation.
 
 A package may have at most one library target, zero or more binary targets, and
 a future PHP-library target under the existing `php-lib` direction. The common
-single-binary shorthand remains `kind = "binary"` with one `entry`. Additional
-target-table spellings are a bounded Stage 33 Slice 1 decision.
+single-binary shorthand remains `kind = "binary"` with one `entry`. Decision
+0126 fixes `[targets.library]`, `[[targets.binary]]`, `--library`, and
+`--binary <name>` as the additional target and selection spellings.
 
 ## Package-Wide `internal`
 
@@ -370,8 +372,8 @@ edition prelude, compiler package/source context, and namespace-aware backend
 execution. Stage 31 Slice 2 implements the versioned build plan, complete
 package graph, package-wide visibility, strict source layout, include-once,
 multi-source diagnostics and lowering, backend execution, and in-memory
-incremental inputs. Stages 31 and 32 are complete. Stage 33 Slice 1 is next;
-Stage 33 remains otherwise scheduled and not implemented, and freezes the product contract in
+incremental inputs. Stages 31 and 32 and Stage 33 Slice 1 are complete; Stage 33
+Slice 2 is next. Stage 33 remains In Progress, Not Complete, and freezes the product contract in
 `dorialang/baton-php` rather than selecting Baton's permanent implementation
 language. The mandatory native transition remains separately scheduled before
 Stage 45.
@@ -380,8 +382,6 @@ Stage 45.
 
 | Item | Owner | Reopens | Fixed constraint |
 | --- | --- | --- | --- |
-| Additional target-table names | Baton | Stage 33 Slice 1 | One library and zero-or-more binaries |
-| Non-publishable field spelling | Baton | Stage 33 Slice 1 | Short names are local-only |
 | Package re-exports | Language and package graph | Separate post-v1 decision | Direct dependency visibility remains the default |
 | Module initialization | Language and compiler | Separate decision | Discovery order has no runtime meaning |
 | Workspace package-selection flags | Baton CLI | Stage 33 Slice 3 | Selection cannot merge package boundaries |
@@ -400,8 +400,9 @@ Stage 45.
 
 ## Non-Goals
 
-Stage 31 implements the compiler-owned portions of this decision. Baton manifest
-schema 2, autoload discovery, dependency resolution, lockfiles, workspaces,
-processors, package caches, and registry behavior remain Stage 33 work in the
-PHP UX bootstrap. Porting that completed behavior to production Doria Baton is
-owned by Decision 0124's Pre-Stage-45 transition.
+Stage 31 implements the compiler-owned portions of this decision. Stage 33 Slice
+1 implements Baton manifest schema 2, autoload discovery, targets, source scopes,
+and single-package plans under Decision 0126. Dependency resolution, lockfiles,
+workspaces, processors, package caches, and registry behavior remain later Stage
+33 work in the PHP UX bootstrap. Porting the completed behavior to production
+Doria Baton is owned by Decision 0124's Pre-Stage-45 transition.

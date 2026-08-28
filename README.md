@@ -210,10 +210,12 @@ and writes no generated source. See
 [`docs/attribute-metadata-protocol.md`](docs/attribute-metadata-protocol.md).
 
 Baton is the accepted project and package tool for Doria. It is the Doria-native project and package tool
-maintained in the `dorialang/baton` repository. The current bootstrap reads manifest schema 1 only; the
-accepted target adds schema 2 with package identity, targets, compile-time `autoload`
-mappings, dependencies, development dependencies, and explicit processors. Baton
-produces a versioned build plan for `doriac`. Compiled executables will never search for or load source files at runtime.
+maintained in the `dorialang/baton` repository. Baton accepts exact schema 1 projects and
+schema 2 manifests with local/scoped package identity, binary and library targets, target
+selection, and compile-time `autoload`/`autoload-dev` source discovery. It emits versioned
+build plans for `doriac`. Compiled executables will never search for or load source files at runtime.
+Decision 0118 separately defines dependency resolution, workspaces, tests, and
+processor orchestration.
 Package versions use SemVer, deterministic resolution is recorded in JSON
 `Baton.lock`, and each workspace has one root lockfile without merging package
 `internal` boundaries. Production toolchains ship the native Baton executable

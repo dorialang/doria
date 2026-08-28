@@ -275,8 +275,8 @@ orchestration and generated-source graph insertion.
 - `SPEC.md` section 11 and `docs/executable-initializers-and-attributes.md` no
   longer describe attribute evaluation as unsettled or runtime-lowered.
 - `docs/doria-end-to-end-plan.md`, `README.md`, and
-  `docs/notes/current-pipeline.md` record Stage 32 complete and Stage 33 Slice 1
-  next.
+  `docs/notes/current-pipeline.md` record Stage 32 and Stage 33 Slice 1 complete
+  and Stage 33 Slice 2 next.
 - Decisions 0084 and 0098 record their implemented Stage 32 consumers.
 - Decision 0118 records that Stage 32 supplies the metadata/protocol boundary
   while Stage 33 Slice 3 owns execution and generated-source orchestration.
