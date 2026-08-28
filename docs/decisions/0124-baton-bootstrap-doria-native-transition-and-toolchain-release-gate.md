@@ -3,7 +3,8 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-27
 - **Date:** 2026-08-27
-- **Implementation Status:** PHP Bootstrap Active; Stage 33 And Pre-Stage-45 Transition Scheduled
+- **Implementation Status:** PHP Bootstrap Active; Stage 33 Slice 1 Implemented;
+  Stage 33 Slice 2 Next; Pre-Stage-45 Transition Scheduled
 - **Amends:** Decision 0118's implementation ownership and the Stage 33 plan
 - **Preserves:** Decisions 0117 and 0118's public manifest, package-graph, resolver, lockfile, workspace, cache, processor, and offline contracts
 
@@ -36,6 +37,12 @@ It may implement the complete accepted Stage 33 project, package, build, test,
 dependency, workspace, cache, lockfile, processor, and offline workflow. This
 work is not an investment in permanent PHP internals: it validates and freezes
 the durable user experience against real compiler and editor integrations.
+
+Decision 0126 records Stage 33 Slice 1 Complete: schema compatibility,
+schema-2 local/scoped identity, targets and selectors, deterministic autoload
+discovery, and single-package build plans now execute in the bootstrap. Slice 2
+is next, Stage 33 remains in progress and not complete, and none of that changes
+the required Doria-native cutover.
 
 Bootstrap implementation choices are never public contracts. The durable
 contract comprises observable behavior:
@@ -162,4 +169,3 @@ Planning checks must fail if they cannot find all of these facts together:
 3. The port is parity-gated against shared observable fixtures.
 4. Production archives drop PHP, Composer, the PHAR, and the private runtime.
 5. The unsuffixed `2026.03.1` release is blocked on the native cutover.
-

@@ -130,7 +130,7 @@ See Decision 0116 for the current control-flow authority.
 
 ### Source organization and compiler directives
 
-The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. Baton discovery and package resolution remain separate Stage 33 responsibilities.
+The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. Baton Slice 1 discovery and single-package planning are implemented; dependency resolution remains a separate Stage 33 Slice 2 responsibility.
 
 Namespaces define logical symbol ownership and declaration scope. They are part of semantic name resolution, not source inclusion, package resolution, build orchestration, or runtime loading.
 
@@ -198,6 +198,16 @@ independent of Doria namespace identity. `internal` is accessible throughout
 one package, including package-owned development sources, but not from another
 package or merely another member of the same workspace. Only direct declared
 dependencies are source-visible.
+
+Manifest schema 2 accepts scoped packages, which are publishable by default,
+and unscoped local packages only with explicit `publishable = false`. Baton maps
+a local manifest name to the reserved compiler identity `local/<name>` without
+deriving it from a namespace or path. The single-binary shorthand remains
+package-level `kind = "binary"` plus `entry`; explicit targets use
+`[targets.library]` and `[[targets.binary]]`. Ambiguous commands select with
+`--library` or `--binary <name>`; Doria has no generic Baton `--target` option or
+manifest `default-target`. A library build checks the complete plan and records
+`artifact: null` until a public native library artifact is separately defined.
 
 In package mode, only a selected binary entry file may contain top-level
 executable statements. Library, autoloaded non-entry, development, generated,

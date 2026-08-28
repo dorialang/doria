@@ -28,7 +28,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Decision 0122 is accepted and implemented. Direct constructor `$this` is a construction root rather than a writable receiver; definitely initialized writable intermediates grant ordinary nested writable access. Owned values initialize owning properties and replace initialized writable owning properties through explicit validated MIR write kinds with acquire-before-drop behavior. E0472 is historical for move-in and remains only on the separate move-out boundary.
 - Phase F namespace, autoload, package, and dependency authority is accepted under decisions 0117 and 0118. Stage 31 is complete. Slice 1 provides namespace/import/include grammar, canonical resolution, the edition-2026 prelude, and package/source identity. Slice 2 provides strict schema-1 JSON build plans, explicit multi-package source graphs, recursive include-once, direct and development dependency visibility, package-wide `internal`, strict hybrid layout, declaration-only non-entry sources, cross-file diagnostics, multi-source HIR/MIR/backend execution, and in-memory compiler fingerprints and invalidation. The public source-discovery term is `autoload`; Baton passes plans to `doriac`, while `doriac` never parses `Baton.toml` or discovers package inventories. E0671 and E0672 have no live route and remain historical and reserved.
 - Stage 32 is complete under Decision 0125. Adjacent `#[...]` groups, typed attribute classes and applications, canonical package-aware name resolution, bounded constant-tier arguments, semantic/HIR metadata, deterministic `doriac metadata` output, and the strict processor request/response protocol are implemented. Attributes add no MIR/runtime representation or reflection, and Stage 32 does not discover or execute processors.
-- Stage 33 is scheduled in three slices in the disposable PHP UX bootstrap and is not implemented. Slice 1 is next. Decision 0124 schedules the parity-gated port to the clean Doria-native `dorialang/baton` repository, production release-ownership transfer, and PHP-free archive cutover as a mandatory Pre-Stage-45 beat; the unsuffixed `2026.03.1` release is blocked until it completes.
+- Stage 33 is in progress in the disposable PHP UX bootstrap. Slice 1 is complete under Decision 0126: exact schema 1 compatibility, strict schema 2, local/scoped package identity, binary/library targets and selectors, autoload/autoload-dev discovery, deterministic source inventories, compiler build plans, target-scoped layouts, and receipts are implemented. Slice 2 dependency resolution and lockfiles are next; workspaces, tests, and processors remain Slice 3. Decision 0124 schedules the parity-gated port to the clean Doria-native `dorialang/baton` repository, production release-ownership transfer, and PHP-free archive cutover as a mandatory Pre-Stage-45 beat; the unsuffixed `2026.03.1` release is blocked until it completes.
 - Stage 25a Slices 1 through 4 are implemented and Stage 25a is complete. The readonly `SharedReference<T>` / `WeakReference<T>` family and the permanently disjoint writable family lower through validated MIR to the interpreter, Cranelift, LLVM, and separate `doria-rt` control structures. `WritableSharedReference<T>` executes class, generic-class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through owned readonly/writable access objects. One access state is shared by every writable-family handle to an allocation; access objects move through returns, parameters, properties, and collection slots; nullable strong, weak, and readonly/writable access forms remain in-family and lazy; and destruction releases access before strong ownership. P1501 carries one of the three exact Decision 0106 conflict conditions as a typed runtime fact. The allocation-free `referencedValue` projection resolves wrapper/payload collisions without changing either ownership count, and durable weak-cycle and bounded-stress fixtures agree across all native paths. Scalar/string payload access and all shared handles through `mixed` remain runtime-pending rather than being given an invented value projection or misrepresented as class pointers. The PHP backend still refuses shared ownership.
 - PHP Stream And I/O Completeness Audit — Implemented. The canonical human
   artifact expands `docs/notes/io-surface-audit.md`; the stored 153-row PHP
@@ -188,6 +188,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Decision 0121 — Accepted; Stage 30 Closure Authority.
 - Decision 0124 — Accepted; Baton Bootstrap, Doria-Native Transition, And Toolchain Release Gate.
 - Decision 0125 — Accepted And Implemented; Typed Attributes, Const-Evaluated Metadata, And Processor Protocol.
+- Decision 0126 — Accepted And Implemented; Baton Schema 2 Local Package, Target, And Selection Spellings.
 - Stage 29 — Complete.
 - Stage 29 Slice 1 — Complete.
 - Stage 29 Slice 2 — Complete.
@@ -213,8 +214,9 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Ambient I/O And Fallible Finalizer Corrective Beat — Complete.
 - E0632 — Historical And Reserved.
 - Stage 32 — Complete.
-- Stage 33 Slice 1 — Next.
-- Stage 33 — Scheduled, Not Implemented.
+- Stage 33 Slice 1 — Complete.
+- Stage 33 Slice 2 — Next.
+- Stage 33 — In Progress, Not Complete.
 - Pre-Stage-45 Doria-Native Baton Transition — Scheduled, Mandatory Before Unsuffixed `2026.03.1`.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36a — Scheduled, Not Implemented.
