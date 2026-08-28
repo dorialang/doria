@@ -113,13 +113,33 @@ function check_stage33_slice1_baton_authority(string $root): array
         'require no Baton PHP runtime or Composer payload',
     ]);
 
-    foreach (['plan', 'pipeline', 'namespaceDecision', 'packageDecision'] as $key) {
-        $forbid($paths[$key], $files[$key], [
-            'Stage 33 Slice 1 — Next',
-            'Stage 33 Slice 1 is next',
-            'Stage 33 — Scheduled, Not Implemented',
-            'Stage 33 is scheduled, not implemented',
-        ]);
+    $staleStatuses = [
+        'Stage 33 Slice 1 — Next',
+        'Stage 33 Slice 1 is next',
+        'Stage 33 — Scheduled, Not Implemented',
+        'Stage 33 is scheduled, not implemented',
+        'Stage 33 remains scheduled',
+        'Slice 1 is next',
+        'with Slice 1 next',
+    ];
+    foreach (['docs', 'scripts'] as $directory) {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($root . '/' . $directory, FilesystemIterator::SKIP_DOTS),
+        );
+        foreach ($iterator as $entry) {
+            if (!$entry->isFile() || !in_array($entry->getExtension(), ['md', 'php'], true)) {
+                continue;
+            }
+            $path = substr($entry->getPathname(), strlen($root) + 1);
+            if ($path === 'scripts/check_stage33_slice1_baton_authority.php') {
+                continue;
+            }
+            $contents = $read($path);
+            if (!str_contains($contents, 'Stage 33')) {
+                continue;
+            }
+            $forbid($path, $contents, $staleStatuses);
+        }
     }
 
     return $failures;
