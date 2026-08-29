@@ -51,7 +51,6 @@ function check_stage30h_closure_completion(string $root): array
             'E0641',
             'Historical',
             'Stage 31',
-            'Next',
         ]);
     }
     $require($paths['spec'], $files['spec'], [

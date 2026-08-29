@@ -12,6 +12,7 @@ use crate::source::Span;
 use crate::types::ResolvedType;
 
 pub const ATTRIBUTE_METADATA_SCHEMA_VERSION: u32 = 1;
+pub const ATTRIBUTE_METADATA_SCHEMA_VERSION_2: u32 = 2;
 pub const ATTRIBUTE_PROCESSOR_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -198,6 +199,47 @@ pub struct AttributeMetadataDocumentV1 {
     pub sources: Vec<MetadataSourceV1>,
     pub attribute_classes: Vec<MetadataAttributeClassV1>,
     pub applications: Vec<MetadataApplicationV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttributeMetadataDocumentV2 {
+    pub schema_version: u32,
+    pub edition: String,
+    pub compiler_revision: String,
+    pub graph_fingerprint: String,
+    pub selected_target: MetadataTargetV1,
+    pub packages: Vec<MetadataPackageV1>,
+    pub sources: Vec<MetadataSourceV1>,
+    pub attribute_classes: Vec<MetadataAttributeClassV1>,
+    pub applications: Vec<MetadataApplicationV1>,
+    pub callables: Vec<MetadataCallableV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetadataCallableV2 {
+    pub identity: String,
+    pub canonical_name: String,
+    pub kind: String,
+    pub package: String,
+    pub source: String,
+    pub access: String,
+    pub generic_parameter_count: usize,
+    pub parameters: Vec<MetadataCallableParameterV2>,
+    pub return_type: String,
+    pub required_effects: Vec<String>,
+    pub ambient_effects: Vec<String>,
+    pub location: MetadataLocationV1,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetadataCallableParameterV2 {
+    pub index: usize,
+    pub name: String,
+    pub r#type: String,
+    pub ownership: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -819,8 +861,53 @@ pub fn metadata_type_name(ty: &ResolvedType) -> String {
         ResolvedType::Mixed => "mixed".to_string(),
         ResolvedType::Error => "Error".to_string(),
         ResolvedType::TypeParameter(name) => name.clone(),
-        ResolvedType::Function(_) => "function".to_string(),
-        ResolvedType::Class(class) => class.name.clone(),
+        ResolvedType::Function(function) => {
+            let invocation = match function.invocation_mode {
+                crate::types::FunctionInvocationMode::Readonly => "",
+                crate::types::FunctionInvocationMode::Writable => " writable",
+                crate::types::FunctionInvocationMode::Once => " once",
+            };
+            let parameters = function
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    let ownership = match parameter.ownership_mode {
+                        crate::types::FunctionTypeParameterMode::Readonly => "",
+                        crate::types::FunctionTypeParameterMode::Writable => "writable ",
+                        crate::types::FunctionTypeParameterMode::Take => "take ",
+                    };
+                    format!("{ownership}{}", metadata_type_name(&parameter.ty))
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut display = format!(
+                "function{invocation}({parameters}): {}",
+                metadata_type_name(&function.return_type)
+            );
+            if !function.checked_effects.is_empty() {
+                display.push_str(" throws ");
+                display.push_str(
+                    &function
+                        .checked_effects
+                        .iter()
+                        .map(metadata_type_name)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+            display
+        }
+        ResolvedType::Class(class) if class.arguments.is_empty() => class.name.clone(),
+        ResolvedType::Class(class) => format!(
+            "{}<{}>",
+            class.name,
+            class
+                .arguments
+                .iter()
+                .map(metadata_type_name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         ResolvedType::TypedArray(inner) => format!("{}[]", metadata_type_name(inner)),
         ResolvedType::List(inner) => format!("List<{}>", metadata_type_name(inner)),
         ResolvedType::Dictionary(key, value) => format!(
@@ -1100,6 +1187,160 @@ pub fn metadata_document(
         sources,
         attribute_classes,
         applications,
+    }
+}
+
+pub fn metadata_document_v2(
+    hir: &crate::hir::Program,
+    graph_fingerprint: impl Into<String>,
+) -> AttributeMetadataDocumentV2 {
+    let base = metadata_document(hir, graph_fingerprint);
+    let mut callables = Vec::new();
+    for item in &hir.items {
+        match item {
+            crate::hir::Item::Function(function) => {
+                callables.push(metadata_callable_v2(hir, function, None));
+            }
+            crate::hir::Item::Class(class) => {
+                for member in &class.members {
+                    if let crate::hir::ClassMember::Method(method) = member {
+                        callables.push(metadata_callable_v2(hir, method, Some(class)));
+                    }
+                }
+            }
+            crate::hir::Item::Enum(_)
+            | crate::hir::Item::Constant(_)
+            | crate::hir::Item::Statement(_) => {}
+        }
+    }
+    callables.sort_by(|left, right| {
+        (
+            left.package.as_str(),
+            left.canonical_name.as_str(),
+            left.kind.as_str(),
+            left.source.as_str(),
+            left.location.byte_start,
+        )
+            .cmp(&(
+                right.package.as_str(),
+                right.canonical_name.as_str(),
+                right.kind.as_str(),
+                right.source.as_str(),
+                right.location.byte_start,
+            ))
+    });
+    AttributeMetadataDocumentV2 {
+        schema_version: ATTRIBUTE_METADATA_SCHEMA_VERSION_2,
+        edition: base.edition,
+        compiler_revision: base.compiler_revision,
+        graph_fingerprint: base.graph_fingerprint,
+        selected_target: base.selected_target,
+        packages: base.packages,
+        sources: base.sources,
+        attribute_classes: base.attribute_classes,
+        applications: base.applications,
+        callables,
+    }
+}
+
+fn metadata_callable_v2(
+    hir: &crate::hir::Program,
+    function: &crate::hir::FunctionDecl,
+    class: Option<&crate::hir::ClassDecl>,
+) -> MetadataCallableV2 {
+    let signature = hir
+        .semantic_info
+        .callable_signatures
+        .get(&function.span)
+        .expect("checked HIR callables have resolved signatures");
+    let owner_name = class.map(|class| {
+        class.global_id.as_ref().map_or_else(
+            || class.name.clone(),
+            |identity| identity.qualified_name.clone(),
+        )
+    });
+    let canonical_name = owner_name.as_ref().map_or_else(
+        || {
+            function.global_id.as_ref().map_or_else(
+                || function.name.clone(),
+                |identity| identity.qualified_name.clone(),
+            )
+        },
+        |owner| format!("{owner}::{}", function.name),
+    );
+    let source = hir
+        .sources
+        .iter()
+        .find(|source| source.identity == function.source_identity);
+    let source_identity = public_source_identity(&function.source_identity.0);
+    let kind = match (class.is_some(), function.name.as_str()) {
+        (true, "__construct") => "constructor",
+        (true, "__destruct") => "destructor",
+        (true, _) => "method",
+        (false, _) => "function",
+    };
+    let identity = if let Some(class) = class {
+        let class_name = class.global_id.as_ref().map_or_else(
+            || class.name.clone(),
+            |identity| identity.qualified_name.clone(),
+        );
+        format!("member:{class_name}:{kind}:{}", function.name)
+    } else {
+        format!("global:{canonical_name}:function")
+    };
+    MetadataCallableV2 {
+        identity,
+        canonical_name,
+        kind: kind.to_string(),
+        package: function.package.display_name().to_string(),
+        source: source_identity.clone(),
+        access: match function.access {
+            crate::ast::MemberAccess::External => "external",
+            crate::ast::MemberAccess::Internal => "internal",
+        }
+        .to_string(),
+        generic_parameter_count: signature.generic_parameter_count,
+        parameters: signature
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(index, parameter)| MetadataCallableParameterV2 {
+                index,
+                name: parameter.name.clone(),
+                r#type: metadata_type_name(&parameter.r#type),
+                ownership: if parameter.take {
+                    "take"
+                } else if parameter.writable {
+                    "writable"
+                } else {
+                    "readonly"
+                }
+                .to_string(),
+            })
+            .collect(),
+        return_type: if matches!(kind, "constructor" | "destructor") {
+            "void".to_string()
+        } else {
+            metadata_type_name(&signature.return_type)
+        },
+        required_effects: function
+            .required_checked_effects
+            .iter()
+            .map(metadata_type_name)
+            .collect(),
+        ambient_effects: function
+            .ambient_checked_effects
+            .iter()
+            .map(metadata_type_name)
+            .collect(),
+        location: MetadataLocationV1 {
+            source: source_identity.clone(),
+            display_path: source
+                .map(|source| public_display_path(&source.display_path))
+                .unwrap_or(source_identity),
+            byte_start: function.span.start,
+            byte_end: function.span.end,
+        },
     }
 }
 

@@ -193,7 +193,7 @@ $require($pipelinePath, $pipeline, [
     'Stage 32 — Complete',
     'Stage 33 Slice 1 — Complete',
     'Stage 33 Slice 2 — Complete',
-    'Stage 33 Slice 3 — Next',
+    'Stage 33 Slice 3 — In Progress',
     'Stage 33 — In Progress, Not Complete',
 ]);
 $require($auditPath, $audit, [

@@ -48,9 +48,14 @@ Stage 32 metadata. Attribute applications execute no code.
 ```console
 doriac metadata source.doria
 doriac metadata --build-plan build-plan.json
+doriac metadata source.doria --schema-version 2
+doriac metadata --build-plan build-plan.json --schema-version 2
 ```
 
-The command emits one deterministic schema-version-1 JSON document to stdout.
+The command emits one deterministic JSON document to stdout. Schema version 1 remains the default,
+and explicit `--schema-version 1` is byte-identical to that
+default. Decision 0128 adds strict schema version 2 for Baton test discovery;
+unknown versions are rejected.
 It produces no backend artifact, invokes no processor, writes no generated
 source, and does not modify input files. Blocking diagnostics follow the
 ordinary CLI diagnostic rules.
@@ -59,7 +64,7 @@ The document contains:
 
 | Field | Meaning |
 | --- | --- |
-| `schemaVersion` | Exact metadata schema version; currently `1` |
+| `schemaVersion` | Exact metadata schema version; `1` by default, or explicit `2` |
 | `edition` | Doria source edition |
 | `compilerRevision` | Compiler revision that produced the document |
 | `graphFingerprint` | Deterministic identity of the complete compiler input |
@@ -68,6 +73,16 @@ The document contains:
 | `sources` | Ordered public source identities and display paths |
 | `attributeClasses` | Compiler-known and user schema declarations |
 | `applications` | Ordered, resolved, typed attribute applications |
+
+Schema version 2 contains every schema-version-1 field plus `callables`. Each
+callable records one canonical attribute-target-compatible identity, name, kind,
+package, source, access, generic arity, ordered parameters, return type, required
+effects, ambient effects, and location. Parameters preserve index, name, exact
+semantic type, and `readonly`, `writable`, or `take` ownership. Functions,
+methods, constructors, and destructors remain distinct.
+
+Callable metadata is static compiler output. It exposes no compiler numeric ID,
+Rust type, MIR or backend symbol, runtime address, or reflection API.
 
 Source locations carry a public source identity, display path, and authoritative
 byte range. Private absolute host paths, compiler numeric IDs, Rust type names,
@@ -118,6 +133,9 @@ applications
 
 The processor package is supplied by future Baton orchestration. `doriac` does
 not parse `Baton.toml`, discover processor packages, or execute a request.
+Metadata schema version 2 does not change this protocol: processor requests and responses remain strict schema version 1,
+and Baton constructs requests from the
+metadata fields common to both document versions.
 
 The parser rejects unknown fields, missing fields, unsupported schema versions,
 invalid package identities, inconsistent bound-value types, malformed or

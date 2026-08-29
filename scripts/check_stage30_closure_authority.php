@@ -189,7 +189,7 @@ function check_stage30_closure_authority(string $root): array
         'Stage 32 — Complete',
         'Stage 33 Slice 1 — Complete',
         'Stage 33 Slice 2 — Complete',
-        'Stage 33 Slice 3 — Next',
+        'Stage 33 Slice 3 — In Progress',
     ]);
     $forbid($pipelinePath, $pipeline, [
         'Stage 30 Closure Authority Proposal — In Review',

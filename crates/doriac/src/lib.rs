@@ -208,6 +208,18 @@ pub fn metadata_source(
     Ok(attributes::metadata_document(&hir, fingerprint))
 }
 
+pub fn metadata_source_v2(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<attributes::AttributeMetadataDocumentV2> {
+    let path = path.into();
+    let text = text.into();
+    let fingerprint =
+        runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes());
+    let hir = lower_source(path, text)?;
+    Ok(attributes::metadata_document_v2(&hir, fingerprint))
+}
+
 pub fn lower_source_with_context(
     path: impl Into<String>,
     text: impl Into<String>,
@@ -440,6 +452,16 @@ pub fn metadata_compilation_graph(
 ) -> DiagnosticResult<attributes::AttributeMetadataDocumentV1> {
     let hir = lower_compilation_graph(graph)?;
     Ok(attributes::metadata_document(
+        &hir,
+        graph.fingerprint.clone(),
+    ))
+}
+
+pub fn metadata_compilation_graph_v2(
+    graph: &compilation_graph::CompilationGraph,
+) -> DiagnosticResult<attributes::AttributeMetadataDocumentV2> {
+    let hir = lower_compilation_graph(graph)?;
+    Ok(attributes::metadata_document_v2(
         &hir,
         graph.fingerprint.clone(),
     ))

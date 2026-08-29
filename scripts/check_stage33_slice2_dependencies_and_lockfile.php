@@ -102,7 +102,7 @@ function check_stage33_slice2_dependencies_and_lockfile(string $root): array
         'Decision 0127',
         'Slice 1 — Complete under Decision 0126',
         'Slice 2 — Complete under Decision 0127',
-        'Stage 33 Slice 3 — Next',
+        'Stage 33 Slice 3 — In Progress',
         'Stage 33 — In Progress, Not Complete',
         'Pre-Stage-45 Doria-Native Baton Transition',
     ]);
@@ -110,7 +110,7 @@ function check_stage33_slice2_dependencies_and_lockfile(string $root): array
         'Decision 0127',
         'Stage 33 Slice 1 — Complete',
         'Stage 33 Slice 2 — Complete',
-        'Stage 33 Slice 3 — Next',
+        'Stage 33 Slice 3 — In Progress',
         'Stage 33 — In Progress, Not Complete',
         'Pre-Stage-45 Doria-Native Baton Transition',
     ]);
@@ -126,7 +126,7 @@ function check_stage33_slice2_dependencies_and_lockfile(string $root): array
         '`Baton.lock` files pin exact Git commits',
         '`install`, `add`, `remove`, `update`, and',
         '`fetch`',
-        'Development dependencies, workspaces, graph inspection, tests, and processor',
+        'Development dependencies, workspaces, graph inspection, tests, processors',
     ]);
 
     $staleStatuses = [

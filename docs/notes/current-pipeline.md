@@ -31,7 +31,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 33 is in progress in the disposable PHP UX bootstrap.
   - **Slice 1 — Complete:** Decision 0126 covers exact schema 1 compatibility, strict schema 2, local/scoped package identity, binary/library targets and selectors, autoload/autoload-dev discovery, deterministic source inventories, compiler build plans, target-scoped layouts, and receipts.
   - **Slice 2 — Complete:** Decision 0127 covers normal path/Git dependencies, strict SemVer validation, one-version and source-substitution diagnostics, deterministic strict JSON `Baton.lock`, exact locked installs, dependency commands, centralized offline policy, global immutable Git caching, live path packages, multi-package plans, and receipt lock/path identities.
-  - **Slice 3 — Next:** Development dependencies, workspaces, graph commands, tests, processors, generated-source orchestration, incremental project inventory, and Phase F closure.
+  - **Slice 3 — In Progress:** Decision 0128 fixes canonical source descriptors, development dependencies, workspaces, graph commands, tests, processors, generated-source orchestration, incremental project inventory, and Phase F closure. Compiler metadata schema 2 is implemented; Baton and language-server integration remain in progress.
   - **Native transition — Scheduled:** Decision 0124 requires a parity-gated port to the clean Doria-native `dorialang/baton` repository, production release-ownership transfer, and PHP-free archive cutover before the unsuffixed `2026.03.1` release.
 - Stage 25a Slices 1 through 4 are implemented and Stage 25a is complete. The readonly `SharedReference<T>` / `WeakReference<T>` family and the permanently disjoint writable family lower through validated MIR to the interpreter, Cranelift, LLVM, and separate `doria-rt` control structures. `WritableSharedReference<T>` executes class, generic-class, typed-array, `List<T>`, `Dictionary<K, V>`, `Set<T>`, and `Bytes` payloads through owned readonly/writable access objects. One access state is shared by every writable-family handle to an allocation; access objects move through returns, parameters, properties, and collection slots; nullable strong, weak, and readonly/writable access forms remain in-family and lazy; and destruction releases access before strong ownership. P1501 carries one of the three exact Decision 0106 conflict conditions as a typed runtime fact. The allocation-free `referencedValue` projection resolves wrapper/payload collisions without changing either ownership count, and durable weak-cycle and bounded-stress fixtures agree across all native paths. Scalar/string payload access and all shared handles through `mixed` remain runtime-pending rather than being given an invented value projection or misrepresented as class pointers. The PHP backend still refuses shared ownership.
 - PHP Stream And I/O Completeness Audit — Implemented. The canonical human
@@ -194,6 +194,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Decision 0125 — Accepted And Implemented; Typed Attributes, Const-Evaluated Metadata, And Processor Protocol.
 - Decision 0126 — Accepted And Implemented; Baton Schema 2 Local Package, Target, And Selection Spellings.
 - Decision 0127 — Accepted And Implemented; Baton Dependency Resolution, Lockfile, Cache, And Offline Semantics.
+- Decision 0128 — Accepted, Implementation In Progress; Baton Workspaces, Development, Tests, Processors, And Project Inventory.
 - Stage 29 — Complete.
 - Stage 29 Slice 1 — Complete.
 - Stage 29 Slice 2 — Complete.
@@ -221,7 +222,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Stage 32 — Complete.
 - Stage 33 Slice 1 — Complete.
 - Stage 33 Slice 2 — Complete.
-- Stage 33 Slice 3 — Next.
+- Stage 33 Slice 3 — In Progress.
 - Stage 33 — In Progress, Not Complete.
 - Pre-Stage-45 Doria-Native Baton Transition — Scheduled, Mandatory Before Unsuffixed `2026.03.1`.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.

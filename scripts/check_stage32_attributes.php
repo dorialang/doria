@@ -82,7 +82,7 @@ function check_stage32_attributes(string $root): array
             'Stage 33 Slice 2',
             'Complete',
             'Stage 33 Slice 3',
-            'Next',
+            'In Progress',
             'E0632',
             'E0641',
             'E0671',
@@ -92,7 +92,7 @@ function check_stage32_attributes(string $root): array
         ]);
     }
     $require($paths['protocol'], $files['protocol'], [
-        'schema-version-1 JSON document',
+        'Schema version 1 remains the default',
         'Processor Request',
         'Processor Response',
         '### Generated sources',

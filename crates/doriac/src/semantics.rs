@@ -120,6 +120,9 @@ pub struct SemanticInfo {
     /// effects that escape its body. Source syntax remains in the AST/HIR
     /// `throws` field and is never synthesized for inferred effects.
     pub callable_effective_checked_effects: HashMap<Span, Vec<ResolvedType>>,
+    /// Resolved callable signatures keyed by declaration span for tooling
+    /// metadata. Runtime lowering uses the existing HIR callable fields.
+    pub callable_signatures: HashMap<Span, CallableSignatureSemanticInfo>,
     /// Exact checked effects produced at each source operation.
     pub(crate) checked_effect_sites: crate::checked_effects::EffectSiteMap,
     /// Resolved owned Error type transferred by each `throw` statement.
@@ -148,6 +151,21 @@ pub struct SemanticInfo {
     pub property_writes: HashMap<Span, PropertyWriteSemanticInfo>,
     /// Object-path expressions proven to carry ordinary writable access.
     pub(crate) writable_object_paths: HashSet<Span>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallableSignatureSemanticInfo {
+    pub generic_parameter_count: usize,
+    pub parameters: Vec<CallableParameterSemanticInfo>,
+    pub return_type: ResolvedType,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallableParameterSemanticInfo {
+    pub name: String,
+    pub r#type: ResolvedType,
+    pub take: bool,
+    pub writable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -693,6 +711,29 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
     checker.diagnostics.extend(ownership_analysis.diagnostics);
     let classes = collect_ordered_class_semantics(program, &mut checker);
     let enums = collect_ordered_enum_semantics(&checker);
+    let callable_signatures = checker
+        .function_signatures
+        .iter()
+        .map(|(span, signature)| {
+            (
+                *span,
+                CallableSignatureSemanticInfo {
+                    generic_parameter_count: signature.type_params.len(),
+                    parameters: signature
+                        .params
+                        .iter()
+                        .map(|parameter| CallableParameterSemanticInfo {
+                            name: parameter.name.clone(),
+                            r#type: checker.types.resolved(parameter.ty),
+                            take: parameter.take,
+                            writable: parameter.writable,
+                        })
+                        .collect(),
+                    return_type: checker.types.resolved(signature.return_ty),
+                },
+            )
+        })
+        .collect();
     SemanticAnalysis {
         info: SemanticInfo {
             compilation_context: checker.compilation_context,
@@ -719,6 +760,7 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
             return_borrows,
             flow_facts: checker.flow_facts,
             callable_effective_checked_effects: checker.callable_effective_checked_effects,
+            callable_signatures,
             checked_effect_sites: checker.checked_effect_sites,
             throw_error_types: checker.throw_error_types,
             try_uncovered_effects: checker.try_uncovered_effects,
