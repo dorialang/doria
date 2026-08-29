@@ -120,8 +120,9 @@ $require($decisionPath, $decision, [
     'checked indirect calls reuse',
     'debug interpreter, Cranelift, LLVM, and PHP',
     '30 through 32 and the Decision 0123 corrective beat are complete. Stage 33',
-    'Slice 1 is complete under Decision 0126',
-    'Stage 33 Slice 2 is next',
+    'Slices 1 and 2 are complete under Decisions 0126 and 0127',
+    'Stage 33 Slice 3 is',
+    'next',
     'Stage 33 remains in progress and is not complete',
 ]);
 

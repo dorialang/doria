@@ -72,8 +72,8 @@ function check_stage33_slice1_baton_authority(string $root): array
         'build/<host-target>/<profile>/<target-name>/',
         'build/<host-target>/<profile>/',
         '"artifact": null',
-        'Stage 33 Slice 2 owns',
-        'Stage 33 Slice 3 owns',
+        'Decision 0127 owns the implemented path',
+        'Stage 33 Slice 3 is next',
         'Stage 33 remains in progress and is not complete',
         'Pre-Stage-45 transition',
         'dorialang/baton',
@@ -81,10 +81,8 @@ function check_stage33_slice1_baton_authority(string $root): array
 
     foreach (['namespaceDecision', 'packageDecision', 'transitionDecision', 'plan', 'pipeline'] as $key) {
         $require($paths[$key], $files[$key], [
-            'Stage 33 Slice 1',
-            'Complete',
-            'Stage 33 Slice 2',
-            'Next',
+            'Stage 33',
+            'Slice 3',
         ]);
     }
     foreach (['plan', 'pipeline'] as $key) {
@@ -104,13 +102,14 @@ function check_stage33_slice1_baton_authority(string $root): array
         '`--binary <name>`',
     ]);
     $require($paths['readme'], $files['readme'], [
-        'Baton accepts exact schema 1 projects',
-        'schema 2 manifests with local/scoped package identity',
+        'Baton is Doria',
+        'exact schema 1 compatibility',
+        'strict schema 2',
+        'projects with local/scoped package identity',
         'binary and library targets',
-        '`autoload`/`autoload-dev` source discovery',
-        'Decision 0118 separately defines dependency resolution',
-        'Doria-native project and package tool',
-        'require no Baton PHP runtime or Composer payload',
+        'compile-time `autoload` discovery',
+        '`dorialang/baton-php` product-contract',
+        'to install PHP or Composer',
     ]);
 
     $staleStatuses = [
@@ -121,6 +120,9 @@ function check_stage33_slice1_baton_authority(string $root): array
         'Stage 33 remains scheduled',
         'Slice 1 is next',
         'with Slice 1 next',
+        'Stage 33 Slice 2 — Next',
+        'Stage 33 Slice 2 is next',
+        'Stage 33 Slice 2 Next',
     ];
     foreach (['docs', 'scripts'] as $directory) {
         $iterator = new RecursiveIteratorIterator(
@@ -131,7 +133,11 @@ function check_stage33_slice1_baton_authority(string $root): array
                 continue;
             }
             $path = substr($entry->getPathname(), strlen($root) + 1);
-            if ($path === 'scripts/check_stage33_slice1_baton_authority.php') {
+            if (in_array($path, [
+                'scripts/check_stage33_slice1_baton_authority.php',
+                'scripts/check_stage33_slice2_dependencies_and_lockfile.php',
+                'scripts/check_phase_f_package_authority.php',
+            ], true)) {
                 continue;
             }
             $contents = $read($path);

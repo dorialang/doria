@@ -363,7 +363,8 @@ compatibility backend execute the supported surface. List algorithm calls carry
 their callback's required structural effects and complete runtime profile,
 including ambient I/O, through the same propagation and cleanup model. Stages
 30 through 32 and the Decision 0123 corrective beat are complete. Stage 33
-Slice 1 is complete under Decision 0126. Stage 33 Slice 2 is next.
+Slices 1 and 2 are complete under Decisions 0126 and 0127. Stage 33 Slice 3 is
+next.
 Stage 33 remains in progress and is not complete.
 
 ## Explicit Exclusions

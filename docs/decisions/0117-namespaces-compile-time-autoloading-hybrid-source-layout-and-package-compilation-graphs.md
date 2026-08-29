@@ -5,11 +5,13 @@
 - **Date:** 2026-08-14
 - **Implementation status:** Stage 31 Slices 1 and 2 implemented; Stage 31
   Complete; Stage 33 Slice 1 Implemented In The PHP Product-Contract Bootstrap;
+  Stage 33 Slice 2 Implemented In The PHP Product-Contract Bootstrap;
   Pre-Stage-45
   Doria-Native Baton Transition Scheduled By Decision 0124
 - **Current pipeline:** Stage 30 — Complete; Stage 31 Slice 1 — Complete;
   Stage 31 Slice 2 — Complete; Stage 31 — Complete; Stage 32 — Complete;
-  Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Next;
+  Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Complete;
+  Stage 33 Slice 3 — Next; Stage 33 — In Progress, Not Complete;
   E0641, E0671, And E0672 — Historical And Reserved
 - **Scope:** Package source discovery, file layout, compilation inputs, package
   visibility, and the Baton-to-compiler boundary
@@ -362,9 +364,11 @@ symbol diagnostics, cross-file diagnostics, and compiler incremental inputs.
 
 Stage 33 Slice 1 implements Baton manifest schema 2, schema 1 compatibility,
 autoload and autoload-dev discovery, scopes, targets, and single-package build
-plans in the disposable PHP UX bootstrap. Decision 0118 owns the rest of Stage
-33. Decision 0124 requires the later Pre-Stage-45 Doria-native port to preserve
-this exact build-plan boundary and observable behavior.
+plans in the disposable PHP UX bootstrap. Stage 33 Slice 2 implements Decision
+0127's normal dependency resolver, lockfile, cache, offline policy, and
+multi-package build-plan emission in the same bootstrap. Decision 0118 owns the
+rest of Stage 33. Decision 0124 requires the later Pre-Stage-45 Doria-native port
+to preserve this exact build-plan boundary and observable behavior.
 
 Stage 30 is complete. Stage 31 Slice 1 implements source-preserving qualified
 names, namespace/import/include grammar, same-file canonical resolution, the
@@ -372,8 +376,8 @@ edition prelude, compiler package/source context, and namespace-aware backend
 execution. Stage 31 Slice 2 implements the versioned build plan, complete
 package graph, package-wide visibility, strict source layout, include-once,
 multi-source diagnostics and lowering, backend execution, and in-memory
-incremental inputs. Stages 31 and 32 and Stage 33 Slice 1 are complete; Stage 33
-Slice 2 is next. Stage 33 remains In Progress, Not Complete, and freezes the product contract in
+incremental inputs. Stages 31 and 32 and Stage 33 Slices 1 and 2 are complete;
+Stage 33 Slice 3 is next. Stage 33 remains In Progress, Not Complete, and freezes the product contract in
 `dorialang/baton-php` rather than selecting Baton's permanent implementation
 language. The mandatory native transition remains separately scheduled before
 Stage 45.

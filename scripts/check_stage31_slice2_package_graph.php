@@ -64,6 +64,8 @@ function check_stage31_slice2_package_graph(string $root): array
             'Stage 33 Slice 1',
             'Complete',
             'Stage 33 Slice 2',
+            'Complete',
+            'Stage 33 Slice 3',
             'Next',
             'Stage 33',
             'In Progress, Not Complete',

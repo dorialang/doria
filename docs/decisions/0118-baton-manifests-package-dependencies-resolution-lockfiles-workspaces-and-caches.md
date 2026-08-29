@@ -3,9 +3,9 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-14
 - **Date:** 2026-08-14
-- **Implementation status:** Stage 33 Slice 1 implemented in the disposable PHP
-  UX bootstrap; Slice 2 next; Doria-native port and production cutover scheduled
-  Pre-Stage-45
+- **Implementation status:** Stage 33 Slices 1 and 2 implemented in the
+  disposable PHP UX bootstrap; Slice 3 next; Doria-native port and production
+  cutover scheduled Pre-Stage-45
 - **Scope:** Baton's package manifest, dependency resolver, lockfile, workspace,
   processor, cache, and offline contracts
 - **Build-graph dependency:** Decision 0117
@@ -19,10 +19,12 @@ parser, otherwise bootstrap shortcuts could become permanent lockfile,
 resolution, or workspace semantics.
 
 This decision fixes the target model while preserving schema 1 exactly as it
-exists. Decision 0126 records the Slice 1 schema-2 spellings and implementation.
-Decision 0124 fixes the implementation sequence: Stage 33 exercises this model
-in the disposable PHP bootstrap, then the mandatory Pre-Stage-45 transition
-ports the frozen behavior to production Doria Baton.
+exists. Decision 0126 records the Slice 1 schema-2 spellings and implementation;
+Decision 0127 records the Slice 2 resolver, lockfile, cache, command, and offline
+contract now exercised by the bootstrap. Decision 0124 fixes the implementation
+sequence: Stage 33 exercises this model in the disposable PHP bootstrap, then
+the mandatory Pre-Stage-45 transition ports the frozen behavior to production
+Doria Baton.
 
 ## Manifest Schema 2
 
@@ -275,9 +277,10 @@ Stage 33 has three implementation slices:
 
 1. **Complete:** Manifest schema 2, schema 1 compatibility, autoload, source
    scopes, targets, deterministic inventory, and single-package build plans.
-2. **Next:** Path and Git resolution, SemVer validation, one-version conflicts,
-   `Baton.lock`, dependency commands, global cache, and offline resolution.
-3. Workspaces, development dependencies, graph commands, incremental inventory,
+2. **Complete:** Path and Git resolution, SemVer validation, one-version
+   conflicts, strict deterministic `Baton.lock`, dependency commands, global
+   cache, offline resolution, multi-package plans, and receipt identities.
+3. **Next:** Workspaces, development dependencies, graph commands, incremental inventory,
    `baton test`, explicit processors, generated sources, and Phase F closure.
 
 Stage 32 implements typed attribute metadata and the strict processor protocol
@@ -292,8 +295,8 @@ identity. Decision 0124's Pre-Stage-45 transition creates the clean
 transfers production release assembly, removes the private PHP payload from
 archives, and blocks the unsuffixed `2026.03.1` release until cutover.
 
-Stages 31 and 32 and Stage 33 Slice 1 are complete. Stage 33 Slice 2 is next.
-Stage 33 is in progress and not complete. The native port remains after
+Stages 31 and 32 and Stage 33 Slices 1 and 2 are complete. Stage 33 Slice 3 is
+next. Stage 33 is in progress and not complete. The native port remains after
 Stage 44 so it can consume the accepted filesystem, process, FFI, and network
 foundations.
 

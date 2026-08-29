@@ -63,7 +63,7 @@ Stage 31 Slice 1 — Complete
 Stage 31 Slice 2 — Complete
 Stage 31 — Complete
 Stage 32 — Complete
-Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Next
+Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Complete; Stage 33 Slice 3 — Next
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping

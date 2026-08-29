@@ -209,17 +209,26 @@ The compiler validates the versioned processor protocol but executes no processo
 and writes no generated source. See
 [`docs/attribute-metadata-protocol.md`](docs/attribute-metadata-protocol.md).
 
-Baton is the accepted project and package tool for Doria. It is the Doria-native project and package tool
-maintained in the `dorialang/baton` repository. Baton accepts exact schema 1 projects and
-schema 2 manifests with local/scoped package identity, binary and library targets, target
-selection, and compile-time `autoload`/`autoload-dev` source discovery. It emits versioned
-build plans for `doriac`. Compiled executables will never search for or load source files at runtime.
-Decision 0118 separately defines dependency resolution, workspaces, tests, and
-processor orchestration.
-Package versions use SemVer, deterministic resolution is recorded in JSON
-`Baton.lock`, and each workspace has one root lockfile without merging package
-`internal` boundaries. Production toolchains ship the native Baton executable
-and require no Baton PHP runtime or Composer payload.
+Baton is Doria's accepted project and package tool. The current executable
+implementation is the disposable `dorialang/baton-php` product-contract
+bootstrap; it is packaged with its own private runtime and does not require users
+to install PHP or Composer. The production implementation will live in the clean
+`dorialang/baton` repository and be written in Doria before the first unsuffixed
+toolchain release.
+
+Baton preserves exact schema 1 compatibility and supports strict schema 2
+projects with local/scoped package identity, binary and library targets,
+compile-time `autoload` discovery, and normal path or Git dependencies. Package
+versions use SemVer, one package identity resolves once, and deterministic JSON
+`Baton.lock` files pin exact Git commits without storing credentials, cache
+locations, or absolute local paths. `install`, `add`, `remove`, `update`, and
+`fetch` share one offline-aware resolver and a global immutable Git cache. Baton
+emits explicit multi-package build plans for `doriac`; neither compiled programs
+nor the compiler search for project source or parse Baton files at runtime.
+
+Development dependencies, workspaces, graph inspection, tests, and processor
+orchestration remain the next Baton slice and are not claimed as current
+behavior.
 
 The CLI supports human, concise, and versioned JSON diagnostics. Human and
 concise output go to stderr; JSON goes to stdout for tools:
