@@ -106,8 +106,20 @@ deterministic; manifest edits performed by Baton and their resulting lock update
 form one recoverable transaction.
 
 An existing valid lock is used exactly. Install, check, build, and run do not
-move tags or branches and do not silently rewrite a valid lock. Missing,
-malformed, stale, or manifest-incompatible locks receive precise diagnostics.
+move tags or branches and do not silently rewrite a valid lock.
+
+Lock absence is command-specific. It is not itself a malformed-lock condition.
+A missing lock is the normal first-install state. `baton install` performs fresh
+resolution, writes the first lock, fetches required sources, and succeeds
+without reporting a missing-lock diagnostic. Full `baton update` and the
+transactional `add` and `remove` commands may likewise create the resulting lock
+because their commands express resolution or manifest-update intent.
+
+Commands that consume an existing locked graph diagnose absence when that lock
+is required. `fetch` and selected updates always require one; check/build/run
+require one when the manifest declares dependencies. Malformed, stale, or
+manifest-incompatible existing locks always receive precise diagnostics and are
+never treated as absent.
 
 ## Commands And Update Intent
 
