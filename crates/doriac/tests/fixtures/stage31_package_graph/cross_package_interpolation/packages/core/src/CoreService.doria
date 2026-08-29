@@ -1,0 +1,7 @@
+class CoreService
+{
+    function value(): int
+    {
+        return 42;
+    }
+}

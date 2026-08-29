@@ -1,0 +1,5 @@
+function main(): void
+{
+    let $service = new CoreService();
+    echo "web {$service->value()}\n";
+}

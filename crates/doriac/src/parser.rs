@@ -3389,7 +3389,7 @@ impl Parser {
             return None;
         }
 
-        let fragment = SourceFile::new("<interpolation>", inner);
+        let fragment = SourceFile::with_id(inner_span.source, "<interpolation>", inner);
         let mut tokens = match Lexer::new(&fragment).lex() {
             Ok(tokens) => tokens,
             Err(mut diagnostics) => {
