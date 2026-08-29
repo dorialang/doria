@@ -81,6 +81,22 @@ function main(): void {}
         serde_json::from_slice(&standalone.stdout).expect("standalone metadata should be JSON");
     assert_eq!(standalone_json["schemaVersion"], 1);
     assert_eq!(standalone_json["applications"].as_array().unwrap().len(), 2);
+    let standalone_text =
+        String::from_utf8(standalone.stdout.clone()).expect("metadata should be UTF-8");
+    assert_json_keys_in_order(
+        &standalone_text,
+        &[
+            "schemaVersion",
+            "edition",
+            "compilerRevision",
+            "graphFingerprint",
+            "selectedTarget",
+            "packages",
+            "sources",
+            "attributeClasses",
+            "applications",
+        ],
+    );
 
     let explicit_schema_1 = Command::new(doriac_bin())
         .current_dir(&temp_dir)
@@ -1052,6 +1068,17 @@ fn assert_failure_contains(label: &str, output: Output, expected: &str) {
         stderr.contains(expected),
         "{label}: expected stderr containing `{expected}`, got `{stderr}`"
     );
+}
+
+fn assert_json_keys_in_order(document: &str, keys: &[&str]) {
+    let mut offset = 0;
+    for key in keys {
+        let needle = format!("\"{key}\":");
+        let position = document[offset..]
+            .find(&needle)
+            .unwrap_or_else(|| panic!("metadata JSON is missing key `{key}` after byte {offset}"));
+        offset += position + needle.len();
+    }
 }
 
 fn temp_dir_path(stem: &str) -> PathBuf {

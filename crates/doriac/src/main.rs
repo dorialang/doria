@@ -630,13 +630,13 @@ fn ast_command(args: &[String]) -> Result<(), CliError> {
 fn metadata_command(args: &[String]) -> Result<(), CliError> {
     let (args, diagnostic_options) = parse_diagnostic_options(args)?;
     let (args, schema_version) = metadata_schema_version(args)?;
-    let document = if let Some(plan_path) = build_plan_argument(&args)? {
+    let document = (if let Some(plan_path) = build_plan_argument(&args)? {
         if args.len() != 2 {
             return Err(format!("unknown metadata option `{}`", args[2]).into());
         }
         let (_, graph) = load_cli_graph(plan_path, diagnostic_options)?;
         match schema_version {
-            1 => serde_json::to_value(doriac::metadata_compilation_graph(&graph).map_err(
+            1 => encode_metadata(&doriac::metadata_compilation_graph(&graph).map_err(
                 |diagnostics| {
                     CliError::graph_diagnostics(
                         graph.source_map.clone(),
@@ -645,7 +645,7 @@ fn metadata_command(args: &[String]) -> Result<(), CliError> {
                     )
                 },
             )?),
-            2 => serde_json::to_value(doriac::metadata_compilation_graph_v2(&graph).map_err(
+            2 => encode_metadata(&doriac::metadata_compilation_graph_v2(&graph).map_err(
                 |diagnostics| {
                     CliError::graph_diagnostics(
                         graph.source_map.clone(),
@@ -665,8 +665,8 @@ fn metadata_command(args: &[String]) -> Result<(), CliError> {
         }
         let (path, text) = read_source(input)?;
         match schema_version {
-            1 => serde_json::to_value(
-                doriac::metadata_source(path.clone(), text.clone()).map_err(|diagnostics| {
+            1 => encode_metadata(
+                &doriac::metadata_source(path.clone(), text.clone()).map_err(|diagnostics| {
                     CliError::diagnostics(
                         path.clone(),
                         text.clone(),
@@ -675,8 +675,8 @@ fn metadata_command(args: &[String]) -> Result<(), CliError> {
                     )
                 })?,
             ),
-            2 => serde_json::to_value(
-                doriac::metadata_source_v2(path.clone(), text.clone()).map_err(|diagnostics| {
+            2 => encode_metadata(
+                &doriac::metadata_source_v2(path.clone(), text.clone()).map_err(|diagnostics| {
                     CliError::diagnostics(
                         path.clone(),
                         text.clone(),
@@ -687,15 +687,14 @@ fn metadata_command(args: &[String]) -> Result<(), CliError> {
             ),
             _ => unreachable!(),
         }
-    };
-    let document =
-        document.map_err(|error| format!("failed to encode attribute metadata: {error}"))?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&document)
-            .map_err(|error| format!("failed to encode attribute metadata: {error}"))?
-    );
+    })?;
+    println!("{document}");
     Ok(())
+}
+
+fn encode_metadata(document: &impl serde::Serialize) -> Result<String, CliError> {
+    serde_json::to_string_pretty(document)
+        .map_err(|error| format!("failed to encode attribute metadata: {error}").into())
 }
 
 fn metadata_schema_version(args: Vec<String>) -> Result<(Vec<String>, u32), CliError> {
