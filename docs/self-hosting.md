@@ -90,11 +90,12 @@ Do not attempt full self-hosting before Doria has:
 
 Avoid creating a huge Doria compiler rewrite too early. That would slow the project down and hide design problems instead of exposing them.
 
-Stage 31 now satisfies four prerequisites in that list: multi-file compilation,
-namespace identity, package-aware source graphs, and source-aware cross-file
-diagnostics. This is meaningful bootstrap progress, not a declaration that
-Doria is ready for a full compiler port. The remaining language, library,
-testing, and long-term IR requirements still govern that decision.
+Stage 31 satisfies multi-file compilation, namespace identity, package-aware
+source graphs, and source-aware cross-file diagnostics. Stage 33 adds practical
+Baton test orchestration over compiler-owned metadata. These are meaningful
+bootstrap advances, not a declaration that Doria is ready for a full compiler
+port; remaining language, library, and long-term IR requirements still govern
+that decision.
 
 ---
 

@@ -3,9 +3,9 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-14
 - **Date:** 2026-08-14
-- **Implementation status:** Stage 33 Slices 1 and 2 implemented in the
-  disposable PHP UX bootstrap; Slice 3 next; Doria-native port and production
-  cutover scheduled Pre-Stage-45
+- **Implementation status:** Stage 33 Slices 1 through 3 and Phase F implemented
+  in the disposable PHP UX bootstrap; Doria-native port and production cutover
+  scheduled Pre-Stage-45
 - **Scope:** Baton's package manifest, dependency resolver, lockfile, workspace,
   processor, cache, and offline contracts
 - **Build-graph dependency:** Decision 0117
@@ -295,8 +295,8 @@ identity. Decision 0124's Pre-Stage-45 transition creates the clean
 transfers production release assembly, removes the private PHP payload from
 archives, and blocks the unsuffixed `2026.03.1` release until cutover.
 
-Stages 31 and 32 and Stage 33 Slices 1 and 2 are complete. Stage 33 Slice 3 is
-next. Stage 33 is in progress and not complete. The native port remains after
+Stages 31 and 32 and all three Stage 33 slices are complete. Stage 33 and Phase F
+are complete, and Stage 34 is next. The native port remains after
 Stage 44 so it can consume the accepted filesystem, process, FFI, and network
 foundations.
 

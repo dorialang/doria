@@ -169,15 +169,15 @@ invent an archive format, or create a placeholder artifact. `baton run
 
 ## Slice Boundaries
 
-Stage 33 Slices 1 and 2 are complete. Decision 0127 owns the implemented path
+Stage 33 Slices 1 through 3 are complete. Decision 0127 owns the implemented path
 and Git dependency resolver, package SemVer validation, one-version conflicts,
 strict deterministic `Baton.lock`, dependency commands, global
 content-addressed cache, offline policy, multi-package plans, and receipt
-identities. Stage 33 Slice 3 is next and owns workspaces, development
+identities. Implemented Stage 33 Slice 3 owns workspaces, development
 orchestration, graph commands, tests, processors, generated-source writes, and
 Phase F closure.
 
-Stage 33 remains in progress and is not complete. The PHP bootstrap remains a
+Stage 33 and Phase F are complete. The PHP bootstrap remains a
 temporary UX oracle. Decision 0124's Pre-Stage-45 transition must port the
 complete Stage 33 contract to Doria, transfer release ownership, remove the PHP
 payload from production archives, and pass parity before the unsuffixed
@@ -196,12 +196,12 @@ payload from production archives, and pass parity before the unsuffixed
 
 ## Invalidated Elsewhere
 
-- `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md`: Slices 1
-  and 2 are complete, Slice 3 is next, and Stage 33 remains in progress.
+- `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md`: all three
+  slices, Stage 33, and Phase F are complete, with Stage 34 next.
 - Decisions 0117, 0118, and 0124: deferred spellings and implementation status.
 - `SPEC.md` and `README.md`: current Baton schema-2 project behavior.
 - Doria authority guards: decision existence, public spellings, implementation
   status, and native-transition requirements.
 - `dorialang/baton-php`: executable behavior and tests implement this record.
-- `dorialang/doria-language-server`: no compiler pin or semantic change is
-  required for this documentation-only authority update.
+- `dorialang/doria-language-server`: consumes the completed Baton project
+  inventory contract without parsing manifests or lockfiles.

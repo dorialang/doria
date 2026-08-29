@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-29
 - **Date:** 2026-08-29
-- **Implementation Status:** In Progress
+- **Implementation Status:** Implemented By Stage 33 Slice 3
 - **Amends:** Decisions 0118, 0124, 0125, 0126, and 0127
 - **Preserves:** Decision 0117 compiler graph authority; compiler build-plan schema 1; schema-1 Baton compatibility; package/namespace separation; package-wide `internal`; direct-dependency visibility; Stage 32 metadata and processor protocol version 1; and the mandatory Pre-Stage-45 native transition
 
@@ -209,10 +209,10 @@ editor-triggered processor execution is introduced.
 
 ## Phase F And Native Transition
 
-Stage 33 Slice 3 implements this record in `dorialang/baton-php`, completing
-Phase F and Stage 33 only after compiler, Baton, language-server, installed-tool,
-and cross-repository validation are green. This does not complete Decision
-0124's native transition.
+Stage 33 Slice 3 implements this record across the compiler, the
+`dorialang/baton-php` product-contract bootstrap, and the language server.
+Stage 33 and Phase F are complete after cross-repository and installed-tool
+validation. This does not complete Decision 0124's native transition.
 
 Before the first unsuffixed `2026.03.1` release, the clean Doria-native
 `dorialang/baton` repository must parity-port the complete Stage 33 behavior and
@@ -242,11 +242,11 @@ protocol boundaries remain implementation-neutral throughout that transition.
 - Decision 0125 keeps processor protocol version 1 while metadata output gains
   additive schema version 2 for callable facts.
 - `README.md`, `SPEC.md`, `docs/doria-end-to-end-plan.md`, and
-  `docs/notes/current-pipeline.md` must stop describing Slice 3 as deferred once
-  all three repository implementations are green.
+  `docs/notes/current-pipeline.md` record Slice 3, Stage 33, and Phase F as
+  complete, with Stage 34 next.
 - `dorialang/baton-php` owns workspace, test, processor, generated-source, graph,
   project-inventory, and security documentation for the bootstrap product.
-- `dorialang/doria-language-server` must replace synthetic open-document package
-  discovery with asynchronous `baton project --json` consumption.
+- `dorialang/doria-language-server` consumes asynchronous `baton project --json`
+  inventory while retaining the bounded synthetic open-document fallback.
 - The website is a later synchronized documentation task and is not edited by
   this compiler/Baton/tooling slice.

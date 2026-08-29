@@ -73,8 +73,8 @@ function check_stage33_slice1_baton_authority(string $root): array
         'build/<host-target>/<profile>/',
         '"artifact": null',
         'Decision 0127 owns the implemented path',
-        'Stage 33 Slice 3 is next',
-        'Stage 33 remains in progress and is not complete',
+        'Implemented Stage 33 Slice 3',
+        'Stage 33 and Phase F are complete',
         'Pre-Stage-45 transition',
         'dorialang/baton',
     ]);
@@ -87,7 +87,9 @@ function check_stage33_slice1_baton_authority(string $root): array
     }
     foreach (['plan', 'pipeline'] as $key) {
         $require($paths[$key], $files[$key], [
-            'Stage 33 — In Progress, Not Complete',
+            'Stage 33 — Complete',
+            'Phase F — Complete',
+            'Stage 34',
             'Pre-Stage-45 Doria-Native Baton Transition',
         ]);
     }

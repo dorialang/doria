@@ -228,10 +228,11 @@ locations, or absolute local paths. `install`, `add`, `remove`, `update`, and
 emits explicit multi-package build plans for `doriac`; neither compiled programs
 nor the compiler search for project source or parse Baton files at runtime.
 
-Development dependencies, workspaces, graph inspection, tests, processors,
-generated sources, and project inventory are being integrated under Decision
-0128. They are not claimed as complete until the compiler, Baton bootstrap, and
-language-server integrations are all green.
+Baton supports development dependencies, workspaces, graph inspection, tests,
+processors, generated sources, and project inventory across the compiler and
+language server. The current PHP bootstrap freezes that product contract while
+Decision 0124 keeps the Doria-native implementation mandatory before the first
+unsuffixed toolchain release.
 
 The CLI supports human, concise, and versioned JSON diagnostics. Human and
 concise output go to stderr; JSON goes to stdout for tools:

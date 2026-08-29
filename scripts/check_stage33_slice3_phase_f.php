@@ -40,7 +40,7 @@ function check_stage33_slice3_phase_f(string $root): array
         '# Decision 0128:',
         '**Status:** Accepted',
         '**Accepted:** 2026-08-29',
-        '**Implementation Status:** In Progress',
+        '**Implementation Status:** Implemented By Stage 33 Slice 3',
         '**Amends:** Decisions 0118, 0124, 0125, 0126, and 0127',
         'compiler build-plan schema 1',
         'schema-1 Baton compatibility',
@@ -60,6 +60,7 @@ function check_stage33_slice3_phase_f(string $root): array
         'language server invokes this command off the UI thread',
         'does not claim sandboxing',
         'mandatory Pre-Stage-45 native transition',
+        'Stage 33 and Phase F are complete',
     ]);
     $require($paths['protocol'], $files['protocol'], [
         '--schema-version 2',

@@ -140,9 +140,10 @@ destination.
 
 ## Baton Boundary
 
-Baton may read project manifests, discover configured sources, resolve and fetch
-dependencies, manage workspaces and caches, and emit this resolved plan.
+Baton reads project manifests, discovers configured sources, resolves and fetches
+dependencies, manages workspaces and caches, and emits this resolved plan.
 `doriac` parses only the build plan: it loads the explicit inventory, resolves
 literal includes, builds and checks the package graph, and emits the selected
-target. Stage 31 does not implement Baton schema 2, dependency solving,
-`Baton.lock`, processors, package installation, or persistent compiler caches.
+target. Stage 33 completes Baton schema 2, dependency solving, `Baton.lock`,
+processors, package installation, and incremental project inventory without
+changing compiler build-plan schema 1.

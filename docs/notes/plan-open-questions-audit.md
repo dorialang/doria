@@ -73,8 +73,8 @@ implementation by itself. Both Stage 31 slices are complete: namespace/import
 syntax, canonical resolution, the edition prelude, compiler context, build-plan
 package graphs, include resolution, package visibility, and multi-source
 lowering are implemented. Stage 32 is complete under Decision 0125. Stage 33
-Slices 1 and 2 are complete under Decisions 0126 and 0127, Slice 3 is next, and Stage 33 remains
-in progress and is not complete. Decision 0124 separately binds the
+Slices 1 through 3 and Phase F are complete under Decisions 0126 through 0128;
+Stage 34 is next. Decision 0124 separately binds the
 Pre-Stage-45 Doria-native port, parity and release cutover, and the unsuffixed
 `2026.03.1` blocker. Stage 30 is complete and E0641 remains historical and
 reserved.

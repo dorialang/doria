@@ -186,9 +186,9 @@ package-relative path. Validation rejects:
 - command, environment, binary-artifact, dependency, or manifest mutation
   fields.
 
-Stage 32 only validates proposed output. Stage 33 Slice 3 owns explicit
-processor execution, output writes, generated-source inventory, and graph
-insertion.
+Stage 32 only validates proposed output. Implemented Stage 33 Slice 3 owns
+explicit processor execution, output writes, generated-source inventory, and
+graph insertion through Baton; the protocol remains version 1.
 
 ## Runtime And Reflection Boundary
 
