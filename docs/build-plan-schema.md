@@ -76,7 +76,10 @@ Source scopes are:
 - `development`: active only when selected by the target and may use declared
   development dependencies.
 - `generated`: explicitly inventoried generated input. It must declare
-  `generatedFor` as `main` or `development`.
+  `generatedFor` as `main` or `development`. Generated sources normally use
+  `origin: "generated"`; a generated source selected as the binary entry uses
+  `origin: "entry"` so generated test dispatchers and similar managed entries
+  remain both generated-scope inputs and unambiguous selected entry sources.
 
 Source origins are `entry`, `autoload`, `explicit`, and `generated`. `autoload`
 records how project tooling selected a source; it does not ask `doriac` to scan

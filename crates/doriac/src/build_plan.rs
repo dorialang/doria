@@ -364,9 +364,15 @@ pub fn validate_build_plan(plan: &BuildPlan) -> DiagnosticResult<()> {
                 "source",
                 &mut diagnostics,
             );
-            if source.scope == SourceScope::Generated && source.origin != SourceOrigin::Generated {
+            let selected_generated_entry = source.scope == SourceScope::Generated
+                && source.origin == SourceOrigin::Entry
+                && plan.selected_target.entry_source.as_deref() == Some(&source.identity);
+            if source.scope == SourceScope::Generated
+                && source.origin != SourceOrigin::Generated
+                && !selected_generated_entry
+            {
                 diagnostics.push(input(format!(
-                    "generated source `{}` must use origin `generated`",
+                    "generated source `{}` must use origin `generated` unless it is the selected entry source",
                     source.identity
                 )));
             }

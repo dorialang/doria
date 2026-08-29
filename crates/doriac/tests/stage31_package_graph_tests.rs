@@ -283,6 +283,44 @@ fn schema_one_rejects_duplicate_missing_and_ambiguous_inventory() {
 }
 
 #[test]
+fn schema_one_accepts_only_the_selected_entry_as_generated_entry_origin() {
+    let entry = "acme/application:build/generated/tests/dispatcher.doria";
+    let mut document = plan(
+        vec![package(
+            "acme/application",
+            vec![scoped_source(
+                "acme/application",
+                "build/generated/tests/dispatcher.doria",
+                SourceScope::Generated,
+                SourceOrigin::Entry,
+                Some(GeneratedFor::Development),
+            )],
+            Vec::new(),
+        )],
+        entry,
+    );
+    document.plan.selected_target.active_scopes = vec![
+        SourceScope::Main,
+        SourceScope::Development,
+        SourceScope::Generated,
+    ];
+    assert!(doriac::build_plan::validate_build_plan(&document.plan).is_ok());
+
+    let mut not_selected = document.plan.clone();
+    not_selected.packages[0].sources.push(source(
+        "acme/application",
+        "main.doria",
+        SourceOrigin::Entry,
+    ));
+    not_selected.selected_target.entry_source = Some("acme/application:main.doria".to_string());
+    assert!(doriac::build_plan::validate_build_plan(&not_selected).is_err());
+
+    let mut explicit_generated = document.plan.clone();
+    explicit_generated.packages[0].sources[0].origin = SourceOrigin::Explicit;
+    assert!(doriac::build_plan::validate_build_plan(&explicit_generated).is_err());
+}
+
+#[test]
 fn top_level_internal_declarations_preserve_modifier_spans() {
     let program = doriac::parse_source(
         "internal.doria",
