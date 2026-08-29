@@ -69,9 +69,11 @@ function check_stage31_slice1_namespaces(string $root): array
             'Stage 33 Slice 2',
             'Complete',
             'Stage 33 Slice 3',
-            'Next',
+            'Complete',
             'Stage 33',
-            'In Progress, Not Complete',
+            'Complete',
+            'Phase F',
+            'Stage 34',
             'E0641',
             'Historical',
         ]);

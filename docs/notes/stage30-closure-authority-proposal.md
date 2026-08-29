@@ -32,8 +32,8 @@ diagnostic, and performance direction on 2026-08-19, with these amendments:
 
 The accepted record also fixes the dependency-ordered Stage 30a through Stage
 30h implementation slices. Stages 30a through 30h and Stage 30 are complete.
-E0641 is historical and reserved. Stages 31 and 32 and Stage 33 Slices 1 and 2
-are complete; Stage 33 Slice 3 is next.
+E0641 is historical and reserved. Stages 31 through 33 and Phase F are complete;
+Stage 34 is next.
 
 ## Historical Scope
 

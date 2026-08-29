@@ -133,10 +133,10 @@ $require($batonPath, $baton, [
     'global content-addressed dependency cache',
     'Offline mode never reaches the network',
     'Stage 33 has three implementation slices',
-    'Stage 33 Slices 1 and 2 are complete',
-    'Stage 33 Slice 3 is',
-    'next',
-    'Stage 33 is in progress and not complete',
+    'all three Stage 33 slices are complete',
+    'Stage 33 and Phase F',
+    'are complete',
+    'Stage 34 is next',
 ]);
 $require($slice1Path, $slice1, [
     '**Status:** Accepted',
@@ -149,7 +149,7 @@ $require($slice1Path, $slice1, [
     '--binary <name>',
     '--library',
     'Decision 0127 owns the implemented path',
-    'Stage 33 Slice 3 is next',
+    'Implemented Stage 33 Slice 3',
 ]);
 $require($slice2Path, $slice2, [
     '**Status:** Accepted',
@@ -170,7 +170,7 @@ $require($slice2Path, $slice2, [
     '`baton update`',
     '`baton fetch`',
     'Offline behavior is one resolver-level network policy',
-    'Stage 33 Slice 3 is next',
+    'Stage 33 Slices 1 through 3 are complete',
 ]);
 
 $require($planPath, $plan, [
@@ -193,8 +193,10 @@ $require($pipelinePath, $pipeline, [
     'Stage 32 — Complete',
     'Stage 33 Slice 1 — Complete',
     'Stage 33 Slice 2 — Complete',
-    'Stage 33 Slice 3 — Next',
-    'Stage 33 — In Progress, Not Complete',
+    'Stage 33 Slice 3 — Complete',
+    'Stage 33 — Complete',
+    'Phase F — Complete',
+    'Stage 34 Single Class Inheritance — Next',
 ]);
 $require($auditPath, $audit, [
     'Resolved. Decision 0117',

@@ -63,7 +63,7 @@ function check_stage33_slice2_dependencies_and_lockfile(string $root): array
         '[dependencies]',
         'exactly one of `rev`, `tag`, or',
         '`branch`',
-        '[dev-dependencies]` remains deferred to Stage 33 Slice 3',
+        '[dev-dependencies]` was deferred to Stage 33 Slice 3',
         'Path dependencies are live inputs',
         'Git dependencies require scoped package',
         'SemVer constraint',
@@ -79,7 +79,7 @@ function check_stage33_slice2_dependencies_and_lockfile(string $root): array
         '`baton remove`',
         '`baton update`',
         '`baton fetch`',
-        '`baton tree` and `baton why` remain recognized Stage 33 Slice 3 commands',
+        '`baton tree` and `baton why` were reserved for Stage 33 Slice 3',
         'Offline behavior is one resolver-level network policy',
         'global cache outside project trees',
         'No project-local vendor directory, registry',
@@ -87,8 +87,8 @@ function check_stage33_slice2_dependencies_and_lockfile(string $root): array
         'lockfile SHA-256',
         'path-dependency content',
         '`doriac` does not parse `Baton.toml` or `Baton.lock`',
-        'Stage 33 Slice 3 is next',
-        'Stage 33 remains In Progress, Not Complete',
+        'Stage 33 Slices 1 through 3 are complete',
+        'Stage 33 and Phase F are complete',
         'mandatory Pre-Stage-45 transition remains scheduled',
     ]);
 
@@ -102,16 +102,18 @@ function check_stage33_slice2_dependencies_and_lockfile(string $root): array
         'Decision 0127',
         'Slice 1 — Complete under Decision 0126',
         'Slice 2 — Complete under Decision 0127',
-        'Stage 33 Slice 3 — Next',
-        'Stage 33 — In Progress, Not Complete',
+        'Slice 3 — Complete under Decision 0128',
+        'Stage 33 — Complete',
+        'Phase F — Complete',
         'Pre-Stage-45 Doria-Native Baton Transition',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Decision 0127',
         'Stage 33 Slice 1 — Complete',
         'Stage 33 Slice 2 — Complete',
-        'Stage 33 Slice 3 — Next',
-        'Stage 33 — In Progress, Not Complete',
+        'Stage 33 Slice 3 — Complete',
+        'Stage 33 — Complete',
+        'Phase F — Complete',
         'Pre-Stage-45 Doria-Native Baton Transition',
     ]);
     $require($paths['spec'], $files['spec'], [
@@ -126,7 +128,7 @@ function check_stage33_slice2_dependencies_and_lockfile(string $root): array
         '`Baton.lock` files pin exact Git commits',
         '`install`, `add`, `remove`, `update`, and',
         '`fetch`',
-        'Development dependencies, workspaces, graph inspection, tests, and processor',
+        'Baton supports development dependencies, workspaces, graph inspection',
     ]);
 
     $staleStatuses = [

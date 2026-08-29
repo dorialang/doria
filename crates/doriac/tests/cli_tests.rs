@@ -81,6 +81,53 @@ function main(): void {}
         serde_json::from_slice(&standalone.stdout).expect("standalone metadata should be JSON");
     assert_eq!(standalone_json["schemaVersion"], 1);
     assert_eq!(standalone_json["applications"].as_array().unwrap().len(), 2);
+    let standalone_text =
+        String::from_utf8(standalone.stdout.clone()).expect("metadata should be UTF-8");
+    assert_json_keys_in_order(
+        &standalone_text,
+        &[
+            "schemaVersion",
+            "edition",
+            "compilerRevision",
+            "graphFingerprint",
+            "selectedTarget",
+            "packages",
+            "sources",
+            "attributeClasses",
+            "applications",
+        ],
+    );
+
+    let explicit_schema_1 = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["metadata", "main.doria", "--schema-version", "1"])
+        .output()
+        .expect("explicit schema-1 metadata should run");
+    assert_success("explicit schema-1 metadata", explicit_schema_1.clone());
+    assert_eq!(
+        explicit_schema_1.stdout, standalone.stdout,
+        "the default metadata protocol must remain byte-identical to explicit schema 1"
+    );
+
+    let schema_2 = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["metadata", "main.doria", "--schema-version", "2"])
+        .output()
+        .expect("schema-2 metadata should run");
+    assert_success("schema-2 metadata", schema_2.clone());
+    let schema_2_json: serde_json::Value =
+        serde_json::from_slice(&schema_2.stdout).expect("schema-2 metadata should be JSON");
+    assert_eq!(schema_2_json["schemaVersion"], 2);
+    assert_eq!(schema_2_json["callables"].as_array().unwrap().len(), 2);
+
+    let unknown_schema = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["metadata", "main.doria", "--schema-version", "3"])
+        .output()
+        .expect("unsupported schema invocation should run");
+    assert!(!unknown_schema.status.success());
+    assert!(String::from_utf8_lossy(&unknown_schema.stderr)
+        .contains("unsupported metadata schema version `3`"));
 
     let plan = serde_json::json!({
         "schemaVersion": 1,
@@ -1021,6 +1068,17 @@ fn assert_failure_contains(label: &str, output: Output, expected: &str) {
         stderr.contains(expected),
         "{label}: expected stderr containing `{expected}`, got `{stderr}`"
     );
+}
+
+fn assert_json_keys_in_order(document: &str, keys: &[&str]) {
+    let mut offset = 0;
+    for key in keys {
+        let needle = format!("\"{key}\":");
+        let position = document[offset..]
+            .find(&needle)
+            .unwrap_or_else(|| panic!("metadata JSON is missing key `{key}` after byte {offset}"));
+        offset += position + needle.len();
+    }
 }
 
 fn temp_dir_path(stem: &str) -> PathBuf {

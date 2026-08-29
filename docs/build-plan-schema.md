@@ -76,7 +76,10 @@ Source scopes are:
 - `development`: active only when selected by the target and may use declared
   development dependencies.
 - `generated`: explicitly inventoried generated input. It must declare
-  `generatedFor` as `main` or `development`.
+  `generatedFor` as `main` or `development`. Generated sources normally use
+  `origin: "generated"`; a generated source selected as the binary entry uses
+  `origin: "entry"` so generated test dispatchers and similar managed entries
+  remain both generated-scope inputs and unambiguous selected entry sources.
 
 Source origins are `entry`, `autoload`, `explicit`, and `generated`. `autoload`
 records how project tooling selected a source; it does not ask `doriac` to scan
@@ -137,9 +140,10 @@ destination.
 
 ## Baton Boundary
 
-Baton may read project manifests, discover configured sources, resolve and fetch
-dependencies, manage workspaces and caches, and emit this resolved plan.
+Baton reads project manifests, discovers configured sources, resolves and fetches
+dependencies, manages workspaces and caches, and emits this resolved plan.
 `doriac` parses only the build plan: it loads the explicit inventory, resolves
 literal includes, builds and checks the package graph, and emits the selected
-target. Stage 31 does not implement Baton schema 2, dependency solving,
-`Baton.lock`, processors, package installation, or persistent compiler caches.
+target. Stage 33 completes Baton schema 2, dependency solving, `Baton.lock`,
+processors, package installation, and incremental project inventory without
+changing compiler build-plan schema 1.

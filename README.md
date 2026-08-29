@@ -202,9 +202,11 @@ function routeCanBeMatched(): void
 
 Attribute arguments reuse ordinary named/default argument binding and the
 bounded constant evaluator. Applying an attribute executes no constructor or
-other Doria code. `#[Test]` is metadata for future Baton orchestration, while
+other Doria code. `#[Test]` is metadata for Baton orchestration, while
 `#[PHPExport]` remains metadata for the later PHP bridge. Use `doriac metadata`
-or `doriac metadata --build-plan` to inspect deterministic typed metadata.
+or `doriac metadata --build-plan` to inspect deterministic typed metadata;
+explicit `--schema-version 2` adds callable facts for Baton test discovery while
+schema 1 remains the default.
 The compiler validates the versioned processor protocol but executes no processor
 and writes no generated source. See
 [`docs/attribute-metadata-protocol.md`](docs/attribute-metadata-protocol.md).
@@ -226,9 +228,11 @@ locations, or absolute local paths. `install`, `add`, `remove`, `update`, and
 emits explicit multi-package build plans for `doriac`; neither compiled programs
 nor the compiler search for project source or parse Baton files at runtime.
 
-Development dependencies, workspaces, graph inspection, tests, and processor
-orchestration remain the next Baton slice and are not claimed as current
-behavior.
+Baton supports development dependencies, workspaces, graph inspection, tests,
+processors, generated sources, and project inventory across the compiler and
+language server. The current PHP bootstrap freezes that product contract while
+Decision 0124 keeps the Doria-native implementation mandatory before the first
+unsuffixed toolchain release.
 
 The CLI supports human, concise, and versioned JSON diagnostics. Human and
 concise output go to stderr; JSON goes to stdout for tools:

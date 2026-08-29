@@ -43,7 +43,7 @@ an optional `version`. Git entries accept `git`, exactly one of `rev`, `tag`, or
 `branch`, and an optional `version`. Unknown or cross-transport fields are
 errors rather than ignored future behavior.
 
-`[dev-dependencies]` remains deferred to Stage 33 Slice 3. Slice 2 neither
+`[dev-dependencies]` was deferred to Stage 33 Slice 3. Slice 2 neither
 resolves nor records development dependency edges.
 
 ## Package Sources And Versions
@@ -139,7 +139,7 @@ A selected update may introduce or remove transitive packages, but it does not
 silently change an unselected pinned package. If the new graph requires that
 change, Baton reports the conflict and asks for a broader update.
 
-`baton tree` and `baton why` remain recognized Stage 33 Slice 3 commands. They
+`baton tree` and `baton why` were reserved for Stage 33 Slice 3. They
 are not implemented by Slice 2.
 
 ## Cache And Offline Policy
@@ -182,10 +182,10 @@ paths or absolute dependency roots.
 
 ## Slice Boundary And Native Transition
 
-Stage 33 Slice 1 and Slice 2 are complete in the disposable PHP UX bootstrap.
-Stage 33 Slice 3 is next and owns development dependencies, workspaces, graph
+Stage 33 Slices 1 through 3 are complete in the disposable PHP UX bootstrap.
+Stage 33 Slice 3 owns development dependencies, workspaces, graph
 commands, tests, processors, generated-source orchestration, incremental project
-inventory, and Phase F closure. Stage 33 remains In Progress, Not Complete.
+inventory, and Phase F closure. Stage 33 and Phase F are complete; Stage 34 is next.
 
 Decision 0124's mandatory Pre-Stage-45 transition remains scheduled. The clean
 `dorialang/baton` repository must parity-port every accepted Stage 33 behavior,
@@ -203,13 +203,13 @@ unsuffixed `2026.03.1` toolchain ships.
   not a command-specific convention.
 - The compiler receives an explicit package graph without becoming coupled to
   Baton's manifest or cache implementation.
-- Slice 3 behavior remains unavailable rather than being implied by partial
-  parser or command support.
+- Slice 3 behavior uses the same resolver and lock authority rather than a
+  parallel dependency implementation.
 
 ## Invalidated Elsewhere
 
 - `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md`: Stage 33
-  Slice 2 is complete, Slice 3 is next, and Stage 33 remains incomplete.
+  Slices 1 through 3 and Phase F are complete, with Stage 34 next.
 - Decisions 0117, 0118, 0124, 0125, and 0126: Stage 33 implementation status and
   the dependency/processor boundary.
 - `README.md` and `SPEC.md`: current Baton dependency, lockfile, cache, offline,

@@ -3,8 +3,8 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-27
 - **Date:** 2026-08-27
-- **Implementation Status:** PHP Bootstrap Active; Stage 33 Slices 1 And 2
-  Implemented; Stage 33 Slice 3 Next; Pre-Stage-45 Transition Scheduled
+- **Implementation Status:** PHP Bootstrap Product Contract Complete By Stage 33;
+  Pre-Stage-45 Transition Scheduled
 - **Amends:** Decision 0118's implementation ownership and the Stage 33 plan
 - **Preserves:** Decisions 0117 and 0118's public manifest, package-graph, resolver, lockfile, workspace, cache, processor, and offline contracts
 
@@ -43,9 +43,9 @@ schema-2 local/scoped identity, targets and selectors, deterministic autoload
 discovery, and single-package build plans execute in the bootstrap. Decision
 0127 records Stage 33 Slice 2 Complete: normal path/Git dependency resolution,
 strict lockfiles, dependency commands, global caching, offline operation, and
-multi-package plans execute there as well. Slice 3 is next, Stage 33 remains in
-progress and not complete, and none of that changes the required Doria-native
-cutover.
+multi-package plans execute there as well. Decision 0128 records Stage 33 Slice 3,
+Stage 33, and Phase F complete. None of that changes the required
+Doria-native cutover.
 
 Bootstrap implementation choices are never public contracts. The durable
 contract comprises observable behavior:

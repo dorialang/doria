@@ -28,7 +28,7 @@ function check_performance_foundation(string $root): array
             'Eligible timing evidence does not gate language or compiler stage progression',
             'Measurement Status: Pending Available Runner',
             'both Stage 31 slices, and Stage 32 are complete',
-            'Stage 33 Slices 1 and 2 are complete and Slice 3 is next',
+            'Stage 33 Slices 1 through 3 and Phase F are complete',
             'Doria Median / Fastest Valid Native Peer Median <= 1.30',
             'A ratio greater than `1.30` is',
             'Inconclusive**, never Pass',
