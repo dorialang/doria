@@ -55,8 +55,15 @@ pub struct SemanticInfo {
     /// Source-local contexts for graph compilation. The standalone context
     /// above remains the selected-entry compatibility view.
     pub compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
+    /// Build-plan-owned source role facts. Testing and future development-only
+    /// compiler surfaces consume this map instead of inferring scope from paths.
+    pub source_semantic_contexts:
+        HashMap<crate::source::SourceId, crate::testing::SourceSemanticContext>,
     /// Canonical global declaration/reference facts produced before checking.
     pub global_symbols: crate::names::GlobalSymbolFacts,
+    /// Compiler-owned suites and unified test declarations. Runtime backends
+    /// consume only the generated ordinary functions, never this metadata.
+    pub test_semantics: crate::testing::TestSemanticFacts,
     /// Fully resolved, type-checked, const-evaluated compiler metadata.
     /// Runtime lowering deliberately ignores this table.
     pub attributes: AttributeSemanticInfo,
@@ -603,6 +610,30 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
     compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
     global_symbols: crate::names::GlobalSymbolFacts,
 ) -> SemanticAnalysis {
+    analyze_program_for_ide_with_graph_and_test_context(
+        program,
+        source_texts,
+        compilation_context,
+        compilation_contexts,
+        HashMap::new(),
+        global_symbols,
+        crate::testing::TestSemanticFacts::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
+    program: &'source Program,
+    source_texts: &HashMap<crate::source::SourceId, &'source str>,
+    compilation_context: crate::names::CompilationContext,
+    compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
+    source_semantic_contexts: HashMap<
+        crate::source::SourceId,
+        crate::testing::SourceSemanticContext,
+    >,
+    global_symbols: crate::names::GlobalSymbolFacts,
+    test_semantics: crate::testing::TestSemanticFacts,
+) -> SemanticAnalysis {
     let (const_evaluation, const_diagnostics) = match crate::const_eval::evaluate_program(program) {
         Ok(evaluation) => (evaluation, Vec::new()),
         Err(diagnostics) => (crate::const_eval::Evaluation::default(), diagnostics),
@@ -617,9 +648,17 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
         compilation_context.clone(),
         compilation_contexts.clone(),
         global_symbols.clone(),
+        source_semantic_contexts.clone(),
+        test_semantics.clone(),
     );
     discovery.check();
     let mut ambient_effect_seed = discovery.inferred_ambient_effects();
+    let generated_test_effect_seed = discovery
+        .callable_effective_checked_effects
+        .iter()
+        .filter(|(span, _)| test_semantics.is_generated_function(**span))
+        .map(|(span, effects)| (*span, effects.clone()))
+        .collect::<HashMap<_, _>>();
 
     // The first pass deliberately over-approximates transitive ambient effects
     // so forward and recursive calls have checked transport available. Narrow
@@ -634,8 +673,11 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
             compilation_context.clone(),
             compilation_contexts.clone(),
             global_symbols.clone(),
+            source_semantic_contexts.clone(),
+            test_semantics.clone(),
         );
         refinement.ambient_effect_seed = ambient_effect_seed.clone();
+        refinement.generated_test_effect_seed = generated_test_effect_seed.clone();
         refinement.check();
         let refined = refinement.escaping_ambient_effects();
         if ambient_effect_maps_equal(&ambient_effect_seed, &refined) {
@@ -652,11 +694,23 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
         compilation_context,
         compilation_contexts,
         global_symbols,
+        source_semantic_contexts,
+        test_semantics,
     );
     checker.ambient_effect_seed = ambient_effect_seed;
+    checker.generated_test_effect_seed = generated_test_effect_seed;
     checker.diagnostics.extend(const_diagnostics);
     checker.check();
+    checker.check_behavioral_arrow_bodies();
     checker.check_attributes();
+    checker
+        .test_semantics
+        .tests
+        .extend(crate::testing::project_attribute_tests(
+            program,
+            &checker.attributes,
+            &checker.global_symbols,
+        ));
     let constructor_analysis = crate::constructor_init::check_program(
         program,
         &checker.given_preludes,
@@ -738,7 +792,9 @@ pub fn analyze_program_for_ide_with_graph_context<'source>(
         info: SemanticInfo {
             compilation_context: checker.compilation_context,
             compilation_contexts: checker.compilation_contexts,
+            source_semantic_contexts: checker.source_semantic_contexts,
             global_symbols: checker.global_symbols,
+            test_semantics: checker.test_semantics,
             attributes: checker.attributes,
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
@@ -1414,7 +1470,10 @@ struct Checker<'program> {
     source_texts: HashMap<crate::source::SourceId, &'program str>,
     compilation_context: crate::names::CompilationContext,
     compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
+    source_semantic_contexts:
+        HashMap<crate::source::SourceId, crate::testing::SourceSemanticContext>,
     global_symbols: crate::names::GlobalSymbolFacts,
+    test_semantics: crate::testing::TestSemanticFacts,
     classes: HashMap<String, ClassInfo>,
     enums: HashMap<String, EnumDefinition>,
     functions: HashMap<String, FunctionInfo>,
@@ -1457,6 +1516,7 @@ struct Checker<'program> {
     callable_declared_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     callable_dependencies: HashMap<Span, Vec<Span>>,
     ambient_effect_seed: HashMap<Span, Vec<ResolvedType>>,
+    generated_test_effect_seed: HashMap<Span, Vec<ResolvedType>>,
     callable_effective_checked_effects: HashMap<Span, Vec<ResolvedType>>,
     checked_effect_sites: crate::checked_effects::EffectSiteMap,
     throw_error_types: HashMap<Span, ResolvedType>,
@@ -2051,6 +2111,27 @@ enum DisplayConversionKind {
 }
 
 impl<'program> Checker<'program> {
+    fn check_behavioral_arrow_bodies(&mut self) {
+        let spans = self
+            .test_semantics
+            .tests
+            .iter()
+            .filter_map(|test| test.arrow_body_span)
+            .collect::<Vec<_>>();
+        for span in spans {
+            let Some(ty) = self.expression_types.get(&span) else {
+                continue;
+            };
+            if !matches!(ty, ResolvedType::Void | ResolvedType::Unsupported) {
+                self.diagnostics.push(
+                    Diagnostic::new("E0707", "behavioral test arrow body must return void", span)
+                        .with_title("Behavioral Test Body Must Return Void"),
+                );
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn new(
         program: &'program Program,
         const_evaluation: crate::const_eval::Evaluation,
@@ -2058,13 +2139,20 @@ impl<'program> Checker<'program> {
         compilation_context: crate::names::CompilationContext,
         compilation_contexts: HashMap<crate::source::SourceId, crate::names::CompilationContext>,
         global_symbols: crate::names::GlobalSymbolFacts,
+        source_semantic_contexts: HashMap<
+            crate::source::SourceId,
+            crate::testing::SourceSemanticContext,
+        >,
+        test_semantics: crate::testing::TestSemanticFacts,
     ) -> Self {
         Self {
             program,
             source_texts: source_texts.clone(),
             compilation_context,
             compilation_contexts,
+            source_semantic_contexts,
             global_symbols,
+            test_semantics,
             classes: HashMap::new(),
             enums: HashMap::new(),
             functions: HashMap::new(),
@@ -2106,6 +2194,7 @@ impl<'program> Checker<'program> {
             callable_declared_checked_effects: HashMap::new(),
             callable_dependencies: HashMap::new(),
             ambient_effect_seed: HashMap::new(),
+            generated_test_effect_seed: HashMap::new(),
             callable_effective_checked_effects: HashMap::new(),
             checked_effect_sites: HashMap::new(),
             throw_error_types: HashMap::new(),
@@ -2160,7 +2249,12 @@ impl<'program> Checker<'program> {
         for item in &self.program.items {
             match item {
                 Item::Statement(statement) => {
-                    self.check_statement(statement, &mut scopes, None, None, None, 0);
+                    if !self
+                        .test_semantics
+                        .is_declaration(statement_span(statement))
+                    {
+                        self.check_statement(statement, &mut scopes, None, None, None, 0);
+                    }
                 }
                 Item::Function(function) => self.check_function(function, None),
                 Item::Constant(constant) => {
@@ -2992,10 +3086,18 @@ impl<'program> Checker<'program> {
     }
 
     fn apply_ambient_effect_seed(&mut self) {
-        if self.ambient_effect_seed.is_empty() {
+        if self.ambient_effect_seed.is_empty() && self.generated_test_effect_seed.is_empty() {
             return;
         }
-        let seeds = self.ambient_effect_seed.clone();
+        let mut seeds = self.ambient_effect_seed.clone();
+        for (declaration, effects) in self.generated_test_effect_seed.clone() {
+            let target = seeds.entry(declaration).or_default();
+            for effect in effects {
+                if !target.contains(&effect) {
+                    target.push(effect);
+                }
+            }
+        }
         for (declaration, effects) in seeds {
             let ids = effects
                 .iter()
@@ -3999,9 +4101,10 @@ impl<'program> Checker<'program> {
                 .next()
                 .unwrap_or(function.name.as_str());
 
-            if source_name
-                .get(.."__doria_".len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__doria_"))
+            if !self.test_semantics.is_generated_function(function.span)
+                && source_name
+                    .get(.."__doria_".len())
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("__doria_"))
             {
                 self.diagnostics.push(
                     Diagnostic::new(
@@ -5872,7 +5975,10 @@ impl<'program> Checker<'program> {
                 .map(|effect| self.types.resolved(*effect))
                 .collect(),
         );
-        if function.throws.is_none() && self.is_accepted_program_entrypoint(function) {
+        if function.throws.is_none()
+            && (self.is_accepted_program_entrypoint(function)
+                || self.test_semantics.is_generated_function(function.span))
+        {
             self.set_inferred_entrypoint_effects(function, &body_effects);
         } else {
             self.check_callable_effect_contract(
@@ -8319,6 +8425,9 @@ impl<'program> Checker<'program> {
                 self.check_is_type(expr, ty, *span, scopes, method_context);
             }
             Expr::FunctionCall { name, args, span } => {
+                if crate::compiler_known_test::is_future_member(name) {
+                    return;
+                }
                 self.record_function_argument_types(name, args);
                 for arg in args {
                     self.check_expr(&arg.value, scopes, method_context);
@@ -16019,6 +16128,17 @@ impl<'program> Checker<'program> {
                     format!("Unknown Type `{}`", ty.name),
                     format!("use `{replacement}`"),
                 )
+            }
+            name if crate::compiler_known_test::is_future_member(name) => {
+                for arg in ty.type_arguments() {
+                    self.resolve_type_ref_in_position(
+                        arg,
+                        span,
+                        TypePosition::Value,
+                        declaring_class,
+                    );
+                }
+                self.types.unknown()
             }
             name if self.classes.contains_key(name) => {
                 let type_params = self

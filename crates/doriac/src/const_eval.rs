@@ -146,6 +146,28 @@ pub fn evaluate_parameter_default(
     evaluator.diagnostics.is_empty().then_some(value.value)
 }
 
+pub fn evaluate_string_expression(evaluation: &Evaluation, expr: &Expr) -> Option<String> {
+    let requester = EvaluationRequester::parameter_default(None);
+    let mut evaluator = Evaluator {
+        nodes: HashMap::new(),
+        states: evaluation
+            .values
+            .iter()
+            .map(|(key, value)| (key.clone(), State::Done(value.clone())))
+            .collect(),
+        stack: Vec::new(),
+        diagnostics: Vec::new(),
+        enum_cases: evaluation.enum_cases.clone(),
+        enum_names: evaluation.enum_names.clone(),
+        payload_cases: evaluation.payload_cases.clone(),
+    };
+    let value = evaluator.evaluate_expr(expr, Some(ConstType::String), &requester)?;
+    match value.value {
+        ConstValue::String(value) if evaluator.diagnostics.is_empty() => Some(value),
+        _ => None,
+    }
+}
+
 pub fn evaluate_attribute_value(
     evaluation: &Evaluation,
     expr: &Expr,

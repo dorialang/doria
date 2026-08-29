@@ -111,6 +111,7 @@ pub enum CompilerSymbolIdentity {
     Prelude(String),
     Intrinsic(String),
     StandardIo(String),
+    StandardTest(String),
     Attribute(String),
 }
 
@@ -137,6 +138,7 @@ pub enum GlobalSymbolKind {
     CompilerKnownType,
     CompilerKnownIntrinsic,
     CompilerKnownAttribute,
+    CompilerKnownTestDeclaration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -156,6 +158,7 @@ pub enum GlobalReferenceRole {
     ImportAliasUse,
     Include,
     AttributeClass,
+    TestDeclaration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +206,7 @@ pub enum CompilerKnownProvenance {
     EditionPrelude(Edition),
     Intrinsic,
     StandardIo,
+    StandardTest,
     Attribute,
 }
 
@@ -888,6 +892,7 @@ impl<'a> Resolver<'a> {
                 imported_targets.insert(target.clone(), entry.target.span);
                 if !self.has_symbol(&target)
                     && !crate::compiler_known_io::is_canonical_type(&target)
+                    && !crate::compiler_known_test::is_canonical_member(&target)
                 {
                     self.imports.insert(
                         alias.clone(),
@@ -1045,6 +1050,9 @@ impl<'a> Resolver<'a> {
                 qualified_name: canonical.to_string(),
             });
         }
+        if let Some(symbol) = crate::compiler_known_test::symbol_id(canonical) {
+            return Some(symbol);
+        }
         if edition_prelude(self.context.edition)
             .iter()
             .any(|entry| entry.name == canonical)
@@ -1112,6 +1120,16 @@ impl<'a> Resolver<'a> {
         if !self.check_graph_visibility(&canonical, span) {
             return None;
         }
+        let role = if matches!(
+            &symbol_id.owner,
+            GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardTest(name))
+                if crate::compiler_known_test::is_declaration(name)
+        ) && role == GlobalReferenceRole::FunctionCall
+        {
+            GlobalReferenceRole::TestDeclaration
+        } else {
+            role
+        };
         self.references.push(GlobalSymbolReference {
             source_identity: self.context.source.clone(),
             symbol_id,
@@ -1128,6 +1146,7 @@ impl<'a> Resolver<'a> {
             || self
                 .environment
                 .is_some_and(|environment| environment.declarations.contains_key(canonical))
+            || crate::compiler_known_test::is_canonical_member(canonical)
     }
 
     fn check_graph_visibility(&mut self, canonical: &str, span: Span) -> bool {
@@ -1874,6 +1893,28 @@ pub fn compiler_known_symbol_facts(edition: Edition) -> Vec<CompilerKnownSymbolF
             provenance: CompilerKnownProvenance::StandardIo,
         }
     }));
+    facts.extend(
+        crate::compiler_known_test::DECLARATIONS
+            .into_iter()
+            .chain([
+                crate::compiler_known_test::EXPECT,
+                crate::compiler_known_test::FAIL,
+            ])
+            .map(|canonical| CompilerKnownSymbolFact {
+                id: crate::compiler_known_test::symbol_id(canonical)
+                    .expect("canonical test member has an identity"),
+                kind: GlobalSymbolKind::CompilerKnownTestDeclaration,
+                source_name: canonical.to_string(),
+                provenance: CompilerKnownProvenance::StandardTest,
+            }),
+    );
+    facts.push(CompilerKnownSymbolFact {
+        id: crate::compiler_known_test::symbol_id(crate::compiler_known_test::ASSERTION_ERROR)
+            .expect("canonical test type has an identity"),
+        kind: GlobalSymbolKind::CompilerKnownType,
+        source_name: crate::compiler_known_test::ASSERTION_ERROR.to_string(),
+        provenance: CompilerKnownProvenance::StandardTest,
+    });
     facts.extend(
         COMPILER_KNOWN_ATTRIBUTES.map(|name| CompilerKnownSymbolFact {
             id: compiler_known_attribute_id(name),

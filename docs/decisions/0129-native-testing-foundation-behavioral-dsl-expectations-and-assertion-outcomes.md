@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-29
 - **Date:** 2026-08-29
-- **Implementation Status:** Scheduled As A Mandatory Pre-Stage-34 Foundation
+- **Implementation Status:** Slice 1 Compiler Implemented; Baton And Tooling Coordination Pending
 - **Amends:** Decisions 0096, 0113, 0121, 0123, 0125, and 0128
 - **Preserves:** Stage 33 and Phase F completion; compiler-owned `#[Test]` metadata; Baton process isolation and development-graph orchestration; Doria ownership, checked-error, namespace, package, and backend laws; and Stage 34 inheritance authority
 
@@ -494,6 +494,13 @@ Pest do not define the language behavior.
 ## Implementation Slices
 
 ### Slice 1: Behavioral Test DSL And Unified Compiler Metadata
+
+Compiler implementation is complete on `develop`. Exact compiler-known
+resolution, development-source enforcement, const-evaluated descriptions,
+nested suite extraction, direct generated callables, unified `#[Test]` and
+behavioral facts, strict metadata schema 3, and ordinary HIR/MIR/backend
+execution are implemented. Baton schema-3 orchestration and language-server
+coordination remain pending, so Slice 1 and the foundation are not yet complete.
 
 Owns:
 

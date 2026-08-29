@@ -41,6 +41,8 @@ pub fn lower_program_with_semantics(
     apply_checked_error_semantics(&mut items, &semantic_info);
     apply_global_identities(&mut items, &semantic_info);
 
+    let test_suites = semantic_info.test_semantics.suites.clone();
+    let tests = semantic_info.test_semantics.tests.clone();
     Ok(hir::Program {
         sources: Vec::new(),
         packages: Vec::new(),
@@ -61,6 +63,8 @@ pub fn lower_program_with_semantics(
         items,
         attribute_metadata: semantic_info.attributes.clone(),
         semantic_info,
+        test_suites,
+        tests,
     })
 }
 

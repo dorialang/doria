@@ -24,7 +24,7 @@ if ($decision === false || $reference === false) {
 $requiredDecisionFacts = [
     '# Decision 0129: Native Testing Foundation, Behavioral DSL, Fluent Expectations, And Assertion Outcomes',
     '**Status:** Accepted',
-    '**Implementation Status:** Scheduled As A Mandatory Pre-Stage-34 Foundation',
+    '**Implementation Status:** Slice 1 Compiler Implemented; Baton And Tooling Coordination Pending',
     'Pre-Stage-34 Native Testing Foundation - Next',
     'Slice 1 - Behavioral Test DSL And Unified Compiler Metadata',
     'Slice 2 - Fluent Expectation Kernel And Assertion Semantics',
@@ -38,6 +38,7 @@ $requiredDecisionFacts = [
     'AssertionError',
     'TestAssertion',
     'metadata schema version 3',
+    'Baton schema-3 orchestration and language-server',
     'Stage 34 Single Class Inheritance - After The Testing Foundation',
     'This is a deferral, not a permanent rejection.',
 ];
@@ -73,7 +74,6 @@ $forbidden = [
     'Baton parses Doria source',
     'runtime suite registry: required',
     'Nested testing hooks are permanently rejected',
-    'Stage 34 Single Class Inheritance - Next',
 ];
 
 foreach ($forbidden as $fact) {

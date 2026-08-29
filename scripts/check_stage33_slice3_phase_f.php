@@ -71,8 +71,10 @@ function check_stage33_slice3_phase_f(string $root): array
     $require($paths['attributes'], $files['attributes'], [
         'pub const ATTRIBUTE_METADATA_SCHEMA_VERSION: u32 = 1;',
         'pub const ATTRIBUTE_METADATA_SCHEMA_VERSION_2: u32 = 2;',
+        'pub const ATTRIBUTE_METADATA_SCHEMA_VERSION_3: u32 = 3;',
         'pub const ATTRIBUTE_PROCESSOR_SCHEMA_VERSION: u32 = 1;',
         'pub struct AttributeMetadataDocumentV2',
+        'pub struct AttributeMetadataDocumentV3',
         'pub struct MetadataCallableV2',
         'pub fn metadata_document_v2',
     ]);
@@ -83,7 +85,7 @@ function check_stage33_slice3_phase_f(string $root): array
     $require($paths['cli'], $files['cli'], [
         'metadata_schema_version',
         'unsupported metadata schema version',
-        '[--schema-version 1|2]',
+        '[--schema-version 1|2|3]',
     ]);
     $require($paths['tests'], $files['tests'], [
         'metadata_schema_2_exposes_exact_callable_signatures_without_runtime_data',
@@ -92,7 +94,8 @@ function check_stage33_slice3_phase_f(string $root): array
     ]);
     $require($paths['cliTests'], $files['cliTests'], [
         'the default metadata protocol must remain byte-identical to explicit schema 1',
-        'unsupported metadata schema version `3`',
+        'schema-3 metadata should run',
+        'unsupported metadata schema version `4`',
     ]);
 
     return $failures;
