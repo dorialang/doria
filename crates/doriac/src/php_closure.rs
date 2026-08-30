@@ -334,6 +334,18 @@ fn collect_statement_closures(
 
 fn collect_expr_closures(expr: &Expr, closures: &mut HashMap<ClosureId, hir::ClosureExpression>) {
     match expr {
+        Expr::Assertion(assertion) => {
+            for operand in [
+                assertion.actual.as_deref(),
+                assertion.expected.as_deref(),
+                assertion.user_message.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                collect_expr_closures(operand, closures);
+            }
+        }
         Expr::Closure(closure) => {
             closures.insert(closure.closure_id, (**closure).clone());
             match &closure.body {
@@ -735,6 +747,18 @@ fn visit_expr_calls(
     cells: &mut HashSet<BindingId>,
 ) {
     match expr {
+        Expr::Assertion(assertion) => {
+            for operand in [
+                assertion.actual.as_deref(),
+                assertion.expected.as_deref(),
+                assertion.user_message.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                visit_expr_calls(operand, program, callables, call_targets, cells);
+            }
+        }
         Expr::CallableCall(call) => {
             if let Some(ResolvedType::Function(function_type)) = program
                 .semantic_info

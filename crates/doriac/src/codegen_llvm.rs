@@ -59,20 +59,20 @@ use crate::native_abi::{
     MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID,
     NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
     READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD,
-    SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE,
-    STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES,
-    STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE,
-    STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64,
-    STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF,
-    STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF,
-    STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END,
-    STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE,
-    STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM,
-    STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR,
-    STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
-    WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS, WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK,
-    WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
-    WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
+    SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_ASSERTION_QUOTE, STRING_BYTE_LENGTH,
+    STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE,
+    STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE,
+    STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32,
+    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH,
+    STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN,
+    STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST,
+    STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN,
+    STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE,
+    STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER,
+    STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE,
+    WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS, WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS,
+    WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK, WRITABLE_SHARED_READONLY_PAYLOAD,
+    WRITABLE_SHARED_RELEASE, WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
     WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_RETAIN,
     WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES,
     WRITE_STDOUT_BYTES,
@@ -458,6 +458,41 @@ fn declare_error_metadata<'ctx>(
             descriptor.type_name.as_bytes(),
             &format!("__doria_error_descriptor_{}_type_name", descriptor.id.0),
         );
+        let assertion_offsets = descriptor
+            .assertion
+            .as_ref()
+            .map(|assertion| {
+                let values = assertion
+                    .fact_properties
+                    .iter()
+                    .map(|property| {
+                        class
+                            .layout
+                            .properties
+                            .iter()
+                            .find(|layout| layout.id == *property)
+                            .map(|layout| word.const_int(u64::from(layout.offset), false))
+                            .ok_or_else(|| {
+                                malformed_mir("AssertionError fact property has no class layout")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let array = word.const_array(&values);
+                let global = module.add_global(
+                    array.get_type(),
+                    None,
+                    &format!(
+                        "__doria_error_descriptor_{}_assertion_offsets",
+                        descriptor.id.0
+                    ),
+                );
+                global.set_initializer(&array);
+                global.set_constant(true);
+                global.set_linkage(Linkage::Internal);
+                Ok::<_, BackendError>(global.as_pointer_value().const_to_int(word))
+            })
+            .transpose()?
+            .unwrap_or_else(|| word.const_zero());
         let initializer = descriptor_type.const_named_struct(&[
             type_name.into(),
             word.const_int(descriptor.type_name.len() as u64, false)
@@ -472,8 +507,15 @@ fn declare_error_metadata<'ctx>(
                 false,
             )
             .into(),
-            word.const_zero().into(),
-            word.const_zero().into(),
+            assertion_offsets.into(),
+            word.const_int(
+                descriptor
+                    .assertion
+                    .as_ref()
+                    .map_or(0, |_| crate::native_abi::ASSERTION_ERROR_DESCRIPTOR_MAGIC),
+                false,
+            )
+            .into(),
         ]);
         let global = module.add_global(
             descriptor_type,
@@ -12694,6 +12736,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     &[argument(0)?.into()],
                 )?
                 .ok_or_else(|| backend_failure("String empty test produced no result"))?,
+            Kind::AssertionQuote => self
+                .call_runtime(
+                    STRING_ASSERTION_QUOTE,
+                    &[pointer.into(), pointer.into()],
+                    Some(pointer.into()),
+                    &[self.current_frame.into(), argument(0)?.into()],
+                )?
+                .ok_or_else(|| {
+                    backend_failure("assertion string presentation produced no result")
+                })?,
             Kind::ToBytes => self
                 .call_runtime(
                     STRING_TO_BYTES,
@@ -13227,6 +13279,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<PointerValue<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match expression {
+            mir::MixedExpression::Null => Ok(pointer.const_null()),
             mir::MixedExpression::Local { local, transfer } => {
                 let slot = local_slot(&self.local_slots, *local)?;
                 let value = build(self.builder.build_load(pointer, slot, "mixed.local"))?
@@ -16535,6 +16588,46 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         "enum.compare",
                     ))?,
                 };
+                build(
+                    self.builder
+                        .build_conditional_branch(condition, then_block, else_block),
+                )?;
+            }
+            mir::BoolExpression::ClassIdentityCompare {
+                op, left, right, ..
+            } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let left = build(self.builder.build_load(
+                    pointer,
+                    local_slot(&self.local_slots, *left)?,
+                    "class.identity.left",
+                ))?
+                .into_pointer_value();
+                let right = build(self.builder.build_load(
+                    pointer,
+                    local_slot(&self.local_slots, *right)?,
+                    "class.identity.right",
+                ))?
+                .into_pointer_value();
+                let predicate = match op {
+                    mir::CompareOp::Equal => IntPredicate::EQ,
+                    mir::CompareOp::NotEqual => IntPredicate::NE,
+                    _ => return Err(malformed_mir("ordered class identity comparison")),
+                };
+                let condition = build(self.builder.build_int_compare(
+                    predicate,
+                    build(self.builder.build_ptr_to_int(
+                        left,
+                        self.context.ptr_sized_int_type(self.target_data, None),
+                        "class.identity.left.word",
+                    ))?,
+                    build(self.builder.build_ptr_to_int(
+                        right,
+                        self.context.ptr_sized_int_type(self.target_data, None),
+                        "class.identity.right.word",
+                    ))?,
+                    "class.identity.compare",
+                ))?;
                 build(
                     self.builder
                         .build_conditional_branch(condition, then_block, else_block),

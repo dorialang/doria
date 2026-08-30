@@ -74,8 +74,9 @@ syntax, canonical resolution, the edition prelude, compiler context, build-plan
 package graphs, include resolution, package visibility, and multi-source
 lowering are implemented. Stage 32 is complete under Decision 0125. Stage 33
 Slices 1 through 3 and Phase F are complete under Decisions 0126 through 0128;
-Native Testing Foundation Slice 1 is complete, Slice 2 is next, and Stage 34
-waits for the foundation. Decision 0124 separately binds the
+Native Testing Foundation Slice 1 is complete; Slice 2's compiler/runtime
+portion is implemented while Baton/tooling coordination remains pending; and
+Stage 34 waits for the foundation. Decision 0124 separately binds the
 Pre-Stage-45 Doria-native port, parity and release cutover, and the unsuffixed
 `2026.03.1` blocker. Stage 30 is complete and E0641 remains historical and
 reserved.

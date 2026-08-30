@@ -52,6 +52,143 @@ unsafe fn copy_range(
     result
 }
 
+const ASSERTION_PRESENTATION_LIMIT: usize = 4096;
+const ASSERTION_TRUNCATION_MARKER: &[u8] = b"...<truncated>";
+
+const fn assertion_escape_length(byte: u8) -> usize {
+    match byte {
+        b'\"' | b'\\' | b'\n' | b'\r' | b'\t' => 2,
+        0..=0x1f | 0x7f => 6,
+        _ => 1,
+    }
+}
+
+unsafe fn write_assertion_escape(output: *mut u8, byte: u8) -> usize {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    match byte {
+        b'\"' | b'\\' => {
+            output.write(b'\\');
+            output.add(1).write(byte);
+            2
+        }
+        b'\n' => {
+            output.write(b'\\');
+            output.add(1).write(b'n');
+            2
+        }
+        b'\r' => {
+            output.write(b'\\');
+            output.add(1).write(b'r');
+            2
+        }
+        b'\t' => {
+            output.write(b'\\');
+            output.add(1).write(b't');
+            2
+        }
+        0..=0x1f | 0x7f => {
+            ptr::copy_nonoverlapping(b"\\u00".as_ptr(), output, 4);
+            output.add(4).write(HEX[usize::from(byte >> 4)]);
+            output.add(5).write(HEX[usize::from(byte & 0x0f)]);
+            6
+        }
+        _ => {
+            output.write(byte);
+            1
+        }
+    }
+}
+
+/// Produces the compiler-owned bounded quoted presentation used only on a
+/// failed assertion edge. The source string is borrowed and unchanged.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_string_assertion_quote(
+    frame: *const DrStackFrameV2,
+    value: *const DrStringV1,
+) -> *mut DrStringV1 {
+    let source = text(value).as_bytes();
+    let escaped_length = source.iter().fold(0usize, |length, byte| {
+        length.saturating_add(assertion_escape_length(*byte))
+    });
+    let truncated = escaped_length.saturating_add(2) > ASSERTION_PRESENTATION_LIMIT;
+    let content_limit = if truncated {
+        ASSERTION_PRESENTATION_LIMIT - 2 - ASSERTION_TRUNCATION_MARKER.len()
+    } else {
+        escaped_length
+    };
+    let mut consumed = 0usize;
+    let mut content_length = 0usize;
+    while consumed < source.len() {
+        let byte = source[consumed];
+        let unit_length = if byte < 0x80 {
+            assertion_escape_length(byte)
+        } else {
+            let width = if byte < 0xe0 {
+                2
+            } else if byte < 0xf0 {
+                3
+            } else {
+                4
+            };
+            if content_length.saturating_add(width) > content_limit {
+                break;
+            }
+            content_length += width;
+            consumed += width;
+            continue;
+        };
+        if content_length.saturating_add(unit_length) > content_limit {
+            break;
+        }
+        content_length += unit_length;
+        consumed += 1;
+    }
+    let result_length = 2
+        + content_length
+        + if truncated {
+            ASSERTION_TRUNCATION_MARKER.len()
+        } else {
+            0
+        };
+    let result = new_result(frame, result_length);
+    let output = string_bytes_mut(result);
+    output.write(b'\"');
+    let mut source_index = 0usize;
+    let mut output_index = 1usize;
+    while source_index < consumed {
+        let byte = source[source_index];
+        if byte < 0x80 {
+            output_index += write_assertion_escape(output.add(output_index), byte);
+            source_index += 1;
+        } else {
+            let width = if byte < 0xe0 {
+                2
+            } else if byte < 0xf0 {
+                3
+            } else {
+                4
+            };
+            ptr::copy_nonoverlapping(
+                source.as_ptr().add(source_index),
+                output.add(output_index),
+                width,
+            );
+            source_index += width;
+            output_index += width;
+        }
+    }
+    if truncated {
+        ptr::copy_nonoverlapping(
+            ASSERTION_TRUNCATION_MARKER.as_ptr(),
+            output.add(output_index),
+            ASSERTION_TRUNCATION_MARKER.len(),
+        );
+        output_index += ASSERTION_TRUNCATION_MARKER.len();
+    }
+    output.add(output_index).write(b'\"');
+    result
+}
+
 unsafe fn transform(
     frame: *const DrStackFrameV2,
     value: *const DrStringV1,

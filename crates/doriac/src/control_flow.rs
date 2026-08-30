@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Block, ElseBranch, Expr, ForIncrement, ForInitializer, ForStmt, Stmt};
 use crate::checked_effects::{CatchTypeMap, EffectSiteMap};
@@ -155,6 +155,7 @@ struct Builder<'a> {
     given_preludes: GivenSemanticInfoMap,
     checked_effect_sites: &'a EffectSiteMap,
     catch_error_types: &'a CatchTypeMap,
+    terminal_expression_spans: &'a HashSet<Span>,
     exception_handlers: Vec<ExceptionHandler>,
 }
 
@@ -169,12 +170,32 @@ pub fn build_function_cfg_with_given(
 ) -> ControlFlowGraph {
     let checked_effect_sites = EffectSiteMap::new();
     let catch_error_types = CatchTypeMap::new();
+    let terminal_expression_spans = HashSet::new();
     build_function_cfg_with_checked_effects(
         body,
         function_span,
         given_preludes,
         &checked_effect_sites,
         &catch_error_types,
+        &terminal_expression_spans,
+    )
+}
+
+pub fn build_function_cfg_with_given_and_terminals(
+    body: &Block,
+    function_span: Span,
+    given_preludes: &GivenSemanticInfoMap,
+    terminal_expression_spans: &HashSet<Span>,
+) -> ControlFlowGraph {
+    let checked_effect_sites = EffectSiteMap::new();
+    let catch_error_types = CatchTypeMap::new();
+    build_function_cfg_with_checked_effects(
+        body,
+        function_span,
+        given_preludes,
+        &checked_effect_sites,
+        &catch_error_types,
+        terminal_expression_spans,
     )
 }
 
@@ -184,6 +205,7 @@ pub(crate) fn build_function_cfg_with_checked_effects(
     given_preludes: &GivenSemanticInfoMap,
     checked_effect_sites: &EffectSiteMap,
     catch_error_types: &CatchTypeMap,
+    terminal_expression_spans: &HashSet<Span>,
 ) -> ControlFlowGraph {
     let graph = ControlFlowGraph::new(function_span);
     let entry = graph.entry;
@@ -194,6 +216,7 @@ pub(crate) fn build_function_cfg_with_checked_effects(
         given_preludes: given_preludes.clone(),
         checked_effect_sites,
         catch_error_types,
+        terminal_expression_spans,
         exception_handlers: Vec::new(),
     };
     let outgoing = builder.build_statements(&body.statements, vec![entry]);
@@ -327,7 +350,9 @@ impl Builder<'_> {
                     outgoing
                 }
             }
-            Stmt::Expr { expr, span } if is_panic_call(expr) => {
+            Stmt::Expr { expr, span }
+                if is_panic_call(expr) || self.terminal_expression_spans.contains(span) =>
+            {
                 self.terminal(
                     NodeKind::DivergeExit,
                     *span,

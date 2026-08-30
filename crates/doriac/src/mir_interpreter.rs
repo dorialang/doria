@@ -378,6 +378,7 @@ enum EvaluationValue {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MixedValue {
+    Null,
     Scalar(mir::ScalarValue),
     String(SharedString),
     Class {
@@ -404,17 +405,20 @@ enum MixedValue {
 }
 
 impl MixedValue {
-    fn tag(&self) -> mir::MixedTag {
+    fn tag(&self) -> Option<mir::MixedTag> {
         match self {
-            Self::Scalar(mir::ScalarValue::Bool(_)) => mir::MixedTag::Bool,
-            Self::Scalar(mir::ScalarValue::Integer(value)) => mir::MixedTag::Integer(value.ty),
-            Self::Scalar(mir::ScalarValue::Float(value)) => mir::MixedTag::Float(value.ty),
-            Self::Scalar(mir::ScalarValue::Enum(value)) => mir::MixedTag::Enum(value.enum_id),
-            Self::String(_) => mir::MixedTag::String,
-            Self::Class { class, .. } => mir::MixedTag::Class(*class),
-            Self::PayloadEnum { value, .. } => mir::MixedTag::PayloadEnum(value.ty),
-            Self::Error { .. } => mir::MixedTag::Error,
-            Self::Function { value, .. } => mir::MixedTag::Function(value.function_type),
+            Self::Null => None,
+            Self::Scalar(mir::ScalarValue::Bool(_)) => Some(mir::MixedTag::Bool),
+            Self::Scalar(mir::ScalarValue::Integer(value)) => {
+                Some(mir::MixedTag::Integer(value.ty))
+            }
+            Self::Scalar(mir::ScalarValue::Float(value)) => Some(mir::MixedTag::Float(value.ty)),
+            Self::Scalar(mir::ScalarValue::Enum(value)) => Some(mir::MixedTag::Enum(value.enum_id)),
+            Self::String(_) => Some(mir::MixedTag::String),
+            Self::Class { class, .. } => Some(mir::MixedTag::Class(*class)),
+            Self::PayloadEnum { value, .. } => Some(mir::MixedTag::PayloadEnum(value.ty)),
+            Self::Error { .. } => Some(mir::MixedTag::Error),
+            Self::Function { value, .. } => Some(mir::MixedTag::Function(value.function_type)),
         }
     }
 }
@@ -4653,7 +4657,7 @@ impl Interpreter<'_> {
                 let LocalValue::Mixed(value) = self.pop_local_value()? else {
                     return Err(InterpreterError::new("nullable mixed payload is not mixed"));
                 };
-                self.push_nullable_mixed(Some(value))?;
+                self.push_nullable_mixed((value != MixedValue::Null).then_some(value))?;
             }
             EvaluationTask::WrapNullable(ty) => {
                 let value = self.pop_local_value()?;
@@ -4803,7 +4807,7 @@ impl Interpreter<'_> {
                         "MIR mixed is expression produced another value type",
                     ));
                 };
-                let matches = value.tag() == tag;
+                let matches = value.tag() == Some(tag);
                 if ownership == mir::MixedOwnership::Owned {
                     self.queue_value_drops(LocalValue::Mixed(value))?;
                 }
@@ -6452,6 +6456,33 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::Value(*right));
                 frame.tasks.push(EvaluationTask::Value(*left));
             }
+            mir::BoolExpression::ClassIdentityCompare {
+                op,
+                class,
+                left,
+                right,
+            } => {
+                let object = |local| match read_local(&self.current_frame()?.locals, local)? {
+                    LocalValue::Class {
+                        object,
+                        class: actual,
+                    } if *actual == class => Ok(*object),
+                    _ => Err(InterpreterError::new(
+                        "MIR class identity comparison has an incompatible local",
+                    )),
+                };
+                let equal = object(left)? == object(right)?;
+                let value = match op {
+                    mir::CompareOp::Equal => equal,
+                    mir::CompareOp::NotEqual => !equal,
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "MIR class identity comparison uses an ordered operator",
+                        ));
+                    }
+                };
+                self.push_scalar(mir::ScalarValue::Bool(value))?;
+            }
             mir::BoolExpression::StringCompare { op, left, right } => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::StringCompare(op));
@@ -7007,6 +7038,7 @@ impl Interpreter<'_> {
         expression: mir::MixedExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
+            mir::MixedExpression::Null => self.push_mixed(MixedValue::Null)?,
             mir::MixedExpression::Local { local, transfer } => {
                 let value = if transfer {
                     self.current_frame_mut()?
@@ -13058,6 +13090,11 @@ impl Interpreter<'_> {
                 let collection = collection_result_id(result)?;
                 self.push_byte_collection(collection, local_string(&arguments, 0)?.as_bytes())?;
             }
+            Kind::AssertionQuote => {
+                self.push_string(crate::assertions::quote_string(local_string(
+                    &arguments, 0,
+                )?))?;
+            }
             Kind::Trim | Kind::TrimStart | Kind::TrimEnd => {
                 let text = local_string(&arguments, 0)?;
                 let mode = match kind {
@@ -13500,7 +13537,7 @@ impl Interpreter<'_> {
                                 "MIR mixed scalar payload references another local type",
                             )
                         })?;
-                if value.tag() != *tag {
+                if value.tag() != Some(*tag) {
                     return Err(InterpreterError::new(
                         "MIR mixed scalar payload observed another tag",
                     ));
@@ -14402,8 +14439,92 @@ impl Interpreter<'_> {
             facts: Vec::new(),
             error_type: Some(descriptor.type_name.clone()),
         };
-        let diagnostic =
-            Diagnostic::runtime_error(descriptor.type_name.clone(), message, span, outcome);
+        let diagnostic = if let Some(assertion) = &descriptor.assertion {
+            let string_fact = |index: usize| -> Result<String, InterpreterError> {
+                object
+                    .properties
+                    .get(assertion.fact_properties[index].index)
+                    .and_then(Option::as_ref)
+                    .and_then(|value| match value {
+                        LocalValue::String(value) => Some(value.to_string()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        InterpreterError::new("escaping AssertionError has malformed string facts")
+                    })
+            };
+            let bool_fact = |index: usize| -> Result<bool, InterpreterError> {
+                object
+                    .properties
+                    .get(assertion.fact_properties[index].index)
+                    .and_then(Option::as_ref)
+                    .and_then(|value| match value {
+                        LocalValue::Scalar(mir::ScalarValue::Bool(value)) => Some(*value),
+                        _ => None,
+                    })
+                    .ok_or_else(|| {
+                        InterpreterError::new("escaping AssertionError has malformed bool facts")
+                    })
+            };
+            let facts = vec![
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_MATCHER_FACT.to_string(),
+                    value: RuntimeFactValue::StaticString(string_fact(0)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_NEGATED_FACT.to_string(),
+                    value: RuntimeFactValue::Boolean(bool_fact(1)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_ACTUAL_PRESENT_FACT.to_string(),
+                    value: RuntimeFactValue::Boolean(bool_fact(2)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_ACTUAL_TYPE_FACT.to_string(),
+                    value: RuntimeFactValue::StaticString(string_fact(3)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_ACTUAL_PRESENTATION_FACT
+                        .to_string(),
+                    value: RuntimeFactValue::StaticString(string_fact(4)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_EXPECTED_PRESENT_FACT.to_string(),
+                    value: RuntimeFactValue::Boolean(bool_fact(5)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_EXPECTED_TYPE_FACT.to_string(),
+                    value: RuntimeFactValue::StaticString(string_fact(6)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_EXPECTED_PRESENTATION_FACT
+                        .to_string(),
+                    value: RuntimeFactValue::StaticString(string_fact(7)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_DIFFERENCE_PRESENT_FACT.to_string(),
+                    value: RuntimeFactValue::Boolean(bool_fact(8)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_DIFFERENCE_FACT.to_string(),
+                    value: RuntimeFactValue::StaticString(string_fact(9)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_USER_MESSAGE_PRESENT_FACT
+                        .to_string(),
+                    value: RuntimeFactValue::Boolean(bool_fact(10)?),
+                },
+                RuntimeFact {
+                    name: doria_diagnostic_catalogue::ASSERTION_USER_MESSAGE_FACT.to_string(),
+                    value: RuntimeFactValue::StaticString(string_fact(11)?),
+                },
+            ];
+            let mut outcome = outcome;
+            outcome.facts = facts;
+            Diagnostic::runtime_assertion(message, span, outcome)
+        } else {
+            Diagnostic::runtime_error(descriptor.type_name.clone(), message, span, outcome)
+        };
         let rendered = render_runtime_diagnostic(self.program, &diagnostic);
         let mut stderr = self.stderr.clone();
         stderr.extend_from_slice(rendered.as_bytes());
@@ -15098,7 +15219,7 @@ fn retain_mixed_claim(value: &mut MixedValue, ownership: mir::MixedOwnership) {
         | MixedValue::Function { owner, .. } => {
             owner.set(owner.get().saturating_add(1));
         }
-        MixedValue::Scalar(_) | MixedValue::String(_) => {}
+        MixedValue::Null | MixedValue::Scalar(_) | MixedValue::String(_) => {}
     }
 }
 

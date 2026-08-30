@@ -859,6 +859,9 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
     if uses_compiler_known_io || crate::compiler_known_io::resolved_facts_use_canonical_io(&facts) {
         combined = crate::compiler_known_io::augment_program(&combined);
     }
+    if crate::compiler_known_test::resolved_facts_use_assertion_surface(&facts) {
+        combined = crate::compiler_known_test::augment_program(&combined);
+    }
 
     let source_texts = graph
         .sources

@@ -329,6 +329,12 @@ pub struct ErrorDescriptor {
     pub class: ClassId,
     pub type_name: String,
     pub message_property: PropertyId,
+    pub assertion: Option<AssertionErrorDescriptor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertionErrorDescriptor {
+    pub fact_properties: [PropertyId; 12],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,7 +373,8 @@ pub struct Function {
     pub return_borrow: Option<ReturnBorrow>,
     pub required_checked_effects: Vec<CheckedEffect>,
     pub ambient_checked_effects: Vec<CheckedEffect>,
-    /// Complete runtime profile: required union ambient.
+    pub test_assertion_checked_effects: Vec<CheckedEffect>,
+    /// Complete runtime profile: required union ambient union test assertion.
     pub checked_effects: Vec<CheckedEffect>,
     pub locals: Vec<Local>,
     pub blocks: Vec<BasicBlock>,
@@ -387,6 +394,7 @@ impl PartialEq for Function {
             && self.return_borrow == other.return_borrow
             && self.required_checked_effects == other.required_checked_effects
             && self.ambient_checked_effects == other.ambient_checked_effects
+            && self.test_assertion_checked_effects == other.test_assertion_checked_effects
             && self.checked_effects == other.checked_effects
             && self.locals == other.locals
             && self.blocks == other.blocks
@@ -426,17 +434,26 @@ pub struct FunctionType {
     pub checked_effects: Vec<CheckedEffect>,
     /// Uniform runtime capability for the two canonical ambient I/O Errors.
     pub ambient_checked_effects: Vec<CheckedEffect>,
+    /// Test-only execution capability, excluded from authored structural identity.
+    pub test_assertion_checked_effects: Vec<CheckedEffect>,
     pub return_borrow: Option<ReturnBorrow>,
 }
 
 impl FunctionType {
     pub fn has_checked_transport(&self) -> bool {
-        !self.checked_effects.is_empty() || !self.ambient_checked_effects.is_empty()
+        !self.checked_effects.is_empty()
+            || !self.ambient_checked_effects.is_empty()
+            || !self.test_assertion_checked_effects.is_empty()
     }
 
     pub fn complete_checked_effects(&self) -> Vec<CheckedEffect> {
         let mut complete = self.checked_effects.clone();
         for effect in &self.ambient_checked_effects {
+            if !complete.contains(effect) {
+                complete.push(*effect);
+            }
+        }
+        for effect in &self.test_assertion_checked_effects {
             if !complete.contains(effect) {
                 complete.push(*effect);
             }
@@ -816,6 +833,8 @@ pub enum StringIntrinsicKind {
     PadStart,
     PadEnd,
     FromBytes,
+    /// Compiler-private, failure-only bounded Doria string presentation.
+    AssertionQuote,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2973,6 +2992,7 @@ impl MixedOwnership {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MixedExpression {
+    Null,
     Local {
         local: LocalId,
         transfer: bool,
@@ -3018,6 +3038,7 @@ pub enum MixedExpression {
 impl MixedExpression {
     pub const fn ownership(&self) -> MixedOwnership {
         match self {
+            Self::Null => MixedOwnership::None,
             Self::Local { transfer: true, .. } | Self::CollectionIndex { transfer: true, .. } => {
                 MixedOwnership::Owned
             }
@@ -3911,6 +3932,12 @@ pub enum BoolExpression {
         left: Box<NullableStringExpression>,
         right: Box<NullableStringExpression>,
     },
+    ClassIdentityCompare {
+        op: CompareOp,
+        class: ClassId,
+        left: LocalId,
+        right: LocalId,
+    },
     NullableScalarIsPresent(Box<NullableScalarExpression>),
     NullableClassIsPresent(Box<NullableClassExpression>),
     NullableCollectionIsPresent(Box<NullableCollectionExpression>),
@@ -4220,11 +4247,38 @@ pub struct MatchArmPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlFlowPlan {
+    Assertion(Box<AssertionPlan>),
     Given(GivenControlFlowPlan),
     When(WhenResultPlan),
     DoWhile(DoWhilePlan),
     Finalizer(FinalizerRegionPlan),
     ListAlgorithm(Box<ListAlgorithmPlan>),
+}
+
+/// Validation identity for one compiler-known terminal expectation. Execution
+/// uses the ordinary CFG and checked-Error path referenced here; no expectation
+/// object or backend-specific assertion instruction exists at runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertionPlan {
+    pub matcher: crate::assertions::AssertionMatcher,
+    pub negated: bool,
+    pub actual: Option<AssertionOperandPlan>,
+    pub actual_type_name: Option<String>,
+    pub expected: Option<AssertionOperandPlan>,
+    pub expected_type_name: Option<String>,
+    pub user_message: Option<LocalId>,
+    pub error: LocalId,
+    pub descriptor: ErrorDescriptorId,
+    pub setup: BlockId,
+    pub success: BlockId,
+    pub failure: BlockId,
+    pub source_span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AssertionOperandPlan {
+    Local { local: LocalId, ty: Type },
+    Null,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -4249,7 +4303,8 @@ pub struct ListAlgorithmPlan {
     pub callback_access: FunctionInvocationMode,
     pub required_checked_effects: Vec<CheckedEffect>,
     pub ambient_checked_effects: Vec<CheckedEffect>,
-    /// Complete runtime transport profile: required plus ambient effects.
+    pub test_assertion_checked_effects: Vec<CheckedEffect>,
+    /// Complete runtime transport profile: required plus automatic effects.
     pub checked_effects: Vec<CheckedEffect>,
     pub output: Option<LocalId>,
     pub accumulator: Option<LocalId>,
@@ -5062,7 +5117,7 @@ fn mixed_class_temporary_capacity(value: &MixedExpression) -> usize {
         }
         MixedExpression::CollectionIndex { index, .. } => rvalue_class_temporary_capacity(index),
         MixedExpression::Local { transfer, .. } => usize::from(*transfer),
-        MixedExpression::Property { .. } => 0,
+        MixedExpression::Null | MixedExpression::Property { .. } => 0,
     }
 }
 
@@ -5369,6 +5424,7 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
             nullable_string_class_temporary_capacity(left)
                 + nullable_string_class_temporary_capacity(right)
         }
+        BoolExpression::ClassIdentityCompare { .. } => 0,
         BoolExpression::NullableErrorIsPresent(value) => {
             rvalue_class_temporary_capacity(&Rvalue::NullableError((**value).clone()))
         }
@@ -5489,11 +5545,17 @@ impl fmt::Display for Function {
             }
         }
         writeln!(formatter, "): {} {{", self.return_type)?;
-        if !self.required_checked_effects.is_empty() || !self.ambient_checked_effects.is_empty() {
+        if !self.required_checked_effects.is_empty()
+            || !self.ambient_checked_effects.is_empty()
+            || !self.test_assertion_checked_effects.is_empty()
+        {
             writeln!(
                 formatter,
-                "effects required {:?} ambient {:?} complete {:?}",
-                self.required_checked_effects, self.ambient_checked_effects, self.checked_effects
+                "effects required {:?} ambient {:?} test-assertion {:?} complete {:?}",
+                self.required_checked_effects,
+                self.ambient_checked_effects,
+                self.test_assertion_checked_effects,
+                self.checked_effects
             )?;
         }
         if !self.locals.is_empty() {
@@ -6291,6 +6353,7 @@ impl fmt::Display for MixedTag {
 impl fmt::Display for MixedExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Null => formatter.write_str("null"),
             Self::Local {
                 local,
                 transfer: true,
@@ -6737,6 +6800,16 @@ impl fmt::Display for BoolExpression {
             Self::NullableStringCompare { op, left, right } => {
                 write!(formatter, "{left} {op} {right}")
             }
+            Self::ClassIdentityCompare {
+                op,
+                class,
+                left,
+                right,
+            } => write!(
+                formatter,
+                "identity<class{}>(local{}) {op} local{}",
+                class.0, left.0, right.0
+            ),
             Self::NullableScalarIsPresent(value) => write!(formatter, "present({value})"),
             Self::NullableErrorIsPresent(value) => write!(
                 formatter,
@@ -6900,6 +6973,7 @@ impl fmt::Display for StringIntrinsicKind {
             Self::PadStart => "padStart",
             Self::PadEnd => "padEnd",
             Self::FromBytes => "fromBytes",
+            Self::AssertionQuote => "assertionQuote",
         })
     }
 }
@@ -7200,6 +7274,16 @@ impl fmt::Display for Statement {
 impl fmt::Display for ControlFlowPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Assertion(plan) => write!(
+                formatter,
+                "assert {:?}{} block{} success block{} failure block{} error local{}",
+                plan.matcher,
+                if plan.negated { " (negated)" } else { "" },
+                plan.setup.0,
+                plan.success.0,
+                plan.failure.0,
+                plan.error.0,
+            ),
             Self::Given(plan) => write!(
                 formatter,
                 "given {:?} setup block{}..block{} predicates [{}] condition block{} false {}",

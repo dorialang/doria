@@ -150,6 +150,7 @@ fn apply_function_checked_error_semantics(
         crate::checked_effects::CheckedEffectProfile::classify(function.checked_effects.clone());
     function.required_checked_effects = profile.required;
     function.ambient_checked_effects = profile.ambient;
+    function.test_assertion_checked_effects = profile.test_assertion;
     if let Some(throws) = &mut function.throws {
         if let Some(effects) = semantic_info
             .callable_effective_checked_effects
@@ -302,6 +303,52 @@ fn apply_expr_checked_error_semantics(
     expression: &mut hir::Expr,
     semantic_info: &crate::semantics::SemanticInfo,
 ) {
+    if let Some(plan) = semantic_info.assertions.get(&expression.span()) {
+        let (actual, expected, user_message) = match expression.clone() {
+            hir::Expr::FunctionCall { mut args, .. }
+                if plan.matcher == crate::assertions::AssertionMatcher::Fail =>
+            {
+                (
+                    None,
+                    None,
+                    args.pop().map(|argument| Box::new(argument.value)),
+                )
+            }
+            hir::Expr::MethodCall {
+                object, mut args, ..
+            } => {
+                let base = match object.as_ref() {
+                    hir::Expr::PropertyAccess { object, .. } if plan.negated => object.as_ref(),
+                    expression => expression,
+                };
+                let actual = match base {
+                    hir::Expr::FunctionCall { args, .. } => args
+                        .first()
+                        .map(|argument| Box::new(argument.value.clone())),
+                    _ => None,
+                };
+                (
+                    actual,
+                    args.pop().map(|argument| Box::new(argument.value)),
+                    None,
+                )
+            }
+            _ => return,
+        };
+        *expression = hir::Expr::Assertion(Box::new(hir::Assertion {
+            matcher: plan.matcher,
+            negated: plan.negated,
+            actual,
+            expected,
+            user_message,
+            actual_type: plan.actual_type.clone(),
+            expected_type: plan.expected_type.clone(),
+            member_span: plan.member_span,
+            span: plan.terminal_span,
+            checked_effect: plan.checked_effect.clone(),
+        }));
+    }
+
     if let hir::Expr::MethodCall {
         object,
         method,
@@ -333,6 +380,7 @@ fn apply_expr_checked_error_semantics(
                 checked_effects: plan.checked_effects.clone(),
                 required_checked_effects: plan.required_checked_effects.clone(),
                 ambient_checked_effects: plan.ambient_checked_effects.clone(),
+                test_assertion_checked_effects: plan.test_assertion_checked_effects.clone(),
                 receiver_span: plan.receiver_span,
                 callback_span: plan.callback_span,
                 span,
@@ -358,6 +406,17 @@ fn apply_expr_checked_error_semantics(
     }
 
     match expression {
+        hir::Expr::Assertion(assertion) => {
+            if let Some(actual) = &mut assertion.actual {
+                apply_expr_checked_error_semantics(actual, semantic_info);
+            }
+            if let Some(expected) = &mut assertion.expected {
+                apply_expr_checked_error_semantics(expected, semantic_info);
+            }
+            if let Some(message) = &mut assertion.user_message {
+                apply_expr_checked_error_semantics(message, semantic_info);
+            }
+        }
         hir::Expr::Closure(closure) => match &mut closure.body {
             hir::ClosureBody::Expression(expression) => {
                 apply_expr_checked_error_semantics(expression, semantic_info)
@@ -653,6 +712,7 @@ fn lower_function(
         checked_effects: Vec::new(),
         required_checked_effects: Vec::new(),
         ambient_checked_effects: Vec::new(),
+        test_assertion_checked_effects: Vec::new(),
         body: lower_block(&function.body, class_name),
         span: function.span,
     }

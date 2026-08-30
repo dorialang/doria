@@ -513,6 +513,7 @@ fn validate_closure_metadata(program: &mir::Program) -> Result<(), BackendError>
         }
         validate_checked_effects(program, &function_type.checked_effects)?;
         validate_checked_effects(program, &function_type.ambient_checked_effects)?;
+        validate_checked_effects(program, &function_type.test_assertion_checked_effects)?;
         validate_ambient_checked_effects(program, &function_type.ambient_checked_effects)?;
         if function_type
             .checked_effects
@@ -521,6 +522,18 @@ fn validate_closure_metadata(program: &mir::Program) -> Result<(), BackendError>
         {
             return Err(malformed_mir(
                 "structural function type includes an ambient effect in required identity",
+            ));
+        }
+        if function_type
+            .test_assertion_checked_effects
+            .iter()
+            .any(|effect| {
+                function_type.checked_effects.contains(effect)
+                    || function_type.ambient_checked_effects.contains(effect)
+            })
+        {
+            return Err(malformed_mir(
+                "structural function type overlaps test-assertion transport with another effect partition",
             ));
         }
         if let Some(return_borrow) = function_type.return_borrow {
@@ -713,6 +726,36 @@ fn validate_error_metadata(program: &mir::Program) -> Result<(), BackendError> {
                 "Error descriptor#{} type name does not match class#{}",
                 descriptor.id.0, descriptor.class.0
             )));
+        }
+        if let Some(assertion) = &descriptor.assertion {
+            if descriptor.type_name != crate::compiler_known_test::ASSERTION_ERROR {
+                return Err(malformed_mir(format!(
+                    "Error descriptor#{} attaches assertion metadata to a non-AssertionError class",
+                    descriptor.id.0
+                )));
+            }
+            for (index, (property, expected_name)) in assertion
+                .fact_properties
+                .iter()
+                .zip(crate::compiler_known_test::ASSERTION_FACT_PROPERTIES)
+                .enumerate()
+            {
+                let property = property_in(program, descriptor.class, *property)?;
+                let expected_type = if matches!(index, 1 | 2 | 5 | 8 | 10) {
+                    mir::Type::Scalar(mir::ScalarType::Bool)
+                } else {
+                    mir::Type::String
+                };
+                if property.name != expected_name
+                    || property.ty != expected_type
+                    || property.writable
+                {
+                    return Err(malformed_mir(format!(
+                        "AssertionError descriptor#{} has an invalid fact projection at slot {index}",
+                        descriptor.id.0
+                    )));
+                }
+            }
         }
     }
     for class in &program.classes {
@@ -1084,6 +1127,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     validate_checked_effects(program, &function.checked_effects)?;
     validate_checked_effects(program, &function.required_checked_effects)?;
     validate_checked_effects(program, &function.ambient_checked_effects)?;
+    validate_checked_effects(program, &function.test_assertion_checked_effects)?;
     validate_ambient_checked_effects(program, &function.ambient_checked_effects)?;
     if function
         .required_checked_effects
@@ -1095,15 +1139,29 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
             function.name
         )));
     }
+    if function
+        .test_assertion_checked_effects
+        .iter()
+        .any(|effect| {
+            function.required_checked_effects.contains(effect)
+                || function.ambient_checked_effects.contains(effect)
+        })
+    {
+        return Err(malformed_mir(format!(
+            "function {} overlaps test-assertion transport with another checked-effect partition",
+            function.name
+        )));
+    }
     let mut complete = function.required_checked_effects.clone();
     complete.extend(function.ambient_checked_effects.iter().copied());
+    complete.extend(function.test_assertion_checked_effects.iter().copied());
     if complete.len() != function.checked_effects.len()
         || complete
             .iter()
             .any(|effect| !function.checked_effects.contains(effect))
     {
         return Err(malformed_mir(format!(
-            "function {} complete checked effects are not required union ambient",
+            "function {} complete checked effects are not required union ambient union test assertion",
             function.name
         )));
     }
@@ -1118,6 +1176,8 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
                 || function.return_borrow != function_type.return_borrow
                 || function.required_checked_effects != function_type.checked_effects
                 || function.ambient_checked_effects != function_type.ambient_checked_effects
+                || function.test_assertion_checked_effects
+                    != function_type.test_assertion_checked_effects
                 || function.checked_effects != function_type.complete_checked_effects()
                 || function.params.len() != function_type.parameters.len() + 1
                 || function.params.first() != Some(&closure.hidden_environment)
@@ -2626,6 +2686,75 @@ fn validate_statement(
             function_type_in(program, *function_type).map(|_| ())
         }
         mir::Statement::ControlFlowPlan(plan) => match plan {
+            mir::ControlFlowPlan::Assertion(plan) => {
+                block_in(function, plan.setup)?;
+                block_in(function, plan.success)?;
+                block_in(function, plan.failure)?;
+                if plan.success == plan.failure {
+                    return Err(malformed_mir(
+                        "assertion success and failure blocks must be distinct",
+                    ));
+                }
+                let source = program
+                    .sources
+                    .iter()
+                    .find(|source| source.id == plan.source_span.source)
+                    .ok_or_else(|| malformed_mir("assertion plan references a missing source"))?;
+                if plan.source_span.start > plan.source_span.end
+                    || plan.source_span.end > source.source.text.len()
+                {
+                    return Err(malformed_mir("assertion plan has an invalid source span"));
+                }
+                let development = source.scope == crate::build_plan::SourceScope::Development
+                    || (source.scope == crate::build_plan::SourceScope::Generated
+                        && source.generated_for
+                            == Some(crate::build_plan::GeneratedFor::Development));
+                if !development {
+                    return Err(malformed_mir(
+                        "assertion plan belongs to non-development source",
+                    ));
+                }
+                let validate_operand = |local, ty| -> Result<(), BackendError> {
+                    let definition = local_in(function, local)?;
+                    if definition.ty != ty || !definition.synthetic {
+                        return Err(malformed_mir(
+                            "assertion operand must use a matching synthetic local",
+                        ));
+                    }
+                    Ok(())
+                };
+                if let Some(mir::AssertionOperandPlan::Local { local, ty }) = plan.actual {
+                    validate_operand(local, ty)?;
+                }
+                if let Some(mir::AssertionOperandPlan::Local { local, ty }) = plan.expected {
+                    validate_operand(local, ty)?;
+                }
+                if plan.actual.is_some() != plan.actual_type_name.is_some()
+                    || (plan.expected.is_some() && plan.expected_type_name.is_none())
+                {
+                    return Err(malformed_mir(
+                        "assertion operand and source type metadata disagree",
+                    ));
+                }
+                if let Some(message) = plan.user_message {
+                    validate_operand(message, mir::Type::String)?;
+                }
+                let error = local_in(function, plan.error)?;
+                if error.ty != mir::Type::Error || !error.owned || !error.synthetic {
+                    return Err(malformed_mir(
+                        "assertion failure must use an owned synthetic Error local",
+                    ));
+                }
+                let descriptor = error_descriptor_in(program, plan.descriptor)?;
+                if descriptor.type_name != crate::compiler_known_test::ASSERTION_ERROR
+                    || descriptor.assertion.is_none()
+                {
+                    return Err(malformed_mir(
+                        "assertion plan does not use the compiler-known AssertionError descriptor",
+                    ));
+                }
+                Ok(())
+            }
             mir::ControlFlowPlan::Given(plan) => {
                 block_in(function, plan.setup_entry)?;
                 block_in(function, plan.setup_exit)?;
@@ -5719,6 +5848,7 @@ fn validate_mixed_expression(
     expression: &mir::MixedExpression,
 ) -> Result<(), BackendError> {
     match expression {
+        mir::MixedExpression::Null => Ok(()),
         mir::MixedExpression::Local { local, transfer } => {
             let definition = local_in(function, *local)?;
             if !matches!(definition.ty, mir::Type::Mixed | mir::Type::NullableMixed) {
@@ -6290,6 +6420,10 @@ fn validate_string_intrinsic(
         Kind::GraphemeLength | Kind::ByteLength => {
             exact(&[string])?;
             require_string_intrinsic_result(call, int)
+        }
+        Kind::AssertionQuote => {
+            exact(&[string])?;
+            require_string_intrinsic_result(call, string)
         }
         Kind::IsEmpty => {
             exact(&[string])?;
@@ -7291,7 +7425,8 @@ fn infer_mixed_expression_return_borrow(
             args,
             return_borrow: Some(return_borrow),
         } => infer_borrowed_rvalue_source(program, function, *callee, args, *return_borrow),
-        mir::MixedExpression::Local { transfer: true, .. }
+        mir::MixedExpression::Null
+        | mir::MixedExpression::Local { transfer: true, .. }
         | mir::MixedExpression::Call {
             return_borrow: None,
             ..
@@ -8512,7 +8647,9 @@ fn collect_mixed_class_local_accesses<'a>(
         mir::MixedExpression::CollectionIndex { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
         }
-        mir::MixedExpression::Local { .. } | mir::MixedExpression::Property { .. } => {}
+        mir::MixedExpression::Null
+        | mir::MixedExpression::Local { .. }
+        | mir::MixedExpression::Property { .. } => {}
     }
 }
 
@@ -8949,6 +9086,10 @@ fn collect_bool_class_local_accesses<'a>(
         mir::BoolExpression::Compare { left, right, .. } => {
             collect_value_class_local_accesses(left, accesses);
             collect_value_class_local_accesses(right, accesses);
+        }
+        mir::BoolExpression::ClassIdentityCompare { left, right, .. } => {
+            accesses.borrow(*left);
+            accesses.borrow(*right);
         }
         mir::BoolExpression::StringCompare { left, right, .. } => {
             collect_string_class_local_accesses(left, accesses);
@@ -9834,6 +9975,43 @@ fn validate_control_flow_plans(
                 continue;
             };
             match plan {
+                mir::ControlFlowPlan::Assertion(plan) => {
+                    if block.id != plan.setup {
+                        return Err(malformed_mir(
+                            "assertion execution plan is not anchored in its setup block",
+                        ));
+                    }
+                    if plan.matcher == crate::assertions::AssertionMatcher::Fail {
+                        if plan.negated
+                            || plan.actual.is_some()
+                            || plan.expected.is_some()
+                            || plan.user_message.is_none()
+                        {
+                            return Err(malformed_mir(
+                                "fail assertion plan has incompatible operands",
+                            ));
+                        }
+                    } else if plan.actual.is_none()
+                        || (plan.matcher.expected_arity() == 1) != plan.expected.is_some()
+                        || plan.user_message.is_some()
+                    {
+                        return Err(malformed_mir(
+                            "expectation assertion plan has incompatible operands",
+                        ));
+                    }
+                    if !cfg_reaches(function, plan.setup, plan.failure)? {
+                        return Err(malformed_mir(
+                            "assertion setup does not reach its failure path",
+                        ));
+                    }
+                    if plan.matcher != crate::assertions::AssertionMatcher::Fail
+                        && !cfg_reaches(function, plan.setup, plan.success)?
+                    {
+                        return Err(malformed_mir(
+                            "expectation setup does not reach its success path",
+                        ));
+                    }
+                }
                 mir::ControlFlowPlan::Given(plan) => {
                     if block.id != plan.setup_entry {
                         return Err(malformed_mir(
@@ -9996,6 +10174,7 @@ fn validate_list_algorithm_types(
         || matches!(callback.invocation_mode, mir::FunctionInvocationMode::Once)
         || callback.checked_effects != plan.required_checked_effects
         || callback.ambient_checked_effects != plan.ambient_checked_effects
+        || callback.test_assertion_checked_effects != plan.test_assertion_checked_effects
         || callback.complete_checked_effects() != plan.checked_effects
     {
         return Err(malformed_mir(
@@ -10027,6 +10206,7 @@ fn validate_list_algorithm_types(
     }
     validate_checked_effects(program, &plan.required_checked_effects)?;
     validate_checked_effects(program, &plan.ambient_checked_effects)?;
+    validate_checked_effects(program, &plan.test_assertion_checked_effects)?;
     validate_checked_effects(program, &plan.checked_effects)?;
 
     match plan.kind {
@@ -13319,7 +13499,9 @@ fn mixed_observes_property(
         mir::MixedExpression::CollectionIndex { index, .. } => {
             rvalue_observes_property(index, receiver, property)
         }
-        mir::MixedExpression::Local { .. } | mir::MixedExpression::Property { .. } => false,
+        mir::MixedExpression::Null
+        | mir::MixedExpression::Local { .. }
+        | mir::MixedExpression::Property { .. } => false,
     }
 }
 
@@ -13634,6 +13816,7 @@ fn bool_observes_property(
             value_observes_property(left, receiver, property)
                 || value_observes_property(right, receiver, property)
         }
+        mir::BoolExpression::ClassIdentityCompare { .. } => false,
         mir::BoolExpression::StringCompare { left, right, .. } => {
             string_observes_property(left, receiver, property)
                 || string_observes_property(right, receiver, property)
@@ -14446,6 +14629,27 @@ fn validate_condition(
             }
             validate_value_expression(program, function, left)?;
             validate_value_expression(program, function, right)
+        }
+        mir::BoolExpression::ClassIdentityCompare {
+            op,
+            class,
+            left,
+            right,
+        } => {
+            if !matches!(op, mir::CompareOp::Equal | mir::CompareOp::NotEqual) {
+                return Err(malformed_mir(
+                    "ordered class identity comparison is invalid",
+                ));
+            }
+            class_in(program, *class)?;
+            for local in [left, right] {
+                if local_in(function, *local)?.ty != mir::Type::Class(*class) {
+                    return Err(malformed_mir(
+                        "class identity comparison uses an incompatible local",
+                    ));
+                }
+            }
+            Ok(())
         }
         mir::BoolExpression::StringCompare { left, right, .. } => {
             validate_string_expression(program, function, left)?;

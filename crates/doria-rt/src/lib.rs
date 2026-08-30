@@ -1083,26 +1083,26 @@ pub unsafe extern "C" fn dr_v1_mixed_free(value: *mut DrMixedV1) {
 
 /// # Safety
 ///
-/// `value` must point to a live mixed box.
+/// `value` must be null or point to a live mixed box.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_mixed_tag(value: *const DrMixedV1) -> u8 {
-    (*value).tag
+    value.as_ref().map_or(0, |value| value.tag)
 }
 
 /// # Safety
 ///
-/// `value` must point to a live mixed box.
+/// `value` must be null or point to a live mixed box.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_mixed_type_id(value: *const DrMixedV1) -> u32 {
-    (*value).type_id
+    value.as_ref().map_or(0, |value| value.type_id)
 }
 
 /// # Safety
 ///
-/// `value` must point to a live mixed box.
+/// `value` must be null or point to a live mixed box.
 #[no_mangle]
 pub unsafe extern "C" fn dr_v1_mixed_payload(value: *const DrMixedV1) -> u64 {
-    (*value).payload
+    value.as_ref().map_or(0, |value| value.payload)
 }
 
 /// # Safety
@@ -1185,10 +1185,29 @@ struct DrErrorDescriptorV1 {
     type_name_length: usize,
     message_offset: usize,
     drop: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
-    _class_size: usize,
+    class_size: usize,
     origin_offset: usize,
-    _reserved_0: usize,
-    _reserved_1: usize,
+    assertion_offsets: usize,
+    assertion_magic: usize,
+}
+
+const ASSERTION_ERROR_DESCRIPTOR_MAGIC: usize = 0xA557_0004;
+const ASSERTION_ERROR_TYPE: &[u8] = b"Doria\\Std\\Test\\AssertionError";
+const ASSERTION_FACT_COUNT: usize = 12;
+
+struct AssertionFactsV4 {
+    matcher: *const DrStringV1,
+    negated: bool,
+    actual_present: bool,
+    actual_type: *const DrStringV1,
+    actual_presentation: *const DrStringV1,
+    expected_present: bool,
+    expected_type: *const DrStringV1,
+    expected_presentation: *const DrStringV1,
+    difference_present: bool,
+    difference: *const DrStringV1,
+    user_message_present: bool,
+    user_message: *const DrStringV1,
 }
 
 #[repr(C)]
@@ -1955,11 +1974,112 @@ unsafe fn report_unhandled_error(error: DrErrorCarrierV1) -> i32 {
     let origin_slot = error.object.add(descriptor.origin_offset) as *const *const DrErrorOriginV1;
     let origin = *origin_slot;
 
-    if !write_runtime_error_record(descriptor, message, origin) {
+    if let Some(facts) = assertion_facts(error.object, descriptor) {
+        let mut path_buffer = [0_u8; 4096];
+        if let Some(channel_path) = runtime_assertion_channel_path(&mut path_buffer) {
+            if !write_runtime_assertion_record(channel_path, descriptor, &facts, origin) {
+                render_runtime_assertion(message, &facts, origin);
+            }
+        } else if !write_runtime_error_record(descriptor, message, origin) {
+            render_runtime_assertion(message, &facts, origin);
+        }
+    } else if !write_runtime_error_record(descriptor, message, origin) {
         render_runtime_error(descriptor, message, origin);
     }
     (descriptor.drop)(ptr::null(), error.object);
     70
+}
+
+unsafe fn assertion_facts(
+    object: *mut u8,
+    descriptor: &DrErrorDescriptorV1,
+) -> Option<AssertionFactsV4> {
+    if descriptor.assertion_magic != ASSERTION_ERROR_DESCRIPTOR_MAGIC
+        || descriptor.assertion_offsets == 0
+        || descriptor.type_name_length != ASSERTION_ERROR_TYPE.len()
+        || core::slice::from_raw_parts(descriptor.type_name, descriptor.type_name_length)
+            != ASSERTION_ERROR_TYPE
+    {
+        return None;
+    }
+    let offsets = core::slice::from_raw_parts(
+        descriptor.assertion_offsets as *const usize,
+        ASSERTION_FACT_COUNT,
+    );
+    let string = |index: usize| -> Option<*const DrStringV1> {
+        let offset = offsets[index];
+        if offset.checked_add(mem::size_of::<usize>())? > descriptor.class_size {
+            return None;
+        }
+        let value = *(object.add(offset) as *const *const DrStringV1);
+        (!value.is_null()).then_some(value)
+    };
+    let boolean = |index: usize| -> Option<bool> {
+        let offset = offsets[index];
+        if offset >= descriptor.class_size {
+            return None;
+        }
+        match *object.add(offset) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    };
+    Some(AssertionFactsV4 {
+        matcher: string(0)?,
+        negated: boolean(1)?,
+        actual_present: boolean(2)?,
+        actual_type: string(3)?,
+        actual_presentation: string(4)?,
+        expected_present: boolean(5)?,
+        expected_type: string(6)?,
+        expected_presentation: string(7)?,
+        difference_present: boolean(8)?,
+        difference: string(9)?,
+        user_message_present: boolean(10)?,
+        user_message: string(11)?,
+    })
+}
+
+unsafe fn render_runtime_assertion(
+    message: *const DrStringV1,
+    facts: &AssertionFactsV4,
+    origin: *const DrErrorOriginV1,
+) {
+    write_panic_fragment(b"Error[R1001]: Assertion Failed");
+    if !origin.is_null() {
+        let frame = DrStackFrameV2 {
+            parent: ptr::null(),
+            function_name: (*origin).function_name,
+            function_name_length: (*origin).function_name_length,
+            source_path: (*origin).source_path,
+            source_path_length: (*origin).source_path_length,
+            source_text: (*origin).source_text,
+            source_text_length: (*origin).source_text_length,
+            function_span_start: (*origin).span_start,
+            function_span_end: (*origin).span_end,
+            active_span_start: (*origin).span_start,
+            active_span_end: (*origin).span_end,
+        };
+        render_runtime_where(&raw const frame, b"Assertion Failed Here");
+    }
+    if facts.expected_present {
+        write_panic_fragment(b"\n\nExpected\n  ");
+        write_panic_bytes(
+            string_bytes(facts.expected_presentation),
+            (*facts.expected_presentation).byte_length,
+        );
+    }
+    if facts.actual_present {
+        write_panic_fragment(b"\n\nActual\n  ");
+        write_panic_bytes(
+            string_bytes(facts.actual_presentation),
+            (*facts.actual_presentation).byte_length,
+        );
+    }
+    write_panic_fragment(b"\n\nWhy\n  ");
+    write_safe_runtime_error_message(string_bytes(message), (*message).byte_length);
+    write_panic_fragment(b"\n\nProcess Exited With Status 70\n");
 }
 
 unsafe fn render_runtime_error(
@@ -2903,6 +3023,123 @@ unsafe fn write_runtime_error_record(
     record.publish()
 }
 
+unsafe fn write_runtime_assertion_record(
+    channel_path: &[u8],
+    descriptor: &DrErrorDescriptorV1,
+    facts: &AssertionFactsV4,
+    origin: *const DrErrorOriginV1,
+) -> bool {
+    const MAX_TYPE: usize = 4096;
+    const MAX_MATCHER: usize = 64;
+    const MAX_PRESENTATION: usize = 4096;
+    const MAX_TEXT: usize = 64 * 1024;
+    const MAX_PATH: usize = 4096;
+    const MAX_SOURCE: usize = 4 * 1024 * 1024;
+    const MAX_FUNCTION: usize = 1024;
+
+    let known_origin = !origin.is_null();
+    let (path_length, source_length, function_length, span_start, span_end) = if known_origin {
+        (
+            (*origin).source_path_length,
+            (*origin).source_text_length,
+            (*origin).function_name_length,
+            (*origin).span_start,
+            (*origin).span_end,
+        )
+    } else {
+        (0, 0, 0, 0, 0)
+    };
+    let strings = [
+        facts.matcher,
+        facts.actual_type,
+        facts.actual_presentation,
+        facts.expected_type,
+        facts.expected_presentation,
+        facts.difference,
+        facts.user_message,
+    ];
+    if descriptor.type_name_length > MAX_TYPE
+        || (*facts.matcher).byte_length > MAX_MATCHER
+        || (*facts.actual_type).byte_length > MAX_TYPE
+        || (*facts.actual_presentation).byte_length > MAX_PRESENTATION
+        || (*facts.expected_type).byte_length > MAX_TYPE
+        || (*facts.expected_presentation).byte_length > MAX_PRESENTATION
+        || (*facts.difference).byte_length > MAX_PRESENTATION
+        || (*facts.user_message).byte_length > MAX_TEXT
+        || path_length > MAX_PATH
+        || source_length > MAX_SOURCE
+        || function_length > MAX_FUNCTION
+        || strings.iter().any(|value| value.is_null())
+    {
+        return false;
+    }
+
+    let mut header = [0_u8; 83];
+    header[..8].copy_from_slice(b"DORIAO4\0");
+    put_u16(&mut header[8..10], 4);
+    put_u32(&mut header[10..14], descriptor.type_name_length as u32);
+    put_u32(&mut header[14..18], 70);
+    header[18] = 1;
+    put_u32(&mut header[19..23], (*facts.matcher).byte_length as u32);
+    header[23] = u8::from(facts.negated);
+    header[24] = u8::from(facts.actual_present);
+    put_u32(&mut header[25..29], (*facts.actual_type).byte_length as u32);
+    put_u32(
+        &mut header[29..33],
+        (*facts.actual_presentation).byte_length as u32,
+    );
+    header[33] = u8::from(facts.expected_present);
+    put_u32(
+        &mut header[34..38],
+        (*facts.expected_type).byte_length as u32,
+    );
+    put_u32(
+        &mut header[38..42],
+        (*facts.expected_presentation).byte_length as u32,
+    );
+    header[42] = u8::from(facts.difference_present);
+    put_u32(&mut header[43..47], (*facts.difference).byte_length as u32);
+    header[47] = u8::from(facts.user_message_present);
+    put_u32(
+        &mut header[48..52],
+        (*facts.user_message).byte_length as u32,
+    );
+    put_u32(&mut header[52..56], path_length as u32);
+    put_u32(&mut header[56..60], source_length as u32);
+    put_u32(&mut header[60..64], function_length as u32);
+    header[64] = u8::from(known_origin);
+    put_u64(&mut header[65..73], span_start as u64);
+    put_u64(&mut header[73..81], span_end as u64);
+    put_u16(&mut header[81..83], 0);
+
+    let Some(mut record) = PrivateRecordWriter::begin(channel_path, &header) else {
+        return false;
+    };
+    if !record.append(core::slice::from_raw_parts(
+        descriptor.type_name,
+        descriptor.type_name_length,
+    )) || strings.iter().any(|value| {
+        !record.append(core::slice::from_raw_parts(
+            string_bytes(*value),
+            (**value).byte_length,
+        ))
+    }) || (known_origin
+        && (!record.append(core::slice::from_raw_parts(
+            (*origin).source_path,
+            path_length,
+        )) || !record.append(core::slice::from_raw_parts(
+            (*origin).source_text,
+            source_length,
+        )) || !record.append(core::slice::from_raw_parts(
+            (*origin).function_name,
+            function_length,
+        ))))
+    {
+        return false;
+    }
+    record.publish()
+}
+
 unsafe fn write_runtime_outcome_record(
     current_frame: *const DrStackFrameV2,
     code: &[u8],
@@ -3092,6 +3329,23 @@ unsafe fn runtime_error_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
     None
 }
 
+#[cfg(unix)]
+unsafe fn runtime_assertion_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
+    let name = b"DORIA_RUNTIME_OUTCOME_V4\0";
+    let value = getenv(name.as_ptr());
+    if value.is_null() {
+        return None;
+    }
+    for index in 0..buffer.len() {
+        let byte = *value.add(index);
+        if byte == 0 {
+            return Some(&buffer[..index]);
+        }
+        buffer[index] = byte;
+    }
+    None
+}
+
 #[cfg(windows)]
 unsafe fn runtime_outcome_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
     let name = b"DORIA_RUNTIME_OUTCOME_V2\0";
@@ -3106,6 +3360,17 @@ unsafe fn runtime_outcome_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
 #[cfg(windows)]
 unsafe fn runtime_error_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
     let name = b"DORIA_RUNTIME_OUTCOME_V3\0";
+    let length = GetEnvironmentVariableA(
+        name.as_ptr(),
+        buffer.as_mut_ptr(),
+        buffer.len().try_into().ok()?,
+    ) as usize;
+    (length != 0 && length < buffer.len()).then_some(&buffer[..length])
+}
+
+#[cfg(windows)]
+unsafe fn runtime_assertion_channel_path(buffer: &mut [u8]) -> Option<&[u8]> {
+    let name = b"DORIA_RUNTIME_OUTCOME_V4\0";
     let length = GetEnvironmentVariableA(
         name.as_ptr(),
         buffer.as_mut_ptr(),

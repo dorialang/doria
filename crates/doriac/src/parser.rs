@@ -4349,7 +4349,16 @@ impl Parser {
     }
 
     fn expect_member_name(&mut self, message: &str) -> Option<String> {
-        self.expect_callable_name(message)
+        let token = self.advance().clone();
+        match token.kind {
+            TokenKind::Identifier(name) => Some(name),
+            TokenKind::Use => Some("use".to_string()),
+            TokenKind::Not => Some("not".to_string()),
+            _ => {
+                self.error(message, token.span);
+                None
+            }
+        }
     }
 
     fn is_callable_name_token(token: &Token) -> bool {

@@ -24,9 +24,9 @@ if ($decision === false || $reference === false) {
 $requiredDecisionFacts = [
     '# Decision 0129: Native Testing Foundation, Behavioral DSL, Fluent Expectations, And Assertion Outcomes',
     '**Status:** Accepted',
-    '**Implementation Status:** Slice 1 Implemented; Slice 2 Next; Foundation In Progress',
+    '**Implementation Status:** Slice 1 Implemented; Slice 2 Compiler/Runtime Implemented, Baton/Tooling Pending; Foundation In Progress',
     'Native Testing Foundation Slice 1 - Complete',
-    'Native Testing Foundation Slice 2 - Next',
+    'Native Testing Foundation Slice 2 - Compiler/Runtime Implemented, Baton/Tooling Pending',
     'Native Testing Foundation - In Progress, Not Complete',
     'Slice 1 - Behavioral Test DSL And Unified Compiler Metadata',
     'Slice 2 - Fluent Expectation Kernel And Assertion Semantics',
@@ -48,7 +48,7 @@ $requiredDecisionFacts = [
 
 $requiredReferenceFacts = [
     'Native Testing Foundation Slice 1 - Complete',
-    'Native Testing Foundation Slice 2 - Next',
+    'Native Testing Foundation Slice 2 - Compiler/Runtime Implemented, Baton/Tooling Pending',
     'Native Testing Foundation - In Progress, Not Complete',
     'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
     'describe("Shopping Cart"',
@@ -58,7 +58,7 @@ $requiredReferenceFacts = [
     'Schema version 3 adds:',
     'no runtime suite registry',
     'no source parsing in Baton',
-    '`expect(...)` in this document is accepted future surface',
+    "Slice 2's compiler/runtime assertion kernel is implemented",
     'beforeEach / afterEach',
     'They are deferred, not permanently rejected.',
 ];

@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-29
 - **Date:** 2026-08-29
-- **Implementation Status:** Slice 1 Implemented; Slice 2 Next; Foundation In Progress
+- **Implementation Status:** Slice 1 Implemented; Slice 2 Compiler/Runtime Implemented, Baton/Tooling Pending; Foundation In Progress
 - **Amends:** Decisions 0096, 0113, 0121, 0123, 0125, and 0128
 - **Preserves:** Stage 33 and Phase F completion; compiler-owned `#[Test]` metadata; Baton process isolation and development-graph orchestration; Doria ownership, checked-error, namespace, package, and backend laws; and Stage 34 inheritance authority
 
@@ -34,7 +34,7 @@ Insert one mandatory foundation before Stage 34:
 Stage 33 - Complete
 Phase F - Complete
 Native Testing Foundation Slice 1 - Complete
-Native Testing Foundation Slice 2 - Next
+Native Testing Foundation Slice 2 - Compiler/Runtime Implemented, Baton/Tooling Pending
 Native Testing Foundation - In Progress, Not Complete
 Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes
 ```
@@ -506,7 +506,9 @@ const-evaluated descriptions, nested suite extraction, direct generated
 callables, unified `#[Test]` and behavioral facts, strict metadata schema 3,
 ordinary HIR/MIR/backend execution, Baton schema-3 orchestration, and
 compiler-fact-based language-server presentation are implemented. Slice 1 is
-complete; the broader foundation remains in progress because Slice 2 is next.
+complete. Slice 2's compiler/runtime portion is implemented; Baton and official
+tooling coordination remain pending, so the broader foundation remains in
+progress.
 
 Owns:
 
@@ -525,7 +527,16 @@ LSP syntax/semantic facts
 
 Acceptance requires no runtime registration and no Baton source parsing.
 
-### Slice 2: Fluent Expectation Kernel And Assertion Semantics
+### Slice 2: Fluent Expectation Kernel And Assertion Semantics — Compiler/Runtime Implemented, Baton/Tooling Pending
+
+The compiler now owns `expect`, `fail`, ephemeral expectation-chain semantics,
+the `not` property, core scalar/null/bool/order/string matchers,
+`AssertionError`, the separate `TestAssertion` checked-effect partition, and
+strict DORIAO4 assertion outcomes. The same validated HIR/MIR executes through
+the debug interpreter, Cranelift, LLVM, and PHP compatibility backends. This is
+an interim implementation checkpoint: Baton regression integration and the
+official language-server pin/fact coordination must still land before Slice 2
+is marked complete.
 
 Owns:
 

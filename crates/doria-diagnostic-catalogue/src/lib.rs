@@ -38,14 +38,15 @@ pub const DIAGNOSTIC_CODES: &[&str] = &[
     "E0682", "E0683", "E0684", "E0685", "E0686", "E0687", "E0688", "E0689", "E0690", "E0691",
     "E0692", "E0693", "E0694", "E0695", "E0696", "E0697", "E0698", "E0699", "E0700", "E0701",
     "E0702", "E0703", "E0704", "E0705", "E0706", "E0707", "E0708", "E0709", "E0710", "E0711",
+    "E0712", "E0713", "E0714", "E0715", "E0716", "E0717", "E0718", "E0719", "E0720", "E0721",
     "I0001", "I1101", "I1301", "I1302", "I1401", "I2001", "I2002", "I2003", "I2201", "I2401",
-    "I2601", "I2701", "I2702", "I2801", "I2802", "I2803", "I2901", "I3001", "I3002", "L0001",
-    "L0002", "M1101", "M1102", "P0001", "P0002", "P0017", "P0018", "P0019", "P0020", "P0021",
-    "P1000", "P1001", "P1101", "P1102", "P1103", "P1104", "P1105", "P1106", "P1107", "P1108",
-    "P1109", "P1110", "P1111", "P1201", "P1202", "P1203", "P1204", "P1205", "P1206", "P1301",
-    "P1302", "P1310", "P1311", "P1312", "P1313", "P1320", "P1321", "P1322", "P1401", "P1402",
-    "P1403", "P1404", "P1405", "P1406", "P1407", "P1410", "P1501", "P1502", "P1503", "P1504",
-    "P1505", "P1601", "R1000",
+    "I2601", "I2701", "I2702", "I2801", "I2802", "I2803", "I2901", "I3001", "I3002", "I7101",
+    "L0001", "L0002", "M1101", "M1102", "P0001", "P0002", "P0017", "P0018", "P0019", "P0020",
+    "P0021", "P1000", "P1001", "P1101", "P1102", "P1103", "P1104", "P1105", "P1106", "P1107",
+    "P1108", "P1109", "P1110", "P1111", "P1201", "P1202", "P1203", "P1204", "P1205", "P1206",
+    "P1301", "P1302", "P1310", "P1311", "P1312", "P1313", "P1320", "P1321", "P1322", "P1401",
+    "P1402", "P1403", "P1404", "P1405", "P1406", "P1407", "P1410", "P1501", "P1502", "P1503",
+    "P1504", "P1505", "P1601", "R1000", "R1001",
 ];
 
 /// Presentation context for untrusted runtime-message text.
@@ -273,6 +274,32 @@ pub const INDEX_FACT: &str = "index";
 pub const INDEXED_LENGTH_FACT: &str = "length";
 pub const COLLECTION_FILL_COUNT_FACT: &str = "count";
 pub const STRING_PADDING_OPERATIONS: &[&str] = &["padStart", "padEnd"];
+pub const ASSERTION_MATCHER_FACT: &str = "matcher";
+pub const ASSERTION_NEGATED_FACT: &str = "negated";
+pub const ASSERTION_ACTUAL_PRESENT_FACT: &str = "actualPresent";
+pub const ASSERTION_ACTUAL_TYPE_FACT: &str = "actualType";
+pub const ASSERTION_ACTUAL_PRESENTATION_FACT: &str = "actualPresentation";
+pub const ASSERTION_EXPECTED_PRESENT_FACT: &str = "expectedPresent";
+pub const ASSERTION_EXPECTED_TYPE_FACT: &str = "expectedType";
+pub const ASSERTION_EXPECTED_PRESENTATION_FACT: &str = "expectedPresentation";
+pub const ASSERTION_DIFFERENCE_PRESENT_FACT: &str = "differencePresent";
+pub const ASSERTION_DIFFERENCE_FACT: &str = "difference";
+pub const ASSERTION_USER_MESSAGE_PRESENT_FACT: &str = "userMessagePresent";
+pub const ASSERTION_USER_MESSAGE_FACT: &str = "userMessage";
+pub const ASSERTION_FACT_NAMES: &[&str] = &[
+    ASSERTION_MATCHER_FACT,
+    ASSERTION_NEGATED_FACT,
+    ASSERTION_ACTUAL_PRESENT_FACT,
+    ASSERTION_ACTUAL_TYPE_FACT,
+    ASSERTION_ACTUAL_PRESENTATION_FACT,
+    ASSERTION_EXPECTED_PRESENT_FACT,
+    ASSERTION_EXPECTED_TYPE_FACT,
+    ASSERTION_EXPECTED_PRESENTATION_FACT,
+    ASSERTION_DIFFERENCE_PRESENT_FACT,
+    ASSERTION_DIFFERENCE_FACT,
+    ASSERTION_USER_MESSAGE_PRESENT_FACT,
+    ASSERTION_USER_MESSAGE_FACT,
+];
 
 pub fn is_string_padding_operation(value: &str) -> bool {
     STRING_PADDING_OPERATIONS.contains(&value)
@@ -291,6 +318,15 @@ pub const RUNTIME_CATALOGUE: &[RuntimeCatalogueEntry] = &[
         explanation: "A checked Error reached the program boundary without being handled.",
         process_status: 70,
         fact_names: &[],
+    },
+    RuntimeCatalogueEntry {
+        code: "R1001",
+        title: "Assertion Failed",
+        domain: "runtime",
+        primary_label: "Assertion Failed Here",
+        explanation: "A compiler-known test expectation was not satisfied.",
+        process_status: 70,
+        fact_names: ASSERTION_FACT_NAMES,
     },
     RuntimeCatalogueEntry {
         code: "P1000",

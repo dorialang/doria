@@ -10,12 +10,14 @@ pub type CatchTypeMap = HashMap<Span, ResolvedType>;
 pub enum CheckedEffectClass {
     Required,
     AmbientIo,
+    TestAssertion,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CheckedEffectProfile {
     pub required: Vec<ResolvedType>,
     pub ambient: Vec<ResolvedType>,
+    pub test_assertion: Vec<ResolvedType>,
 }
 
 impl CheckedEffectProfile {
@@ -25,6 +27,7 @@ impl CheckedEffectProfile {
             let target = match classify_effect(&effect) {
                 CheckedEffectClass::Required => &mut profile.required,
                 CheckedEffectClass::AmbientIo => &mut profile.ambient,
+                CheckedEffectClass::TestAssertion => &mut profile.test_assertion,
             };
             if !target.contains(&effect) {
                 target.push(effect);
@@ -44,12 +47,26 @@ pub fn classify_effect(effect: &ResolvedType) -> CheckedEffectClass {
         {
             CheckedEffectClass::AmbientIo
         }
+        ResolvedType::Class(class) if class.name == crate::compiler_known_test::ASSERTION_ERROR => {
+            CheckedEffectClass::TestAssertion
+        }
         _ => CheckedEffectClass::Required,
     }
 }
 
 pub fn is_ambient_io_effect(effect: &ResolvedType) -> bool {
     classify_effect(effect) == CheckedEffectClass::AmbientIo
+}
+
+pub fn is_test_assertion_effect(effect: &ResolvedType) -> bool {
+    classify_effect(effect) == CheckedEffectClass::TestAssertion
+}
+
+pub fn is_automatic_effect(effect: &ResolvedType) -> bool {
+    matches!(
+        classify_effect(effect),
+        CheckedEffectClass::AmbientIo | CheckedEffectClass::TestAssertion
+    )
 }
 
 pub(crate) fn record_effect_site(

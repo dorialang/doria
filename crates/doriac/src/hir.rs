@@ -193,6 +193,7 @@ pub struct FunctionDecl {
     pub checked_effects: Vec<ResolvedType>,
     pub required_checked_effects: Vec<ResolvedType>,
     pub ambient_checked_effects: Vec<ResolvedType>,
+    pub test_assertion_checked_effects: Vec<ResolvedType>,
     pub body: Block,
     pub span: Span,
 }
@@ -498,13 +499,31 @@ pub struct ListAlgorithmCall {
     pub checked_effects: Vec<ResolvedType>,
     pub required_checked_effects: Vec<ResolvedType>,
     pub ambient_checked_effects: Vec<ResolvedType>,
+    pub test_assertion_checked_effects: Vec<ResolvedType>,
     pub receiver_span: Span,
     pub callback_span: Span,
     pub span: Span,
 }
 
+/// One terminal compiler-owned expectation. No intermediate expectation value
+/// survives semantic lowering, so this node cannot be stored or dispatched.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assertion {
+    pub matcher: crate::assertions::AssertionMatcher,
+    pub negated: bool,
+    pub actual: Option<Box<Expr>>,
+    pub expected: Option<Box<Expr>>,
+    pub user_message: Option<Box<Expr>>,
+    pub actual_type: Option<ResolvedType>,
+    pub expected_type: Option<ResolvedType>,
+    pub member_span: Span,
+    pub span: Span,
+    pub checked_effect: ResolvedType,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
+    Assertion(Box<Assertion>),
     Closure(Box<ClosureExpression>),
     CallableCall(Box<CallableCall>),
     ListAlgorithmCall(Box<ListAlgorithmCall>),
@@ -702,6 +721,7 @@ pub struct ArrayElement {
 impl Expr {
     pub fn span(&self) -> Span {
         match self {
+            Expr::Assertion(assertion) => assertion.span,
             Expr::Closure(closure) => closure.span,
             Expr::CallableCall(call) => call.span,
             Expr::ListAlgorithmCall(call) => call.span,

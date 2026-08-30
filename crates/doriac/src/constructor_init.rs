@@ -203,6 +203,7 @@ fn check_class(
         given_preludes,
         checked_effect_sites,
         catch_error_types,
+        &std::collections::HashSet::new(),
     );
     let result = solve_forward(
         &graph,

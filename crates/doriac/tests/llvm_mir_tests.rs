@@ -621,6 +621,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 return_borrow: None,
                 required_checked_effects: Vec::new(),
                 ambient_checked_effects: Vec::new(),
+                test_assertion_checked_effects: Vec::new(),
                 checked_effects: Vec::new(),
                 locals: Vec::new(),
                 blocks: vec![BasicBlock {
@@ -643,6 +644,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 return_borrow: None,
                 required_checked_effects: Vec::new(),
                 ambient_checked_effects: Vec::new(),
+                test_assertion_checked_effects: Vec::new(),
                 checked_effects: Vec::new(),
                 locals: Vec::new(),
                 blocks: vec![BasicBlock {

@@ -195,7 +195,7 @@ function check_stage30_closure_authority(string $root): array
         'Stage 33 — Complete',
         'Phase F — Complete',
         'Native Testing Foundation Slice 1 — Complete',
-        'Native Testing Foundation Slice 2 — Next',
+        'Native Testing Foundation Slice 2 — Compiler/Runtime Implemented, Baton/Tooling Pending',
         'Stage 34 Single Class Inheritance — Blocked Until The Foundation Completes',
     ]);
     $forbid($pipelinePath, $pipeline, [

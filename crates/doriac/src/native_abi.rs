@@ -2,6 +2,8 @@
 
 use crate::mir;
 
+pub const ASSERTION_ERROR_DESCRIPTOR_MAGIC: u64 = 0xA557_0004;
+
 pub const STRING_FROM_UTF8: &str = "dr_v1_string_from_utf8";
 pub const PROCESS_EXIT: &str = "dr_v1_exit_process";
 pub const STRING_RETAIN: &str = "dr_v1_string_retain";
@@ -97,6 +99,7 @@ pub const STRING_FROM_U64: &str = "dr_v1_string_from_u64";
 pub const STRING_FROM_F32: &str = "dr_v1_string_from_f32";
 pub const STRING_FROM_F64: &str = "dr_v1_string_from_f64";
 pub const STRING_FROM_BOOL: &str = "dr_v1_string_from_bool";
+pub const STRING_ASSERTION_QUOTE: &str = "dr_v4_string_assertion_quote";
 pub const CLASS_ALLOCATE: &str = "dr_v2_class_allocate";
 pub const CLASS_FREE: &str = "dr_v1_class_free";
 pub const CLOSURE_ENVIRONMENT_ALLOCATE: &str = "dr_v1_closure_environment_allocate";
