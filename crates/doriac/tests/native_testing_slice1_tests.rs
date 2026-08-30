@@ -944,6 +944,35 @@ function callableCase(function(): void $value): void { expect($value)->completio
 }
 
 #[test]
+fn source_ide_analysis_preserves_development_scope_for_completion_recovery() {
+    let source = r#"
+use Doria\Std\Test\expect;
+function integerCase(int $value): void { expect($value)->completionPlaceholder(); }
+"#;
+    let compilation = doriac::names::CompilationContext::standalone("tests.doria");
+    let source_context = doriac::testing::SourceSemanticContext {
+        compilation,
+        scope: SourceScope::Development,
+        origin: SourceOrigin::Explicit,
+        generated_for: None,
+    };
+    let (_, analysis) =
+        doriac::analyze_source_for_ide_with_source_context("tests.doria", source, source_context)
+            .expect("development source analysis");
+
+    let completion = analysis
+        .info
+        .assertion_completions
+        .values()
+        .next()
+        .expect("typed assertion completion");
+    assert!(completion
+        .matchers
+        .iter()
+        .any(|matcher| matcher.source_name() == "toEqual"));
+}
+
+#[test]
 fn user_functions_with_test_like_short_names_remain_ordinary() {
     let source = r#"
 function it(string $name): void { echo $name; }

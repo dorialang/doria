@@ -121,7 +121,17 @@ pub fn analyze_source_for_ide_with_context(
     text: impl Into<String>,
     context: CompilationContext,
 ) -> DiagnosticResult<(Program, semantics::SemanticAnalysis)> {
+    let source_context = testing::SourceSemanticContext::standalone(context);
+    analyze_source_for_ide_with_source_context(path, text, source_context)
+}
+
+pub fn analyze_source_for_ide_with_source_context(
+    path: impl Into<String>,
+    text: impl Into<String>,
+    source_context: testing::SourceSemanticContext,
+) -> DiagnosticResult<(Program, semantics::SemanticAnalysis)> {
     let source = SourceFile::new(path, text);
+    let context = source_context.compilation.clone();
     let authored = parse_source_file(&source)?;
     compiler_known_io::validate_reserved_identities(&authored)?;
     compiler_known_test::validate_reserved_identities(&authored)?;
@@ -136,7 +146,6 @@ pub fn analyze_source_for_ide_with_context(
         resolution.resolved.program =
             compiler_known_test::augment_program(&resolution.resolved.program);
     }
-    let source_context = testing::SourceSemanticContext::standalone(context.clone());
     let (evaluation, _) =
         const_eval::evaluate_program_with_diagnostics(&resolution.resolved.program);
     let elaboration = testing::elaborate_source(
