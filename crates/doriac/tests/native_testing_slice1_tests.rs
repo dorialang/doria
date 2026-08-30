@@ -808,6 +808,142 @@ function malformed(): void { expect(1); }
 }
 
 #[test]
+fn compiler_publishes_typed_matcher_candidates_for_incomplete_expectations() {
+    let source = r#"
+use Doria\Std\Test\expect;
+
+function integerCase(int $value): void { expect($value)->completionPlaceholder(); }
+function nullableCase(?int $value): void { expect($value)->completionPlaceholder(); }
+function booleanCase(bool $value): void { expect($value)->not->completionPlaceholder(); }
+function stringCase(string $value): void { expect($value)->completionPlaceholder(); }
+function bytesCase(Bytes $value): void { expect($value)->completionPlaceholder(); }
+function listCase(List<int> $value): void { expect($value)->completionPlaceholder(); }
+function unsupportedListCase(List<Bytes> $value): void { expect($value)->completionPlaceholder(); }
+function dictionaryCase(Dictionary<string, int> $value): void { expect($value)->completionPlaceholder(); }
+function callableCase(function(): void $value): void { expect($value)->completionPlaceholder(); }
+"#;
+    let analysis =
+        analyze_compilation_graph_for_ide(&graph(source, SourceScope::Development, None));
+    let facts = analysis
+        .semantic_info
+        .assertion_completions
+        .values()
+        .collect::<Vec<_>>();
+    assert_eq!(facts.len(), 9, "{:#?}", analysis.diagnostics);
+
+    let matcher_names = |predicate: &dyn Fn(&doriac::types::ResolvedType) -> bool,
+                         negated: bool| {
+        let fact = facts
+            .iter()
+            .find(|fact| fact.negated == negated && predicate(&fact.actual_type))
+            .expect("typed assertion completion fact");
+        let mut names = fact
+            .matchers
+            .iter()
+            .map(|matcher| matcher.source_name())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    };
+    let assert_names = |actual: Vec<&str>, expected: &[&str]| {
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    };
+
+    assert_names(
+        matcher_names(
+            &|ty| matches!(ty, doriac::types::ResolvedType::Integer(_)),
+            false,
+        ),
+        &[
+            "toBeGreaterThan",
+            "toBeGreaterThanOrEqual",
+            "toBeLessThan",
+            "toBeLessThanOrEqual",
+            "toEqual",
+        ],
+    );
+    assert_names(
+        matcher_names(
+            &|ty| matches!(ty, doriac::types::ResolvedType::Nullable(_)),
+            false,
+        ),
+        &["toBeNull"],
+    );
+    assert_names(
+        matcher_names(&|ty| matches!(ty, doriac::types::ResolvedType::Bool), true),
+        &[
+            "toBeFalse",
+            "toBeGreaterThan",
+            "toBeGreaterThanOrEqual",
+            "toBeLessThan",
+            "toBeLessThanOrEqual",
+            "toBeTrue",
+            "toEqual",
+        ],
+    );
+    assert_names(
+        matcher_names(
+            &|ty| matches!(ty, doriac::types::ResolvedType::String),
+            false,
+        ),
+        &[
+            "toBeEmpty",
+            "toBeGreaterThan",
+            "toBeGreaterThanOrEqual",
+            "toContain",
+            "toEndWith",
+            "toEqual",
+            "toBeLessThan",
+            "toBeLessThanOrEqual",
+            "toStartWith",
+        ],
+    );
+    assert_names(
+        matcher_names(
+            &|ty| matches!(ty, doriac::types::ResolvedType::Bytes),
+            false,
+        ),
+        &["toBeEmpty", "toEqual", "toHaveCount"],
+    );
+    assert_names(
+        matcher_names(
+            &|ty| {
+                matches!(ty, doriac::types::ResolvedType::List(element)
+                if matches!(element.as_ref(), doriac::types::ResolvedType::Integer(_)))
+            },
+            false,
+        ),
+        &["toBeEmpty", "toContain", "toHaveCount"],
+    );
+    assert_names(
+        matcher_names(
+            &|ty| {
+                matches!(ty, doriac::types::ResolvedType::List(element)
+                if matches!(element.as_ref(), doriac::types::ResolvedType::Bytes))
+            },
+            false,
+        ),
+        &["toBeEmpty", "toHaveCount"],
+    );
+    assert_names(
+        matcher_names(
+            &|ty| matches!(ty, doriac::types::ResolvedType::Dictionary(_, _)),
+            false,
+        ),
+        &["toBeEmpty", "toHaveCount", "toHaveKey", "toHaveValue"],
+    );
+    assert_names(
+        matcher_names(
+            &|ty| matches!(ty, doriac::types::ResolvedType::Function(_)),
+            false,
+        ),
+        &["toThrow"],
+    );
+}
+
+#[test]
 fn user_functions_with_test_like_short_names_remain_ordinary() {
     let source = r#"
 function it(string $name): void { echo $name; }
