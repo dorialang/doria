@@ -2984,10 +2984,9 @@ impl Checker<'_> {
                 }
                 self.push_exception_scope(&before);
                 for catch in &statement.catches {
-                    let catch_type = self
-                        .catch_error_types
-                        .get(&catch.span)
-                        .expect("checked catch type");
+                    let Some(catch_type) = self.catch_error_types.get(&catch.span) else {
+                        continue;
+                    };
                     let mut caught_states = Vec::new();
                     let mut remaining = Vec::new();
                     for exit in unmatched_exits {

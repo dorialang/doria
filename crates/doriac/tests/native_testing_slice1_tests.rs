@@ -999,6 +999,25 @@ it("catch assertion", function (): void {
 }
 
 #[test]
+fn plain_development_helpers_can_catch_assertion_errors() {
+    let source = r#"
+use Doria\Std\Test\{AssertionError, fail};
+
+function helper(): void
+{
+    try { fail("caught"); } catch (AssertionError $error) { echo $error->message; }
+}
+"#;
+    let analysis =
+        analyze_compilation_graph_for_ide(&graph(source, SourceScope::Development, None));
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
 fn malformed_expectation_shapes_report_one_root_diagnostic() {
     let cases = [
         ("function f(): void { expect(); }", "E0713"),
