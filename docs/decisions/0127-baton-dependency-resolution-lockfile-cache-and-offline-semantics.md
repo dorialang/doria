@@ -185,7 +185,9 @@ paths or absolute dependency roots.
 Stage 33 Slices 1 through 3 are complete in the disposable PHP UX bootstrap.
 Stage 33 Slice 3 owns development dependencies, workspaces, graph
 commands, tests, processors, generated-source orchestration, incremental project
-inventory, and Phase F closure. Stage 33 and Phase F are complete; Stage 34 is next.
+inventory, and Phase F closure. Stage 33 and Phase F are complete. Native
+Testing Foundation Slice 1 is complete, Slice 2 is next, and Stage 34 waits for
+the foundation.
 
 Decision 0124's mandatory Pre-Stage-45 transition remains scheduled. The clean
 `dorialang/baton` repository must parity-port every accepted Stage 33 behavior,
@@ -209,7 +211,8 @@ unsuffixed `2026.03.1` toolchain ships.
 ## Invalidated Elsewhere
 
 - `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md`: Stage 33
-  Slices 1 through 3 and Phase F are complete, with Stage 34 next.
+  Slices 1 through 3 and Phase F are complete; the Native Testing Foundation is
+  in progress before Stage 34.
 - Decisions 0117, 0118, 0124, 0125, and 0126: Stage 33 implementation status and
   the dependency/processor boundary.
 - `README.md` and `SPEC.md`: current Baton dependency, lockfile, cache, offline,

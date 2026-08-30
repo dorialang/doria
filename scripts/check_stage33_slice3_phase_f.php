@@ -61,6 +61,8 @@ function check_stage33_slice3_phase_f(string $root): array
         'does not claim sandboxing',
         'mandatory Pre-Stage-45 native transition',
         'Stage 33 and Phase F are complete',
+        'Native Testing Foundation',
+        'Stage 34 waits for the foundation',
     ]);
     $require($paths['protocol'], $files['protocol'], [
         '--schema-version 2',

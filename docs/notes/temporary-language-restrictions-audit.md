@@ -24,6 +24,7 @@ posture without implementing unrelated work.
 | `mixed` collection/aggregate boxing boundaries | Several values cannot yet enter the boxed runtime carrier | Box layout/drop paths are not complete for those families | Accepted But Not Implemented | Stage 23 mixed authority | Future mixed-runtime extension | Yes when stage-named and development-only |
 | Collection `Cloneable` boundaries | Move-value sequence fills and duplication are unavailable | No public explicit-duplication contract exists yet | Accepted But Not Implemented | Decisions 0100/0113 and planned Stage 35 `Cloneable` | Stage 35 | Yes when the diagnostic names the missing capability rather than invalid syntax |
 | General property move-out | No source operation leaves a property hole or atomically replaces it | Writable path, alias, and object-invariant semantics are unsettled | Open Design Question | Decision 0122 | Separate take-and-replace/swap authority | Current rejection is required; do not describe move-in as equally unresolved |
+| `Doria\Std\Test` expectation members | `expect`, `fail`, `AssertionError`, and `TestAssertion` remain unavailable while `describe`/`it`/`test` execute | Assertion ownership, structured outcomes, cleanup, and backend parity belong to the next bounded slice | Accepted But Not Implemented | Decision 0129 | Native Testing Foundation Slice 2 | Yes when one stage-named E0710 boundary is emitted; do not reject delivered behavioral declarations |
 
 ## Standing Review Rule
 

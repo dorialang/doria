@@ -33,7 +33,8 @@ diagnostic, and performance direction on 2026-08-19, with these amendments:
 The accepted record also fixes the dependency-ordered Stage 30a through Stage
 30h implementation slices. Stages 30a through 30h and Stage 30 are complete.
 E0641 is historical and reserved. Stages 31 through 33 and Phase F are complete;
-Stage 34 is next.
+Native Testing Foundation Slice 1 is complete, Slice 2 is next, and Stage 34
+waits for the foundation.
 
 ## Historical Scope
 

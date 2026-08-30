@@ -9,16 +9,26 @@
 
 ```text
 Decision 0129 - Accepted
-Pre-Stage-34 Native Testing Foundation - Next
-Stage 34 Single Class Inheritance - Blocked Until This Foundation Completes
+Stage 33 - Complete
+Phase F - Complete
+Native Testing Foundation Slice 1 - Complete
+Native Testing Foundation Slice 2 - Next
+Native Testing Foundation - In Progress, Not Complete
+Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes
 ```
 
-Stage 33 and Phase F remain complete. Baton already owns test discovery,
-development graph activation, dispatcher compilation, fresh-process isolation,
-and suite orchestration. This foundation adds the missing first-party test
-language and assertion system.
+Slice 1 implements compiler-owned behavioral declarations, unified schema-3
+metadata, Baton discovery/dispatch, and compiler-fact-based tooling. Stage 33
+and Phase F remain complete. Baton retains development graph activation,
+dispatcher compilation, fresh-process isolation, and suite orchestration. The
+first-party assertion system remains Slice 2 and later work.
 
 ## Canonical Authoring Experience
+
+The complete target example below combines delivered Slice 1
+`describe`/`it` declarations with future Slice 2 `expect` calls. Every
+`expect(...)` in this document is accepted future surface, not current
+executable behavior, until Slice 2 lands.
 
 ```doria
 use Doria\Std\Test\{
@@ -70,12 +80,17 @@ Baton never parses Doria source.
 Doria\Std\Test
 ```
 
-Initial public identities:
+Delivered Slice 1 identities:
 
 ```text
 describe
 test
 it
+```
+
+Accepted future Slice 2 identities:
+
+```text
 expect
 fail
 AssertionError
@@ -252,7 +267,7 @@ Processor request and response protocols remain version 1.
 
 ## Implementation Sequence
 
-### Slice 1 — Behavioral Test DSL And Unified Compiler Metadata
+### Slice 1 — Behavioral Test DSL And Unified Compiler Metadata — Complete
 
 Deliver:
 
@@ -265,7 +280,7 @@ compiler-generated test callables
 unified #[Test] metadata
 metadata schema 3
 Baton discovery migration to schema 3
-LSP compiler facts
+LSP compiler facts and presentation
 ```
 
 Acceptance:
@@ -278,7 +293,7 @@ stable full test identity
 #[Test] remains green
 ```
 
-### Slice 2 — Fluent Expectation Kernel And Assertion Semantics
+### Slice 2 — Fluent Expectation Kernel And Assertion Semantics — Next
 
 Deliver:
 
@@ -360,11 +375,13 @@ They are deferred, not permanently rejected.
 ## Invalidated Elsewhere
 
 - `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md` must place
-  this foundation before Stage 34 when the first implementation slice begins.
-- `docs/stdlib-reference.md` must gain the `Doria\Std\Test` surface.
-- `docs/self-hosting.md` must distinguish the existing runner from the complete
+  the in-progress foundation and Slice 2 before Stage 34.
+- `docs/stdlib-reference.md` records the delivered and future
+  `Doria\Std\Test` surface.
+- `docs/self-hosting.md` distinguishes delivered declarations from the complete
   native testing story.
 - Decision 0128 remains the Baton orchestration authority but is no longer the
   complete testing API authority.
-- Baton, language-server, editor, and website documentation require staged
-  synchronization as the three slices land.
+- Baton and language-server/editor Slice 1 synchronization is complete.
+- Website testing documentation remains invalidated elsewhere and is not edited
+  by this compiler/Baton/tooling slice.

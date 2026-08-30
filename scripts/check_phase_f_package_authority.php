@@ -136,7 +136,8 @@ $require($batonPath, $baton, [
     'all three Stage 33 slices are complete',
     'Stage 33 and Phase F',
     'are complete',
-    'Stage 34 is next',
+    'Native Testing Foundation Slice 1 is complete',
+    'Stage 34 waits for the foundation',
 ]);
 $require($slice1Path, $slice1, [
     '**Status:** Accepted',
@@ -196,7 +197,9 @@ $require($pipelinePath, $pipeline, [
     'Stage 33 Slice 3 — Complete',
     'Stage 33 — Complete',
     'Phase F — Complete',
-    'Stage 34 Single Class Inheritance — Next',
+    'Native Testing Foundation Slice 1 — Complete',
+    'Native Testing Foundation Slice 2 — Next',
+    'Stage 34 Single Class Inheritance — Blocked Until The Foundation Completes',
 ]);
 $require($auditPath, $audit, [
     'Resolved. Decision 0117',

@@ -364,7 +364,8 @@ their callback's required structural effects and complete runtime profile,
 including ambient I/O, through the same propagation and cleanup model. Stages
 30 through 32 and the Decision 0123 corrective beat are complete. All three
 Stage 33 slices and Phase F are complete under Decisions 0126 through 0128;
-Stage 34 is next.
+Native Testing Foundation Slice 1 is complete, Slice 2 is next, and Stage 34
+waits for the foundation.
 
 ## Explicit Exclusions
 

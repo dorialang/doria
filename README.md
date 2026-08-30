@@ -205,11 +205,19 @@ bounded constant evaluator. Applying an attribute executes no constructor or
 other Doria code. `#[Test]` is metadata for Baton orchestration, while
 `#[PHPExport]` remains metadata for the later PHP bridge. Use `doriac metadata`
 or `doriac metadata --build-plan` to inspect deterministic typed metadata;
-explicit `--schema-version 2` adds callable facts for Baton test discovery while
-schema 1 remains the default.
+explicit `--schema-version 2` adds callable facts while schema 1 remains the
+default. Schema 3 preserves both older schemas exactly and adds one unified
+compiler-owned table for `#[Test]` methods and behavioral tests.
 The compiler validates the versioned processor protocol but executes no processor
 and writes no generated source. See
 [`docs/attribute-metadata-protocol.md`](docs/attribute-metadata-protocol.md).
+
+Development source may import `describe`, `it`, and `test` from
+`Doria\Std\Test`. They are compiler-owned declarations, not runtime
+registration calls: descriptions are const-evaluated, test bodies become stable
+generated callables, and Baton discovers both behavioral declarations and
+`#[Test]` through metadata schema 3 without parsing Doria. Decision 0129 records
+the complete native testing model and implementation sequence.
 
 Baton is Doria's accepted project and package tool. The current executable
 implementation is the disposable `dorialang/baton-php` product-contract
