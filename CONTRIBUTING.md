@@ -24,7 +24,7 @@ Inspect size without changing anything:
 php scripts/check_cargo_target_size.php
 ```
 
-Move the reusable cache to another volume with `DORIA_VALIDATION_TARGET_DIR` or `--target-dir`. Reclaim it deliberately with:
+Move the reusable cache to another volume with `DORIA_VALIDATION_TARGET_DIR` or `--target-dir`. Custom targets must be dedicated empty directories on first use; the validator records repository ownership and refuses roots, ancestors, or unowned shared caches. Reclaim it deliberately with:
 
 ```bash
 php scripts/validate_work_unit.php --reclaim

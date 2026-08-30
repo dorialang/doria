@@ -16,11 +16,8 @@ for ($index = 1; $index < count($argv); $index++) {
     $target = $argv[++$index];
 }
 
-if (!str_starts_with($target, '/') && !preg_match('/^[A-Za-z]:[\\\\\/]/', $target)) {
-    $target = $root . DIRECTORY_SEPARATOR . $target;
-}
-
 try {
+    $target = doria_canonical_path($target, $root);
     $bytes = doria_allocated_directory_bytes($target);
 } catch (RuntimeException $error) {
     fwrite(STDERR, "ERROR: {$error->getMessage()}.\n");
@@ -37,7 +34,9 @@ if ($bytes > DORIA_TARGET_WARNING_BYTES) {
     fwrite(
         STDERR,
         "WARNING: the Cargo target exceeds 15 GiB. Reclaim the managed cache with "
-            . "`php scripts/validate_work_unit.php --reclaim`.\n",
+            . "`php scripts/validate_work_unit.php --target-dir "
+            . escapeshellarg($target)
+            . " --reclaim`.\n",
     );
     exit(2);
 }

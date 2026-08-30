@@ -37,7 +37,11 @@ for ($index = 1; $index < count($argv); $index++) {
     }
 }
 
-$target = absolute_path($target, $root);
+try {
+    $target = doria_prepare_managed_target($target, $root, !$plan);
+} catch (RuntimeException $error) {
+    fail($error->getMessage());
+}
 $llvmTarget = $target . DIRECTORY_SEPARATOR . 'llvm-backend';
 $stampPath = $target . DIRECTORY_SEPARATOR . '.doria-artifact-cache.json';
 $identity = cache_identity($root);
@@ -231,6 +235,7 @@ function reclaim_target(string $root, string $target, string $reason): void
 {
     fwrite(STDOUT, "Reclaiming managed Cargo target because {$reason}.\n");
     run(['cargo', 'clean', '--target-dir', $target], $root, environment_for($target));
+    doria_write_artifact_owner($target, $root);
 }
 
 function cache_identity(string $root): string
@@ -338,21 +343,6 @@ function ensure_directory(string $path): void
     if (!is_dir($path) && !mkdir($path, 0777, true) && !is_dir($path)) {
         fail("could not create directory {$path}");
     }
-}
-
-function absolute_path(string $path, string $base): string
-{
-    if (str_starts_with($path, '~' . DIRECTORY_SEPARATOR)) {
-        $home = getenv(PHP_OS_FAMILY === 'Windows' ? 'USERPROFILE' : 'HOME');
-        if (is_string($home) && $home !== '') {
-            $path = $home . substr($path, 1);
-        }
-    }
-    if (str_starts_with($path, '/') || preg_match('/^[A-Za-z]:[\\\\\/]/', $path)) {
-        return rtrim($path, '/\\');
-    }
-
-    return rtrim($base . DIRECTORY_SEPARATOR . $path, '/\\');
 }
 
 /** @param list<string> $command */

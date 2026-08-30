@@ -110,7 +110,7 @@ toolchain release may ship before that native cutover is complete.
 
 - Cargo does not garbage-collect old project artifacts. Use `php scripts/validate_work_unit.php` for canonical local validation; it reports allocated target size before and after the run.
 - The validator keeps reusable caches, isolates the LLVM feature graph under `target/llvm-backend`, and reclaims through `cargo clean --target-dir` only when cache identity changes, free space is critically low, or the managed target exceeds 15 GiB. Do not replace this with disposable per-run targets: repeated cold builds increase SSD writes.
-- Use `DORIA_VALIDATION_TARGET_DIR` or `--target-dir` to place the managed cache on another volume. Repository layout and platform-specific absolute paths must never be assumed.
+- Use `DORIA_VALIDATION_TARGET_DIR` or `--target-dir` to place the managed cache on another volume. A custom target must be dedicated to this checkout: the validator records ownership and rejects roots, repository ancestors, and nonempty unowned shared caches before cleanup. Repository layout and platform-specific absolute paths must never be assumed.
 - `php scripts/check_cargo_target_size.php` remains the non-destructive size probe. Use `php scripts/validate_work_unit.php --reclaim` for an intentional manual reclamation; do not remove `target/` recursively.
 - Keep dev and test debug information at line-table level, dependency debug information disabled, and test incremental compilation disabled unless Andrew explicitly accepts the storage tradeoff.
 
