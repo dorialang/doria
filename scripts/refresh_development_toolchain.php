@@ -53,15 +53,15 @@ $compiler = $cargoRoot . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . 'do
 $languageServer = $cargoRoot . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . 'doria-lsp'
     . $executableSuffix;
 
+$managedTarget = getenv('DORIA_VALIDATION_TARGET_DIR');
+$managedTarget = is_string($managedTarget) && $managedTarget !== ''
+    ? absolute_path($managedTarget, $root)
+    : $root . DIRECTORY_SEPARATOR . 'target';
 $environment = current_environment();
 $environment['CARGO_INSTALL_ROOT'] = $cargoRoot;
-$environment['CARGO_TARGET_DIR'] = $cargoRoot
+$environment['CARGO_TARGET_DIR'] = $managedTarget
     . DIRECTORY_SEPARATOR
-    . 'doria'
-    . DIRECTORY_SEPARATOR
-    . 'build'
-    . DIRECTORY_SEPARATOR
-    . 'doriac';
+    . 'toolchain-install';
 $environment['DORIA_BUILD_COMMIT'] = $commit;
 
 $installCompiler = [

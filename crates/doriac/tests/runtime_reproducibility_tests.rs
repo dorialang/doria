@@ -12,6 +12,29 @@ use std::process::Command;
 
 use doriac::runtime_artifact::{RuntimeArtifact, RuntimeOrigin};
 
+struct ScratchDirectory {
+    path: PathBuf,
+}
+
+impl ScratchDirectory {
+    fn new(path: PathBuf) -> Self {
+        if path.exists() {
+            std::fs::remove_dir_all(&path).expect("remove stale runtime reproducibility scratch");
+        }
+        Self { path }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for ScratchDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -103,14 +126,13 @@ fn one_revision_produces_one_runtime_archive() {
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR"));
     for profile in ["debug", "release"] {
         let bundled = bundled_runtime(profile);
-        let first = build_runtime_into(
-            &scratch.join(format!("runtime-reproducibility-{profile}-first")),
-            profile,
+        let first_scratch =
+            ScratchDirectory::new(scratch.join(format!("runtime-reproducibility-{profile}-first")));
+        let second_scratch = ScratchDirectory::new(
+            scratch.join(format!("runtime-reproducibility-{profile}-second")),
         );
-        let second = build_runtime_into(
-            &scratch.join(format!("runtime-reproducibility-{profile}-second")),
-            profile,
-        );
+        let first = build_runtime_into(first_scratch.path(), profile);
+        let second = build_runtime_into(second_scratch.path(), profile);
 
         let bundled_identity = identity(&bundled);
         let first_identity = identity(&first);

@@ -9,22 +9,28 @@ Language-server transport and editor integrations live in [`dorialang/doria-lang
 Run these before opening a pull request:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace --all-targets
+php scripts/validate_work_unit.php
 ```
 
 ## Build artifact storage
 
-Cargo reuses `target/` between builds but does not garbage-collect obsolete hashed artifacts. This repository therefore uses line-table debug information and disables incremental compilation for the test profile while leaving ordinary development builds incremental.
+Cargo reuses `target/` between builds but does not garbage-collect obsolete hashed artifacts. This repository limits debug metadata, preserves useful incremental development artifacts, and gives feature-incompatible validation graphs stable cache namespaces.
 
-Run the non-destructive size guard before and after a full Rust validation:
+The work-unit validator reports allocated size before and after validation. It automatically uses Cargo's own cleanup operation when the cache identity changes, free space is critically low, or the managed target exceeds 15 GiB. It does not clean after every run, because cold rebuilds waste time and increase SSD writes.
+
+Inspect size without changing anything:
 
 ```bash
 php scripts/check_cargo_target_size.php
 ```
 
-The command exits nonzero when `target/` exceeds 15 GiB and never removes anything. Inspect an oversized directory with an appropriate disk-usage tool and use `cargo clean --dry-run` to preview Cargo's cleanup. Run `cargo clean` only as an intentional, approved maintenance action; cleaning after every build would discard useful artifacts and force unnecessary cold rebuilds.
+Move the reusable cache to another volume with `DORIA_VALIDATION_TARGET_DIR` or `--target-dir`. Reclaim it deliberately with:
+
+```bash
+php scripts/validate_work_unit.php --reclaim
+```
+
+Do not recursively delete `target/`; the repository-owned workflow remains portable across macOS, Linux, and Windows and lets Cargo own its artifacts.
 
 ## Pull requests
 

@@ -108,10 +108,11 @@ toolchain release may ship before that native cutover is complete.
 
 ## Build artifact storage
 
-- Cargo does not garbage-collect old project artifacts. Run `php scripts/check_cargo_target_size.php` before and after the full Rust validation suite.
-- The checker reports a problem when the repository's `target/` exceeds 15 GiB. It is diagnostic only and must never delete build artifacts.
-- Never run `cargo clean` or remove `target/` automatically. Report the measured size and ask Andrew for approval before cleaning.
-- Keep test debug information at line-table level and test incremental compilation disabled unless Andrew explicitly accepts the storage tradeoff.
+- Cargo does not garbage-collect old project artifacts. Use `php scripts/validate_work_unit.php` for canonical local validation; it reports allocated target size before and after the run.
+- The validator keeps reusable caches, isolates the LLVM feature graph under `target/llvm-backend`, and reclaims through `cargo clean --target-dir` only when cache identity changes, free space is critically low, or the managed target exceeds 15 GiB. Do not replace this with disposable per-run targets: repeated cold builds increase SSD writes.
+- Use `DORIA_VALIDATION_TARGET_DIR` or `--target-dir` to place the managed cache on another volume. Repository layout and platform-specific absolute paths must never be assumed.
+- `php scripts/check_cargo_target_size.php` remains the non-destructive size probe. Use `php scripts/validate_work_unit.php --reclaim` for an intentional manual reclamation; do not remove `target/` recursively.
+- Keep dev and test debug information at line-table level, dependency debug information disabled, and test incremental compilation disabled unless Andrew explicitly accepts the storage tradeoff.
 
 ## Decision triage
 
@@ -167,7 +168,7 @@ php scripts/refresh_development_toolchain.php \
     --language-server /absolute/path/to/doria-language-server
 ```
 
-The refresh installs compiled `doriac` and `doria-lsp` artifacts into Cargo's platform-neutral install root, verifies that both embed the delivered compiler commit, and rejects `PATH` entries that shadow them. Editor clients and Baton must consume these installed artifacts (or explicit/bundled release artifacts), never an implicitly discovered workspace `target/debug` executable.
+The refresh installs compiled `doriac` and `doria-lsp` artifacts into Cargo's platform-neutral install root, verifies that both embed the delivered compiler commit, and rejects `PATH` entries that shadow them. Its reusable build cache lives under the managed validation target (or `DORIA_VALIDATION_TARGET_DIR`) so installed-tool refreshes cannot create a second unmeasured cache under Cargo home. Editor clients and Baton must consume these installed artifacts (or explicit/bundled release artifacts), never an implicitly discovered workspace `target/debug` executable.
 
 `bin/doriac` remains an explicit from-source compiler-development launcher. It uses an isolated Cargo target directory and must never be linked, copied, or renamed into a machine-global `doriac`. On Windows, stop a running language-server process before refreshing if the OS prevents replacement of the installed executable; a failed replacement is a failed refresh, not permission to keep using the stale binary.
 
@@ -402,16 +403,10 @@ Small native backend smoke tests are not ruled out by any non-goal. They are pre
 Run core checks for compiler changes:
 
 ```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo build --workspace --all-targets --locked --verbose
-cargo test --workspace --all-targets --locked --verbose
-cargo run -p doriac -- check examples/php/person.doria
-cargo run -p doriac -- hir examples/php/person.doria
-cargo run -p doriac -- compile examples/native/main_return_zero.doria --target native --out build/native/main_return_zero
-cargo run -p doriac -- compile examples/native/main_return_42.doria --target native --out build/native/main_return_42
-cargo run -p doriac -- compile examples/native/main_void_hello.doria --target native --out build/native/main_void_hello
+php scripts/validate_work_unit.php
 ```
+
+This runner performs formatting, workspace-wide Clippy and tests, production compiler/runtime builds, and the direct compiler/native smokes without first compiling every test target redundantly in the dev profile. When the work changes LLVM behavior, run `php scripts/validate_work_unit.php --llvm`; this reuses a fixed, separately hashed LLVM cache instead of mixing feature graphs in the ordinary target.
 
 Run documentation guardrails for documentation changes:
 
