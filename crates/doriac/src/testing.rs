@@ -211,7 +211,7 @@ impl Elaborator<'_> {
         let Expr::FunctionCall { args, .. } = expr else {
             return false;
         };
-        let Some(name) = self.resolved_test_member(expr.span()) else {
+        let Some((name, call_name_span)) = self.resolved_test_member(expr.span()) else {
             return false;
         };
         if !crate::compiler_known_test::is_declaration(&name) {
@@ -220,7 +220,6 @@ impl Elaborator<'_> {
         self.facts.declaration_spans.insert(*span);
         self.facts.compiler_elided_statement_spans.insert(*span);
         let ordinal = self.next_ordinal();
-        let call_name_span = self.call_name_span(&name, expr.span());
         if !self.context.is_development() {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -357,24 +356,32 @@ impl Elaborator<'_> {
         };
         if self
             .resolved_test_member(expr.span())
-            .is_some_and(|name| crate::compiler_known_test::is_future_member(&name))
+            .is_some_and(|(name, _)| crate::compiler_known_test::is_future_member(&name))
         {
             self.facts.compiler_elided_statement_spans.insert(*span);
         }
     }
 
-    fn resolved_test_member(&self, within: Span) -> Option<String> {
+    fn resolved_test_member(&self, call_span: Span) -> Option<(String, Span)> {
         self.symbols
             .references
             .iter()
-            .filter(|reference| {
+            .find(|reference| {
                 crate::compiler_known_test::is_canonical_member(&reference.symbol_id.qualified_name)
-                    && reference.source_span.source == within.source
-                    && reference.source_span.start >= within.start
-                    && reference.source_span.end <= within.end
+                    && matches!(
+                        reference.role,
+                        GlobalReferenceRole::FunctionCall | GlobalReferenceRole::TestDeclaration
+                    )
+                    && reference.source_span.source == call_span.source
+                    && reference.source_span.start == call_span.start
+                    && reference.source_span.end <= call_span.end
             })
-            .min_by_key(|reference| reference.source_span.start)
-            .map(|reference| reference.symbol_id.qualified_name.clone())
+            .map(|reference| {
+                (
+                    reference.symbol_id.qualified_name.clone(),
+                    reference.source_span,
+                )
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -530,21 +537,6 @@ impl Elaborator<'_> {
             declaration_span,
             authored_ordinal,
         });
-    }
-
-    fn call_name_span(&self, canonical: &str, within: Span) -> Span {
-        self.symbols
-            .references
-            .iter()
-            .filter(|reference| {
-                reference.role == GlobalReferenceRole::TestDeclaration
-                    && reference.symbol_id.qualified_name == canonical
-                    && reference.source_span.source == within.source
-                    && reference.source_span.start >= within.start
-                    && reference.source_span.end <= within.end
-            })
-            .min_by_key(|reference| reference.source_span.start)
-            .map_or(within, |reference| reference.source_span)
     }
 
     fn future_surface_diagnostics(&mut self) {

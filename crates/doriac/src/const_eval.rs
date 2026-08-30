@@ -265,10 +265,21 @@ impl EvaluationRequester {
 }
 
 pub fn evaluate_program(program: &ast::Program) -> DiagnosticResult<Evaluation> {
+    let (evaluation, diagnostics) = evaluate_program_with_diagnostics(program);
+    if diagnostics.is_empty() {
+        Ok(evaluation)
+    } else {
+        Err(diagnostics)
+    }
+}
+
+pub(crate) fn evaluate_program_with_diagnostics(
+    program: &ast::Program,
+) -> (Evaluation, Vec<Diagnostic>) {
     let mut evaluator = Evaluator::collect(program);
     evaluator.evaluate_all();
-    if evaluator.diagnostics.is_empty() {
-        Ok(Evaluation {
+    (
+        Evaluation {
             values: evaluator
                 .states
                 .into_iter()
@@ -280,10 +291,9 @@ pub fn evaluate_program(program: &ast::Program) -> DiagnosticResult<Evaluation> 
             enum_cases: evaluator.enum_cases,
             enum_names: evaluator.enum_names,
             payload_cases: evaluator.payload_cases,
-        })
-    } else {
-        Err(evaluator.diagnostics)
-    }
+        },
+        evaluator.diagnostics,
+    )
 }
 
 struct Evaluator {

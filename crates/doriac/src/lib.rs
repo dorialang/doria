@@ -132,7 +132,8 @@ pub fn analyze_source_for_ide_with_context(
             compiler_known_io::augment_program(&resolution.resolved.program);
     }
     let source_context = testing::SourceSemanticContext::standalone(context.clone());
-    let evaluation = const_eval::evaluate_program(&resolution.resolved.program).unwrap_or_default();
+    let (evaluation, _) =
+        const_eval::evaluate_program_with_diagnostics(&resolution.resolved.program);
     let elaboration = testing::elaborate_source(
         &resolution.resolved.program,
         &resolution.resolved.facts,
@@ -672,7 +673,7 @@ pub(crate) fn prepare_parsed_source(
         resolved.program = compiler_known_io::augment_program(&resolved.program);
     }
     let source_context = testing::SourceSemanticContext::standalone(context.clone());
-    let evaluation = const_eval::evaluate_program(&resolved.program).unwrap_or_default();
+    let (evaluation, _) = const_eval::evaluate_program_with_diagnostics(&resolved.program);
     let elaboration = testing::elaborate_source(
         &resolved.program,
         &resolved.facts,

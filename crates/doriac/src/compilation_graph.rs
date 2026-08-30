@@ -718,8 +718,8 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         append_program(&mut preliminary_combined, &resolved.program);
         preliminary_sources.insert(identity.clone(), resolved);
     }
-    let preliminary_evaluation =
-        crate::const_eval::evaluate_program(&preliminary_combined).unwrap_or_default();
+    let (preliminary_evaluation, _) =
+        crate::const_eval::evaluate_program_with_diagnostics(&preliminary_combined);
     let mut elaborated_sources = BTreeMap::new();
     let mut test_semantics = crate::testing::TestSemanticFacts::default();
     let mut source_semantic_contexts = HashMap::new();

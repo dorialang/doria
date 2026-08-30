@@ -458,6 +458,71 @@ function main(): void { it("ordinary"); }
 }
 
 #[test]
+fn nested_test_references_do_not_reclassify_the_outer_call() {
+    let source = r#"
+use Doria\Std\Test\it;
+
+function wrapper(string $name, function(): void $body): void {}
+
+wrapper("outer", function (): void {
+    it("nested", function (): void {});
+});
+"#;
+    let analysis =
+        analyze_compilation_graph_for_ide(&graph(source, SourceScope::Development, None));
+
+    assert!(
+        analysis.semantic_info.test_semantics.tests.is_empty(),
+        "a nested test reference must not turn its containing call into a test: {:#?}",
+        analysis.semantic_info.test_semantics.tests
+    );
+    assert!(
+        analysis
+            .semantic_info
+            .test_semantics
+            .compiler_elided_statement_spans
+            .is_empty(),
+        "the ordinary outer call must remain in the authored program"
+    );
+}
+
+#[test]
+fn invalid_constants_do_not_erase_valid_test_descriptions() {
+    let source = r#"
+use Doria\Std\Test\it;
+
+const string NAME = "works";
+const int BROKEN = 1 / 0;
+
+it(NAME, function (): void {});
+"#;
+    let analysis =
+        analyze_compilation_graph_for_ide(&graph(source, SourceScope::Development, None));
+
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code.starts_with("E04")),
+        "the invalid constant must retain its own diagnostic: {:#?}",
+        analysis.diagnostics
+    );
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .all(|diagnostic| diagnostic.code != "E0704"),
+        "an unrelated constant failure must not invalidate NAME: {:#?}",
+        analysis.diagnostics
+    );
+    assert_eq!(analysis.semantic_info.test_semantics.tests.len(), 1);
+    assert_eq!(
+        analysis.semantic_info.test_semantics.tests[0].display_name,
+        "works"
+    );
+}
+
+#[test]
 fn metadata_schema_three_is_strict_and_older_schemas_remain_disjoint() {
     let source = "function main(): void {}";
     let v1 = serde_json::to_string(&doriac::metadata_source("main.doria", source).unwrap())

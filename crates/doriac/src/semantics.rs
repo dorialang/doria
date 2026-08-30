@@ -634,10 +634,8 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     global_symbols: crate::names::GlobalSymbolFacts,
     test_semantics: crate::testing::TestSemanticFacts,
 ) -> SemanticAnalysis {
-    let (const_evaluation, const_diagnostics) = match crate::const_eval::evaluate_program(program) {
-        Ok(evaluation) => (evaluation, Vec::new()),
-        Err(diagnostics) => (crate::const_eval::Evaluation::default(), diagnostics),
-    };
+    let (const_evaluation, const_diagnostics) =
+        crate::const_eval::evaluate_program_with_diagnostics(program);
     // Discover ambient I/O through the complete direct-call graph before the
     // diagnostic pass. This preserves forward-call precision without making
     // source order part of a callable's runtime Error transport.
