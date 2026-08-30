@@ -124,6 +124,15 @@ function test_target_ownership(array &$failures): void
         if (!is_file($default . DIRECTORY_SEPARATOR . DORIA_ARTIFACT_OWNER_FILE)) {
             $failures[] = 'the canonical repository target was not marked as owned';
         }
+        $cacheTag = $default . DIRECTORY_SEPARATOR . 'CACHEDIR.TAG';
+        if (file_get_contents($cacheTag) !== DORIA_CARGO_CACHE_TAG) {
+            $failures[] = 'the managed target did not receive Cargo cache identity';
+        }
+        unlink($cacheTag);
+        doria_prepare_managed_target($default, $repository, true);
+        if (file_get_contents($cacheTag) !== DORIA_CARGO_CACHE_TAG) {
+            $failures[] = 'an existing managed target did not recover missing Cargo cache identity';
+        }
         doria_prepare_managed_target($dedicated, $repository, true);
         expect_target_rejection(
             static fn (): string => doria_prepare_managed_target(
