@@ -217,7 +217,10 @@ Development source may import `describe`, `it`, and `test` from
 registration calls: descriptions are const-evaluated, test bodies become stable
 generated callables, and Baton discovers both behavioral declarations and
 `#[Test]` through metadata schema 3 without parsing Doria. Decision 0129 records
-the complete native testing model and implementation sequence.
+the implemented native testing model: scalar, string, collection, dictionary,
+and checked-Error expectations; bounded failure differences; strict DORIAO4
+outcomes; and compiler-fact-based Baton and editor tooling. The Native Testing
+Foundation is complete.
 
 Baton is Doria's accepted project and package tool. The current executable
 implementation is the disposable `dorialang/baton-php` product-contract

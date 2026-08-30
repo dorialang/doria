@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-29
 - **Date:** 2026-08-29
-- **Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Compiler/Runtime In Progress; Foundation In Progress
+- **Implementation Status:** Implemented By Native Testing Foundation Slices 1 Through 3
 - **Amends:** Decisions 0096, 0113, 0121, 0123, 0125, and 0128
 - **Preserves:** Stage 33 and Phase F completion; compiler-owned `#[Test]` metadata; Baton process isolation and development-graph orchestration; Doria ownership, checked-error, namespace, package, and backend laws; and Stage 34 inheritance authority
 
@@ -35,9 +35,10 @@ Stage 33 - Complete
 Phase F - Complete
 Native Testing Foundation Slice 1 - Complete
 Native Testing Foundation Slice 2 - Complete
-Native Testing Foundation Slice 3 - Compiler/Runtime In Progress
-Native Testing Foundation - In Progress, Not Complete
-Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes
+Native Testing Foundation Slice 3 - Complete
+Native Testing Foundation - Complete
+Stage 34 Single Class Inheritance - Next
+Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
 This foundation has three slices:
@@ -540,9 +541,8 @@ Exact compiler-known resolution, development-source enforcement,
 const-evaluated descriptions, nested suite extraction, direct generated
 callables, unified `#[Test]` and behavioral facts, strict metadata schema 3,
 ordinary HIR/MIR/backend execution, Baton schema-3 orchestration, and
-compiler-fact-based language-server presentation are implemented. Slice 1 is
-complete. Slice 2 is complete, and the broader foundation remains in progress
-with Slice 3 next.
+compiler-fact-based language-server presentation are implemented. All three
+slices are complete, and the broader foundation is implemented.
 
 Owns:
 
@@ -591,7 +591,7 @@ readonly expectation borrowing
 interpreter / Cranelift / LLVM / PHP parity
 ```
 
-### Slice 3: Collections, Errors, Baton Reporting, And Tooling Closure — Compiler/Runtime In Progress
+### Slice 3: Collections, Errors, Baton Reporting, And Tooling Closure — Implemented
 
 Owns:
 
@@ -610,11 +610,12 @@ installed-toolchain validation
 cross-repository closure
 ```
 
-After Slice 3:
+Completed status:
 
 ```text
 Native Testing Foundation - Complete
 Stage 34 Single Class Inheritance - Next
+Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
 ## Deliberate Deferrals
@@ -687,7 +688,7 @@ No test assertion may consume a Move value merely to inspect it.
 - Baton remains the runner and process orchestrator.
 - The compiler remains the semantic authority.
 - The language server remains a presentation client over compiler/Baton facts.
-- Stage 34 begins only after this foundation closes.
+- Stage 34 is next because this foundation is closed.
 
 ## Invalidated Elsewhere
 
@@ -702,8 +703,7 @@ No test assertion may consume a Move value merely to inspect it.
   self-hosting note, README, and SPEC must schedule and describe this mandatory
   foundation before Stage 34.
 - Baton strict V2/V3/V4 decoding, classified hierarchy reporting, and final
-  behavioral-name filtering remain the next cross-repository part of Slice 3.
+  behavioral-name filtering now consume the completed compiler outcome model.
 - Language-server collection/Error completion, hovers, symbols, and navigation
-  remain the final cross-repository part of Slice 3 after the Doria closure
-  commit is green.
+  consume compiler-owned facts from the final foundation closure revision.
 - Website testing documentation remains a later synchronization task.

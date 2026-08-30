@@ -37,16 +37,16 @@ foreach ($files as $key => $relative) {
 $required = [
     'decision' => [
         '**Status:** Accepted',
-        '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Compiler/Runtime In Progress; Foundation In Progress',
+        '**Implementation Status:** Implemented By Native Testing Foundation Slices 1 Through 3',
         'Native Testing Foundation Slice 1 - Complete',
         'Native Testing Foundation Slice 2 - Complete',
-        'Native Testing Foundation Slice 3 - Compiler/Runtime In Progress',
+        'Native Testing Foundation Slice 3 - Complete',
         'Slice 3 - Collection/Error Expectations, Baton Reporting, And Tooling Closure',
-        'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
+        'Stage 34 Single Class Inheritance - Next',
     ],
     'reference' => [
         'Baton regression integration',
-        'Slice 3 owns collection/Error expectations',
+        'Slice 3\'s collection/Error expectations are',
     ],
     'identity' => [
         'IMPLEMENTED_MEMBERS: [&str; 6]',

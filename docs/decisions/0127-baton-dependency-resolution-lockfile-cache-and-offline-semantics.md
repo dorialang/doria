@@ -186,8 +186,8 @@ Stage 33 Slices 1 through 3 are complete in the disposable PHP UX bootstrap.
 Stage 33 Slice 3 owns development dependencies, workspaces, graph
 commands, tests, processors, generated-source orchestration, incremental project
 inventory, and Phase F closure. Stage 33 and Phase F are complete. Native
-Testing Foundation Slices 1 and 2 are complete, Slice 3 is next, and Stage 34
-waits for the foundation.
+Testing Foundation Slices 1 through 3 and the foundation are complete, and
+Stage 34 is next.
 
 Decision 0124's mandatory Pre-Stage-45 transition remains scheduled. The clean
 `dorialang/baton` repository must parity-port every accepted Stage 33 behavior,

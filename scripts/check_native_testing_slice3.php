@@ -29,7 +29,10 @@ foreach ($files as $key => $relative) {
 
 $required = [
     'decision' => [
-        '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Compiler/Runtime In Progress; Foundation In Progress',
+        '**Implementation Status:** Implemented By Native Testing Foundation Slices 1 Through 3',
+        'Native Testing Foundation Slice 3 - Complete',
+        'Native Testing Foundation - Complete',
+        'Stage 34 Single Class Inheritance - Next',
         '| `Bytes` | yes | yes | no | no | no |',
         '| `Dictionary<K, V>` / `SortedDictionary<K, V>` | yes | yes | no | yes | yes |',
         'ordinary once-call consumption',

@@ -87,10 +87,9 @@ function check_inferred_main_effects(string $root): array
         '**Superseded By Accepted Decision 0121.**',
         'Stages 30a through 30h and Stage 30 are complete',
         'Stages 31 through 33 and Phase F are complete',
-        'Native Testing Foundation Slices 1 and 2 are complete',
-        'Slice 3 is',
-        'Stage 34',
-        'waits for the foundation',
+        'Native Testing Foundation Slices 1 through 3 are complete',
+        'foundation is complete',
+        'Stage 34 is next',
     ]);
     $require($compatibilityPath, $compatibility, [
         'function main(): void throws Doria\Std\Io\IoError',

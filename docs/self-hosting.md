@@ -93,11 +93,12 @@ Avoid creating a huge Doria compiler rewrite too early. That would slow the proj
 Stage 31 satisfies multi-file compilation, namespace identity, package-aware
 source graphs, and source-aware cross-file diagnostics. Stage 33 adds practical
 Baton test orchestration over compiler-owned metadata. Native Testing Foundation
-Slice 1 now adds compiler-owned `describe`/`it`/`test` declarations, stable
-generated callables, and unified schema-3 discovery without a runtime registry
-or source parser. Slice 2's expectation kernel, Baton integration, and official
-tooling coordination are implemented; final collection/Error expectations and
-reporting remain Slice 3, so the native testing foundation is still in progress.
+Slices 1 through 3 add compiler-owned `describe`/`it`/`test` declarations,
+stable generated callables, unified schema-3 discovery without a runtime
+registry or source parser, scalar/string/collection/Error expectations, bounded
+failure differences, strict outcome classification and hierarchy reporting,
+and official tooling coordination. The foundation is complete and Stage 34 is
+next.
 These are meaningful
 bootstrap advances, not a declaration that Doria is ready for a full compiler
 port; remaining language, library, and long-term IR requirements still govern

@@ -30,7 +30,7 @@ function check_performance_foundation(string $root): array
             'both Stage 31 slices, and Stage 32 are complete',
             'Stage 33 Slices 1 through 3 and Phase F are complete',
             'Native Testing Foundation',
-            'Stage 34 waits for the foundation',
+            'Stage 34 is next',
             'Doria Median / Fastest Valid Native Peer Median <= 1.30',
             'A ratio greater than `1.30` is',
             'Inconclusive**, never Pass',
