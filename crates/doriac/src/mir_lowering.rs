@@ -4173,17 +4173,23 @@ fn assertion_equal_condition(
                     )),
                 })
             }
-            (mir::Type::String, mir::Type::String) => Ok(mir::BoolExpression::StringCompare {
-                op: mir::CompareOp::Equal,
-                left: Box::new(mir::StringExpression::Local(left)),
-                right: Box::new(mir::StringExpression::Local(right)),
-            }),
-            (mir::Type::NullableString, mir::Type::NullableString) => {
-                Ok(mir::BoolExpression::NullableStringCompare {
-                    op: mir::CompareOp::Equal,
-                    left: Box::new(mir::NullableStringExpression::Local(left)),
-                    right: Box::new(mir::NullableStringExpression::Local(right)),
-                })
+            (left_ty, right_ty)
+                if matches!(left_ty, mir::Type::String | mir::Type::NullableString)
+                    && matches!(right_ty, mir::Type::String | mir::Type::NullableString) =>
+            {
+                if left_ty == mir::Type::String && right_ty == mir::Type::String {
+                    Ok(mir::BoolExpression::StringCompare {
+                        op: mir::CompareOp::Equal,
+                        left: Box::new(mir::StringExpression::Local(left)),
+                        right: Box::new(mir::StringExpression::Local(right)),
+                    })
+                } else {
+                    Ok(mir::BoolExpression::NullableStringCompare {
+                        op: mir::CompareOp::Equal,
+                        left: Box::new(assertion_nullable_string_operand(left, left_ty)),
+                        right: Box::new(assertion_nullable_string_operand(right, right_ty)),
+                    })
+                }
             }
             (mir::Type::Class(left_class), mir::Type::Class(right_class))
                 if left_class == right_class =>
@@ -4240,6 +4246,19 @@ fn assertion_equal_condition(
                 span,
             )]),
         },
+    }
+}
+
+fn assertion_nullable_string_operand(
+    local: mir::LocalId,
+    ty: mir::Type,
+) -> mir::NullableStringExpression {
+    match ty {
+        mir::Type::String => {
+            mir::NullableStringExpression::String(mir::StringExpression::Local(local))
+        }
+        mir::Type::NullableString => mir::NullableStringExpression::Local(local),
+        _ => unreachable!("assertion nullable string operand must be string-shaped"),
     }
 }
 

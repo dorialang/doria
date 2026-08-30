@@ -136,6 +136,8 @@ function __doria_assertion_presentation(mixed $value, string $type): string
         $presentation = $value ? "true" : "false";
     } elseif (is_int($value) || is_float($value)) {
         $presentation = __doria_display($value);
+    } elseif ($value instanceof \UnitEnum) {
+        $presentation = $type . "::" . $value->name;
     } elseif (str_starts_with($type, "class ")) {
         $presentation = "<" . substr($type, 6) . ">";
     } else {
@@ -195,6 +197,15 @@ function __doria_write_assertion_outcome_v4(
         ? __doria_source_location($origin)
         : ["", "", 0];
     $function = $known ? $caught->error()->__doriaErrorCallable() : "";
+    if (strlen($type) > 4096 || strlen($matcher) > 64 ||
+        strlen($actualType) > 4096 || strlen($actualPresentation) > 4096 ||
+        strlen($expectedType) > 4096 || strlen($expectedPresentation) > 4096 ||
+        strlen($difference) > 4096 || strlen($userMessage) > 65536 ||
+        strlen($sourcePath) > 4096 || strlen($sourceText) > 4194304 ||
+        strlen($function) > 1024
+    ) {
+        return false;
+    }
     $record = "DORIAO4\0" . pack("vVVCVCCVV", 4, strlen($type), 70, 1,
         strlen($matcher), $negated ? 1 : 0, $actualPresent ? 1 : 0,
         strlen($actualType), strlen($actualPresentation)) .

@@ -919,6 +919,10 @@ internal enum Payload { case Number(int $value); case Empty; }
 function actual(): int { echo "a"; return 7; }
 function expected(): int { echo "e"; return 7; }
 function assertPresent(?int $value): void { expect($value)->not->toBeNull(); }
+function assertNullableString(?string $value): void {
+    expect($value)->toEqual("alpha");
+    expect("alpha")->toEqual($value);
+}
 
 it("core matcher matrix", function (): void {
     expect(actual())->toEqual(expected());
@@ -936,6 +940,7 @@ it("core matcher matrix", function (): void {
     expect("alpha")->toEndWith("ha");
     expect("")->toBeEmpty();
     expect("alpha")->not->toBeEmpty();
+    assertNullableString("alpha");
 
     ?int $missing = null;
     mixed $mixedNull = null;
@@ -1253,4 +1258,83 @@ it("reports", function (): void {
         );
         assert_v4(&payload);
     }
+}
+
+#[test]
+fn php_assertion_outcomes_preserve_enum_cases_and_reject_oversized_records() {
+    if Command::new("php").arg("--version").output().is_err() {
+        return;
+    }
+
+    let enum_source = r#"
+use Doria\Std\Test\{expect, it};
+internal enum State { case Ready; case Waiting; }
+it("enum facts", function (): void { expect(State::Ready)->toEqual(State::Waiting); });
+"#;
+    let dispatcher = first_behavioral_dispatcher(enum_source);
+    let php = doriac::compile_compilation_graph(&dispatcher_graph(
+        enum_source,
+        &dispatcher,
+        CompilerTarget::Php,
+        None,
+    ))
+    .expect("PHP enum assertion dispatcher");
+    let doriac::backend::BackendOutput::Text { contents, .. } = php else {
+        panic!("PHP backend must emit text");
+    };
+    let path = temporary_path("php");
+    let outcome = temporary_path("outcome");
+    fs::write(&path, contents).expect("write PHP enum assertion");
+    let output = Command::new("php")
+        .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
+        .arg(&path)
+        .output()
+        .expect("run PHP enum assertion");
+    let payload = fs::read(&outcome).expect("PHP enum assertion outcome");
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&outcome);
+    assert_eq!(output.status.code(), Some(70));
+    for presentation in [b"State::Ready".as_slice(), b"State::Waiting".as_slice()] {
+        assert!(
+            payload
+                .windows(presentation.len())
+                .any(|window| window == presentation),
+            "missing enum presentation {:?} in {payload:?}",
+            String::from_utf8_lossy(presentation)
+        );
+    }
+
+    let message = "x".repeat(64 * 1024 + 1);
+    let oversized_source = format!(
+        "use Doria\\Std\\Test\\{{fail, it}};\nit(\"oversized\", function (): void {{ fail(\"{message}\"); }});\n"
+    );
+    let dispatcher = first_behavioral_dispatcher(&oversized_source);
+    let php = doriac::compile_compilation_graph(&dispatcher_graph(
+        &oversized_source,
+        &dispatcher,
+        CompilerTarget::Php,
+        None,
+    ))
+    .expect("PHP oversized assertion dispatcher");
+    let doriac::backend::BackendOutput::Text { contents, .. } = php else {
+        panic!("PHP backend must emit text");
+    };
+    let path = temporary_path("php");
+    let outcome = temporary_path("outcome");
+    fs::write(&path, contents).expect("write oversized PHP assertion");
+    let output = Command::new("php")
+        .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
+        .arg(&path)
+        .output()
+        .expect("run oversized PHP assertion");
+    let _ = fs::remove_file(&path);
+    let published = fs::read(&outcome).ok();
+    let _ = fs::remove_file(&outcome);
+    assert_eq!(output.status.code(), Some(70));
+    assert!(published.is_none(), "oversized V4 record was published");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Error[R1001]: Assertion Failed"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
