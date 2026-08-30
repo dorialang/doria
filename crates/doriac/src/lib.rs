@@ -1,4 +1,5 @@
 pub mod arg_binding;
+pub mod assertions;
 pub mod ast;
 pub mod attributes;
 pub mod backend;
@@ -130,6 +131,10 @@ pub fn analyze_source_for_ide_with_context(
     if uses_compiler_known_io {
         resolution.resolved.program =
             compiler_known_io::augment_program(&resolution.resolved.program);
+    }
+    if compiler_known_test::resolved_facts_use_assertion_surface(&resolution.resolved.facts) {
+        resolution.resolved.program =
+            compiler_known_test::augment_program(&resolution.resolved.program);
     }
     let source_context = testing::SourceSemanticContext::standalone(context.clone());
     let (evaluation, _) =
@@ -671,6 +676,9 @@ pub(crate) fn prepare_parsed_source(
         || compiler_known_io::resolved_facts_use_canonical_io(&resolved.facts);
     if uses_compiler_known_io {
         resolved.program = compiler_known_io::augment_program(&resolved.program);
+    }
+    if compiler_known_test::resolved_facts_use_assertion_surface(&resolved.facts) {
+        resolved.program = compiler_known_test::augment_program(&resolved.program);
     }
     let source_context = testing::SourceSemanticContext::standalone(context.clone());
     let (evaluation, _) = const_eval::evaluate_program_with_diagnostics(&resolved.program);

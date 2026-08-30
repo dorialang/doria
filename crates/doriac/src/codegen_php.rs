@@ -125,6 +125,101 @@ function __doria_safe_error_message(string $message): string
     return $safe;
 }
 
+function __doria_assertion_presentation(mixed $value, string $type): string
+{
+    if ($value === null) {
+        $presentation = "null";
+    } elseif ($type === "string" || $type === "?string") {
+        $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        $presentation = $encoded === false ? "\"<invalid string>\"" : $encoded;
+    } elseif (is_bool($value)) {
+        $presentation = $value ? "true" : "false";
+    } elseif (is_int($value) || is_float($value)) {
+        $presentation = __doria_display($value);
+    } elseif ($value instanceof \UnitEnum) {
+        $presentation = $type . "::" . $value->name;
+    } elseif (str_starts_with($type, "class ")) {
+        $presentation = "<" . substr($type, 6) . ">";
+    } else {
+        $presentation = "<" . $type . ">";
+    }
+    if (strlen($presentation) <= 4096) {
+        return $presentation;
+    }
+    $marker = "...<truncated>";
+    $prefix = substr($presentation, 0, 4096 - strlen($marker));
+    while ($prefix !== "" && preg_match('//u', $prefix) !== 1) {
+        $prefix = substr($prefix, 0, -1);
+    }
+    return $prefix . $marker;
+}
+
+function __doria_u64_le(int $value): string
+{
+    return pack("V2", $value & 0xffffffff, intdiv($value, 4294967296));
+}
+
+function __doria_publish_outcome(string $path, string $record): bool
+{
+    return @file_put_contents($path, $record, LOCK_EX) === strlen($record);
+}
+
+function __doria_write_error_outcome_v3(__DoriaCheckedError $caught, string $path): bool
+{
+    $type = $caught->descriptor->typeName;
+    $message = $caught->error()->message;
+    $origin = $caught->origin;
+    $known = $origin !== 0;
+    [$sourcePath, $sourceText, $start] = $known
+        ? __doria_source_location($origin)
+        : ["", "", 0];
+    $function = $known ? $caught->error()->__doriaErrorCallable() : "";
+    $record = "DORIAO3\0" . pack("vV", 3, strlen($type)) .
+        __doria_u64_le(strlen($message)) .
+        pack("VVVC", strlen($sourcePath), strlen($sourceText), strlen($function), $known ? 1 : 0) .
+        __doria_u64_le($start) . __doria_u64_le($start + ($known ? 1 : 0)) .
+        $type . $message . $sourcePath . $sourceText . $function;
+    return __doria_publish_outcome($path, $record);
+}
+
+function __doria_write_assertion_outcome_v4(
+    __DoriaCheckedError $caught,
+    array $facts,
+    string $path,
+): bool {
+    [$matcher, $negated, $actualPresent, $actualType, $actualPresentation,
+        $expectedPresent, $expectedType, $expectedPresentation,
+        $differencePresent, $difference, $userMessagePresent, $userMessage] = $facts;
+    $type = $caught->descriptor->typeName;
+    $origin = $caught->origin;
+    $known = $origin !== 0;
+    [$sourcePath, $sourceText, $start] = $known
+        ? __doria_source_location($origin)
+        : ["", "", 0];
+    $function = $known ? $caught->error()->__doriaErrorCallable() : "";
+    if (strlen($type) > 4096 || strlen($matcher) > 64 ||
+        strlen($actualType) > 4096 || strlen($actualPresentation) > 4096 ||
+        strlen($expectedType) > 4096 || strlen($expectedPresentation) > 4096 ||
+        strlen($difference) > 4096 || strlen($userMessage) > 65536 ||
+        strlen($sourcePath) > 4096 || strlen($sourceText) > 4194304 ||
+        strlen($function) > 1024
+    ) {
+        return false;
+    }
+    $record = "DORIAO4\0" . pack("vVVCVCCVV", 4, strlen($type), 70, 1,
+        strlen($matcher), $negated ? 1 : 0, $actualPresent ? 1 : 0,
+        strlen($actualType), strlen($actualPresentation)) .
+        pack("CVVCVCVVVVC", $expectedPresent ? 1 : 0, strlen($expectedType),
+            strlen($expectedPresentation), $differencePresent ? 1 : 0,
+            strlen($difference), $userMessagePresent ? 1 : 0, strlen($userMessage),
+            strlen($sourcePath), strlen($sourceText), strlen($function), $known ? 1 : 0) .
+        __doria_u64_le($start) . __doria_u64_le($start + ($known ? 1 : 0)) .
+        pack("v", 0) . $type . $matcher . $actualType . $actualPresentation .
+        $expectedType . $expectedPresentation . $difference . $userMessage .
+        $sourcePath . $sourceText . $function;
+    return __doria_publish_outcome($path, $record);
+}
+
 function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
 {
     $type = $caught->descriptor->typeName;
@@ -138,12 +233,47 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
     $lineEnd = $lineEnd === false ? strlen($sourceText) : $lineEnd;
     $lineText = rtrim(substr($sourceText, $lineStart, $lineEnd - $lineStart), "\r");
     $markerOffset = max(0, $sourceOffset - $lineStart);
+    $error = $caught->error();
+    $assertion = $type === "Doria\\Std\\Test\\AssertionError" &&
+        method_exists($error, "__doriaAssertionFacts");
+    if ($assertion) {
+        $facts = $error->__doriaAssertionFacts();
+        $v4 = getenv("DORIA_RUNTIME_OUTCOME_V4");
+        if (is_string($v4) && __doria_write_assertion_outcome_v4($caught, $facts, $v4)) {
+            unset($caught);
+            exit(70);
+        }
+    }
+    $v3 = getenv("DORIA_RUNTIME_OUTCOME_V3");
+    if (!$assertion && is_string($v3) && __doria_write_error_outcome_v3($caught, $v3)) {
+        unset($caught);
+        exit(70);
+    }
+    if ($assertion && !is_string(getenv("DORIA_RUNTIME_OUTCOME_V4")) &&
+        is_string($v3) && __doria_write_error_outcome_v3($caught, $v3)) {
+        unset($caught);
+        exit(70);
+    }
+    if ($assertion) {
+        [, , $actualPresent, , $actualPresentation,
+            $expectedPresent, , $expectedPresentation] = $facts;
+        $message = "Error[R1001]: Assertion Failed\n\nWhere\n" .
+            $sourcePath . " · line " . $line . " · " . $error->__doriaErrorCallable() . "\n\n" .
+            $lineText . "\n" . str_repeat(" ", $markerOffset) . "^\nAssertion Failed Here" .
+            ($expectedPresent ? "\n\nExpected\n  " . $expectedPresentation : "") .
+            ($actualPresent ? "\n\nActual\n  " . $actualPresentation : "") .
+            "\n\nWhy\n  " . __doria_safe_error_message($error->message) .
+            "\n\nProcess Exited With Status 70\n";
+        @fwrite(STDERR, $message);
+        unset($caught);
+        exit(70);
+    }
     $message = "Error[R1000]: Unhandled " . $type . "\n\nWhere\n" .
         $sourcePath . " · line " . $line . " · " .
-        $caught->error()->__doriaErrorCallable() . "\n\n" .
+        $error->__doriaErrorCallable() . "\n\n" .
         $lineText . "\n" . str_repeat(" ", $markerOffset) . "^\n" .
         "This Error Was First Thrown Here\n\nWhy\n  " .
-        __doria_safe_error_message($caught->error()->message) .
+        __doria_safe_error_message($error->message) .
         "\n\nProcess Exited With Status 70\n";
     @fwrite(STDERR, $message);
     unset($caught);
@@ -2168,6 +2298,19 @@ fn unsupported_increment(increment: &IncrementStmt) -> BackendError {
 
 fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
     match expr {
+        Expr::Assertion(assertion) => {
+            for operand in [
+                assertion.actual.as_deref(),
+                assertion.expected.as_deref(),
+                assertion.user_message.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                validate_expr(operand, semantic_info)?;
+            }
+            Ok(())
+        }
         Expr::Closure(closure) => {
             for parameter in &closure.parameters {
                 validate_type(&parameter.ty, parameter.span)?;
@@ -2634,6 +2777,7 @@ fn requires_php_runtime_property_initializer(
         return None;
     }
     match expr {
+        Expr::Assertion(_) => Some((expr.span(), "test assertion execution")),
         Expr::Closure(_) | Expr::CallableCall(_) => Some((expr.span(), "closure execution")),
         Expr::ListAlgorithmCall(call) => Some((call.span, "List algorithm execution")),
         Expr::StaticMember {
@@ -3443,6 +3587,21 @@ fn emit_class(
         writeln(output, indent + 2, "return $this->__doriaErrorCallable;");
         writeln(output, indent + 1, "}");
         output.push('\n');
+        if class_decl.name == crate::compiler_known_test::ASSERTION_ERROR {
+            writeln(
+                output,
+                indent + 1,
+                "public function __doriaAssertionFacts(): array",
+            );
+            writeln(output, indent + 1, "{");
+            writeln(
+                output,
+                indent + 2,
+                "return [$this->__assertionMatcher, $this->__assertionNegated, $this->__assertionActualPresent, $this->__assertionActualType, $this->__assertionActualPresentation, $this->__assertionExpectedPresent, $this->__assertionExpectedType, $this->__assertionExpectedPresentation, $this->__assertionDifferencePresent, $this->__assertionDifference, $this->__assertionUserMessagePresent, $this->__assertionUserMessage];",
+            );
+            writeln(output, indent + 1, "}");
+            output.push('\n');
+        }
     }
     for member in &class_decl.members {
         let ClassMember::Method(method) = member else {
@@ -3486,8 +3645,17 @@ fn emit_class(
                 } else {
                     &[]
                 };
+                let mut emitted_method = method.clone();
+                if class_decl.name == crate::compiler_known_test::ASSERTION_ERROR
+                    && emitted_method.name == "__construct"
+                {
+                    // The generated assertion helper constructs this compiler-owned
+                    // class outside its PHP class body. Doria source still cannot
+                    // invoke the internal constructor.
+                    emitted_method.access = MemberAccess::External;
+                }
                 emit_function(
-                    method,
+                    &emitted_method,
                     semantic_info,
                     output,
                     indent + 1,
@@ -4439,6 +4607,10 @@ fn emit_statement(
             );
         }
         Stmt::Expr { expr, .. } => {
+            if let Expr::Assertion(assertion) = expr {
+                emit_assertion_statement(assertion, output, indent, scopes);
+                return;
+            }
             if let Expr::FunctionCall { name, args, span } = expr {
                 if name == "panic" && args.len() == 1 {
                     emit_panic(&args[0].value, *span, output, indent, scopes);
@@ -4450,6 +4622,187 @@ fn emit_statement(
         Stmt::Throw(statement) => emit_throw_statement(statement, output, indent, scopes),
         Stmt::Try(statement) => emit_try_statement(statement, output, indent, scopes),
     }
+}
+
+fn assertion_type_name(ty: &ResolvedType) -> String {
+    match ty {
+        ResolvedType::Integer(ty) => ty.source_name().to_string(),
+        ResolvedType::Float(ty) => ty.source_name().to_string(),
+        ResolvedType::String => "string".to_string(),
+        ResolvedType::Bool => "bool".to_string(),
+        ResolvedType::Null => "null".to_string(),
+        ResolvedType::Mixed => "mixed".to_string(),
+        ResolvedType::Error => "Error".to_string(),
+        ResolvedType::Enum(ty) => ty.name.clone(),
+        ResolvedType::Class(ty) => format!("class {}", ty.name),
+        ResolvedType::Nullable(inner) => format!("?{}", assertion_type_name(inner)),
+        other => resolved_type_identity(other),
+    }
+}
+
+fn emit_assertion_statement(
+    assertion: &Assertion,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    let error_class = php_symbol_name(crate::compiler_known_test::ASSERTION_ERROR);
+    let matcher = assertion.matcher.fact_name();
+    let origin = php_source_location(assertion.span, assertion.span.start.saturating_add(1));
+    if assertion.matcher == crate::assertions::AssertionMatcher::Fail {
+        let message = scopes.fresh_temp("__doria_assertion_message");
+        let value = assertion
+            .user_message
+            .as_deref()
+            .expect("checked fail assertion has a message");
+        writeln(
+            output,
+            indent,
+            &format!("${message} = {};", emit_expr(value, scopes)),
+        );
+        writeln(
+            output,
+            indent,
+            &format!(
+                "__doria_throw(new {error_class}(${message}, {}, false, false, \"\", \"\", false, \"\", \"\", false, \"\", true, ${message}), {origin}, {});",
+                emit_php_string_literal(matcher),
+                scopes.callable_identity(),
+            ),
+        );
+        return;
+    }
+
+    let actual = scopes.fresh_temp("__doria_assertion_actual");
+    let actual_expr = assertion
+        .actual
+        .as_deref()
+        .expect("checked matcher assertion has an actual operand");
+    writeln(
+        output,
+        indent,
+        &format!("${actual} = {};", emit_expr(actual_expr, scopes)),
+    );
+    let expected = assertion.expected.as_deref().map(|value| {
+        let name = scopes.fresh_temp("__doria_assertion_expected");
+        writeln(
+            output,
+            indent,
+            &format!("${name} = {};", emit_expr(value, scopes)),
+        );
+        name
+    });
+    let comparison = match assertion.matcher {
+        crate::assertions::AssertionMatcher::Equal => {
+            format!("__doria_equal(${actual}, ${})", expected.as_ref().unwrap())
+        }
+        crate::assertions::AssertionMatcher::Null => format!("${actual} === null"),
+        crate::assertions::AssertionMatcher::True => format!("${actual} === true"),
+        crate::assertions::AssertionMatcher::False => format!("${actual} === false"),
+        crate::assertions::AssertionMatcher::GreaterThan => {
+            format!(
+                "__doria_greater(${actual}, ${})",
+                expected.as_ref().unwrap()
+            )
+        }
+        crate::assertions::AssertionMatcher::GreaterThanOrEqual => format!(
+            "__doria_greater_equal(${actual}, ${})",
+            expected.as_ref().unwrap()
+        ),
+        crate::assertions::AssertionMatcher::LessThan => {
+            format!("__doria_less(${actual}, ${})", expected.as_ref().unwrap())
+        }
+        crate::assertions::AssertionMatcher::LessThanOrEqual => format!(
+            "__doria_less_equal(${actual}, ${})",
+            expected.as_ref().unwrap()
+        ),
+        crate::assertions::AssertionMatcher::StringContains => {
+            format!("str_contains(${actual}, ${})", expected.as_ref().unwrap())
+        }
+        crate::assertions::AssertionMatcher::StringStartsWith => {
+            format!(
+                "str_starts_with(${actual}, ${})",
+                expected.as_ref().unwrap()
+            )
+        }
+        crate::assertions::AssertionMatcher::StringEndsWith => {
+            format!("str_ends_with(${actual}, ${})", expected.as_ref().unwrap())
+        }
+        crate::assertions::AssertionMatcher::StringEmpty => format!("${actual} === \"\""),
+        crate::assertions::AssertionMatcher::Fail => unreachable!(),
+    };
+    let passed = if assertion.negated {
+        format!("!({comparison})")
+    } else {
+        comparison
+    };
+    writeln(output, indent, &format!("if (!({passed}))"));
+    writeln(output, indent, "{");
+    let actual_type = assertion
+        .actual_type
+        .as_ref()
+        .map(assertion_type_name)
+        .unwrap_or_default();
+    let actual_presentation = scopes.fresh_temp("__doria_assertion_actual_text");
+    writeln(
+        output,
+        indent + 1,
+        &format!(
+            "${actual_presentation} = __doria_assertion_presentation(${actual}, {});",
+            emit_php_string_literal(&actual_type)
+        ),
+    );
+    let (expected_present, expected_type, expected_presentation) = if let Some(expected) = expected
+    {
+        let ty = assertion
+            .expected_type
+            .as_ref()
+            .map(assertion_type_name)
+            .unwrap_or_default();
+        let presentation = scopes.fresh_temp("__doria_assertion_expected_text");
+        writeln(
+            output,
+            indent + 1,
+            &format!(
+                "${presentation} = __doria_assertion_presentation(${expected}, {});",
+                emit_php_string_literal(&ty)
+            ),
+        );
+        (true, ty, format!("${presentation}"))
+    } else {
+        match assertion.matcher {
+            crate::assertions::AssertionMatcher::Null => {
+                (true, "null".to_string(), emit_php_string_literal("null"))
+            }
+            crate::assertions::AssertionMatcher::True => {
+                (true, "bool".to_string(), emit_php_string_literal("true"))
+            }
+            crate::assertions::AssertionMatcher::False => {
+                (true, "bool".to_string(), emit_php_string_literal("false"))
+            }
+            crate::assertions::AssertionMatcher::StringEmpty => {
+                (true, "string".to_string(), emit_php_string_literal("\"\""))
+            }
+            _ => (false, String::new(), emit_php_string_literal("")),
+        }
+    };
+    writeln(
+        output,
+        indent + 1,
+        &format!(
+            "__doria_throw(new {error_class}({}, {}, {}, true, {}, ${actual_presentation}, {}, {}, {expected_presentation}, false, \"\", false, \"\"), {origin}, {});",
+            emit_php_string_literal(crate::assertions::stable_message(
+                assertion.matcher,
+                assertion.negated,
+            )),
+            emit_php_string_literal(matcher),
+            if assertion.negated { "true" } else { "false" },
+            emit_php_string_literal(&actual_type),
+            if expected_present { "true" } else { "false" },
+            emit_php_string_literal(&expected_type),
+            scopes.callable_identity(),
+        ),
+    );
+    writeln(output, indent, "}");
 }
 
 fn emit_throw_statement(
@@ -5292,6 +5645,9 @@ fn emit_list_algorithm_call(call: &ListAlgorithmCall, scopes: &PhpNameScopes) ->
 
 fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
     match expr {
+        Expr::Assertion(_) => {
+            unreachable!("checked assertions are emitted only from terminal statement position")
+        }
         Expr::Closure(closure) => emit_closure_expression(closure, scopes),
         Expr::CallableCall(call) => emit_callable_call(call, scopes),
         Expr::ListAlgorithmCall(call) => emit_list_algorithm_call(call, scopes),

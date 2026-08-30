@@ -156,6 +156,7 @@ struct FunctionSignature {
     receiver_mode: Option<mir::ReceiverMode>,
     required_checked_effects: Vec<mir::CheckedEffect>,
     ambient_checked_effects: Vec<mir::CheckedEffect>,
+    test_assertion_checked_effects: Vec<mir::CheckedEffect>,
     checked_effects: Vec<mir::CheckedEffect>,
 }
 
@@ -318,6 +319,18 @@ fn collect_closure_expressions<'a>(
 
     fn visit_expr(expr: &hir::Expr, closures: &mut Vec<hir::ClosureExpression>) {
         match expr {
+            hir::Expr::Assertion(assertion) => {
+                for operand in [
+                    assertion.actual.as_deref(),
+                    assertion.expected.as_deref(),
+                    assertion.user_message.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    visit_expr(operand, closures);
+                }
+            }
             hir::Expr::Closure(closure) => {
                 closures.push((**closure).clone());
                 match &closure.body {
@@ -1162,16 +1175,32 @@ fn lower_program_impl(
         .iter()
         .filter(|class| class.implements(crate::symbols::BuiltinInterface::Error))
         .enumerate()
-        .map(|(index, class)| mir::ErrorDescriptor {
-            id: mir::ErrorDescriptorId(index),
-            class: class.id,
-            type_name: class.name.clone(),
-            message_property: class
-                .properties
-                .iter()
-                .find(|property| property.name == "message")
-                .expect("checked Error conformance has a message property")
-                .id,
+        .map(|(index, class)| {
+            let property = |name: &str| {
+                class
+                    .properties
+                    .iter()
+                    .find(|property| property.name == name)
+                    .expect("compiler-known assertion property is present")
+                    .id
+            };
+            mir::ErrorDescriptor {
+                id: mir::ErrorDescriptorId(index),
+                class: class.id,
+                type_name: class.name.clone(),
+                message_property: class
+                    .properties
+                    .iter()
+                    .find(|property| property.name == "message")
+                    .expect("checked Error conformance has a message property")
+                    .id,
+                assertion: (class.name == crate::compiler_known_test::ASSERTION_ERROR).then(|| {
+                    mir::AssertionErrorDescriptor {
+                        fact_properties: crate::compiler_known_test::ASSERTION_FACT_PROPERTIES
+                            .map(property),
+                    }
+                }),
+            }
         })
         .collect::<Vec<_>>();
     let error_descriptor_ids = error_descriptors
@@ -2016,6 +2045,16 @@ fn intern_resolved_collection_types(
                     .map(|effect| checked_effect_for_resolved(effect, class_ids, collections))
                     .collect::<Option<Vec<_>>>()?;
                 let ambient_checked_effects = ambient_mir_checked_effects(class_ids, collections)?;
+                let test_assertion_checked_effects = checked_effect_for_resolved(
+                    &ResolvedType::Class(ClassType::new(
+                        crate::compiler_known_test::ASSERTION_ERROR.to_string(),
+                        Vec::new(),
+                    )),
+                    class_ids,
+                    collections,
+                )
+                .into_iter()
+                .collect();
                 let id = mir::FunctionTypeId(collections.function_types.len());
                 collections.function_types.push(mir::FunctionType {
                     id,
@@ -2034,6 +2073,7 @@ fn intern_resolved_collection_types(
                     return_type,
                     checked_effects,
                     ambient_checked_effects,
+                    test_assertion_checked_effects,
                     return_borrow: function.return_borrow.map(|borrow| mir::ReturnBorrow {
                         source: match borrow.source {
                             crate::types::FunctionBorrowSource::Parameter(index) => {
@@ -2609,6 +2649,20 @@ fn collect_function_signature(
                 },
             )
             .collect(),
+        test_assertion_checked_effects: function
+            .test_assertion_checked_effects
+            .iter()
+            .filter_map(
+                |effect| match substitute_resolved_type(effect, substitutions) {
+                    ResolvedType::Class(class) => class_ids
+                        .get(&class)
+                        .and_then(|class| error_descriptor_ids.get(class))
+                        .copied()
+                        .map(mir::CheckedEffect::Concrete),
+                    _ => None,
+                },
+            )
+            .collect(),
         checked_effects: function
             .checked_effects
             .iter()
@@ -3045,6 +3099,7 @@ fn lower_function(
         return_borrow: signature.return_borrow,
         required_checked_effects: signature.required_checked_effects,
         ambient_checked_effects: signature.ambient_checked_effects,
+        test_assertion_checked_effects: signature.test_assertion_checked_effects,
         checked_effects: signature.checked_effects,
         locals,
         blocks,
@@ -3216,6 +3271,7 @@ fn lower_closure_function(
         return_borrow: definition.return_borrow,
         required_checked_effects: definition.checked_effects.clone(),
         ambient_checked_effects: definition.ambient_checked_effects.clone(),
+        test_assertion_checked_effects: definition.test_assertion_checked_effects.clone(),
         checked_effects: definition.complete_checked_effects(),
         locals,
         blocks,
@@ -3600,6 +3656,9 @@ fn lower_expression_statement(
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if let hir::Expr::Assertion(assertion) = expr {
+        return lower_assertion_statement(assertion, context);
+    }
     if let hir::Expr::CallableCall(call) = expr {
         let _ = materialize_indirect_call(call, false, context)?;
         return Ok(());
@@ -3759,6 +3818,726 @@ fn lower_expression_statement(
         }
     }
     Ok(())
+}
+
+fn lower_assertion_statement(
+    assertion: &hir::Assertion,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    use crate::assertions::AssertionMatcher as Matcher;
+
+    let setup = context.current_block();
+    let actual = assertion
+        .actual
+        .as_deref()
+        .zip(assertion.actual_type.as_ref())
+        .map(|(expression, ty)| lower_assertion_operand(expression, ty, context))
+        .transpose()?;
+    let actual_type_name = assertion
+        .actual_type
+        .as_ref()
+        .map(crate::attributes::metadata_type_name);
+    let expected = assertion
+        .expected
+        .as_deref()
+        .zip(assertion.expected_type.as_ref())
+        .map(|(expression, ty)| lower_assertion_operand(expression, ty, context))
+        .transpose()?;
+    let explicit_expected_type_name = assertion
+        .expected_type
+        .as_ref()
+        .map(crate::attributes::metadata_type_name);
+    let implicit_expected = match assertion.matcher {
+        Matcher::Null => Some(("null", "null")),
+        Matcher::True => Some(("bool", "true")),
+        Matcher::False => Some(("bool", "false")),
+        Matcher::StringEmpty => Some(("string", "\"\"")),
+        _ => None,
+    };
+    let expected_type_name = explicit_expected_type_name
+        .clone()
+        .or_else(|| implicit_expected.map(|(ty, _)| ty.to_string()));
+    let user_message = assertion
+        .user_message
+        .as_deref()
+        .map(|message| lower_assertion_string_operand(message, context))
+        .transpose()?;
+
+    let success = context.create_block();
+    let failure = context.create_block();
+    let error = context.declare_routed_error();
+    let error_class = context
+        .class_id_for_name(crate::compiler_known_test::ASSERTION_ERROR)
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I7101",
+                "compiler-known AssertionError has no native class identity",
+                assertion.span,
+            )]
+        })?;
+    let descriptor = context
+        .error_descriptor_ids
+        .get(&error_class)
+        .copied()
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I7101",
+                "compiler-known AssertionError has no native Error descriptor",
+                assertion.span,
+            )]
+        })?;
+    context.blocks[setup.0]
+        .statements
+        .push(mir::Statement::ControlFlowPlan(
+            mir::ControlFlowPlan::Assertion(Box::new(mir::AssertionPlan {
+                matcher: assertion.matcher,
+                negated: assertion.negated,
+                actual,
+                actual_type_name: actual_type_name.clone(),
+                expected,
+                expected_type_name: expected_type_name.clone(),
+                user_message,
+                error,
+                descriptor,
+                setup,
+                success,
+                failure,
+                source_span: assertion.span,
+            })),
+        ));
+
+    if assertion.matcher == Matcher::Fail {
+        context.terminate_current(mir::Terminator::Jump(failure));
+    } else {
+        let mut condition = assertion_condition(
+            assertion.matcher,
+            actual.expect("checked expectation has an actual operand"),
+            expected,
+            assertion.span,
+        )?;
+        if assertion.negated {
+            condition = mir::BoolExpression::Not(Box::new(condition));
+        }
+        context.terminate_current(mir::Terminator::Branch {
+            condition,
+            then_block: success,
+            else_block: failure,
+        });
+    }
+
+    let statement_temporaries = context.statement_owned_locals.clone();
+    context.current_block = Some(failure);
+    let actual_presentation = actual
+        .zip(actual_type_name.as_deref())
+        .map(|(operand, ty)| {
+            materialize_assertion_presentation(operand, ty, assertion.span, context)
+        })
+        .transpose()?;
+    let expected_presentation = expected
+        .zip(explicit_expected_type_name.as_deref())
+        .map(|(operand, ty)| {
+            materialize_assertion_presentation(operand, ty, assertion.span, context)
+        })
+        .transpose()?;
+    let message = if let Some(message) = user_message {
+        mir::Rvalue::String(mir::StringExpression::Local(message))
+    } else {
+        mir::Rvalue::String(mir::StringExpression::Literal(
+            crate::assertions::stable_message(assertion.matcher, assertion.negated).to_string(),
+        ))
+    };
+    let string = |value: String| mir::Rvalue::String(mir::StringExpression::Literal(value));
+    let boolean = |value| {
+        mir::Rvalue::Value(mir::ValueExpression::Bool(mir::BoolExpression::Use {
+            operand: mir::Operand::Scalar(mir::ScalarValue::Bool(value)),
+        }))
+    };
+    let presentation = |value: Option<mir::LocalId>| {
+        value.map_or_else(
+            || string(String::new()),
+            |local| mir::Rvalue::String(mir::StringExpression::Local(local)),
+        )
+    };
+    let args = vec![
+        message,
+        string(assertion.matcher.fact_name().to_string()),
+        boolean(assertion.negated),
+        boolean(actual.is_some()),
+        string(actual_type_name.unwrap_or_default()),
+        presentation(actual_presentation),
+        boolean(expected.is_some() || implicit_expected.is_some()),
+        string(expected_type_name.unwrap_or_default()),
+        implicit_expected.map_or_else(
+            || presentation(expected_presentation),
+            |(_, value)| string(value.to_string()),
+        ),
+        boolean(false),
+        string(String::new()),
+        boolean(user_message.is_some()),
+        user_message.map_or_else(
+            || string(String::new()),
+            |local| mir::Rvalue::String(mir::StringExpression::Local(local)),
+        ),
+    ];
+    let properties = lower_new_property_values(error_class, context)?;
+    let constructor = context
+        .lookup_lifecycle(error_class, "__construct")
+        .expect("compiler-known AssertionError has an internal constructor");
+    context.push_statement(mir::Statement::AssignLocal {
+        target: error,
+        value: mir::Rvalue::Error(mir::ErrorExpression::FromClass {
+            object: Box::new(mir::ClassExpression::New {
+                class: error_class,
+                properties,
+                constructor: Some(constructor.id),
+                args,
+            }),
+            descriptor,
+        }),
+    });
+    let origin = context
+        .error_origin_ids
+        .get(&assertion.span)
+        .copied()
+        .expect("checked assertion has deterministic origin metadata");
+    context.push_statement(mir::Statement::EnsureErrorOrigin { error, origin });
+    context.route_checked_error(error);
+    context.statement_owned_locals = statement_temporaries;
+    context.current_block = Some(success);
+    Ok(())
+}
+
+fn lower_assertion_operand(
+    expression: &hir::Expr,
+    resolved: &ResolvedType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::AssertionOperandPlan> {
+    if matches!(resolved, ResolvedType::Null) {
+        return Ok(mir::AssertionOperandPlan::Null);
+    }
+    materialize_nested_collection_places(expression, false, context)?;
+    let resolved = substitute_resolved_type(resolved, &context.type_substitutions);
+    let ty = context.mir_resolved_type(&resolved).ok_or_else(|| {
+        vec![Diagnostic::new(
+            "I7101",
+            "checked assertion operand has no native representation",
+            expression.span(),
+        )]
+    })?;
+    let value = lower_rvalue_as_borrowed(expression, ty, context)?;
+    let string_value = matches!(ty, mir::Type::String | mir::Type::NullableString);
+    let owned = !string_value && ty.has_move_ownership() && !value.borrows_move_value();
+    let local = context.declare_checked_call_slot(ty, owned);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value,
+    });
+    if string_value {
+        context
+            .statement_owned_locals
+            .last_mut()
+            .expect("assertion operands require an active statement scope")
+            .push(DropObligation::String(local));
+    } else if owned {
+        context.track_statement_owned_local(local, ty);
+    }
+    Ok(mir::AssertionOperandPlan::Local { local, ty })
+}
+
+fn lower_assertion_string_operand(
+    expression: &hir::Expr,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::LocalId> {
+    match lower_assertion_operand(expression, &ResolvedType::String, context)? {
+        mir::AssertionOperandPlan::Local { local, .. } => Ok(local),
+        mir::AssertionOperandPlan::Null => unreachable!("string assertion operand is not null"),
+    }
+}
+
+fn assertion_condition(
+    matcher: crate::assertions::AssertionMatcher,
+    actual: mir::AssertionOperandPlan,
+    expected: Option<mir::AssertionOperandPlan>,
+    span: Span,
+) -> DiagnosticResult<mir::BoolExpression> {
+    use crate::assertions::AssertionMatcher as Matcher;
+    use mir::AssertionOperandPlan::Local;
+
+    let comparison = match matcher {
+        Matcher::Null => assertion_operand_is_null(actual, span)?,
+        Matcher::True | Matcher::False => {
+            let Local {
+                local,
+                ty: mir::Type::Scalar(mir::ScalarType::Bool),
+            } = actual
+            else {
+                return Err(vec![Diagnostic::new(
+                    "I7101",
+                    "boolean assertion operand has another MIR type",
+                    span,
+                )]);
+            };
+            let value = mir::BoolExpression::Use {
+                operand: mir::Operand::Local(local),
+            };
+            if matcher == Matcher::False {
+                mir::BoolExpression::Not(Box::new(value))
+            } else {
+                value
+            }
+        }
+        Matcher::Equal => assertion_equal_condition(
+            actual,
+            expected.expect("equality assertion has expected operand"),
+            span,
+        )?,
+        Matcher::GreaterThan
+        | Matcher::GreaterThanOrEqual
+        | Matcher::LessThan
+        | Matcher::LessThanOrEqual => assertion_ordered_condition(
+            matcher,
+            actual,
+            expected.expect("ordered assertion has expected operand"),
+            span,
+        )?,
+        Matcher::StringContains
+        | Matcher::StringStartsWith
+        | Matcher::StringEndsWith
+        | Matcher::StringEmpty => {
+            let Local {
+                local: actual,
+                ty: mir::Type::String,
+            } = actual
+            else {
+                return Err(vec![Diagnostic::new(
+                    "I7101",
+                    "string assertion actual has another MIR type",
+                    span,
+                )]);
+            };
+            let (kind, mut args) = match matcher {
+                Matcher::StringContains => (mir::StringIntrinsicKind::Contains, Vec::new()),
+                Matcher::StringStartsWith => (mir::StringIntrinsicKind::StartsWith, Vec::new()),
+                Matcher::StringEndsWith => (mir::StringIntrinsicKind::EndsWith, Vec::new()),
+                Matcher::StringEmpty => (mir::StringIntrinsicKind::IsEmpty, Vec::new()),
+                _ => unreachable!(),
+            };
+            args.push(local_rvalue(actual, mir::Type::String, false));
+            if let Some(Local {
+                local,
+                ty: mir::Type::String,
+            }) = expected
+            {
+                args.push(local_rvalue(local, mir::Type::String, false));
+            }
+            mir::BoolExpression::Use {
+                operand: mir::Operand::StringIntrinsic(Box::new(mir::StringIntrinsicCall {
+                    kind,
+                    argument_spans: vec![span; args.len()],
+                    args,
+                    result: mir::Type::Scalar(mir::ScalarType::Bool),
+                    span,
+                })),
+            }
+        }
+        Matcher::Fail => unreachable!("fail has no success condition"),
+    };
+    Ok(comparison)
+}
+
+fn assertion_equal_condition(
+    left: mir::AssertionOperandPlan,
+    right: mir::AssertionOperandPlan,
+    span: Span,
+) -> DiagnosticResult<mir::BoolExpression> {
+    use mir::AssertionOperandPlan::{Local, Null};
+    match (left, right) {
+        (Null, other) | (other, Null) => assertion_operand_is_null(other, span),
+        (
+            Local { local: left, ty },
+            Local {
+                local: right,
+                ty: other,
+            },
+        ) => match (ty, other) {
+            (mir::Type::Scalar(left_ty), mir::Type::Scalar(right_ty)) => {
+                Ok(mir::BoolExpression::Compare {
+                    op: mir::CompareOp::Equal,
+                    left: Box::new(value_expression_from_operand(
+                        left_ty,
+                        mir::Operand::Local(left),
+                    )),
+                    right: Box::new(value_expression_from_operand(
+                        right_ty,
+                        mir::Operand::Local(right),
+                    )),
+                })
+            }
+            (left_ty, right_ty)
+                if matches!(left_ty, mir::Type::String | mir::Type::NullableString)
+                    && matches!(right_ty, mir::Type::String | mir::Type::NullableString) =>
+            {
+                if left_ty == mir::Type::String && right_ty == mir::Type::String {
+                    Ok(mir::BoolExpression::StringCompare {
+                        op: mir::CompareOp::Equal,
+                        left: Box::new(mir::StringExpression::Local(left)),
+                        right: Box::new(mir::StringExpression::Local(right)),
+                    })
+                } else {
+                    Ok(mir::BoolExpression::NullableStringCompare {
+                        op: mir::CompareOp::Equal,
+                        left: Box::new(assertion_nullable_string_operand(left, left_ty)),
+                        right: Box::new(assertion_nullable_string_operand(right, right_ty)),
+                    })
+                }
+            }
+            (mir::Type::Class(left_class), mir::Type::Class(right_class))
+                if left_class == right_class =>
+            {
+                Ok(mir::BoolExpression::ClassIdentityCompare {
+                    op: mir::CompareOp::Equal,
+                    class: left_class,
+                    left,
+                    right,
+                })
+            }
+            (mir::Type::PayloadEnum(left_ty), mir::Type::PayloadEnum(right_ty))
+                if left_ty == right_ty =>
+            {
+                Ok(mir::BoolExpression::PayloadEnumCompare {
+                    op: mir::CompareOp::Equal,
+                    left: Box::new(mir::PayloadEnumExpression::Use {
+                        ty: left_ty,
+                        place: mir::PayloadEnumPlace::Local(left),
+                        mode: mir::PayloadEnumUseMode::Borrow,
+                    }),
+                    right: Box::new(mir::PayloadEnumExpression::Use {
+                        ty: right_ty,
+                        place: mir::PayloadEnumPlace::Local(right),
+                        mode: mir::PayloadEnumUseMode::Borrow,
+                    }),
+                })
+            }
+            (mir::Type::NullablePayloadEnum(left_ty), mir::Type::NullablePayloadEnum(right_ty))
+                if left_ty == right_ty =>
+            {
+                Ok(mir::BoolExpression::NullablePayloadEnumCompare {
+                    op: mir::CompareOp::Equal,
+                    left: Box::new(mir::NullablePayloadEnumExpression::Use {
+                        ty: left_ty,
+                        place: mir::PayloadEnumPlace::Local(left),
+                        mode: mir::PayloadEnumUseMode::Borrow,
+                    }),
+                    right: Box::new(mir::NullablePayloadEnumExpression::Use {
+                        ty: right_ty,
+                        place: mir::PayloadEnumPlace::Local(right),
+                        mode: mir::PayloadEnumUseMode::Borrow,
+                    }),
+                })
+            }
+            (mir::Type::Collection(left_collection), mir::Type::Collection(right_collection))
+                if left_collection == right_collection =>
+            {
+                Ok(mir::BoolExpression::CollectionEqual { left, right })
+            }
+            _ => Err(vec![Diagnostic::new(
+                "I7101",
+                "checked equality assertion has no native comparison representation",
+                span,
+            )]),
+        },
+    }
+}
+
+fn assertion_nullable_string_operand(
+    local: mir::LocalId,
+    ty: mir::Type,
+) -> mir::NullableStringExpression {
+    match ty {
+        mir::Type::String => {
+            mir::NullableStringExpression::String(mir::StringExpression::Local(local))
+        }
+        mir::Type::NullableString => mir::NullableStringExpression::Local(local),
+        _ => unreachable!("assertion nullable string operand must be string-shaped"),
+    }
+}
+
+fn assertion_ordered_condition(
+    matcher: crate::assertions::AssertionMatcher,
+    left: mir::AssertionOperandPlan,
+    right: mir::AssertionOperandPlan,
+    span: Span,
+) -> DiagnosticResult<mir::BoolExpression> {
+    let op = match matcher {
+        crate::assertions::AssertionMatcher::GreaterThan => mir::CompareOp::Greater,
+        crate::assertions::AssertionMatcher::GreaterThanOrEqual => mir::CompareOp::GreaterEqual,
+        crate::assertions::AssertionMatcher::LessThan => mir::CompareOp::Less,
+        crate::assertions::AssertionMatcher::LessThanOrEqual => mir::CompareOp::LessEqual,
+        _ => unreachable!(),
+    };
+    match (left, right) {
+        (
+            mir::AssertionOperandPlan::Local {
+                local: left,
+                ty: mir::Type::Scalar(left_ty),
+            },
+            mir::AssertionOperandPlan::Local {
+                local: right,
+                ty: mir::Type::Scalar(right_ty),
+            },
+        ) => Ok(mir::BoolExpression::Compare {
+            op,
+            left: Box::new(value_expression_from_operand(
+                left_ty,
+                mir::Operand::Local(left),
+            )),
+            right: Box::new(value_expression_from_operand(
+                right_ty,
+                mir::Operand::Local(right),
+            )),
+        }),
+        (
+            mir::AssertionOperandPlan::Local {
+                local: left,
+                ty: mir::Type::String,
+            },
+            mir::AssertionOperandPlan::Local {
+                local: right,
+                ty: mir::Type::String,
+            },
+        ) => Ok(mir::BoolExpression::StringCompare {
+            op,
+            left: Box::new(mir::StringExpression::Local(left)),
+            right: Box::new(mir::StringExpression::Local(right)),
+        }),
+        _ => Err(vec![Diagnostic::new(
+            "I7101",
+            "checked ordered assertion has no native comparison representation",
+            span,
+        )]),
+    }
+}
+
+fn assertion_operand_is_null(
+    operand: mir::AssertionOperandPlan,
+    span: Span,
+) -> DiagnosticResult<mir::BoolExpression> {
+    use mir::AssertionOperandPlan::{Local, Null};
+    let present = match operand {
+        Null => {
+            return Ok(mir::BoolExpression::Use {
+                operand: mir::Operand::Scalar(mir::ScalarValue::Bool(true)),
+            });
+        }
+        Local { local, ty } => match_presence_condition(local, ty).map_err(|_| {
+            vec![Diagnostic::new(
+                "I7101",
+                "null assertion has a non-nullable native operand",
+                span,
+            )]
+        })?,
+    };
+    Ok(mir::BoolExpression::Not(Box::new(present)))
+}
+
+fn materialize_assertion_presentation(
+    operand: mir::AssertionOperandPlan,
+    type_name: &str,
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::LocalId> {
+    let local = context.declare_statement_string_temp();
+    let value = match operand {
+        mir::AssertionOperandPlan::Null => mir::StringExpression::Literal("null".to_string()),
+        mir::AssertionOperandPlan::Local {
+            local,
+            ty: mir::Type::String,
+        } => mir::StringExpression::Intrinsic(Box::new(mir::StringIntrinsicCall {
+            kind: mir::StringIntrinsicKind::AssertionQuote,
+            args: vec![local_rvalue(local, mir::Type::String, false)],
+            result: mir::Type::String,
+            span,
+            argument_spans: vec![span],
+        })),
+        mir::AssertionOperandPlan::Local {
+            local: source,
+            ty: mir::Type::Scalar(mir::ScalarType::Enum(enum_id)),
+        } => {
+            materialize_enum_assertion_presentation(local, source, enum_id, context)?;
+            return Ok(local);
+        }
+        mir::AssertionOperandPlan::Local {
+            local,
+            ty: mir::Type::Scalar(ty),
+        } => mir::StringExpression::Display(value_expression_from_operand(
+            ty,
+            mir::Operand::Local(local),
+        )),
+        mir::AssertionOperandPlan::Local {
+            local: source,
+            ty: mir::Type::NullableScalar(ty),
+        } => {
+            materialize_nullable_assertion_presentation(
+                local,
+                mir::BoolExpression::NullableScalarIsPresent(Box::new(
+                    mir::NullableScalarExpression::Local { ty, local: source },
+                )),
+                mir::StringExpression::Display(value_expression_from_operand(
+                    ty,
+                    mir::Operand::NullablePayload(source),
+                )),
+                context,
+            );
+            return Ok(local);
+        }
+        mir::AssertionOperandPlan::Local {
+            local: source,
+            ty: mir::Type::NullableString,
+        } => {
+            let value = mir::StringExpression::Intrinsic(Box::new(mir::StringIntrinsicCall {
+                kind: mir::StringIntrinsicKind::AssertionQuote,
+                args: vec![mir::Rvalue::String(
+                    mir::StringExpression::NullableLocalAssumeNonNull(source),
+                )],
+                result: mir::Type::String,
+                span,
+                argument_spans: vec![span],
+            }));
+            materialize_nullable_assertion_presentation(
+                local,
+                mir::BoolExpression::NullableStringCompare {
+                    op: mir::CompareOp::NotEqual,
+                    left: Box::new(mir::NullableStringExpression::Local(source)),
+                    right: Box::new(mir::NullableStringExpression::Null),
+                },
+                value,
+                context,
+            );
+            return Ok(local);
+        }
+        mir::AssertionOperandPlan::Local { local: source, ty }
+            if assertion_operand_can_be_null(ty) =>
+        {
+            let present = match_presence_condition(source, ty)?;
+            materialize_nullable_assertion_presentation(
+                local,
+                present,
+                mir::StringExpression::Literal(format!("<{type_name}>")),
+                context,
+            );
+            return Ok(local);
+        }
+        mir::AssertionOperandPlan::Local { .. } => {
+            mir::StringExpression::Literal(format!("<{type_name}>"))
+        }
+    };
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: mir::Rvalue::String(value),
+    });
+    Ok(local)
+}
+
+fn materialize_enum_assertion_presentation(
+    target: mir::LocalId,
+    source: mir::LocalId,
+    enum_id: crate::enums::EnumId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let definition = context
+        .semantic_info
+        .enums
+        .iter()
+        .find(|definition| definition.id == enum_id)
+        .ok_or_else(|| {
+            vec![Diagnostic::new(
+                "I7101",
+                "checked enum assertion operand has no enum definition",
+                Span::default(),
+            )]
+        })?;
+    let enum_name = definition.name.clone();
+    let cases = definition
+        .cases
+        .iter()
+        .map(|case| (case.id, case.name.clone()))
+        .collect::<Vec<_>>();
+    let continuation = context.create_block();
+
+    for (index, (case_id, case_name)) in cases.iter().enumerate() {
+        let selected = context.create_block();
+        let next = if index + 1 == cases.len() {
+            context.terminate_current(mir::Terminator::Jump(selected));
+            None
+        } else {
+            let next = context.create_block();
+            context.terminate_current(mir::Terminator::Branch {
+                condition: mir::BoolExpression::Compare {
+                    op: mir::CompareOp::Equal,
+                    left: Box::new(value_expression_from_operand(
+                        mir::ScalarType::Enum(enum_id),
+                        mir::Operand::Local(source),
+                    )),
+                    right: Box::new(value_expression_from_operand(
+                        mir::ScalarType::Enum(enum_id),
+                        mir::Operand::Scalar(mir::ScalarValue::Enum(crate::enums::EnumValue {
+                            enum_id,
+                            case_id: *case_id,
+                        })),
+                    )),
+                },
+                then_block: selected,
+                else_block: next,
+            });
+            Some(next)
+        };
+
+        context.current_block = Some(selected);
+        context.push_statement(mir::Statement::AssignLocal {
+            target,
+            value: mir::Rvalue::String(mir::StringExpression::Literal(format!(
+                "{enum_name}::{case_name}"
+            ))),
+        });
+        context.terminate_current(mir::Terminator::Jump(continuation));
+        context.current_block = next;
+    }
+
+    context.current_block = Some(continuation);
+    Ok(())
+}
+
+fn assertion_operand_can_be_null(ty: mir::Type) -> bool {
+    ty == mir::Type::Mixed || non_null_match_type(ty).1
+}
+
+fn materialize_nullable_assertion_presentation(
+    target: mir::LocalId,
+    present: mir::BoolExpression,
+    payload: mir::StringExpression,
+    context: &mut LoweringContext,
+) {
+    let payload_block = context.create_block();
+    let null_block = context.create_block();
+    let done = context.create_block();
+    context.terminate_current(mir::Terminator::Branch {
+        condition: present,
+        then_block: payload_block,
+        else_block: null_block,
+    });
+    context.current_block = Some(payload_block);
+    context.push_statement(mir::Statement::AssignLocal {
+        target,
+        value: mir::Rvalue::String(payload),
+    });
+    context.terminate_current(mir::Terminator::Jump(done));
+    context.current_block = Some(null_block);
+    context.push_statement(mir::Statement::AssignLocal {
+        target,
+        value: mir::Rvalue::String(mir::StringExpression::Literal("null".to_string())),
+    });
+    context.terminate_current(mir::Terminator::Jump(done));
+    context.current_block = Some(done);
 }
 
 fn lower_if_statement(
@@ -5503,6 +6282,7 @@ impl<'semantic> LoweringContext<'semantic> {
                             continue;
                         };
                         match plan {
+                            mir::ControlFlowPlan::Assertion(_) => {}
                             mir::ControlFlowPlan::When(plan) => {
                                 metrics.when_expression_count += 1;
                                 metrics.else_when_branch_count +=
@@ -10272,6 +11052,7 @@ fn string_intrinsic_signature(
 
     let (parameters, names, defaults, result) = match kind {
         Kind::GraphemeLength | Kind::ByteLength => (vec![string], vec!["text"], vec![None], int),
+        Kind::AssertionQuote => (vec![string], vec!["text"], vec![None], string),
         Kind::IsEmpty => (vec![string], vec!["text"], vec![None], bool_ty),
         Kind::ToBytes => (
             vec![string],
@@ -10409,6 +11190,7 @@ fn string_intrinsic_signature(
         receiver_mode: None,
         required_checked_effects: Vec::new(),
         ambient_checked_effects: Vec::new(),
+        test_assertion_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
     })
 }
@@ -10447,6 +11229,7 @@ const fn string_intrinsic_name(kind: mir::StringIntrinsicKind) -> &'static str {
         Kind::PadStart => "padStart",
         Kind::PadEnd => "padEnd",
         Kind::FromBytes => "fromBytes",
+        Kind::AssertionQuote => "<assertionQuote>",
     }
 }
 
@@ -10971,7 +11754,7 @@ fn lower_coalesce_rvalue(
     let absent_block = context.create_block();
     let merge_block = context.create_block();
     context.terminate_condition(
-        match_presence_condition(left_local, left_type, context)?,
+        match_presence_condition(left_local, left_type)?,
         present_block,
         absent_block,
     );
@@ -11452,7 +12235,7 @@ fn lower_match_pattern_to_blocks(
             context.terminate_current(mir::Terminator::Jump(arm_block));
         }
         ResolvedMatchPattern::Null => {
-            let present = match_presence_condition(scrutinee, scrutinee_type, context)?;
+            let present = match_presence_condition(scrutinee, scrutinee_type)?;
             context.terminate_condition(present, next_block, arm_block);
         }
         ResolvedMatchPattern::EnumCase { enum_id, case_id } => {
@@ -11507,7 +12290,7 @@ fn lower_match_pattern_to_blocks(
                     }),
                     tag: mixed_tag_for_type(narrowed, match_pattern_span(pattern))?,
                 },
-                _ => match_presence_condition(scrutinee, scrutinee_type, context)?,
+                _ => match_presence_condition(scrutinee, scrutinee_type)?,
             };
             context.terminate_condition(condition, arm_block, next_block);
         }
@@ -11533,7 +12316,7 @@ fn lower_match_constant_to_blocks(
     let (base, nullable) = non_null_match_type(scrutinee_type);
     if nullable {
         let compare_block = context.create_block();
-        let present = match_presence_condition(scrutinee, scrutinee_type, context)?;
+        let present = match_presence_condition(scrutinee, scrutinee_type)?;
         context.terminate_condition(present, compare_block, next_block);
         context.current_block = Some(compare_block);
     }
@@ -11628,7 +12411,6 @@ fn non_null_match_type(ty: mir::Type) -> (mir::Type, bool) {
 fn match_presence_condition(
     local: mir::LocalId,
     ty: mir::Type,
-    _context: &LoweringContext,
 ) -> DiagnosticResult<mir::BoolExpression> {
     let condition = match ty {
         mir::Type::NullableScalar(ty) => mir::BoolExpression::NullableScalarIsPresent(Box::new(
@@ -12364,6 +13146,30 @@ fn lower_condition(
                     } else {
                         equal
                     })
+                } else if let (mir::Type::Class(left_class), mir::Type::Class(right_class)) = (
+                    context.expression_type(left)?,
+                    context.expression_type(right)?,
+                ) {
+                    if left_class != right_class {
+                        return Err(vec![unsupported(
+                            expr.span(),
+                            "class identity comparison requires the same nominal class type",
+                        )]);
+                    }
+                    if !matches!(op, hir::BinaryOp::Equal | hir::BinaryOp::NotEqual) {
+                        return Err(vec![unsupported(
+                            expr.span(),
+                            "class values support only identity equality comparisons",
+                        )]);
+                    }
+                    let left = materialize_class_identity_operand(left, left_class, context)?;
+                    let right = materialize_class_identity_operand(right, right_class, context)?;
+                    Ok(mir::BoolExpression::ClassIdentityCompare {
+                        op: lower_compare_op(op),
+                        class: left_class,
+                        left,
+                        right,
+                    })
                 } else if matches!(
                     context.expression_type(left)?,
                     mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
@@ -12575,6 +13381,24 @@ fn lower_condition(
             "this expression cannot be used as a condition in native compilation",
         )]),
     }
+}
+
+fn materialize_class_identity_operand(
+    expression: &hir::Expr,
+    class: ClassId,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::LocalId> {
+    let value = lower_class_expression(expression, class, false, context)?;
+    let owned = value.owned_temporary_class().is_some();
+    let local = context.declare_checked_call_slot(mir::Type::Class(class), owned);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: mir::Rvalue::Class(value),
+    });
+    if owned {
+        context.track_statement_owned_local(local, mir::Type::Class(class));
+    }
+    Ok(local)
 }
 
 fn lower_null_comparison(
@@ -15305,6 +16129,7 @@ fn materialize_list_algorithm_call(
                 },
                 required_checked_effects: function.checked_effects.clone(),
                 ambient_checked_effects: function.ambient_checked_effects.clone(),
+                test_assertion_checked_effects: function.test_assertion_checked_effects.clone(),
                 checked_effects: function.complete_checked_effects(),
                 output,
                 accumulator,
@@ -15408,7 +16233,7 @@ fn materialize_checked_null_safe_signature_call(
     let absent = context.create_block();
     let merge = context.create_block();
     context.terminate_condition(
-        match_presence_condition(receiver, receiver_type, context)?,
+        match_presence_condition(receiver, receiver_type)?,
         present,
         absent,
     );
@@ -15867,6 +16692,7 @@ fn lower_payload_enum_expression(
                 receiver_mode: None,
                 required_checked_effects: Vec::new(),
                 ambient_checked_effects: Vec::new(),
+                test_assertion_checked_effects: Vec::new(),
                 checked_effects: Vec::new(),
             };
             let fields = lower_call_args_with_ownership(
@@ -16149,6 +16975,9 @@ fn lower_mixed_expression(
     transfer: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::MixedExpression> {
+    if context.expression_is_null(expr) {
+        return Ok(mir::MixedExpression::Null);
+    }
     if let Some(mir::Rvalue::Mixed(value)) =
         materialize_checked_rvalue(expr, mir::Type::Mixed, transfer, context)?
     {
@@ -17309,6 +18138,18 @@ fn materialize_nested_collection_places(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     match expr {
+        hir::Expr::Assertion(assertion) => {
+            for operand in [
+                assertion.actual.as_deref(),
+                assertion.expected.as_deref(),
+                assertion.user_message.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                materialize_nested_collection_places(operand, false, context)?;
+            }
+        }
         hir::Expr::Closure(_) | hir::Expr::CallableCall(_) => {}
         hir::Expr::ListAlgorithmCall(call) => {
             materialize_nested_collection_places(&call.receiver, false, context)?;
@@ -22380,6 +23221,7 @@ fn unsigned_integer_literal_magnitude(expr: &hir::Expr) -> Option<u128> {
 
 fn unsupported_int_expr(expr: &hir::Expr) -> Diagnostic {
     let detail = match expr {
+        hir::Expr::Assertion(_) => "an assertion does not produce an integer value",
         hir::Expr::Closure(_) => "a closure value cannot be used as an integer expression",
         hir::Expr::CallableCall(_) => {
             "this callable result cannot be used as an integer expression in this lowering path"

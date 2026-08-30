@@ -1189,6 +1189,7 @@ fn execute_native_output(
     let status = Command::new(&temp_path)
         .env("DORIA_RUNTIME_OUTCOME_V2", &outcome_path)
         .env("DORIA_RUNTIME_OUTCOME_V3", &outcome_path)
+        .env("DORIA_RUNTIME_OUTCOME_V4", &outcome_path)
         .args(program_args)
         .status()
         .map_err(|error| {
@@ -1204,6 +1205,9 @@ fn execute_native_output(
 }
 
 fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnostic, CliError> {
+    if payload.starts_with(b"DORIAO4\0") {
+        return decode_runtime_assertion_outcome(payload, source_path);
+    }
     if payload.starts_with(b"DORIAO3\0") {
         return decode_runtime_error_outcome(payload, source_path);
     }
@@ -1391,6 +1395,223 @@ fn decode_runtime_outcome(payload: &[u8], source_path: &str) -> Result<Diagnosti
         diagnostic.notes.push(message);
     }
     Ok(diagnostic)
+}
+
+fn decode_runtime_assertion_outcome(
+    payload: &[u8],
+    source_path: &str,
+) -> Result<Diagnostic, CliError> {
+    const ASSERTION_ERROR: &str = "Doria\\Std\\Test\\AssertionError";
+    let mut decoder = RuntimeOutcomeDecoder::new(payload);
+    if decoder.take(8)? != b"DORIAO4\0" || decoder.u16()? != 4 {
+        return Err("native program returned an unsupported runtime assertion record".into());
+    }
+    let error_type_length = decoder.u32()? as usize;
+    if decoder.u32()? != 70 || decoder.byte()? != 1 {
+        return Err("native program returned an invalid assertion termination contract".into());
+    }
+    let matcher_length = decoder.u32()? as usize;
+    let flag = |decoder: &mut RuntimeOutcomeDecoder<'_>| -> Result<bool, CliError> {
+        match decoder.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err("native program returned an invalid assertion presence flag".into()),
+        }
+    };
+    let negated = flag(&mut decoder)?;
+    let actual_present = flag(&mut decoder)?;
+    let actual_type_length = decoder.u32()? as usize;
+    let actual_presentation_length = decoder.u32()? as usize;
+    let expected_present = flag(&mut decoder)?;
+    let expected_type_length = decoder.u32()? as usize;
+    let expected_presentation_length = decoder.u32()? as usize;
+    let difference_present = flag(&mut decoder)?;
+    let difference_length = decoder.u32()? as usize;
+    let user_message_present = flag(&mut decoder)?;
+    let user_message_length = decoder.u32()? as usize;
+    let path_length = decoder.u32()? as usize;
+    let source_length = decoder.u32()? as usize;
+    let function_length = decoder.u32()? as usize;
+    let origin_known = flag(&mut decoder)?;
+    let span = Span::new(decoder.u64()? as usize, decoder.u64()? as usize);
+    let frame_count = usize::from(decoder.u16()?);
+    if error_type_length > 4096
+        || matcher_length > 64
+        || actual_type_length > 4096
+        || actual_presentation_length > doriac::assertions::PRESENTATION_LIMIT
+        || expected_type_length > 4096
+        || expected_presentation_length > doriac::assertions::PRESENTATION_LIMIT
+        || difference_length > doriac::assertions::PRESENTATION_LIMIT
+        || user_message_length > 64 * 1024
+        || path_length > 4096
+        || source_length > 4 * 1024 * 1024
+        || function_length > 1024
+        || frame_count > 128
+    {
+        return Err("native program returned an oversized runtime assertion record".into());
+    }
+    if (!actual_present && (actual_type_length != 0 || actual_presentation_length != 0))
+        || (!expected_present && (expected_type_length != 0 || expected_presentation_length != 0))
+        || (!difference_present && difference_length != 0)
+        || (!user_message_present && user_message_length != 0)
+    {
+        return Err("native program returned values for absent assertion facts".into());
+    }
+
+    let error_type = decoder.text(error_type_length)?;
+    let matcher_name = decoder.text(matcher_length)?;
+    let actual_type = decoder.text(actual_type_length)?;
+    let actual_presentation = decoder.text(actual_presentation_length)?;
+    let expected_type = decoder.text(expected_type_length)?;
+    let expected_presentation = decoder.text(expected_presentation_length)?;
+    let difference = decoder.text(difference_length)?;
+    let user_message = decoder.text(user_message_length)?;
+    if error_type != ASSERTION_ERROR || difference_present || !difference.is_empty() {
+        return Err("native program returned an invalid Slice-2 assertion identity".into());
+    }
+    let matcher = doriac::assertions::matcher_from_fact_name(&matcher_name)
+        .ok_or_else(|| "native program returned an unknown assertion matcher".to_string())?;
+    use doriac::assertions::AssertionMatcher as Matcher;
+    match matcher {
+        Matcher::Fail if negated || actual_present || expected_present || !user_message_present => {
+            return Err("native program returned malformed explicit-failure facts".into());
+        }
+        Matcher::Null
+            if !expected_present || expected_type != "null" || expected_presentation != "null" =>
+        {
+            return Err("native program returned malformed null-expectation facts".into());
+        }
+        Matcher::True
+            if !expected_present || expected_type != "bool" || expected_presentation != "true" =>
+        {
+            return Err("native program returned malformed true-expectation facts".into());
+        }
+        Matcher::False
+            if !expected_present || expected_type != "bool" || expected_presentation != "false" =>
+        {
+            return Err("native program returned malformed false-expectation facts".into());
+        }
+        Matcher::StringEmpty
+            if !expected_present
+                || expected_type != "string"
+                || expected_presentation != "\"\"" =>
+        {
+            return Err("native program returned malformed empty-string expectation facts".into());
+        }
+        Matcher::Fail => {}
+        _ if !actual_present => {
+            return Err("native program returned an expectation without an actual value".into());
+        }
+        _ => {}
+    }
+
+    let (record_path, function) = if origin_known {
+        let path = decoder.text(path_length)?;
+        let _embedded_source = decoder.text(source_length)?;
+        let function = decoder.text(function_length)?;
+        (path, Some(function))
+    } else {
+        if path_length != 0
+            || source_length != 0
+            || function_length != 0
+            || span != Span::default()
+            || frame_count != 0
+        {
+            return Err("native program returned facts for an unavailable assertion origin".into());
+        }
+        (String::new(), None)
+    };
+    let mut frames = Vec::with_capacity(frame_count);
+    for _ in 0..frame_count {
+        let frame_function_length = usize::from(decoder.u16()?);
+        let frame_path_length = decoder.u32()? as usize;
+        let frame_span = Span::new(decoder.u64()? as usize, decoder.u64()? as usize);
+        if frame_function_length > 1024 || frame_path_length > 4096 {
+            return Err("native program returned an oversized assertion frame".into());
+        }
+        frames.push(RuntimeOutcomeFrame {
+            function: decoder.text(frame_function_length)?,
+            source: diagnostic_source(&decoder.text(frame_path_length)?, source_path),
+            span: frame_span,
+        });
+    }
+    if !decoder.is_empty() {
+        return Err("native program returned trailing runtime assertion bytes".into());
+    }
+
+    let facts = vec![
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_MATCHER_FACT.to_string(),
+            value: RuntimeFactValue::StaticString(matcher_name),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_NEGATED_FACT.to_string(),
+            value: RuntimeFactValue::Boolean(negated),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_ACTUAL_PRESENT_FACT.to_string(),
+            value: RuntimeFactValue::Boolean(actual_present),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_ACTUAL_TYPE_FACT.to_string(),
+            value: RuntimeFactValue::StaticString(actual_type),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_ACTUAL_PRESENTATION_FACT.to_string(),
+            value: RuntimeFactValue::StaticString(actual_presentation),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_EXPECTED_PRESENT_FACT.to_string(),
+            value: RuntimeFactValue::Boolean(expected_present),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_EXPECTED_TYPE_FACT.to_string(),
+            value: RuntimeFactValue::StaticString(expected_type),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_EXPECTED_PRESENTATION_FACT.to_string(),
+            value: RuntimeFactValue::StaticString(expected_presentation),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_DIFFERENCE_PRESENT_FACT.to_string(),
+            value: RuntimeFactValue::Boolean(false),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_DIFFERENCE_FACT.to_string(),
+            value: RuntimeFactValue::StaticString(difference),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_USER_MESSAGE_PRESENT_FACT.to_string(),
+            value: RuntimeFactValue::Boolean(user_message_present),
+        },
+        RuntimeFact {
+            name: doria_diagnostic_catalogue::ASSERTION_USER_MESSAGE_FACT.to_string(),
+            value: RuntimeFactValue::StaticString(user_message.clone()),
+        },
+    ];
+    let source = if origin_known {
+        diagnostic_source(&record_path, source_path)
+    } else {
+        DiagnosticSource::Unavailable
+    };
+    let outcome = RuntimeOutcomeDetails {
+        process_status: 70,
+        termination_behavior: TerminationBehavior::PropagateWithCleanup,
+        origin: RuntimeOutcomeOrigin {
+            source,
+            span,
+            function,
+        },
+        path: frames,
+        facts,
+        error_type: Some(error_type),
+    };
+    let message = if user_message_present {
+        user_message
+    } else {
+        doriac::assertions::stable_message(matcher, negated).to_string()
+    };
+    Ok(Diagnostic::runtime_assertion(message, span, outcome))
 }
 
 fn decode_runtime_error_outcome(payload: &[u8], source_path: &str) -> Result<Diagnostic, CliError> {
@@ -1675,6 +1896,59 @@ mod tests {
         bytes
     }
 
+    fn assertion_record(
+        matcher: &str,
+        negated: bool,
+        actual: Option<(&str, &str)>,
+        expected: Option<(&str, &str)>,
+        user_message: Option<&str>,
+    ) -> Vec<u8> {
+        let error_type = "Doria\\Std\\Test\\AssertionError";
+        let path = "main.doria";
+        let source = "function main(): void {}\n";
+        let function = "main";
+        let (actual_type, actual_presentation) = actual.unwrap_or_default();
+        let (expected_type, expected_presentation) = expected.unwrap_or_default();
+        let user_message_present = user_message.is_some();
+        let user_message = user_message.unwrap_or_default();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"DORIAO4\0");
+        bytes.extend_from_slice(&4_u16.to_le_bytes());
+        bytes.extend_from_slice(&(error_type.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&70_u32.to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&(matcher.len() as u32).to_le_bytes());
+        bytes.push(u8::from(negated));
+        bytes.push(u8::from(actual.is_some()));
+        bytes.extend_from_slice(&(actual_type.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(actual_presentation.len() as u32).to_le_bytes());
+        bytes.push(u8::from(expected.is_some()));
+        bytes.extend_from_slice(&(expected_type.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(expected_presentation.len() as u32).to_le_bytes());
+        bytes.push(0);
+        bytes.extend_from_slice(&0_u32.to_le_bytes());
+        bytes.push(u8::from(user_message_present));
+        bytes.extend_from_slice(&(user_message.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(path.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(source.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&(function.len() as u32).to_le_bytes());
+        bytes.push(1);
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&8_u64.to_le_bytes());
+        bytes.extend_from_slice(&0_u16.to_le_bytes());
+        bytes.extend_from_slice(error_type.as_bytes());
+        bytes.extend_from_slice(matcher.as_bytes());
+        bytes.extend_from_slice(actual_type.as_bytes());
+        bytes.extend_from_slice(actual_presentation.as_bytes());
+        bytes.extend_from_slice(expected_type.as_bytes());
+        bytes.extend_from_slice(expected_presentation.as_bytes());
+        bytes.extend_from_slice(user_message.as_bytes());
+        bytes.extend_from_slice(path.as_bytes());
+        bytes.extend_from_slice(source.as_bytes());
+        bytes.extend_from_slice(function.as_bytes());
+        bytes
+    }
+
     fn decode_error(payload: &[u8]) -> String {
         match decode_runtime_outcome(payload, "main.doria") {
             Err(CliError::Message(message)) => message,
@@ -1753,5 +2027,53 @@ mod tests {
             runtime_record("P1501", &[("conflictReason", 4, 0, "Unknown Conflict")]);
         assert!(decode_error(&unknown_conflict_reason)
             .contains("invalid shared-access conflict reason"));
+    }
+
+    #[test]
+    fn runtime_assertion_transport_is_strict_and_catalogued() {
+        let payload = assertion_record(
+            "Equal",
+            false,
+            Some(("int", "41")),
+            Some(("int", "42")),
+            None,
+        );
+        let diagnostic = decode_runtime_outcome(&payload, "main.doria").expect("valid V4 record");
+        assert_eq!(diagnostic.code, "R1001");
+        assert_eq!(
+            diagnostic.kind,
+            doriac::diagnostics::DiagnosticKind::RuntimeAssertion
+        );
+        let outcome = diagnostic
+            .runtime_outcome
+            .as_ref()
+            .expect("runtime assertion outcome");
+        assert_eq!(outcome.process_status, 70);
+        assert_eq!(
+            outcome.termination_behavior,
+            TerminationBehavior::PropagateWithCleanup
+        );
+        assert_eq!(outcome.facts.len(), 12);
+        assert!(outcome.facts.iter().map(|fact| fact.name.as_str()).eq(
+            doria_diagnostic_catalogue::ASSERTION_FACT_NAMES
+                .iter()
+                .copied()
+        ));
+
+        let mut invalid_flag = payload.clone();
+        invalid_flag[23] = 2;
+        assert!(decode_error(&invalid_flag).contains("invalid assertion presence flag"));
+
+        let mut trailing = payload.clone();
+        trailing.push(0);
+        assert!(decode_error(&trailing).contains("trailing runtime assertion bytes"));
+
+        let mut oversized = payload.clone();
+        oversized[29..33].copy_from_slice(&4097_u32.to_le_bytes());
+        assert!(decode_error(&oversized).contains("oversized runtime assertion record"));
+
+        let mut difference = payload;
+        difference[42] = 1;
+        assert!(decode_error(&difference).contains("invalid Slice-2 assertion identity"));
     }
 }

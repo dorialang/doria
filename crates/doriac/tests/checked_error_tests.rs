@@ -28,6 +28,21 @@ fn assert_code(source: &str, code: &str) {
     );
 }
 
+#[test]
+fn unresolved_catch_types_remain_diagnostics_during_ownership_recovery() {
+    let diagnostics = doriac::check_source(
+        "unresolved_catch.doria",
+        "function helper(): void { try {} catch (MissingError $error) {} }",
+    )
+    .expect_err("an unresolved catch type must be rejected");
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0401"),
+        "{diagnostics:#?}"
+    );
+}
+
 fn collect_doria_sources(root: &Path, sources: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(root)
         .unwrap_or_else(|error| panic!("failed to read {}: {error}", root.display()))

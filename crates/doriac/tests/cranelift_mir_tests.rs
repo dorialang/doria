@@ -412,6 +412,7 @@ fn rejects_mixed_width_float_binary_operands() {
         return_borrow: None,
         required_checked_effects: Vec::new(),
         ambient_checked_effects: Vec::new(),
+        test_assertion_checked_effects: Vec::new(),
         checked_effects: Vec::new(),
         locals: Vec::new(),
         blocks: vec![BasicBlock {
@@ -479,6 +480,7 @@ fn void_program() -> Program {
             return_borrow: None,
             required_checked_effects: Vec::new(),
             ambient_checked_effects: Vec::new(),
+            test_assertion_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: Vec::new(),
             blocks: vec![BasicBlock {

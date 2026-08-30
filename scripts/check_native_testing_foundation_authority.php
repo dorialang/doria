@@ -5,8 +5,17 @@ declare(strict_types=1);
 $root = dirname(__DIR__);
 $decisionPath = $root . '/docs/decisions/0129-native-testing-foundation-behavioral-dsl-expectations-and-assertion-outcomes.md';
 $referencePath = $root . '/docs/native-testing-foundation.md';
+$statusPaths = [
+    $root . '/SPEC.md',
+    $root . '/docs/doria-end-to-end-plan.md',
+    $root . '/docs/stdlib-reference.md',
+    $root . '/docs/self-hosting.md',
+    $root . '/docs/notes/current-pipeline.md',
+    $root . '/docs/notes/plan-open-questions-audit.md',
+    $root . '/docs/notes/temporary-language-restrictions-audit.md',
+];
 
-foreach ([$decisionPath, $referencePath] as $path) {
+foreach ([$decisionPath, $referencePath, ...$statusPaths] as $path) {
     if (!is_file($path)) {
         fwrite(STDERR, "Missing native testing authority file: {$path}\n");
         exit(1);
@@ -15,6 +24,16 @@ foreach ([$decisionPath, $referencePath] as $path) {
 
 $decision = file_get_contents($decisionPath);
 $reference = file_get_contents($referencePath);
+$status = '';
+
+foreach ($statusPaths as $path) {
+    $text = file_get_contents($path);
+    if ($text === false) {
+        fwrite(STDERR, "Unable to read native testing status file: {$path}\n");
+        exit(1);
+    }
+    $status .= "\n" . $text;
+}
 
 if ($decision === false || $reference === false) {
     fwrite(STDERR, "Unable to read native testing authority files.\n");
@@ -24,9 +43,10 @@ if ($decision === false || $reference === false) {
 $requiredDecisionFacts = [
     '# Decision 0129: Native Testing Foundation, Behavioral DSL, Fluent Expectations, And Assertion Outcomes',
     '**Status:** Accepted',
-    '**Implementation Status:** Slice 1 Implemented; Slice 2 Next; Foundation In Progress',
+    '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Next; Foundation In Progress',
     'Native Testing Foundation Slice 1 - Complete',
-    'Native Testing Foundation Slice 2 - Next',
+    'Native Testing Foundation Slice 2 - Complete',
+    'Native Testing Foundation Slice 3 - Next',
     'Native Testing Foundation - In Progress, Not Complete',
     'Slice 1 - Behavioral Test DSL And Unified Compiler Metadata',
     'Slice 2 - Fluent Expectation Kernel And Assertion Semantics',
@@ -48,7 +68,8 @@ $requiredDecisionFacts = [
 
 $requiredReferenceFacts = [
     'Native Testing Foundation Slice 1 - Complete',
-    'Native Testing Foundation Slice 2 - Next',
+    'Native Testing Foundation Slice 2 - Complete',
+    'Native Testing Foundation Slice 3 - Next',
     'Native Testing Foundation - In Progress, Not Complete',
     'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
     'describe("Shopping Cart"',
@@ -58,7 +79,8 @@ $requiredReferenceFacts = [
     'Schema version 3 adds:',
     'no runtime suite registry',
     'no source parsing in Baton',
-    '`expect(...)` in this document is accepted future surface',
+    'Baton regression integration',
+    'Slice 3 owns collection/Error expectations',
     'beforeEach / afterEach',
     'They are deferred, not permanently rejected.',
 ];
@@ -80,10 +102,14 @@ $forbidden = [
     'Baton parses Doria source',
     'runtime suite registry: required',
     'Nested testing hooks are permanently rejected',
+    'Compiler/Runtime Implemented, Baton/Tooling Pending',
+    'Baton/tooling coordination remains pending',
+    'Slice 2 is next',
+    'Slice 2 — Next',
 ];
 
 foreach ($forbidden as $fact) {
-    if (str_contains($decision, $fact) || str_contains($reference, $fact)) {
+    if (str_contains($decision, $fact) || str_contains($reference, $fact) || str_contains($status, $fact)) {
         $missing[] = "forbidden wording: {$fact}";
     }
 }

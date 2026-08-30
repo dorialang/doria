@@ -1,8 +1,10 @@
 use crate::ast::{Block, ElseBranch, FunctionDecl, Stmt};
 use crate::control_flow::{
-    build_function_cfg, build_function_cfg_with_given, ControlFlowGraph, GivenSemanticInfoMap, Node,
+    build_function_cfg, build_function_cfg_with_given, build_function_cfg_with_given_and_terminals,
+    ControlFlowGraph, GivenSemanticInfoMap, Node,
 };
 use crate::dataflow::{solve_forward, ForwardAnalysis};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReturnAnalysis {
@@ -33,6 +35,20 @@ pub fn analyze_block_with_given(
 ) -> ReturnAnalysis {
     let graph = build_function_cfg_with_given(block, owner_span, given_preludes);
     analyze_graph(graph)
+}
+
+pub fn analyze_block_with_given_and_terminals(
+    block: &Block,
+    owner_span: crate::source::Span,
+    given_preludes: &GivenSemanticInfoMap,
+    terminal_expression_spans: &HashSet<crate::source::Span>,
+) -> ReturnAnalysis {
+    analyze_graph(build_function_cfg_with_given_and_terminals(
+        block,
+        owner_span,
+        given_preludes,
+        terminal_expression_spans,
+    ))
 }
 
 fn analyze_graph(graph: ControlFlowGraph) -> ReturnAnalysis {

@@ -33,9 +33,10 @@ foreach ($files as $key => $relative) {
 $required = [
     'decision' => [
         '**Status:** Accepted',
-        '**Implementation Status:** Slice 1 Implemented; Slice 2 Next; Foundation In Progress',
+        '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Next; Foundation In Progress',
         'Native Testing Foundation Slice 1 - Complete',
-        'Native Testing Foundation Slice 2 - Next',
+        'Native Testing Foundation Slice 2 - Complete',
+        'Native Testing Foundation Slice 3 - Next',
         'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
         'no runtime registration',
         'no Baton source parsing',
@@ -44,7 +45,8 @@ $required = [
         'Stage 33 - Complete',
         'Phase F - Complete',
         'Native Testing Foundation - In Progress, Not Complete',
-        '`expect(...)` in this document is accepted future surface',
+        'Baton regression integration',
+        'Slice 3 owns collection/Error expectations',
     ],
     'identity' => [
         'CompilerSymbolIdentity::StandardTest',
@@ -52,8 +54,8 @@ $required = [
         'pub const IT:',
         'pub const TEST:',
         'pub const DECLARATIONS: [&str; 3] = [DESCRIBE, IT, TEST]',
-        'FUTURE_MEMBERS',
-        '[EXPECT, FAIL, ASSERTION_ERROR]',
+        'FUTURE_MEMBERS: [&str; 0]',
+        'IMPLEMENTED_MEMBERS: [&str; 6]',
     ],
     'names' => [
         'GlobalSymbolKind::CompilerKnownTestDeclaration',
@@ -70,7 +72,6 @@ $required = [
         'generated_function_spans',
         'evaluate_string_expression',
         '__doria_test_',
-        'E0710',
     ],
     'graph' => [
         'elaborate_source',
@@ -98,7 +99,7 @@ $required = [
         'generated_development_sources_are_accepted_but_main_sources_are_not',
         'user_functions_with_test_like_short_names_remain_ordinary',
         'behavioral_declarations_elaborate_into_unified_metadata_and_hir',
-        'future_test_type_has_one_slice_two_boundary',
+        'slice_two_matchers_evaluate_once_in_order_and_execute_on_every_backend',
     ],
 ];
 
@@ -123,11 +124,9 @@ foreach (['name == "describe"', 'name == "it"', 'name == "test"'] as $rawMatch) 
     }
 }
 
-foreach (['effects', 'semantics', 'mir', 'runtime'] as $key) {
-    foreach (['TestAssertion', 'AssertionError'] as $futureRuntimeIdentity) {
-        if (str_contains($contents[$key], $futureRuntimeIdentity)) {
-            $failures[] = "{$files[$key]}: Slice 2 identity is executable too early `{$futureRuntimeIdentity}`";
-        }
+foreach (['testing', 'effects', 'semantics', 'mir', 'runtime'] as $key) {
+    if (str_contains($contents[$key], 'E0710')) {
+        $failures[] = "{$files[$key]}: historical E0710 still has a live compiler/runtime route";
     }
 }
 

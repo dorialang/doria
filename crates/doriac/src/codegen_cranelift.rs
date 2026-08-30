@@ -51,20 +51,20 @@ use crate::native_abi::{
     MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID,
     NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
     READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD,
-    SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_BYTE_LENGTH, STRING_COMPARE,
-    STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES,
-    STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE,
-    STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64,
-    STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF,
-    STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF,
-    STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END,
-    STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE,
-    STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM,
-    STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR,
-    STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
-    WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS, WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK,
-    WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
-    WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
+    SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_ASSERTION_QUOTE, STRING_BYTE_LENGTH,
+    STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE,
+    STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE,
+    STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32,
+    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH,
+    STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN,
+    STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST,
+    STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN,
+    STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE,
+    STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER,
+    STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE,
+    WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS, WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS,
+    WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK, WRITABLE_SHARED_READONLY_PAYLOAD,
+    WRITABLE_SHARED_RELEASE, WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
     WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_RETAIN,
     WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES,
     WRITE_STDOUT_BYTES,
@@ -637,6 +637,40 @@ fn define_static_data(
         let drop_id = *class_drop_function_ids
             .get(descriptor.class.0)
             .ok_or_else(|| malformed_mir("Error class drop glue was not declared"))?;
+        let assertion_offsets_id = descriptor
+            .assertion
+            .as_ref()
+            .map(|assertion| {
+                let offsets_id = module
+                    .declare_data(
+                        &format!("{symbol}_assertion_offsets"),
+                        Linkage::Local,
+                        false,
+                        false,
+                    )
+                    .map_err(|error| backend_failure(error.to_string()))?;
+                let mut offsets = DataDescription::new();
+                offsets.set_align(pointer_bytes as u64);
+                let mut bytes = Vec::with_capacity(pointer_bytes * assertion.fact_properties.len());
+                for property in assertion.fact_properties {
+                    let offset = class
+                        .layout
+                        .properties
+                        .iter()
+                        .find(|layout| layout.id == property)
+                        .ok_or_else(|| {
+                            malformed_mir("AssertionError fact property has no class layout")
+                        })?
+                        .offset;
+                    append_target_word(&mut bytes, u64::from(offset), pointer_bytes);
+                }
+                offsets.define(bytes.into_boxed_slice());
+                module
+                    .define_data(offsets_id, &offsets)
+                    .map_err(|error| backend_failure(error.to_string()))?;
+                Ok::<_, BackendError>(offsets_id)
+            })
+            .transpose()?;
         let id = module
             .declare_data(&symbol, Linkage::Local, false, false)
             .map_err(|error| backend_failure(error.to_string()))?;
@@ -656,12 +690,23 @@ fn define_static_data(
             pointer_bytes,
         );
         append_target_word(&mut bytes, 0, pointer_bytes);
-        append_target_word(&mut bytes, 0, pointer_bytes);
+        append_target_word(
+            &mut bytes,
+            descriptor
+                .assertion
+                .as_ref()
+                .map_or(0, |_| crate::native_abi::ASSERTION_ERROR_DESCRIPTOR_MAGIC),
+            pointer_bytes,
+        );
         description.define(bytes.into_boxed_slice());
         let type_name_reference = module.declare_data_in_data(type_name_id, &mut description);
         description.write_data_addr(0, type_name_reference, 0);
         let drop_reference = module.declare_func_in_data(drop_id, &mut description);
         description.write_function_addr((pointer_bytes * 3) as u32, drop_reference);
+        if let Some(offsets_id) = assertion_offsets_id {
+            let offsets_reference = module.declare_data_in_data(offsets_id, &mut description);
+            description.write_data_addr((pointer_bytes * 6) as u32, offsets_reference, 0);
+        }
         module
             .define_data(id, &description)
             .map_err(|error| backend_failure(error.to_string()))?;
@@ -12199,6 +12244,7 @@ fn lower_mixed_expression(
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     match expression {
+        mir::MixedExpression::Null => Ok(builder.ins().iconst(pointer, 0)),
         mir::MixedExpression::Local { local, transfer } => {
             let slot = local_slot(resources.local_slots, *local)?;
             let value =
@@ -14702,6 +14748,14 @@ fn lower_string_intrinsic_call(
             &[argument(0)?],
             resources,
         )?),
+        Kind::AssertionQuote => LoweredValue::Single(call_runtime(
+            builder,
+            STRING_ASSERTION_QUOTE,
+            &[pointer, pointer],
+            pointer,
+            &[resources.current_frame, argument(0)?],
+            resources,
+        )?),
         Kind::Trim
         | Kind::TrimStart
         | Kind::TrimEnd
@@ -15449,6 +15503,30 @@ fn lower_condition_to_branch(
                 mir::ScalarType::Bool => builder.ins().icmp(bool_compare_code(*op), left, right),
                 mir::ScalarType::Enum(_) => builder.ins().icmp(bool_compare_code(*op), left, right),
             };
+            builder.ins().brif(value, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::ClassIdentityCompare {
+            op, left, right, ..
+        } => {
+            let pointer = resources.module.target_config().pointer_type();
+            let left = builder.ins().stack_load(
+                pointer,
+                pointer,
+                local_slot(resources.local_slots, *left)?,
+                0,
+            );
+            let right = builder.ins().stack_load(
+                pointer,
+                pointer,
+                local_slot(resources.local_slots, *right)?,
+                0,
+            );
+            let code = match op {
+                mir::CompareOp::Equal => IntCC::Equal,
+                mir::CompareOp::NotEqual => IntCC::NotEqual,
+                _ => return Err(malformed_mir("ordered class identity comparison")),
+            };
+            let value = builder.ins().icmp(code, left, right);
             builder.ins().brif(value, then_block, &[], else_block, &[]);
         }
         mir::BoolExpression::StringCompare { op, left, right } => {

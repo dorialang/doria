@@ -204,6 +204,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
             return_borrow: None,
             required_checked_effects: Vec::new(),
             ambient_checked_effects: Vec::new(),
+            test_assertion_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: vec![Local {
                 id: LocalId(0),
@@ -899,6 +900,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
             return_borrow: None,
             required_checked_effects: Vec::new(),
             ambient_checked_effects: Vec::new(),
+            test_assertion_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: vec![Local {
                 id: LocalId(0),
@@ -1578,6 +1580,7 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
             return_borrow: None,
             required_checked_effects: Vec::new(),
             ambient_checked_effects: Vec::new(),
+            test_assertion_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: Vec::new(),
             blocks: vec![BasicBlock {
@@ -3075,6 +3078,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
             return_borrow: None,
             required_checked_effects: Vec::new(),
             ambient_checked_effects: Vec::new(),
+            test_assertion_checked_effects: Vec::new(),
             checked_effects: Vec::new(),
             locals: vec![Local {
                 id: LocalId(0),

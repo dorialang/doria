@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 const DORIA_TARGET_WARNING_BYTES = 15 * 1024 * 1024 * 1024;
 const DORIA_ARTIFACT_OWNER_FILE = '.doria-artifact-owner.json';
+const DORIA_CARGO_CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n"
+    . "# This file is a cache directory tag created by cargo.\n"
+    . "# For information about cache directory tags see https://bford.info/cachedir/\n";
 
 function doria_canonical_path(string $path, string $base): string
 {
@@ -75,6 +78,9 @@ function doria_prepare_managed_target(
                 "Cargo target belongs to another repository: {$recordedRepository}",
             );
         }
+        if ($writeOwner) {
+            doria_write_cargo_cache_tag($target);
+        }
 
         return $target;
     }
@@ -115,6 +121,18 @@ function doria_write_artifact_owner(string $target, string $repository): void
     );
     if (file_put_contents($ownerPath, $contents . "\n") === false) {
         throw new RuntimeException("could not write Cargo target ownership marker {$ownerPath}");
+    }
+    doria_write_cargo_cache_tag($target);
+}
+
+function doria_write_cargo_cache_tag(string $target): void
+{
+    $path = $target . DIRECTORY_SEPARATOR . 'CACHEDIR.TAG';
+    if (is_file($path) && file_get_contents($path) === DORIA_CARGO_CACHE_TAG) {
+        return;
+    }
+    if (file_put_contents($path, DORIA_CARGO_CACHE_TAG) === false) {
+        throw new RuntimeException("could not write Cargo cache tag {$path}");
     }
 }
 

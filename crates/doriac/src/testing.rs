@@ -171,7 +171,6 @@ pub fn elaborate_source(
             elaborator.elide_future_statement(statement);
         }
     }
-    elaborator.future_surface_diagnostics();
     let mut program = program.clone();
     program.items.retain(|item| match item {
         Item::Statement(statement) => !elaborator
@@ -537,35 +536,6 @@ impl Elaborator<'_> {
             declaration_span,
             authored_ordinal,
         });
-    }
-
-    fn future_surface_diagnostics(&mut self) {
-        let mut seen = HashSet::new();
-        for reference in &self.symbols.references {
-            if reference.source_identity != self.context.compilation.source
-                || matches!(
-                    reference.role,
-                    GlobalReferenceRole::ImportTarget | GlobalReferenceRole::ImportAliasUse
-                )
-                || !crate::compiler_known_test::is_future_member(
-                    &reference.symbol_id.qualified_name,
-                )
-                || !seen.insert(reference.source_span)
-            {
-                continue;
-            }
-            self.diagnostics.push(
-                Diagnostic::unsupported_stage(
-                    "E0710",
-                    format!(
-                        "`{}` awaits Native Testing Foundation Slice 2",
-                        reference.symbol_id.qualified_name
-                    ),
-                    reference.source_span,
-                )
-                .with_title("Expectation Kernel Awaits Native Testing Foundation Slice 2"),
-            );
-        }
     }
 
     fn next_ordinal(&mut self) -> usize {

@@ -13,7 +13,7 @@
   Stage 31 Slice 2 — Complete; Stage 31 — Complete; Stage 32 — Complete;
   Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Complete;
   Stage 33 Slice 3 — Complete; Stage 33 — Complete; Phase F — Complete;
-  Native Testing Foundation Slice 1 — Complete; Slice 2 — Next;
+  Native Testing Foundation Slices 1 And 2 — Complete; Slice 3 — Next;
   Stage 34 Single Class Inheritance — Blocked Until The Foundation Completes;
   E0641, E0671, And E0672 — Historical And Reserved
 - **Scope:** Package source discovery, file layout, compilation inputs, package
@@ -380,8 +380,8 @@ execution. Stage 31 Slice 2 implements the versioned build plan, complete
 package graph, package-wide visibility, strict source layout, include-once,
 multi-source diagnostics and lowering, backend execution, and in-memory
 incremental inputs. Stages 31 and 32 and all three Stage 33 slices are complete.
-Stage 33 and Phase F are complete. Native Testing Foundation Slice 1 is
-complete, Slice 2 is next, and Stage 34 waits for the foundation. The completed
+Stage 33 and Phase F are complete. Native Testing Foundation Slices 1 and 2 are
+complete, Slice 3 is next, and Stage 34 waits for the foundation. The completed
 Baton contract remains frozen in
 `dorialang/baton-php` rather than selecting Baton's permanent implementation
 language. The mandatory native transition remains separately scheduled before

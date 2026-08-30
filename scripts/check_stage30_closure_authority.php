@@ -138,7 +138,8 @@ function check_stage30_closure_authority(string $root): array
         'Stages 30a through 30h and Stage 30 are complete',
         'E0641 is historical and reserved',
         'Stages 31 through 33 and Phase F are complete',
-        'Native Testing Foundation Slice 1 is complete',
+        'Native Testing Foundation Slices 1 and 2 are complete',
+        'Slice 3 is',
         'Stage 34',
         'waits for the foundation',
     ]);
@@ -195,7 +196,8 @@ function check_stage30_closure_authority(string $root): array
         'Stage 33 — Complete',
         'Phase F — Complete',
         'Native Testing Foundation Slice 1 — Complete',
-        'Native Testing Foundation Slice 2 — Next',
+        'Native Testing Foundation Slice 2 — Complete',
+        'Native Testing Foundation Slice 3 — Next',
         'Stage 34 Single Class Inheritance — Blocked Until The Foundation Completes',
     ]);
     $forbid($pipelinePath, $pipeline, [

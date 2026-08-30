@@ -47,6 +47,23 @@ pub struct MixedBoxPlan {
     pub nullable_target: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertionSemanticInfo {
+    pub matcher: crate::assertions::AssertionMatcher,
+    pub negated: bool,
+    pub actual_type: Option<ResolvedType>,
+    pub expected_type: Option<ResolvedType>,
+    pub actual_span: Option<Span>,
+    pub expected_span: Option<Span>,
+    pub terminal_span: Span,
+    pub member_span: Span,
+    pub source: crate::names::SourceIdentity,
+    pub package: crate::names::PackageIdentity,
+    pub source_scope: crate::build_plan::SourceScope,
+    pub first_origin_span: Span,
+    pub checked_effect: ResolvedType,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SemanticInfo {
     /// Compiler inputs that own this semantic analysis. Namespace and package
@@ -64,6 +81,9 @@ pub struct SemanticInfo {
     /// Compiler-owned suites and unified test declarations. Runtime backends
     /// consume only the generated ordinary functions, never this metadata.
     pub test_semantics: crate::testing::TestSemanticFacts,
+    /// Fully checked terminal expectations and explicit failures. The
+    /// intermediate expectation chain has no public or runtime type.
+    pub assertions: HashMap<Span, AssertionSemanticInfo>,
     /// Fully resolved, type-checked, const-evaluated compiler metadata.
     /// Runtime lowering deliberately ignores this table.
     pub attributes: AttributeSemanticInfo,
@@ -195,6 +215,7 @@ pub struct FunctionTypeSemanticInfo {
     pub ty: ResolvedType,
     pub authored_checked_effects: Vec<ResolvedType>,
     pub ambient_checked_effects: Vec<ResolvedType>,
+    pub test_assertion_checked_effects: Vec<ResolvedType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -231,6 +252,7 @@ pub struct ClosureSemanticInfo {
     pub inferred_checked_effects: Vec<ResolvedType>,
     pub required_checked_effects: Vec<ResolvedType>,
     pub ambient_checked_effects: Vec<ResolvedType>,
+    pub test_assertion_checked_effects: Vec<ResolvedType>,
     pub inferred_return_type: ResolvedType,
     pub execution_boundary_span: Span,
 }
@@ -249,6 +271,7 @@ pub struct CallableValueCallInfo {
     pub checked_effects: Vec<ResolvedType>,
     pub required_checked_effects: Vec<ResolvedType>,
     pub ambient_checked_effects: Vec<ResolvedType>,
+    pub test_assertion_checked_effects: Vec<ResolvedType>,
     pub target_kind: CallableValueTargetKind,
 }
 
@@ -277,6 +300,7 @@ pub struct ListAlgorithmCallInfo {
     pub checked_effects: Vec<ResolvedType>,
     pub required_checked_effects: Vec<ResolvedType>,
     pub ambient_checked_effects: Vec<ResolvedType>,
+    pub test_assertion_checked_effects: Vec<ResolvedType>,
     pub source_span: Span,
     pub receiver_span: Span,
     pub callback_span: Span,
@@ -793,6 +817,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             source_semantic_contexts: checker.source_semantic_contexts,
             global_symbols: checker.global_symbols,
             test_semantics: checker.test_semantics,
+            assertions: checker.assertions,
             attributes: checker.attributes,
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
@@ -1472,6 +1497,7 @@ struct Checker<'program> {
         HashMap<crate::source::SourceId, crate::testing::SourceSemanticContext>,
     global_symbols: crate::names::GlobalSymbolFacts,
     test_semantics: crate::testing::TestSemanticFacts,
+    assertions: HashMap<Span, AssertionSemanticInfo>,
     classes: HashMap<String, ClassInfo>,
     enums: HashMap<String, EnumDefinition>,
     functions: HashMap<String, FunctionInfo>,
@@ -1531,6 +1557,7 @@ struct Checker<'program> {
     list_algorithm_calls: HashMap<Span, ListAlgorithmCallInfo>,
     property_writes: HashMap<Span, PropertyWriteSemanticInfo>,
     writable_object_paths: HashSet<Span>,
+    allow_terminal_assertion: bool,
     attributes: AttributeSemanticInfo,
     active_closures: Vec<ActiveClosure>,
     initializing_bindings: Vec<HashMap<String, Span>>,
@@ -2109,6 +2136,15 @@ enum DisplayConversionKind {
 }
 
 impl<'program> Checker<'program> {
+    fn terminal_assertion_spans(&self) -> HashSet<Span> {
+        self.assertions
+            .iter()
+            .filter_map(|(span, assertion)| {
+                (assertion.matcher == crate::assertions::AssertionMatcher::Fail).then_some(*span)
+            })
+            .collect()
+    }
+
     fn check_behavioral_arrow_bodies(&mut self) {
         let spans = self
             .test_semantics
@@ -2151,6 +2187,7 @@ impl<'program> Checker<'program> {
             source_semantic_contexts,
             global_symbols,
             test_semantics,
+            assertions: HashMap::new(),
             classes: HashMap::new(),
             enums: HashMap::new(),
             functions: HashMap::new(),
@@ -2209,6 +2246,7 @@ impl<'program> Checker<'program> {
             list_algorithm_calls: HashMap::new(),
             property_writes: HashMap::new(),
             writable_object_paths: HashSet::new(),
+            allow_terminal_assertion: false,
             attributes: AttributeSemanticInfo::default(),
             active_closures: Vec::new(),
             initializing_bindings: Vec::new(),
@@ -3033,8 +3071,7 @@ impl<'program> Checker<'program> {
         {
             let target = ambient.entry(*callable).or_default();
             for effect in effects {
-                if crate::checked_effects::is_ambient_io_effect(effect) && !target.contains(effect)
-                {
+                if crate::checked_effects::is_automatic_effect(effect) && !target.contains(effect) {
                     target.push(effect.clone());
                 }
             }
@@ -3073,8 +3110,7 @@ impl<'program> Checker<'program> {
         {
             let target = ambient.entry(*callable).or_default();
             for effect in effects {
-                if crate::checked_effects::is_ambient_io_effect(effect) && !target.contains(effect)
-                {
+                if crate::checked_effects::is_automatic_effect(effect) && !target.contains(effect) {
                     target.push(effect.clone());
                 }
             }
@@ -5386,7 +5422,7 @@ impl<'program> Checker<'program> {
         if !has_constructor {
             if let Some(effects) = self.class_initializer_effects.get(&class_decl.name) {
                 let required = effects.ordered.iter().any(|effect| {
-                    !crate::checked_effects::is_ambient_io_effect(&self.types.resolved(*effect))
+                    !crate::checked_effects::is_automatic_effect(&self.types.resolved(*effect))
                 });
                 if required {
                     self.diagnostics.push(
@@ -6074,8 +6110,13 @@ impl<'program> Checker<'program> {
             .iter()
             .copied()
             .filter(|effect| {
-                function.name == "__destruct"
-                    || !crate::checked_effects::is_ambient_io_effect(&self.types.resolved(*effect))
+                let resolved = self.types.resolved(*effect);
+                if crate::checked_effects::is_test_assertion_effect(&resolved) {
+                    false
+                } else {
+                    function.name == "__destruct"
+                        || !crate::checked_effects::is_ambient_io_effect(&resolved)
+                }
             })
             // The effective signature includes inferred ambient transport for
             // ABI lowering. Destructors still cannot let any checked Error
@@ -6149,7 +6190,7 @@ impl<'program> Checker<'program> {
         let required = effects
             .into_iter()
             .filter(|effect| {
-                !crate::checked_effects::is_ambient_io_effect(&self.types.resolved(*effect))
+                !crate::checked_effects::is_automatic_effect(&self.types.resolved(*effect))
             })
             .collect::<Vec<_>>();
         if required.is_empty() {
@@ -6482,15 +6523,20 @@ impl<'program> Checker<'program> {
                     );
                 }
             }
-            Stmt::Expr { expr, .. } => match expr {
-                Expr::FunctionCall { name, args, span } if name == "panic" => {
-                    for arg in args {
-                        self.check_expr(&arg.value, scopes, method_context);
+            Stmt::Expr { expr, .. } => {
+                let previous = self.allow_terminal_assertion;
+                self.allow_terminal_assertion = true;
+                match expr {
+                    Expr::FunctionCall { name, args, span } if name == "panic" => {
+                        for arg in args {
+                            self.check_expr(&arg.value, scopes, method_context);
+                        }
+                        self.check_panic_call(args, *span, scopes, method_context);
                     }
-                    self.check_panic_call(args, *span, scopes, method_context);
+                    _ => self.check_expr(expr, scopes, method_context),
                 }
-                _ => self.check_expr(expr, scopes, method_context),
-            },
+                self.allow_terminal_assertion = previous;
+            }
             Stmt::Return { expr, span } => {
                 if self.return_leaves_active_finalizer() {
                     if let Some(expr) = expr {
@@ -7887,8 +7933,13 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        if crate::return_analysis::analyze_with_given(function, &self.given_preludes)
-            .fallthrough_reachable
+        if crate::return_analysis::analyze_block_with_given_and_terminals(
+            &function.body,
+            function.span,
+            &self.given_preludes,
+            &self.terminal_assertion_spans(),
+        )
+        .fallthrough_reachable
         {
             self.report_missing_return_value(context, expected, function.span);
         }
@@ -8189,6 +8240,514 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn assertion_source_context(
+        &self,
+        span: Span,
+    ) -> Option<&crate::testing::SourceSemanticContext> {
+        self.source_semantic_contexts.get(&span.source)
+    }
+
+    fn contains_compiler_expect(expr: &Expr) -> bool {
+        match expr {
+            Expr::FunctionCall { name, .. } => name == crate::compiler_known_test::EXPECT,
+            Expr::PropertyAccess { object, .. }
+            | Expr::MethodCall { object, .. }
+            | Expr::Grouped { expr: object, .. } => Self::contains_compiler_expect(object),
+            _ => false,
+        }
+    }
+
+    fn check_test_module_scope(&mut self, span: Span) -> bool {
+        if self
+            .assertion_source_context(span)
+            .is_some_and(crate::testing::SourceSemanticContext::is_development)
+        {
+            return true;
+        }
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0712",
+                "Doria\\Std\\Test assertion APIs require development source",
+                span,
+            )
+            .with_title("Test Module Requires Development Source")
+            .with_help("move this code into a development source selected by the build plan"),
+        );
+        false
+    }
+
+    fn check_assertion_expression(
+        &mut self,
+        expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        if let Expr::FunctionCall { name, args, span } = expr {
+            if name == crate::compiler_known_test::FAIL {
+                self.check_fail_assertion(args, *span, scopes, method_context);
+                return true;
+            }
+            if name == crate::compiler_known_test::EXPECT {
+                if self.check_test_module_scope(*span)
+                    && self.check_expect_root_arguments(args, *span)
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0714",
+                            "expectation must end in a terminal matcher",
+                            *span,
+                        )
+                        .with_title("Expectation Must End In A Matcher"),
+                    );
+                }
+                return true;
+            }
+        }
+
+        let Expr::MethodCall {
+            object,
+            method,
+            member_span,
+            args,
+            null_safe,
+            span,
+            ..
+        } = expr
+        else {
+            if Self::contains_compiler_expect(expr) {
+                if self.check_test_module_scope(expr.span()) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0714",
+                            "expectation must end in a terminal matcher",
+                            expr.span(),
+                        )
+                        .with_title("Expectation Must End In A Matcher"),
+                    );
+                }
+                return true;
+            }
+            return false;
+        };
+
+        if !Self::contains_compiler_expect(object) {
+            return false;
+        }
+        if !self.check_test_module_scope(*span) {
+            return true;
+        }
+        if *null_safe {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0714",
+                    "an expectation matcher cannot use null-safe dispatch",
+                    *member_span,
+                )
+                .with_title("Expectation Must End In A Matcher"),
+            );
+            return true;
+        }
+        if method == "not" {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0716",
+                    "expectation negation is the `not` property, not a method",
+                    *member_span,
+                )
+                .with_title("Expectation Negation Is A Property")
+                .with_help("remove `()` and continue the chain through `->not`"),
+            );
+            return true;
+        }
+
+        let (base, negated) = match object.as_ref() {
+            Expr::FunctionCall { .. } => (object.as_ref(), false),
+            Expr::PropertyAccess {
+                object: base,
+                property,
+                null_safe,
+                member_span,
+                ..
+            } if property == "not" && !*null_safe => {
+                if matches!(base.as_ref(), Expr::PropertyAccess { property, .. } if property == "not")
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0716",
+                            "an expectation cannot be negated more than once",
+                            *member_span,
+                        )
+                        .with_title("Expectation Cannot Be Negated More Than Once"),
+                    );
+                    return true;
+                }
+                (base.as_ref(), true)
+            }
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0714",
+                        "expectation has an unsupported continuation before its matcher",
+                        *member_span,
+                    )
+                    .with_title("Expectation Must End In A Matcher"),
+                );
+                return true;
+            }
+        };
+        let Expr::FunctionCall {
+            name,
+            args: expect_args,
+            ..
+        } = base
+        else {
+            self.diagnostics.push(
+                Diagnostic::new("E0714", "malformed expectation chain", *span)
+                    .with_title("Expectation Must End In A Matcher"),
+            );
+            return true;
+        };
+        if name != crate::compiler_known_test::EXPECT {
+            return false;
+        }
+        if !self.check_expect_root_arguments(expect_args, base.span()) {
+            return true;
+        }
+        let Some(matcher) = crate::assertions::matcher_from_source_name(method) else {
+            let title = if crate::assertions::is_future_matcher(method) {
+                "Error Expectation Awaits Native Testing Foundation Slice 3"
+            } else {
+                "Expectation Matcher Is Unknown"
+            };
+            let code = if crate::assertions::is_future_matcher(method) {
+                "E0718"
+            } else {
+                "E0717"
+            };
+            self.diagnostics.push(
+                if code == "E0718" {
+                    Diagnostic::unsupported_stage(
+                        code,
+                        format!("expectation matcher `{method}` is reserved for Native Testing Foundation Slice 3"),
+                        *member_span,
+                    )
+                } else {
+                    Diagnostic::new(code, format!("unknown expectation matcher `{method}`"), *member_span)
+                }
+                .with_title(title),
+            );
+            return true;
+        };
+        if args.iter().any(|argument| argument.name.is_some()) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0717",
+                    "expectation matcher arguments must be positional",
+                    *span,
+                )
+                .with_title("Expectation Matcher Arguments Must Be Positional"),
+            );
+            return true;
+        }
+        if args.len() != matcher.expected_arity() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0717",
+                    format!(
+                        "{} expects {} argument(s), got {}",
+                        matcher.source_name(),
+                        matcher.expected_arity(),
+                        args.len()
+                    ),
+                    *span,
+                )
+                .with_title("Expectation Matcher Has Wrong Arity"),
+            );
+            return true;
+        }
+        if !self.allow_terminal_assertion {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0715",
+                    "an expectation is ephemeral and may only appear as a terminal statement",
+                    *span,
+                )
+                .with_title("Expectation Value Cannot Escape"),
+            );
+            return true;
+        }
+
+        let previous = self.allow_terminal_assertion;
+        self.allow_terminal_assertion = false;
+        let actual = &expect_args[0].value;
+        self.check_expr(actual, scopes, method_context);
+        let actual_ty = self.infer_expr_type(actual, scopes, method_context);
+        let expected = args.first().map(|argument| &argument.value);
+        if let Some(expected) = expected {
+            self.check_expr(expected, scopes, method_context);
+        }
+        self.allow_terminal_assertion = previous;
+
+        if self.is_void_type(actual_ty) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0715",
+                    "void cannot be used as an expectation value",
+                    actual.span(),
+                )
+                .with_title("Cannot Expect Void"),
+            );
+            return true;
+        }
+        let diagnostics_before_domain = self.diagnostics.len();
+        let expected_ty = expected.map(|value| self.infer_expr_type(value, scopes, method_context));
+        match matcher {
+            crate::assertions::AssertionMatcher::Equal => {
+                let expected = expected.expect("validated equality matcher arity");
+                self.check_mixed_binary_operands(
+                    actual,
+                    &BinaryOp::Equal,
+                    expected,
+                    *span,
+                    scopes,
+                    method_context,
+                );
+                self.check_binary_operands(
+                    actual,
+                    &BinaryOp::Equal,
+                    expected,
+                    *span,
+                    scopes,
+                    method_context,
+                );
+            }
+            crate::assertions::AssertionMatcher::Null => {
+                if !matches!(
+                    self.types.kind(actual_ty),
+                    TypeKind::Null | TypeKind::Nullable(_) | TypeKind::Mixed
+                ) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0720",
+                            format!(
+                                "toBeNull requires a nullable or mixed value, got `{}`",
+                                self.types.display(actual_ty)
+                            ),
+                            actual.span(),
+                        )
+                        .with_title("Null Expectation Requires Nullable Or Mixed"),
+                    );
+                }
+            }
+            crate::assertions::AssertionMatcher::True
+            | crate::assertions::AssertionMatcher::False => {
+                if !matches!(self.types.kind(actual_ty), TypeKind::Bool) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0720",
+                            format!(
+                                "{} requires bool, got `{}`",
+                                matcher.source_name(),
+                                self.types.display(actual_ty)
+                            ),
+                            actual.span(),
+                        )
+                        .with_title("Boolean Expectation Requires Bool"),
+                    );
+                }
+            }
+            matcher if matcher.is_ordered() => {
+                let expected = expected.expect("validated ordered matcher arity");
+                let op = match matcher {
+                    crate::assertions::AssertionMatcher::GreaterThan => BinaryOp::Greater,
+                    crate::assertions::AssertionMatcher::GreaterThanOrEqual => {
+                        BinaryOp::GreaterEqual
+                    }
+                    crate::assertions::AssertionMatcher::LessThan => BinaryOp::Less,
+                    crate::assertions::AssertionMatcher::LessThanOrEqual => BinaryOp::LessEqual,
+                    _ => unreachable!(),
+                };
+                self.check_mixed_binary_operands(
+                    actual,
+                    &op,
+                    expected,
+                    *span,
+                    scopes,
+                    method_context,
+                );
+                self.check_binary_operands(actual, &op, expected, *span, scopes, method_context);
+            }
+            matcher if matcher.is_string() => {
+                if self.is_runtime_collection_type(actual_ty) {
+                    self.diagnostics.push(
+                        Diagnostic::unsupported_stage(
+                            "E0718",
+                            format!(
+                                "collection matcher `{}` awaits Native Testing Foundation Slice 3",
+                                matcher.source_name()
+                            ),
+                            actual.span(),
+                        )
+                        .with_title(
+                            "Collection Expectation Awaits Native Testing Foundation Slice 3",
+                        ),
+                    );
+                } else if !matches!(self.types.kind(actual_ty), TypeKind::String)
+                    || expected_ty
+                        .is_some_and(|ty| !matches!(self.types.kind(ty), TypeKind::String))
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0720",
+                            format!("{} requires string operands", matcher.source_name()),
+                            *span,
+                        )
+                        .with_title("String Expectation Requires String"),
+                    );
+                }
+            }
+            _ => unreachable!("fail is not a terminal matcher method"),
+        }
+        if self.diagnostics.len() != diagnostics_before_domain {
+            return true;
+        }
+
+        let checked_effect_id =
+            self.symbolic_class_type(crate::compiler_known_test::ASSERTION_ERROR);
+        let checked_effect = self.types.resolved(checked_effect_id);
+        self.record_checked_effects([checked_effect_id], *span);
+        let source_context = self
+            .assertion_source_context(*span)
+            .cloned()
+            .expect("checked assertion source has semantic context");
+        self.assertions.insert(
+            *span,
+            AssertionSemanticInfo {
+                matcher,
+                negated,
+                actual_type: Some(self.types.resolved(actual_ty)),
+                expected_type: expected_ty.map(|ty| self.types.resolved(ty)),
+                actual_span: Some(actual.span()),
+                expected_span: expected.map(Expr::span),
+                terminal_span: *span,
+                member_span: *member_span,
+                source: source_context.compilation.source,
+                package: source_context.compilation.package,
+                source_scope: source_context.scope,
+                first_origin_span: *span,
+                checked_effect,
+            },
+        );
+        self.expression_types.insert(*span, ResolvedType::Void);
+        true
+    }
+
+    fn check_expect_root_arguments(&mut self, args: &[Argument], span: Span) -> bool {
+        if args.len() != 1 {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0713",
+                    format!("expect requires exactly one argument, got {}", args.len()),
+                    span,
+                )
+                .with_title("Expectation Requires One Argument"),
+            );
+            return false;
+        }
+        if args[0].name.is_some() {
+            self.diagnostics.push(
+                Diagnostic::new("E0713", "expect arguments must be positional", args[0].span)
+                    .with_title("Expectation Arguments Must Be Positional"),
+            );
+            return false;
+        }
+        true
+    }
+
+    fn check_fail_assertion(
+        &mut self,
+        args: &[Argument],
+        span: Span,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        if !self.check_test_module_scope(span) {
+            return;
+        }
+        if args.len() != 1 {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0717",
+                    format!("fail expects exactly one argument, got {}", args.len()),
+                    span,
+                )
+                .with_title("Expectation Matcher Has Wrong Arity"),
+            );
+            return;
+        }
+        if args[0].name.is_some() {
+            self.diagnostics.push(
+                Diagnostic::new("E0717", "fail argument must be positional", args[0].span)
+                    .with_title("Expectation Matcher Arguments Must Be Positional"),
+            );
+            return;
+        }
+        if !self.allow_terminal_assertion {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0715",
+                    "fail may only appear as a terminating statement",
+                    span,
+                )
+                .with_title("Expectation Value Cannot Escape"),
+            );
+            return;
+        }
+        let previous = self.allow_terminal_assertion;
+        self.allow_terminal_assertion = false;
+        self.check_expr(&args[0].value, scopes, method_context);
+        let message_ty = self.infer_expr_type(&args[0].value, scopes, method_context);
+        self.allow_terminal_assertion = previous;
+        if !matches!(self.types.kind(message_ty), TypeKind::String) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0720",
+                    "fail requires an exact string message",
+                    args[0].value.span(),
+                )
+                .with_title("String Expectation Requires String"),
+            );
+            return;
+        }
+        let checked_effect_id =
+            self.symbolic_class_type(crate::compiler_known_test::ASSERTION_ERROR);
+        let checked_effect = self.types.resolved(checked_effect_id);
+        self.record_checked_effects([checked_effect_id], span);
+        let source_context = self
+            .assertion_source_context(span)
+            .cloned()
+            .expect("checked fail source has semantic context");
+        self.assertions.insert(
+            span,
+            AssertionSemanticInfo {
+                matcher: crate::assertions::AssertionMatcher::Fail,
+                negated: false,
+                actual_type: None,
+                expected_type: None,
+                actual_span: None,
+                expected_span: None,
+                terminal_span: span,
+                member_span: span,
+                source: source_context.compilation.source,
+                package: source_context.compilation.package,
+                source_scope: source_context.scope,
+                first_origin_span: span,
+                checked_effect,
+            },
+        );
+        self.expression_types.insert(span, ResolvedType::Void);
+    }
+
     fn check_expr(
         &mut self,
         expr: &Expr,
@@ -8205,6 +8764,9 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
         allow_range_expr: bool,
     ) {
+        if self.check_assertion_expression(expr, scopes, method_context) {
+            return;
+        }
         match expr {
             Expr::Closure(closure) => {
                 self.check_closure_expression(closure, scopes, method_context);
@@ -8487,6 +9049,23 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 let class_name = &class_type.name;
+                if class_name == crate::compiler_known_test::ASSERTION_ERROR {
+                    for arg in args {
+                        self.check_expr(&arg.value, scopes, method_context);
+                    }
+                    if self.check_test_module_scope(*span) {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0719",
+                                "AssertionError values are created only by the native testing API",
+                                *span,
+                            )
+                            .with_title("AssertionError Cannot Be Constructed Directly")
+                            .with_help("use `expect(...)->matcher(...)` or `fail(...)`"),
+                        );
+                    }
+                    return;
+                }
                 self.record_constructor_argument_types(class_type, args);
                 if let Some(kind) = SharedHandleKind::from_source_name(class_name) {
                     for arg in args {
@@ -8925,6 +9504,7 @@ impl<'program> Checker<'program> {
                 checked_effects: resolved_effects,
                 required_checked_effects: effect_profile.required,
                 ambient_checked_effects: effect_profile.ambient,
+                test_assertion_checked_effects: effect_profile.test_assertion,
                 target_kind,
             },
         );
@@ -9290,10 +9870,11 @@ impl<'program> Checker<'program> {
                         .unwrap_or_else(|| self.types.intern(TypeKind::Void))
                 });
                 if !self.is_void_type(inferred)
-                    && crate::return_analysis::analyze_block_with_given(
+                    && crate::return_analysis::analyze_block_with_given_and_terminals(
                         block,
                         closure.span,
                         &self.given_preludes,
+                        &self.terminal_assertion_spans(),
                     )
                     .fallthrough_reachable
                 {
@@ -9396,6 +9977,7 @@ impl<'program> Checker<'program> {
                 inferred_checked_effects: inferred_resolved_effects,
                 required_checked_effects: effect_profile.required,
                 ambient_checked_effects: effect_profile.ambient,
+                test_assertion_checked_effects: effect_profile.test_assertion,
                 inferred_return_type: self.types.resolved(inferred_return),
                 execution_boundary_span: closure.span,
             },
@@ -9831,6 +10413,7 @@ impl<'program> Checker<'program> {
                     .map(|effect| self.types.resolved(effect))
                     .collect(),
                 ambient_checked_effects,
+                test_assertion_checked_effects: Vec::new(),
             },
         );
         ty
@@ -10373,10 +10956,11 @@ impl<'program> Checker<'program> {
                 None,
                 enclosing_loop_depth,
             );
-            if crate::return_analysis::analyze_block_with_given(
+            if crate::return_analysis::analyze_block_with_given_and_terminals(
                 &branch.block,
                 branch.block.span,
                 &self.given_preludes,
+                &self.terminal_assertion_spans(),
             )
             .fallthrough_reachable
             {
@@ -15803,6 +16387,22 @@ impl<'program> Checker<'program> {
         position: TypePosition,
         declaring_class: Option<&str>,
     ) -> TypeId {
+        if ty.name == crate::compiler_known_test::ASSERTION_ERROR
+            && span.source != crate::compiler_known_io::SYNTHETIC_SOURCE_ID
+            && !self
+                .assertion_source_context(span)
+                .is_some_and(crate::testing::SourceSemanticContext::is_development)
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0712",
+                    "Doria\\Std\\Test\\AssertionError requires development source",
+                    span,
+                )
+                .with_title("Test Module Requires Development Source"),
+            );
+            return self.types.unknown();
+        }
         if let Some(grouped) = &ty.grouped {
             let mut inner = grouped.inner.clone();
             inner.nullable |= ty.nullable;
@@ -17273,6 +17873,9 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> TypeId {
+        if self.assertions.contains_key(&expr.span()) {
+            return self.types.intern(TypeKind::Void);
+        }
         match expr {
             Expr::Closure(closure) => self
                 .closure_types
@@ -19365,6 +19968,7 @@ impl<'program> Checker<'program> {
                 checked_effects,
                 required_checked_effects: effect_profile.required,
                 ambient_checked_effects: effect_profile.ambient,
+                test_assertion_checked_effects: effect_profile.test_assertion,
                 source_span: span,
                 receiver_span: receiver.span(),
                 callback_span: callback.span(),

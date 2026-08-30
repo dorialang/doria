@@ -151,6 +151,49 @@ fn dispatcher_graph(
     load_compilation_graph(&document, &provider).expect("dispatcher graph")
 }
 
+fn assertion_mir(source: &str) -> doriac::mir::Program {
+    let metadata =
+        doriac::metadata_compilation_graph_v3(&graph(source, SourceScope::Development, None))
+            .expect("assertion metadata");
+    let callable = &metadata.tests[0]
+        .callable
+        .as_ref()
+        .expect("generated assertion callable")
+        .canonical_name;
+    doriac::lower_compilation_graph_to_mir(&dispatcher_graph(
+        source,
+        &format!("function main(): void {{ {callable}(); }}"),
+        CompilerTarget::Debug,
+        None,
+    ))
+    .expect("valid assertion source should lower")
+}
+
+fn assertion_plan_mut(program: &mut doriac::mir::Program) -> &mut doriac::mir::AssertionPlan {
+    program
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            doriac::mir::Statement::ControlFlowPlan(doriac::mir::ControlFlowPlan::Assertion(
+                plan,
+            )) => Some(plan.as_mut()),
+            _ => None,
+        })
+        .expect("assertion plan")
+}
+
+fn assert_malformed_assertion_mir(program: &doriac::mir::Program, expected: &str) {
+    let error = doriac::mir_validation::validate_program(program)
+        .expect_err("malformed assertion MIR must stop before backend execution");
+    assert!(
+        error.message.contains(expected),
+        "expected {expected:?}, got {:?}",
+        error.message
+    );
+}
+
 fn temporary_path(extension: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -187,6 +230,37 @@ fn run_emitted(output: doriac::backend::BackendOutput) -> std::process::Output {
     output
 }
 
+fn run_emitted_with_assertion_outcome(
+    output: doriac::backend::BackendOutput,
+) -> (std::process::Output, Vec<u8>) {
+    let doriac::backend::BackendOutput::Executable { bytes, extension } = output else {
+        panic!("native backend must emit an executable");
+    };
+    let path = temporary_path(&extension);
+    let outcome = temporary_path("outcome");
+    fs::write(&path, bytes).expect("write executable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(&path)
+            .expect("executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("executable permissions");
+    }
+    let output = retry_transient_executable_busy(|| {
+        Command::new(&path)
+            .env("DORIA_RUNTIME_OUTCOME_V3", &outcome)
+            .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
+            .output()
+    })
+    .expect("run executable");
+    let payload = fs::read(&outcome).expect("assertion outcome");
+    let _ = fs::remove_file(path);
+    let _ = fs::remove_file(outcome);
+    (output, payload)
+}
+
 fn retry_transient_executable_busy<T>(
     mut operation: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
@@ -212,6 +286,102 @@ fn is_transient_executable_busy(error: &io::Error) -> bool {
     {
         let _ = error;
         false
+    }
+}
+
+fn first_behavioral_dispatcher(source: &str) -> String {
+    let metadata =
+        doriac::metadata_compilation_graph_v3(&graph(source, SourceScope::Development, None))
+            .expect("behavioral metadata");
+    let callable = &metadata.tests[0]
+        .callable
+        .as_ref()
+        .expect("generated callable")
+        .canonical_name;
+    format!("function main(): void {{ {callable}(); }}")
+}
+
+fn assert_behavioral_output_on_every_enabled_backend(source: &str, expected_stdout: &[u8]) {
+    let dispatcher = first_behavioral_dispatcher(source);
+    let debug = doriac::compile_compilation_graph(&dispatcher_graph(
+        source,
+        &dispatcher,
+        CompilerTarget::Debug,
+        None,
+    ))
+    .expect("debug dispatcher");
+    let doriac::backend::BackendOutput::Text { contents, .. } = debug else {
+        panic!("debug backend must emit text");
+    };
+    assert!(
+        contents.contains(&format!(
+            "stdout: {}",
+            String::from_utf8_lossy(expected_stdout)
+        )),
+        "{contents}"
+    );
+
+    if Command::new(if cfg!(windows) { "cl.exe" } else { "cc" })
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
+            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+                continue;
+            }
+            let native = doriac::compile_compilation_graph(&dispatcher_graph(
+                source,
+                &dispatcher,
+                CompilerTarget::Native,
+                Some(profile),
+            ))
+            .unwrap_or_else(|error| panic!("{profile:?} dispatcher: {error:?}"));
+            let output = run_emitted(native);
+            assert_eq!(output.status.code(), Some(0), "{profile:?}");
+            assert_eq!(output.stdout, expected_stdout, "{profile:?}");
+            assert!(
+                output.stderr.is_empty(),
+                "{profile:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    if Command::new("php").arg("--version").output().is_ok() {
+        let php = doriac::compile_compilation_graph(&dispatcher_graph(
+            source,
+            &dispatcher,
+            CompilerTarget::Php,
+            None,
+        ))
+        .expect("PHP dispatcher");
+        let doriac::backend::BackendOutput::Text { contents, .. } = php else {
+            panic!("PHP backend must emit text");
+        };
+        for forbidden in ["assert(", "PHPUnit", "Pest", "Reflection", "testRegistry"] {
+            assert!(
+                !contents.contains(forbidden),
+                "generated PHP contains {forbidden}"
+            );
+        }
+        let path = temporary_path("php");
+        fs::write(&path, contents).expect("write PHP");
+        let lint = Command::new("php")
+            .arg("-l")
+            .arg(&path)
+            .output()
+            .expect("lint PHP");
+        assert!(
+            lint.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lint.stderr)
+        );
+        let output = Command::new("php").arg(&path).output().expect("run PHP");
+        let _ = fs::remove_file(path);
+        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(output.stdout, expected_stdout);
+        assert!(output.stderr.is_empty());
     }
 }
 
@@ -418,13 +588,12 @@ it("scoped", function (): void {});
 }
 
 #[test]
-fn malformed_behavioral_shapes_and_future_members_have_single_boundaries() {
+fn malformed_behavioral_shapes_and_unterminated_expectations_have_single_boundaries() {
     let source = r#"
 use Doria\Std\Test\{describe, it, expect, fail};
 describe("bad", function (): void { echo "setup"; });
 it("parameters", function (int $value): void {});
-expect(1);
-fail("stop");
+function malformed(): void { expect(1); }
 "#;
     let graph = graph(source, SourceScope::Development, None);
     let diagnostics = analyze_compilation_graph_for_ide(&graph).diagnostics;
@@ -437,15 +606,14 @@ fail("stop");
     assert_eq!(
         diagnostics
             .iter()
-            .filter(|diagnostic| diagnostic.code == "E0710")
+            .filter(|diagnostic| diagnostic.code == "E0714")
             .count(),
-        2,
+        1,
         "{diagnostics:#?}"
     );
-    assert!(diagnostics
+    assert!(!diagnostics
         .iter()
-        .filter(|diagnostic| diagnostic.code == "E0710")
-        .all(|diagnostic| diagnostic.development_only));
+        .any(|diagnostic| diagnostic.code == "E0710"));
 }
 
 #[test]
@@ -607,24 +775,45 @@ describe("suite", function (): void { it("case", function (): void {}); });
 }
 
 #[test]
-fn future_test_type_has_one_slice_two_boundary() {
+fn assertion_error_is_an_exact_development_only_compiler_known_type() {
     let source = r#"
 use Doria\Std\Test\AssertionError;
 function consume(AssertionError $error): void {}
 "#;
-    let diagnostics =
-        analyze_compilation_graph_for_ide(&graph(source, SourceScope::Development, None))
-            .diagnostics;
-    assert_eq!(diagnostics.len(), 1, "{diagnostics:#?}");
-    assert_eq!(diagnostics[0].code, "E0710");
-    assert!(diagnostics[0].development_only);
+    let development =
+        analyze_compilation_graph_for_ide(&graph(source, SourceScope::Development, None));
+    assert!(
+        development.diagnostics.is_empty(),
+        "{:#?}",
+        development.diagnostics
+    );
+
+    let main = analyze_compilation_graph_for_ide(&graph(source, SourceScope::Main, None));
+    assert_eq!(
+        main.diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0712")
+            .count(),
+        1,
+        "{:#?}",
+        main.diagnostics
+    );
 }
 
 #[test]
 fn generated_dispatcher_executes_behavioral_callable_on_every_enabled_backend() {
     let source = r#"
-use Doria\Std\Test\it;
-it("dispatches", function (): void { echo "behavioral\n"; });
+use Doria\Std\Test\{expect, fail, it};
+
+internal class Token {}
+
+it("dispatches", function (): void {
+    expect(42)->toEqual(42);
+    let $token = new Token();
+    if ($token != $token) { fail("ordinary class identity drifted"); }
+    expect($token)->toEqual($token);
+    echo "behavioral\n";
+});
 "#;
     let metadata =
         doriac::metadata_compilation_graph_v3(&graph(source, SourceScope::Development, None))
@@ -663,7 +852,11 @@ it("dispatches", function (): void { echo "behavioral\n"; });
         let output = run_emitted(native);
         assert_eq!(output.status.code(), Some(0));
         assert_eq!(output.stdout, b"behavioral\n");
-        assert!(output.stderr.is_empty());
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
 
         #[cfg(feature = "llvm-backend")]
         {
@@ -712,4 +905,436 @@ it("dispatches", function (): void { echo "behavioral\n"; });
         assert_eq!(output.stdout, b"behavioral\n");
         assert!(output.stderr.is_empty());
     }
+}
+
+#[test]
+fn slice_two_matchers_evaluate_once_in_order_and_execute_on_every_backend() {
+    let source = r#"
+use Doria\Std\Test\{expect, it};
+
+internal class Token {}
+internal enum State { case Ready; case Waiting; }
+internal enum Payload { case Number(int $value); case Empty; }
+
+function actual(): int { echo "a"; return 7; }
+function expected(): int { echo "e"; return 7; }
+function assertPresent(?int $value): void { expect($value)->not->toBeNull(); }
+function assertNullableString(?string $value): void {
+    expect($value)->toEqual("alpha");
+    expect("alpha")->toEqual($value);
+}
+
+it("core matcher matrix", function (): void {
+    expect(actual())->toEqual(expected());
+    expect(7)->not->toEqual(8);
+    expect(true)->toBeTrue();
+    expect(false)->toBeFalse();
+    expect(true)->not->toBeFalse();
+    expect(8)->toBeGreaterThan(7);
+    expect(8)->toBeGreaterThanOrEqual(8);
+    expect(7)->toBeLessThan(8);
+    expect(8)->toBeLessThanOrEqual(8);
+    expect(3.5)->toBeGreaterThan(3.0);
+    expect("alpha")->toContain("ph");
+    expect("alpha")->toStartWith("al");
+    expect("alpha")->toEndWith("ha");
+    expect("")->toBeEmpty();
+    expect("alpha")->not->toBeEmpty();
+    assertNullableString("alpha");
+
+    ?int $missing = null;
+    mixed $mixedNull = null;
+    mixed $mixedValue = "value";
+    expect(null)->toBeNull();
+    expect($missing)->toBeNull();
+    assertPresent(1);
+    expect($mixedNull)->toBeNull();
+    expect($mixedValue)->not->toBeNull();
+
+    expect(State::Ready)->toEqual(State::Ready);
+    expect(Payload::Number(42))->toEqual(Payload::Number(42));
+    let $token = new Token();
+    let $other = new Token();
+    expect($token)->toEqual($token);
+    expect($token)->not->toEqual($other);
+    if ($token != $token) { echo "identity drift"; }
+    echo " ok\n";
+});
+"#;
+    assert_behavioral_output_on_every_enabled_backend(source, b"ae ok\n");
+}
+
+#[test]
+fn assertion_errors_are_catchable_and_helpers_need_no_throws_clause() {
+    let source = r#"
+use Doria\Std\Test\{AssertionError, expect, fail, it};
+
+function helper(): void { fail("caught"); }
+function forwarded(): void { helper(); }
+
+it("catch assertion", function (): void {
+    try { forwarded(); } catch (AssertionError $error) {
+        expect($error->message)->toEqual("caught");
+        echo "exact ";
+    }
+    try { expect(false)->toBeTrue(); } catch (Error) { echo "base\n"; }
+});
+"#;
+    assert_behavioral_output_on_every_enabled_backend(source, b"exact base\n");
+
+    let analysis =
+        analyze_compilation_graph_for_ide(&graph(source, SourceScope::Development, None));
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    let helper = analysis
+        .semantic_info
+        .callable_effective_checked_effects
+        .iter()
+        .find(|(span, _)| source[span.start..span.end].starts_with("function helper"))
+        .map(|(_, effects)| effects)
+        .expect("helper effect profile");
+    assert_eq!(helper.len(), 1);
+    assert_eq!(
+        doriac::attributes::metadata_type_name(&helper[0]),
+        "Doria\\Std\\Test\\AssertionError"
+    );
+}
+
+#[test]
+fn plain_development_helpers_can_catch_assertion_errors() {
+    let source = r#"
+use Doria\Std\Test\{AssertionError, fail};
+
+function helper(): void
+{
+    try { fail("caught"); } catch (AssertionError $error) { echo $error->message; }
+}
+"#;
+    let analysis =
+        analyze_compilation_graph_for_ide(&graph(source, SourceScope::Development, None));
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn malformed_expectation_shapes_report_one_root_diagnostic() {
+    let cases = [
+        ("function f(): void { expect(); }", "E0713"),
+        ("function f(): void { expect(1, 2); }", "E0713"),
+        ("function f(): void { expect(value: 1); }", "E0713"),
+        ("function f(): void { expect(1); }", "E0714"),
+        ("function f(): void { expect(1)->not; }", "E0714"),
+        ("function f(): void { expect(1)->not(); }", "E0716"),
+        (
+            "function f(): void { expect(1)->not->not->toEqual(2); }",
+            "E0716",
+        ),
+        (
+            "function f(): void { expect(1)->unknownMatcher(); }",
+            "E0717",
+        ),
+        (
+            "function f(): void { expect(1)->toEqual(value: 1); }",
+            "E0717",
+        ),
+        ("function f(): void { expect(1)->toEqual(); }", "E0717"),
+        (
+            "function f(): void { let $value = expect(1)->toEqual(1); }",
+            "E0715",
+        ),
+        ("function f(): void { expect([1])->toContain(1); }", "E0718"),
+        ("function f(): void { expect(1)->toBeNull(); }", "E0720"),
+        ("function f(): void { expect(1)->toBeTrue(); }", "E0720"),
+    ];
+    for (body, expected) in cases {
+        let source = format!("use Doria\\Std\\Test\\expect;\n{body}");
+        let diagnostics =
+            analyze_compilation_graph_for_ide(&graph(&source, SourceScope::Development, None))
+                .diagnostics;
+        let roots = diagnostics
+            .iter()
+            .filter(|diagnostic| !diagnostic.is_consequence)
+            .collect::<Vec<_>>();
+        assert_eq!(roots.len(), 1, "{body}: {diagnostics:#?}");
+        assert_eq!(roots[0].code, expected, "{body}: {diagnostics:#?}");
+    }
+}
+
+#[test]
+fn shared_validator_rejects_malformed_assertion_plans_and_descriptors() {
+    let source = r#"
+use Doria\Std\Test\{expect, it};
+it("valid", function (): void { expect(42)->toEqual(42); });
+"#;
+    let valid = assertion_mir(source);
+    doriac::mir_validation::validate_program(&valid).expect("valid assertion MIR");
+
+    let mut shared_edge = valid.clone();
+    let plan = assertion_plan_mut(&mut shared_edge);
+    plan.failure = plan.success;
+    assert_malformed_assertion_mir(&shared_edge, "success and failure blocks must be distinct");
+
+    let mut missing_actual = valid.clone();
+    assertion_plan_mut(&mut missing_actual).actual = None;
+    assert_malformed_assertion_mir(
+        &missing_actual,
+        "assertion operand and source type metadata disagree",
+    );
+
+    let mut missing_source = valid.clone();
+    assertion_plan_mut(&mut missing_source).source_span.source = doriac::source::SourceId(999);
+    assert_malformed_assertion_mir(&missing_source, "references a missing source");
+
+    let mut invalid_span = valid.clone();
+    assertion_plan_mut(&mut invalid_span).source_span.end = usize::MAX;
+    assert_malformed_assertion_mir(&invalid_span, "invalid source span");
+
+    let mut main_source = valid.clone();
+    let source_id = assertion_plan_mut(&mut main_source).source_span.source;
+    main_source
+        .sources
+        .iter_mut()
+        .find(|source| source.id == source_id)
+        .expect("assertion source")
+        .scope = SourceScope::Main;
+    assert_malformed_assertion_mir(&main_source, "non-development source");
+
+    let mut missing_assertion_descriptor = valid.clone();
+    let descriptor = assertion_plan_mut(&mut missing_assertion_descriptor).descriptor;
+    missing_assertion_descriptor.error_descriptors[descriptor.0].assertion = None;
+    assert_malformed_assertion_mir(
+        &missing_assertion_descriptor,
+        "does not use the compiler-known AssertionError descriptor",
+    );
+
+    let mut reordered_facts = valid.clone();
+    let descriptor = assertion_plan_mut(&mut reordered_facts).descriptor;
+    reordered_facts.error_descriptors[descriptor.0]
+        .assertion
+        .as_mut()
+        .expect("assertion descriptor")
+        .fact_properties
+        .swap(0, 1);
+    assert_malformed_assertion_mir(&reordered_facts, "invalid fact projection at slot 0");
+
+    let fail_source = r#"
+use Doria\Std\Test\{fail, it};
+it("valid", function (): void { fail("stop"); });
+"#;
+    let mut negated_fail = assertion_mir(fail_source);
+    assertion_plan_mut(&mut negated_fail).negated = true;
+    assert_malformed_assertion_mir(
+        &negated_fail,
+        "fail assertion plan has incompatible operands",
+    );
+}
+
+#[test]
+fn escaping_assertion_uses_the_strict_v4_outcome_on_every_enabled_backend() {
+    let source = r#"
+use Doria\Std\Test\it;
+use Doria\Std\Test\expect;
+it("reports", function (): void {
+    expect("alpha")->not->toContain("ph");
+});
+"#;
+    let metadata =
+        doriac::metadata_compilation_graph_v3(&graph(source, SourceScope::Development, None))
+            .expect("behavioral metadata");
+    let callable = &metadata.tests[0]
+        .callable
+        .as_ref()
+        .expect("generated callable")
+        .canonical_name;
+    let dispatcher = format!("function main(): void {{ {callable}(); }}");
+
+    let debug = doriac::compile_compilation_graph(&dispatcher_graph(
+        source,
+        &dispatcher,
+        CompilerTarget::Debug,
+        None,
+    ))
+    .expect("debug dispatcher");
+    let doriac::backend::BackendOutput::Text { contents, .. } = debug else {
+        panic!("debug backend must emit text");
+    };
+    assert!(
+        contents.contains("Error[R1001]: Assertion Failed"),
+        "{contents}"
+    );
+    assert!(contents.contains("Expected\n  \"ph\""), "{contents}");
+    assert!(contents.contains("Actual\n  \"alpha\""), "{contents}");
+
+    let assert_v4 = |payload: &[u8]| {
+        assert!(payload.starts_with(b"DORIAO4\0\x04\0"), "{payload:?}");
+        for value in [
+            b"Doria\\Std\\Test\\AssertionError".as_slice(),
+            b"StringContains".as_slice(),
+            b"string".as_slice(),
+            b"\"alpha\"".as_slice(),
+            b"\"ph\"".as_slice(),
+        ] {
+            assert!(
+                payload.windows(value.len()).any(|window| window == value),
+                "missing {:?} in {payload:?}",
+                String::from_utf8_lossy(value)
+            );
+        }
+    };
+
+    if Command::new(if cfg!(windows) { "cl.exe" } else { "cc" })
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        let native = doriac::compile_compilation_graph(&dispatcher_graph(
+            source,
+            &dispatcher,
+            CompilerTarget::Native,
+            Some(BuildNativeProfile::Fast),
+        ))
+        .expect("Cranelift dispatcher");
+        let (output, payload) = run_emitted_with_assertion_outcome(native);
+        assert_eq!(output.status.code(), Some(70));
+        assert!(output.stderr.is_empty());
+        assert_v4(&payload);
+
+        #[cfg(feature = "llvm-backend")]
+        {
+            let llvm = doriac::compile_compilation_graph(&dispatcher_graph(
+                source,
+                &dispatcher,
+                CompilerTarget::Native,
+                Some(BuildNativeProfile::Release),
+            ))
+            .expect("LLVM dispatcher");
+            let (output, payload) = run_emitted_with_assertion_outcome(llvm);
+            assert_eq!(output.status.code(), Some(70));
+            assert!(output.stderr.is_empty());
+            assert_v4(&payload);
+        }
+    }
+
+    if Command::new("php").arg("--version").output().is_ok() {
+        let php = doriac::compile_compilation_graph(&dispatcher_graph(
+            source,
+            &dispatcher,
+            CompilerTarget::Php,
+            None,
+        ))
+        .expect("PHP dispatcher");
+        let doriac::backend::BackendOutput::Text { contents, .. } = php else {
+            panic!("PHP backend must emit text");
+        };
+        let path = temporary_path("php");
+        let outcome = temporary_path("outcome");
+        fs::write(&path, contents).expect("write PHP");
+        let output = Command::new("php")
+            .env("DORIA_RUNTIME_OUTCOME_V3", &outcome)
+            .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
+            .arg(&path)
+            .output()
+            .expect("run PHP");
+        let payload = fs::read(&outcome).unwrap_or_else(|error| {
+            panic!(
+                "PHP assertion outcome: {error}; status={:?}; stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(outcome);
+        assert_eq!(output.status.code(), Some(70));
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_v4(&payload);
+    }
+}
+
+#[test]
+fn php_assertion_outcomes_preserve_enum_cases_and_reject_oversized_records() {
+    if Command::new("php").arg("--version").output().is_err() {
+        return;
+    }
+
+    let enum_source = r#"
+use Doria\Std\Test\{expect, it};
+internal enum State { case Ready; case Waiting; }
+it("enum facts", function (): void { expect(State::Ready)->toEqual(State::Waiting); });
+"#;
+    let dispatcher = first_behavioral_dispatcher(enum_source);
+    let php = doriac::compile_compilation_graph(&dispatcher_graph(
+        enum_source,
+        &dispatcher,
+        CompilerTarget::Php,
+        None,
+    ))
+    .expect("PHP enum assertion dispatcher");
+    let doriac::backend::BackendOutput::Text { contents, .. } = php else {
+        panic!("PHP backend must emit text");
+    };
+    let path = temporary_path("php");
+    let outcome = temporary_path("outcome");
+    fs::write(&path, contents).expect("write PHP enum assertion");
+    let output = Command::new("php")
+        .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
+        .arg(&path)
+        .output()
+        .expect("run PHP enum assertion");
+    let payload = fs::read(&outcome).expect("PHP enum assertion outcome");
+    let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(&outcome);
+    assert_eq!(output.status.code(), Some(70));
+    for presentation in [b"State::Ready".as_slice(), b"State::Waiting".as_slice()] {
+        assert!(
+            payload
+                .windows(presentation.len())
+                .any(|window| window == presentation),
+            "missing enum presentation {:?} in {payload:?}",
+            String::from_utf8_lossy(presentation)
+        );
+    }
+
+    let message = "x".repeat(64 * 1024 + 1);
+    let oversized_source = format!(
+        "use Doria\\Std\\Test\\{{fail, it}};\nit(\"oversized\", function (): void {{ fail(\"{message}\"); }});\n"
+    );
+    let dispatcher = first_behavioral_dispatcher(&oversized_source);
+    let php = doriac::compile_compilation_graph(&dispatcher_graph(
+        &oversized_source,
+        &dispatcher,
+        CompilerTarget::Php,
+        None,
+    ))
+    .expect("PHP oversized assertion dispatcher");
+    let doriac::backend::BackendOutput::Text { contents, .. } = php else {
+        panic!("PHP backend must emit text");
+    };
+    let path = temporary_path("php");
+    let outcome = temporary_path("outcome");
+    fs::write(&path, contents).expect("write oversized PHP assertion");
+    let output = Command::new("php")
+        .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
+        .arg(&path)
+        .output()
+        .expect("run oversized PHP assertion");
+    let _ = fs::remove_file(&path);
+    let published = fs::read(&outcome).ok();
+    let _ = fs::remove_file(&outcome);
+    assert_eq!(output.status.code(), Some(70));
+    assert!(published.is_none(), "oversized V4 record was published");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Error[R1001]: Assertion Failed"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

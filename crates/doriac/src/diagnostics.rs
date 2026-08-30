@@ -45,6 +45,7 @@ pub enum DiagnosticKind {
     InternalCompiler,
     RuntimePanic,
     RuntimeError,
+    RuntimeAssertion,
 }
 
 impl DiagnosticKind {
@@ -58,6 +59,7 @@ impl DiagnosticKind {
             Self::InternalCompiler => "internalCompiler",
             Self::RuntimePanic => "runtimePanic",
             Self::RuntimeError => "runtimeError",
+            Self::RuntimeAssertion => "runtimeAssertion",
         }
     }
 
@@ -65,6 +67,7 @@ impl DiagnosticKind {
         match self {
             Self::RuntimePanic => "Panic",
             Self::RuntimeError => "Error",
+            Self::RuntimeAssertion => "Error",
             _ => severity.title(),
         }
     }
@@ -329,6 +332,25 @@ impl Diagnostic {
         diagnostic
     }
 
+    pub fn runtime_assertion(
+        message: impl Into<String>,
+        span: Span,
+        outcome: RuntimeOutcomeDetails,
+    ) -> Self {
+        let message = message.into();
+        let mut diagnostic = Self::build(
+            "R1001",
+            message.clone(),
+            span,
+            DiagnosticKind::RuntimeAssertion,
+        )
+        .with_title("Assertion Failed")
+        .with_primary_label("Assertion Failed Here")
+        .with_explanation(message);
+        diagnostic.runtime_outcome = Some(outcome);
+        diagnostic
+    }
+
     fn build(code: &'static str, message: String, span: Span, kind: DiagnosticKind) -> Self {
         debug_assert!(
             is_catalogued_code(code),
@@ -352,6 +374,7 @@ impl Diagnostic {
                 metadata.title_family.to_string()
             }
             DiagnosticKind::RuntimeError => "Runtime Error".to_string(),
+            DiagnosticKind::RuntimeAssertion => "Assertion Failed".to_string(),
             _ => to_title_case(&message),
         };
         debug_assert!(
@@ -772,7 +795,12 @@ fn render_human(
         );
         let prefix = if color {
             let ansi = match (diagnostic.kind, diagnostic.severity) {
-                (DiagnosticKind::RuntimePanic | DiagnosticKind::RuntimeError, _) => "31;1",
+                (
+                    DiagnosticKind::RuntimePanic
+                    | DiagnosticKind::RuntimeError
+                    | DiagnosticKind::RuntimeAssertion,
+                    _,
+                ) => "31;1",
                 (_, DiagnosticSeverity::Error) => "31;1",
                 (_, DiagnosticSeverity::Warning) => "33;1",
                 (_, DiagnosticSeverity::Note) => "36;1",
@@ -820,8 +848,14 @@ fn render_human(
                 );
             }
         }
+        if diagnostic.kind == DiagnosticKind::RuntimeAssertion {
+            render_assertion_values(&mut block, diagnostic);
+        }
         if let Some(explanation) = &diagnostic.explanation {
-            if diagnostic.kind == DiagnosticKind::RuntimeError {
+            if matches!(
+                diagnostic.kind,
+                DiagnosticKind::RuntimeError | DiagnosticKind::RuntimeAssertion
+            ) {
                 block.push_str("\n\nWhy\n  ");
                 block.push_str(&terminal_safe_runtime_text(
                     explanation,
@@ -1055,7 +1089,10 @@ fn render_concise(
                 "{path}:{line}:{col}: {}[{}]: {}{}",
                 diagnostic.kind.title(diagnostic.severity),
                 diagnostic.code,
-                if diagnostic.kind == DiagnosticKind::RuntimeError {
+                if matches!(
+                    diagnostic.kind,
+                    DiagnosticKind::RuntimeError | DiagnosticKind::RuntimeAssertion
+                ) {
                     terminal_safe_runtime_text(
                         &diagnostic.title,
                         doria_diagnostic_catalogue::RuntimeTextPresentation::Concise,
@@ -1080,6 +1117,51 @@ fn render_concise(
         lines.push(format_summary(summary));
     }
     lines.join("\n")
+}
+
+fn render_assertion_values(rendered: &mut String, diagnostic: &Diagnostic) {
+    let Some(outcome) = &diagnostic.runtime_outcome else {
+        return;
+    };
+    let boolean = |name: &str| {
+        outcome
+            .facts
+            .iter()
+            .find(|fact| fact.name == name)
+            .and_then(|fact| match fact.value {
+                RuntimeFactValue::Boolean(value) => Some(value),
+                _ => None,
+            })
+    };
+    let text = |name: &str| {
+        outcome
+            .facts
+            .iter()
+            .find(|fact| fact.name == name)
+            .and_then(|fact| match &fact.value {
+                RuntimeFactValue::StaticString(value) => Some(value.as_str()),
+                _ => None,
+            })
+    };
+    if boolean(doria_diagnostic_catalogue::ASSERTION_EXPECTED_PRESENT_FACT) == Some(true) {
+        if let Some(value) = text(doria_diagnostic_catalogue::ASSERTION_EXPECTED_PRESENTATION_FACT)
+        {
+            rendered.push_str("\n\nExpected\n  ");
+            rendered.push_str(&terminal_safe_runtime_text(
+                value,
+                doria_diagnostic_catalogue::RuntimeTextPresentation::Human,
+            ));
+        }
+    }
+    if boolean(doria_diagnostic_catalogue::ASSERTION_ACTUAL_PRESENT_FACT) == Some(true) {
+        if let Some(value) = text(doria_diagnostic_catalogue::ASSERTION_ACTUAL_PRESENTATION_FACT) {
+            rendered.push_str("\n\nActual\n  ");
+            rendered.push_str(&terminal_safe_runtime_text(
+                value,
+                doria_diagnostic_catalogue::RuntimeTextPresentation::Human,
+            ));
+        }
+    }
 }
 
 fn terminal_safe_runtime_text(

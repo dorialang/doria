@@ -12,7 +12,8 @@ Decision 0129 - Accepted
 Stage 33 - Complete
 Phase F - Complete
 Native Testing Foundation Slice 1 - Complete
-Native Testing Foundation Slice 2 - Next
+Native Testing Foundation Slice 2 - Complete
+Native Testing Foundation Slice 3 - Next
 Native Testing Foundation - In Progress, Not Complete
 Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes
 ```
@@ -20,15 +21,17 @@ Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes
 Slice 1 implements compiler-owned behavioral declarations, unified schema-3
 metadata, Baton discovery/dispatch, and compiler-fact-based tooling. Stage 33
 and Phase F remain complete. Baton retains development graph activation,
-dispatcher compilation, fresh-process isolation, and suite orchestration. The
-first-party assertion system remains Slice 2 and later work.
+dispatcher compilation, fresh-process isolation, and suite orchestration. Slice
+2's assertion kernel, Baton regression integration, and official tooling
+coordination are implemented. Slice 3 owns collection/Error expectations and
+final reporting/tooling closure.
 
 ## Canonical Authoring Experience
 
 The complete target example below combines delivered Slice 1
-`describe`/`it` declarations with future Slice 2 `expect` calls. Every
-`expect(...)` in this document is accepted future surface, not current
-executable behavior, until Slice 2 lands.
+`describe`/`it` declarations with executable Slice 2 `expect` calls. The
+compiler/runtime behavior and Baton/tooling integration are available in
+development source.
 
 ```doria
 use Doria\Std\Test\{
@@ -293,7 +296,7 @@ stable full test identity
 #[Test] remains green
 ```
 
-### Slice 2 — Fluent Expectation Kernel And Assertion Semantics — Next
+### Slice 2 — Fluent Expectation Kernel And Assertion Semantics — Complete
 
 Deliver:
 
