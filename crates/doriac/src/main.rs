@@ -108,6 +108,20 @@ impl From<&str> for CliError {
 }
 
 fn main() -> ExitCode {
+    #[cfg(feature = "bundled-runtime")]
+    doriac::runtime_artifact::register_embedded_runtimes(
+        include_bytes!(env!("DORIA_RT_BUILT_DEBUG_PATH")),
+        include_str!(concat!(
+            env!("DORIA_RT_BUILT_DEBUG_PATH"),
+            ".doria-runtime.json"
+        )),
+        include_bytes!(env!("DORIA_RT_BUILT_RELEASE_PATH")),
+        include_str!(concat!(
+            env!("DORIA_RT_BUILT_RELEASE_PATH"),
+            ".doria-runtime.json"
+        )),
+    );
+
     match run() {
         Ok(exit_code) => exit_code,
         Err(error) => {

@@ -21,6 +21,15 @@ LLVM consumes the exact same validated typed MIR as the interpreter and Cranelif
 
 LLVM emits one host object in memory. The existing native linker path links that object with the same implementation-private `doria-rt` ABI used by Cranelift. Release profile discovery prefers the release runtime artifact; `DORIA_RT_PATH` remains the explicit override.
 
+A standalone `doriac` embeds the deterministic fast and release `doria-rt`
+archives and their identity metadata in the compiler executable. At native
+compile time it verifies the selected embedded bytes, materializes them into a
+content-addressed temporary cache, and passes that verified archive through the
+ordinary runtime-selection path. Cargo build-output paths remain a development
+fallback for library consumers and tests; they are never an installed-toolchain
+dependency. Installation acceptance therefore deletes the entire installation
+build target before exercising a native compile and execution.
+
 The LLVM module uses the host triple and data layout, is verified before optimization, runs LLVM's `default<O3>` pipeline, is verified again, and is emitted by the host target machine. The initial implementation uses a generic host CPU rather than host-specific feature specialization. LTO and cross-compilation remain outside Stage 15.
 
 ## Semantic constraints

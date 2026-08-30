@@ -16,6 +16,14 @@ php scripts/validate_work_unit.php
 
 Cargo reuses `target/` between builds but does not garbage-collect obsolete hashed artifacts. This repository limits debug metadata, preserves useful incremental development artifacts, and gives feature-incompatible validation graphs stable cache namespaces.
 
+Cargo target directories contain only reclaimable build state. They are not a
+distribution layout and installed tools may not retain paths into them.
+`doriac` embeds the deterministic fast and release `doria-rt` archives used by
+the standalone compiler and materializes the selected, identity-checked archive
+from its own bytes. The development-toolchain refresh deliberately cleans its
+`target/toolchain-install` build directory before it verifies a native compile
+and execution through the installed compiler.
+
 The work-unit validator reports allocated size before and after validation. It automatically uses Cargo's own cleanup operation when the cache identity changes, free space is critically low, or the managed target exceeds 15 GiB. It does not clean after every run, because cold rebuilds waste time and increase SSD writes.
 
 Inspect size without changing anything:

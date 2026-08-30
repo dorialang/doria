@@ -13,6 +13,11 @@
 
 Doria is a general-purpose systems language built around three commitments: **code that reads plainly, safety that is checked at compile time, and performance that is deterministic.** It compiles to standalone native executables with deterministic ownership and no tracing garbage collector. Runtime and allocation costs are specified explicitly and verified with workload-specific measurements, while the syntax stays approachable enough to be someone's first language.
 
+The standalone compiler carries its deterministic fast and release native
+runtime archives with it. It verifies and materializes the selected archive by
+content identity when linking, so an installed `doriac` does not depend on a
+source checkout or Cargo build directory remaining on disk.
+
 ```doria
 function greet(string $name, int $year): string
 {
