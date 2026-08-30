@@ -1,71 +1,42 @@
+#!/usr/bin/env php
 <?php
 
 declare(strict_types=1);
 
-const TARGET_WARNING_BYTES = 15 * 1024 * 1024 * 1024;
+require_once __DIR__ . '/cargo_artifacts.php';
 
-$target = dirname(__DIR__) . DIRECTORY_SEPARATOR . 'target';
+$root = dirname(__DIR__);
+$target = getenv('DORIA_VALIDATION_TARGET_DIR') ?: getenv('CARGO_TARGET_DIR') ?: $root . '/target';
 
-if (!is_dir($target)) {
-    fwrite(STDOUT, "Cargo target size: 0 B (target/ is absent; warning threshold: 15 GiB)\n");
-    exit(0);
+for ($index = 1; $index < count($argv); $index++) {
+    if ($argv[$index] !== '--target-dir' || !isset($argv[$index + 1])) {
+        fwrite(STDERR, "Usage: php scripts/check_cargo_target_size.php [--target-dir <path>]\n");
+        exit(1);
+    }
+    $target = $argv[++$index];
 }
 
-$bytes = 0;
-$seenFiles = [];
-$entries = new RecursiveIteratorIterator(
-    new RecursiveDirectoryIterator($target, FilesystemIterator::SKIP_DOTS),
-    RecursiveIteratorIterator::LEAVES_ONLY,
+try {
+    $target = doria_canonical_path($target, $root);
+    $bytes = doria_allocated_directory_bytes($target);
+} catch (RuntimeException $error) {
+    fwrite(STDERR, "ERROR: {$error->getMessage()}.\n");
+    exit(1);
+}
+
+fwrite(
+    STDOUT,
+    "Cargo target allocated size: " . doria_format_bytes($bytes)
+        . " ({$target}; warning threshold: 15 GiB)\n",
 );
 
-foreach ($entries as $entry) {
-    if ($entry->isFile() && !$entry->isLink()) {
-        $metadata = stat($entry->getPathname());
-        if ($metadata === false) {
-            fwrite(STDERR, "ERROR: could not measure {$entry->getPathname()}.\n");
-            exit(1);
-        }
-
-        $identity = "{$metadata['dev']}:{$metadata['ino']}";
-        if ($metadata['ino'] !== 0 && isset($seenFiles[$identity])) {
-            continue;
-        }
-
-        if ($metadata['ino'] !== 0) {
-            $seenFiles[$identity] = true;
-        }
-
-        $bytes += array_key_exists('blocks', $metadata)
-            ? $metadata['blocks'] * 512
-            : $metadata['size'];
-    }
-}
-
-$size = format_bytes($bytes);
-fwrite(STDOUT, "Cargo target allocated size: {$size} (warning threshold: 15 GiB)\n");
-
-if ($bytes > TARGET_WARNING_BYTES) {
+if ($bytes > DORIA_TARGET_WARNING_BYTES) {
     fwrite(
         STDERR,
-        "WARNING: target/ exceeds 15 GiB. Cargo does not garbage-collect obsolete project artifacts.\n"
-        . "Inspect the directory and use `cargo clean --dry-run` to preview cleanup. "
-        . "Do not clean it without Andrew's approval.\n",
+        "WARNING: the Cargo target exceeds 15 GiB. Reclaim the managed cache with "
+            . "`php scripts/validate_work_unit.php --target-dir "
+            . escapeshellarg($target)
+            . " --reclaim`.\n",
     );
     exit(2);
-}
-
-function format_bytes(int $bytes): string
-{
-    $units = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-    $value = (float) $bytes;
-    $unit = 0;
-
-    while ($value >= 1024 && $unit < count($units) - 1) {
-        $value /= 1024;
-        ++$unit;
-    }
-
-    return $unit === 0
-        ? sprintf('%d %s', $bytes, $units[$unit])
-        : sprintf('%.2f %s', $value, $units[$unit]);
 }

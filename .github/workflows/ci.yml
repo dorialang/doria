@@ -230,6 +230,7 @@ jobs:
             find scripts -type f -name '*.py' -print
             exit 1
           fi
+          php scripts/check_build_artifact_policy.php
 
       - name: Check documentation authority
         run: |

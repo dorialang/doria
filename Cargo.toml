@@ -22,7 +22,11 @@ ryu = { version = "=1.0.23", default-features = false }
 writeable = { version = "=0.6.4", default-features = false }
 
 [profile.dev]
+debug = "line-tables-only"
 panic = "abort"
+
+[profile.dev.package."*"]
+debug = false
 
 [profile.dev.package.icu_provider]
 # ICU4X's debug logging shim links `std` when `alloc` and debug assertions are
@@ -33,6 +37,9 @@ debug-assertions = false
 [profile.test]
 debug = "line-tables-only"
 incremental = false
+
+[profile.test.package."*"]
+debug = false
 
 [profile.release]
 panic = "abort"
