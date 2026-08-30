@@ -243,7 +243,8 @@ protocol boundaries remain implementation-neutral throughout that transition.
   additive schema version 2 for callable facts.
 - `README.md`, `SPEC.md`, `docs/doria-end-to-end-plan.md`, and
   `docs/notes/current-pipeline.md` record Slice 3, Stage 33, and Phase F as
-  complete, with Stage 34 next.
+  complete. Decision 0129 inserts the in-progress Native Testing Foundation;
+  Slice 1 is complete, Slice 2 is next, and Stage 34 waits for the foundation.
 - `dorialang/baton-php` owns workspace, test, processor, generated-source, graph,
   project-inventory, and security documentation for the bootstrap product.
 - `dorialang/doria-language-server` consumes asynchronous `baton project --json`

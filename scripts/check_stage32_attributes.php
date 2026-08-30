@@ -85,6 +85,8 @@ function check_stage32_attributes(string $root): array
             'Complete',
             'Stage 33',
             'Phase F',
+            'Native Testing Foundation Slice 1',
+            'Native Testing Foundation Slice 2',
             'Stage 34',
             'E0632',
             'E0641',

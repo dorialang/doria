@@ -109,7 +109,7 @@ function check_stage31_slice2_package_graph(string $root): array
         'pub fn load_compilation_graph_with_options',
         'pub fn analyze_compilation_graph_for_ide',
         'validate_package_cycles',
-        'validate_source_shape',
+        'validate_resolved_source_shape',
         'validate_layout',
         'visible_packages',
         'direct_normal_dependencies',

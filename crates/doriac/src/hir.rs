@@ -30,6 +30,11 @@ pub struct Program {
     /// this table, so attributes cannot alter Doria runtime identity or layout.
     pub attribute_metadata: crate::attributes::AttributeSemanticInfo,
     pub semantic_info: crate::semantics::SemanticInfo,
+    /// Compiler-owned test metadata. Behavioral declaration calls and suite
+    /// closures are absent from runtime items; generated tests are ordinary
+    /// functions in `items`.
+    pub test_suites: Vec<crate::testing::BehavioralTestSuite>,
+    pub tests: Vec<crate::testing::TestSemanticInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

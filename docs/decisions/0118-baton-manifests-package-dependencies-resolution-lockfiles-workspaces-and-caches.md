@@ -296,9 +296,9 @@ transfers production release assembly, removes the private PHP payload from
 archives, and blocks the unsuffixed `2026.03.1` release until cutover.
 
 Stages 31 and 32 and all three Stage 33 slices are complete. Stage 33 and Phase F
-are complete, and Stage 34 is next. The native port remains after
-Stage 44 so it can consume the accepted filesystem, process, FFI, and network
-foundations.
+are complete. Native Testing Foundation Slice 1 is complete, Slice 2 is next,
+and Stage 34 waits for the foundation. The native port remains after Stage 44 so
+it can consume the accepted filesystem, process, FFI, and network foundations.
 
 ## Safe Deferrals
 

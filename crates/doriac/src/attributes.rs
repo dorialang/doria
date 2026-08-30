@@ -13,6 +13,7 @@ use crate::types::ResolvedType;
 
 pub const ATTRIBUTE_METADATA_SCHEMA_VERSION: u32 = 1;
 pub const ATTRIBUTE_METADATA_SCHEMA_VERSION_2: u32 = 2;
+pub const ATTRIBUTE_METADATA_SCHEMA_VERSION_3: u32 = 3;
 pub const ATTRIBUTE_PROCESSOR_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -214,6 +215,91 @@ pub struct AttributeMetadataDocumentV2 {
     pub attribute_classes: Vec<MetadataAttributeClassV1>,
     pub applications: Vec<MetadataApplicationV1>,
     pub callables: Vec<MetadataCallableV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttributeMetadataDocumentV3 {
+    pub schema_version: u32,
+    pub edition: String,
+    pub compiler_revision: String,
+    pub graph_fingerprint: String,
+    pub selected_target: MetadataTargetV1,
+    pub packages: Vec<MetadataPackageV1>,
+    pub sources: Vec<MetadataSourceV1>,
+    pub attribute_classes: Vec<MetadataAttributeClassV1>,
+    pub applications: Vec<MetadataApplicationV1>,
+    pub callables: Vec<MetadataCallableV2>,
+    pub test_suites: Vec<MetadataTestSuiteV3>,
+    pub tests: Vec<MetadataTestV3>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetadataTestSuiteV3 {
+    pub identity: String,
+    pub display_name: String,
+    pub path_segments: Vec<String>,
+    pub package: String,
+    pub source: String,
+    pub parent_suite: Option<String>,
+    pub authored_ordinal: usize,
+    pub location: MetadataLocationV1,
+    pub call_name_location: MetadataLocationV1,
+    pub description_location: MetadataLocationV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MetadataTestOriginV3 {
+    Attribute,
+    Behavioral,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MetadataTestSpellingV3 {
+    It,
+    Test,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MetadataTestShapeIssueV3 {
+    TargetIsNotCallable,
+    CallableIsNotAFunction,
+    FunctionIsGeneric,
+    FunctionHasParameters,
+    FunctionDoesNotReturnVoid,
+    UnsupportedAccess,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetadataTestCallableV3 {
+    pub identity: String,
+    pub canonical_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MetadataTestV3 {
+    pub identity: String,
+    pub display_name: String,
+    pub path_segments: Vec<String>,
+    pub origin: MetadataTestOriginV3,
+    pub authored_spelling: Option<MetadataTestSpellingV3>,
+    pub package: String,
+    pub source: String,
+    pub suite: Option<String>,
+    pub target: String,
+    pub callable: Option<MetadataTestCallableV3>,
+    pub executable: bool,
+    pub shape_issue: Option<MetadataTestShapeIssueV3>,
+    pub authored_ordinal: usize,
+    pub location: MetadataLocationV1,
+    pub call_name_location: MetadataLocationV1,
+    pub description_location: MetadataLocationV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1240,6 +1326,139 @@ pub fn metadata_document_v2(
         attribute_classes: base.attribute_classes,
         applications: base.applications,
         callables,
+    }
+}
+
+pub fn metadata_document_v3(
+    hir: &crate::hir::Program,
+    graph_fingerprint: impl Into<String>,
+) -> AttributeMetadataDocumentV3 {
+    let base = metadata_document_v2(hir, graph_fingerprint);
+    let location_for = |span: Span, source_identity: &SourceIdentity| {
+        let source = hir.sources.iter().find(|source| source.id == span.source);
+        let identity = source
+            .map(|source| public_source_identity(&source.identity.0))
+            .unwrap_or_else(|| public_source_identity(&source_identity.0));
+        MetadataLocationV1 {
+            source: identity.clone(),
+            display_path: source
+                .map(|source| public_display_path(&source.display_path))
+                .unwrap_or(identity),
+            byte_start: span.start,
+            byte_end: span.end,
+        }
+    };
+    let mut test_suites = hir
+        .test_suites
+        .iter()
+        .map(|suite| MetadataTestSuiteV3 {
+            identity: suite.identity.clone(),
+            display_name: suite.display_name.clone(),
+            path_segments: suite.path_segments.clone(),
+            package: suite.package.display_name().to_string(),
+            source: public_source_identity(&suite.source.0),
+            parent_suite: suite.parent_suite.clone(),
+            authored_ordinal: suite.authored_ordinal,
+            location: location_for(suite.declaration_span, &suite.source),
+            call_name_location: location_for(suite.call_name_span, &suite.source),
+            description_location: location_for(suite.description_span, &suite.source),
+        })
+        .collect::<Vec<_>>();
+    test_suites.sort_by(|left, right| {
+        (
+            left.package.as_str(),
+            left.source.as_str(),
+            left.location.byte_start,
+            left.authored_ordinal,
+        )
+            .cmp(&(
+                right.package.as_str(),
+                right.source.as_str(),
+                right.location.byte_start,
+                right.authored_ordinal,
+            ))
+    });
+    let mut tests = hir
+        .tests
+        .iter()
+        .map(|test| MetadataTestV3 {
+            identity: test.identity.clone(),
+            display_name: test.display_name.clone(),
+            path_segments: test.path_segments.clone(),
+            origin: match test.origin {
+                crate::testing::TestOrigin::Attribute => MetadataTestOriginV3::Attribute,
+                crate::testing::TestOrigin::Behavioral => MetadataTestOriginV3::Behavioral,
+            },
+            authored_spelling: test.authored_spelling.map(|spelling| match spelling {
+                crate::testing::BehavioralTestSpelling::It => MetadataTestSpellingV3::It,
+                crate::testing::BehavioralTestSpelling::Test => MetadataTestSpellingV3::Test,
+            }),
+            package: test.package.display_name().to_string(),
+            source: public_source_identity(&test.source.0),
+            suite: test.suite.clone(),
+            target: test.target.clone(),
+            callable: test
+                .callable_identity
+                .as_ref()
+                .zip(test.callable_canonical_name.as_ref())
+                .map(|(identity, canonical_name)| MetadataTestCallableV3 {
+                    identity: identity.clone(),
+                    canonical_name: canonical_name.clone(),
+                }),
+            executable: test.executable,
+            shape_issue: test.shape_issue.map(|issue| match issue {
+                crate::testing::TestShapeIssue::TargetIsNotCallable => {
+                    MetadataTestShapeIssueV3::TargetIsNotCallable
+                }
+                crate::testing::TestShapeIssue::CallableIsNotAFunction => {
+                    MetadataTestShapeIssueV3::CallableIsNotAFunction
+                }
+                crate::testing::TestShapeIssue::FunctionIsGeneric => {
+                    MetadataTestShapeIssueV3::FunctionIsGeneric
+                }
+                crate::testing::TestShapeIssue::FunctionHasParameters => {
+                    MetadataTestShapeIssueV3::FunctionHasParameters
+                }
+                crate::testing::TestShapeIssue::FunctionDoesNotReturnVoid => {
+                    MetadataTestShapeIssueV3::FunctionDoesNotReturnVoid
+                }
+                crate::testing::TestShapeIssue::UnsupportedAccess => {
+                    MetadataTestShapeIssueV3::UnsupportedAccess
+                }
+            }),
+            authored_ordinal: test.authored_ordinal,
+            location: location_for(test.declaration_span, &test.source),
+            call_name_location: location_for(test.call_name_span, &test.source),
+            description_location: location_for(test.description_span, &test.source),
+        })
+        .collect::<Vec<_>>();
+    tests.sort_by(|left, right| {
+        (
+            left.package.as_str(),
+            left.source.as_str(),
+            left.location.byte_start,
+            left.authored_ordinal,
+        )
+            .cmp(&(
+                right.package.as_str(),
+                right.source.as_str(),
+                right.location.byte_start,
+                right.authored_ordinal,
+            ))
+    });
+    AttributeMetadataDocumentV3 {
+        schema_version: ATTRIBUTE_METADATA_SCHEMA_VERSION_3,
+        edition: base.edition,
+        compiler_revision: base.compiler_revision,
+        graph_fingerprint: base.graph_fingerprint,
+        selected_target: base.selected_target,
+        packages: base.packages,
+        sources: base.sources,
+        attribute_classes: base.attribute_classes,
+        applications: base.applications,
+        callables: base.callables,
+        test_suites,
+        tests,
     }
 }
 

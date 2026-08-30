@@ -5,6 +5,12 @@ declare(strict_types=1);
 (static function (): void {
     require __DIR__ . '/check_string_api_completeness.php';
 })();
+(static function (): void {
+    require __DIR__ . '/check_native_testing_foundation_authority.php';
+})();
+(static function (): void {
+    require __DIR__ . '/check_native_testing_slice1.php';
+})();
 
 require_once __DIR__ . '/check_stream_io_completeness.php';
 require_once __DIR__ . '/check_grouped_local_declarations.php';

@@ -15,6 +15,7 @@ pub mod codegen_php;
 pub mod collection_diagnostics;
 pub mod compilation_graph;
 pub mod compiler_known_io;
+pub mod compiler_known_test;
 pub mod const_eval;
 mod constructor_init;
 pub mod control_flow;
@@ -49,6 +50,7 @@ pub mod source_map;
 pub mod source_provider;
 pub mod string_literal;
 pub mod symbols;
+pub mod testing;
 pub mod types;
 
 pub const TOOLCHAIN_VERSION: &str = env!("DORIA_TOOLCHAIN_VERSION");
@@ -66,6 +68,9 @@ struct PreparedSource {
     resolved: Program,
     context: CompilationContext,
     global_symbols: GlobalSymbolFacts,
+    source_semantic_contexts:
+        std::collections::HashMap<source::SourceId, testing::SourceSemanticContext>,
+    test_semantics: testing::TestSemanticFacts,
 }
 
 pub fn lex_source(
@@ -118,6 +123,7 @@ pub fn analyze_source_for_ide_with_context(
     let source = SourceFile::new(path, text);
     let authored = parse_source_file(&source)?;
     compiler_known_io::validate_reserved_identities(&authored)?;
+    compiler_known_test::validate_reserved_identities(&authored)?;
     let mut resolution = names::resolve_program_for_ide(&authored, &context);
     let uses_compiler_known_io = compiler_known_io::source_uses_io_intrinsics(&source)?
         || compiler_known_io::resolved_facts_use_canonical_io(&resolution.resolved.facts);
@@ -125,6 +131,17 @@ pub fn analyze_source_for_ide_with_context(
         resolution.resolved.program =
             compiler_known_io::augment_program(&resolution.resolved.program);
     }
+    let source_context = testing::SourceSemanticContext::standalone(context.clone());
+    let (evaluation, _) =
+        const_eval::evaluate_program_with_diagnostics(&resolution.resolved.program);
+    let elaboration = testing::elaborate_source(
+        &resolution.resolved.program,
+        &resolution.resolved.facts,
+        &source_context,
+        &evaluation,
+    );
+    resolution.resolved.program = elaboration.program;
+    resolution.diagnostics.extend(elaboration.diagnostics);
     let resolution_succeeded = resolution.diagnostics.is_empty();
     let mut analysis = if resolution_succeeded {
         let mut source_texts = std::collections::HashMap::from([(source.id, source.text.as_str())]);
@@ -135,12 +152,14 @@ pub fn analyze_source_for_ide_with_context(
             &mut source_texts,
             &mut contexts,
         );
-        semantics::analyze_program_for_ide_with_graph_context(
+        semantics::analyze_program_for_ide_with_graph_and_test_context(
             &resolution.resolved.program,
             &source_texts,
             context.clone(),
             contexts,
+            std::collections::HashMap::from([(source.id, source_context)]),
             resolution.resolved.facts.clone(),
+            elaboration.facts,
         )
     } else {
         semantics::SemanticAnalysis {
@@ -218,6 +237,18 @@ pub fn metadata_source_v2(
         runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes());
     let hir = lower_source(path, text)?;
     Ok(attributes::metadata_document_v2(&hir, fingerprint))
+}
+
+pub fn metadata_source_v3(
+    path: impl Into<String>,
+    text: impl Into<String>,
+) -> DiagnosticResult<attributes::AttributeMetadataDocumentV3> {
+    let path = path.into();
+    let text = text.into();
+    let fingerprint =
+        runtime_digest::sha256_hex(format!("source={path};contents={text}").as_bytes());
+    let hir = lower_source(path, text)?;
+    Ok(attributes::metadata_document_v3(&hir, fingerprint))
 }
 
 pub fn lower_source_with_context(
@@ -467,6 +498,16 @@ pub fn metadata_compilation_graph_v2(
     ))
 }
 
+pub fn metadata_compilation_graph_v3(
+    graph: &compilation_graph::CompilationGraph,
+) -> DiagnosticResult<attributes::AttributeMetadataDocumentV3> {
+    let hir = lower_compilation_graph(graph)?;
+    Ok(attributes::metadata_document_v3(
+        &hir,
+        graph.fingerprint.clone(),
+    ))
+}
+
 pub fn metadata_build_plan_file(
     path: impl AsRef<Path>,
 ) -> DiagnosticResult<attributes::AttributeMetadataDocumentV1> {
@@ -561,12 +602,14 @@ pub(crate) fn analyze_prepared_source(
         &mut source_texts,
         &mut contexts,
     );
-    let analysis = semantics::analyze_program_for_ide_with_graph_context(
+    let analysis = semantics::analyze_program_for_ide_with_graph_and_test_context(
         &prepared.resolved,
         &source_texts,
         prepared.context.clone(),
         contexts,
+        prepared.source_semantic_contexts.clone(),
         prepared.global_symbols.clone(),
+        prepared.test_semantics.clone(),
     );
     if analysis.diagnostics.is_empty() {
         Ok(analysis.info)
@@ -622,17 +665,31 @@ pub(crate) fn prepare_parsed_source(
     authored: Program,
 ) -> DiagnosticResult<PreparedSource> {
     compiler_known_io::validate_reserved_identities(&authored)?;
+    compiler_known_test::validate_reserved_identities(&authored)?;
     let mut resolved = names::resolve_program(&authored, &context)?;
     let uses_compiler_known_io = compiler_known_io::source_uses_io_intrinsics(source)?
         || compiler_known_io::resolved_facts_use_canonical_io(&resolved.facts);
     if uses_compiler_known_io {
         resolved.program = compiler_known_io::augment_program(&resolved.program);
     }
+    let source_context = testing::SourceSemanticContext::standalone(context.clone());
+    let (evaluation, _) = const_eval::evaluate_program_with_diagnostics(&resolved.program);
+    let elaboration = testing::elaborate_source(
+        &resolved.program,
+        &resolved.facts,
+        &source_context,
+        &evaluation,
+    );
+    if !elaboration.diagnostics.is_empty() {
+        return Err(elaboration.diagnostics);
+    }
     Ok(PreparedSource {
         authored,
-        resolved: resolved.program,
+        resolved: elaboration.program,
         context,
         global_symbols: resolved.facts,
+        source_semantic_contexts: std::collections::HashMap::from([(source.id, source_context)]),
+        test_semantics: elaboration.facts,
     })
 }
 

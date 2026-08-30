@@ -120,14 +120,29 @@ function main(): void {}
     assert_eq!(schema_2_json["schemaVersion"], 2);
     assert_eq!(schema_2_json["callables"].as_array().unwrap().len(), 2);
 
-    let unknown_schema = Command::new(doriac_bin())
+    let schema_3 = Command::new(doriac_bin())
         .current_dir(&temp_dir)
         .args(["metadata", "main.doria", "--schema-version", "3"])
+        .output()
+        .expect("schema-3 metadata should run");
+    assert_success("schema-3 metadata", schema_3.clone());
+    let schema_3_json: serde_json::Value =
+        serde_json::from_slice(&schema_3.stdout).expect("schema-3 metadata should be JSON");
+    assert_eq!(schema_3_json["schemaVersion"], 3);
+    assert!(schema_3_json["testSuites"].as_array().unwrap().is_empty());
+    let schema_3_tests = schema_3_json["tests"].as_array().unwrap();
+    assert_eq!(schema_3_tests.len(), 1);
+    assert_eq!(schema_3_tests[0]["origin"], "attribute");
+    assert_eq!(schema_3_tests[0]["displayName"], "main");
+
+    let unknown_schema = Command::new(doriac_bin())
+        .current_dir(&temp_dir)
+        .args(["metadata", "main.doria", "--schema-version", "4"])
         .output()
         .expect("unsupported schema invocation should run");
     assert!(!unknown_schema.status.success());
     assert!(String::from_utf8_lossy(&unknown_schema.stderr)
-        .contains("unsupported metadata schema version `3`"));
+        .contains("unsupported metadata schema version `4`"));
 
     let plan = serde_json::json!({
         "schemaVersion": 1,

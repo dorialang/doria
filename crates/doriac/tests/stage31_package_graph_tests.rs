@@ -721,8 +721,9 @@ fn package_cycles_and_non_entry_execution_are_rejected_deterministically() {
         entry,
     );
     provider.insert("acme/application", "extra.doria", "echo \"not an entry\";");
-    let diagnostics = load_compilation_graph(&non_entry, &provider)
-        .expect_err("non-entry executable source must be rejected");
+    let non_entry_graph =
+        load_compilation_graph(&non_entry, &provider).expect("non-entry graph should load");
+    let diagnostics = analyze_compilation_graph_for_ide(&non_entry_graph).diagnostics;
     assert!(diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "E0683"));

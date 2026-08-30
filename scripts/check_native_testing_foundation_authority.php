@@ -24,8 +24,10 @@ if ($decision === false || $reference === false) {
 $requiredDecisionFacts = [
     '# Decision 0129: Native Testing Foundation, Behavioral DSL, Fluent Expectations, And Assertion Outcomes',
     '**Status:** Accepted',
-    '**Implementation Status:** Scheduled As A Mandatory Pre-Stage-34 Foundation',
-    'Pre-Stage-34 Native Testing Foundation - Next',
+    '**Implementation Status:** Slice 1 Implemented; Slice 2 Next; Foundation In Progress',
+    'Native Testing Foundation Slice 1 - Complete',
+    'Native Testing Foundation Slice 2 - Next',
+    'Native Testing Foundation - In Progress, Not Complete',
     'Slice 1 - Behavioral Test DSL And Unified Compiler Metadata',
     'Slice 2 - Fluent Expectation Kernel And Assertion Semantics',
     'Slice 3 - Collection/Error Expectations, Baton Reporting, And Tooling Closure',
@@ -38,13 +40,17 @@ $requiredDecisionFacts = [
     'AssertionError',
     'TestAssertion',
     'metadata schema version 3',
-    'Stage 34 Single Class Inheritance - After The Testing Foundation',
+    'Baton schema-3 orchestration',
+    'language-server presentation',
+    'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
     'This is a deferral, not a permanent rejection.',
 ];
 
 $requiredReferenceFacts = [
-    'Pre-Stage-34 Native Testing Foundation - Next',
-    'Stage 34 Single Class Inheritance - Blocked Until This Foundation Completes',
+    'Native Testing Foundation Slice 1 - Complete',
+    'Native Testing Foundation Slice 2 - Next',
+    'Native Testing Foundation - In Progress, Not Complete',
+    'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
     'describe("Shopping Cart"',
     'expect($cart->total)->toEqual(0)',
     'expect($cart->items)->not->toContain',
@@ -52,6 +58,7 @@ $requiredReferenceFacts = [
     'Schema version 3 adds:',
     'no runtime suite registry',
     'no source parsing in Baton',
+    '`expect(...)` in this document is accepted future surface',
     'beforeEach / afterEach',
     'They are deferred, not permanently rejected.',
 ];
@@ -73,7 +80,6 @@ $forbidden = [
     'Baton parses Doria source',
     'runtime suite registry: required',
     'Nested testing hooks are permanently rejected',
-    'Stage 34 Single Class Inheritance - Next',
 ];
 
 foreach ($forbidden as $fact) {

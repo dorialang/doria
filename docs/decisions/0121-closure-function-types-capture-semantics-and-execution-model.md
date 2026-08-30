@@ -64,7 +64,9 @@ Stage 31 Slice 2 — Complete
 Stage 31 — Complete
 Stage 32 — Complete
 Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Complete; Stage 33 Slice 3 — Complete
-Stage 33 — Complete; Phase F — Complete; Stage 34 — Next
+Stage 33 — Complete; Phase F — Complete
+Native Testing Foundation Slice 1 — Complete; Slice 2 — Next
+Stage 34 — Blocked Until The Native Testing Foundation Completes
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping

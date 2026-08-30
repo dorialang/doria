@@ -134,7 +134,7 @@ See Decision 0116 for the current control-flow authority.
 
 ### Source organization and compiler directives
 
-The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0127 fixes the implemented normal path/Git dependency resolver, SemVer validation, one-version graph, strict deterministic lockfile, dependency commands, global Git cache, offline policy, multi-package plans, and receipt identities. Decision 0128 fixes and implements canonical dependency source descriptors, workspaces, development graphs, tests, processors, generated-source ownership, graph inspection, and project inventory. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. All three Stage 33 slices and Phase F are complete; Stage 34 single class inheritance is next.
+The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0127 fixes the implemented normal path/Git dependency resolver, SemVer validation, one-version graph, strict deterministic lockfile, dependency commands, global Git cache, offline policy, multi-package plans, and receipt identities. Decision 0128 fixes and implements canonical dependency source descriptors, workspaces, development graphs, tests, processors, generated-source ownership, graph inspection, and project inventory. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. All three Stage 33 slices and Phase F are complete. Native Testing Foundation Slice 1 is complete, Slice 2 is next, and Stage 34 single class inheritance remains blocked until the foundation completes.
 
 Namespaces define logical symbol ownership and declaration scope. They are part of semantic name resolution, not source inclusion, package resolution, build orchestration, or runtime loading.
 
@@ -1878,10 +1878,28 @@ metadata is retained in semantic information and HIR, while MIR and every
 runtime backend remain metadata-free. Doria has no runtime attribute reflection.
 
 `doriac metadata` and `doriac metadata --build-plan` emit deterministic strict
-schema-version-1 JSON. The compiler also defines a strict versioned processor
+schema-version-1 JSON. Schema version 2 additively carries callable facts, and
+schema version 3 additively unifies compiler-owned `#[Test]` and behavioral test
+suites/tests. Schemas 1 and 2 remain exact. The compiler also defines a strict versioned processor
 request/response protocol, but Stage 32 executes no processor and writes no
 generated source. Baton orchestration begins in Stage 33; PHP bridge semantics
 remain Stage 41 work.
+
+### Native behavioral test declarations
+
+In development and generated-development source, exact compiler-known imports
+from `Doria\Std\Test` expose `describe`, `it`, and `test`. These call-shaped
+forms are declarations, not runtime functions: `describe` contains nested test
+declarations, while `it` and `test` produce deterministic compiler-generated
+callables. Descriptions are const-evaluable strings, the compiler applies
+ordinary source/package scope, and no runtime registration or source parsing in
+Baton exists. `#[Test]` remains the lower-level function-oriented form, and both
+forms enter one schema-version-3 test table consumed by Baton.
+
+The fluent `expect`/`fail` surface, `AssertionError`, and the `TestAssertion`
+effect are not implemented in Slice 1. They remain the accepted Slice 2
+boundary and produce the single stage-named diagnostic until that slice lands.
+Decision 0129 is authoritative.
 
 Decision 0125 is authoritative. See
 `docs/attribute-metadata-protocol.md` for the protocol reference and

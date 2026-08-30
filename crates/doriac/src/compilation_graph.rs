@@ -85,6 +85,7 @@ pub struct IncludeEdge {
 pub struct CompilationGraph {
     pub build_plan: crate::build_plan::BuildPlan,
     pub completeness: GraphCompleteness,
+    pub project_structure: ProjectStructureAuthority,
     pub packages: BTreeMap<String, PackageNode>,
     pub sources: BTreeMap<String, GraphSource>,
     pub source_map: SourceMap,
@@ -457,16 +458,18 @@ fn load_compilation_graph_inner(
             }
             parsed
         };
-        validate_source_shape(
-            &document.plan,
-            package_specs
-                .get(pending_source.package.display_name())
-                .expect("source package exists"),
-            &pending_source,
-            &authored,
-            options.project_structure,
-            &mut diagnostics,
-        );
+        if options.project_structure == ProjectStructureAuthority::Authoritative {
+            validate_layout(
+                package_specs
+                    .get(pending_source.package.display_name())
+                    .expect("source package exists"),
+                &pending_source,
+                &authored,
+                document.plan.selected_target.entry_source.as_deref()
+                    == Some(&pending_source.identity.0),
+                &mut diagnostics,
+            );
+        }
         sources.insert(
             identity,
             GraphSource {
@@ -507,6 +510,7 @@ fn load_compilation_graph_inner(
     Ok(CompilationGraph {
         build_plan: document.plan.clone(),
         completeness: options.completeness,
+        project_structure: options.project_structure,
         packages,
         source_map,
         sources,
@@ -572,6 +576,71 @@ pub fn compilation_context(source: &GraphSource) -> CompilationContext {
     }
 }
 
+fn empty_program() -> Program {
+    Program {
+        namespace: None,
+        imports: Vec::new(),
+        includes: Vec::new(),
+        qualified_names: Vec::new(),
+        attributes: Vec::new(),
+        items: Vec::new(),
+    }
+}
+
+fn append_program(combined: &mut Program, program: &Program) {
+    combined
+        .qualified_names
+        .extend(program.qualified_names.iter().cloned());
+    combined
+        .attributes
+        .extend(program.attributes.iter().cloned());
+    combined.items.extend(program.items.iter().cloned());
+}
+
+fn validate_resolved_source_shape(
+    graph: &CompilationGraph,
+    source: &GraphSource,
+    resolved: &Program,
+    testing: &crate::testing::TestSemanticFacts,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let first_executable = resolved.items.iter().find_map(|item| match item {
+        Item::Statement(statement) => {
+            let span = statement_span(statement);
+            (!testing.is_compiler_elided_statement(span)).then_some(span)
+        }
+        _ => None,
+    });
+    let Some(span) = first_executable else {
+        return;
+    };
+    let is_entry = graph.selected_entry.as_ref() == Some(&source.identity);
+    if graph.project_structure == ProjectStructureAuthority::Authoritative
+        && (!is_entry || graph.build_plan.selected_target.kind == TargetKind::Library)
+    {
+        diagnostics.push(
+            source_language(
+                "E0683",
+                "top-level executable statements are allowed only in the selected binary entry source",
+                span,
+                &source.display_path,
+            )
+            .with_title("Source Is Not A Binary Entry"),
+        );
+    }
+    if source.included {
+        diagnostics.push(
+            source_language(
+                "E0679",
+                "an included source must contain declarations only",
+                span,
+                &source.display_path,
+            )
+            .with_title("Included Source Contains Executable Statements"),
+        );
+    }
+}
+
 pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSemanticAnalysis {
     let mut diagnostics = Vec::new();
     let mut declaration_groups = BTreeMap::<String, Vec<GlobalSymbolDeclaration>>::new();
@@ -579,6 +648,11 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         let context = compilation_context(source);
         if let Err(source_diagnostics) =
             crate::compiler_known_io::validate_reserved_identities(&source.authored)
+        {
+            diagnostics.extend(source_diagnostics);
+        }
+        if let Err(source_diagnostics) =
+            crate::compiler_known_test::validate_reserved_identities(&source.authored)
         {
             diagnostics.extend(source_diagnostics);
         }
@@ -618,14 +692,101 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
         declarations.insert(qualified_name, group.remove(0));
     }
 
-    let mut combined = Program {
-        namespace: None,
-        imports: Vec::new(),
-        includes: Vec::new(),
-        qualified_names: Vec::new(),
-        attributes: Vec::new(),
-        items: Vec::new(),
-    };
+    // Behavioral calls are ordinary syntax whose declaration identity depends
+    // on imports. Resolve once against authored declarations, elaborate the
+    // test callables, then close the final graph index including those generated
+    // package functions before resolving dispatcher references.
+    let mut preliminary_sources = BTreeMap::new();
+    let mut preliminary_combined = empty_program();
+    for (identity, source) in &graph.sources {
+        let context = compilation_context(source);
+        let environment = NameResolutionEnvironment {
+            declarations: declarations.clone(),
+            visible_packages: visible_packages(graph, source),
+            direct_normal_dependencies: direct_normal_dependencies(graph, source),
+            direct_development_dependencies: direct_development_dependencies(graph, source),
+            dependency_paths: dependency_paths(graph, source.package.display_name()),
+            complete: graph.completeness == GraphCompleteness::Complete,
+            includes_resolved: true,
+        };
+        let resolved = crate::names::resolve_program_in_graph_for_ide(
+            &source.authored,
+            &context,
+            &environment,
+        )
+        .resolved;
+        append_program(&mut preliminary_combined, &resolved.program);
+        preliminary_sources.insert(identity.clone(), resolved);
+    }
+    let (preliminary_evaluation, _) =
+        crate::const_eval::evaluate_program_with_diagnostics(&preliminary_combined);
+    let mut elaborated_sources = BTreeMap::new();
+    let mut test_semantics = crate::testing::TestSemanticFacts::default();
+    let mut source_semantic_contexts = HashMap::new();
+    for (identity, source) in &graph.sources {
+        let context = crate::testing::SourceSemanticContext {
+            compilation: compilation_context(source),
+            scope: source.scope,
+            origin: source.origin,
+            generated_for: source.generated_for,
+        };
+        source_semantic_contexts.insert(source.id, context.clone());
+        let preliminary = preliminary_sources
+            .get(identity)
+            .expect("every graph source has preliminary resolution");
+        let elaboration = crate::testing::elaborate_source(
+            &source.authored,
+            &preliminary.facts,
+            &context,
+            &preliminary_evaluation,
+        );
+        diagnostics.extend(elaboration.diagnostics);
+        validate_resolved_source_shape(
+            graph,
+            source,
+            &preliminary.program,
+            &elaboration.facts,
+            &mut diagnostics,
+        );
+        for declaration in
+            crate::names::graph_declaration_headers(&elaboration.program, &context.compilation)
+        {
+            if !elaboration
+                .facts
+                .generated_function_spans
+                .contains(&declaration.declaration_span)
+            {
+                continue;
+            }
+            if let Some(previous) = declarations.get(&declaration.qualified_name) {
+                diagnostics.push(
+                    Diagnostic::new(
+                        "E0711",
+                        "compiler-generated test identity collides with another declaration",
+                        declaration.name_span,
+                    )
+                    .with_title("Compiler-Generated Test Identity Is Reserved")
+                    .with_related(previous.name_span, "the conflicting declaration is here"),
+                );
+            } else {
+                declarations.insert(declaration.qualified_name.clone(), declaration);
+            }
+        }
+        test_semantics.suites.extend(elaboration.facts.suites);
+        test_semantics.tests.extend(elaboration.facts.tests);
+        test_semantics
+            .declaration_spans
+            .extend(elaboration.facts.declaration_spans);
+        test_semantics
+            .generated_function_spans
+            .extend(elaboration.facts.generated_function_spans);
+        elaborated_sources.insert(identity.clone(), elaboration.program);
+    }
+    diagnostics.extend(crate::testing::reject_duplicate_behavioral_names(
+        &test_semantics,
+    ));
+
+    let mut combined = empty_program();
     let mut facts = GlobalSymbolFacts::default();
     let mut authored_sources = BTreeMap::new();
     let mut contexts = HashMap::new();
@@ -651,7 +812,9 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             includes_resolved: true,
         };
         let resolution = crate::names::resolve_program_in_graph_for_ide(
-            &source.authored,
+            elaborated_sources
+                .get(identity)
+                .expect("every graph source has an elaborated program"),
             &context,
             &environment,
         );
@@ -661,15 +824,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             selected_namespace = resolved.facts.namespace.clone();
             selected_namespace_declaration = resolved.facts.namespace_declaration.clone();
         }
-        combined
-            .qualified_names
-            .extend(resolved.program.qualified_names.iter().cloned());
-        combined
-            .attributes
-            .extend(resolved.program.attributes.iter().cloned());
-        combined
-            .items
-            .extend(resolved.program.items.iter().cloned());
+        append_program(&mut combined, &resolved.program);
         facts.namespaces.extend(resolved.facts.namespaces);
         facts.declarations.extend(resolved.facts.declarations);
         facts.references.extend(resolved.facts.references);
@@ -685,6 +840,21 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
     }
     facts.namespace = selected_namespace;
     facts.namespace_declaration = selected_namespace_declaration;
+    for test in &mut test_semantics.tests {
+        if test.origin != crate::testing::TestOrigin::Behavioral {
+            continue;
+        }
+        let Some(canonical_name) = test.callable_canonical_name.as_ref() else {
+            continue;
+        };
+        if facts.declarations.iter().any(|declaration| {
+            declaration.id.qualified_name == *canonical_name
+                && declaration.id.owner
+                    == crate::names::GlobalSymbolOwner::Package(test.package.clone())
+        }) {
+            test.callable_identity = Some(format!("global:{canonical_name}:function"));
+        }
+    }
 
     if uses_compiler_known_io || crate::compiler_known_io::resolved_facts_use_canonical_io(&facts) {
         combined = crate::compiler_known_io::augment_program(&combined);
@@ -708,12 +878,14 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             source: SourceIdentity(crate::compiler_known_io::SYNTHETIC_SOURCE_IDENTITY.to_string()),
         },
     );
-    let mut semantic = crate::semantics::analyze_program_for_ide_with_graph_context(
+    let mut semantic = crate::semantics::analyze_program_for_ide_with_graph_and_test_context(
         &combined,
         &source_texts,
         selected_context(graph),
         contexts,
+        source_semantic_contexts,
         facts,
+        test_semantics,
     );
     diagnostics.append(&mut semantic.diagnostics);
     let declaration_sources = semantic
@@ -1066,63 +1238,6 @@ fn detect_cycle(
         }
     }
     active.pop();
-}
-
-fn validate_source_shape(
-    plan: &crate::build_plan::BuildPlan,
-    package: &Package,
-    source: &PendingSource,
-    authored: &Program,
-    project_structure: ProjectStructureAuthority,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
-    let is_entry = plan.selected_target.entry_source.as_deref() == Some(&source.identity.0);
-    let has_statements = authored
-        .items
-        .iter()
-        .any(|item| matches!(item, Item::Statement(_)));
-    if project_structure == ProjectStructureAuthority::Authoritative
-        && has_statements
-        && (!is_entry || plan.selected_target.kind == TargetKind::Library)
-    {
-        diagnostics.push(
-            source_language(
-                "E0683",
-                "top-level executable statements are allowed only in the selected binary entry source",
-                authored
-                    .items
-                    .iter()
-                    .find_map(|item| match item {
-                        Item::Statement(statement) => Some(statement_span(statement)),
-                        _ => None,
-                    })
-                    .unwrap_or_default(),
-                &source.provided.display_path,
-            )
-            .with_title("Source Is Not A Binary Entry"),
-        );
-    }
-    if source.included && has_statements {
-        diagnostics.push(
-            source_language(
-                "E0679",
-                "an included source must contain declarations only",
-                authored
-                    .items
-                    .iter()
-                    .find_map(|item| match item {
-                        Item::Statement(statement) => Some(statement_span(statement)),
-                        _ => None,
-                    })
-                    .unwrap_or_default(),
-                &source.provided.display_path,
-            )
-            .with_title("Included Source Contains Executable Statements"),
-        );
-    }
-    if project_structure == ProjectStructureAuthority::Authoritative {
-        validate_layout(package, source, authored, is_entry, diagnostics);
-    }
 }
 
 fn validate_layout(
