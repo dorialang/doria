@@ -208,16 +208,19 @@ impl Elaborator<'_> {
         let Stmt::Expr { expr, span } = statement else {
             return false;
         };
-        let Expr::FunctionCall { name, args, .. } = expr else {
+        let Expr::FunctionCall { args, .. } = expr else {
             return false;
         };
-        if !crate::compiler_known_test::is_declaration(name) {
+        let Some(name) = self.resolved_test_member(expr.span()) else {
+            return false;
+        };
+        if !crate::compiler_known_test::is_declaration(&name) {
             return false;
         }
         self.facts.declaration_spans.insert(*span);
         self.facts.compiler_elided_statement_spans.insert(*span);
         let ordinal = self.next_ordinal();
-        let call_name_span = self.call_name_span(name, expr.span());
+        let call_name_span = self.call_name_span(&name, expr.span());
         if !self.context.is_development() {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -331,7 +334,7 @@ impl Elaborator<'_> {
             );
         } else {
             self.test(
-                name,
+                &name,
                 description,
                 description_span,
                 closure,
@@ -349,12 +352,29 @@ impl Elaborator<'_> {
         let Stmt::Expr { expr, span } = statement else {
             return;
         };
-        let Expr::FunctionCall { name, .. } = expr else {
+        let Expr::FunctionCall { .. } = expr else {
             return;
         };
-        if crate::compiler_known_test::is_future_member(name) {
+        if self
+            .resolved_test_member(expr.span())
+            .is_some_and(|name| crate::compiler_known_test::is_future_member(&name))
+        {
             self.facts.compiler_elided_statement_spans.insert(*span);
         }
+    }
+
+    fn resolved_test_member(&self, within: Span) -> Option<String> {
+        self.symbols
+            .references
+            .iter()
+            .filter(|reference| {
+                crate::compiler_known_test::is_canonical_member(&reference.symbol_id.qualified_name)
+                    && reference.source_span.source == within.source
+                    && reference.source_span.start >= within.start
+                    && reference.source_span.end <= within.end
+            })
+            .min_by_key(|reference| reference.source_span.start)
+            .map(|reference| reference.symbol_id.qualified_name.clone())
     }
 
     #[allow(clippy::too_many_arguments)]

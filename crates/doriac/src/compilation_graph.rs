@@ -735,7 +735,7 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             .get(identity)
             .expect("every graph source has preliminary resolution");
         let elaboration = crate::testing::elaborate_source(
-            &preliminary.program,
+            &source.authored,
             &preliminary.facts,
             &context,
             &preliminary_evaluation,

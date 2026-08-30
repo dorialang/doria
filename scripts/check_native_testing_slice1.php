@@ -63,7 +63,8 @@ $required = [
     'testing' => [
         'SourceSemanticContext',
         'is_development()',
-        'compiler_known_test::is_declaration(name)',
+        'resolved_test_member(expr.span())',
+        'compiler_known_test::is_declaration(&name)',
         'BehavioralTestSuite',
         'TestSemanticInfo',
         'generated_function_spans',

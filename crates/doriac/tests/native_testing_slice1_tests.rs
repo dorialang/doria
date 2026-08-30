@@ -308,6 +308,36 @@ function writeGreeting(): void {
 }
 
 #[test]
+fn behavioral_elaboration_preserves_authored_import_alias_facts() {
+    let source = r#"
+use Doria\Std\Io\IoError as Failure;
+
+function inspect(Failure $failure): Failure {
+    return $failure;
+}
+"#;
+    let analysis =
+        analyze_compilation_graph_for_ide(&graph(source, SourceScope::Development, None));
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:#?}",
+        analysis.diagnostics
+    );
+    let alias_references = analysis
+        .semantic_info
+        .global_symbols
+        .references
+        .iter()
+        .filter(|reference| reference.source_spelling == "Failure")
+        .collect::<Vec<_>>();
+    assert_eq!(alias_references.len(), 2);
+    assert!(alias_references.iter().all(|reference| {
+        reference.import_alias.as_deref() == Some("Failure")
+            && reference.symbol_id.qualified_name == "Doria\\Std\\Io\\IoError"
+    }));
+}
+
+#[test]
 fn behavioral_identity_and_metadata_are_deterministic() {
     let source = r#"
 use Doria\Std\Test\it;
