@@ -136,7 +136,8 @@ $require($batonPath, $baton, [
     'all three Stage 33 slices are complete',
     'Stage 33 and Phase F',
     'are complete',
-    'Native Testing Foundation Slice 1 is complete',
+    'Native Testing Foundation Slices 1 and 2 are complete',
+    'Slice 3 is',
     'Stage 34 waits for the foundation',
 ]);
 $require($slice1Path, $slice1, [
@@ -198,7 +199,8 @@ $require($pipelinePath, $pipeline, [
     'Stage 33 — Complete',
     'Phase F — Complete',
     'Native Testing Foundation Slice 1 — Complete',
-    'Native Testing Foundation Slice 2 — Compiler/Runtime Implemented, Baton/Tooling Pending',
+    'Native Testing Foundation Slice 2 — Complete',
+    'Native Testing Foundation Slice 3 — Next',
     'Stage 34 Single Class Inheritance — Blocked Until The Foundation Completes',
 ]);
 $require($auditPath, $audit, [

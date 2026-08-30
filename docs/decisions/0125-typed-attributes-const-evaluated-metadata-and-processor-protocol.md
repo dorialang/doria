@@ -277,7 +277,7 @@ orchestration and generated-source graph insertion.
 - `docs/doria-end-to-end-plan.md`, `README.md`, and
   `docs/notes/current-pipeline.md` record Stage 32, all three Stage 33 slices,
   Stage 33, and Phase F complete. Decision 0129 inserts the in-progress Native
-  Testing Foundation before Stage 34; Slice 1 is complete and Slice 2 is next.
+  Testing Foundation before Stage 34; Slices 1 and 2 are complete and Slice 3 is next.
 - Decisions 0084 and 0098 record their implemented Stage 32 consumers.
 - Decision 0118 records that Stage 32 supplies the metadata/protocol boundary
   while implemented Stage 33 Slice 3 owns execution and generated-source

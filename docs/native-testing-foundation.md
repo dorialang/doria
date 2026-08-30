@@ -12,7 +12,8 @@ Decision 0129 - Accepted
 Stage 33 - Complete
 Phase F - Complete
 Native Testing Foundation Slice 1 - Complete
-Native Testing Foundation Slice 2 - Compiler/Runtime Implemented, Baton/Tooling Pending
+Native Testing Foundation Slice 2 - Complete
+Native Testing Foundation Slice 3 - Next
 Native Testing Foundation - In Progress, Not Complete
 Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes
 ```
@@ -20,18 +21,17 @@ Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes
 Slice 1 implements compiler-owned behavioral declarations, unified schema-3
 metadata, Baton discovery/dispatch, and compiler-fact-based tooling. Stage 33
 and Phase F remain complete. Baton retains development graph activation,
-dispatcher compilation, fresh-process isolation, and suite orchestration. The
-Slice 2's compiler/runtime assertion kernel is implemented. Baton regression
-integration and official language-server coordination remain pending before the
-slice is complete; Slice 3 still owns collection/Error expectations and final
-reporting/tooling closure.
+dispatcher compilation, fresh-process isolation, and suite orchestration. Slice
+2's assertion kernel, Baton regression integration, and official tooling
+coordination are implemented. Slice 3 owns collection/Error expectations and
+final reporting/tooling closure.
 
 ## Canonical Authoring Experience
 
 The complete target example below combines delivered Slice 1
 `describe`/`it` declarations with executable Slice 2 `expect` calls. The
-compiler/runtime behavior is available in development source while Baton and
-official tooling coordination are completed.
+compiler/runtime behavior and Baton/tooling integration are available in
+development source.
 
 ```doria
 use Doria\Std\Test\{
@@ -296,7 +296,7 @@ stable full test identity
 #[Test] remains green
 ```
 
-### Slice 2 — Fluent Expectation Kernel And Assertion Semantics — Compiler/Runtime Implemented, Baton/Tooling Pending
+### Slice 2 — Fluent Expectation Kernel And Assertion Semantics — Complete
 
 Deliver:
 

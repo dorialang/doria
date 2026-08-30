@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-29
 - **Date:** 2026-08-29
-- **Implementation Status:** Slice 1 Implemented; Slice 2 Compiler/Runtime Implemented, Baton/Tooling Pending; Foundation In Progress
+- **Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Next; Foundation In Progress
 - **Amends:** Decisions 0096, 0113, 0121, 0123, 0125, and 0128
 - **Preserves:** Stage 33 and Phase F completion; compiler-owned `#[Test]` metadata; Baton process isolation and development-graph orchestration; Doria ownership, checked-error, namespace, package, and backend laws; and Stage 34 inheritance authority
 
@@ -34,7 +34,8 @@ Insert one mandatory foundation before Stage 34:
 Stage 33 - Complete
 Phase F - Complete
 Native Testing Foundation Slice 1 - Complete
-Native Testing Foundation Slice 2 - Compiler/Runtime Implemented, Baton/Tooling Pending
+Native Testing Foundation Slice 2 - Complete
+Native Testing Foundation Slice 3 - Next
 Native Testing Foundation - In Progress, Not Complete
 Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes
 ```
@@ -78,9 +79,9 @@ generated-development source. Main and release source cannot silently acquire a
 test-only runtime or assertion effect.
 
 The primary authored experience is a behavioral DSL plus fluent expectations.
-All `expect(...)` examples in this record show accepted Slice 2 future surface;
-Slice 1 currently executes the surrounding `describe`/`it`/`test`
-declarations, not the expectation calls:
+All `expect(...)` examples in this record show delivered Slice 2 surface. Slice
+1 executes the surrounding `describe`/`it`/`test` declarations and Slice 2
+executes the expectation calls:
 
 ```doria
 describe("User", function (): void {
@@ -506,9 +507,8 @@ const-evaluated descriptions, nested suite extraction, direct generated
 callables, unified `#[Test]` and behavioral facts, strict metadata schema 3,
 ordinary HIR/MIR/backend execution, Baton schema-3 orchestration, and
 compiler-fact-based language-server presentation are implemented. Slice 1 is
-complete. Slice 2's compiler/runtime portion is implemented; Baton and official
-tooling coordination remain pending, so the broader foundation remains in
-progress.
+complete. Slice 2 is complete, and the broader foundation remains in progress
+with Slice 3 next.
 
 Owns:
 
@@ -527,16 +527,16 @@ LSP syntax/semantic facts
 
 Acceptance requires no runtime registration and no Baton source parsing.
 
-### Slice 2: Fluent Expectation Kernel And Assertion Semantics — Compiler/Runtime Implemented, Baton/Tooling Pending
+### Slice 2: Fluent Expectation Kernel And Assertion Semantics — Implemented
 
 The compiler now owns `expect`, `fail`, ephemeral expectation-chain semantics,
 the `not` property, core scalar/null/bool/order/string matchers,
 `AssertionError`, the separate `TestAssertion` checked-effect partition, and
 strict DORIAO4 assertion outcomes. The same validated HIR/MIR executes through
-the debug interpreter, Cranelift, LLVM, and PHP compatibility backends. This is
-an interim implementation checkpoint: Baton regression integration and the
-official language-server pin/fact coordination must still land before Slice 2
-is marked complete.
+the debug interpreter, Cranelift, LLVM, and PHP compatibility backends. Baton
+preserves generic process isolation and `FAIL` reporting while replaying the
+runtime-rendered assertion failure, and the official tooling consumes compiler
+facts instead of parsing Doria source. Slice 2 is complete.
 
 Owns:
 
@@ -667,8 +667,10 @@ No test assertion may consume a Move value merely to inspect it.
 - The end-to-end plan, current-pipeline note, standard-library reference,
   self-hosting note, README, and SPEC must schedule and describe this mandatory
   foundation before Stage 34.
-- Baton documentation must distinguish assertion failures, unexpected checked
-  Errors, and panics once Slice 3 lands.
-- Language-server documentation and fixtures must gain the behavioral DSL and
-  expectation surface during implementation.
+- Baton documentation and regression coverage now preserve generic `FAIL`
+  orchestration while replaying assertion failures; hierarchy-aware
+  classification remains Slice 3.
+- Language-server documentation and fixtures now cover the Slice 2 behavioral
+  DSL and expectation surface through compiler facts; collection/Error
+  completion and navigation remain Slice 3.
 - Website testing documentation remains a later synchronization task.

@@ -33,9 +33,10 @@ foreach ($files as $key => $relative) {
 $required = [
     'decision' => [
         '**Status:** Accepted',
-        '**Implementation Status:** Slice 1 Implemented; Slice 2 Compiler/Runtime Implemented, Baton/Tooling Pending; Foundation In Progress',
+        '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Next; Foundation In Progress',
         'Native Testing Foundation Slice 1 - Complete',
-        'Native Testing Foundation Slice 2 - Compiler/Runtime Implemented, Baton/Tooling Pending',
+        'Native Testing Foundation Slice 2 - Complete',
+        'Native Testing Foundation Slice 3 - Next',
         'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
         'no runtime registration',
         'no Baton source parsing',
@@ -44,7 +45,8 @@ $required = [
         'Stage 33 - Complete',
         'Phase F - Complete',
         'Native Testing Foundation - In Progress, Not Complete',
-        "Slice 2's compiler/runtime assertion kernel is implemented",
+        'Baton regression integration',
+        'Slice 3 owns collection/Error expectations',
     ],
     'identity' => [
         'CompilerSymbolIdentity::StandardTest',

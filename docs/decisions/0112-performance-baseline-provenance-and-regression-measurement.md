@@ -203,7 +203,7 @@ Stage 26b slices are complete. Decision 0113 and all four slices, Stages 27,
 28, and 28a are complete. Stage 29, the pre-Stage-30 grammar slice, and Stages
 30a through 30h, Stage 30, both Stage 31 slices, and Stage 32 are complete.
 Stage 33 Slices 1 through 3 and Phase F are complete. Native Testing Foundation
-Slice 1 is complete, Slice 2 is next, and Stage 34 waits for the foundation.
+Slices 1 and 2 are complete, Slice 3 is next, and Stage 34 waits for the foundation.
 Controlled timing remains `Measurement Status: Pending Available Runner` and
 does not block language work.
 
