@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Accepted:** 2026-08-29
 - **Date:** 2026-08-29
-- **Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Next; Foundation In Progress
+- **Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Compiler/Runtime In Progress; Foundation In Progress
 - **Amends:** Decisions 0096, 0113, 0121, 0123, 0125, and 0128
 - **Preserves:** Stage 33 and Phase F completion; compiler-owned `#[Test]` metadata; Baton process isolation and development-graph orchestration; Doria ownership, checked-error, namespace, package, and backend laws; and Stage 34 inheritance authority
 
@@ -35,7 +35,7 @@ Stage 33 - Complete
 Phase F - Complete
 Native Testing Foundation Slice 1 - Complete
 Native Testing Foundation Slice 2 - Complete
-Native Testing Foundation Slice 3 - Next
+Native Testing Foundation Slice 3 - Compiler/Runtime In Progress
 Native Testing Foundation - In Progress, Not Complete
 Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes
 ```
@@ -330,8 +330,25 @@ The compiler exposes only assertions supported by the concrete collection and
 element capabilities already implemented. It does not invent equality, hashing,
 ordering, cloning, or iteration for a type that lacks it.
 
-Typed arrays, `Bytes`, and named collections receive only the assertions their
-current surface can prove soundly.
+The exact initial matrix is:
+
+| Actual | `toBeEmpty` | `toHaveCount` | `toContain` | `toHaveKey` | `toHaveValue` |
+| --- | --- | --- | --- | --- | --- |
+| `T[]` | yes | yes | yes | no | no |
+| `Bytes` | yes | yes | no | no | no |
+| `List<T>` | yes | yes | yes | no | no |
+| `Dictionary<K, V>` / `SortedDictionary<K, V>` | yes | yes | no | yes | yes |
+| `Set<T>` / `SortedSet<T>` | yes | yes | yes | no | no |
+| `PriorityQueue<T>` | yes | yes | yes | no | no |
+| `Deque<T>` | yes | yes | yes | no | no |
+
+String `toContain` and `toBeEmpty` retain the `StringContains` and
+`StringEmpty` runtime fact names. Collection overloads use the distinct
+`CollectionContains` and `CollectionEmpty` facts. Receiver-domain selection is
+owned by one compiler matcher table; backends and tooling consume the selected
+fact rather than repeating this matrix. `Bytes` gains no test-only membership
+operation, dictionary `toContain` remains an ambiguous-use diagnostic, and a
+`PriorityQueue` presentation never exposes private heap order.
 
 ## Checked Error Expectations
 
@@ -357,6 +374,9 @@ expect(fn() => parseConfiguration("invalid"))
 Rules:
 
 - the subject function value is invoked exactly once;
+- a readonly subject uses an ordinary readonly invocation and remains usable;
+- a writable subject requires ordinary writable access and remains usable;
+- a once subject uses ordinary once-call consumption and cannot be used again;
 - it may have any concrete return type and checked-effect set accepted by the
   compiler-known matcher;
 - a normal result is destroyed normally when `toThrow` expected an Error;
@@ -367,6 +387,20 @@ Rules:
 - fatal panic is never treated as a thrown checked Error;
 - panic remains a panic and Baton reports it separately;
 - inspector assertions use ordinary assertion propagation.
+
+The optional inspector is evaluated once before subject invocation. It is a
+function value taking exactly one readonly `Error` or exact concrete
+Error-conforming class and returning `void`. Its complete required, ambient,
+and `TestAssertion` effects propagate normally. A concrete inspector compares
+the runtime Error descriptor by exact identity; an erased `Error` inspector
+accepts every checked Error. Negated `toThrow` accepts no inspector. Fatal panic
+is never routed through the checked-Error branch.
+
+Normal Move results and caught Errors are each destroyed exactly once on their
+ordinary structured paths. Presentations and differences are constructed only
+after matcher failure, are bounded to 4 KiB, and collection previews show at
+most eight public-order entries. No user `Displayable`, reflection registry,
+runtime suite registry, type token, metadata schema 4, or DORIAO5 is introduced.
 
 No `Type::class`, `Type::type`, string class name, or general runtime type-token
 model is introduced.
@@ -557,7 +591,7 @@ readonly expectation borrowing
 interpreter / Cranelift / LLVM / PHP parity
 ```
 
-### Slice 3: Collections, Errors, Baton Reporting, And Tooling Closure
+### Slice 3: Collections, Errors, Baton Reporting, And Tooling Closure — Compiler/Runtime In Progress
 
 Owns:
 
@@ -667,10 +701,9 @@ No test assertion may consume a Move value merely to inspect it.
 - The end-to-end plan, current-pipeline note, standard-library reference,
   self-hosting note, README, and SPEC must schedule and describe this mandatory
   foundation before Stage 34.
-- Baton documentation and regression coverage now preserve generic `FAIL`
-  orchestration while replaying assertion failures; hierarchy-aware
-  classification remains Slice 3.
-- Language-server documentation and fixtures now cover the Slice 2 behavioral
-  DSL and expectation surface through compiler facts; collection/Error
-  completion and navigation remain Slice 3.
+- Baton strict V2/V3/V4 decoding, classified hierarchy reporting, and final
+  behavioral-name filtering remain the next cross-repository part of Slice 3.
+- Language-server collection/Error completion, hovers, symbols, and navigation
+  remain the final cross-repository part of Slice 3 after the Doria closure
+  commit is green.
 - Website testing documentation remains a later synchronization task.

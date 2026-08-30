@@ -250,6 +250,7 @@ fn run_emitted_with_assertion_outcome(
     }
     let output = retry_transient_executable_busy(|| {
         Command::new(&path)
+            .env("DORIA_RUNTIME_OUTCOME_V2", &outcome)
             .env("DORIA_RUNTIME_OUTCOME_V3", &outcome)
             .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
             .output()
@@ -379,9 +380,199 @@ fn assert_behavioral_output_on_every_enabled_backend(source: &str, expected_stdo
         );
         let output = Command::new("php").arg(&path).output().expect("run PHP");
         let _ = fs::remove_file(path);
-        assert_eq!(output.status.code(), Some(0));
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(output.stdout, expected_stdout);
-        assert!(output.stderr.is_empty());
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn assert_behavioral_failure_on_every_enabled_backend(source: &str, expected_facts: &[&str]) {
+    let dispatcher = first_behavioral_dispatcher(source);
+    let assert_facts = |label: &str, payload: &[u8]| {
+        for expected in expected_facts {
+            assert!(
+                payload
+                    .windows(expected.len())
+                    .any(|window| window == expected.as_bytes()),
+                "{label}: missing {expected:?} in {}",
+                String::from_utf8_lossy(payload)
+            );
+        }
+    };
+
+    let debug = doriac::compile_compilation_graph(&dispatcher_graph(
+        source,
+        &dispatcher,
+        CompilerTarget::Debug,
+        None,
+    ))
+    .expect("debug failing dispatcher");
+    let doriac::backend::BackendOutput::Text { contents, .. } = debug else {
+        panic!("debug backend must emit text");
+    };
+    assert!(
+        contents.contains("Error[R1001]: Assertion Failed"),
+        "{contents}"
+    );
+
+    if Command::new(if cfg!(windows) { "cl.exe" } else { "cc" })
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
+            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+                continue;
+            }
+            let native = doriac::compile_compilation_graph(&dispatcher_graph(
+                source,
+                &dispatcher,
+                CompilerTarget::Native,
+                Some(profile),
+            ))
+            .unwrap_or_else(|error| panic!("{profile:?} failing dispatcher: {error:?}"));
+            let (output, payload) = run_emitted_with_assertion_outcome(native);
+            assert_eq!(output.status.code(), Some(70), "{profile:?}");
+            assert!(
+                output.stderr.is_empty(),
+                "{profile:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(payload.starts_with(b"DORIAO4\0\x04\0"), "{profile:?}");
+            assert_facts(&format!("{profile:?}"), &payload);
+        }
+    }
+
+    if Command::new("php").arg("--version").output().is_ok() {
+        let php = doriac::compile_compilation_graph(&dispatcher_graph(
+            source,
+            &dispatcher,
+            CompilerTarget::Php,
+            None,
+        ))
+        .expect("PHP failing dispatcher");
+        let doriac::backend::BackendOutput::Text { contents, .. } = php else {
+            panic!("PHP backend must emit text");
+        };
+        let path = temporary_path("php");
+        let outcome = temporary_path("outcome");
+        fs::write(&path, contents).expect("write PHP failing dispatcher");
+        let lint = Command::new("php")
+            .arg("-l")
+            .arg(&path)
+            .output()
+            .expect("lint PHP failing dispatcher");
+        assert!(
+            lint.status.success(),
+            "{}",
+            String::from_utf8_lossy(&lint.stderr)
+        );
+        let output = Command::new("php")
+            .env("DORIA_RUNTIME_OUTCOME_V2", &outcome)
+            .env("DORIA_RUNTIME_OUTCOME_V3", &outcome)
+            .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
+            .arg(&path)
+            .output()
+            .expect("run PHP failing dispatcher");
+        let payload = fs::read(&outcome).unwrap_or_else(|error| {
+            panic!(
+                "PHP assertion outcome: {error}; status={:?}; stderr={}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(outcome);
+        assert_eq!(output.status.code(), Some(70));
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(payload.starts_with(b"DORIAO4\0\x04\0"));
+        assert_facts("PHP", &payload);
+    }
+}
+
+fn assert_behavioral_panic_on_every_enabled_backend(source: &str) {
+    let dispatcher = first_behavioral_dispatcher(source);
+    let debug = doriac::compile_compilation_graph(&dispatcher_graph(
+        source,
+        &dispatcher,
+        CompilerTarget::Debug,
+        None,
+    ))
+    .expect("debug panic dispatcher");
+    let doriac::backend::BackendOutput::Text { contents, .. } = debug else {
+        panic!("debug backend must emit text");
+    };
+    assert!(contents.contains("exit_status: 101"), "{contents}");
+    assert!(contents.contains("P1000"), "{contents}");
+
+    if Command::new(if cfg!(windows) { "cl.exe" } else { "cc" })
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
+            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+                continue;
+            }
+            let native = doriac::compile_compilation_graph(&dispatcher_graph(
+                source,
+                &dispatcher,
+                CompilerTarget::Native,
+                Some(profile),
+            ))
+            .unwrap_or_else(|error| panic!("{profile:?} panic dispatcher: {error:?}"));
+            let (output, payload) = run_emitted_with_assertion_outcome(native);
+            assert_eq!(output.status.code(), Some(101), "{profile:?}");
+            assert!(payload.starts_with(b"DORIAO2\0\x02\0"), "{profile:?}");
+            assert!(
+                !payload.windows(8).any(|window| window == b"DORIAO4"),
+                "{profile:?}"
+            );
+        }
+    }
+
+    if Command::new("php").arg("--version").output().is_ok() {
+        let php = doriac::compile_compilation_graph(&dispatcher_graph(
+            source,
+            &dispatcher,
+            CompilerTarget::Php,
+            None,
+        ))
+        .expect("PHP panic dispatcher");
+        let doriac::backend::BackendOutput::Text { contents, .. } = php else {
+            panic!("PHP backend must emit text");
+        };
+        let path = temporary_path("php");
+        let outcome = temporary_path("outcome");
+        fs::write(&path, contents).expect("write PHP panic dispatcher");
+        let output = Command::new("php")
+            .env("DORIA_RUNTIME_OUTCOME_V2", &outcome)
+            .env("DORIA_RUNTIME_OUTCOME_V3", &outcome)
+            .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
+            .arg(&path)
+            .output()
+            .expect("run PHP panic dispatcher");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(outcome);
+        assert_eq!(output.status.code(), Some(101));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("Program Panicked"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 
@@ -910,8 +1101,7 @@ it("dispatches", function (): void {
 #[test]
 fn slice_two_matchers_evaluate_once_in_order_and_execute_on_every_backend() {
     let source = r#"
-use Doria\Std\Test\{expect, it};
-
+use Doria\Std\Test\{expect, fail, it};
 internal class Token {}
 internal enum State { case Ready; case Waiting; }
 internal enum Payload { case Number(int $value); case Empty; }
@@ -962,6 +1152,326 @@ it("core matcher matrix", function (): void {
 });
 "#;
     assert_behavioral_output_on_every_enabled_backend(source, b"ae ok\n");
+}
+
+#[test]
+fn slice_three_collection_matchers_execute_on_every_backend() {
+    let source = r#"
+use Doria\Std\Test\{expect, it};
+
+it("collection matcher matrix", function (): void {
+    int[] $array = [1, 2, 3];
+    List<int> $list = [1, 2, 3];
+    Dictionary<string, int> $dictionary = ["one" => 1, "two" => 2];
+    Set<int> $set = Set::from([1, 2, 3]);
+    SortedDictionary<string, int> $sortedDictionary =
+        SortedDictionary::from(["two" => 2, "one" => 1]);
+    SortedSet<int> $sortedSet = SortedSet::from([3, 1, 2]);
+    PriorityQueue<int> $queue = PriorityQueue::from([3, 1, 2]);
+    Deque<int> $deque = Deque::from([1, 2, 3]);
+    Bytes $bytes = Bytes::fromArray([1, 2, 3]);
+
+    expect($array)->toHaveCount(3);
+    expect($array)->toContain(2);
+    expect($list)->not->toBeEmpty();
+    expect($list)->toHaveCount(3);
+    expect($list)->toContain(3);
+    expect($dictionary)->toHaveKey("one");
+    expect($dictionary)->toHaveValue(2);
+    expect($dictionary)->not->toHaveKey("missing");
+    expect($set)->toContain(1);
+    expect($sortedDictionary)->toHaveKey("two");
+    expect($sortedDictionary)->toHaveValue(1);
+    expect($sortedSet)->toContain(2);
+    expect($queue)->toContain(1);
+    expect($deque)->toContain(3);
+    expect($bytes)->toHaveCount(3);
+
+    List<int> $empty = [];
+    expect($empty)->toBeEmpty();
+    echo "collections ok\n";
+});
+"#;
+    assert_behavioral_output_on_every_enabled_backend(source, b"collections ok\n");
+}
+
+#[test]
+fn slice_three_throw_matchers_intercept_checked_errors_exactly() {
+    let source = r#"
+use Doria\Std\Test\{expect, fail, it};
+
+internal class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+
+internal class OtherFailure implements Error
+{
+    function __construct(string $message) {}
+}
+
+it("throw matcher matrix", function (): void {
+    let $throws = function (): string { throw new Failure("boom"); };
+    expect($throws)->toThrow(function (Failure $error): void {
+        expect($error->message)->toContain("boom");
+        echo "inspected ";
+    });
+
+    let $returns = fn() => "ok";
+    expect($returns)->not->toThrow();
+
+    let $erased = function (): void { throw new OtherFailure("other"); };
+    expect($erased)->toThrow(function (Error $error): void {
+        expect($error->message)->toContain("other");
+        echo "erased ";
+    });
+
+    let $assertion = function (): void { fail("inner"); };
+    expect($assertion)->toThrow();
+    echo "assertion\n";
+});
+"#;
+    assert_behavioral_output_on_every_enabled_backend(source, b"inspected erased assertion\n");
+}
+
+#[test]
+fn slice_three_throw_matcher_never_converts_panic_to_checked_error() {
+    let source = r#"
+use Doria\Std\Test\{expect, it};
+
+it("panic remains fatal", function (): void {
+    expect(function (): void { panic("fatal"); })->toThrow();
+});
+"#;
+    assert_behavioral_panic_on_every_enabled_backend(source);
+}
+
+#[test]
+fn slice_three_throw_matchers_use_ordinary_invocation_modes_and_cleanup() {
+    let source = r#"
+use Doria\Std\Test\{expect, it};
+
+it("invocation modes", function (): void {
+    let $readonly = fn() => 42;
+    expect($readonly)->not->toThrow();
+    expect($readonly)->not->toThrow();
+
+    let writable $flag = false;
+    let writable $mutating = function (): void with (writable $flag) { $flag = !$flag; };
+    expect($mutating)->not->toThrow();
+    expect($mutating)->not->toThrow();
+    expect($flag)->toBeFalse();
+
+    let $value = "once-result";
+    let $once = function (): string with (take $value) { return $value; };
+    expect($once)->not->toThrow();
+    echo "modes ok\n";
+});
+"#;
+    assert_behavioral_output_on_every_enabled_backend(source, b"modes ok\n");
+
+    let consumed = r#"
+use Doria\Std\Test\expect;
+internal class Token {}
+function invalid(): void {
+    let $token = new Token();
+    let $once = function (): Token with (take $token) { return $token; };
+    expect($once)->not->toThrow();
+    $once();
+}
+"#;
+    let diagnostics =
+        analyze_compilation_graph_for_ide(&graph(consumed, SourceScope::Development, None))
+            .diagnostics;
+    assert!(
+        diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0655"),
+        "{diagnostics:#?}"
+    );
+}
+
+#[test]
+fn slice_three_failure_facts_match_on_every_backend() {
+    let no_error = r#"
+use Doria\Std\Test\{expect, it};
+it("missing error", function (): void {
+    expect(function (): int { return 42; })->toThrow();
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        no_error,
+        &[
+            "Throws",
+            "NoError",
+            "No Checked Error",
+            "Error",
+            "A Checked Error",
+            "No Checked Error Was Produced",
+        ],
+    );
+
+    let wrong_error = r#"
+use Doria\Std\Test\{expect, it};
+internal class ExpectedFailure implements Error { function __construct(string $message) {} }
+internal class ActualFailure implements Error { function __construct(string $message) {} }
+it("wrong error", function (): void {
+    expect(function (): void { throw new ActualFailure("bad\nmessage"); })
+        ->toThrow(function (ExpectedFailure $error): void {});
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        wrong_error,
+        &[
+            "Throws",
+            "ExpectedFailure",
+            "ActualFailure",
+            "ActualFailure: bad\\nmessage",
+            "The Checked Error Type Did Not Match",
+        ],
+    );
+
+    let negated_error = r#"
+use Doria\Std\Test\{expect, it};
+internal class Failure implements Error { function __construct(string $message) {} }
+it("unexpected error", function (): void {
+    expect(function (): void { throw new Failure("boom"); })->not->toThrow();
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        negated_error,
+        &[
+            "Throws",
+            "NoError",
+            "No Checked Error",
+            "Failure",
+            "Failure: boom",
+            "A Checked Error Was Produced",
+        ],
+    );
+
+    let count = r#"
+use Doria\Std\Test\{expect, it};
+it("wrong count", function (): void {
+    List<int> $values = [1, 2, 3];
+    expect($values)->toHaveCount(5);
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        count,
+        &[
+            "CollectionCount",
+            "Expected Count: 5",
+            "Actual Count: 3",
+            "Delta: -2",
+        ],
+    );
+
+    let bytes = r#"
+use Doria\Std\Test\{expect, it};
+it("wrong bytes", function (): void {
+    expect(Bytes::fromArray([0, 255, 16]))->toEqual(Bytes::fromArray([0, 254, 16]));
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        bytes,
+        &[
+            "Equal",
+            "First Differing Byte: 1",
+            "Expected Byte: fe",
+            "Actual Byte: ff",
+        ],
+    );
+}
+
+#[test]
+fn slice_three_collection_presentations_are_bounded_and_public() {
+    let list = r#"
+use Doria\Std\Test\{expect, it};
+it("list preview", function (): void {
+    List<int> $values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+    expect($values)->toContain(42);
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        list,
+        &[
+            "CollectionContains",
+            "List<int>(count: 10) [0, 1, 2, 3, 4, 5, 6, 7, ...<truncated>]",
+            "No Matching Element Was Found",
+        ],
+    );
+
+    let dictionary = r#"
+use Doria\Std\Test\{expect, it};
+it("dictionary preview", function (): void {
+    Dictionary<string, int> $values = ["one" => 1, "two" => 2];
+    expect($values)->toHaveKey("missing");
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        dictionary,
+        &[
+            "DictionaryHasKey",
+            "Dictionary<string, int>(count: 2) {\"one\" => 1, \"two\" => 2}",
+            "The Expected Key Was Not Found",
+        ],
+    );
+
+    let bytes = r#"
+use Doria\Std\Test\{expect, it};
+it("Bytes preview", function (): void {
+    Bytes $values = Bytes::fromArray([0, 255, 16]);
+    expect($values)->toHaveCount(4);
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        bytes,
+        &["CollectionCount", "Bytes(length: 3, hex: \"00 ff 10\")"],
+    );
+
+    let queue = r#"
+use Doria\Std\Test\{expect, it};
+it("queue opacity", function (): void {
+    PriorityQueue<int> $values = PriorityQueue::from([3, 1, 2]);
+    expect($values)->toContain(9);
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        queue,
+        &[
+            "CollectionContains",
+            "PriorityQueue<int>(count: 3)",
+            "No Matching Element Was Found",
+        ],
+    );
+
+    let nullable = r#"
+use Doria\Std\Test\{expect, it};
+it("nullable preview", function (): void {
+    List<?int> $values = [null, 0];
+    expect($values)->toContain(null);
+    expect($values)->toContain(0);
+    expect($values)->toContain(7);
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        nullable,
+        &["CollectionContains", "List<?int>(count: 2) [null, 0]"],
+    );
+
+    let opaque = r#"
+use Doria\Std\Test\{expect, it};
+internal class Product {}
+it("opaque preview", function (): void {
+    List<Product> $values = [new Product()];
+    expect($values)->toBeEmpty();
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        opaque,
+        &["CollectionEmpty", "List<Product>(count: 1) [<Product>]"],
+    );
 }
 
 #[test]
@@ -1048,7 +1558,14 @@ fn malformed_expectation_shapes_report_one_root_diagnostic() {
             "function f(): void { let $value = expect(1)->toEqual(1); }",
             "E0715",
         ),
-        ("function f(): void { expect([1])->toContain(1); }", "E0718"),
+        (
+            "function f(): void { Dictionary<string, int> $values = [\"one\" => 1]; expect($values)->toContain(1); }",
+            "E0720",
+        ),
+        (
+            "function f(): void { Bytes $values = Bytes::fromArray([1]); expect($values)->toContain(1); }",
+            "E0720",
+        ),
         ("function f(): void { expect(1)->toBeNull(); }", "E0720"),
         ("function f(): void { expect(1)->toBeTrue(); }", "E0720"),
     ];
@@ -1063,6 +1580,79 @@ fn malformed_expectation_shapes_report_one_root_diagnostic() {
             .collect::<Vec<_>>();
         assert_eq!(roots.len(), 1, "{body}: {diagnostics:#?}");
         assert_eq!(roots[0].code, expected, "{body}: {diagnostics:#?}");
+    }
+}
+
+#[test]
+fn slice_three_expectation_diagnostics_preserve_domain_and_inspector_causes() {
+    let prelude = r#"
+use Doria\Std\Test\expect;
+internal class Failure implements Error { function __construct(string $message) {} }
+"#;
+    let cases = [
+        (
+            "function f(): void { Bytes $values = Bytes::fromArray([1]); expect($values)->toContain(1); }",
+            "Bytes Does Not Support Membership Expectations",
+        ),
+        (
+            "function f(): void { Dictionary<string, int> $values = [\"one\" => 1]; expect($values)->toContain(1); }",
+            "Dictionary Membership Expectation Is Ambiguous",
+        ),
+        (
+            "function f(): void { List<int> $values = [1]; expect($values)->toHaveKey(1); }",
+            "Key Expectations Require A Dictionary",
+        ),
+        (
+            "function f(): void { Set<int> $values = Set::from([1]); expect($values)->toHaveValue(1); }",
+            "Value Expectations Require A Dictionary",
+        ),
+        (
+            "function f(): void { expect([1])->toHaveCount(\"one\"); }",
+            "Collection Count Expectation Requires Int",
+        ),
+        (
+            "function f(): void { expect(1)->toThrow(); }",
+            "Error Expectation Requires A Function Value",
+        ),
+        (
+            "function f(): void { expect(function (int $value): void {})->toThrow(); }",
+            "Error Expectation Function Must Have No Parameters",
+        ),
+        (
+            "function f(): void { expect(function (): void {})->toThrow(function (): void {}); }",
+            "Error Inspector Must Have One Parameter",
+        ),
+        (
+            "function f(): void { expect(function (): void {})->toThrow(function (writable Failure $error): void {}); }",
+            "Error Inspector Parameter Must Be Readonly",
+        ),
+        (
+            "function f(): void { expect(function (): void {})->toThrow(function (string $error): void {}); }",
+            "Error Inspector Parameter Must Implement Error",
+        ),
+        (
+            "function f(): void { expect(function (): void {})->toThrow(function (Failure $error): int { return 1; }); }",
+            "Error Inspector Must Return Void",
+        ),
+        (
+            "function f(): void { expect(function (): void {})->not->toThrow(function (Failure $error): void {}); }",
+            "Negated Error Expectation Does Not Accept An Inspector",
+        ),
+    ];
+
+    for (body, title) in cases {
+        let source = format!("{prelude}\n{body}");
+        let diagnostics =
+            analyze_compilation_graph_for_ide(&graph(&source, SourceScope::Development, None))
+                .diagnostics;
+        let roots = diagnostics
+            .iter()
+            .filter(|diagnostic| !diagnostic.is_consequence)
+            .collect::<Vec<_>>();
+        assert!(
+            roots.iter().any(|diagnostic| diagnostic.title == title),
+            "{body}: expected {title:?}, got {diagnostics:#?}"
+        );
     }
 }
 
@@ -1132,6 +1722,58 @@ it("valid", function (): void { fail("stop"); });
     assert_malformed_assertion_mir(
         &negated_fail,
         "fail assertion plan has incompatible operands",
+    );
+
+    let list_source = r#"
+use Doria\Std\Test\{expect, it};
+it("valid", function (): void { List<int> $values = [1]; expect($values)->toContain(1); });
+"#;
+    let mut dictionary_matcher_on_list = assertion_mir(list_source);
+    assertion_plan_mut(&mut dictionary_matcher_on_list).matcher =
+        doriac::assertions::AssertionMatcher::DictionaryHasKey;
+    assert_malformed_assertion_mir(
+        &dictionary_matcher_on_list,
+        "dictionary key assertion requires a dictionary collection",
+    );
+
+    let bytes_source = r#"
+use Doria\Std\Test\{expect, it};
+it("valid", function (): void {
+    Bytes $values = Bytes::fromArray([1]);
+    expect($values)->toHaveCount(1);
+});
+"#;
+    let mut membership_on_bytes = assertion_mir(bytes_source);
+    assertion_plan_mut(&mut membership_on_bytes).matcher =
+        doriac::assertions::AssertionMatcher::CollectionContains;
+    assert_malformed_assertion_mir(
+        &membership_on_bytes,
+        "collection membership assertion uses an unsupported collection family",
+    );
+
+    let mut invalid_count_operand = assertion_mir(bytes_source);
+    let actual = assertion_plan_mut(&mut invalid_count_operand)
+        .actual
+        .expect("count assertion actual");
+    assertion_plan_mut(&mut invalid_count_operand).expected = Some(actual);
+    assert_malformed_assertion_mir(
+        &invalid_count_operand,
+        "collection count assertion requires exact int operand",
+    );
+
+    let throw_source = r#"
+use Doria\Std\Test\{expect, it};
+internal class Failure implements Error { function __construct(string $message) {} }
+it("valid", function (): void {
+    expect(function (): void { throw new Failure("stop"); })
+        ->toThrow(function (Failure $error): void {});
+});
+"#;
+    let mut negated_throw_with_inspector = assertion_mir(throw_source);
+    assertion_plan_mut(&mut negated_throw_with_inspector).negated = true;
+    assert_malformed_assertion_mir(
+        &negated_throw_with_inspector,
+        "negated throw assertion cannot carry an inspector",
     );
 }
 
@@ -1257,6 +1899,97 @@ it("reports", function (): void {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_v4(&payload);
+    }
+}
+
+#[test]
+fn failed_string_equality_reports_a_grapheme_aware_v4_difference() {
+    let source = r#"
+use Doria\Std\Test\{expect, it};
+it("unicode difference", function (): void {
+    expect("Café")->toEqual("Café");
+});
+"#;
+    let dispatcher = first_behavioral_dispatcher(source);
+    let difference = b"First Differing Grapheme: 3";
+
+    let debug = doriac::compile_compilation_graph(&dispatcher_graph(
+        source,
+        &dispatcher,
+        CompilerTarget::Debug,
+        None,
+    ))
+    .expect("debug difference dispatcher");
+    let doriac::backend::BackendOutput::Text { contents, .. } = debug else {
+        panic!("debug backend must emit text");
+    };
+    assert!(
+        contents.contains("First Differing Grapheme: 3"),
+        "{contents}"
+    );
+
+    if Command::new(if cfg!(windows) { "cl.exe" } else { "cc" })
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        for profile in [BuildNativeProfile::Fast, BuildNativeProfile::Release] {
+            if profile == BuildNativeProfile::Release && !cfg!(feature = "llvm-backend") {
+                continue;
+            }
+            let native = doriac::compile_compilation_graph(&dispatcher_graph(
+                source,
+                &dispatcher,
+                CompilerTarget::Native,
+                Some(profile),
+            ))
+            .unwrap_or_else(|error| panic!("{profile:?} difference dispatcher: {error:?}"));
+            let (output, payload) = run_emitted_with_assertion_outcome(native);
+            assert_eq!(output.status.code(), Some(70), "{profile:?}");
+            assert!(output.stderr.is_empty(), "{profile:?}");
+            assert!(
+                payload
+                    .windows(difference.len())
+                    .any(|window| window == difference),
+                "{profile:?}: {payload:?}"
+            );
+        }
+    }
+
+    if Command::new("php").arg("--version").output().is_ok() {
+        let php = doriac::compile_compilation_graph(&dispatcher_graph(
+            source,
+            &dispatcher,
+            CompilerTarget::Php,
+            None,
+        ))
+        .expect("PHP difference dispatcher");
+        let doriac::backend::BackendOutput::Text { contents, .. } = php else {
+            panic!("PHP backend must emit text");
+        };
+        let path = temporary_path("php");
+        let outcome = temporary_path("outcome");
+        fs::write(&path, contents).expect("write PHP difference dispatcher");
+        let output = Command::new("php")
+            .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
+            .arg(&path)
+            .output()
+            .expect("run PHP difference dispatcher");
+        let payload = fs::read(&outcome).expect("PHP difference outcome");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(outcome);
+        assert_eq!(
+            output.status.code(),
+            Some(70),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            payload
+                .windows(difference.len())
+                .any(|window| window == difference),
+            "{payload:?}"
+        );
     }
 }
 

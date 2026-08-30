@@ -26,19 +26,20 @@ use crate::mir_validation;
 use crate::native_abi::{
     collection_comparator_code, collection_value_width, function_symbol,
     nullable_collection_access_code, nullable_payload_type, stage26_collection_kind, APPEND_FILE,
-    APPEND_FILE_BYTES, BYTES_DATA, BYTES_EQUAL, BYTES_FREE, BYTES_FROM_COLLECTION, BYTES_GET,
-    BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CHECKED_IO, CHECKED_IO_APPEND_FILE,
-    CHECKED_IO_ERROR_INVALID_UTF8, CHECKED_IO_ERROR_IO, CHECKED_IO_META_HAS_INVALID_COUNT_SHIFT,
-    CHECKED_IO_META_HAS_SYSTEM_CODE_SHIFT, CHECKED_IO_META_KIND_SHIFT,
-    CHECKED_IO_META_OPERATION_SHIFT, CHECKED_IO_META_REASON_SHIFT, CHECKED_IO_META_TARGET_SHIFT,
-    CHECKED_IO_READ_FILE_BYTES, CHECKED_IO_READ_FILE_TEXT, CHECKED_IO_READ_LINE,
-    CHECKED_IO_READ_STDIN_BYTES, CHECKED_IO_WRITE_FILE, CHECKED_IO_WRITE_STDERR,
-    CHECKED_IO_WRITE_STDOUT, CLASS_ALLOCATE, CLASS_FREE, CLOSURE_ENVIRONMENT_ALLOCATE,
-    CLOSURE_ENVIRONMENT_FREE, COLLECTION_AGGREGATE_INSERT_SLOT,
+    APPEND_FILE_BYTES, BYTES_ASSERTION_DIFFERENCE, BYTES_DATA, BYTES_EQUAL, BYTES_FREE,
+    BYTES_FROM_COLLECTION, BYTES_GET, BYTES_LENGTH, BYTES_SET, BYTES_TO_COLLECTION, CHECKED_IO,
+    CHECKED_IO_APPEND_FILE, CHECKED_IO_ERROR_INVALID_UTF8, CHECKED_IO_ERROR_IO,
+    CHECKED_IO_META_HAS_INVALID_COUNT_SHIFT, CHECKED_IO_META_HAS_SYSTEM_CODE_SHIFT,
+    CHECKED_IO_META_KIND_SHIFT, CHECKED_IO_META_OPERATION_SHIFT, CHECKED_IO_META_REASON_SHIFT,
+    CHECKED_IO_META_TARGET_SHIFT, CHECKED_IO_READ_FILE_BYTES, CHECKED_IO_READ_FILE_TEXT,
+    CHECKED_IO_READ_LINE, CHECKED_IO_READ_STDIN_BYTES, CHECKED_IO_WRITE_FILE,
+    CHECKED_IO_WRITE_STDERR, CHECKED_IO_WRITE_STDOUT, CLASS_ALLOCATE, CLASS_FREE,
+    CLOSURE_ENVIRONMENT_ALLOCATE, CLOSURE_ENVIRONMENT_FREE, COLLECTION_AGGREGATE_INSERT_SLOT,
     COLLECTION_AGGREGATE_KEYED_SET_SLOT, COLLECTION_AGGREGATE_NEW,
     COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO, COLLECTION_AGGREGATE_PUSH_FRONT_SLOT,
     COLLECTION_AGGREGATE_PUSH_SLOT, COLLECTION_AGGREGATE_REMOVE_AT_INTO,
-    COLLECTION_AGGREGATE_VALUE_AT, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64,
+    COLLECTION_AGGREGATE_VALUE_AT, COLLECTION_ASSERTION_COUNT_DIFFERENCE,
+    COLLECTION_ASSERTION_PRESENTATION, COLLECTION_COMPARE_FLOAT32, COLLECTION_COMPARE_FLOAT64,
     COLLECTION_COMPARE_STRING, COLLECTION_COMPARE_WORD, COLLECTION_CONTAINS,
     COLLECTION_DETACH_FOR_CLEANUP, COLLECTION_FILL_STRING, COLLECTION_FILL_WORD,
     COLLECTION_FINISH_DETACHED_CLEANUP, COLLECTION_FREE, COLLECTION_INDEX_FIELD,
@@ -50,29 +51,30 @@ use crate::native_abi::{
     COLLECTION_REMOVE_AT, COLLECTION_REMOVE_VALUE, COLLECTION_RESET_AFTER_CLEANUP,
     COLLECTION_SET_ALGEBRA, COLLECTION_SET_AT, COLLECTION_SET_AT_NULLABLE,
     COLLECTION_STAGE26_FINALIZE, COLLECTION_STAGE26_FROM_COPY, COLLECTION_STAGE26_NEW,
-    COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, FLOAT_PARSE, FORMAT_F32, FORMAT_F64, FORMAT_I64,
-    FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED, MIXED_FREE, MIXED_NEW,
-    MIXED_NEW_AGGREGATE, MIXED_NEW_AGGREGATE_BORROWED, MIXED_NEW_BORROWED, MIXED_PAYLOAD,
-    MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM,
+    COLLECTION_VALUES_FIELD, COLLECTION_VALUE_AT, ERROR_ASSERTION_PRESENTATION, FLOAT_PARSE,
+    FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED,
+    MIXED_FREE, MIXED_NEW, MIXED_NEW_AGGREGATE, MIXED_NEW_AGGREGATE_BORROWED, MIXED_NEW_BORROWED,
+    MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM,
     MIXED_TAG_ERROR, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_FUNCTION, MIXED_TAG_INT16,
     MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_PAYLOAD_ENUM, MIXED_TAG_STRING,
     MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID,
     NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
     READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD,
-    SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_ASSERTION_QUOTE, STRING_BYTE_LENGTH,
-    STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE,
-    STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE,
-    STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32,
-    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH,
-    STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN,
-    STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST,
-    STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN,
-    STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE,
-    STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER,
-    STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE,
-    WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS, WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS,
-    WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK, WRITABLE_SHARED_READONLY_PAYLOAD,
-    WRITABLE_SHARED_RELEASE, WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
+    SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_ASSERTION_DIFFERENCE,
+    STRING_ASSERTION_QUOTE, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
+    STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
+    STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
+    STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
+    STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY,
+    STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER,
+    STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT,
+    STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
+    STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
+    STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
+    WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
+    WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS, WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK,
+    WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
+    WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
     WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_RETAIN,
     WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES,
     WRITE_STDOUT_BYTES,
@@ -6905,7 +6907,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<(IntValue<'ctx>, BasicValueEnum<'ctx>, mir::Type), BackendError> {
         let payload_ty = nullable_payload_type(ty)
             .ok_or_else(|| malformed_mir("collection value is not nullable"))?;
+        let value_ty = value.ty();
         let value = self.lower_rvalue(value)?;
+        if value_ty == payload_ty {
+            return Ok((
+                self.context.i8_type().const_int(1, false),
+                value,
+                payload_ty,
+            ));
+        }
         if matches!(ty, mir::Type::NullableScalar(_) | mir::Type::NullableString) {
             let (present, payload) = self.nullable_parts(value.into_struct_value())?;
             let present = build(self.builder.build_int_truncate(
@@ -12745,6 +12755,93 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?
                 .ok_or_else(|| {
                     backend_failure("assertion string presentation produced no result")
+                })?,
+            Kind::AssertionDifference => self
+                .call_runtime(
+                    STRING_ASSERTION_DIFFERENCE,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        pointer.into(),
+                        i64_type.into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                        argument(2)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("assertion string difference produced no result"))?,
+            Kind::AssertionBytesDifference => self
+                .call_runtime(
+                    BYTES_ASSERTION_DIFFERENCE,
+                    &[pointer.into(), pointer.into(), pointer.into()],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("assertion Bytes difference produced no result"))?,
+            Kind::AssertionCountDifference => self
+                .call_runtime(
+                    COLLECTION_ASSERTION_COUNT_DIFFERENCE,
+                    &[pointer.into(), i64_type.into(), i64_type.into()],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("assertion count difference produced no result"))?,
+            Kind::AssertionErrorPresentation => {
+                self.call_runtime(
+                    ERROR_ASSERTION_PRESENTATION,
+                    &[pointer.into(), pointer.into(), pointer.into()],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| backend_failure("assertion Error presentation produced no result"))?
+            }
+            Kind::AssertionCollectionPresentation => self
+                .call_runtime(
+                    COLLECTION_ASSERTION_PRESENTATION,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        pointer.into(),
+                        i64_type.into(),
+                        i64_type.into(),
+                        pointer.into(),
+                        pointer.into(),
+                        i64_type.into(),
+                        pointer.into(),
+                        pointer.into(),
+                    ],
+                    Some(pointer.into()),
+                    &[
+                        self.current_frame.into(),
+                        argument(0)?.into(),
+                        argument(1)?.into(),
+                        argument(2)?.into(),
+                        argument(3)?.into(),
+                        argument(4)?.into(),
+                        argument(5)?.into(),
+                        argument(6)?.into(),
+                        argument(7)?.into(),
+                        argument(8)?.into(),
+                    ],
+                )?
+                .ok_or_else(|| {
+                    backend_failure("assertion collection presentation produced no result")
                 })?,
             Kind::ToBytes => self
                 .call_runtime(

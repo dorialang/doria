@@ -33,10 +33,10 @@ foreach ($files as $key => $relative) {
 $required = [
     'decision' => [
         '**Status:** Accepted',
-        '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Next; Foundation In Progress',
+        '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Compiler/Runtime In Progress; Foundation In Progress',
         'Native Testing Foundation Slice 1 - Complete',
         'Native Testing Foundation Slice 2 - Complete',
-        'Native Testing Foundation Slice 3 - Next',
+        'Native Testing Foundation Slice 3 - Compiler/Runtime In Progress',
         'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
         'no runtime registration',
         'no Baton source parsing',

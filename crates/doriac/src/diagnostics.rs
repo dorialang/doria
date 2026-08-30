@@ -1162,6 +1162,15 @@ fn render_assertion_values(rendered: &mut String, diagnostic: &Diagnostic) {
             ));
         }
     }
+    if boolean(doria_diagnostic_catalogue::ASSERTION_DIFFERENCE_PRESENT_FACT) == Some(true) {
+        if let Some(value) = text(doria_diagnostic_catalogue::ASSERTION_DIFFERENCE_FACT) {
+            rendered.push_str("\n\nDifference\n  ");
+            rendered.push_str(&terminal_safe_runtime_text(
+                value,
+                doria_diagnostic_catalogue::RuntimeTextPresentation::Human,
+            ));
+        }
+    }
 }
 
 fn terminal_safe_runtime_text(

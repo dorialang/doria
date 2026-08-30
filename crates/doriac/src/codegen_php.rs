@@ -44,7 +44,7 @@ final class __DoriaCheckedError extends Exception
     private bool $__doriaLive = true;
 
     public function __construct(
-        private __DoriaErrorValue $error,
+        private ?__DoriaErrorValue $error,
         public __DoriaErrorDescriptor $descriptor,
         public int $origin,
     ) {
@@ -53,21 +53,31 @@ final class __DoriaCheckedError extends Exception
 
     public function error(): __DoriaErrorValue
     {
+        if (!$this->__doriaLive || $this->error === null) {
+            throw new LogicException("compiler invariant violated: moved Doria error was used");
+        }
         return $this->error;
     }
 
     public function takeError(): __DoriaErrorValue
     {
+        $error = $this->error();
+        $this->error = null;
         $this->__doriaLive = false;
-        return $this->error;
+        return $error;
     }
 
     public function dropError(): void
     {
-        if ($this->__doriaLive && function_exists("__doria_drop_value")) {
-            __doria_drop_value($this->error);
+        if (!$this->__doriaLive || $this->error === null) {
+            return;
         }
+        $error = $this->error;
+        $this->error = null;
         $this->__doriaLive = false;
+        if (function_exists("__doria_drop_value")) {
+            __doria_drop_value($error);
+        }
     }
 
     public function __destruct()
@@ -125,6 +135,39 @@ function __doria_safe_error_message(string $message): string
     return $safe;
 }
 
+function __doria_bound_assertion_text(string $presentation): string
+{
+    if (strlen($presentation) <= 4096) {
+        return $presentation;
+    }
+    $marker = "...<truncated>";
+    $prefix = substr($presentation, 0, 4096 - strlen($marker));
+    while ($prefix !== "" && preg_match('//u', $prefix) !== 1) {
+        $prefix = substr($prefix, 0, -1);
+    }
+    return $prefix . $marker;
+}
+
+function __doria_assertion_error_message(string $message): string
+{
+    $escaped = "";
+    $length = strlen($message);
+    for ($index = 0; $index < $length; ++$index) {
+        $byte = ord($message[$index]);
+        $escaped .= match ($byte) {
+            34 => "\\\"",
+            92 => "\\\\",
+            10 => "\\n",
+            13 => "\\r",
+            9 => "\\t",
+            default => $byte < 0x20 || $byte === 0x7f
+                ? sprintf("\\u00%02x", $byte)
+                : $message[$index],
+        };
+    }
+    return __doria_bound_assertion_text($escaped);
+}
+
 function __doria_assertion_presentation(mixed $value, string $type): string
 {
     if ($value === null) {
@@ -132,6 +175,10 @@ function __doria_assertion_presentation(mixed $value, string $type): string
     } elseif ($type === "string" || $type === "?string") {
         $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
         $presentation = $encoded === false ? "\"<invalid string>\"" : $encoded;
+    } elseif ($type === "Bytes" || str_ends_with($type, "[]") ||
+        preg_match('/^(List|Dictionary|SortedDictionary|Set|SortedSet|PriorityQueue|Deque)</', $type) === 1
+    ) {
+        return __doria_assertion_collection_presentation($value, $type);
     } elseif (is_bool($value)) {
         $presentation = $value ? "true" : "false";
     } elseif (is_int($value) || is_float($value)) {
@@ -143,15 +190,165 @@ function __doria_assertion_presentation(mixed $value, string $type): string
     } else {
         $presentation = "<" . $type . ">";
     }
-    if (strlen($presentation) <= 4096) {
-        return $presentation;
+    return __doria_bound_assertion_text($presentation);
+}
+
+function __doria_assertion_type_arguments(string $type): array
+{
+    $open = strpos($type, '<');
+    if ($open === false || !str_ends_with($type, '>')) { return []; }
+    $arguments = [];
+    $start = $open + 1;
+    $depth = 0;
+    $length = strlen($type) - 1;
+    for ($index = $start; $index < $length; ++$index) {
+        $character = $type[$index];
+        if ($character === '<') { ++$depth; }
+        elseif ($character === '>') { --$depth; }
+        elseif ($character === ',' && $depth === 0) {
+            $arguments[] = trim(substr($type, $start, $index - $start));
+            $start = $index + 1;
+        }
     }
-    $marker = "...<truncated>";
-    $prefix = substr($presentation, 0, 4096 - strlen($marker));
-    while ($prefix !== "" && preg_match('//u', $prefix) !== 1) {
+    $arguments[] = trim(substr($type, $start, $length - $start));
+    return $arguments;
+}
+
+function __doria_assertion_item_presentation(mixed $value, string $type): string
+{
+    if ($value === null) { return "null"; }
+    $type = ltrim($type, '?');
+    if ($type === 'string') {
+        $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        return $encoded === false ? '"<invalid string>"' : $encoded;
+    }
+    if (is_bool($value)) { return $value ? 'true' : 'false'; }
+    if (is_int($value) || is_float($value)) { return __doria_display($value); }
+    if ($value instanceof \UnitEnum) { return $type . '::' . $value->name; }
+    return '<' . $type . '>';
+}
+
+function __doria_assertion_collection_presentation(mixed $value, string $type): string
+{
+    $count = __doria_assertion_collection_count($value);
+    if ($type === 'Bytes') {
+        $items = [];
+        foreach ($value as $byte) {
+            if (count($items) === 8) { break; }
+            $items[] = sprintf('%02x', $byte);
+        }
+        $suffix = $count > 8 ? ' ...<truncated>' : '';
+        return __doria_bound_assertion_text(
+            'Bytes(length: ' . $count . ', hex: "' . implode(' ', $items) . $suffix . '")'
+        );
+    }
+    if (str_starts_with($type, 'PriorityQueue<')) {
+        return __doria_bound_assertion_text($type . '(count: ' . $count . ')');
+    }
+
+    $dictionary = str_starts_with($type, 'Dictionary<') ||
+        str_starts_with($type, 'SortedDictionary<');
+    $set = str_starts_with($type, 'Set<') || str_starts_with($type, 'SortedSet<');
+    $typedArray = str_ends_with($type, '[]');
+    $arguments = __doria_assertion_type_arguments($type);
+    $keyType = $dictionary ? ($arguments[0] ?? 'mixed') : '';
+    $valueType = $typedArray
+        ? substr($type, 0, -2)
+        : ($arguments[$dictionary ? 1 : 0] ?? 'mixed');
+    $presentation = $typedArray
+        ? '['
+        : $type . '(count: ' . $count . ') ' . (($dictionary || $set) ? '{' : '[');
+    $shown = 0;
+    foreach ($value as $key => $item) {
+        if ($shown === 8) { break; }
+        if ($shown !== 0) { $presentation .= ', '; }
+        if ($dictionary) {
+            $presentation .= __doria_assertion_item_presentation($key, $keyType) . ' => ';
+        }
+        $presentation .= __doria_assertion_item_presentation($item, $valueType);
+        ++$shown;
+    }
+    if ($count > 8) {
+        if ($shown !== 0) { $presentation .= ', '; }
+        $presentation .= '...<truncated>';
+    }
+    $presentation .= ($dictionary || $set) ? '}' : ']';
+    return __doria_bound_assertion_text($presentation);
+}
+
+function __doria_assertion_string_difference(string $actual, string $expected, int $mode): string
+{
+    preg_match_all('/\X/u', $actual, $actualMatches);
+    preg_match_all('/\X/u', $expected, $expectedMatches);
+    $actualGraphemes = $actualMatches[0];
+    $expectedGraphemes = $expectedMatches[0];
+    if ($mode === 2) {
+        $common = min(count($actualGraphemes), count($expectedGraphemes));
+        $actualGraphemes = array_slice($actualGraphemes, count($actualGraphemes) - $common);
+        $expectedGraphemes = array_slice($expectedGraphemes, count($expectedGraphemes) - $common);
+    }
+    $common = min(count($actualGraphemes), count($expectedGraphemes));
+    $index = $common;
+    for ($candidate = 0; $candidate < $common; ++$candidate) {
+        if ($actualGraphemes[$candidate] !== $expectedGraphemes[$candidate]) {
+            $index = $candidate;
+            break;
+        }
+    }
+    $relation = $mode === 1 ? 'Prefix' : ($mode === 2 ? 'Suffix' : 'Value');
+    $actualText = __doria_assertion_presentation($actual, 'string');
+    $expectedText = __doria_assertion_presentation($expected, 'string');
+    $difference = 'First Differing Grapheme: ' . $index . "\n" .
+        'Expected ' . $relation . ': ' . $expectedText . "\n" .
+        'Actual ' . $relation . ': ' . $actualText . "\n" .
+        'Expected Grapheme Length: ' . count($expectedMatches[0]) . "\n" .
+        'Actual Grapheme Length: ' . count($actualMatches[0]);
+    if (strlen($difference) <= 4096) { return $difference; }
+    $marker = '...<truncated>';
+    $prefix = substr($difference, 0, 4096 - strlen($marker));
+    while ($prefix !== '' && preg_match('//u', $prefix) !== 1) {
         $prefix = substr($prefix, 0, -1);
     }
     return $prefix . $marker;
+}
+
+function __doria_assertion_decimal_add(string $left, string $right): string
+{
+    $carry = 0;
+    $result = '';
+    for ($leftIndex = strlen($left) - 1, $rightIndex = strlen($right) - 1;
+        $leftIndex >= 0 || $rightIndex >= 0 || $carry !== 0;
+        --$leftIndex, --$rightIndex
+    ) {
+        $sum = $carry + ($leftIndex >= 0 ? ord($left[$leftIndex]) - 48 : 0) +
+            ($rightIndex >= 0 ? ord($right[$rightIndex]) - 48 : 0);
+        $result = chr(48 + ($sum % 10)) . $result;
+        $carry = intdiv($sum, 10);
+    }
+    return $result;
+}
+
+function __doria_assertion_count_difference(mixed $collection, int $expected): string
+{
+    $actual = __doria_assertion_collection_count($collection);
+    $delta = $expected < 0 && $actual > PHP_INT_MAX + $expected
+        ? __doria_assertion_decimal_add((string) $actual, substr((string) $expected, 1))
+        : (string) ($actual - $expected);
+    return "Expected Count: " . $expected . "\nActual Count: " . $actual . "\nDelta: " . $delta;
+}
+
+function __doria_assertion_bytes_difference(array $actual, array $expected): string
+{
+    $common = min(count($actual), count($expected));
+    for ($index = 0; $index < $common; ++$index) {
+        if ($actual[$index] !== $expected[$index]) {
+            return "First Differing Byte: " . $index . "\nExpected Byte: " .
+                sprintf('%02x', $expected[$index]) . "\nActual Byte: " .
+                sprintf('%02x', $actual[$index]);
+        }
+    }
+    return "Expected Byte Length: " . count($expected) . "\nActual Byte Length: " .
+        count($actual) . "\nDelta: " . (count($actual) - count($expected));
 }
 
 function __doria_u64_le(int $value): string
@@ -256,12 +453,14 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
     }
     if ($assertion) {
         [, , $actualPresent, , $actualPresentation,
-            $expectedPresent, , $expectedPresentation] = $facts;
+            $expectedPresent, , $expectedPresentation,
+            $differencePresent, $difference] = $facts;
         $message = "Error[R1001]: Assertion Failed\n\nWhere\n" .
             $sourcePath . " · line " . $line . " · " . $error->__doriaErrorCallable() . "\n\n" .
             $lineText . "\n" . str_repeat(" ", $markerOffset) . "^\nAssertion Failed Here" .
             ($expectedPresent ? "\n\nExpected\n  " . $expectedPresentation : "") .
             ($actualPresent ? "\n\nActual\n  " . $actualPresentation : "") .
+            ($differencePresent ? "\n\nDifference\n  " . __doria_safe_error_message($difference) : "") .
             "\n\nWhy\n  " . __doria_safe_error_message($error->message) .
             "\n\nProcess Exited With Status 70\n";
         @fwrite(STDERR, $message);
@@ -310,6 +509,36 @@ abstract class __DoriaOrderedCollection
             unset($pairs[$key]);
         }
     }
+}
+
+function __doria_assertion_collection_count(mixed $collection): int
+{
+    return is_array($collection) ? count($collection) : $collection->count;
+}
+
+function __doria_assertion_collection_contains(mixed $collection, mixed $value): bool
+{
+    if (!is_array($collection)) { return $collection->contains($value); }
+    foreach ($collection as $candidate) {
+        if (__doria_equal($candidate, $value)) { return true; }
+    }
+    return false;
+}
+
+function __doria_assertion_dictionary_has_key(mixed $collection, mixed $key): bool
+{
+    return is_array($collection)
+        ? array_key_exists($key, $collection)
+        : $collection->containsKey($key);
+}
+
+function __doria_assertion_dictionary_has_value(mixed $collection, mixed $value): bool
+{
+    if (!is_array($collection)) { return $collection->containsValue($value); }
+    foreach ($collection as $candidate) {
+        if (__doria_equal($candidate, $value)) { return true; }
+    }
+    return false;
 }
 
 final class SortedDictionary extends __DoriaOrderedCollection implements ArrayAccess, IteratorAggregate
@@ -537,6 +766,13 @@ final class PriorityQueue extends __DoriaOrderedCollection
         if ($this->heap) { $this->heap[0] = $last; $this->siftDown(0); }
         return $value;
     }
+    public function contains(mixed $value): bool
+    {
+        foreach ($this->heap as $candidate) {
+            if ($candidate === $value) { return true; }
+        }
+        return false;
+    }
     public function clear(): void
     {
         $heap = $this->heap;
@@ -604,6 +840,15 @@ final class Deque extends __DoriaOrderedCollection implements IteratorAggregate
         unset($this->values[$index]);
         --$this->count;
         return $value;
+    }
+    public function contains(mixed $value): bool
+    {
+        for ($offset = 0; $offset < $this->count; ++$offset) {
+            if ($this->values[($this->head + $offset) % $this->capacity] === $value) {
+                return true;
+            }
+        }
+        return false;
     }
     public function clear(): void
     {
@@ -2082,12 +2327,6 @@ fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
     if crate::types::SharedHandleKind::from_source_name(&ty.name).is_some() {
         return Err(unsupported_shared_ownership(span));
     }
-    if ty.name == "Bytes" {
-        return Err(unsupported_collection_shape(
-            span,
-            "the native `Bytes` runtime representation",
-        ));
-    }
     for argument in ty.type_arguments() {
         validate_type(argument, span)?;
     }
@@ -2484,6 +2723,11 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
                     *span,
                     format!("Unicode String operation `String::{method}`"),
                 ));
+            }
+            if (class_name == "Bytes" && method == "fromArray" && args.len() == 1)
+                || (class_name == "Set" && method == "from" && args.len() == 1)
+            {
+                return validate_arguments(args, semantic_info);
             }
             if matches!(class_name.as_str(), "Bytes" | "Set") {
                 validate_arguments(args, semantic_info)?;
@@ -4634,8 +4878,42 @@ fn assertion_type_name(ty: &ResolvedType) -> String {
         ResolvedType::Mixed => "mixed".to_string(),
         ResolvedType::Error => "Error".to_string(),
         ResolvedType::Enum(ty) => ty.name.clone(),
-        ResolvedType::Class(ty) => format!("class {}", ty.name),
+        ResolvedType::Class(ty) => {
+            if ty.arguments.is_empty() {
+                ty.name.clone()
+            } else {
+                format!(
+                    "{}<{}>",
+                    ty.name,
+                    ty.arguments
+                        .iter()
+                        .map(assertion_type_name)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        }
         ResolvedType::Nullable(inner) => format!("?{}", assertion_type_name(inner)),
+        ResolvedType::TypedArray(element) => format!("{}[]", assertion_type_name(element)),
+        ResolvedType::List(element) => format!("List<{}>", assertion_type_name(element)),
+        ResolvedType::Dictionary(key, value) => format!(
+            "Dictionary<{}, {}>",
+            assertion_type_name(key),
+            assertion_type_name(value)
+        ),
+        ResolvedType::SortedDictionary(key, value) => format!(
+            "SortedDictionary<{}, {}>",
+            assertion_type_name(key),
+            assertion_type_name(value)
+        ),
+        ResolvedType::Set(element) => format!("Set<{}>", assertion_type_name(element)),
+        ResolvedType::SortedSet(element) => {
+            format!("SortedSet<{}>", assertion_type_name(element))
+        }
+        ResolvedType::PriorityQueue(element) => {
+            format!("PriorityQueue<{}>", assertion_type_name(element))
+        }
+        ResolvedType::Deque(element) => format!("Deque<{}>", assertion_type_name(element)),
         other => resolved_type_identity(other),
     }
 }
@@ -4691,44 +4969,219 @@ fn emit_assertion_statement(
         );
         name
     });
-    let comparison = match assertion.matcher {
-        crate::assertions::AssertionMatcher::Equal => {
-            format!("__doria_equal(${actual}, ${})", expected.as_ref().unwrap())
+    let throw_facts = if assertion.matcher == crate::assertions::AssertionMatcher::Throws {
+        let actual_type = scopes.fresh_temp("__doria_assertion_throw_actual_type");
+        let actual_presentation = scopes.fresh_temp("__doria_assertion_throw_actual_presentation");
+        let expected_type = scopes.fresh_temp("__doria_assertion_throw_expected_type");
+        let expected_presentation =
+            scopes.fresh_temp("__doria_assertion_throw_expected_presentation");
+        let difference = scopes.fresh_temp("__doria_assertion_throw_difference");
+        let expected_error_type = match assertion.expected_type.as_ref() {
+            Some(ResolvedType::Function(function)) => match &function
+                .parameters
+                .first()
+                .expect("checked throw inspector has one parameter")
+                .ty
+            {
+                ResolvedType::Class(class) => class.name.as_str(),
+                ResolvedType::Error => "Error",
+                _ => unreachable!("checked throw inspector parameter implements Error"),
+            },
+            _ => "Error",
+        };
+        writeln(output, indent, &format!("${actual_type} = \"NoError\";"));
+        writeln(
+            output,
+            indent,
+            &format!("${actual_presentation} = \"No Checked Error\";"),
+        );
+        writeln(
+            output,
+            indent,
+            &format!(
+                "${expected_type} = {};",
+                emit_php_string_literal(if assertion.negated {
+                    "NoError"
+                } else {
+                    expected_error_type
+                })
+            ),
+        );
+        writeln(
+            output,
+            indent,
+            &format!(
+                "${expected_presentation} = {};",
+                emit_php_string_literal(if assertion.negated {
+                    "No Checked Error"
+                } else if expected_error_type == "Error" {
+                    "A Checked Error"
+                } else {
+                    expected_error_type
+                })
+            ),
+        );
+        writeln(
+            output,
+            indent,
+            &format!("${difference} = \"No Checked Error Was Produced\";"),
+        );
+        Some((
+            actual_type,
+            actual_presentation,
+            expected_type,
+            expected_presentation,
+            difference,
+        ))
+    } else {
+        None
+    };
+    let comparison = if assertion.matcher == crate::assertions::AssertionMatcher::Throws {
+        let (throw_actual_type, throw_actual_presentation, _, _, throw_difference) =
+            throw_facts.as_ref().expect("throw facts");
+        let threw = scopes.fresh_temp("__doria_assertion_threw");
+        let result = scopes.fresh_temp("__doria_assertion_result");
+        let caught = scopes.fresh_temp("__doria_assertion_caught");
+        writeln(output, indent, &format!("${threw} = false;"));
+        writeln(output, indent, "try");
+        writeln(output, indent, "{");
+        writeln(output, indent + 1, &format!("${result} = (${actual})();"));
+        writeln(
+            output,
+            indent + 1,
+            &format!("__doria_drop_value(${result});"),
+        );
+        writeln(output, indent, "}");
+        writeln(
+            output,
+            indent,
+            &format!("catch (__DoriaCheckedError ${caught})"),
+        );
+        writeln(output, indent, "{");
+        let caught_error = scopes.fresh_temp("__doria_assertion_error");
+        writeln(
+            output,
+            indent + 1,
+            &format!("${caught_error} = ${caught}->error();"),
+        );
+        writeln(
+            output,
+            indent + 1,
+            &format!("${throw_actual_type} = ${caught}->descriptor->typeName;"),
+        );
+        writeln(
+            output,
+            indent + 1,
+            &format!(
+                "${throw_actual_presentation} = __doria_bound_assertion_text(${throw_actual_type} . {} . __doria_assertion_error_message(${caught_error}->message));",
+                emit_php_string_literal(": ")
+            ),
+        );
+        writeln(
+            output,
+            indent + 1,
+            &format!(
+                "${throw_difference} = {};",
+                emit_php_string_literal(if assertion.negated {
+                    "A Checked Error Was Produced"
+                } else {
+                    "The Checked Error Type Did Not Match"
+                })
+            ),
+        );
+        if let Some(inspector) = expected.as_ref() {
+            let parameter = match assertion.expected_type.as_ref() {
+                Some(ResolvedType::Function(function)) => function.parameters.first(),
+                _ => None,
+            }
+            .expect("checked throw inspector has one parameter");
+            let exact = match &parameter.ty {
+                ResolvedType::Class(class) => Some(php_symbol_name(&class.name)),
+                ResolvedType::Error => None,
+                _ => unreachable!("checked throw inspector parameter implements Error"),
+            };
+            let error = format!("${caught_error}");
+            if let Some(exact) = exact {
+                writeln(
+                    output,
+                    indent + 1,
+                    &format!("if (${caught}->descriptor === {exact}::__doriaErrorType())"),
+                );
+                writeln(output, indent + 1, "{");
+                writeln(output, indent + 2, &format!("(${inspector})({error});"));
+                writeln(output, indent + 2, &format!("${threw} = true;"));
+                writeln(output, indent + 1, "}");
+            } else {
+                writeln(output, indent + 1, &format!("(${inspector})({error});"));
+                writeln(output, indent + 1, &format!("${threw} = true;"));
+            }
+        } else {
+            writeln(output, indent + 1, &format!("${threw} = true;"));
         }
-        crate::assertions::AssertionMatcher::Null => format!("${actual} === null"),
-        crate::assertions::AssertionMatcher::True => format!("${actual} === true"),
-        crate::assertions::AssertionMatcher::False => format!("${actual} === false"),
-        crate::assertions::AssertionMatcher::GreaterThan => {
-            format!(
-                "__doria_greater(${actual}, ${})",
+        writeln(output, indent + 1, &format!("unset(${caught_error});"));
+        writeln(output, indent + 1, &format!("unset(${caught});"));
+        writeln(output, indent, "}");
+        format!("${threw}")
+    } else {
+        match assertion.matcher {
+            crate::assertions::AssertionMatcher::Equal => {
+                format!("__doria_equal(${actual}, ${})", expected.as_ref().unwrap())
+            }
+            crate::assertions::AssertionMatcher::Null => format!("${actual} === null"),
+            crate::assertions::AssertionMatcher::True => format!("${actual} === true"),
+            crate::assertions::AssertionMatcher::False => format!("${actual} === false"),
+            crate::assertions::AssertionMatcher::GreaterThan => {
+                format!(
+                    "__doria_greater(${actual}, ${})",
+                    expected.as_ref().unwrap()
+                )
+            }
+            crate::assertions::AssertionMatcher::GreaterThanOrEqual => format!(
+                "__doria_greater_equal(${actual}, ${})",
                 expected.as_ref().unwrap()
-            )
-        }
-        crate::assertions::AssertionMatcher::GreaterThanOrEqual => format!(
-            "__doria_greater_equal(${actual}, ${})",
-            expected.as_ref().unwrap()
-        ),
-        crate::assertions::AssertionMatcher::LessThan => {
-            format!("__doria_less(${actual}, ${})", expected.as_ref().unwrap())
-        }
-        crate::assertions::AssertionMatcher::LessThanOrEqual => format!(
-            "__doria_less_equal(${actual}, ${})",
-            expected.as_ref().unwrap()
-        ),
-        crate::assertions::AssertionMatcher::StringContains => {
-            format!("str_contains(${actual}, ${})", expected.as_ref().unwrap())
-        }
-        crate::assertions::AssertionMatcher::StringStartsWith => {
-            format!(
-                "str_starts_with(${actual}, ${})",
+            ),
+            crate::assertions::AssertionMatcher::LessThan => {
+                format!("__doria_less(${actual}, ${})", expected.as_ref().unwrap())
+            }
+            crate::assertions::AssertionMatcher::LessThanOrEqual => format!(
+                "__doria_less_equal(${actual}, ${})",
                 expected.as_ref().unwrap()
-            )
+            ),
+            crate::assertions::AssertionMatcher::StringContains => {
+                format!("str_contains(${actual}, ${})", expected.as_ref().unwrap())
+            }
+            crate::assertions::AssertionMatcher::StringStartsWith => {
+                format!(
+                    "str_starts_with(${actual}, ${})",
+                    expected.as_ref().unwrap()
+                )
+            }
+            crate::assertions::AssertionMatcher::StringEndsWith => {
+                format!("str_ends_with(${actual}, ${})", expected.as_ref().unwrap())
+            }
+            crate::assertions::AssertionMatcher::StringEmpty => format!("${actual} === \"\""),
+            crate::assertions::AssertionMatcher::CollectionContains => format!(
+                "__doria_assertion_collection_contains(${actual}, ${})",
+                expected.as_ref().unwrap()
+            ),
+            crate::assertions::AssertionMatcher::CollectionEmpty => {
+                format!("__doria_assertion_collection_count(${actual}) === 0")
+            }
+            crate::assertions::AssertionMatcher::CollectionCount => format!(
+                "__doria_assertion_collection_count(${actual}) === ${}",
+                expected.as_ref().unwrap()
+            ),
+            crate::assertions::AssertionMatcher::DictionaryHasKey => format!(
+                "__doria_assertion_dictionary_has_key(${actual}, ${})",
+                expected.as_ref().unwrap()
+            ),
+            crate::assertions::AssertionMatcher::DictionaryHasValue => format!(
+                "__doria_assertion_dictionary_has_value(${actual}, ${})",
+                expected.as_ref().unwrap()
+            ),
+            crate::assertions::AssertionMatcher::Throws => unreachable!(),
+            crate::assertions::AssertionMatcher::Fail => unreachable!(),
         }
-        crate::assertions::AssertionMatcher::StringEndsWith => {
-            format!("str_ends_with(${actual}, ${})", expected.as_ref().unwrap())
-        }
-        crate::assertions::AssertionMatcher::StringEmpty => format!("${actual} === \"\""),
-        crate::assertions::AssertionMatcher::Fail => unreachable!(),
     };
     let passed = if assertion.negated {
         format!("!({comparison})")
@@ -4737,68 +5190,144 @@ fn emit_assertion_statement(
     };
     writeln(output, indent, &format!("if (!({passed}))"));
     writeln(output, indent, "{");
-    let actual_type = assertion
-        .actual_type
-        .as_ref()
-        .map(assertion_type_name)
-        .unwrap_or_default();
-    let actual_presentation = scopes.fresh_temp("__doria_assertion_actual_text");
-    writeln(
-        output,
-        indent + 1,
-        &format!(
-            "${actual_presentation} = __doria_assertion_presentation(${actual}, {});",
-            emit_php_string_literal(&actual_type)
-        ),
-    );
-    let (expected_present, expected_type, expected_presentation) = if let Some(expected) = expected
-    {
-        let ty = assertion
-            .expected_type
-            .as_ref()
-            .map(assertion_type_name)
-            .unwrap_or_default();
-        let presentation = scopes.fresh_temp("__doria_assertion_expected_text");
-        writeln(
-            output,
-            indent + 1,
-            &format!(
-                "${presentation} = __doria_assertion_presentation(${expected}, {});",
-                emit_php_string_literal(&ty)
-            ),
-        );
-        (true, ty, format!("${presentation}"))
-    } else {
-        match assertion.matcher {
-            crate::assertions::AssertionMatcher::Null => {
-                (true, "null".to_string(), emit_php_string_literal("null"))
+    let (actual_type, actual_presentation) =
+        if let Some((throw_actual_type, throw_actual_presentation, _, _, _)) = throw_facts.as_ref()
+        {
+            (
+                format!("${throw_actual_type}"),
+                throw_actual_presentation.clone(),
+            )
+        } else {
+            let ty = assertion
+                .actual_type
+                .as_ref()
+                .map(assertion_type_name)
+                .unwrap_or_default();
+            let presentation = scopes.fresh_temp("__doria_assertion_actual_text");
+            writeln(
+                output,
+                indent + 1,
+                &format!(
+                    "${presentation} = __doria_assertion_presentation(${actual}, {});",
+                    emit_php_string_literal(&ty)
+                ),
+            );
+            (emit_php_string_literal(&ty), presentation)
+        };
+    let (expected_present, expected_type, expected_presentation) =
+        if let Some((_, _, throw_expected_type, throw_expected_presentation, _)) =
+            throw_facts.as_ref()
+        {
+            (
+                true,
+                format!("${throw_expected_type}"),
+                format!("${throw_expected_presentation}"),
+            )
+        } else if let Some(ref expected) = expected {
+            let ty = assertion
+                .expected_type
+                .as_ref()
+                .map(assertion_type_name)
+                .unwrap_or_default();
+            let presentation = scopes.fresh_temp("__doria_assertion_expected_text");
+            writeln(
+                output,
+                indent + 1,
+                &format!(
+                    "${presentation} = __doria_assertion_presentation(${expected}, {});",
+                    emit_php_string_literal(&ty)
+                ),
+            );
+            (
+                true,
+                emit_php_string_literal(&ty),
+                format!("${presentation}"),
+            )
+        } else {
+            match assertion.matcher {
+                crate::assertions::AssertionMatcher::Null => (
+                    true,
+                    emit_php_string_literal("null"),
+                    emit_php_string_literal("null"),
+                ),
+                crate::assertions::AssertionMatcher::True => (
+                    true,
+                    emit_php_string_literal("bool"),
+                    emit_php_string_literal("true"),
+                ),
+                crate::assertions::AssertionMatcher::False => (
+                    true,
+                    emit_php_string_literal("bool"),
+                    emit_php_string_literal("false"),
+                ),
+                crate::assertions::AssertionMatcher::StringEmpty => (
+                    true,
+                    emit_php_string_literal("string"),
+                    emit_php_string_literal("\"\""),
+                ),
+                _ => (
+                    false,
+                    emit_php_string_literal(""),
+                    emit_php_string_literal(""),
+                ),
             }
-            crate::assertions::AssertionMatcher::True => {
-                (true, "bool".to_string(), emit_php_string_literal("true"))
-            }
-            crate::assertions::AssertionMatcher::False => {
-                (true, "bool".to_string(), emit_php_string_literal("false"))
-            }
-            crate::assertions::AssertionMatcher::StringEmpty => {
-                (true, "string".to_string(), emit_php_string_literal("\"\""))
-            }
-            _ => (false, String::new(), emit_php_string_literal("")),
+        };
+    let static_difference =
+        crate::assertions::stable_difference(assertion.matcher, assertion.negated);
+    let dynamic_difference = match assertion.matcher {
+        crate::assertions::AssertionMatcher::Equal
+            if matches!(assertion.actual_type, Some(ResolvedType::String))
+                && matches!(assertion.expected_type, Some(ResolvedType::String)) =>
+        {
+            expected.as_ref().map(|expected| {
+                format!("__doria_assertion_string_difference(${actual}, ${expected}, 0)")
+            })
         }
+        crate::assertions::AssertionMatcher::StringStartsWith => {
+            expected.as_ref().map(|expected| {
+                format!("__doria_assertion_string_difference(${actual}, ${expected}, 1)")
+            })
+        }
+        crate::assertions::AssertionMatcher::StringEndsWith => expected.as_ref().map(|expected| {
+            format!("__doria_assertion_string_difference(${actual}, ${expected}, 2)")
+        }),
+        crate::assertions::AssertionMatcher::Equal
+            if matches!(assertion.actual_type, Some(ResolvedType::Bytes))
+                && matches!(assertion.expected_type, Some(ResolvedType::Bytes)) =>
+        {
+            expected.as_ref().map(|expected| {
+                format!("__doria_assertion_bytes_difference(${actual}, ${expected})")
+            })
+        }
+        crate::assertions::AssertionMatcher::CollectionCount => expected
+            .as_ref()
+            .map(|expected| format!("__doria_assertion_count_difference(${actual}, ${expected})")),
+        _ => None,
     };
+    let throw_difference = throw_facts
+        .as_ref()
+        .map(|(_, _, _, _, difference)| format!("${difference}"));
+    let difference_present =
+        throw_difference.is_some() || dynamic_difference.is_some() || static_difference.is_some();
+    let difference = throw_difference
+        .or(dynamic_difference)
+        .unwrap_or_else(|| emit_php_string_literal(static_difference.unwrap_or_default()));
     writeln(
         output,
         indent + 1,
         &format!(
-            "__doria_throw(new {error_class}({}, {}, {}, true, {}, ${actual_presentation}, {}, {}, {expected_presentation}, false, \"\", false, \"\"), {origin}, {});",
+            "__doria_throw(new {error_class}({}, {}, {}, true, {}, ${actual_presentation}, {}, {}, {expected_presentation}, {}, {}, false, \"\"), {origin}, {});",
             emit_php_string_literal(crate::assertions::stable_message(
                 assertion.matcher,
                 assertion.negated,
             )),
             emit_php_string_literal(matcher),
             if assertion.negated { "true" } else { "false" },
-            emit_php_string_literal(&actual_type),
+            actual_type,
             if expected_present { "true" } else { "false" },
-            emit_php_string_literal(&expected_type),
+            expected_type,
+            if difference_present { "true" } else { "false" },
+            difference,
             scopes.callable_identity(),
         ),
     );
@@ -5779,6 +6308,12 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             span,
             ..
         } => {
+            if ((class_name == "Bytes" && method == "fromArray")
+                || (class_name == "Set" && method == "from"))
+                && args.len() == 1
+            {
+                return format!("array_values({})", emit_expr(&args[0].value, scopes));
+            }
             if class_name == "SortedDictionary" && method == "from" && args.len() == 1 {
                 if let Expr::Array { elements, .. } = &args[0].value {
                     if elements.iter().all(|element| element.key.is_some()) {

@@ -37,10 +37,10 @@ foreach ($files as $key => $relative) {
 $required = [
     'decision' => [
         '**Status:** Accepted',
-        '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Next; Foundation In Progress',
+        '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Compiler/Runtime In Progress; Foundation In Progress',
         'Native Testing Foundation Slice 1 - Complete',
         'Native Testing Foundation Slice 2 - Complete',
-        'Native Testing Foundation Slice 3 - Next',
+        'Native Testing Foundation Slice 3 - Compiler/Runtime In Progress',
         'Slice 3 - Collection/Error Expectations, Baton Reporting, And Tooling Closure',
         'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
     ],
@@ -56,8 +56,10 @@ $required = [
     ],
     'matchers' => [
         'pub enum AssertionMatcher',
-        'pub const MATCHERS: [AssertionMatcher; 12]',
-        'pub const FUTURE_MATCHERS:',
+        'pub const MATCHER_SPECS: [MatcherSpec; 19]',
+        'CollectionContains',
+        'DictionaryHasKey',
+        'Throws',
         'pub const PRESENTATION_LIMIT: usize = 4096',
     ],
     'effects' => [
@@ -70,7 +72,7 @@ $required = [
         'expectation negation is the `not` property, not a method',
         'Expectation Cannot Be Negated More Than Once',
         'Expectation Value Cannot Escape',
-        'Native Testing Foundation Slice 3',
+        'check_throw_assertion',
     ],
     'hir' => ['Assertion(Box<Assertion>)', 'test_assertion_checked_effects'],
     'mir' => [

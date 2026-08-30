@@ -264,7 +264,9 @@ $require($phpPath, $php, [
     'final class __DoriaCheckedError extends Exception',
     'private bool $__doriaLive = true',
     'public function takeError(): __DoriaErrorValue',
-    '__doria_drop_value($this->error)',
+    '$error = $this->error;',
+    '$this->error = null;',
+    '__doria_drop_value($error)',
     '__doriaEnsureErrorOrigin',
     'catch (__DoriaCheckedError',
 ]);

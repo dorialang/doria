@@ -1,5 +1,6 @@
 use core::mem;
 use core::ptr;
+use core::{fmt, fmt::Write};
 
 use doria_unicode::{CaseMapping, PadSide, StringError, TrimMode};
 
@@ -187,6 +188,389 @@ pub unsafe extern "C" fn dr_v4_string_assertion_quote(
     }
     output.add(output_index).write(b'\"');
     result
+}
+
+struct AssertionBuffer {
+    bytes: [u8; ASSERTION_PRESENTATION_LIMIT],
+    length: usize,
+    truncated: bool,
+}
+
+impl AssertionBuffer {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; ASSERTION_PRESENTATION_LIMIT],
+            length: 0,
+            truncated: false,
+        }
+    }
+
+    unsafe fn finish(mut self, frame: *const DrStackFrameV2) -> *mut DrStringV1 {
+        if self.truncated {
+            let marker_start = ASSERTION_PRESENTATION_LIMIT - ASSERTION_TRUNCATION_MARKER.len();
+            self.length = self.length.min(marker_start);
+            self.bytes[marker_start..].copy_from_slice(ASSERTION_TRUNCATION_MARKER);
+            self.length = ASSERTION_PRESENTATION_LIMIT;
+        }
+        let result = new_result(frame, self.length);
+        if self.length != 0 {
+            ptr::copy_nonoverlapping(self.bytes.as_ptr(), string_bytes_mut(result), self.length);
+        }
+        result
+    }
+}
+
+impl fmt::Write for AssertionBuffer {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self.truncated {
+            return Ok(());
+        }
+        let available = ASSERTION_PRESENTATION_LIMIT
+            .saturating_sub(ASSERTION_TRUNCATION_MARKER.len())
+            .saturating_sub(self.length);
+        if value.len() <= available {
+            self.bytes[self.length..self.length + value.len()].copy_from_slice(value.as_bytes());
+            self.length += value.len();
+            return Ok(());
+        }
+        let mut accepted = available.min(value.len());
+        while !value.is_char_boundary(accepted) {
+            accepted -= 1;
+        }
+        self.bytes[self.length..self.length + accepted]
+            .copy_from_slice(&value.as_bytes()[..accepted]);
+        self.length += accepted;
+        self.truncated = true;
+        Ok(())
+    }
+}
+
+fn write_assertion_escaped(buffer: &mut AssertionBuffer, value: &str) {
+    for character in value.chars() {
+        match character {
+            '"' => {
+                let _ = buffer.write_str("\\\"");
+            }
+            '\\' => {
+                let _ = buffer.write_str("\\\\");
+            }
+            '\n' => {
+                let _ = buffer.write_str("\\n");
+            }
+            '\r' => {
+                let _ = buffer.write_str("\\r");
+            }
+            '\t' => {
+                let _ = buffer.write_str("\\t");
+            }
+            character if character.is_control() => {
+                let _ = write!(buffer, "\\u{:04x}", u32::from(character));
+            }
+            character => {
+                let _ = buffer.write_char(character);
+            }
+        }
+    }
+}
+
+fn write_assertion_quoted(buffer: &mut AssertionBuffer, value: &str) {
+    let _ = buffer.write_char('"');
+    write_assertion_escaped(buffer, value);
+    let _ = buffer.write_char('"');
+}
+
+fn first_differing_grapheme(actual: &str, expected: &str, suffix: bool) -> usize {
+    let actual_count = doria_unicode::grapheme_count(actual);
+    let expected_count = doria_unicode::grapheme_count(expected);
+    let common = actual_count.min(expected_count);
+    let actual_skip = if suffix { actual_count - common } else { 0 };
+    let expected_skip = if suffix { expected_count - common } else { 0 };
+    let mut actual_boundaries = doria_unicode::grapheme_boundaries(actual).skip(actual_skip);
+    let mut expected_boundaries = doria_unicode::grapheme_boundaries(expected).skip(expected_skip);
+    let mut actual_start = actual_boundaries.next().unwrap_or(actual.len());
+    let mut expected_start = expected_boundaries.next().unwrap_or(expected.len());
+    for index in 0..common {
+        let actual_end = actual_boundaries.next().unwrap_or(actual.len());
+        let expected_end = expected_boundaries.next().unwrap_or(expected.len());
+        if actual[actual_start..actual_end] != expected[expected_start..expected_end] {
+            return index;
+        }
+        actual_start = actual_end;
+        expected_start = expected_end;
+    }
+    common
+}
+
+/// Produces one bounded, grapheme-aware difference on an assertion failure.
+/// `mode` is 0 for equality, 1 for prefix, and 2 for suffix comparison.
+///
+/// # Safety
+/// Both strings must be live Doria strings and `frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_string_assertion_difference(
+    frame: *const DrStackFrameV2,
+    actual: *const DrStringV1,
+    expected: *const DrStringV1,
+    mode: i64,
+) -> *mut DrStringV1 {
+    let actual = text(actual);
+    let expected = text(expected);
+    let relation = match mode {
+        1 => "Prefix",
+        2 => "Suffix",
+        _ => "Value",
+    };
+    let index = first_differing_grapheme(actual, expected, mode == 2);
+    let mut buffer = AssertionBuffer::new();
+    let _ = write!(
+        buffer,
+        "First Differing Grapheme: {index}\nExpected {relation}: "
+    );
+    write_assertion_quoted(&mut buffer, expected);
+    let _ = write!(buffer, "\nActual {relation}: ");
+    write_assertion_quoted(&mut buffer, actual);
+    let _ = write!(
+        buffer,
+        "\nExpected Grapheme Length: {}\nActual Grapheme Length: {}",
+        doria_unicode::grapheme_count(expected),
+        doria_unicode::grapheme_count(actual),
+    );
+    buffer.finish(frame)
+}
+
+/// Produces one bounded, byte-aware difference on a failed Bytes equality.
+///
+/// # Safety
+/// Both values must be live Doria Bytes values and `frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_bytes_assertion_difference(
+    frame: *const DrStackFrameV2,
+    actual: *const DrBytesV1,
+    expected: *const DrBytesV1,
+) -> *mut DrStringV1 {
+    let actual = core::slice::from_raw_parts(bytes::data(actual), bytes::length(actual));
+    let expected = core::slice::from_raw_parts(bytes::data(expected), bytes::length(expected));
+    let common = actual.len().min(expected.len());
+    let mut buffer = AssertionBuffer::new();
+    if let Some(index) = (0..common).find(|index| actual[*index] != expected[*index]) {
+        let _ = write!(
+            buffer,
+            "First Differing Byte: {index}\nExpected Byte: {:02x}\nActual Byte: {:02x}",
+            expected[index], actual[index],
+        );
+    } else {
+        let _ = write!(
+            buffer,
+            "Expected Byte Length: {}\nActual Byte Length: {}\nDelta: {}",
+            expected.len(),
+            actual.len(),
+            (actual.len() as i128) - (expected.len() as i128),
+        );
+    }
+    buffer.finish(frame)
+}
+
+/// Produces one exact count delta without overflowing Doria's `int` domain.
+///
+/// # Safety
+/// `frame` must be null or point to a live stack frame.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_assertion_count_difference(
+    frame: *const DrStackFrameV2,
+    actual: i64,
+    expected: i64,
+) -> *mut DrStringV1 {
+    let mut buffer = AssertionBuffer::new();
+    let _ = write!(
+        buffer,
+        "Expected Count: {expected}\nActual Count: {actual}\nDelta: {}",
+        i128::from(actual) - i128::from(expected),
+    );
+    buffer.finish(frame)
+}
+
+/// Produces one bounded checked-Error presentation with escaped controls.
+///
+/// # Safety
+/// Both values must be live Doria strings and `frame` must be null or valid.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_error_assertion_presentation(
+    frame: *const DrStackFrameV2,
+    error_type: *const DrStringV1,
+    message: *const DrStringV1,
+) -> *mut DrStringV1 {
+    let mut buffer = AssertionBuffer::new();
+    let _ = write!(buffer, "{}: ", text(error_type));
+    write_assertion_escaped(&mut buffer, text(message));
+    buffer.finish(frame)
+}
+
+fn write_assertion_enum(buffer: &mut AssertionBuffer, value: u64, type_name: &str, cases: &str) {
+    let case = cases.lines().find_map(|entry| {
+        let (tag, name) = entry.split_once('\t')?;
+        (tag.parse::<u64>().ok() == Some(value)).then_some(name)
+    });
+    if let Some(case) = case {
+        let _ = write!(buffer, "{type_name}::{case}");
+    } else {
+        let _ = write!(buffer, "<{type_name}>");
+    }
+}
+
+unsafe fn write_assertion_collection_value(
+    buffer: &mut AssertionBuffer,
+    present: bool,
+    value: u64,
+    kind: i64,
+    type_name: &str,
+    enum_cases: &str,
+) {
+    if !present {
+        let _ = buffer.write_str("null");
+        return;
+    }
+    match kind {
+        1 => {
+            let _ = buffer.write_str(if value == 0 { "false" } else { "true" });
+        }
+        2 => {
+            let _ = write!(buffer, "{}", value as u8 as i8);
+        }
+        3 => {
+            let _ = write!(buffer, "{}", value as u16 as i16);
+        }
+        4 => {
+            let _ = write!(buffer, "{}", value as u32 as i32);
+        }
+        5 => {
+            let _ = write!(buffer, "{}", value as i64);
+        }
+        6 => {
+            let _ = write!(buffer, "{}", value as u8);
+        }
+        7 => {
+            let _ = write!(buffer, "{}", value as u16);
+        }
+        8 => {
+            let _ = write!(buffer, "{}", value as u32);
+        }
+        9 => {
+            let _ = write!(buffer, "{value}");
+        }
+        10 => {
+            let _ = write!(buffer, "{}", f32::from_bits(value as u32));
+        }
+        11 => {
+            let _ = write!(buffer, "{}", f64::from_bits(value));
+        }
+        12 => write_assertion_quoted(buffer, text(value as *const DrStringV1)),
+        13 => write_assertion_enum(buffer, value, type_name, enum_cases),
+        _ => {
+            let _ = write!(buffer, "<{type_name}>");
+        }
+    }
+}
+
+/// Produces one bounded public collection presentation without copying or
+/// mutating the collection. The numeric kind vocabulary is compiler-private.
+///
+/// # Safety
+/// The collection and string arguments must be live values of the shapes
+/// described by the compiler-provided kind metadata.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v4_collection_assertion_presentation(
+    frame: *const DrStackFrameV2,
+    value: *const u8,
+    type_name: *const DrStringV1,
+    collection_kind: i64,
+    value_kind: i64,
+    value_type_name: *const DrStringV1,
+    value_enum_cases: *const DrStringV1,
+    key_kind: i64,
+    key_type_name: *const DrStringV1,
+    key_enum_cases: *const DrStringV1,
+) -> *mut DrStringV1 {
+    const ITEM_LIMIT: usize = 8;
+    let type_name = text(type_name);
+    let value_type_name = text(value_type_name);
+    let value_enum_cases = text(value_enum_cases);
+    let key_type_name = text(key_type_name);
+    let key_enum_cases = text(key_enum_cases);
+    let mut buffer = AssertionBuffer::new();
+
+    if collection_kind == 0 {
+        let bytes = value.cast::<DrBytesV1>();
+        let length = bytes::length(bytes);
+        let _ = write!(buffer, "Bytes(length: {length}, hex: \"");
+        let contents = core::slice::from_raw_parts(bytes::data(bytes), length);
+        for (index, byte) in contents.iter().take(ITEM_LIMIT).enumerate() {
+            if index != 0 {
+                let _ = buffer.write_char(' ');
+            }
+            let _ = write!(buffer, "{byte:02x}");
+        }
+        if length > ITEM_LIMIT {
+            let _ = buffer.write_str(" ...<truncated>");
+        }
+        let _ = buffer.write_str("\")");
+        return buffer.finish(frame);
+    }
+
+    let collection = value.cast::<DrCollectionV1>();
+    let length = collection::length(collection);
+    match collection_kind {
+        1 => {
+            let _ = buffer.write_char('[');
+        }
+        3..=6 => {
+            let _ = write!(buffer, "{type_name}(count: {length}) {{");
+        }
+        7 => {
+            let _ = write!(buffer, "{type_name}(count: {length})");
+            return buffer.finish(frame);
+        }
+        _ => {
+            let _ = write!(buffer, "{type_name}(count: {length}) [");
+        }
+    }
+
+    for index in 0..length.min(ITEM_LIMIT) {
+        if index != 0 {
+            let _ = buffer.write_str(", ");
+        }
+        if matches!(collection_kind, 3 | 4) {
+            write_assertion_collection_value(
+                &mut buffer,
+                true,
+                collection::assertion_key_at(collection, index),
+                key_kind,
+                key_type_name,
+                key_enum_cases,
+            );
+            let _ = buffer.write_str(" => ");
+        }
+        let (present, value) = collection::assertion_value_at(collection, index);
+        write_assertion_collection_value(
+            &mut buffer,
+            present,
+            value,
+            value_kind,
+            value_type_name,
+            value_enum_cases,
+        );
+    }
+    if length > ITEM_LIMIT {
+        if ITEM_LIMIT != 0 {
+            let _ = buffer.write_str(", ");
+        }
+        let _ = buffer.write_str("...<truncated>");
+    }
+    let _ = buffer.write_char(if matches!(collection_kind, 3..=6) {
+        '}'
+    } else {
+        ']'
+    });
+    buffer.finish(frame)
 }
 
 unsafe fn transform(

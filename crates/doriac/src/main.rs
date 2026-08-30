@@ -1466,7 +1466,7 @@ fn decode_runtime_assertion_outcome(
     let expected_presentation = decoder.text(expected_presentation_length)?;
     let difference = decoder.text(difference_length)?;
     let user_message = decoder.text(user_message_length)?;
-    if error_type != ASSERTION_ERROR || difference_present || !difference.is_empty() {
+    if error_type != ASSERTION_ERROR {
         return Err("native program returned an invalid Slice-2 assertion identity".into());
     }
     let matcher = doriac::assertions::matcher_from_fact_name(&matcher_name)
@@ -1574,7 +1574,7 @@ fn decode_runtime_assertion_outcome(
         },
         RuntimeFact {
             name: doria_diagnostic_catalogue::ASSERTION_DIFFERENCE_PRESENT_FACT.to_string(),
-            value: RuntimeFactValue::Boolean(false),
+            value: RuntimeFactValue::Boolean(difference_present),
         },
         RuntimeFact {
             name: doria_diagnostic_catalogue::ASSERTION_DIFFERENCE_FACT.to_string(),
@@ -2072,8 +2072,13 @@ mod tests {
         oversized[29..33].copy_from_slice(&4097_u32.to_le_bytes());
         assert!(decode_error(&oversized).contains("oversized runtime assertion record"));
 
-        let mut difference = payload;
-        difference[42] = 1;
-        assert!(decode_error(&difference).contains("invalid Slice-2 assertion identity"));
+        let mut invalid_identity = payload;
+        let error_type = b"Doria\\Std\\Test\\AssertionError";
+        let error_type_offset = invalid_identity
+            .windows(error_type.len())
+            .position(|window| window == error_type)
+            .expect("encoded assertion error type");
+        invalid_identity[error_type_offset] = b'X';
+        assert!(decode_error(&invalid_identity).contains("invalid Slice-2 assertion identity"));
     }
 }

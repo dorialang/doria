@@ -11,6 +11,12 @@ declare(strict_types=1);
 (static function (): void {
     require __DIR__ . '/check_native_testing_slice1.php';
 })();
+(static function (): void {
+    require __DIR__ . '/check_native_testing_slice2.php';
+})();
+(static function (): void {
+    require __DIR__ . '/check_native_testing_slice3.php';
+})();
 
 require_once __DIR__ . '/check_stream_io_completeness.php';
 require_once __DIR__ . '/check_grouped_local_declarations.php';

@@ -43,10 +43,10 @@ if ($decision === false || $reference === false) {
 $requiredDecisionFacts = [
     '# Decision 0129: Native Testing Foundation, Behavioral DSL, Fluent Expectations, And Assertion Outcomes',
     '**Status:** Accepted',
-    '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Next; Foundation In Progress',
+    '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Compiler/Runtime In Progress; Foundation In Progress',
     'Native Testing Foundation Slice 1 - Complete',
     'Native Testing Foundation Slice 2 - Complete',
-    'Native Testing Foundation Slice 3 - Next',
+    'Native Testing Foundation Slice 3 - Compiler/Runtime In Progress',
     'Native Testing Foundation - In Progress, Not Complete',
     'Slice 1 - Behavioral Test DSL And Unified Compiler Metadata',
     'Slice 2 - Fluent Expectation Kernel And Assertion Semantics',

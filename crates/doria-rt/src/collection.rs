@@ -585,6 +585,22 @@ pub unsafe fn length(collection: *const DrCollectionV1) -> usize {
     (*collection).length
 }
 
+pub(crate) unsafe fn assertion_value_at(
+    collection: *const DrCollectionV1,
+    index: usize,
+) -> (bool, u64) {
+    debug_assert!(index < (*collection).length);
+    (
+        read_present(collection, index),
+        read_value(collection, index),
+    )
+}
+
+pub(crate) unsafe fn assertion_key_at(collection: *const DrCollectionV1, index: usize) -> u64 {
+    debug_assert!((*collection).keyed != 0 && index < (*collection).length);
+    *(*collection).keys.add(index)
+}
+
 pub unsafe fn push(collection: *mut DrCollectionV1, value: u64) {
     if (*collection).length == (*collection).capacity {
         grow(collection);
