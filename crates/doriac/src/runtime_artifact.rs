@@ -211,12 +211,13 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
         .and_then(Path::parent)
         .expect("doriac must live under the workspace crates directory");
     let target_override = env::var_os("CARGO_TARGET_DIR");
-    let embedded_runtime = materialize_embedded_runtime(profile)?;
+    let explicit_override = env::var_os("DORIA_RT_PATH");
+    let embedded_runtime = embedded_runtime_candidate(profile, explicit_override.as_deref())?;
     let compiler_runtime = embedded_runtime
         .as_deref()
         .or_else(|| compiler_built_runtime(profile));
     resolve(
-        env::var_os("DORIA_RT_PATH").as_deref(),
+        explicit_override.as_deref(),
         &current_executable,
         compiler_runtime,
         workspace,
@@ -229,6 +230,16 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
         profile_directory(profile),
         &RuntimeExpectation::current(profile),
     )
+}
+
+fn embedded_runtime_candidate(
+    profile: NativeProfile,
+    explicit_override: Option<&OsStr>,
+) -> Result<Option<PathBuf>, BackendError> {
+    if explicit_override.is_some() {
+        return Ok(None);
+    }
+    materialize_embedded_runtime(profile)
 }
 
 fn materialize_embedded_runtime(profile: NativeProfile) -> Result<Option<PathBuf>, BackendError> {
@@ -1073,6 +1084,15 @@ mod tests {
             .is_some());
         assert!(archive.starts_with(&directory));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn explicit_override_skips_embedded_runtime_materialization() {
+        assert_eq!(
+            embedded_runtime_candidate(NativeProfile::Fast, Some(OsStr::new("runtime")))
+                .expect("explicit runtime selection must not materialize the embedded archive"),
+            None
+        );
     }
 
     #[test]

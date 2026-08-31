@@ -15153,18 +15153,9 @@ fn assertion_local_value_presentation(
     ty: mir::Type,
 ) -> String {
     match value {
-        LocalValue::Scalar(mir::ScalarValue::Enum(value)) => program
-            .enums
-            .iter()
-            .find(|definition| definition.id == value.enum_id)
-            .and_then(|definition| {
-                definition
-                    .cases
-                    .iter()
-                    .find(|case| case.id == value.case_id)
-                    .map(|case| format!("{}::{}", definition.name, case.name))
-            })
-            .unwrap_or_else(|| format!("<{ty}>")),
+        LocalValue::Scalar(mir::ScalarValue::Enum(value)) => {
+            assertion_enum_presentation(program, *value, ty)
+        }
         LocalValue::Scalar(value) => display_scalar(*value),
         LocalValue::String(value) => crate::assertions::quote_string(value),
         LocalValue::NullableScalar { value: None, .. }
@@ -15180,11 +15171,34 @@ fn assertion_local_value_presentation(
         | LocalValue::NullablePayloadEnum { value: None, .. }
         | LocalValue::NullableFunction { value: None, .. } => "null".to_string(),
         LocalValue::NullableScalar {
+            value: Some(mir::ScalarValue::Enum(value)),
+            ..
+        } => assertion_enum_presentation(program, *value, ty),
+        LocalValue::NullableScalar {
             value: Some(value), ..
         } => display_scalar(*value),
         LocalValue::NullableString(Some(value)) => crate::assertions::quote_string(value),
         _ => format!("<{ty}>"),
     }
+}
+
+fn assertion_enum_presentation(
+    program: &mir::Program,
+    value: crate::enums::EnumValue,
+    ty: mir::Type,
+) -> String {
+    program
+        .enums
+        .iter()
+        .find(|definition| definition.id == value.enum_id)
+        .and_then(|definition| {
+            definition
+                .cases
+                .iter()
+                .find(|case| case.id == value.case_id)
+                .map(|case| format!("{}::{}", definition.name, case.name))
+        })
+        .unwrap_or_else(|| format!("<{ty}>"))
 }
 
 fn local_nullable_int(

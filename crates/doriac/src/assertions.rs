@@ -520,10 +520,19 @@ pub fn string_difference(actual: &str, expected: &str, mode: u8) -> String {
     let actual_count = actual_boundaries.len().saturating_sub(1);
     let expected_count = expected_boundaries.len().saturating_sub(1);
     let common = actual_count.min(expected_count);
+    let actual_skip = if mode == 2 { actual_count - common } else { 0 };
+    let expected_skip = if mode == 2 {
+        expected_count - common
+    } else {
+        0
+    };
     let first_difference = (0..common)
         .find(|index| {
-            actual[actual_boundaries[*index]..actual_boundaries[*index + 1]]
-                != expected[expected_boundaries[*index]..expected_boundaries[*index + 1]]
+            let actual_index = actual_skip + *index;
+            let expected_index = expected_skip + *index;
+            actual[actual_boundaries[actual_index]..actual_boundaries[actual_index + 1]]
+                != expected
+                    [expected_boundaries[expected_index]..expected_boundaries[expected_index + 1]]
         })
         .unwrap_or(common);
     let relation = match mode {
@@ -565,6 +574,7 @@ pub fn error_presentation(error_type: &str, message: &str) -> String {
     let mut result = format!("{error_type}: ");
     for character in message.chars() {
         match character {
+            '"' => result.push_str("\\\""),
             '\n' => result.push_str("\\n"),
             '\r' => result.push_str("\\r"),
             '\t' => result.push_str("\\t"),

@@ -207,10 +207,13 @@ impl AssertionBuffer {
 
     unsafe fn finish(mut self, frame: *const DrStackFrameV2) -> *mut DrStringV1 {
         if self.truncated {
-            let marker_start = ASSERTION_PRESENTATION_LIMIT - ASSERTION_TRUNCATION_MARKER.len();
-            self.length = self.length.min(marker_start);
-            self.bytes[marker_start..].copy_from_slice(ASSERTION_TRUNCATION_MARKER);
-            self.length = ASSERTION_PRESENTATION_LIMIT;
+            self.length = self
+                .length
+                .min(ASSERTION_PRESENTATION_LIMIT - ASSERTION_TRUNCATION_MARKER.len());
+            let marker_start = self.length;
+            let marker_end = marker_start + ASSERTION_TRUNCATION_MARKER.len();
+            self.bytes[marker_start..marker_end].copy_from_slice(ASSERTION_TRUNCATION_MARKER);
+            self.length += ASSERTION_TRUNCATION_MARKER.len();
         }
         let result = new_result(frame, self.length);
         if self.length != 0 {
@@ -406,6 +409,7 @@ pub unsafe extern "C" fn dr_v4_error_assertion_presentation(
 }
 
 fn write_assertion_enum(buffer: &mut AssertionBuffer, value: u64, type_name: &str, cases: &str) {
+    let type_name = type_name.strip_prefix('?').unwrap_or(type_name);
     let case = cases.lines().find_map(|entry| {
         let (tag, name) = entry.split_once('\t')?;
         (tag.parse::<u64>().ok() == Some(value)).then_some(name)
@@ -1090,6 +1094,7 @@ pub unsafe extern "C" fn dr_v1_string_from_bytes(value: *const DrBytesV1) -> *mu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::fmt::Write;
 
     unsafe fn string(value: &str) -> *mut DrStringV1 {
         crate::dr_v1_string_from_utf8(value.as_ptr(), value.len())
@@ -1097,6 +1102,40 @@ mod tests {
 
     unsafe fn read(value: *const DrStringV1) -> &'static str {
         text(value)
+    }
+
+    #[test]
+    fn assertion_buffer_appends_truncation_marker_after_a_utf8_boundary() {
+        unsafe {
+            let mut buffer = AssertionBuffer::new();
+            let prefix =
+                "a".repeat(ASSERTION_PRESENTATION_LIMIT - ASSERTION_TRUNCATION_MARKER.len() - 1);
+            buffer.write_str(&prefix).expect("write prefix");
+            buffer.write_str("é").expect("truncate at UTF-8 boundary");
+
+            let result = buffer.finish(ptr::null());
+            let presentation = read(result);
+            assert_eq!(
+                presentation,
+                format!(
+                    "{prefix}{}",
+                    core::str::from_utf8(ASSERTION_TRUNCATION_MARKER).unwrap()
+                )
+            );
+            assert!(!presentation.as_bytes().contains(&0));
+            crate::dr_v1_string_release(result);
+        }
+    }
+
+    #[test]
+    fn present_nullable_enum_values_use_the_public_case_name() {
+        unsafe {
+            let mut buffer = AssertionBuffer::new();
+            write_assertion_enum(&mut buffer, 1, "?State", "0\tWaiting\n1\tReady");
+            let result = buffer.finish(ptr::null());
+            assert_eq!(read(result), "State::Ready");
+            crate::dr_v1_string_release(result);
+        }
     }
 
     #[test]

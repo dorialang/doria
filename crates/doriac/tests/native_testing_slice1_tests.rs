@@ -303,6 +303,14 @@ fn first_behavioral_dispatcher(source: &str) -> String {
 }
 
 fn assert_behavioral_output_on_every_enabled_backend(source: &str, expected_stdout: &[u8]) {
+    assert_behavioral_output(source, expected_stdout, true);
+}
+
+fn assert_behavioral_output_on_native_backends(source: &str, expected_stdout: &[u8]) {
+    assert_behavioral_output(source, expected_stdout, false);
+}
+
+fn assert_behavioral_output(source: &str, expected_stdout: &[u8], include_php: bool) {
     let dispatcher = first_behavioral_dispatcher(source);
     let debug = doriac::compile_compilation_graph(&dispatcher_graph(
         source,
@@ -349,7 +357,7 @@ fn assert_behavioral_output_on_every_enabled_backend(source: &str, expected_stdo
         }
     }
 
-    if Command::new("php").arg("--version").output().is_ok() {
+    if include_php && Command::new("php").arg("--version").output().is_ok() {
         let php = doriac::compile_compilation_graph(&dispatcher_graph(
             source,
             &dispatcher,
@@ -1457,6 +1465,60 @@ function invalid(): void {
 }
 
 #[test]
+fn slice_three_once_inspector_cleanup_follows_only_unconsumed_paths() {
+    let source = r#"
+use Doria\Std\Test\{AssertionError, expect, it};
+
+internal class ExpectedFailure implements Error
+{
+    function __construct(string $message) {}
+}
+
+internal class ActualFailure implements Error
+{
+    function __construct(string $message) {}
+}
+
+internal class Marker
+{
+    function __construct(string $name) {}
+
+    function __destruct(): void
+    {
+        try { echo "drop {$this->name}\n"; }
+        catch (Doria\Std\Io\IoError) {}
+    }
+}
+
+it("once inspector cleanup", function (): void {
+    let $normal = new Marker("normal");
+    try {
+        expect(function (): void {})
+            ->toThrow(function (ExpectedFailure $error): void with (take $normal) {
+                if ($normal != $normal) { echo "unreachable"; }
+            });
+    } catch (AssertionError) {
+        echo "caught normal\n";
+    }
+
+    let $wrong = new Marker("wrong");
+    try {
+        expect(function (): void { throw new ActualFailure("wrong"); })
+            ->toThrow(function (ExpectedFailure $error): void with (take $wrong) {
+                if ($wrong != $wrong) { echo "unreachable"; }
+            });
+    } catch (AssertionError) {
+        echo "caught wrong\n";
+    }
+});
+"#;
+    assert_behavioral_output_on_native_backends(
+        source,
+        b"drop normal\ncaught normal\ndrop wrong\ncaught wrong\n",
+    );
+}
+
+#[test]
 fn slice_three_failure_facts_match_on_every_backend() {
     let no_error = r#"
 use Doria\Std\Test\{expect, it};
@@ -1494,6 +1556,31 @@ it("wrong error", function (): void {
             "ActualFailure: bad\\nmessage",
             "The Checked Error Type Did Not Match",
         ],
+    );
+
+    let quoted_error = r#"
+use Doria\Std\Test\{expect, it};
+internal class ExpectedFailure implements Error { function __construct(string $message) {} }
+internal class ActualFailure implements Error { function __construct(string $message) {} }
+it("quoted error", function (): void {
+    expect(function (): void { throw new ActualFailure("bad \"quote\""); })
+        ->toThrow(function (ExpectedFailure $error): void {});
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        quoted_error,
+        &["ActualFailure: bad \\\"quote\\\""],
+    );
+
+    let suffix = r#"
+use Doria\Std\Test\{expect, it};
+it("unaligned suffix", function (): void {
+    expect("xabc")->toEndWith("xbc");
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        suffix,
+        &["StringEndsWith", "First Differing Grapheme: 0"],
     );
 
     let negated_error = r#"
@@ -1623,6 +1710,19 @@ it("nullable preview", function (): void {
     assert_behavioral_failure_on_every_enabled_backend(
         nullable,
         &["CollectionContains", "List<?int>(count: 2) [null, 0]"],
+    );
+
+    let nullable_enum = r#"
+use Doria\Std\Test\{expect, it};
+internal enum State { case Ready; }
+it("nullable enum preview", function (): void {
+    List<?State> $values = [State::Ready];
+    expect($values)->toBeEmpty();
+});
+"#;
+    assert_behavioral_failure_on_every_enabled_backend(
+        nullable_enum,
+        &["CollectionEmpty", "List<?State>(count: 1) [State::Ready]"],
     );
 
     let opaque = r#"

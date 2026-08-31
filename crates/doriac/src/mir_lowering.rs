@@ -4308,6 +4308,7 @@ fn lower_throw_assertion_flow(
         .filter(|definition| definition.id == subject_type)
         .expect("checked throw subject function type exists")
         .clone();
+    let unused_inspector_cleanup = assertion_once_callable_cleanup(inspector, context);
     let result = assertion_call_result_slot(&subject_definition, context);
     let normal = context.create_block();
     let callee = mir::FunctionExpression::Local {
@@ -4331,7 +4332,13 @@ fn lower_throw_assertion_flow(
         });
         context.current_block = Some(caught_block);
         lower_caught_throw_assertion(
-            assertion, caught, inspector, success, failure, facts, context,
+            assertion,
+            caught,
+            inspector,
+            unused_inspector_cleanup,
+            (success, failure),
+            facts,
+            context,
         )?;
     } else {
         context.terminate_current(mir::Terminator::IndirectCall {
@@ -4349,6 +4356,9 @@ fn lower_throw_assertion_flow(
     if let Some((local, ty)) = result {
         emit_assertion_call_result_drop(local, ty, context);
     }
+    if let Some(cleanup) = unused_inspector_cleanup {
+        context.emit_drop_obligations(&[cleanup]);
+    }
     context.terminate_current(mir::Terminator::Jump(if assertion.negated {
         success
     } else {
@@ -4362,11 +4372,12 @@ fn lower_caught_throw_assertion(
     assertion: &hir::Assertion,
     caught: mir::LocalId,
     inspector: Option<mir::AssertionOperandPlan>,
-    success: mir::BlockId,
-    failure: mir::BlockId,
+    unused_inspector_cleanup: Option<DropObligation>,
+    destinations: (mir::BlockId, mir::BlockId),
     facts: ThrowAssertionFacts,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    let (success, failure) = destinations;
     materialize_caught_error_assertion_facts(caught, facts, assertion.span, context);
     if assertion.negated {
         replace_assertion_fact_string(
@@ -4432,6 +4443,9 @@ fn lower_caught_throw_assertion(
                 mir::StringExpression::Literal("The Checked Error Type Did Not Match".to_string()),
                 context,
             );
+            if let Some(cleanup) = unused_inspector_cleanup {
+                context.emit_drop_obligations(&[cleanup]);
+            }
             context.push_statement(mir::Statement::DropError { local: caught });
             context.terminate_current(mir::Terminator::Jump(failure));
             context.current_block = Some(matching);
@@ -4494,6 +4508,27 @@ fn lower_caught_throw_assertion(
     context.emit_drop_obligations(&[cleanup]);
     context.terminate_current(mir::Terminator::Jump(success));
     Ok(())
+}
+
+fn assertion_once_callable_cleanup(
+    operand: Option<mir::AssertionOperandPlan>,
+    context: &LoweringContext<'_>,
+) -> Option<DropObligation> {
+    let mir::AssertionOperandPlan::Local {
+        local,
+        ty: mir::Type::Function(function_type),
+    } = operand?
+    else {
+        return None;
+    };
+    let definition = context
+        .collection_registry
+        .function_types
+        .get(function_type.0)
+        .filter(|definition| definition.id == function_type)?;
+    (context.locals[local.0].owned
+        && definition.invocation_mode == mir::FunctionInvocationMode::Once)
+        .then(|| drop_obligation_for_owned_local(local, mir::Type::Function(function_type)))
 }
 
 fn materialize_caught_error_assertion_facts(
