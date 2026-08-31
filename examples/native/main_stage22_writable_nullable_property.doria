@@ -1,0 +1,36 @@
+class Window
+{
+    writable function render(string $message): void throws Doria\Std\Io\IoError
+    {
+        echo "render {$message}\n";
+    }
+}
+
+class Application
+{
+    internal writable ?Window $window = null;
+
+    writable function attach(): void
+    {
+        $this->window = new Window();
+    }
+
+    writable function render(string $name): void throws Doria\Std\Io\IoError
+    {
+        $this->window?->render(argument($name));
+    }
+}
+
+function argument(string $name): string throws Doria\Std\Io\IoError
+{
+    echo "argument {$name}\n";
+    return $name;
+}
+
+function main(): void
+{
+    let writable $application = new Application();
+    $application->render("absent");
+    $application->attach();
+    $application->render("present");
+}

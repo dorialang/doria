@@ -78,6 +78,44 @@ function main(): void throws Doria\Std\Io\IoError
 }
 
 #[test]
+fn php_backend_executes_writable_null_safe_property_calls() {
+    let source =
+        include_str!("../../../examples/native/main_stage22_writable_nullable_property.doria");
+    let php = doriac::compile_source_to_php("writable-null-safe-property.doria", source)
+        .expect("the PHP backend should lower writable null-safe property calls");
+
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\n{}();",
+        php.strip_prefix("<?php").expect("generated PHP header"),
+        php_function_name("main")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated null-safe property PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(
+        run.stdout,
+        include_bytes!(
+            "fixtures/native_io/main_stage22_writable_nullable_property/expected_stdout"
+        )
+    );
+}
+
+#[test]
 fn php_backend_emits_native_unit_and_backed_enums() {
     let php = doriac::compile_source_to_php(
         "stage27.doria",

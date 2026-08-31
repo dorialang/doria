@@ -405,6 +405,84 @@ fn same_package_sources_share_functions_and_internal_access() {
 }
 
 #[test]
+fn multi_source_graph_preserves_writable_nullable_property_receivers() {
+    let entry = "acme/application:src/main.doria";
+    let application = Package {
+        identity: "acme/application".to_string(),
+        root: ".".to_string(),
+        namespace_mappings: vec![NamespaceMapping {
+            prefix: "Doria\\Tui\\".to_string(),
+            path: "src/".to_string(),
+            scope: SourceScope::Main,
+            generated_for: None,
+        }],
+        sources: vec![
+            source("acme/application", "src/main.doria", SourceOrigin::Entry),
+            source(
+                "acme/application",
+                "src/Core/Application.doria",
+                SourceOrigin::Explicit,
+            ),
+            source(
+                "acme/application",
+                "src/Ui/Window.doria",
+                SourceOrigin::Explicit,
+            ),
+        ],
+        dependencies: Vec::new(),
+    };
+    let document = plan(vec![application], entry);
+    let mut provider = InMemorySourceProvider::new();
+    provider.insert(
+        "acme/application",
+        "src/main.doria",
+        r#"namespace Doria\Tui;
+use Doria\Tui\Core\Application;
+function main(): void
+{
+    let writable $application = new Application();
+    $application->attach();
+    $application->render();
+}
+"#,
+    );
+    provider.insert(
+        "acme/application",
+        "src/Core/Application.doria",
+        r#"namespace Doria\Tui\Core;
+use Doria\Tui\Ui\Window;
+class Application
+{
+    internal writable ?Window $window = null;
+    writable function attach(): void { $this->window = new Window(); }
+    writable function render(): void throws Doria\Std\Io\IoError
+    {
+        $this->window?->render();
+    }
+}
+"#,
+    );
+    provider.insert(
+        "acme/application",
+        "src/Ui/Window.doria",
+        r#"namespace Doria\Tui\Ui;
+class Window
+{
+    writable function render(): void throws Doria\Std\Io\IoError { echo "multi\n"; }
+}
+"#,
+    );
+
+    let graph = load_compilation_graph(&document, &provider).expect("complete multi-source graph");
+    let mir = doriac::lower_compilation_graph_to_mir(&graph)
+        .expect("the complete graph should lower writable nullable property calls");
+    let output = doriac::mir_interpreter::interpret(&mir)
+        .expect("the complete graph should execute through the debug interpreter");
+    assert_eq!(output.stdout, b"multi\n");
+    assert_eq!(output.exit_status, 0);
+}
+
+#[test]
 fn compiler_known_declarations_have_no_authored_source_or_package_ownership() {
     let entry = "acme/application:main.doria";
     let document = plan(

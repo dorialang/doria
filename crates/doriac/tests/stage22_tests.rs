@@ -1736,6 +1736,159 @@ function main(): void
 }
 
 #[test]
+fn writable_nullable_property_preserves_receiver_capability() {
+    let source = r#"
+class Window
+{
+    writable function render(): void throws Doria\Std\Io\IoError {}
+}
+
+class Application
+{
+    internal writable ?Window $window = null;
+
+    writable function render(): void throws Doria\Std\Io\IoError
+    {
+        $this->window?->render();
+    }
+}
+
+function main(): void
+{
+    let writable $application = new Application();
+    $application->render();
+}
+"#;
+
+    doriac::check_source("stage22-writable-nullable-property.doria", source)
+        .expect("a writable nullable property path should pass semantic checking");
+    let hir = doriac::lower_source("stage22-writable-nullable-property.doria", source)
+        .expect("a writable nullable property path should lower to HIR");
+    let program = doriac::mir_lowering::lower_program(&hir)
+        .expect("a writable nullable property path should lower to MIR");
+    doriac::mir_validation::validate_program(&program)
+        .expect("a writable nullable property path should pass shared MIR validation");
+
+    let application_render = program
+        .functions
+        .iter()
+        .find(|function| function.name == "Application::render")
+        .expect("fixture should contain Application::render");
+    let (receiver, owner) =
+        application_render
+            .blocks
+            .iter()
+            .flat_map(|block| &block.statements)
+            .find_map(|statement| match statement {
+                doriac::mir::Statement::AssignLocal {
+                    target,
+                    value:
+                        doriac::mir::Rvalue::NullableClass(
+                            doriac::mir::NullableClassExpression::Property { object, .. },
+                        ),
+                } => Some((*target, *object)),
+                _ => None,
+            })
+            .expect("checked null-safe lowering should materialize the nullable property borrow");
+    assert!(application_render.locals[owner.0].writable);
+    assert!(application_render.locals[receiver.0].writable);
+    let called_receiver = application_render
+        .blocks
+        .iter()
+        .find_map(|block| match &block.terminator {
+            doriac::mir::Terminator::CheckedCall { args, .. } => match args.first() {
+                Some(doriac::mir::Rvalue::Class(
+                    doriac::mir::ClassExpression::NullableLocalAssumeNonNull { local, .. },
+                )) => Some(*local),
+                _ => None,
+            },
+            _ => None,
+        })
+        .expect("the checked method call should use the materialized receiver");
+    assert_eq!(called_receiver, receiver);
+
+    let mut readonly = program;
+    readonly
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "Application::render")
+        .and_then(|function| {
+            function
+                .locals
+                .iter_mut()
+                .find(|local| local.id == receiver)
+        })
+        .expect("fixture should contain the checked receiver temporary")
+        .writable = false;
+    let error = doriac::mir_validation::validate_program(&readonly)
+        .expect_err("shared validation must reject a readonly checked method receiver");
+    assert!(error.message.contains("requires a writable class value"));
+}
+
+#[test]
+fn checked_writable_null_safe_owned_temporaries_preserve_receiver_capability() {
+    let source = r#"
+class Window
+{
+    writable function prepare(): void {}
+    writable function render(): void throws Doria\Std\Io\IoError { echo "rendered"; }
+}
+
+function maybeWindow(): ?Window { return new Window(); }
+
+function main(): void
+{
+    maybeWindow()?->prepare();
+    maybeWindow()?->render();
+}
+"#;
+
+    let program = doriac::lower_source_to_mir("stage22-writable-nullable-temporary.doria", source)
+        .expect("an owned nullable temporary should retain writable receiver capability");
+    let output = doriac::mir_interpreter::interpret(&program)
+        .expect("the checked writable call on an owned nullable temporary should execute");
+    assert_eq!(output.stdout, b"rendered");
+}
+
+#[test]
+fn readonly_nullable_property_paths_reject_writable_null_safe_calls() {
+    let diagnostics = diagnostics(
+        r#"
+class Window
+{
+    writable function render(): void throws Doria\Std\Io\IoError {}
+}
+
+class ReadonlyProperty
+{
+    ?Window $window = null;
+    writable function render(): void throws Doria\Std\Io\IoError
+    {
+        $this->window?->render();
+    }
+}
+
+class ReadonlyReceiver
+{
+    writable ?Window $window = null;
+    function render(): void throws Doria\Std\Io\IoError
+    {
+        $this->window?->render();
+    }
+}
+"#,
+    );
+    assert_eq!(
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "E0203")
+            .count(),
+        2,
+        "readonly property and containing-receiver paths must remain source errors: {diagnostics:#?}"
+    );
+}
+
+#[test]
 fn shared_validation_invalidates_nullable_class_presence_after_writable_calls() {
     let mut program = doriac::lower_source_to_mir(
         "stage22-writable-nullable-class-presence.doria",

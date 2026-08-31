@@ -10981,6 +10981,10 @@ fn lower_nullable_payload_expression(
     class: ClassId,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::NullableClassExpression> {
+    let receiver_writable = context
+        .semantic_info
+        .writable_object_paths
+        .contains(&object.span());
     let value = match context.expression_type(object)? {
         mir::Type::NullableClass(actual) if actual == class => {
             lower_nullable_class_expression(object, class, false, context)
@@ -11005,6 +11009,7 @@ fn lower_nullable_payload_expression(
     // instead of leaving backend expression lowering to release it early.
     if value.owned_temporary_class().is_some() {
         let receiver = context.declare_owned_temp(mir::Type::NullableClass(class));
+        context.locals[receiver.0].writable = receiver_writable;
         context.push_statement(mir::Statement::AssignLocal {
             target: receiver,
             value: mir::Rvalue::NullableClass(value),
@@ -17142,12 +17147,18 @@ fn materialize_checked_null_safe_signature_call(
     let class = signature
         .method_class
         .expect("null-safe checked call must have a method class");
+    let receiver_writable = context
+        .semantic_info
+        .writable_object_paths
+        .contains(&object.span());
     let object = lower_nullable_payload_expression(object, class, context)?;
     let receiver_type = mir::Type::NullableClass(class);
     let receiver = if object.owned_temporary_class().is_some() {
-        context.declare_owned_temp(receiver_type)
+        let receiver = context.declare_owned_temp(receiver_type);
+        context.locals[receiver.0].writable = receiver_writable;
+        receiver
     } else {
-        context.declare_borrowed_temp(receiver_type, false)
+        context.declare_borrowed_temp(receiver_type, receiver_writable)
     };
     context.push_statement(mir::Statement::AssignLocal {
         target: receiver,

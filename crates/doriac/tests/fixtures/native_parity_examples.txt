@@ -111,6 +111,7 @@ examples/native/main_stage20b_const_string_defaults.doria
 examples/native/main_stage21_conditional_constructor.doria
 examples/native/main_stage22_nullable.doria
 examples/native/main_stage22_nullable_local_narrowing.doria
+examples/native/main_stage22_writable_nullable_property.doria
 examples/native/main_stage23_collection_ownership.doria
 examples/native/main_stage23_collection_regressions.doria
 examples/native/main_stage23_collection_oob_panic.doria
