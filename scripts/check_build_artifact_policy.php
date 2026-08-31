@@ -13,7 +13,10 @@ $agents = read('AGENTS.md');
 $contributing = read('CONTRIBUTING.md');
 $validator = read('scripts/validate_work_unit.php');
 $refresh = read('scripts/refresh_development_toolchain.php');
+$compilerMain = read('crates/doriac/src/main.rs');
+$runtimeArtifact = read('crates/doriac/src/runtime_artifact.rs');
 $runtimeReproducibility = read('crates/doriac/tests/runtime_reproducibility_tests.rs');
+$runtimeDecision = read('docs/decisions/0073-stage-15-llvm-release-backend.md');
 $ci = read('.github/workflows/ci.yml');
 
 foreach ([
@@ -31,6 +34,16 @@ foreach ([
     "'CARGO_TARGET_DIR'" => $validator,
     "getenv('DORIA_VALIDATION_TARGET_DIR')" => $refresh,
     "'toolchain-install'" => $refresh,
+    "'cargo', 'clean', '--target-dir', \$installTarget" => $refresh,
+    'verify_installed_native_compiler($compiler)' => $refresh,
+    "unset(\$probeEnvironment['DORIA_RT_PATH'])" => $refresh,
+    "\$probeEnvironment['CARGO_TARGET_DIR'] = \$probeTarget" => $refresh,
+    'register_embedded_runtimes(' => $compilerMain,
+    'include_bytes!(env!("DORIA_RT_BUILT_DEBUG_PATH"))' => $compilerMain,
+    'include_bytes!(env!("DORIA_RT_BUILT_RELEASE_PATH"))' => $compilerMain,
+    'EMBEDDED_RUNTIME_CACHE_DIRECTORY' => $runtimeArtifact,
+    'Cargo target directories contain only reclaimable build state.' => $contributing,
+    'Installation acceptance therefore deletes the entire installation' => $runtimeDecision,
     'struct ScratchDirectory' => $runtimeReproducibility,
     'remove_dir_all(&self.path)' => $runtimeReproducibility,
     'php scripts/check_build_artifact_policy.php' => $ci,

@@ -13095,6 +13095,39 @@ impl Interpreter<'_> {
                     &arguments, 0,
                 )?))?;
             }
+            Kind::AssertionDifference => {
+                let actual = local_string(&arguments, 0)?;
+                let expected = local_string(&arguments, 1)?;
+                let mode = u8::try_from(local_int(&arguments, 2)?).map_err(|_| {
+                    InterpreterError::new("assertion difference mode is outside u8 range")
+                })?;
+                self.push_string(crate::assertions::string_difference(actual, expected, mode))?;
+            }
+            Kind::AssertionBytesDifference => {
+                let actual = collection_bytes(local_collection(&arguments, 0)?)?;
+                let expected = collection_bytes(local_collection(&arguments, 1)?)?;
+                self.push_string(crate::assertions::bytes_difference(&actual, &expected))?;
+            }
+            Kind::AssertionCountDifference => {
+                self.push_string(crate::assertions::count_difference(
+                    local_int(&arguments, 0)?,
+                    local_int(&arguments, 1)?,
+                ))?;
+            }
+            Kind::AssertionErrorPresentation => {
+                self.push_string(crate::assertions::error_presentation(
+                    local_string(&arguments, 0)?,
+                    local_string(&arguments, 1)?,
+                ))?;
+            }
+            Kind::AssertionCollectionPresentation => {
+                let presentation = assertion_collection_presentation(
+                    self.program,
+                    local_collection(&arguments, 0)?,
+                    local_string(&arguments, 1)?,
+                )?;
+                self.push_string(presentation)?;
+            }
             Kind::Trim | Kind::TrimStart | Kind::TrimEnd => {
                 let text = local_string(&arguments, 0)?;
                 let mode = match kind {
@@ -15030,6 +15063,144 @@ fn local_int(arguments: &[LocalValue], index: usize) -> Result<i64, InterpreterE
     }
 }
 
+fn assertion_collection_presentation(
+    program: &mir::Program,
+    collection: &CollectionValue,
+    type_name: &str,
+) -> Result<String, InterpreterError> {
+    use std::fmt::Write as _;
+
+    let definition = program
+        .collection_types
+        .get(collection.ty.0)
+        .ok_or_else(|| InterpreterError::new("assertion collection type does not exist"))?;
+    let entries = collection.entries();
+    if definition.kind == mir::CollectionKind::Bytes {
+        let mut result = format!("Bytes(length: {}, hex: \"", entries.len());
+        for (index, (_, value)) in entries
+            .iter()
+            .take(crate::assertions::COLLECTION_PRESENTATION_ITEMS)
+            .enumerate()
+        {
+            let LocalValue::Scalar(mir::ScalarValue::Integer(value)) = value else {
+                return Err(InterpreterError::new(
+                    "Bytes assertion presentation found a non-byte element",
+                ));
+            };
+            if index != 0 {
+                result.push(' ');
+            }
+            let _ = write!(result, "{:02x}", value.unsigned_value());
+        }
+        if entries.len() > crate::assertions::COLLECTION_PRESENTATION_ITEMS {
+            result.push_str(" ...<truncated>");
+        }
+        result.push_str("\")");
+        return Ok(crate::assertions::bound_text(result));
+    }
+    if definition.kind == mir::CollectionKind::PriorityQueue {
+        return Ok(format!("{type_name}(count: {})", entries.len()));
+    }
+
+    let (opening, closing) = match definition.kind {
+        mir::CollectionKind::TypedArray => ("[".to_string(), ']'),
+        mir::CollectionKind::Dictionary
+        | mir::CollectionKind::SortedDictionary
+        | mir::CollectionKind::Set
+        | mir::CollectionKind::SortedSet => {
+            (format!("{type_name}(count: {}) {{", entries.len()), '}')
+        }
+        _ => (format!("{type_name}(count: {}) [", entries.len()), ']'),
+    };
+    let mut result = opening;
+    for (index, (key, value)) in entries
+        .iter()
+        .take(crate::assertions::COLLECTION_PRESENTATION_ITEMS)
+        .enumerate()
+    {
+        if index != 0 {
+            result.push_str(", ");
+        }
+        if definition.kind.is_dictionary() {
+            result.push_str(&assertion_local_value_presentation(
+                program,
+                key.as_ref().ok_or_else(|| {
+                    InterpreterError::new("dictionary assertion presentation is missing a key")
+                })?,
+                definition.key.expect("dictionary has a key type"),
+            ));
+            result.push_str(" => ");
+        }
+        result.push_str(&assertion_local_value_presentation(
+            program,
+            value,
+            definition.value,
+        ));
+    }
+    if entries.len() > crate::assertions::COLLECTION_PRESENTATION_ITEMS {
+        if !entries.is_empty() {
+            result.push_str(", ");
+        }
+        result.push_str(crate::assertions::TRUNCATION_MARKER);
+    }
+    result.push(closing);
+    Ok(crate::assertions::bound_text(result))
+}
+
+fn assertion_local_value_presentation(
+    program: &mir::Program,
+    value: &LocalValue,
+    ty: mir::Type,
+) -> String {
+    match value {
+        LocalValue::Scalar(mir::ScalarValue::Enum(value)) => {
+            assertion_enum_presentation(program, *value, ty)
+        }
+        LocalValue::Scalar(value) => display_scalar(*value),
+        LocalValue::String(value) => crate::assertions::quote_string(value),
+        LocalValue::NullableScalar { value: None, .. }
+        | LocalValue::NullableString(None)
+        | LocalValue::NullableMixed(None)
+        | LocalValue::NullableError(None)
+        | LocalValue::NullableClass { object: None, .. }
+        | LocalValue::NullableSharedReference { control: None, .. }
+        | LocalValue::NullableWeakReference { control: None, .. }
+        | LocalValue::NullableWritableSharedReference { control: None, .. }
+        | LocalValue::NullableWritableWeakReference { control: None, .. }
+        | LocalValue::NullableSharedReferenceAccess { control: None, .. }
+        | LocalValue::NullablePayloadEnum { value: None, .. }
+        | LocalValue::NullableFunction { value: None, .. } => "null".to_string(),
+        LocalValue::NullableScalar {
+            value: Some(mir::ScalarValue::Enum(value)),
+            ..
+        } => assertion_enum_presentation(program, *value, ty),
+        LocalValue::NullableScalar {
+            value: Some(value), ..
+        } => display_scalar(*value),
+        LocalValue::NullableString(Some(value)) => crate::assertions::quote_string(value),
+        _ => format!("<{ty}>"),
+    }
+}
+
+fn assertion_enum_presentation(
+    program: &mir::Program,
+    value: crate::enums::EnumValue,
+    ty: mir::Type,
+) -> String {
+    program
+        .enums
+        .iter()
+        .find(|definition| definition.id == value.enum_id)
+        .and_then(|definition| {
+            definition
+                .cases
+                .iter()
+                .find(|case| case.id == value.case_id)
+                .map(|case| format!("{}::{}", definition.name, case.name))
+        })
+        .unwrap_or_else(|| format!("<{ty}>"))
+}
+
 fn local_nullable_int(
     arguments: &[LocalValue],
     index: usize,
@@ -15388,6 +15559,244 @@ fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop
 fn collection_values_equal(ty: mir::Type, left: &LocalValue, right: &LocalValue) -> bool {
     match (ty, left, right) {
         (
+            mir::Type::NullableScalar(payload),
+            LocalValue::NullableScalar {
+                value: Some(left), ..
+            },
+            LocalValue::Scalar(right),
+        )
+        | (
+            mir::Type::NullableScalar(payload),
+            LocalValue::Scalar(right),
+            LocalValue::NullableScalar {
+                value: Some(left), ..
+            },
+        ) => scalar_collection_values_equal(payload, *left, *right),
+        (
+            mir::Type::NullableString,
+            LocalValue::NullableString(Some(left)),
+            LocalValue::String(right),
+        )
+        | (
+            mir::Type::NullableString,
+            LocalValue::String(right),
+            LocalValue::NullableString(Some(left)),
+        ) => left == right,
+        (
+            mir::Type::NullableMixed,
+            LocalValue::NullableMixed(Some(left)),
+            LocalValue::Mixed(right),
+        )
+        | (
+            mir::Type::NullableMixed,
+            LocalValue::Mixed(right),
+            LocalValue::NullableMixed(Some(left)),
+        ) => left == right,
+        (
+            mir::Type::NullableError,
+            LocalValue::NullableError(Some(left)),
+            LocalValue::Error(right),
+        )
+        | (
+            mir::Type::NullableError,
+            LocalValue::Error(right),
+            LocalValue::NullableError(Some(left)),
+        ) => left == right,
+        (
+            mir::Type::NullableClass(class),
+            LocalValue::NullableClass {
+                object: Some(left),
+                class: left_class,
+            },
+            LocalValue::Class {
+                object: right,
+                class: right_class,
+            },
+        )
+        | (
+            mir::Type::NullableClass(class),
+            LocalValue::Class {
+                object: right,
+                class: right_class,
+            },
+            LocalValue::NullableClass {
+                object: Some(left),
+                class: left_class,
+            },
+        ) => left == right && *left_class == class && *right_class == class,
+        (
+            mir::Type::NullableSharedReference(class),
+            LocalValue::NullableSharedReference {
+                control: Some(left),
+                class: left_class,
+            },
+            LocalValue::SharedReference {
+                control: right,
+                class: right_class,
+            },
+        )
+        | (
+            mir::Type::NullableSharedReference(class),
+            LocalValue::SharedReference {
+                control: right,
+                class: right_class,
+            },
+            LocalValue::NullableSharedReference {
+                control: Some(left),
+                class: left_class,
+            },
+        ) => left == right && *left_class == class && *right_class == class,
+        (
+            mir::Type::NullableWeakReference(class),
+            LocalValue::NullableWeakReference {
+                control: Some(left),
+                class: left_class,
+            },
+            LocalValue::WeakReference {
+                control: right,
+                class: right_class,
+            },
+        )
+        | (
+            mir::Type::NullableWeakReference(class),
+            LocalValue::WeakReference {
+                control: right,
+                class: right_class,
+            },
+            LocalValue::NullableWeakReference {
+                control: Some(left),
+                class: left_class,
+            },
+        ) => left == right && *left_class == class && *right_class == class,
+        (
+            mir::Type::NullableWritableSharedReference(payload),
+            LocalValue::NullableWritableSharedReference {
+                control: Some(left),
+                payload: left_payload,
+            },
+            LocalValue::WritableSharedReference {
+                control: right,
+                payload: right_payload,
+            },
+        )
+        | (
+            mir::Type::NullableWritableSharedReference(payload),
+            LocalValue::WritableSharedReference {
+                control: right,
+                payload: right_payload,
+            },
+            LocalValue::NullableWritableSharedReference {
+                control: Some(left),
+                payload: left_payload,
+            },
+        ) => left == right && *left_payload == payload && *right_payload == payload,
+        (
+            mir::Type::NullableWritableWeakReference(payload),
+            LocalValue::NullableWritableWeakReference {
+                control: Some(left),
+                payload: left_payload,
+            },
+            LocalValue::WritableWeakReference {
+                control: right,
+                payload: right_payload,
+            },
+        )
+        | (
+            mir::Type::NullableWritableWeakReference(payload),
+            LocalValue::WritableWeakReference {
+                control: right,
+                payload: right_payload,
+            },
+            LocalValue::NullableWritableWeakReference {
+                control: Some(left),
+                payload: left_payload,
+            },
+        ) => left == right && *left_payload == payload && *right_payload == payload,
+        (
+            mir::Type::NullableReadonlySharedReferenceAccess(payload),
+            LocalValue::NullableSharedReferenceAccess {
+                control: Some(left),
+                payload: left_payload,
+                writable: false,
+            },
+            LocalValue::SharedReferenceAccess {
+                control: right,
+                payload: right_payload,
+                writable: false,
+            },
+        )
+        | (
+            mir::Type::NullableReadonlySharedReferenceAccess(payload),
+            LocalValue::SharedReferenceAccess {
+                control: right,
+                payload: right_payload,
+                writable: false,
+            },
+            LocalValue::NullableSharedReferenceAccess {
+                control: Some(left),
+                payload: left_payload,
+                writable: false,
+            },
+        )
+        | (
+            mir::Type::NullableWritableSharedReferenceAccess(payload),
+            LocalValue::NullableSharedReferenceAccess {
+                control: Some(left),
+                payload: left_payload,
+                writable: true,
+            },
+            LocalValue::SharedReferenceAccess {
+                control: right,
+                payload: right_payload,
+                writable: true,
+            },
+        )
+        | (
+            mir::Type::NullableWritableSharedReferenceAccess(payload),
+            LocalValue::SharedReferenceAccess {
+                control: right,
+                payload: right_payload,
+                writable: true,
+            },
+            LocalValue::NullableSharedReferenceAccess {
+                control: Some(left),
+                payload: left_payload,
+                writable: true,
+            },
+        ) => left == right && *left_payload == payload && *right_payload == payload,
+        (
+            mir::Type::NullablePayloadEnum(payload),
+            LocalValue::NullablePayloadEnum {
+                ty: left_ty,
+                value: Some(left),
+            },
+            LocalValue::PayloadEnum(right),
+        )
+        | (
+            mir::Type::NullablePayloadEnum(payload),
+            LocalValue::PayloadEnum(right),
+            LocalValue::NullablePayloadEnum {
+                ty: left_ty,
+                value: Some(left),
+            },
+        ) => left == right && *left_ty == payload && right.ty == payload,
+        (
+            mir::Type::NullableFunction(function_type),
+            LocalValue::NullableFunction {
+                function_type: left_type,
+                value: Some(left),
+            },
+            LocalValue::Function(right),
+        )
+        | (
+            mir::Type::NullableFunction(function_type),
+            LocalValue::Function(right),
+            LocalValue::NullableFunction {
+                function_type: left_type,
+                value: Some(left),
+            },
+        ) => left == right && *left_type == function_type && right.function_type == function_type,
+        (
             mir::Type::Scalar(mir::ScalarType::Float(FloatType::Float32)),
             LocalValue::Scalar(mir::ScalarValue::Float(left)),
             LocalValue::Scalar(mir::ScalarValue::Float(right)),
@@ -15398,6 +15807,26 @@ fn collection_values_equal(ty: mir::Type, left: &LocalValue, right: &LocalValue)
             LocalValue::Scalar(mir::ScalarValue::Float(right)),
         ) => left.as_f64() == right.as_f64(),
         _ => left == right,
+    }
+}
+
+fn scalar_collection_values_equal(
+    ty: mir::ScalarType,
+    left: mir::ScalarValue,
+    right: mir::ScalarValue,
+) -> bool {
+    match (ty, left, right) {
+        (
+            mir::ScalarType::Float(FloatType::Float32),
+            mir::ScalarValue::Float(left),
+            mir::ScalarValue::Float(right),
+        ) => left.as_f32() == right.as_f32(),
+        (
+            mir::ScalarType::Float(FloatType::Float64),
+            mir::ScalarValue::Float(left),
+            mir::ScalarValue::Float(right),
+        ) => left.as_f64() == right.as_f64(),
+        (_, left, right) => left == right,
     }
 }
 

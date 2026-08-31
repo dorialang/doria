@@ -121,10 +121,9 @@ $require($decisionPath, $decision, [
     'debug interpreter, Cranelift, LLVM, and PHP',
     '30 through 32 and the Decision 0123 corrective beat are complete. All three',
     'Stage 33 slices and Phase F are complete under Decisions 0126 through 0128',
-    'Native Testing Foundation Slices 1 and 2 are complete',
-    'Slice 3 is next',
-    'Stage 34',
-    'waits for the foundation',
+    'Native Testing Foundation Slices 1 through 3 are complete',
+    'Foundation is complete',
+    'Stage 34 is next',
 ]);
 
 foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {
@@ -264,7 +263,9 @@ $require($phpPath, $php, [
     'final class __DoriaCheckedError extends Exception',
     'private bool $__doriaLive = true',
     'public function takeError(): __DoriaErrorValue',
-    '__doria_drop_value($this->error)',
+    '$error = $this->error;',
+    '$this->error = null;',
+    '__doria_drop_value($error)',
     '__doriaEnsureErrorOrigin',
     'catch (__DoriaCheckedError',
 ]);

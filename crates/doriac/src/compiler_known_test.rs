@@ -1,7 +1,8 @@
 use crate::ast::{Block, ClassDecl, ClassMember, FunctionDecl, Item, MemberAccess, Param, Program};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
+use crate::lexer::{Lexer, Token, TokenKind};
 use crate::names::{CompilerSymbolIdentity, GlobalSymbolFacts, GlobalSymbolId, GlobalSymbolOwner};
-use crate::source::Span;
+use crate::source::{SourceFile, Span};
 use crate::types::TypeRef;
 
 pub const NAMESPACE: &str = "Doria\\Std\\Test";
@@ -78,6 +79,69 @@ pub fn symbol_id(name: &str) -> Option<GlobalSymbolId> {
         )),
         qualified_name: name.to_string(),
     })
+}
+
+/// Returns the member prefix at an incomplete import of the compiler-owned
+/// Test module. Tooling consumes this compiler-owned context rather than
+/// duplicating Doria import token shapes.
+pub fn import_completion_prefix(text: &str, offset: usize) -> Option<String> {
+    let prefix = text.get(..offset)?;
+    let source = SourceFile::new("<test-import-completion>", prefix.to_string());
+    let tokens = Lexer::new(&source).lex().ok()?;
+    let tokens = tokens
+        .iter()
+        .filter(|token| !matches!(token.kind, TokenKind::Eof))
+        .collect::<Vec<_>>();
+    let use_index = tokens
+        .iter()
+        .rposition(|token| matches!(token.kind, TokenKind::Use))?;
+    let tail = &tokens[use_index + 1..];
+    let segments = NAMESPACE.split('\\').collect::<Vec<_>>();
+    let mut cursor = 0;
+    for segment in segments {
+        let TokenKind::Identifier(actual) = &tail.get(cursor)?.kind else {
+            return None;
+        };
+        if actual != segment || !matches!(tail.get(cursor + 1)?.kind, TokenKind::Backslash) {
+            return None;
+        }
+        cursor += 2;
+    }
+
+    let remainder = &tail[cursor..];
+    if matches!(
+        remainder.first().map(|token| &token.kind),
+        Some(TokenKind::LeftBrace)
+    ) {
+        let grouped = &remainder[1..];
+        if grouped
+            .iter()
+            .any(|token| matches!(token.kind, TokenKind::RightBrace | TokenKind::Semicolon))
+        {
+            return None;
+        }
+        let start = grouped
+            .iter()
+            .rposition(|token| matches!(token.kind, TokenKind::Comma))
+            .map_or(0, |index| index + 1);
+        completion_token_prefix(prefix, &grouped[start..])
+    } else {
+        completion_token_prefix(prefix, remainder)
+    }
+}
+
+fn completion_token_prefix(source: &str, tokens: &[&Token]) -> Option<String> {
+    match tokens {
+        [] => Some(String::new()),
+        [token] => {
+            let value = source.get(token.span.start..token.span.end)?;
+            value
+                .chars()
+                .all(|character| character == '_' || character.is_ascii_alphanumeric())
+                .then(|| value.to_string())
+        }
+        _ => None,
+    }
 }
 
 /// Adds the compiler-owned assertion Error to the ordinary class model. Name
@@ -190,5 +254,45 @@ pub fn validate_reserved_identities(program: &Program) -> DiagnosticResult<()> {
         Ok(())
     } else {
         Err(diagnostics)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::import_completion_prefix;
+
+    #[test]
+    fn test_import_completion_context_covers_direct_grouped_and_prefixed_forms() {
+        for (source, expected) in [
+            ("use Doria\\Std\\Test\\", ""),
+            ("use Doria\\Std\\Test\\exp", "exp"),
+            ("use Doria\\Std\\Test\\{", ""),
+            ("use Doria\\Std\\Test\\{exp", "exp"),
+            ("use Doria\\Std\\Test\\{describe, ", ""),
+            ("use Doria\\Std\\Test\\{describe, exp", "exp"),
+            ("use Doria\\Std\\Test\\{describe, test", "test"),
+        ] {
+            assert_eq!(
+                import_completion_prefix(source, source.len()).as_deref(),
+                Some(expected),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_import_completion_context_rejects_completed_or_unrelated_imports() {
+        for source in [
+            "use Doria\\Std\\Io\\",
+            "use Doria\\Std\\Test\\expect;",
+            "use Doria\\Std\\Test\\{expect};",
+            "use Doria\\Std\\Test\\expect as verify",
+        ] {
+            assert_eq!(
+                import_completion_prefix(source, source.len()),
+                None,
+                "{source}"
+            );
+        }
     }
 }

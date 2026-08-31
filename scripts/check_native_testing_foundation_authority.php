@@ -43,11 +43,11 @@ if ($decision === false || $reference === false) {
 $requiredDecisionFacts = [
     '# Decision 0129: Native Testing Foundation, Behavioral DSL, Fluent Expectations, And Assertion Outcomes',
     '**Status:** Accepted',
-    '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Next; Foundation In Progress',
+    '**Implementation Status:** Implemented By Native Testing Foundation Slices 1 Through 3',
     'Native Testing Foundation Slice 1 - Complete',
     'Native Testing Foundation Slice 2 - Complete',
-    'Native Testing Foundation Slice 3 - Next',
-    'Native Testing Foundation - In Progress, Not Complete',
+    'Native Testing Foundation Slice 3 - Complete',
+    'Native Testing Foundation - Complete',
     'Slice 1 - Behavioral Test DSL And Unified Compiler Metadata',
     'Slice 2 - Fluent Expectation Kernel And Assertion Semantics',
     'Slice 3 - Collection/Error Expectations, Baton Reporting, And Tooling Closure',
@@ -62,16 +62,17 @@ $requiredDecisionFacts = [
     'metadata schema version 3',
     'Baton schema-3 orchestration',
     'language-server presentation',
-    'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
+    'Stage 34 Single Class Inheritance - Next',
+    'Pre-Stage-45 Doria-Native Baton Transition - Scheduled',
     'This is a deferral, not a permanent rejection.',
 ];
 
 $requiredReferenceFacts = [
     'Native Testing Foundation Slice 1 - Complete',
     'Native Testing Foundation Slice 2 - Complete',
-    'Native Testing Foundation Slice 3 - Next',
-    'Native Testing Foundation - In Progress, Not Complete',
-    'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
+    'Native Testing Foundation Slice 3 - Complete',
+    'Native Testing Foundation - Complete',
+    'Stage 34 Single Class Inheritance - Next',
     'describe("Shopping Cart"',
     'expect($cart->total)->toEqual(0)',
     'expect($cart->items)->not->toContain',
@@ -80,7 +81,7 @@ $requiredReferenceFacts = [
     'no runtime suite registry',
     'no source parsing in Baton',
     'Baton regression integration',
-    'Slice 3 owns collection/Error expectations',
+    'Slice 3\'s collection/Error expectations are',
     'beforeEach / afterEach',
     'They are deferred, not permanently rejected.',
 ];
@@ -106,6 +107,9 @@ $forbidden = [
     'Baton/tooling coordination remains pending',
     'Slice 2 is next',
     'Slice 2 — Next',
+    'Slice 3 Compiler/Runtime In Progress',
+    'Native Testing Foundation - In Progress, Not Complete',
+    'Blocked Until The Foundation Completes',
 ];
 
 foreach ($forbidden as $fact) {

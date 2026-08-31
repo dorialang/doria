@@ -124,7 +124,9 @@ function check_ambient_io_and_fallible_finalizers(string $root): array
     $require($paths['php'], $files['php'], [
         'private bool $__doriaLive = true',
         'public function takeError(): __DoriaErrorValue',
-        '__doria_drop_value($this->error)',
+        '$error = $this->error;',
+        '$this->error = null;',
+        '__doria_drop_value($error)',
     ]);
     $require($paths['tests'], $files['tests'], [
         'canonical_io_is_ambient_in_source_but_retained_in_hir_and_mir',

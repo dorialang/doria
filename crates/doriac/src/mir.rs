@@ -835,6 +835,16 @@ pub enum StringIntrinsicKind {
     FromBytes,
     /// Compiler-private, failure-only bounded Doria string presentation.
     AssertionQuote,
+    /// Compiler-private, failure-only grapheme-aware assertion difference.
+    AssertionDifference,
+    /// Compiler-private, failure-only byte-aware assertion difference.
+    AssertionBytesDifference,
+    /// Compiler-private, failure-only exact collection-count difference.
+    AssertionCountDifference,
+    /// Compiler-private, failure-only bounded checked-Error presentation.
+    AssertionErrorPresentation,
+    /// Compiler-private, failure-only bounded public collection presentation.
+    AssertionCollectionPresentation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6974,6 +6984,11 @@ impl fmt::Display for StringIntrinsicKind {
             Self::PadEnd => "padEnd",
             Self::FromBytes => "fromBytes",
             Self::AssertionQuote => "assertionQuote",
+            Self::AssertionDifference => "assertionDifference",
+            Self::AssertionBytesDifference => "assertionBytesDifference",
+            Self::AssertionCountDifference => "assertionCountDifference",
+            Self::AssertionErrorPresentation => "assertionErrorPresentation",
+            Self::AssertionCollectionPresentation => "assertionCollectionPresentation",
         })
     }
 }

@@ -1,6 +1,10 @@
 use std::env;
 use std::ffi::OsStr;
+use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::{BackendError, NativeProfile};
 use crate::diagnostics::Diagnostic;
@@ -8,6 +12,46 @@ use crate::runtime_digest::sha256_hex;
 use crate::source::Span;
 
 const RUNTIME_METADATA_SCHEMA_VERSION: u32 = 1;
+const EMBEDDED_RUNTIME_CACHE_DIRECTORY: &str = "doria-embedded-runtime-v1";
+
+#[derive(Debug, Clone, Copy)]
+struct EmbeddedRuntimeProfile {
+    archive: &'static [u8],
+    metadata: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EmbeddedRuntimeSet {
+    debug: EmbeddedRuntimeProfile,
+    release: EmbeddedRuntimeProfile,
+}
+
+static EMBEDDED_RUNTIMES: OnceLock<EmbeddedRuntimeSet> = OnceLock::new();
+static NEXT_EMBEDDED_RUNTIME_ID: AtomicU64 = AtomicU64::new(0);
+
+/// Register the runtime archives compiled into the standalone `doriac` binary.
+///
+/// The library remains usable without embedded archives by the language server
+/// and compiler tests. The executable registers both profiles at startup so an
+/// installed compiler never retains a dependency on Cargo's reclaimable target
+/// directory.
+pub fn register_embedded_runtimes(
+    debug_archive: &'static [u8],
+    debug_metadata: &'static str,
+    release_archive: &'static [u8],
+    release_metadata: &'static str,
+) {
+    let _ = EMBEDDED_RUNTIMES.set(EmbeddedRuntimeSet {
+        debug: EmbeddedRuntimeProfile {
+            archive: debug_archive,
+            metadata: debug_metadata,
+        },
+        release: EmbeddedRuntimeProfile {
+            archive: release_archive,
+            metadata: release_metadata,
+        },
+    });
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ArchiveFormat {
@@ -167,10 +211,15 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
         .and_then(Path::parent)
         .expect("doriac must live under the workspace crates directory");
     let target_override = env::var_os("CARGO_TARGET_DIR");
+    let explicit_override = env::var_os("DORIA_RT_PATH");
+    let embedded_runtime = embedded_runtime_candidate(profile, explicit_override.as_deref())?;
+    let compiler_runtime = embedded_runtime
+        .as_deref()
+        .or_else(|| compiler_built_runtime(profile));
     resolve(
-        env::var_os("DORIA_RT_PATH").as_deref(),
+        explicit_override.as_deref(),
         &current_executable,
-        compiler_built_runtime(profile),
+        compiler_runtime,
         workspace,
         target_override.as_deref(),
         if cfg!(all(windows, target_env = "msvc")) {
@@ -181,6 +230,114 @@ pub fn locate(profile: NativeProfile) -> Result<RuntimeArtifact, BackendError> {
         profile_directory(profile),
         &RuntimeExpectation::current(profile),
     )
+}
+
+fn embedded_runtime_candidate(
+    profile: NativeProfile,
+    explicit_override: Option<&OsStr>,
+) -> Result<Option<PathBuf>, BackendError> {
+    if explicit_override.is_some() {
+        return Ok(None);
+    }
+    materialize_embedded_runtime(profile)
+}
+
+fn materialize_embedded_runtime(profile: NativeProfile) -> Result<Option<PathBuf>, BackendError> {
+    let Some(runtimes) = EMBEDDED_RUNTIMES.get() else {
+        return Ok(None);
+    };
+    let embedded = match profile {
+        NativeProfile::Fast => runtimes.debug,
+        NativeProfile::Release => runtimes.release,
+    };
+    let cache_root = env::temp_dir().join(EMBEDDED_RUNTIME_CACHE_DIRECTORY);
+    materialize_embedded_runtime_at(embedded, &cache_root).map(Some)
+}
+
+fn materialize_embedded_runtime_at(
+    embedded: EmbeddedRuntimeProfile,
+    cache_root: &Path,
+) -> Result<PathBuf, BackendError> {
+    let metadata = parse_metadata(embedded.metadata).ok_or_else(|| {
+        BackendError::new("compiler-bundled doria-rt identity metadata is malformed or incomplete")
+    })?;
+    let actual_sha256 = sha256_hex(embedded.archive);
+    if metadata.bytes != embedded.archive.len() as u64 || metadata.sha256 != actual_sha256 {
+        return Err(BackendError::new(
+            "compiler-bundled doria-rt bytes do not match their embedded identity metadata",
+        ));
+    }
+
+    fs::create_dir_all(cache_root).map_err(|error| {
+        BackendError::new(format!(
+            "compiler-bundled doria-rt could not create its materialization directory: {error}"
+        ))
+    })?;
+    // The sidecar is part of the artifact identity. Two compiler revisions can
+    // legitimately produce identical archive bytes while recording different
+    // revision/profile facts, so key the cache by both inputs.
+    let cache_identity = sha256_hex(format!("{actual_sha256}\n{}", embedded.metadata).as_bytes());
+    let final_directory = cache_root.join(&cache_identity);
+    let filename = runtime_filename(if cfg!(all(windows, target_env = "msvc")) {
+        ArchiveFormat::Msvc
+    } else {
+        ArchiveFormat::Gnu
+    });
+    let final_archive = final_directory.join(filename);
+    if materialized_runtime_matches(&final_archive, embedded.archive, embedded.metadata) {
+        return Ok(final_archive);
+    }
+
+    let staging_directory = unique_materialization_directory(cache_root, &cache_identity);
+    fs::create_dir(&staging_directory).map_err(|error| {
+        BackendError::new(format!(
+            "compiler-bundled doria-rt could not create a private materialization directory: {error}"
+        ))
+    })?;
+    let staging_archive = staging_directory.join(filename);
+    let write_result = fs::write(&staging_archive, embedded.archive)
+        .and_then(|()| fs::write(metadata_path(&staging_archive), embedded.metadata));
+    if let Err(error) = write_result {
+        let _ = fs::remove_dir_all(&staging_directory);
+        return Err(BackendError::new(format!(
+            "compiler-bundled doria-rt could not be materialized: {error}"
+        )));
+    }
+
+    match fs::rename(&staging_directory, &final_directory) {
+        Ok(()) => Ok(final_archive),
+        Err(_)
+            if materialized_runtime_matches(
+                &final_archive,
+                embedded.archive,
+                embedded.metadata,
+            ) =>
+        {
+            let _ = fs::remove_dir_all(&staging_directory);
+            Ok(final_archive)
+        }
+        // Never replace an unexpected existing cache entry. The private
+        // staging directory already contains verified compiler-owned bytes and
+        // is safe to use for this invocation.
+        Err(_) => Ok(staging_archive),
+    }
+}
+
+fn materialized_runtime_matches(path: &Path, archive: &[u8], metadata: &str) -> bool {
+    fs::read(path).is_ok_and(|bytes| bytes == archive)
+        && fs::read_to_string(metadata_path(path)).is_ok_and(|contents| contents == metadata)
+}
+
+fn unique_materialization_directory(cache_root: &Path, digest: &str) -> PathBuf {
+    let sequence = NEXT_EMBEDDED_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    cache_root.join(format!(
+        ".{digest}-{}-{nanos}-{sequence}",
+        std::process::id()
+    ))
 }
 
 fn compiler_built_runtime(profile: NativeProfile) -> Option<&'static Path> {
@@ -901,6 +1058,41 @@ mod tests {
             .expect_err("a missing override should fail");
         assert!(error.message.contains("absent"));
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn embedded_runtime_materialization_is_independent_of_cargo_output() {
+        let directory = temp_directory("embedded-materialization");
+        let archive = b"embedded archive";
+        let metadata = format!(
+            "{{\n  \"schemaVersion\": 1,\n  \"abiVersion\": \"1\",\n  \"runtimeRevision\": \"cafebabe\",\n  \"targetTriple\": \"aarch64-apple-darwin\",\n  \"profile\": \"debug\",\n  \"featureSet\": [],\n  \"bytes\": {},\n  \"sha256\": \"{}\"\n}}\n",
+            archive.len(),
+            sha256_hex(archive),
+        );
+        let archive = materialize_embedded_runtime_at(
+            EmbeddedRuntimeProfile {
+                archive,
+                metadata: Box::leak(metadata.into_boxed_str()),
+            },
+            &directory,
+        )
+        .expect("embedded runtime should materialize");
+
+        assert_eq!(fs::read(&archive).unwrap(), b"embedded archive");
+        assert!(load_metadata(&archive)
+            .expect("metadata should parse")
+            .is_some());
+        assert!(archive.starts_with(&directory));
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn explicit_override_skips_embedded_runtime_materialization() {
+        assert_eq!(
+            embedded_runtime_candidate(NativeProfile::Fast, Some(OsStr::new("runtime")))
+                .expect("explicit runtime selection must not materialize the embedded archive"),
+            None
+        );
     }
 
     #[test]

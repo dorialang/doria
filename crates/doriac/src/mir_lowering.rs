@@ -3820,6 +3820,72 @@ fn lower_expression_statement(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct ThrowAssertionFacts {
+    actual_type: mir::LocalId,
+    actual_presentation: mir::LocalId,
+    expected_type: mir::LocalId,
+    expected_presentation: mir::LocalId,
+    difference: mir::LocalId,
+}
+
+fn initialize_throw_assertion_facts(
+    assertion: &hir::Assertion,
+    context: &mut LoweringContext,
+) -> ThrowAssertionFacts {
+    let expected_type = assertion
+        .expected_type
+        .as_ref()
+        .and_then(|ty| match ty {
+            ResolvedType::Function(function) => function.parameters.first(),
+            _ => None,
+        })
+        .map(|parameter| crate::attributes::metadata_type_name(&parameter.ty))
+        .unwrap_or_else(|| "Error".to_string());
+    let expected_presentation = if assertion.negated {
+        "No Checked Error".to_string()
+    } else if expected_type == "Error" {
+        "A Checked Error".to_string()
+    } else {
+        expected_type.clone()
+    };
+    ThrowAssertionFacts {
+        actual_type: initialize_assertion_fact_string("NoError", context),
+        actual_presentation: initialize_assertion_fact_string("No Checked Error", context),
+        expected_type: initialize_assertion_fact_string(
+            if assertion.negated {
+                "NoError"
+            } else {
+                &expected_type
+            },
+            context,
+        ),
+        expected_presentation: initialize_assertion_fact_string(&expected_presentation, context),
+        difference: initialize_assertion_fact_string("No Checked Error Was Produced", context),
+    }
+}
+
+fn initialize_assertion_fact_string(value: &str, context: &mut LoweringContext) -> mir::LocalId {
+    let local = context.declare_statement_string_temp();
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: mir::Rvalue::String(mir::StringExpression::Literal(value.to_string())),
+    });
+    local
+}
+
+fn replace_assertion_fact_string(
+    local: mir::LocalId,
+    value: mir::StringExpression,
+    context: &mut LoweringContext,
+) {
+    context.push_statement(mir::Statement::DropString { local });
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: mir::Rvalue::String(value),
+    });
+}
+
 fn lower_assertion_statement(
     assertion: &hir::Assertion,
     context: &mut LoweringContext,
@@ -3831,7 +3897,13 @@ fn lower_assertion_statement(
         .actual
         .as_deref()
         .zip(assertion.actual_type.as_ref())
-        .map(|(expression, ty)| lower_assertion_operand(expression, ty, context))
+        .map(|(expression, ty)| {
+            if assertion.matcher == Matcher::Throws {
+                lower_assertion_callable_operand(expression, ty, context)
+            } else {
+                lower_assertion_operand(expression, ty, context)
+            }
+        })
         .transpose()?;
     let actual_type_name = assertion
         .actual_type
@@ -3841,7 +3913,13 @@ fn lower_assertion_statement(
         .expected
         .as_deref()
         .zip(assertion.expected_type.as_ref())
-        .map(|(expression, ty)| lower_assertion_operand(expression, ty, context))
+        .map(|(expression, ty)| {
+            if assertion.matcher == Matcher::Throws {
+                lower_assertion_callable_operand(expression, ty, context)
+            } else {
+                lower_assertion_operand(expression, ty, context)
+            }
+        })
         .transpose()?;
     let explicit_expected_type_name = assertion
         .expected_type
@@ -3862,6 +3940,8 @@ fn lower_assertion_statement(
         .as_deref()
         .map(|message| lower_assertion_string_operand(message, context))
         .transpose()?;
+    let throw_facts = (assertion.matcher == Matcher::Throws)
+        .then(|| initialize_throw_assertion_facts(assertion, context));
 
     let success = context.create_block();
     let failure = context.create_block();
@@ -3908,12 +3988,23 @@ fn lower_assertion_statement(
 
     if assertion.matcher == Matcher::Fail {
         context.terminate_current(mir::Terminator::Jump(failure));
+    } else if assertion.matcher == Matcher::Throws {
+        lower_throw_assertion_flow(
+            assertion,
+            actual.expect("checked throw expectation has a subject"),
+            expected,
+            success,
+            failure,
+            throw_facts.expect("throw assertion facts"),
+            context,
+        )?;
     } else {
         let mut condition = assertion_condition(
             assertion.matcher,
             actual.expect("checked expectation has an actual operand"),
             expected,
             assertion.span,
+            &context.collection_registry,
         )?;
         if assertion.negated {
             condition = mir::BoolExpression::Not(Box::new(condition));
@@ -3927,18 +4018,26 @@ fn lower_assertion_statement(
 
     let statement_temporaries = context.statement_owned_locals.clone();
     context.current_block = Some(failure);
-    let actual_presentation = actual
-        .zip(actual_type_name.as_deref())
-        .map(|(operand, ty)| {
-            materialize_assertion_presentation(operand, ty, assertion.span, context)
-        })
-        .transpose()?;
-    let expected_presentation = expected
-        .zip(explicit_expected_type_name.as_deref())
-        .map(|(operand, ty)| {
-            materialize_assertion_presentation(operand, ty, assertion.span, context)
-        })
-        .transpose()?;
+    let actual_presentation = if let Some(facts) = throw_facts {
+        Some(facts.actual_presentation)
+    } else {
+        actual
+            .zip(assertion.actual_type.as_ref())
+            .map(|(operand, ty)| {
+                materialize_assertion_presentation(operand, ty, assertion.span, context)
+            })
+            .transpose()?
+    };
+    let expected_presentation = if let Some(facts) = throw_facts {
+        Some(facts.expected_presentation)
+    } else {
+        expected
+            .zip(assertion.expected_type.as_ref())
+            .map(|(operand, ty)| {
+                materialize_assertion_presentation(operand, ty, assertion.span, context)
+            })
+            .transpose()?
+    };
     let message = if let Some(message) = user_message {
         mir::Rvalue::String(mir::StringExpression::Local(message))
     } else {
@@ -3958,21 +4057,37 @@ fn lower_assertion_statement(
             |local| mir::Rvalue::String(mir::StringExpression::Local(local)),
         )
     };
+    let difference = throw_facts.map_or_else(
+        || assertion_difference(assertion, actual, expected, context),
+        |facts| Some(mir::StringExpression::Local(facts.difference)),
+    );
+    let actual_type_value = throw_facts.map_or_else(
+        || string(actual_type_name.unwrap_or_default()),
+        |facts| mir::Rvalue::String(mir::StringExpression::Local(facts.actual_type)),
+    );
+    let expected_type_value = throw_facts.map_or_else(
+        || string(expected_type_name.unwrap_or_default()),
+        |facts| mir::Rvalue::String(mir::StringExpression::Local(facts.expected_type)),
+    );
     let args = vec![
         message,
         string(assertion.matcher.fact_name().to_string()),
         boolean(assertion.negated),
         boolean(actual.is_some()),
-        string(actual_type_name.unwrap_or_default()),
+        actual_type_value,
         presentation(actual_presentation),
-        boolean(expected.is_some() || implicit_expected.is_some()),
-        string(expected_type_name.unwrap_or_default()),
-        implicit_expected.map_or_else(
-            || presentation(expected_presentation),
-            |(_, value)| string(value.to_string()),
-        ),
-        boolean(false),
-        string(String::new()),
+        boolean(throw_facts.is_some() || expected.is_some() || implicit_expected.is_some()),
+        expected_type_value,
+        if throw_facts.is_some() {
+            presentation(expected_presentation)
+        } else {
+            implicit_expected.map_or_else(
+                || presentation(expected_presentation),
+                |(_, value)| string(value.to_string()),
+            )
+        },
+        boolean(difference.is_some()),
+        difference.map_or_else(|| string(String::new()), mir::Rvalue::String),
         boolean(user_message.is_some()),
         user_message.map_or_else(
             || string(String::new()),
@@ -4005,6 +4120,515 @@ fn lower_assertion_statement(
     context.statement_owned_locals = statement_temporaries;
     context.current_block = Some(success);
     Ok(())
+}
+
+fn assertion_difference(
+    assertion: &hir::Assertion,
+    actual: Option<mir::AssertionOperandPlan>,
+    expected: Option<mir::AssertionOperandPlan>,
+    context: &LoweringContext<'_>,
+) -> Option<mir::StringExpression> {
+    use crate::assertions::AssertionMatcher as Matcher;
+    if assertion.matcher == Matcher::CollectionCount {
+        let (
+            Some(mir::AssertionOperandPlan::Local {
+                local: actual,
+                ty: mir::Type::Collection(_),
+            }),
+            Some(mir::AssertionOperandPlan::Local {
+                local: expected,
+                ty: mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+            }),
+        ) = (actual, expected)
+        else {
+            return None;
+        };
+        return Some(mir::StringExpression::Intrinsic(Box::new(
+            mir::StringIntrinsicCall {
+                kind: mir::StringIntrinsicKind::AssertionCountDifference,
+                args: vec![
+                    mir::Rvalue::Value(mir::ValueExpression::Integer(
+                        mir::IntegerExpression::Use {
+                            ty: IntegerType::Int64,
+                            operand: mir::Operand::CollectionLength(actual),
+                        },
+                    )),
+                    local_rvalue(
+                        expected,
+                        mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                        false,
+                    ),
+                ],
+                result: mir::Type::String,
+                span: assertion.span,
+                argument_spans: vec![assertion.span; 2],
+            },
+        )));
+    }
+    if assertion.matcher == Matcher::Equal {
+        if let (
+            Some(mir::AssertionOperandPlan::Local {
+                local: actual,
+                ty: mir::Type::Collection(actual_collection),
+            }),
+            Some(mir::AssertionOperandPlan::Local {
+                local: expected,
+                ty: mir::Type::Collection(expected_collection),
+            }),
+        ) = (actual, expected)
+        {
+            let actual_kind = context.collection_registry.types[actual_collection.0].kind;
+            let expected_kind = context.collection_registry.types[expected_collection.0].kind;
+            if actual_kind == mir::CollectionKind::Bytes
+                && expected_kind == mir::CollectionKind::Bytes
+            {
+                return Some(mir::StringExpression::Intrinsic(Box::new(
+                    mir::StringIntrinsicCall {
+                        kind: mir::StringIntrinsicKind::AssertionBytesDifference,
+                        args: vec![
+                            local_rvalue(actual, mir::Type::Collection(actual_collection), false),
+                            local_rvalue(
+                                expected,
+                                mir::Type::Collection(expected_collection),
+                                false,
+                            ),
+                        ],
+                        result: mir::Type::String,
+                        span: assertion.span,
+                        argument_spans: vec![assertion.span; 2],
+                    },
+                )));
+            }
+        }
+    }
+    let mode = match assertion.matcher {
+        Matcher::Equal => 0,
+        Matcher::StringStartsWith => 1,
+        Matcher::StringEndsWith => 2,
+        _ => {
+            return crate::assertions::stable_difference(assertion.matcher, assertion.negated)
+                .map(|difference| mir::StringExpression::Literal(difference.to_string()));
+        }
+    };
+    let (
+        Some(mir::AssertionOperandPlan::Local {
+            local: actual,
+            ty: mir::Type::String,
+        }),
+        Some(mir::AssertionOperandPlan::Local {
+            local: expected,
+            ty: mir::Type::String,
+        }),
+    ) = (actual, expected)
+    else {
+        return None;
+    };
+    let mode = IntegerValue::from_i128(IntegerType::Int64, i128::from(mode))
+        .expect("assertion difference mode fits int");
+    Some(mir::StringExpression::Intrinsic(Box::new(
+        mir::StringIntrinsicCall {
+            kind: mir::StringIntrinsicKind::AssertionDifference,
+            args: vec![
+                local_rvalue(actual, mir::Type::String, false),
+                local_rvalue(expected, mir::Type::String, false),
+                mir::Rvalue::Value(mir::ValueExpression::Integer(
+                    mir::IntegerExpression::constant(mode),
+                )),
+            ],
+            result: mir::Type::String,
+            span: assertion.span,
+            argument_spans: vec![assertion.span; 3],
+        },
+    )))
+}
+
+fn lower_assertion_callable_operand(
+    expression: &hir::Expr,
+    resolved: &ResolvedType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<mir::AssertionOperandPlan> {
+    let resolved = substitute_resolved_type(resolved, &context.type_substitutions);
+    let Some(mir::Type::Function(function_type)) = context.mir_resolved_type(&resolved) else {
+        return Err(vec![Diagnostic::new(
+            "I7101",
+            "throw expectation callable has no native function type",
+            expression.span(),
+        )]);
+    };
+    let definition = context
+        .collection_registry
+        .function_types
+        .get(function_type.0)
+        .filter(|definition| definition.id == function_type)
+        .expect("checked throw expectation function type exists")
+        .clone();
+    let transfer = definition.invocation_mode == mir::FunctionInvocationMode::Once;
+    let value = lower_function_expression(expression, function_type, transfer, context)?;
+    let owned = !mir::function_expression_is_borrowed(&value);
+    let local = context.declare_checked_call_slot(mir::Type::Function(function_type), owned);
+    context.locals[local.0].writable =
+        definition.invocation_mode == mir::FunctionInvocationMode::Writable;
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: mir::Rvalue::Function(value),
+    });
+    if owned && !transfer {
+        context.track_statement_owned_local(local, mir::Type::Function(function_type));
+    }
+    Ok(mir::AssertionOperandPlan::Local {
+        local,
+        ty: mir::Type::Function(function_type),
+    })
+}
+
+fn lower_throw_assertion_flow(
+    assertion: &hir::Assertion,
+    subject: mir::AssertionOperandPlan,
+    inspector: Option<mir::AssertionOperandPlan>,
+    success: mir::BlockId,
+    failure: mir::BlockId,
+    facts: ThrowAssertionFacts,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let mir::AssertionOperandPlan::Local {
+        local: subject,
+        ty: mir::Type::Function(subject_type),
+    } = subject
+    else {
+        return Err(vec![Diagnostic::new(
+            "I7101",
+            "throw expectation subject is not a MIR function value",
+            assertion.span,
+        )]);
+    };
+    let subject_definition = context
+        .collection_registry
+        .function_types
+        .get(subject_type.0)
+        .filter(|definition| definition.id == subject_type)
+        .expect("checked throw subject function type exists")
+        .clone();
+    let unused_inspector_cleanup = assertion_once_callable_cleanup(inspector, context);
+    let result = assertion_call_result_slot(&subject_definition, context);
+    let normal = context.create_block();
+    let callee = mir::FunctionExpression::Local {
+        function_type: subject_type,
+        local: subject,
+        transfer: subject_definition.invocation_mode == mir::FunctionInvocationMode::Once,
+    };
+    if subject_definition.has_checked_transport() {
+        let caught = context.declare_checked_call_slot(mir::Type::Error, true);
+        let caught_block = context.create_block();
+        context.terminate_current(mir::Terminator::CheckedIndirectCall {
+            callee,
+            function_type: subject_type,
+            invocation_mode: subject_definition.invocation_mode,
+            args: Vec::new(),
+            result: result.map(|(local, _)| local),
+            error: caught,
+            success: normal,
+            failure: caught_block,
+            span: assertion.span,
+        });
+        context.current_block = Some(caught_block);
+        lower_caught_throw_assertion(
+            assertion,
+            caught,
+            inspector,
+            unused_inspector_cleanup,
+            (success, failure),
+            facts,
+            context,
+        )?;
+    } else {
+        context.terminate_current(mir::Terminator::IndirectCall {
+            callee,
+            function_type: subject_type,
+            invocation_mode: subject_definition.invocation_mode,
+            args: Vec::new(),
+            result: result.map(|(local, _)| local),
+            continuation: normal,
+            span: assertion.span,
+        });
+    }
+
+    context.current_block = Some(normal);
+    if let Some((local, ty)) = result {
+        emit_assertion_call_result_drop(local, ty, context);
+    }
+    if let Some(cleanup) = unused_inspector_cleanup {
+        context.emit_drop_obligations(&[cleanup]);
+    }
+    context.terminate_current(mir::Terminator::Jump(if assertion.negated {
+        success
+    } else {
+        failure
+    }));
+    context.current_block = Some(success);
+    Ok(())
+}
+
+fn lower_caught_throw_assertion(
+    assertion: &hir::Assertion,
+    caught: mir::LocalId,
+    inspector: Option<mir::AssertionOperandPlan>,
+    unused_inspector_cleanup: Option<DropObligation>,
+    destinations: (mir::BlockId, mir::BlockId),
+    facts: ThrowAssertionFacts,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let (success, failure) = destinations;
+    materialize_caught_error_assertion_facts(caught, facts, assertion.span, context);
+    if assertion.negated {
+        replace_assertion_fact_string(
+            facts.difference,
+            mir::StringExpression::Literal("A Checked Error Was Produced".to_string()),
+            context,
+        );
+        context.push_statement(mir::Statement::DropError { local: caught });
+        context.terminate_current(mir::Terminator::Jump(failure));
+        return Ok(());
+    }
+    let Some(mir::AssertionOperandPlan::Local {
+        local: inspector,
+        ty: mir::Type::Function(inspector_type),
+    }) = inspector
+    else {
+        context.push_statement(mir::Statement::DropError { local: caught });
+        context.terminate_current(mir::Terminator::Jump(success));
+        return Ok(());
+    };
+    let definition = context
+        .collection_registry
+        .function_types
+        .get(inspector_type.0)
+        .filter(|definition| definition.id == inspector_type)
+        .expect("checked throw inspector function type exists")
+        .clone();
+    let [parameter] = definition.parameters.as_slice() else {
+        unreachable!("semantic checking requires one throw inspector parameter")
+    };
+    let (entry, argument, cleanup) = match parameter.ty {
+        mir::Type::Error => (
+            context.current_block(),
+            mir::Rvalue::Error(mir::ErrorExpression::Local {
+                local: caught,
+                transfer: false,
+            }),
+            DropObligation::Error(caught),
+        ),
+        mir::Type::Class(class) => {
+            let descriptor = context
+                .error_descriptor_ids
+                .get(&class)
+                .copied()
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "I7101",
+                        "throw inspector Error class has no runtime descriptor",
+                        assertion.span,
+                    )]
+                })?;
+            let matching = context.create_block();
+            let wrong = context.create_block();
+            context.terminate_current(mir::Terminator::ErrorSwitch {
+                error: caught,
+                cases: vec![(descriptor, matching)],
+                catch_all: None,
+                fallback: wrong,
+            });
+            context.current_block = Some(wrong);
+            replace_assertion_fact_string(
+                facts.difference,
+                mir::StringExpression::Literal("The Checked Error Type Did Not Match".to_string()),
+                context,
+            );
+            if let Some(cleanup) = unused_inspector_cleanup {
+                context.emit_drop_obligations(&[cleanup]);
+            }
+            context.push_statement(mir::Statement::DropError { local: caught });
+            context.terminate_current(mir::Terminator::Jump(failure));
+            context.current_block = Some(matching);
+            let object = context.declare_checked_call_slot(mir::Type::Class(class), true);
+            context.push_statement(mir::Statement::ExtractErrorObject {
+                target: object,
+                error: caught,
+                descriptor,
+            });
+            (
+                matching,
+                mir::Rvalue::Class(mir::ClassExpression::Local {
+                    class,
+                    local: object,
+                    transfer: false,
+                }),
+                DropObligation::Class(object, class),
+            )
+        }
+        _ => unreachable!("semantic checking restricts throw inspectors to Error values"),
+    };
+    context.current_block = Some(entry);
+    let callee = mir::FunctionExpression::Local {
+        function_type: inspector_type,
+        local: inspector,
+        transfer: definition.invocation_mode == mir::FunctionInvocationMode::Once,
+    };
+    let inspector_success = context.create_block();
+    if definition.has_checked_transport() {
+        let inspector_error = context.declare_checked_call_slot(mir::Type::Error, true);
+        let inspector_failure = context.create_block();
+        context.terminate_current(mir::Terminator::CheckedIndirectCall {
+            callee,
+            function_type: inspector_type,
+            invocation_mode: definition.invocation_mode,
+            args: vec![argument],
+            result: None,
+            error: inspector_error,
+            success: inspector_success,
+            failure: inspector_failure,
+            span: assertion.span,
+        });
+        let statement_temporaries = context.statement_owned_locals.clone();
+        context.current_block = Some(inspector_failure);
+        context.emit_drop_obligations(&[cleanup]);
+        context.route_checked_error(inspector_error);
+        context.statement_owned_locals = statement_temporaries;
+    } else {
+        context.terminate_current(mir::Terminator::IndirectCall {
+            callee,
+            function_type: inspector_type,
+            invocation_mode: definition.invocation_mode,
+            args: vec![argument],
+            result: None,
+            continuation: inspector_success,
+            span: assertion.span,
+        });
+    }
+    context.current_block = Some(inspector_success);
+    context.emit_drop_obligations(&[cleanup]);
+    context.terminate_current(mir::Terminator::Jump(success));
+    Ok(())
+}
+
+fn assertion_once_callable_cleanup(
+    operand: Option<mir::AssertionOperandPlan>,
+    context: &LoweringContext<'_>,
+) -> Option<DropObligation> {
+    let mir::AssertionOperandPlan::Local {
+        local,
+        ty: mir::Type::Function(function_type),
+    } = operand?
+    else {
+        return None;
+    };
+    let definition = context
+        .collection_registry
+        .function_types
+        .get(function_type.0)
+        .filter(|definition| definition.id == function_type)?;
+    (context.locals[local.0].owned
+        && definition.invocation_mode == mir::FunctionInvocationMode::Once)
+        .then(|| drop_obligation_for_owned_local(local, mir::Type::Function(function_type)))
+}
+
+fn materialize_caught_error_assertion_facts(
+    caught: mir::LocalId,
+    facts: ThrowAssertionFacts,
+    span: Span,
+    context: &mut LoweringContext,
+) {
+    let mut descriptors = context
+        .error_descriptor_ids
+        .iter()
+        .map(|(class, descriptor)| {
+            let name = context
+                .semantic_info
+                .classes
+                .iter()
+                .find(|definition| definition.id == *class)
+                .map(|definition| definition.name.clone())
+                .expect("checked Error descriptor has a semantic class");
+            (*descriptor, name)
+        })
+        .collect::<Vec<_>>();
+    descriptors.sort_by_key(|(descriptor, _)| descriptor.0);
+    let continuation = context.create_block();
+    let fallback = context.create_block();
+    let cases = descriptors
+        .iter()
+        .map(|(descriptor, _)| (*descriptor, context.create_block()))
+        .collect::<Vec<_>>();
+    context.terminate_current(mir::Terminator::ErrorSwitch {
+        error: caught,
+        cases: cases.clone(),
+        catch_all: None,
+        fallback,
+    });
+    for ((_, name), (_, block)) in descriptors.iter().zip(&cases) {
+        context.current_block = Some(*block);
+        assign_caught_error_assertion_facts(caught, name, facts, span, context);
+        context.terminate_current(mir::Terminator::Jump(continuation));
+    }
+    context.current_block = Some(fallback);
+    assign_caught_error_assertion_facts(caught, "Error", facts, span, context);
+    context.terminate_current(mir::Terminator::Jump(continuation));
+    context.current_block = Some(continuation);
+}
+
+fn assign_caught_error_assertion_facts(
+    caught: mir::LocalId,
+    error_type: &str,
+    facts: ThrowAssertionFacts,
+    span: Span,
+    context: &mut LoweringContext,
+) {
+    replace_assertion_fact_string(
+        facts.actual_type,
+        mir::StringExpression::Literal(error_type.to_string()),
+        context,
+    );
+    replace_assertion_fact_string(
+        facts.actual_presentation,
+        mir::StringExpression::Intrinsic(Box::new(mir::StringIntrinsicCall {
+            kind: mir::StringIntrinsicKind::AssertionErrorPresentation,
+            args: vec![
+                local_rvalue(facts.actual_type, mir::Type::String, false),
+                mir::Rvalue::String(mir::StringExpression::ErrorMessage(Box::new(
+                    mir::ErrorExpression::Local {
+                        local: caught,
+                        transfer: false,
+                    },
+                ))),
+            ],
+            result: mir::Type::String,
+            span,
+            argument_spans: vec![span; 2],
+        })),
+        context,
+    );
+}
+
+fn assertion_call_result_slot(
+    definition: &mir::FunctionType,
+    context: &mut LoweringContext,
+) -> Option<(mir::LocalId, mir::Type)> {
+    let mir::ReturnType::Value(ty) = definition.return_type else {
+        return None;
+    };
+    let owned = user_local_type_owns_value(ty);
+    Some((context.declare_checked_call_slot(ty, owned), ty))
+}
+
+fn emit_assertion_call_result_drop(
+    local: mir::LocalId,
+    ty: mir::Type,
+    context: &mut LoweringContext,
+) {
+    if matches!(ty, mir::Type::String | mir::Type::NullableString) {
+        context.emit_drop_obligations(&[DropObligation::String(local)]);
+    } else if ty.has_move_ownership() {
+        context.emit_drop_obligations(&[drop_obligation_for_owned_local(local, ty)]);
+    }
 }
 
 fn lower_assertion_operand(
@@ -4059,6 +4683,7 @@ fn assertion_condition(
     actual: mir::AssertionOperandPlan,
     expected: Option<mir::AssertionOperandPlan>,
     span: Span,
+    collection_registry: &CollectionRegistry,
 ) -> DiagnosticResult<mir::BoolExpression> {
     use crate::assertions::AssertionMatcher as Matcher;
     use mir::AssertionOperandPlan::Local;
@@ -4140,9 +4765,170 @@ fn assertion_condition(
                 })),
             }
         }
+        Matcher::CollectionEmpty => {
+            let Local {
+                local: collection,
+                ty: mir::Type::Collection(_),
+            } = actual
+            else {
+                return Err(vec![Diagnostic::new(
+                    "I7101",
+                    "collection assertion actual has another MIR type",
+                    span,
+                )]);
+            };
+            mir::BoolExpression::CollectionIsEmpty { collection }
+        }
+        Matcher::CollectionCount => {
+            let Local {
+                local: collection,
+                ty: mir::Type::Collection(_),
+            } = actual
+            else {
+                return Err(vec![Diagnostic::new(
+                    "I7101",
+                    "collection count assertion actual has another MIR type",
+                    span,
+                )]);
+            };
+            let Local {
+                local: expected,
+                ty: mir::Type::Scalar(mir::ScalarType::Integer(expected_ty)),
+            } = expected.expect("collection count assertion has expected operand")
+            else {
+                return Err(vec![Diagnostic::new(
+                    "I7101",
+                    "collection count assertion expected value is not an integer",
+                    span,
+                )]);
+            };
+            mir::BoolExpression::Compare {
+                op: mir::CompareOp::Equal,
+                left: Box::new(value_expression_from_operand(
+                    mir::ScalarType::Integer(expected_ty),
+                    mir::Operand::CollectionLength(collection),
+                )),
+                right: Box::new(value_expression_from_operand(
+                    mir::ScalarType::Integer(expected_ty),
+                    mir::Operand::Local(expected),
+                )),
+            }
+        }
+        Matcher::CollectionContains | Matcher::DictionaryHasKey | Matcher::DictionaryHasValue => {
+            let Local {
+                local: collection,
+                ty: mir::Type::Collection(collection_type),
+            } = actual
+            else {
+                return Err(vec![Diagnostic::new(
+                    "I7101",
+                    "collection membership assertion actual has another MIR type",
+                    span,
+                )]);
+            };
+            let definition = collection_registry
+                .types
+                .get(collection_type.0)
+                .ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "I7101",
+                        "collection assertion references an unknown MIR collection type",
+                        span,
+                    )]
+                })?;
+            let expected_type = if matcher == Matcher::DictionaryHasKey {
+                definition.key.ok_or_else(|| {
+                    vec![Diagnostic::new(
+                        "I7101",
+                        "dictionary-key assertion targets a collection without keys",
+                        span,
+                    )]
+                })?
+            } else {
+                definition.value
+            };
+            let value = match expected.ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I7101",
+                    "collection membership assertion has no expected operand",
+                    span,
+                )]
+            })? {
+                Local { local, ty } => local_rvalue(local, ty, false),
+                mir::AssertionOperandPlan::Null => null_rvalue_for_type(expected_type, span)?,
+            };
+            mir::BoolExpression::CollectionHas {
+                collection,
+                value: Box::new(value),
+                op: if matcher == Matcher::DictionaryHasValue {
+                    mir::CollectionMembershipOp::ContainsValue
+                } else {
+                    mir::CollectionMembershipOp::Contains
+                },
+            }
+        }
+        Matcher::Throws => unreachable!("throw assertions use checked-call control flow"),
         Matcher::Fail => unreachable!("fail has no success condition"),
     };
     Ok(comparison)
+}
+
+fn null_rvalue_for_type(ty: mir::Type, span: Span) -> DiagnosticResult<mir::Rvalue> {
+    let value = match ty {
+        mir::Type::NullableScalar(ty) => {
+            mir::Rvalue::NullableScalar(mir::NullableScalarExpression::Null(ty))
+        }
+        mir::Type::NullableString => {
+            mir::Rvalue::NullableString(mir::NullableStringExpression::Null)
+        }
+        mir::Type::NullableMixed => mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Null),
+        mir::Type::NullableError => mir::Rvalue::NullableError(mir::NullableErrorExpression::Null),
+        mir::Type::NullableClass(class) => {
+            mir::Rvalue::NullableClass(mir::NullableClassExpression::Null(class))
+        }
+        mir::Type::NullableSharedReference(class) => mir::Rvalue::NullableSharedReference(
+            mir::NullableSharedReferenceExpression::Null(class),
+        ),
+        mir::Type::NullableWeakReference(class) => {
+            mir::Rvalue::NullableWeakReference(mir::NullableWeakReferenceExpression::Null(class))
+        }
+        mir::Type::NullableWritableSharedReference(payload) => {
+            mir::Rvalue::NullableWritableSharedReference(
+                mir::NullableWritableSharedReferenceExpression::Null(payload),
+            )
+        }
+        mir::Type::NullableWritableWeakReference(payload) => {
+            mir::Rvalue::NullableWritableWeakReference(
+                mir::NullableWritableWeakReferenceExpression::Null(payload),
+            )
+        }
+        mir::Type::NullableReadonlySharedReferenceAccess(payload)
+        | mir::Type::NullableWritableSharedReferenceAccess(payload) => {
+            mir::Rvalue::NullableSharedReferenceAccess(
+                mir::NullableSharedReferenceAccessExpression::Null {
+                    payload,
+                    writable: matches!(ty, mir::Type::NullableWritableSharedReferenceAccess(_)),
+                },
+            )
+        }
+        mir::Type::NullableCollection(collection) => {
+            mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Null(collection))
+        }
+        mir::Type::NullablePayloadEnum(ty) => {
+            mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Null(ty))
+        }
+        mir::Type::NullableFunction(function_type) => {
+            mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Null { function_type })
+        }
+        _ => {
+            return Err(vec![Diagnostic::new(
+                "I7101",
+                "null assertion operand does not match a nullable MIR type",
+                span,
+            )]);
+        }
+    };
+    Ok(value)
 }
 
 fn assertion_equal_condition(
@@ -4342,10 +5128,11 @@ fn assertion_operand_is_null(
 
 fn materialize_assertion_presentation(
     operand: mir::AssertionOperandPlan,
-    type_name: &str,
+    resolved: &ResolvedType,
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::LocalId> {
+    let type_name = crate::attributes::metadata_type_name(resolved);
     let local = context.declare_statement_string_temp();
     let value = match operand {
         mir::AssertionOperandPlan::Null => mir::StringExpression::Literal("null".to_string()),
@@ -4373,6 +5160,10 @@ fn materialize_assertion_presentation(
             ty,
             mir::Operand::Local(local),
         )),
+        mir::AssertionOperandPlan::Local {
+            local: source,
+            ty: mir::Type::Collection(collection),
+        } => assertion_collection_presentation(source, collection, resolved, span, context)?,
         mir::AssertionOperandPlan::Local {
             local: source,
             ty: mir::Type::NullableScalar(ty),
@@ -4436,6 +5227,100 @@ fn materialize_assertion_presentation(
         value: mir::Rvalue::String(value),
     });
     Ok(local)
+}
+
+fn assertion_collection_presentation(
+    source: mir::LocalId,
+    collection: mir::CollectionTypeId,
+    resolved: &ResolvedType,
+    span: Span,
+    context: &LoweringContext<'_>,
+) -> DiagnosticResult<mir::StringExpression> {
+    let definition = context.collection_registry.types[collection.0].clone();
+    let (key_resolved, value_resolved) = match resolved {
+        ResolvedType::Bytes => (None, ResolvedType::Integer(IntegerType::UInt8)),
+        ResolvedType::TypedArray(value)
+        | ResolvedType::List(value)
+        | ResolvedType::Set(value)
+        | ResolvedType::SortedSet(value)
+        | ResolvedType::PriorityQueue(value)
+        | ResolvedType::Deque(value) => (None, (**value).clone()),
+        ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
+            (Some((**key).clone()), (**value).clone())
+        }
+        _ => {
+            return Err(vec![Diagnostic::new(
+                "I7101",
+                "collection assertion presentation has no semantic collection type",
+                span,
+            )]);
+        }
+    };
+    let integer = |value: i64| {
+        mir::Rvalue::Value(mir::ValueExpression::Integer(
+            mir::IntegerExpression::constant(
+                IntegerValue::from_i128(IntegerType::Int64, i128::from(value))
+                    .expect("assertion presentation code fits int"),
+            ),
+        ))
+    };
+    let string = |value: String| mir::Rvalue::String(mir::StringExpression::Literal(value));
+    let enum_cases = |ty: mir::Type| {
+        let enum_id = match ty {
+            mir::Type::Scalar(mir::ScalarType::Enum(enum_id))
+            | mir::Type::NullableScalar(mir::ScalarType::Enum(enum_id)) => Some(enum_id),
+            _ => None,
+        };
+        enum_id
+            .and_then(|enum_id| {
+                context
+                    .semantic_info
+                    .enums
+                    .iter()
+                    .find(|definition| definition.id == enum_id)
+            })
+            .map(|definition| {
+                definition
+                    .cases
+                    .iter()
+                    .map(|case| format!("{}\t{}\n", case.tag, case.name))
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    };
+    let key_type = definition.key;
+    let key_resolved = key_resolved.as_ref();
+    Ok(mir::StringExpression::Intrinsic(Box::new(
+        mir::StringIntrinsicCall {
+            kind: mir::StringIntrinsicKind::AssertionCollectionPresentation,
+            args: vec![
+                local_rvalue(source, mir::Type::Collection(collection), false),
+                string(crate::attributes::metadata_type_name(resolved)),
+                integer(crate::native_abi::assertion_collection_kind(
+                    definition.kind,
+                )),
+                integer(crate::native_abi::assertion_presentation_kind(
+                    definition.value,
+                )),
+                string(crate::attributes::metadata_type_name(&value_resolved)),
+                string(enum_cases(definition.value)),
+                integer(
+                    key_type
+                        .map(crate::native_abi::assertion_presentation_kind)
+                        .unwrap_or(crate::native_abi::ASSERTION_PRESENT_OPAQUE),
+                ),
+                string(
+                    key_resolved
+                        .map(crate::attributes::metadata_type_name)
+                        .unwrap_or_default(),
+                ),
+                string(key_type.map(enum_cases).unwrap_or_default()),
+            ],
+            result: mir::Type::String,
+            span,
+            argument_spans: vec![span; 9],
+        },
+    )))
 }
 
 fn materialize_enum_assertion_presentation(
@@ -11053,6 +11938,46 @@ fn string_intrinsic_signature(
     let (parameters, names, defaults, result) = match kind {
         Kind::GraphemeLength | Kind::ByteLength => (vec![string], vec!["text"], vec![None], int),
         Kind::AssertionQuote => (vec![string], vec!["text"], vec![None], string),
+        Kind::AssertionDifference => (
+            vec![string, string, int],
+            vec!["actual", "expected", "mode"],
+            vec![None, None, None],
+            string,
+        ),
+        Kind::AssertionBytesDifference => {
+            let bytes = bytes().ok_or_else(|| {
+                vec![Diagnostic::new(
+                    "I1301",
+                    "checked Bytes assertion has no interned Bytes MIR type",
+                    span,
+                )]
+            })?;
+            (
+                vec![bytes, bytes],
+                vec!["actual", "expected"],
+                vec![None, None],
+                string,
+            )
+        }
+        Kind::AssertionCountDifference => (
+            vec![int, int],
+            vec!["actual", "expected"],
+            vec![None, None],
+            string,
+        ),
+        Kind::AssertionErrorPresentation => (
+            vec![string, string],
+            vec!["type", "message"],
+            vec![None, None],
+            string,
+        ),
+        Kind::AssertionCollectionPresentation => {
+            return Err(vec![Diagnostic::new(
+                "I1301",
+                "collection assertion presentation is compiler-private",
+                span,
+            )]);
+        }
         Kind::IsEmpty => (vec![string], vec!["text"], vec![None], bool_ty),
         Kind::ToBytes => (
             vec![string],
@@ -11230,6 +12155,11 @@ const fn string_intrinsic_name(kind: mir::StringIntrinsicKind) -> &'static str {
         Kind::PadEnd => "padEnd",
         Kind::FromBytes => "fromBytes",
         Kind::AssertionQuote => "<assertionQuote>",
+        Kind::AssertionDifference => "<assertionDifference>",
+        Kind::AssertionBytesDifference => "<assertionBytesDifference>",
+        Kind::AssertionCountDifference => "<assertionCountDifference>",
+        Kind::AssertionErrorPresentation => "<assertionErrorPresentation>",
+        Kind::AssertionCollectionPresentation => "<assertionCollectionPresentation>",
     }
 }
 

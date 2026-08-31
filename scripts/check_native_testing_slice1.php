@@ -33,20 +33,20 @@ foreach ($files as $key => $relative) {
 $required = [
     'decision' => [
         '**Status:** Accepted',
-        '**Implementation Status:** Slices 1 And 2 Implemented; Slice 3 Next; Foundation In Progress',
+        '**Implementation Status:** Implemented By Native Testing Foundation Slices 1 Through 3',
         'Native Testing Foundation Slice 1 - Complete',
         'Native Testing Foundation Slice 2 - Complete',
-        'Native Testing Foundation Slice 3 - Next',
-        'Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes',
+        'Native Testing Foundation Slice 3 - Complete',
+        'Stage 34 Single Class Inheritance - Next',
         'no runtime registration',
         'no Baton source parsing',
     ],
     'reference' => [
         'Stage 33 - Complete',
         'Phase F - Complete',
-        'Native Testing Foundation - In Progress, Not Complete',
+        'Native Testing Foundation - Complete',
         'Baton regression integration',
-        'Slice 3 owns collection/Error expectations',
+        'Slice 3\'s collection/Error expectations are',
     ],
     'identity' => [
         'CompilerSymbolIdentity::StandardTest',
@@ -136,7 +136,7 @@ $crateIterator = new RecursiveIteratorIterator(
 foreach ($crateIterator as $entry) {
     $relative = str_replace('\\', '/', substr($entry->getPathname(), strlen($root) + 1));
     if (preg_match('/(?:stage[_-]?34|inheritance)/i', $relative) === 1) {
-        $failures[] = "{$relative}: Stage 34 implementation file exists before the testing foundation completes";
+        $failures[] = "{$relative}: Stage 34 implementation landed in the testing-foundation closure commit";
     }
 }
 

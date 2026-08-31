@@ -59,9 +59,10 @@ $managedTarget = is_string($managedTarget) && $managedTarget !== ''
     : $root . DIRECTORY_SEPARATOR . 'target';
 $environment = current_environment();
 $environment['CARGO_INSTALL_ROOT'] = $cargoRoot;
-$environment['CARGO_TARGET_DIR'] = $managedTarget
+$installTarget = $managedTarget
     . DIRECTORY_SEPARATOR
     . 'toolchain-install';
+$environment['CARGO_TARGET_DIR'] = $installTarget;
 $environment['DORIA_BUILD_COMMIT'] = $commit;
 
 $installCompiler = [
@@ -96,6 +97,13 @@ run(
 
 require_executable($compiler, 'installed doriac');
 require_executable($languageServer, 'installed doria-lsp');
+
+// Installed tools are release artifacts, whereas Cargo's installation target
+// is a reclaimable build cache. Delete that cache before verification so this
+// workflow cannot accidentally certify a compiler that still references files
+// beneath it.
+run(['cargo', 'clean', '--target-dir', $installTarget], $root, $environment);
+verify_installed_native_compiler($compiler);
 
 $compilerIdentity = decode_json(capture([$compiler, '--version', '--json'], $root));
 if (($compilerIdentity['commit'] ?? null) !== $commit) {
@@ -158,7 +166,11 @@ function run(array $command, string $workingDirectory, ?array $environment = nul
 }
 
 /** @param list<string> $command */
-function capture(array $command, string $workingDirectory): string
+function capture(
+    array $command,
+    string $workingDirectory,
+    ?array $environment = null,
+): string
 {
     $process = proc_open(
         $command,
@@ -169,6 +181,7 @@ function capture(array $command, string $workingDirectory): string
         ],
         $pipes,
         $workingDirectory,
+        $environment,
     );
     if (!is_resource($process)) {
         fail('could not start command: ' . display_command($command));
@@ -245,6 +258,89 @@ function require_executable(string $path, string $label): void
     if (!is_file($path) || (PHP_OS_FAMILY !== 'Windows' && !is_executable($path))) {
         fail("{$label} was not created at:\n    {$path}");
     }
+}
+
+function verify_installed_native_compiler(string $compiler): void
+{
+    $directory = sys_get_temp_dir()
+        . DIRECTORY_SEPARATOR
+        . 'doria-installed-compiler-smoke-'
+        . bin2hex(random_bytes(8));
+    if (!mkdir($directory, 0700, true) && !is_dir($directory)) {
+        fail("could not create installed-compiler smoke directory:\n    {$directory}");
+    }
+    register_shutdown_function(static function () use ($directory): void {
+        remove_tree($directory);
+    });
+
+    try {
+        $probeEnvironment = current_environment();
+        unset($probeEnvironment['DORIA_RT_PATH']);
+        $probeTarget = $directory . DIRECTORY_SEPARATOR . 'empty-cargo-target';
+        if (!mkdir($probeTarget, 0700, true) && !is_dir($probeTarget)) {
+            fail("could not create isolated compiler-probe target:\n    {$probeTarget}");
+        }
+        $probeEnvironment['CARGO_TARGET_DIR'] = $probeTarget;
+        $source = $directory . DIRECTORY_SEPARATOR . 'main.doria';
+        $executable = $directory
+            . DIRECTORY_SEPARATOR
+            . 'main'
+            . (PHP_OS_FAMILY === 'Windows' ? '.exe' : '');
+        $program = <<<'DORIA'
+function main(): void
+{
+    echo "installed runtime ready\n";
+}
+DORIA;
+        if (file_put_contents($source, $program . "\n") === false) {
+            fail("could not write installed-compiler smoke source:\n    {$source}");
+        }
+        run(
+            [
+                $compiler,
+                'compile',
+                $source,
+                '--target',
+                'native',
+                '--out',
+                $executable,
+                '--diagnostic-format',
+                'human',
+                '--diagnostic-color',
+                'never',
+            ],
+            $directory,
+            $probeEnvironment,
+        );
+        require_executable($executable, 'installed doriac native smoke artifact');
+        $output = capture([$executable], $directory, $probeEnvironment);
+        if ($output !== "installed runtime ready\n") {
+            fail(
+                "installed doriac native smoke emitted unexpected output:\n"
+                    . describe($output)
+            );
+        }
+    } finally {
+        remove_tree($directory);
+    }
+}
+
+function remove_tree(string $path): void
+{
+    if (is_link($path) || is_file($path)) {
+        @unlink($path);
+        return;
+    }
+    if (!is_dir($path)) {
+        return;
+    }
+    foreach (scandir($path) ?: [] as $entry) {
+        if ($entry === '.' || $entry === '..') {
+            continue;
+        }
+        remove_tree($path . DIRECTORY_SEPARATOR . $entry);
+    }
+    @rmdir($path);
 }
 
 function require_unshadowed(string $name, string $expected): void

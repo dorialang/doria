@@ -2,8 +2,8 @@
 
 > **Documentation role:** implementation-facing reference for Decision 0129.
 > Decision 0129 owns the accepted semantics. The end-to-end plan owns the global
-> roadmap once mechanically synchronized. Until that synchronization lands, this
-> accepted amendment inserts the Native Testing Foundation before Stage 34.
+> roadmap once mechanically synchronized. The completed foundation precedes
+> Stage 34.
 
 ## Status
 
@@ -13,18 +13,20 @@ Stage 33 - Complete
 Phase F - Complete
 Native Testing Foundation Slice 1 - Complete
 Native Testing Foundation Slice 2 - Complete
-Native Testing Foundation Slice 3 - Next
-Native Testing Foundation - In Progress, Not Complete
-Stage 34 Single Class Inheritance - Blocked Until The Foundation Completes
+Native Testing Foundation Slice 3 - Complete
+Native Testing Foundation - Complete
+Stage 34 Single Class Inheritance - Next
+Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
 Slice 1 implements compiler-owned behavioral declarations, unified schema-3
 metadata, Baton discovery/dispatch, and compiler-fact-based tooling. Stage 33
 and Phase F remain complete. Baton retains development graph activation,
 dispatcher compilation, fresh-process isolation, and suite orchestration. Slice
-2's assertion kernel, Baton regression integration, and official tooling
-coordination are implemented. Slice 3 owns collection/Error expectations and
-final reporting/tooling closure.
+2's assertion kernel and Slice 3's collection/Error expectations are
+implemented. Baton regression integration, classification/hierarchy, and
+official tooling consume the same compiler-owned facts, completing the
+foundation without source parsing or runtime registration.
 
 ## Canonical Authoring Experience
 
@@ -324,9 +326,9 @@ panic remains separate
 no mandatory success-path allocation
 ```
 
-### Slice 3 — Collections, Errors, Baton Reporting, And Tooling Closure
+### Slice 3 — Collections, Errors, Baton Reporting, And Tooling Closure — Complete
 
-Deliver:
+Delivered:
 
 ```text
 collection and dictionary expectations
@@ -377,14 +379,12 @@ They are deferred, not permanently rejected.
 
 ## Invalidated Elsewhere
 
-- `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md` must place
-  the in-progress foundation and Slice 2 before Stage 34.
-- `docs/stdlib-reference.md` records the delivered and future
-  `Doria\Std\Test` surface.
-- `docs/self-hosting.md` distinguishes delivered declarations from the complete
-  native testing story.
+- `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md` place the
+  completed foundation before Stage 34.
+- `docs/stdlib-reference.md` records the delivered `Doria\Std\Test` surface.
+- `docs/self-hosting.md` records the complete native testing story.
 - Decision 0128 remains the Baton orchestration authority but is no longer the
   complete testing API authority.
-- Baton and language-server/editor Slice 1 synchronization is complete.
+- Baton and language-server/editor synchronization complete the foundation.
 - Website testing documentation remains invalidated elsewhere and is not edited
   by this compiler/Baton/tooling slice.

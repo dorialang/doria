@@ -6425,6 +6425,93 @@ fn validate_string_intrinsic(
             exact(&[string])?;
             require_string_intrinsic_result(call, string)
         }
+        Kind::AssertionDifference => {
+            exact(&[string, string, int])?;
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::AssertionBytesDifference => {
+            if call.args.len() != 2 {
+                return Err(malformed_mir(format!(
+                    "String {} expects 2 arguments, got {}",
+                    call.kind,
+                    call.args.len()
+                )));
+            }
+            for argument in &call.args {
+                require_collection_shape(
+                    program,
+                    argument.ty(),
+                    mir::CollectionKind::Bytes,
+                    None,
+                    mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt8)),
+                )?;
+            }
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::AssertionCountDifference => {
+            exact(&[int, int])?;
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::AssertionErrorPresentation => {
+            exact(&[string, string])?;
+            require_string_intrinsic_result(call, string)
+        }
+        Kind::AssertionCollectionPresentation => {
+            if call.args.len() != 9 {
+                return Err(malformed_mir(format!(
+                    "String {} expects 9 arguments, got {}",
+                    call.kind,
+                    call.args.len()
+                )));
+            }
+            let mir::Type::Collection(collection) = call.args[0].ty() else {
+                return Err(malformed_mir(
+                    "collection assertion presentation requires a collection",
+                ));
+            };
+            let definition = collection_in(program, collection)?;
+            let expected = [string, int, int, string, string, int, string, string];
+            for (index, (argument, expected)) in call.args[1..].iter().zip(expected).enumerate() {
+                if argument.ty() != expected {
+                    return Err(malformed_mir(format!(
+                        "String {} argument {} has type {}, expected {expected}",
+                        call.kind,
+                        index + 2,
+                        argument.ty()
+                    )));
+                }
+            }
+            let constant = |index: usize| match &call.args[index] {
+                mir::Rvalue::Value(mir::ValueExpression::Integer(
+                    mir::IntegerExpression::Use {
+                        operand: mir::Operand::Scalar(mir::ScalarValue::Integer(value)),
+                        ..
+                    },
+                )) => i64::try_from(value.signed_value()).ok(),
+                _ => None,
+            };
+            if constant(2)
+                != Some(crate::native_abi::assertion_collection_kind(
+                    definition.kind,
+                ))
+                || constant(3)
+                    != Some(crate::native_abi::assertion_presentation_kind(
+                        definition.value,
+                    ))
+                || constant(6)
+                    != Some(
+                        definition
+                            .key
+                            .map(crate::native_abi::assertion_presentation_kind)
+                            .unwrap_or(crate::native_abi::ASSERTION_PRESENT_OPAQUE),
+                    )
+            {
+                return Err(malformed_mir(
+                    "collection assertion presentation metadata disagrees with its collection",
+                ));
+            }
+            require_string_intrinsic_result(call, string)
+        }
         Kind::IsEmpty => {
             exact(&[string])?;
             require_string_intrinsic_result(call, bool_ty)
@@ -9942,6 +10029,235 @@ fn validate_match_result_plans(function: &mir::Function) -> Result<(), BackendEr
     Ok(())
 }
 
+fn assertion_operand_type(operand: Option<mir::AssertionOperandPlan>) -> Option<mir::Type> {
+    match operand {
+        Some(mir::AssertionOperandPlan::Local { ty, .. }) => Some(ty),
+        Some(mir::AssertionOperandPlan::Null) | None => None,
+    }
+}
+
+fn validate_assertion_collection_contract(
+    program: &mir::Program,
+    plan: &mir::AssertionPlan,
+) -> Result<(), BackendError> {
+    use crate::assertions::AssertionMatcher as Matcher;
+
+    let Some(mir::Type::Collection(collection)) = assertion_operand_type(plan.actual) else {
+        return Err(malformed_mir(
+            "collection assertion requires a concrete collection actual",
+        ));
+    };
+    let definition = collection_in(program, collection)?;
+    let expected = assertion_operand_type(plan.expected);
+    let require_expected = |required: mir::Type, label: &str| {
+        if expected == Some(required)
+            || crate::native_abi::nullable_payload_type(required) == expected
+            || (matches!(plan.expected, Some(mir::AssertionOperandPlan::Null))
+                && matches!(
+                    required,
+                    mir::Type::NullableScalar(_)
+                        | mir::Type::NullableString
+                        | mir::Type::NullableMixed
+                        | mir::Type::NullableError
+                        | mir::Type::NullableClass(_)
+                        | mir::Type::NullableSharedReference(_)
+                        | mir::Type::NullableWeakReference(_)
+                        | mir::Type::NullableWritableSharedReference(_)
+                        | mir::Type::NullableWritableWeakReference(_)
+                        | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                        | mir::Type::NullableWritableSharedReferenceAccess(_)
+                        | mir::Type::NullableCollection(_)
+                        | mir::Type::NullablePayloadEnum(_)
+                        | mir::Type::NullableFunction(_)
+                ))
+        {
+            Ok(())
+        } else {
+            Err(malformed_mir(format!(
+                "{label} assertion operand does not match the collection element type"
+            )))
+        }
+    };
+
+    match plan.matcher {
+        Matcher::CollectionEmpty => Ok(()),
+        Matcher::CollectionCount => {
+            if expected
+                == Some(mir::Type::Scalar(mir::ScalarType::Integer(
+                    IntegerType::Int64,
+                )))
+            {
+                Ok(())
+            } else {
+                Err(malformed_mir(
+                    "collection count assertion requires exact int operand",
+                ))
+            }
+        }
+        Matcher::CollectionContains => {
+            if matches!(
+                definition.kind,
+                mir::CollectionKind::Bytes
+                    | mir::CollectionKind::Dictionary
+                    | mir::CollectionKind::SortedDictionary
+            ) {
+                return Err(malformed_mir(
+                    "collection membership assertion uses an unsupported collection family",
+                ));
+            }
+            require_expected(definition.value, "collection membership")
+        }
+        Matcher::DictionaryHasKey => {
+            let key = definition
+                .key
+                .filter(|_| definition.kind.is_dictionary())
+                .ok_or_else(|| {
+                    malformed_mir("dictionary key assertion requires a dictionary collection")
+                })?;
+            require_expected(key, "dictionary key")
+        }
+        Matcher::DictionaryHasValue => {
+            if !definition.kind.is_dictionary() {
+                return Err(malformed_mir(
+                    "dictionary value assertion requires a dictionary collection",
+                ));
+            }
+            require_expected(definition.value, "dictionary value")
+        }
+        _ => Err(malformed_mir(
+            "non-collection matcher uses a collection assertion contract",
+        )),
+    }
+}
+
+fn validate_throw_assertion_contract(
+    program: &mir::Program,
+    function: &mir::Function,
+    plan: &mir::AssertionPlan,
+) -> Result<(), BackendError> {
+    let Some(mir::Type::Function(subject_type)) = assertion_operand_type(plan.actual) else {
+        return Err(malformed_mir(
+            "throw assertion requires a function-value actual",
+        ));
+    };
+    let subject = function_type_in(program, subject_type)?;
+    if !subject.parameters.is_empty() {
+        return Err(malformed_mir(
+            "throw assertion subject function must have no parameters",
+        ));
+    }
+    let subject_local = match plan.actual {
+        Some(mir::AssertionOperandPlan::Local { local, .. }) => local,
+        _ => unreachable!(),
+    };
+    let valid_callee = |callee: &mir::FunctionExpression| {
+        matches!(
+            callee,
+            mir::FunctionExpression::Local {
+                function_type,
+                local,
+                transfer,
+            } if *function_type == subject_type
+                && *local == subject_local
+                && *transfer == (subject.invocation_mode == mir::FunctionInvocationMode::Once)
+        )
+    };
+    let setup = block_in(function, plan.setup)?;
+    let valid_call = match &setup.terminator {
+        mir::Terminator::CheckedIndirectCall {
+            callee,
+            function_type,
+            invocation_mode,
+            args,
+            error,
+            success,
+            failure,
+            ..
+        } => {
+            let error = local_in(function, *error)?;
+            subject.has_checked_transport()
+                && valid_callee(callee)
+                && *function_type == subject_type
+                && *invocation_mode == subject.invocation_mode
+                && args.is_empty()
+                && error.ty == mir::Type::Error
+                && error.owned
+                && success != failure
+        }
+        mir::Terminator::IndirectCall {
+            callee,
+            function_type,
+            invocation_mode,
+            args,
+            ..
+        } => {
+            !subject.has_checked_transport()
+                && valid_callee(callee)
+                && *function_type == subject_type
+                && *invocation_mode == subject.invocation_mode
+                && args.is_empty()
+        }
+        _ => false,
+    };
+    if !valid_call {
+        return Err(malformed_mir(
+            "throw assertion does not use the subject's ordinary indirect-call contract",
+        ));
+    }
+
+    let Some(inspector_type) = assertion_operand_type(plan.expected) else {
+        return Ok(());
+    };
+    if plan.negated {
+        return Err(malformed_mir(
+            "negated throw assertion cannot carry an inspector",
+        ));
+    }
+    let mir::Type::Function(inspector_type) = inspector_type else {
+        return Err(malformed_mir(
+            "throw assertion inspector must be a function value",
+        ));
+    };
+    let inspector = function_type_in(program, inspector_type)?;
+    let [parameter] = inspector.parameters.as_slice() else {
+        return Err(malformed_mir(
+            "throw assertion inspector must have exactly one parameter",
+        ));
+    };
+    if parameter.mode != mir::FunctionParameterMode::Readonly {
+        return Err(malformed_mir(
+            "throw assertion inspector parameter must be readonly",
+        ));
+    }
+    if !matches!(inspector.return_type, mir::ReturnType::Void) {
+        return Err(malformed_mir("throw assertion inspector must return void"));
+    }
+    match parameter.ty {
+        mir::Type::Error => Ok(()),
+        mir::Type::Class(class) if class_in(program, class)?.error_descriptor.is_some() => Ok(()),
+        _ => Err(malformed_mir(
+            "throw assertion inspector parameter must be Error or a concrete Error class",
+        )),
+    }
+}
+
+fn validate_assertion_contract(
+    program: &mir::Program,
+    function: &mir::Function,
+    plan: &mir::AssertionPlan,
+) -> Result<(), BackendError> {
+    use crate::assertions::AssertionMatcher as Matcher;
+    match plan.matcher {
+        Matcher::CollectionContains
+        | Matcher::CollectionEmpty
+        | Matcher::CollectionCount
+        | Matcher::DictionaryHasKey
+        | Matcher::DictionaryHasValue => validate_assertion_collection_contract(program, plan),
+        Matcher::Throws => validate_throw_assertion_contract(program, function, plan),
+        _ => Ok(()),
+    }
+}
+
 fn validate_control_flow_plans(
     program: &mir::Program,
     function: &mir::Function,
@@ -9992,13 +10308,16 @@ fn validate_control_flow_plans(
                             ));
                         }
                     } else if plan.actual.is_none()
-                        || (plan.matcher.expected_arity() == 1) != plan.expected.is_some()
+                        || !plan
+                            .matcher
+                            .accepts_arity(usize::from(plan.expected.is_some()))
                         || plan.user_message.is_some()
                     {
                         return Err(malformed_mir(
                             "expectation assertion plan has incompatible operands",
                         ));
                     }
+                    validate_assertion_contract(program, function, plan)?;
                     if !cfg_reaches(function, plan.setup, plan.failure)? {
                         return Err(malformed_mir(
                             "assertion setup does not reach its failure path",
@@ -14802,7 +15121,9 @@ fn validate_condition(
             } else {
                 collection_type.value
             };
-            if value.ty() != expected {
+            if value.ty() != expected
+                && crate::native_abi::nullable_payload_type(expected) != Some(value.ty())
+            {
                 return Err(malformed_mir("collection has argument type mismatch"));
             }
             match (op, collection_type.kind) {

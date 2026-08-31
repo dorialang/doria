@@ -100,6 +100,76 @@ pub const STRING_FROM_F32: &str = "dr_v1_string_from_f32";
 pub const STRING_FROM_F64: &str = "dr_v1_string_from_f64";
 pub const STRING_FROM_BOOL: &str = "dr_v1_string_from_bool";
 pub const STRING_ASSERTION_QUOTE: &str = "dr_v4_string_assertion_quote";
+pub const STRING_ASSERTION_DIFFERENCE: &str = "dr_v4_string_assertion_difference";
+pub const BYTES_ASSERTION_DIFFERENCE: &str = "dr_v4_bytes_assertion_difference";
+pub const COLLECTION_ASSERTION_COUNT_DIFFERENCE: &str =
+    "dr_v4_collection_assertion_count_difference";
+pub const ERROR_ASSERTION_PRESENTATION: &str = "dr_v4_error_assertion_presentation";
+pub const COLLECTION_ASSERTION_PRESENTATION: &str = "dr_v4_collection_assertion_presentation";
+
+pub const ASSERTION_PRESENT_OPAQUE: i64 = 0;
+pub const ASSERTION_PRESENT_BOOL: i64 = 1;
+pub const ASSERTION_PRESENT_I8: i64 = 2;
+pub const ASSERTION_PRESENT_I16: i64 = 3;
+pub const ASSERTION_PRESENT_I32: i64 = 4;
+pub const ASSERTION_PRESENT_I64: i64 = 5;
+pub const ASSERTION_PRESENT_U8: i64 = 6;
+pub const ASSERTION_PRESENT_U16: i64 = 7;
+pub const ASSERTION_PRESENT_U32: i64 = 8;
+pub const ASSERTION_PRESENT_U64: i64 = 9;
+pub const ASSERTION_PRESENT_F32: i64 = 10;
+pub const ASSERTION_PRESENT_F64: i64 = 11;
+pub const ASSERTION_PRESENT_STRING: i64 = 12;
+pub const ASSERTION_PRESENT_ENUM: i64 = 13;
+
+pub const fn assertion_collection_kind(kind: mir::CollectionKind) -> i64 {
+    match kind {
+        mir::CollectionKind::Bytes => 0,
+        mir::CollectionKind::TypedArray => 1,
+        mir::CollectionKind::List => 2,
+        mir::CollectionKind::Dictionary => 3,
+        mir::CollectionKind::SortedDictionary => 4,
+        mir::CollectionKind::Set => 5,
+        mir::CollectionKind::SortedSet => 6,
+        mir::CollectionKind::PriorityQueue => 7,
+        mir::CollectionKind::Deque => 8,
+    }
+}
+
+pub const fn assertion_presentation_kind(ty: mir::Type) -> i64 {
+    use crate::numeric::{FloatType, IntegerType};
+    use mir::{ScalarType, Type};
+    match ty {
+        Type::Scalar(ScalarType::Bool) | Type::NullableScalar(ScalarType::Bool) => {
+            ASSERTION_PRESENT_BOOL
+        }
+        Type::Scalar(ScalarType::Integer(IntegerType::Int8))
+        | Type::NullableScalar(ScalarType::Integer(IntegerType::Int8)) => ASSERTION_PRESENT_I8,
+        Type::Scalar(ScalarType::Integer(IntegerType::Int16))
+        | Type::NullableScalar(ScalarType::Integer(IntegerType::Int16)) => ASSERTION_PRESENT_I16,
+        Type::Scalar(ScalarType::Integer(IntegerType::Int32))
+        | Type::NullableScalar(ScalarType::Integer(IntegerType::Int32)) => ASSERTION_PRESENT_I32,
+        Type::Scalar(ScalarType::Integer(IntegerType::Int64))
+        | Type::NullableScalar(ScalarType::Integer(IntegerType::Int64)) => ASSERTION_PRESENT_I64,
+        Type::Scalar(ScalarType::Integer(IntegerType::UInt8))
+        | Type::NullableScalar(ScalarType::Integer(IntegerType::UInt8)) => ASSERTION_PRESENT_U8,
+        Type::Scalar(ScalarType::Integer(IntegerType::UInt16))
+        | Type::NullableScalar(ScalarType::Integer(IntegerType::UInt16)) => ASSERTION_PRESENT_U16,
+        Type::Scalar(ScalarType::Integer(IntegerType::UInt32))
+        | Type::NullableScalar(ScalarType::Integer(IntegerType::UInt32)) => ASSERTION_PRESENT_U32,
+        Type::Scalar(ScalarType::Integer(IntegerType::UInt64))
+        | Type::NullableScalar(ScalarType::Integer(IntegerType::UInt64)) => ASSERTION_PRESENT_U64,
+        Type::Scalar(ScalarType::Float(FloatType::Float32))
+        | Type::NullableScalar(ScalarType::Float(FloatType::Float32)) => ASSERTION_PRESENT_F32,
+        Type::Scalar(ScalarType::Float(FloatType::Float64))
+        | Type::NullableScalar(ScalarType::Float(FloatType::Float64)) => ASSERTION_PRESENT_F64,
+        Type::String | Type::NullableString => ASSERTION_PRESENT_STRING,
+        Type::Scalar(ScalarType::Enum(_)) | Type::NullableScalar(ScalarType::Enum(_)) => {
+            ASSERTION_PRESENT_ENUM
+        }
+        _ => ASSERTION_PRESENT_OPAQUE,
+    }
+}
 pub const CLASS_ALLOCATE: &str = "dr_v2_class_allocate";
 pub const CLASS_FREE: &str = "dr_v1_class_free";
 pub const CLOSURE_ENVIRONMENT_ALLOCATE: &str = "dr_v1_closure_environment_allocate";

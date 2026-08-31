@@ -64,6 +64,13 @@ pub struct AssertionSemanticInfo {
     pub checked_effect: ResolvedType,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssertionCompletionInfo {
+    pub actual_type: ResolvedType,
+    pub negated: bool,
+    pub matchers: Vec<crate::assertions::AssertionMatcher>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SemanticInfo {
     /// Compiler inputs that own this semantic analysis. Namespace and package
@@ -84,6 +91,9 @@ pub struct SemanticInfo {
     /// Fully checked terminal expectations and explicit failures. The
     /// intermediate expectation chain has no public or runtime type.
     pub assertions: HashMap<Span, AssertionSemanticInfo>,
+    /// Compiler-owned matcher candidates for incomplete expectation chains.
+    /// Tooling consumes these facts instead of reproducing matcher domains.
+    pub assertion_completions: HashMap<Span, AssertionCompletionInfo>,
     /// Fully resolved, type-checked, const-evaluated compiler metadata.
     /// Runtime lowering deliberately ignores this table.
     pub attributes: AttributeSemanticInfo,
@@ -779,6 +789,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             binding_resolution: &checker.binding_resolution,
             closures: &checker.closures,
             callable_value_calls: &checker.callable_value_calls,
+            assertion_callable_invocations: &checker.assertion_callable_invocations,
             list_algorithm_calls: &checker.list_algorithm_calls,
         },
     );
@@ -818,6 +829,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             global_symbols: checker.global_symbols,
             test_semantics: checker.test_semantics,
             assertions: checker.assertions,
+            assertion_completions: checker.assertion_completions,
             attributes: checker.attributes,
             integer_expression_types: checker.integer_expression_types,
             float_expression_types: checker.float_expression_types,
@@ -1488,6 +1500,14 @@ pub(crate) fn trait_declaration_diagnostic(trait_decl: &TraitDecl) -> Diagnostic
     )
 }
 
+struct ThrowAssertionCheck<'expression> {
+    subject: &'expression Expr,
+    actual_type: TypeId,
+    inspector: Option<&'expression Expr>,
+    negated: bool,
+    span: Span,
+}
+
 struct Checker<'program> {
     program: &'program Program,
     source_texts: HashMap<crate::source::SourceId, &'program str>,
@@ -1498,6 +1518,7 @@ struct Checker<'program> {
     global_symbols: crate::names::GlobalSymbolFacts,
     test_semantics: crate::testing::TestSemanticFacts,
     assertions: HashMap<Span, AssertionSemanticInfo>,
+    assertion_completions: HashMap<Span, AssertionCompletionInfo>,
     classes: HashMap<String, ClassInfo>,
     enums: HashMap<String, EnumDefinition>,
     functions: HashMap<String, FunctionInfo>,
@@ -1554,6 +1575,7 @@ struct Checker<'program> {
     closures: HashMap<ClosureId, ClosureSemanticInfo>,
     closure_types: HashMap<Span, TypeId>,
     callable_value_calls: HashMap<Span, CallableValueCallInfo>,
+    assertion_callable_invocations: HashMap<Span, FunctionInvocationMode>,
     list_algorithm_calls: HashMap<Span, ListAlgorithmCallInfo>,
     property_writes: HashMap<Span, PropertyWriteSemanticInfo>,
     writable_object_paths: HashSet<Span>,
@@ -2188,6 +2210,7 @@ impl<'program> Checker<'program> {
             global_symbols,
             test_semantics,
             assertions: HashMap::new(),
+            assertion_completions: HashMap::new(),
             classes: HashMap::new(),
             enums: HashMap::new(),
             functions: HashMap::new(),
@@ -2243,6 +2266,7 @@ impl<'program> Checker<'program> {
             closures: HashMap::new(),
             closure_types: HashMap::new(),
             callable_value_calls: HashMap::new(),
+            assertion_callable_invocations: HashMap::new(),
             list_algorithm_calls: HashMap::new(),
             property_writes: HashMap::new(),
             writable_object_paths: HashSet::new(),
@@ -8413,31 +8437,25 @@ impl<'program> Checker<'program> {
         if !self.check_expect_root_arguments(expect_args, base.span()) {
             return true;
         }
-        let Some(matcher) = crate::assertions::matcher_from_source_name(method) else {
-            let title = if crate::assertions::is_future_matcher(method) {
-                "Error Expectation Awaits Native Testing Foundation Slice 3"
-            } else {
-                "Expectation Matcher Is Unknown"
-            };
-            let code = if crate::assertions::is_future_matcher(method) {
-                "E0718"
-            } else {
-                "E0717"
-            };
+        let actual = &expect_args[0].value;
+        let matcher_candidates = crate::assertions::matcher_candidates(method).collect::<Vec<_>>();
+        if matcher_candidates.is_empty() {
+            let previous = self.allow_terminal_assertion;
+            self.allow_terminal_assertion = false;
+            self.check_expr(actual, scopes, method_context);
+            let actual_ty = self.infer_expr_type(actual, scopes, method_context);
+            self.allow_terminal_assertion = previous;
+            self.record_assertion_completion(object.span(), actual_ty, negated);
             self.diagnostics.push(
-                if code == "E0718" {
-                    Diagnostic::unsupported_stage(
-                        code,
-                        format!("expectation matcher `{method}` is reserved for Native Testing Foundation Slice 3"),
-                        *member_span,
-                    )
-                } else {
-                    Diagnostic::new(code, format!("unknown expectation matcher `{method}`"), *member_span)
-                }
-                .with_title(title),
+                Diagnostic::new(
+                    "E0717",
+                    format!("unknown expectation matcher `{method}`"),
+                    *member_span,
+                )
+                .with_title("Expectation Matcher Is Unknown"),
             );
             return true;
-        };
+        }
         if args.iter().any(|argument| argument.name.is_some()) {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -8449,14 +8467,31 @@ impl<'program> Checker<'program> {
             );
             return true;
         }
-        if args.len() != matcher.expected_arity() {
+        if !matcher_candidates
+            .iter()
+            .any(|matcher| matcher.accepts_arity(args.len()))
+        {
+            let minimum = matcher_candidates
+                .iter()
+                .map(|matcher| matcher.minimum_arity())
+                .min()
+                .expect("matcher candidates are nonempty");
+            let maximum = matcher_candidates
+                .iter()
+                .map(|matcher| matcher.maximum_arity())
+                .max()
+                .expect("matcher candidates are nonempty");
+            let expected = if minimum == maximum {
+                minimum.to_string()
+            } else {
+                format!("{minimum} to {maximum}")
+            };
             self.diagnostics.push(
                 Diagnostic::new(
                     "E0717",
                     format!(
-                        "{} expects {} argument(s), got {}",
-                        matcher.source_name(),
-                        matcher.expected_arity(),
+                        "{} expects {expected} argument(s), got {}",
+                        method,
                         args.len()
                     ),
                     *span,
@@ -8479,9 +8514,19 @@ impl<'program> Checker<'program> {
 
         let previous = self.allow_terminal_assertion;
         self.allow_terminal_assertion = false;
-        let actual = &expect_args[0].value;
         self.check_expr(actual, scopes, method_context);
         let actual_ty = self.infer_expr_type(actual, scopes, method_context);
+        let Some(matcher) = self.select_assertion_matcher(&matcher_candidates, actual_ty) else {
+            self.diagnostics
+                .push(self.unsupported_assertion_matcher_diagnostic(
+                    method,
+                    actual_ty,
+                    actual.span(),
+                ));
+            self.allow_terminal_assertion = previous;
+            return true;
+        };
+        self.record_assertion_completion(object.span(), actual_ty, negated);
         let expected = args.first().map(|argument| &argument.value);
         if let Some(expected) = expected {
             self.check_expr(expected, scopes, method_context);
@@ -8578,21 +8623,7 @@ impl<'program> Checker<'program> {
                 self.check_binary_operands(actual, &op, expected, *span, scopes, method_context);
             }
             matcher if matcher.is_string() => {
-                if self.is_runtime_collection_type(actual_ty) {
-                    self.diagnostics.push(
-                        Diagnostic::unsupported_stage(
-                            "E0718",
-                            format!(
-                                "collection matcher `{}` awaits Native Testing Foundation Slice 3",
-                                matcher.source_name()
-                            ),
-                            actual.span(),
-                        )
-                        .with_title(
-                            "Collection Expectation Awaits Native Testing Foundation Slice 3",
-                        ),
-                    );
-                } else if !matches!(self.types.kind(actual_ty), TypeKind::String)
+                if !matches!(self.types.kind(actual_ty), TypeKind::String)
                     || expected_ty
                         .is_some_and(|ty| !matches!(self.types.kind(ty), TypeKind::String))
                 {
@@ -8605,6 +8636,78 @@ impl<'program> Checker<'program> {
                         .with_title("String Expectation Requires String"),
                     );
                 }
+            }
+            crate::assertions::AssertionMatcher::CollectionEmpty => {}
+            crate::assertions::AssertionMatcher::CollectionCount => {
+                let expected = expected.expect("validated collection-count matcher arity");
+                if !expected_ty.is_some_and(|ty| {
+                    matches!(self.types.kind(ty), TypeKind::Integer(IntegerType::Int64))
+                }) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0720",
+                            "toHaveCount requires one exact int operand",
+                            expected.span(),
+                        )
+                        .with_title("Collection Count Expectation Requires Int"),
+                    );
+                }
+            }
+            crate::assertions::AssertionMatcher::CollectionContains => {
+                let expected = expected.expect("validated collection matcher arity");
+                let element = match self.types.kind(actual_ty) {
+                    TypeKind::TypedArray(element)
+                    | TypeKind::List(element)
+                    | TypeKind::Set(element)
+                    | TypeKind::SortedSet(element)
+                    | TypeKind::PriorityQueue(element)
+                    | TypeKind::Deque(element) => *element,
+                    _ => unreachable!("matcher overload was selected from the actual type"),
+                };
+                self.check_stage23_equatable_type(element, *span, "toContain");
+                self.check_expr_assignable(
+                    element,
+                    expected,
+                    scopes,
+                    method_context,
+                    AssignmentDestination::Type,
+                );
+            }
+            crate::assertions::AssertionMatcher::DictionaryHasKey
+            | crate::assertions::AssertionMatcher::DictionaryHasValue => {
+                let expected = expected.expect("validated dictionary matcher arity");
+                let (key, value) = match self.types.kind(actual_ty) {
+                    TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
+                        (*key, *value)
+                    }
+                    _ => unreachable!("matcher overload was selected from the actual type"),
+                };
+                let compared = if matcher == crate::assertions::AssertionMatcher::DictionaryHasKey {
+                    key
+                } else {
+                    value
+                };
+                self.check_stage23_equatable_type(compared, *span, matcher.source_name());
+                self.check_expr_assignable(
+                    compared,
+                    expected,
+                    scopes,
+                    method_context,
+                    AssignmentDestination::Type,
+                );
+            }
+            crate::assertions::AssertionMatcher::Throws => {
+                self.check_throw_assertion(
+                    ThrowAssertionCheck {
+                        subject: actual,
+                        actual_type: actual_ty,
+                        inspector: expected,
+                        negated,
+                        span: *span,
+                    },
+                    scopes,
+                    method_context,
+                );
             }
             _ => unreachable!("fail is not a terminal matcher method"),
         }
@@ -8640,6 +8743,427 @@ impl<'program> Checker<'program> {
         );
         self.expression_types.insert(*span, ResolvedType::Void);
         true
+    }
+
+    fn select_assertion_matcher(
+        &self,
+        candidates: &[crate::assertions::AssertionMatcher],
+        actual_ty: TypeId,
+    ) -> Option<crate::assertions::AssertionMatcher> {
+        candidates
+            .iter()
+            .copied()
+            .find(|matcher| self.assertion_matcher_domain_matches(*matcher, actual_ty))
+    }
+
+    fn assertion_matchers_for_type(
+        &self,
+        actual_ty: TypeId,
+    ) -> Vec<crate::assertions::AssertionMatcher> {
+        crate::assertions::MATCHER_SPECS
+            .iter()
+            .map(|spec| spec.matcher)
+            .filter(|matcher| *matcher != crate::assertions::AssertionMatcher::Fail)
+            .filter(|matcher| self.assertion_matcher_domain_matches(*matcher, actual_ty))
+            .filter(|matcher| self.assertion_matcher_operands_supported(*matcher, actual_ty))
+            .collect()
+    }
+
+    fn record_assertion_completion(&mut self, span: Span, actual_ty: TypeId, negated: bool) {
+        let matchers = self.assertion_matchers_for_type(actual_ty);
+        self.assertion_completions.insert(
+            span,
+            AssertionCompletionInfo {
+                actual_type: self.types.resolved(actual_ty),
+                negated,
+                matchers,
+            },
+        );
+    }
+
+    fn assertion_matcher_domain_matches(
+        &self,
+        matcher: crate::assertions::AssertionMatcher,
+        actual_ty: TypeId,
+    ) -> bool {
+        use crate::assertions::MatcherDomain;
+        let kind = self.types.kind(actual_ty);
+        match matcher.domain() {
+            MatcherDomain::String => matches!(kind, TypeKind::String),
+            MatcherDomain::CollectionContains => matches!(
+                kind,
+                TypeKind::TypedArray(_)
+                    | TypeKind::List(_)
+                    | TypeKind::Set(_)
+                    | TypeKind::SortedSet(_)
+                    | TypeKind::PriorityQueue(_)
+                    | TypeKind::Deque(_)
+            ),
+            MatcherDomain::CollectionEmpty | MatcherDomain::CollectionCount => {
+                self.is_runtime_collection_type(actual_ty)
+                    && !matches!(kind, TypeKind::EmptyCollection)
+            }
+            MatcherDomain::DictionaryKey | MatcherDomain::DictionaryValue => matches!(
+                kind,
+                TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _)
+            ),
+            MatcherDomain::Throws => matches!(kind, TypeKind::Function(_)),
+            MatcherDomain::General
+            | MatcherDomain::Nullable
+            | MatcherDomain::Bool
+            | MatcherDomain::Ordered => true,
+            MatcherDomain::ExplicitFailure => false,
+        }
+    }
+
+    fn assertion_matcher_operands_supported(
+        &self,
+        matcher: crate::assertions::AssertionMatcher,
+        actual_ty: TypeId,
+    ) -> bool {
+        use crate::assertions::MatcherDomain;
+        match matcher.domain() {
+            MatcherDomain::General => self.assertion_equality_supported(actual_ty),
+            MatcherDomain::Nullable => matches!(
+                self.types.kind(actual_ty),
+                TypeKind::Null | TypeKind::Nullable(_) | TypeKind::Mixed
+            ),
+            MatcherDomain::Bool => matches!(self.types.kind(actual_ty), TypeKind::Bool),
+            MatcherDomain::Ordered => self.assertion_ordering_supported(actual_ty),
+            MatcherDomain::CollectionContains => self
+                .assertion_collection_operand(actual_ty)
+                .is_some_and(|element| self.stage23_equatable_type(element)),
+            MatcherDomain::DictionaryKey => self
+                .assertion_dictionary_operands(actual_ty)
+                .is_some_and(|(key, _)| self.stage23_equatable_type(key)),
+            MatcherDomain::DictionaryValue => self
+                .assertion_dictionary_operands(actual_ty)
+                .is_some_and(|(_, value)| self.stage23_equatable_type(value)),
+            MatcherDomain::String
+            | MatcherDomain::CollectionEmpty
+            | MatcherDomain::CollectionCount
+            | MatcherDomain::Throws => true,
+            MatcherDomain::ExplicitFailure => false,
+        }
+    }
+
+    fn assertion_equality_supported(&self, ty: TypeId) -> bool {
+        match self.types.kind(ty) {
+            TypeKind::Integer(_)
+            | TypeKind::Float(_)
+            | TypeKind::String
+            | TypeKind::Bytes
+            | TypeKind::Bool
+            | TypeKind::Error
+            | TypeKind::Class(_)
+            | TypeKind::SharedHandle(_, _)
+            | TypeKind::Unknown => true,
+            TypeKind::Enum(enum_type) => self
+                .enums
+                .values()
+                .find(|definition| definition.id == enum_type.id)
+                .is_none_or(|definition| definition.capabilities.equality),
+            TypeKind::TypeParameter(parameter) => {
+                self.type_parameter_has_constraint(parameter, "Equatable")
+            }
+            TypeKind::Void
+            | TypeKind::Nullable(_)
+            | TypeKind::Null
+            | TypeKind::Mixed
+            | TypeKind::Function(_)
+            | TypeKind::TypedArray(_)
+            | TypeKind::Heterogeneous
+            | TypeKind::EmptyCollection
+            | TypeKind::List(_)
+            | TypeKind::Dictionary(_, _)
+            | TypeKind::SortedDictionary(_, _)
+            | TypeKind::Set(_)
+            | TypeKind::SortedSet(_)
+            | TypeKind::PriorityQueue(_)
+            | TypeKind::Deque(_) => false,
+        }
+    }
+
+    fn assertion_ordering_supported(&self, ty: TypeId) -> bool {
+        match self.types.kind(ty) {
+            TypeKind::Integer(_)
+            | TypeKind::Float(_)
+            | TypeKind::String
+            | TypeKind::Bool
+            | TypeKind::Unknown => true,
+            TypeKind::TypeParameter(parameter) => {
+                self.type_parameter_has_constraint(parameter, "Comparable")
+            }
+            _ => false,
+        }
+    }
+
+    fn assertion_collection_operand(&self, ty: TypeId) -> Option<TypeId> {
+        match self.types.kind(ty) {
+            TypeKind::TypedArray(element)
+            | TypeKind::List(element)
+            | TypeKind::Set(element)
+            | TypeKind::SortedSet(element)
+            | TypeKind::PriorityQueue(element)
+            | TypeKind::Deque(element) => Some(*element),
+            _ => None,
+        }
+    }
+
+    fn assertion_dictionary_operands(&self, ty: TypeId) -> Option<(TypeId, TypeId)> {
+        match self.types.kind(ty) {
+            TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
+                Some((*key, *value))
+            }
+            _ => None,
+        }
+    }
+
+    fn stage23_equatable_type(&self, ty: TypeId) -> bool {
+        match self.types.kind(ty) {
+            TypeKind::Nullable(inner) => self.stage23_equatable_type(*inner),
+            TypeKind::Integer(_)
+            | TypeKind::Float(_)
+            | TypeKind::String
+            | TypeKind::Bool
+            | TypeKind::Enum(_)
+            | TypeKind::Unknown => true,
+            _ => false,
+        }
+    }
+
+    fn unsupported_assertion_matcher_diagnostic(
+        &self,
+        method: &str,
+        actual_ty: TypeId,
+        span: Span,
+    ) -> Diagnostic {
+        let kind = self.types.kind(actual_ty);
+        match (method, kind) {
+            ("toContain", TypeKind::Bytes) => Diagnostic::new(
+                "E0720",
+                "Bytes exposes length, indexing, and byte equality, but no public membership operation",
+                span,
+            )
+            .with_title("Bytes Does Not Support Membership Expectations"),
+            (
+                "toContain",
+                TypeKind::Dictionary(_, _) | TypeKind::SortedDictionary(_, _),
+            ) => Diagnostic::new(
+                "E0720",
+                "dictionary membership is ambiguous; use `toHaveKey` or `toHaveValue`",
+                span,
+            )
+            .with_title("Dictionary Membership Expectation Is Ambiguous"),
+            ("toHaveKey", _) => Diagnostic::new(
+                "E0720",
+                format!(
+                    "toHaveKey requires Dictionary or SortedDictionary, got `{}`",
+                    self.types.display(actual_ty)
+                ),
+                span,
+            )
+            .with_title("Key Expectations Require A Dictionary"),
+            ("toHaveValue", _) => Diagnostic::new(
+                "E0720",
+                format!(
+                    "toHaveValue requires Dictionary or SortedDictionary, got `{}`",
+                    self.types.display(actual_ty)
+                ),
+                span,
+            )
+            .with_title("Value Expectations Require A Dictionary"),
+            ("toThrow", _) => Diagnostic::new(
+                "E0720",
+                format!(
+                    "toThrow requires a function value, got `{}`",
+                    self.types.display(actual_ty)
+                ),
+                span,
+            )
+            .with_title("Error Expectation Requires A Function Value"),
+            _ => Diagnostic::new(
+                "E0720",
+                format!(
+                    "{method} is not available for `{}`",
+                    self.types.display(actual_ty)
+                ),
+                span,
+            )
+            .with_title("Expectation Matcher Does Not Support This Type"),
+        }
+    }
+
+    fn check_throw_assertion(
+        &mut self,
+        check: ThrowAssertionCheck<'_>,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) {
+        let ThrowAssertionCheck {
+            subject: subject_expr,
+            actual_type,
+            inspector,
+            negated,
+            span,
+        } = check;
+        let TypeKind::Function(subject) = self.types.kind(actual_type).clone() else {
+            return;
+        };
+        if !subject.parameters.is_empty() {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0720",
+                    format!(
+                        "toThrow requires a zero-parameter function value, got {} parameter(s)",
+                        subject.parameters.len()
+                    ),
+                    span,
+                )
+                .with_title("Error Expectation Function Must Have No Parameters"),
+            );
+        }
+        if matches!(
+            self.types.kind(subject.return_type),
+            TypeKind::Unknown | TypeKind::Heterogeneous | TypeKind::EmptyCollection
+        ) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0720",
+                    "toThrow requires a function value with a concrete return type",
+                    span,
+                )
+                .with_title("Throw Expectation Requires Concrete Return Type"),
+            );
+        }
+        let requirement = match subject.invocation_mode {
+            FunctionInvocationMode::Readonly => CaptureRequirement::Readonly,
+            FunctionInvocationMode::Writable => CaptureRequirement::Writable,
+            FunctionInvocationMode::Once => CaptureRequirement::Take,
+        };
+        self.assertion_callable_invocations
+            .insert(subject_expr.span(), subject.invocation_mode);
+        self.record_capture_requirement_for_expr(subject_expr, scopes, requirement);
+        if subject.invocation_mode != FunctionInvocationMode::Readonly
+            && !self.callable_access_is_sufficient(
+                subject_expr,
+                subject.invocation_mode,
+                scopes,
+                method_context,
+            )
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0651",
+                    "toThrow subject does not provide the access required by its invocation mode",
+                    subject_expr.span(),
+                )
+                .with_title("Throw Subject Requires Stronger Access"),
+            );
+        }
+        let _ = self.complete_function_value_effects(&subject.checked_effects, span);
+
+        let Some(inspector) = inspector else {
+            return;
+        };
+        if negated {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0720",
+                    "negated toThrow does not accept an error inspector",
+                    inspector.span(),
+                )
+                .with_title("Negated Error Expectation Does Not Accept An Inspector"),
+            );
+            return;
+        }
+        let inspector_ty = self.infer_expr_type(inspector, scopes, method_context);
+        let TypeKind::Function(function) = self.types.kind(inspector_ty).clone() else {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0720",
+                    "toThrow inspector must be a function value",
+                    inspector.span(),
+                )
+                .with_title("Error Inspector Must Be A Function Value"),
+            );
+            return;
+        };
+        let parameter = match function.parameters.as_slice() {
+            [parameter] => Some(parameter),
+            _ => {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0720",
+                        format!(
+                            "toThrow inspector must take exactly one parameter, got {}",
+                            function.parameters.len()
+                        ),
+                        inspector.span(),
+                    )
+                    .with_title("Error Inspector Must Have One Parameter"),
+                );
+                None
+            }
+        };
+        if parameter.is_some_and(|parameter| {
+            parameter.ownership_mode != FunctionTypeParameterMode::Readonly
+        }) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0720",
+                    "toThrow inspector parameter must use readonly ownership",
+                    inspector.span(),
+                )
+                .with_title("Error Inspector Parameter Must Be Readonly"),
+            );
+        } else if parameter.is_some_and(|parameter| !self.type_implements_error(parameter.ty)) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0720",
+                    "toThrow inspector parameter must be Error or one concrete class that implements Error",
+                    inspector.span(),
+                )
+                .with_title("Error Inspector Parameter Must Implement Error"),
+            );
+        }
+        if !matches!(self.types.kind(function.return_type), TypeKind::Void) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0720",
+                    "toThrow inspector must return void",
+                    inspector.span(),
+                )
+                .with_title("Error Inspector Must Return Void"),
+            );
+        }
+        let complete = self.complete_function_value_effects(&function.checked_effects, span);
+        self.record_checked_effects(complete, span);
+        let inspector_requirement = match function.invocation_mode {
+            FunctionInvocationMode::Readonly => CaptureRequirement::Readonly,
+            FunctionInvocationMode::Writable => CaptureRequirement::Writable,
+            FunctionInvocationMode::Once => CaptureRequirement::Take,
+        };
+        self.assertion_callable_invocations
+            .insert(inspector.span(), function.invocation_mode);
+        self.record_capture_requirement_for_expr(inspector, scopes, inspector_requirement);
+        if function.invocation_mode != FunctionInvocationMode::Readonly
+            && !self.callable_access_is_sufficient(
+                inspector,
+                function.invocation_mode,
+                scopes,
+                method_context,
+            )
+        {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0651",
+                    "toThrow inspector does not provide the access required by its invocation mode",
+                    inspector.span(),
+                )
+                .with_title("Throw Inspector Requires Stronger Access"),
+            );
+        }
     }
 
     fn check_expect_root_arguments(&mut self, args: &[Argument], span: Span) -> bool {

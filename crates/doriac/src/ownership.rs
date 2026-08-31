@@ -898,6 +898,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
     let binding_resolution = BindingResolution::default();
     let closures = HashMap::new();
     let callable_value_calls = HashMap::new();
+    let assertion_callable_invocations = HashMap::new();
     let list_algorithm_calls = HashMap::new();
     check_program_with_inferred_move_returns(
         program,
@@ -913,6 +914,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
             binding_resolution: &binding_resolution,
             closures: &closures,
             callable_value_calls: &callable_value_calls,
+            assertion_callable_invocations: &assertion_callable_invocations,
             list_algorithm_calls: &list_algorithm_calls,
         },
     )
@@ -931,6 +933,7 @@ pub(crate) struct OwnershipAnalysisContext<'a> {
     pub(crate) binding_resolution: &'a BindingResolution,
     pub(crate) closures: &'a HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
     pub(crate) callable_value_calls: &'a HashMap<Span, crate::semantics::CallableValueCallInfo>,
+    pub(crate) assertion_callable_invocations: &'a HashMap<Span, FunctionInvocationMode>,
     pub(crate) list_algorithm_calls: &'a HashMap<Span, crate::semantics::ListAlgorithmCallInfo>,
 }
 
@@ -950,6 +953,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         binding_resolution,
         closures,
         callable_value_calls,
+        assertion_callable_invocations,
         list_algorithm_calls,
     } = *context;
     let classes = program
@@ -1165,6 +1169,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         binding_resolution,
         closures,
         callable_value_calls,
+        assertion_callable_invocations,
         list_algorithm_calls,
         next_binding_id: 0,
         diagnostics: Vec::new(),
@@ -1864,6 +1869,7 @@ struct Checker<'a> {
     binding_resolution: &'a BindingResolution,
     closures: &'a HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
     callable_value_calls: &'a HashMap<Span, crate::semantics::CallableValueCallInfo>,
+    assertion_callable_invocations: &'a HashMap<Span, FunctionInvocationMode>,
     list_algorithm_calls: &'a HashMap<Span, crate::semantics::ListAlgorithmCallInfo>,
     next_binding_id: usize,
     diagnostics: Vec<Diagnostic>,
@@ -4142,6 +4148,12 @@ impl Checker<'_> {
     }
 
     fn use_expr(&mut self, expr: &Expr, scopes: &mut Scopes, mode: UseMode) {
+        let mode = match self.assertion_callable_invocations.get(&expr.span()) {
+            Some(FunctionInvocationMode::Readonly) => UseMode::Read,
+            Some(FunctionInvocationMode::Writable) => UseMode::Write,
+            Some(FunctionInvocationMode::Once) => UseMode::Give,
+            None => mode,
+        };
         match expr {
             Expr::Variable { name, span } => {
                 let root = scopes.get(name).map(|binding| binding_root(binding, name));
