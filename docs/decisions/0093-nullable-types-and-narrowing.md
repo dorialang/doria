@@ -53,18 +53,19 @@ fixed-width integers, floats, `bool`, `string`, or a declared concrete class. Fo
 false. Tests over already concrete values are valid; an always-true or
 always-false lint is a diagnostics follow-up and does not change behavior.
 
-Stage 22 does not perform subtype or interface conformance tests. Source using
-those forms parses, then receives a Stage 34 or Stage 35 unsupported-feature
-diagnostic. `instanceof` and its migration fix are namespace-stage work, not part
-of this record.
+Decision 0130 extends class tests from exact identity to target-or-descendant
+hierarchy identity while preserving the same dataflow and null proof. Interface
+conformance tests remain a Stage 35 unsupported feature. `instanceof` remains
+permanently invalid in favor of `is`.
 
 ### Runtime representation and ownership
 
-A nullable concrete class uses the null pointer for absence, so `?Class` remains
-one pointer wide. Nullable non-class values use an explicit presence word plus
-their payload. This is a semantic layout requirement, not permission for a
-backend to define Doria; Cranelift and LLVM may represent the pair differently
-inside their private IR while preserving the same Doria ABI and behavior.
+A nullable closed exact class uses the null pointer for absence and remains one
+pointer wide. Under Decision 0130, a nullable statically open class uses the
+two-word data/descriptor carrier and tests the data pointer for presence.
+Nullable non-class values use an explicit presence word plus their payload.
+These are semantic layout requirements, not permission for a backend to define
+Doria.
 
 `?T` has the ownership classification of `T`. Adding `null` adds an inhabitant,
 not an allocation: `?int`, `?bool`, floats, and `?string` are Copy when their
@@ -148,3 +149,6 @@ It is intentionally not modified by this compiler-repository decision.
   historical account of the first nullable position remain.
 - Pipeline and parity notes that placed Stage 22 wholly in the future or listed
   only the narrow `?string` runtime path.
+
+Decision 0130 also retires active Stage-34 subtype-test deferrals; Stage 35
+interface tests remain separate.

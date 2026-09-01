@@ -1,0 +1,13 @@
+open class Base
+{
+    function __destruct(): void { try { echo "base drop\n"; } catch (Doria\Std\Io\IoError) {} }
+}
+class Child extends Base
+{
+    function __destruct(): void { try { echo "child drop\n"; } catch (Doria\Std\Io\IoError) {} }
+}
+function main(): void
+{
+    Base $value = new Child();
+    echo "dynamic\n";
+}

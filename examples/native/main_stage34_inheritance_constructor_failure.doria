@@ -1,0 +1,20 @@
+open class BuildFailure implements Error
+{
+    function __construct(string $message) {}
+}
+open class Base
+{
+    function __construct() throws BuildFailure
+    {
+        throw new BuildFailure("parent failed");
+    }
+}
+class Child extends Base
+{
+    function __construct() throws BuildFailure { parent::__construct(); }
+}
+function main(): void
+{
+    try { let $value = new Child(); }
+    catch (BuildFailure $error) { echo "constructor {$error->message}\n"; }
+}

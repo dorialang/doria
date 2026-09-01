@@ -2228,15 +2228,62 @@ class Person
 }
 
 #[test]
-fn rejects_deterministic_destruction_that_php_cannot_preserve() {
-    let diagnostics = doriac::compile_source_to_php(
-        "test.doria",
-        "class Person { function __destruct(): void { return; } }",
+fn php_backend_schedules_inherited_destruction_in_doria_order() {
+    let php = doriac::compile_source_to_php(
+        "inheritance-destruction.doria",
+        r#"
+open class Base
+{
+    static writable string $log = "";
+    open function value(): int { return 1; }
+    function __destruct(): void { Base::log = Base::log . "base "; }
+}
+
+class Child extends Base
+{
+    override function value(): int { return 42; }
+    function __destruct(): void { Base::log = Base::log . "child "; return; }
+}
+
+function main(): void
+{
+    {
+        Base $value = new Child();
+        echo "value {$value->value()}\n";
+    }
+    echo Base::log . "\n";
+}
+"#,
     )
-    .expect_err("PHP destruction timing is not Doria scope destruction");
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == "B1901"));
+    .expect("PHP compatibility output should preserve inherited destruction");
+
+    assert!(php.contains("class Child extends Base"));
+    assert!(php.contains("parent::__destruct();"));
+    assert!(!php.contains("Reflection"));
+    assert!(!php.contains("static::"));
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        return;
+    };
+    if !version.status.success() {
+        return;
+    }
+    let script = format!(
+        "{}\n__DoriaFunction_6d61696e();",
+        php.strip_prefix("<?php").expect("generated PHP header")
+    );
+    let run = Command::new("php")
+        .arg("-d")
+        .arg("display_errors=1")
+        .arg("-r")
+        .arg(script)
+        .output()
+        .expect("generated inheritance PHP should execute");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout, b"value 42\nchild base \n");
 }
 
 #[test]
@@ -3801,4 +3848,36 @@ function main(): void
     .expect("clause-free throwing main should compile through the checked boundary");
     assert!(inferred.contains("catch (__DoriaCheckedError"));
     assert!(inferred.contains("__doria_report_unhandled_error($error);"));
+}
+
+#[test]
+fn php_backend_preserves_explicit_parent_qualification_and_arguments() {
+    let php = doriac::compile_source_to_php(
+        "parent-calls.doria",
+        r#"
+open class Base
+{
+    function __construct(string $label) {}
+    function describe(): string { return "base"; }
+}
+
+class Child extends Base
+{
+    function __construct() { parent::__construct("typed"); }
+    function parentLabel(): string { return parent::describe(); }
+}
+
+function main(): void
+{
+    let $child = new Child();
+    echo $child->parentLabel();
+}
+"#,
+    )
+    .expect("explicit parent calls should compile to PHP");
+
+    assert_eq!(php.matches("parent::__construct(\"typed\");").count(), 1);
+    assert!(php.contains("return parent::describe();"));
+    assert!(!php.contains("Base::__construct(\"typed\")"));
+    assert!(!php.contains("Base::describe()"));
 }

@@ -1,0 +1,7 @@
+open class OpenBase {}
+class ClosedLeaf extends OpenBase {}
+function main(): void
+{
+    OpenBase $value = new ClosedLeaf();
+    echo "open closed\n";
+}

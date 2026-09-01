@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ast::MemberAccess;
 use crate::numeric::IntegerValue;
 use crate::source::{SourceId, Span};
-use crate::types::{ResolvedType, TypeId, TypeRef};
+use crate::types::{ClassType, ResolvedType, TypeId, TypeRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BindingId(pub usize);
@@ -116,6 +116,10 @@ impl Binding {
 
 #[derive(Debug, Clone)]
 pub struct ClassInfo {
+    pub declaration: Span,
+    pub is_open: bool,
+    pub parent: Option<ClassType<TypeId>>,
+    pub parent_span: Option<Span>,
     pub type_params: Vec<TypeParamInfo>,
     pub builtin_interfaces: HashSet<BuiltinInterface>,
     pub properties: HashMap<String, PropertyInfo>,
@@ -223,6 +227,9 @@ pub struct FunctionInfo {
 #[derive(Debug, Clone)]
 pub struct MethodInfo {
     pub declaration: Span,
+    pub is_open: bool,
+    pub is_override: bool,
+    pub virtual_root: Option<Span>,
     pub access: MemberAccess,
     pub receiver_mode: Option<ReceiverMode>,
     pub return_borrow: Option<ReturnBorrow>,

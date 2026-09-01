@@ -37,7 +37,8 @@ Native Testing Foundation Slice 1 - Complete
 Native Testing Foundation Slice 2 - Complete
 Native Testing Foundation Slice 3 - Complete
 Native Testing Foundation - Complete
-Stage 34 Single Class Inheritance - Next
+Stage 34 Single Class Inheritance - Complete
+Stage 35 Interfaces And Traits - Next
 Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
@@ -614,7 +615,8 @@ Completed status:
 
 ```text
 Native Testing Foundation - Complete
-Stage 34 Single Class Inheritance - Next
+Stage 34 Single Class Inheritance - Complete
+Stage 35 Interfaces And Traits - Next
 Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
@@ -688,7 +690,7 @@ No test assertion may consume a Move value merely to inspect it.
 - Baton remains the runner and process orchestrator.
 - The compiler remains the semantic authority.
 - The language server remains a presentation client over compiler/Baton facts.
-- Stage 34 is next because this foundation is closed.
+- Stage 34 is complete and Stage 35 is next because this foundation is closed.
 
 ## Invalidated Elsewhere
 
@@ -707,3 +709,8 @@ No test assertion may consume a Move value merely to inspect it.
 - Language-server collection/Error completion, hovers, symbols, and navigation
   consume compiler-owned facts from the final foundation closure revision.
 - Website testing documentation remains a later synchronization task.
+
+Decision 0130 makes `toThrow` inspectors hierarchy-aware and preserves dynamic
+Error identity in assertion facts and Baton presentation. Virtual test methods
+retain the separate TestAssertion effect and strict DORIAO4 outcome contract;
+the compiler still emits no runtime suite registry.

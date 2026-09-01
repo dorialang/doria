@@ -1,0 +1,7 @@
+open class Shape {}
+class Circle extends Shape { function value(): int { return 42; } }
+function describe(Shape $shape): int
+{
+    return match ($shape) { Circle $circle => $circle->value(), default => 0, };
+}
+function main(): void { echo "match {describe(new Circle())}\n"; }

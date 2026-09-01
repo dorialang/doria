@@ -1,0 +1,19 @@
+open class Base
+{
+    open function total(int $left = 20, int $right = 22): int
+    {
+        return $left + $right;
+    }
+}
+class Child extends Base
+{
+    override function total(int $left, int $right): int
+    {
+        return $left + $right;
+    }
+}
+function main(): void
+{
+    let $value = new Child();
+    echo "defaults {$value->total()} {$value->total(right: 2, left: 40)}\n";
+}

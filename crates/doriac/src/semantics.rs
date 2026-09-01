@@ -31,8 +31,8 @@ use crate::symbols::{
 use crate::types::{
     resolved_type_complexity, ClassType, FunctionBorrowSource, FunctionInvocationMode,
     FunctionReturnBorrow, FunctionTypeParameterMode, FunctionTypeRef, ResolvedType,
-    SemanticFunctionParameter, SemanticFunctionType, SharedHandleKind, TypeId, TypeKind, TypeRef,
-    TypeRegistry,
+    SemanticFunctionParameter, SemanticFunctionType, SharedHandleKind, TypeArgumentRef, TypeId,
+    TypeKind, TypeRef, TypeRegistry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -127,6 +127,17 @@ pub struct SemanticInfo {
     pub given_preludes: HashMap<Span, GivenSemanticInfo>,
     /// Compiler-resolved callable target for each user-defined call expression.
     pub call_targets: HashMap<Span, CallableTarget>,
+    /// Compiler-owned hierarchy identity for every checked method declaration.
+    ///
+    /// Tooling uses this table to relate override families without rebuilding
+    /// inheritance or virtual-dispatch semantics from syntax.
+    pub method_hierarchy: HashMap<Span, MethodHierarchySemanticInfo>,
+    /// Exact declaration and virtual-family identity selected at each method call.
+    pub method_call_targets: HashMap<Span, MethodCallSemanticInfo>,
+    /// Declaring class selected for inherited static-property and class-constant access.
+    /// HIR lowering canonicalizes storage through this map instead of reproducing
+    /// hierarchy lookup in each backend.
+    pub static_member_targets: HashMap<Span, String>,
     /// Concrete generic arguments selected for each checked user-defined call.
     ///
     /// The argument enum is intentionally kinded: Stage 24 supplies only type
@@ -138,6 +149,9 @@ pub struct SemanticInfo {
     pub(crate) constrained_display_calls: HashSet<Span>,
     /// Stable nominal class identities and the total Stage 19 property order.
     pub classes: Vec<ClassSemanticInfo>,
+    /// Declaration-level hierarchy facts for every class, including generic
+    /// classes that have not yet been instantiated in executable code.
+    pub class_hierarchy: HashMap<Span, ClassHierarchySemanticInfo>,
     /// Stable nominal enum identities and declaration-order case metadata.
     pub enums: Vec<EnumSemanticInfo>,
     /// Values produced by the bounded Stage 20 constant evaluator.
@@ -203,6 +217,7 @@ pub struct CallableParameterSemanticInfo {
     pub r#type: ResolvedType,
     pub take: bool,
     pub writable: bool,
+    pub has_default: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,7 +349,29 @@ pub enum CallableTarget {
     Method {
         class_type: ClassType<ResolvedType>,
         method_name: String,
+        direct_parent: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodHierarchySemanticInfo {
+    pub declaring_class: String,
+    pub name: String,
+    pub declaration: Span,
+    pub is_open: bool,
+    pub is_override: bool,
+    pub virtual_root: Option<Span>,
+    pub overridden_declaration: Option<Span>,
+    pub access: MemberAccess,
+    pub receiver_mode: Option<ReceiverMode>,
+    pub is_static: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodCallSemanticInfo {
+    pub declaration: Span,
+    pub virtual_root: Option<Span>,
+    pub direct_parent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -349,8 +386,21 @@ pub struct ClassSemanticInfo {
     pub declaration_name: String,
     pub name: String,
     pub arguments: Vec<ResolvedType>,
+    pub is_open: bool,
+    pub parent: Option<ClassType<ResolvedType>>,
+    pub ancestors: Vec<ClassType<ResolvedType>>,
     pub builtin_interfaces: Vec<BuiltinInterface>,
     pub properties: Vec<PropertySemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassHierarchySemanticInfo {
+    pub declaration: Span,
+    pub name: String,
+    pub is_open: bool,
+    pub generic_parameter_count: usize,
+    pub parent: Option<ClassType<ResolvedType>>,
+    pub ancestors: Vec<String>,
 }
 
 impl ClassSemanticInfo {
@@ -366,6 +416,7 @@ fn contains_comment(text: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PropertySemanticInfo {
     pub id: PropertyId,
+    pub declaring_class: String,
     pub name: String,
     pub ty: ResolvedType,
     pub writable: bool,
@@ -796,6 +847,8 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     let closure_ownership = ownership_analysis.closures;
     let return_borrows = ownership_analysis.return_borrows;
     checker.diagnostics.extend(ownership_analysis.diagnostics);
+    let class_hierarchy = collect_class_hierarchy_semantics(&checker);
+    let method_hierarchy = collect_method_hierarchy_semantics(&checker);
     let classes = collect_ordered_class_semantics(program, &mut checker);
     let enums = collect_ordered_enum_semantics(&checker);
     let callable_signatures = checker
@@ -814,6 +867,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
                             r#type: checker.types.resolved(parameter.ty),
                             take: parameter.take,
                             writable: parameter.writable,
+                            has_default: parameter.has_default,
                         })
                         .collect(),
                     return_type: checker.types.resolved(signature.return_ty),
@@ -842,9 +896,13 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             whens: checker.whens,
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
+            method_hierarchy,
+            method_call_targets: checker.method_call_targets,
+            static_member_targets: checker.static_member_targets,
             generic_call_specializations: checker.generic_call_specializations,
             constrained_display_calls: checker.constrained_display_calls,
             classes,
+            class_hierarchy,
             enums,
             const_evaluation: checker.const_evaluation,
             parameter_defaults: checker.parameter_defaults,
@@ -921,6 +979,83 @@ fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo
         .collect()
 }
 
+fn collect_method_hierarchy_semantics(
+    checker: &Checker<'_>,
+) -> HashMap<Span, MethodHierarchySemanticInfo> {
+    checker
+        .classes
+        .iter()
+        .flat_map(|(class_name, class)| {
+            class.methods.iter().map(move |(method_name, method)| {
+                (
+                    method.declaration,
+                    MethodHierarchySemanticInfo {
+                        declaring_class: class_name.clone(),
+                        name: method_name.clone(),
+                        declaration: method.declaration,
+                        is_open: method.is_open,
+                        is_override: method.is_override,
+                        virtual_root: method.virtual_root,
+                        overridden_declaration: checker
+                            .overridden_declarations
+                            .get(&method.declaration)
+                            .copied(),
+                        access: method.access,
+                        receiver_mode: method.receiver_mode,
+                        is_static: method.is_static,
+                    },
+                )
+            })
+        })
+        .collect()
+}
+
+fn collect_class_hierarchy_semantics(
+    checker: &Checker<'_>,
+) -> HashMap<Span, ClassHierarchySemanticInfo> {
+    checker
+        .classes
+        .iter()
+        .map(|(class_name, class)| {
+            let parent = class.parent.as_ref().map(|parent| {
+                ClassType::new(
+                    parent.name.clone(),
+                    parent
+                        .arguments
+                        .iter()
+                        .map(|argument| checker.types.resolved(*argument))
+                        .collect(),
+                )
+            });
+            let mut ancestors = Vec::new();
+            let mut current = class.parent.as_ref().map(|parent| parent.name.as_str());
+            let mut visited = HashSet::new();
+            while let Some(name) = current {
+                if !visited.insert(name) {
+                    break;
+                }
+                ancestors.push(name.to_string());
+                current = checker
+                    .classes
+                    .get(name)
+                    .and_then(|ancestor| ancestor.parent.as_ref())
+                    .map(|parent| parent.name.as_str());
+            }
+            (
+                class.declaration,
+                ClassHierarchySemanticInfo {
+                    declaration: class.declaration,
+                    name: class_name.clone(),
+                    is_open: class.is_open,
+                    generic_parameter_count: class.type_params.len(),
+                    parent,
+                    ancestors,
+                },
+            )
+        })
+        .collect()
+}
+
 fn collect_ordered_class_semantics(
     program: &Program,
     checker: &mut Checker<'_>,
@@ -987,40 +1122,87 @@ fn collect_ordered_class_semantics(
 
         for instance in instances {
             let id = ClassId(classes.len());
-            let substitutions = checker.class_type_substitutions(&instance);
-            let explicit = declaration
-                .members
-                .iter()
-                .filter_map(|member| match member {
-                    ClassMember::Property(property) if !property.is_static => {
-                        Some((property.name.clone(), property.writable, false))
-                    }
-                    ClassMember::Property(_)
-                    | ClassMember::Method(_)
-                    | ClassMember::Constant(_) => None,
-                });
-            let promoted = declaration.members.iter().find_map(|member| match member {
-                ClassMember::Method(method) if method.name == "__construct" => {
-                    Some(method.params.iter().filter_map(|param| {
-                        param
-                            .promoted_access
-                            .as_ref()
-                            .map(|_| (param.name.clone(), param.writable, true))
-                    }))
+            let parent = checker.specialized_parent_type(&instance);
+            let ancestors = checker.specialized_ancestor_types(&instance);
+            let mut hierarchy = ancestors.iter().rev().cloned().collect::<Vec<_>>();
+            hierarchy.push(instance.clone());
+            let mut properties = Vec::new();
+            for hierarchy_class in &hierarchy {
+                let Some(hierarchy_declaration) =
+                    program.items.iter().find_map(|item| match item {
+                        Item::Class(declaration) if declaration.name == hierarchy_class.name => {
+                            Some(declaration)
+                        }
+                        _ => None,
+                    })
+                else {
+                    continue;
+                };
+                let Some(hierarchy_info) = checker.classes.get(&hierarchy_class.name).cloned()
+                else {
+                    continue;
+                };
+                let substitutions = checker.class_type_substitutions(hierarchy_class);
+                let explicit =
+                    hierarchy_declaration
+                        .members
+                        .iter()
+                        .filter_map(|member| match member {
+                            ClassMember::Property(property) if !property.is_static => Some((
+                                hierarchy_class.name.clone(),
+                                property.name.clone(),
+                                property.writable,
+                                false,
+                            )),
+                            ClassMember::Property(_)
+                            | ClassMember::Method(_)
+                            | ClassMember::Constant(_) => None,
+                        });
+                let promoted =
+                    hierarchy_declaration
+                        .members
+                        .iter()
+                        .find_map(|member| match member {
+                            ClassMember::Method(method) if method.name == "__construct" => {
+                                Some(method.params.iter().filter_map(|param| {
+                                    param.promoted_access.as_ref().map(|_| {
+                                        (
+                                            hierarchy_class.name.clone(),
+                                            param.name.clone(),
+                                            param.writable,
+                                            true,
+                                        )
+                                    })
+                                }))
+                            }
+                            _ => None,
+                        });
+                let mut declared = explicit.collect::<Vec<_>>();
+                if let Some(promoted) = promoted {
+                    declared.extend(promoted);
                 }
-                _ => None,
-            });
-            let mut properties = explicit.collect::<Vec<_>>();
-            if let Some(promoted) = promoted {
-                properties.extend(promoted);
+                for (declaring_class, name, writable, promoted) in declared {
+                    let Some(property) = hierarchy_info.properties.get(&name) else {
+                        continue;
+                    };
+                    let ty = checker.substitute_type_id(property.ty, &substitutions);
+                    properties.push((
+                        declaring_class,
+                        name,
+                        checker.types.resolved(ty),
+                        writable,
+                        promoted,
+                    ));
+                }
             }
             let class_type_id = checker.types.intern(TypeKind::Class(instance.clone()));
-            let mut builtin_interfaces = class_info
-                .builtin_interfaces
+            let mut builtin_interfaces = hierarchy
                 .iter()
-                .copied()
+                .filter_map(|class| checker.classes.get(&class.name))
+                .flat_map(|class| class.builtin_interfaces.iter().copied())
                 .collect::<Vec<_>>();
             builtin_interfaces.sort();
+            builtin_interfaces.dedup();
             classes.push(ClassSemanticInfo {
                 id,
                 declaration_name: declaration.name.clone(),
@@ -1030,20 +1212,43 @@ fn collect_ordered_class_semantics(
                     .iter()
                     .map(|argument| checker.types.resolved(*argument))
                     .collect(),
+                is_open: class_info.is_open,
+                parent: parent.map(|parent| {
+                    ClassType::new(
+                        parent.name,
+                        parent
+                            .arguments
+                            .iter()
+                            .map(|argument| checker.types.resolved(*argument))
+                            .collect(),
+                    )
+                }),
+                ancestors: ancestors
+                    .into_iter()
+                    .map(|ancestor| {
+                        ClassType::new(
+                            ancestor.name,
+                            ancestor
+                                .arguments
+                                .iter()
+                                .map(|argument| checker.types.resolved(*argument))
+                                .collect(),
+                        )
+                    })
+                    .collect(),
                 builtin_interfaces,
                 properties: properties
                     .into_iter()
                     .enumerate()
-                    .filter_map(|(index, (name, writable, promoted))| {
-                        let property = class_info.properties.get(&name)?;
-                        let ty = checker.substitute_type_id(property.ty, &substitutions);
-                        Some(PropertySemanticInfo {
+                    .map(|(index, (declaring_class, name, ty, writable, promoted))| {
+                        PropertySemanticInfo {
                             id: PropertyId { class: id, index },
+                            declaring_class,
                             name,
-                            ty: checker.types.resolved(ty),
+                            ty,
                             writable,
                             promoted,
-                        })
+                        }
                     })
                     .collect(),
             });
@@ -1536,6 +1741,8 @@ struct Checker<'program> {
     whens: HashMap<Span, WhenSemanticInfo>,
     given_preludes: HashMap<Span, GivenSemanticInfo>,
     call_targets: HashMap<Span, CallableTarget>,
+    method_call_targets: HashMap<Span, MethodCallSemanticInfo>,
+    static_member_targets: HashMap<Span, String>,
     generic_call_specializations: HashMap<Span, GenericSpecialization>,
     constrained_display_calls: HashSet<Span>,
     pending_generic_calls: HashMap<Span, PendingGenericCall>,
@@ -1550,6 +1757,8 @@ struct Checker<'program> {
     const_evaluation: crate::const_eval::Evaluation,
     parameter_defaults:
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
+    override_roots: HashMap<Span, Span>,
+    overridden_declarations: HashMap<Span, Span>,
     flow_facts: crate::narrowing::FactsByUse,
     contextual_expression_types: HashMap<Span, TypeId>,
     when_contexts: Vec<WhenCheckContext>,
@@ -1879,6 +2088,7 @@ fn semantic_layout_shape(
     types: &TypeRegistry,
     ty: TypeId,
     enum_layouts: &HashMap<EnumId, EnumLayout>,
+    classes: &HashMap<String, ClassInfo>,
 ) -> Option<LayoutShape> {
     const POINTER: u32 = 8;
     let scalar = |bytes| LayoutShape {
@@ -1892,7 +2102,6 @@ fn semantic_layout_shape(
         TypeKind::String
         | TypeKind::Bytes
         | TypeKind::Mixed
-        | TypeKind::Class(_)
         | TypeKind::TypedArray(_)
         | TypeKind::List(_)
         | TypeKind::Dictionary(_, _)
@@ -1902,6 +2111,13 @@ fn semantic_layout_shape(
         | TypeKind::PriorityQueue(_)
         | TypeKind::Deque(_)
         | TypeKind::SharedHandle(_, _) => Some(scalar(POINTER)),
+        TypeKind::Class(class) => Some(scalar(
+            if classes.get(&class.name).is_some_and(|class| class.is_open) {
+                POINTER * 2
+            } else {
+                POINTER
+            },
+        )),
         TypeKind::Function(_) => Some(LayoutShape {
             size: POINTER * crate::native_closure_abi::CARRIER_WORDS,
             align: POINTER,
@@ -1918,10 +2134,18 @@ fn semantic_layout_shape(
                     align: POINTER,
                 });
             }
+            if let TypeKind::Class(class) = inner_kind {
+                return Some(scalar(
+                    if classes.get(&class.name).is_some_and(|class| class.is_open) {
+                        POINTER * 2
+                    } else {
+                        POINTER
+                    },
+                ));
+            }
             if matches!(
                 inner_kind,
-                TypeKind::Class(_)
-                    | TypeKind::Mixed
+                TypeKind::Mixed
                     | TypeKind::Bytes
                     | TypeKind::TypedArray(_)
                     | TypeKind::List(_)
@@ -1935,7 +2159,7 @@ fn semantic_layout_shape(
             ) {
                 return Some(scalar(POINTER));
             }
-            let payload = semantic_layout_shape(types, *inner, enum_layouts)?;
+            let payload = semantic_layout_shape(types, *inner, enum_layouts, classes)?;
             let align = POINTER.max(payload.align);
             let payload_offset = checked_layout_align(POINTER, payload.align)?;
             let size = checked_layout_align(payload_offset.checked_add(payload.size)?, align)?;
@@ -1993,6 +2217,93 @@ fn type_parameter_scope(params: &[TypeParamDecl]) -> HashMap<String, Vec<TypeRef
         .iter()
         .map(|param| (param.name.clone(), param.constraints.clone()))
         .collect()
+}
+
+fn type_refs_alpha_equivalent(
+    child: &TypeRef,
+    parent: &TypeRef,
+    child_params: &[TypeParamInfo],
+    parent_params: &[TypeParamInfo],
+) -> bool {
+    let child = child
+        .grouped
+        .as_ref()
+        .map_or(child, |grouped| &grouped.inner);
+    let parent = parent
+        .grouped
+        .as_ref()
+        .map_or(parent, |grouped| &grouped.inner);
+    let child_name = child_params
+        .iter()
+        .position(|parameter| parameter.name == child.name)
+        .and_then(|index| parent_params.get(index))
+        .map_or(child.name.as_str(), |parameter| parameter.name.as_str());
+    if child_name != parent.name
+        || child.nullable != parent.nullable
+        || child.arguments.len() != parent.arguments.len()
+    {
+        return false;
+    }
+    if !child
+        .arguments
+        .iter()
+        .zip(&parent.arguments)
+        .all(|(child, parent)| match (child, parent) {
+            (TypeArgumentRef::Type(child), TypeArgumentRef::Type(parent)) => {
+                type_refs_alpha_equivalent(child, parent, child_params, parent_params)
+            }
+            (TypeArgumentRef::Value(child), TypeArgumentRef::Value(parent)) => child == parent,
+            _ => false,
+        })
+    {
+        return false;
+    }
+    match (&child.function, &parent.function) {
+        (None, None) => true,
+        (Some(child), Some(parent)) => {
+            child.invocation_mode == parent.invocation_mode
+                && child.parameters.len() == parent.parameters.len()
+                && child
+                    .parameters
+                    .iter()
+                    .zip(&parent.parameters)
+                    .all(|(child, parent)| {
+                        child.ownership_mode == parent.ownership_mode
+                            && type_refs_alpha_equivalent(
+                                &child.ty,
+                                &parent.ty,
+                                child_params,
+                                parent_params,
+                            )
+                    })
+                && type_refs_alpha_equivalent(
+                    &child.return_type,
+                    &parent.return_type,
+                    child_params,
+                    parent_params,
+                )
+                && match (&child.throws_clause, &parent.throws_clause) {
+                    (None, None) => true,
+                    (Some(child), Some(parent)) => {
+                        child.entries.len() == parent.entries.len()
+                            && child
+                                .entries
+                                .iter()
+                                .zip(&parent.entries)
+                                .all(|(child, parent)| {
+                                    type_refs_alpha_equivalent(
+                                        &child.ty,
+                                        &parent.ty,
+                                        child_params,
+                                        parent_params,
+                                    )
+                                })
+                    }
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
 }
 
 /// The callee facts a call site needs to resolve a returned borrow back to the
@@ -2135,6 +2446,12 @@ struct StaticAccess<'a> {
 }
 
 #[derive(Debug, Clone)]
+enum StaticMemberInfo {
+    Constant(ConstantInfo),
+    Property(StaticPropertyInfo),
+}
+
+#[derive(Debug, Clone)]
 enum AssignmentDestination {
     Type,
     Parameter { name: String },
@@ -2228,6 +2545,8 @@ impl<'program> Checker<'program> {
             whens: HashMap::new(),
             given_preludes: HashMap::new(),
             call_targets: HashMap::new(),
+            method_call_targets: HashMap::new(),
+            static_member_targets: HashMap::new(),
             generic_call_specializations: HashMap::new(),
             constrained_display_calls: HashSet::new(),
             pending_generic_calls: HashMap::new(),
@@ -2241,6 +2560,8 @@ impl<'program> Checker<'program> {
             negated_integer_literal_operands: HashSet::new(),
             const_evaluation,
             parameter_defaults: HashMap::new(),
+            override_roots: HashMap::new(),
+            overridden_declarations: HashMap::new(),
             flow_facts: crate::narrowing::analyze_program(program),
             contextual_expression_types: HashMap::new(),
             when_contexts: Vec::new(),
@@ -2281,6 +2602,8 @@ impl<'program> Checker<'program> {
         self.predeclare_classes();
         self.collect_enums();
         self.collect_classes();
+        self.validate_class_hierarchies();
+        self.finalize_enum_metadata();
         self.collect_functions();
         self.apply_ambient_effect_seed();
         self.check_instance_property_initializers();
@@ -2332,6 +2655,8 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+        self.materialize_override_parameter_defaults();
+        self.validate_parent_constructor_protocols();
         self.report_unresolved_generic_calls();
         self.check_pending_integer_literal_ranges();
     }
@@ -3121,6 +3446,7 @@ impl<'program> Checker<'program> {
                 break;
             }
         }
+        self.close_virtual_ambient_effects(&mut ambient);
         ambient.retain(|_, effects| !effects.is_empty());
         ambient
     }
@@ -3139,8 +3465,36 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+        self.close_virtual_ambient_effects(&mut ambient);
         ambient.retain(|_, effects| !effects.is_empty());
         ambient
+    }
+
+    fn close_virtual_ambient_effects(&self, ambient: &mut HashMap<Span, Vec<ResolvedType>>) {
+        loop {
+            let mut changed = false;
+            for (declaration, root) in &self.override_roots {
+                let family = ambient
+                    .get(root)
+                    .into_iter()
+                    .flatten()
+                    .chain(ambient.get(declaration).into_iter().flatten())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for member in [root, declaration] {
+                    let effects = ambient.entry(*member).or_default();
+                    for effect in &family {
+                        if !effects.contains(effect) {
+                            effects.push(effect.clone());
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 
     fn apply_ambient_effect_seed(&mut self) {
@@ -3217,6 +3571,10 @@ impl<'program> Checker<'program> {
             self.classes.insert(
                 class_decl.name.clone(),
                 ClassInfo {
+                    declaration: class_decl.span,
+                    is_open: class_decl.is_open,
+                    parent: None,
+                    parent_span: class_decl.parent_span,
                     type_params: class_decl
                         .type_params
                         .iter()
@@ -3257,7 +3615,30 @@ impl<'program> Checker<'program> {
             self.check_class_type_parameter_declarations(class_decl);
             self.type_parameter_scopes
                 .push(type_parameter_scope(&class_decl.type_params));
+            let parent = class_decl.parent.as_ref().and_then(|parent| {
+                let ty = self
+                    .resolve_type_ref(parent, class_decl.parent_span.unwrap_or(class_decl.span));
+                match self.types.kind(ty).clone() {
+                    TypeKind::Class(parent) => Some(parent),
+                    TypeKind::Unknown => None,
+                    _ => {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0723",
+                                "a class parent must resolve to one concrete class type",
+                                class_decl.parent_span.unwrap_or(class_decl.span),
+                            )
+                            .with_title("Class Parent Must Be A Class"),
+                        );
+                        None
+                    }
+                }
+            });
             let mut info = ClassInfo {
+                declaration: class_decl.span,
+                is_open: class_decl.is_open,
+                parent,
+                parent_span: class_decl.parent_span,
                 type_params: class_decl
                     .type_params
                     .iter()
@@ -3343,6 +3724,9 @@ impl<'program> Checker<'program> {
                                 method.name.clone(),
                                 MethodInfo {
                                     declaration: signature.declaration,
+                                    is_open: method.is_open,
+                                    is_override: method.is_override,
+                                    virtual_root: method.is_open.then_some(signature.declaration),
                                     access: method.access,
                                     receiver_mode: (!method.is_static).then_some(
                                         if method.writable_this
@@ -3385,6 +3769,514 @@ impl<'program> Checker<'program> {
             self.type_parameter_scopes.pop();
             self.classes.insert(class_decl.name.clone(), info);
         }
+    }
+
+    fn validate_class_hierarchies(&mut self) {
+        let declarations = self
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(declaration) => Some(declaration.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for declaration in &declarations {
+            let Some(parent) = self
+                .classes
+                .get(&declaration.name)
+                .and_then(|class| class.parent.clone())
+            else {
+                continue;
+            };
+            if let Some(parent_info) = self.classes.get(&parent.name) {
+                if !parent_info.is_open {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0722",
+                            format!(
+                                "class `{}` is closed and cannot be extended",
+                                parent.name
+                            ),
+                            declaration.parent_span.unwrap_or(declaration.span),
+                        )
+                        .with_title("Class Must Be Open To Be Extended")
+                        .with_related(parent_info.declaration, "the closed parent is declared here")
+                        .with_help(format!(
+                            "declare the parent as `open class {}` if subclassing is part of its API",
+                            parent.name
+                        )),
+                    );
+                }
+            }
+        }
+
+        let mut reported_cycles = HashSet::new();
+        for declaration in &declarations {
+            let mut positions = HashMap::<String, usize>::new();
+            let mut chain = Vec::<String>::new();
+            let mut current = declaration.name.clone();
+            loop {
+                if let Some(start) = positions.get(&current).copied() {
+                    let cycle = &chain[start..];
+                    let mut canonical = cycle.to_vec();
+                    canonical.sort();
+                    if reported_cycles.insert(canonical.join("\0")) {
+                        let primary = self
+                            .classes
+                            .get(&current)
+                            .and_then(|class| class.parent_span)
+                            .unwrap_or(declaration.span);
+                        let mut diagnostic = Diagnostic::new(
+                            "E0724",
+                            format!(
+                                "class inheritance cycle: {}",
+                                cycle
+                                    .iter()
+                                    .chain(std::iter::once(&cycle[0]))
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                                    .join(" -> ")
+                            ),
+                            primary,
+                        )
+                        .with_title("Class Inheritance Cycle");
+                        for name in cycle {
+                            if let Some(info) = self.classes.get(name) {
+                                diagnostic = diagnostic.with_related(
+                                    info.declaration,
+                                    format!("`{name}` participates in this cycle"),
+                                );
+                            }
+                        }
+                        self.diagnostics.push(diagnostic);
+                    }
+                    break;
+                }
+                positions.insert(current.clone(), chain.len());
+                chain.push(current.clone());
+                let Some(parent) = self
+                    .classes
+                    .get(&current)
+                    .and_then(|class| class.parent.as_ref())
+                else {
+                    break;
+                };
+                current = parent.name.clone();
+            }
+        }
+
+        let cyclic_classes = reported_cycles
+            .iter()
+            .flat_map(|cycle| cycle.split('\0'))
+            .collect::<HashSet<_>>();
+        for declaration in &declarations {
+            let Some(class_info) = self.classes.get(&declaration.name).cloned() else {
+                continue;
+            };
+            for member in &declaration.members {
+                let ClassMember::Method(method) = member else {
+                    continue;
+                };
+                if method.is_open
+                    && (!class_info.is_open
+                        || method.is_static
+                        || method.access == MemberAccess::Internal
+                        || LifecycleMethod::from_method_name(&method.name).is_some())
+                {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0725",
+                            format!(
+                                "method `{}::{}` cannot be open",
+                                declaration.name, method.name
+                            ),
+                            method.open_span.unwrap_or(method.span),
+                        )
+                        .with_title("Method Cannot Be Open")
+                        .with_help(
+                            "only external instance methods on open classes may be declared open",
+                        ),
+                    );
+                }
+            }
+
+            if cyclic_classes.contains(declaration.name.as_str()) {
+                continue;
+            }
+            let Some(parent) = class_info.parent.clone() else {
+                for (name, method) in &class_info.methods {
+                    if method.is_override {
+                        self.report_missing_override_target(&declaration.name, name, method);
+                    }
+                }
+                continue;
+            };
+            for (name, member) in &class_info.members {
+                let Some((declaring_class, inherited)) =
+                    self.lookup_inherited_member(&parent, name)
+                else {
+                    if let Some(method) = class_info.methods.get(name) {
+                        if method.is_override {
+                            self.report_missing_override_target(&declaration.name, name, method);
+                        }
+                    }
+                    continue;
+                };
+                let Some(method) = class_info.methods.get(name) else {
+                    self.report_inherited_member_collision(
+                        &declaration.name,
+                        name,
+                        member.span,
+                        &declaring_class,
+                        inherited.span,
+                    );
+                    continue;
+                };
+                let Some(inherited_method) = self
+                    .classes
+                    .get(&declaring_class.name)
+                    .and_then(|class| class.methods.get(name))
+                    .cloned()
+                else {
+                    self.report_inherited_member_collision(
+                        &declaration.name,
+                        name,
+                        method.declaration,
+                        &declaring_class,
+                        inherited.span,
+                    );
+                    continue;
+                };
+                let inherited_method =
+                    self.specialize_method_for_class(&inherited_method, &declaring_class);
+                if !inherited_method.is_open && inherited_method.virtual_root.is_none() {
+                    self.report_inherited_member_collision(
+                        &declaration.name,
+                        name,
+                        method.declaration,
+                        &declaring_class,
+                        inherited_method.declaration,
+                    );
+                    continue;
+                }
+                if !method.is_override {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0726",
+                            format!(
+                                "method `{}::{name}` replaces an inherited open method and must use `override`",
+                                declaration.name
+                            ),
+                            method.declaration,
+                        )
+                        .with_title("Override Modifier Is Required")
+                        .with_related(
+                            inherited_method.declaration,
+                            format!("the inherited open method is declared on `{}`", declaring_class.name),
+                        )
+                        .with_help("add `override` before `function`"),
+                    );
+                    continue;
+                }
+                if self.validate_override_contract(
+                    &declaration.name,
+                    method,
+                    &declaring_class,
+                    &inherited_method,
+                ) {
+                    let root = inherited_method
+                        .virtual_root
+                        .unwrap_or(inherited_method.declaration);
+                    self.complete_override_contract(
+                        &declaration.name,
+                        name,
+                        method.declaration,
+                        root,
+                        inherited_method.declaration,
+                        &inherited_method.params,
+                    );
+                }
+            }
+        }
+    }
+
+    fn complete_override_contract(
+        &mut self,
+        class: &str,
+        method_name: &str,
+        declaration: Span,
+        virtual_root: Span,
+        overridden_declaration: Span,
+        inherited_params: &[ParamInfo],
+    ) {
+        if let Some(method) = self
+            .classes
+            .get_mut(class)
+            .and_then(|class| class.methods.get_mut(method_name))
+        {
+            method.virtual_root = Some(virtual_root);
+            for (parameter, inherited) in method.params.iter_mut().zip(inherited_params) {
+                parameter.has_default = inherited.has_default;
+            }
+        }
+
+        if let Some(signature) = self.function_signatures.get_mut(&declaration) {
+            for (parameter, inherited) in signature.params.iter_mut().zip(inherited_params) {
+                parameter.has_default = inherited.has_default;
+            }
+        }
+        self.override_roots.insert(declaration, virtual_root);
+        self.overridden_declarations
+            .insert(declaration, overridden_declaration);
+    }
+
+    fn materialize_override_parameter_defaults(&mut self) {
+        let overrides = self.override_roots.clone();
+        for (declaration, root) in overrides {
+            let Some(signature) = self.function_signatures.get(&declaration) else {
+                continue;
+            };
+            for parameter_index in 0..signature.params.len() {
+                let root_key = crate::const_eval::ParameterDefaultKey {
+                    function_start: root.start,
+                    parameter_index,
+                };
+                let Some(value) = self.parameter_defaults.get(&root_key).cloned() else {
+                    continue;
+                };
+                self.parameter_defaults.insert(
+                    crate::const_eval::ParameterDefaultKey {
+                        function_start: declaration.start,
+                        parameter_index,
+                    },
+                    value,
+                );
+            }
+        }
+    }
+
+    fn validate_parent_constructor_protocols(&mut self) {
+        let declarations = self
+            .program
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Class(declaration) => Some(declaration.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        for declaration in declarations {
+            let Some(parent) = self
+                .classes
+                .get(&declaration.name)
+                .and_then(|class| class.parent.clone())
+            else {
+                continue;
+            };
+            let parent_constructor = self
+                .classes
+                .get(&parent.name)
+                .and_then(|class| class.methods.get("__construct"))
+                .cloned();
+
+            if let Some(parent_constructor) = parent_constructor.as_ref() {
+                if parent_constructor.access == MemberAccess::Internal {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0735",
+                            format!(
+                                "class `{}` cannot invoke internal constructor `{}::__construct`",
+                                declaration.name, parent.name
+                            ),
+                            declaration.parent_span.unwrap_or(declaration.span),
+                        )
+                        .with_title("Parent Constructor Is Not Accessible")
+                        .with_related(
+                            parent_constructor.declaration,
+                            "the internal parent constructor is declared here",
+                        )
+                        .with_help(
+                            "make the parent constructor externally accessible before extending this class",
+                        ),
+                    );
+                }
+            }
+
+            let constructor = declaration.members.iter().find_map(|member| match member {
+                ClassMember::Method(method) if method.name == "__construct" => Some(method),
+                _ => None,
+            });
+            let parent_requires_arguments =
+                parent_constructor.as_ref().is_some_and(|constructor| {
+                    constructor
+                        .params
+                        .iter()
+                        .any(|parameter| !parameter.has_default)
+                });
+
+            let mut constructor_calls = Vec::new();
+            for member in declaration
+                .members
+                .iter()
+                .filter_map(|member| match member {
+                    ClassMember::Method(method) => Some(method),
+                    _ => None,
+                })
+            {
+                let mut calls = self
+                    .call_targets
+                    .iter()
+                    .filter_map(|(span, target)| {
+                        (span.source == member.span.source
+                            && span.start >= member.span.start
+                            && span.end <= member.span.end
+                            && matches!(
+                                target,
+                                CallableTarget::Method {
+                                    method_name,
+                                    direct_parent: true,
+                                    ..
+                                } if method_name == "__construct"
+                            ))
+                        .then_some(*span)
+                    })
+                    .collect::<Vec<_>>();
+                calls.sort();
+                if member.name == "__construct" {
+                    constructor_calls.extend(calls);
+                } else {
+                    for span in calls {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0736",
+                                "`parent::__construct(...)` is available only as the first statement of a subclass constructor",
+                                span,
+                            )
+                            .with_title("Parent Constructor Call Is Not Allowed Here"),
+                        );
+                    }
+                }
+            }
+            constructor_calls.sort();
+
+            let Some(constructor) = constructor else {
+                if parent_requires_arguments {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0732",
+                            format!(
+                                "class `{}` must pass the required arguments for `{}::__construct`",
+                                declaration.name, parent.name
+                            ),
+                            declaration.parent_span.unwrap_or(declaration.span),
+                        )
+                        .with_title("Parent Constructor Call Is Required")
+                        .with_help(
+                            "declare `__construct` and make `parent::__construct(...)` its first statement",
+                        ),
+                    );
+                }
+                continue;
+            };
+
+            if constructor_calls.is_empty() {
+                if parent_requires_arguments {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0732",
+                            format!(
+                                "constructor `{}::__construct` must pass the required arguments for `{}::__construct`",
+                                declaration.name, parent.name
+                            ),
+                            constructor.span,
+                        )
+                        .with_title("Parent Constructor Call Is Required")
+                        .with_help(
+                            "make `parent::__construct(...)` the first statement of this constructor",
+                        ),
+                    );
+                }
+                continue;
+            }
+
+            let first_statement_is_parent_call =
+                constructor
+                    .body
+                    .statements
+                    .first()
+                    .is_some_and(|statement| {
+                        matches!(
+                            statement,
+                            Stmt::Expr {
+                                expr: Expr::StaticCall {
+                                    qualifier: StaticQualifier::Parent,
+                                    method,
+                                    ..
+                                },
+                                ..
+                            } if method == "__construct"
+                        )
+                    });
+            if !first_statement_is_parent_call {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0733",
+                        "`parent::__construct(...)` must be the first source-level statement of the subclass constructor",
+                        constructor_calls[0],
+                    )
+                    .with_title("Parent Constructor Call Must Be First"),
+                );
+            }
+            for span in constructor_calls.iter().skip(1) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0734",
+                        "a subclass constructor invokes its direct parent constructor more than once",
+                        *span,
+                    )
+                    .with_title("Parent Constructor Call Is Repeated")
+                    .with_related(constructor_calls[0], "the first parent constructor call is here"),
+                );
+            }
+        }
+    }
+
+    fn report_missing_override_target(&mut self, class: &str, name: &str, method: &MethodInfo) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0730",
+                format!(
+                    "method `{class}::{name}` uses `override`, but no inherited open method matches"
+                ),
+                method.declaration,
+            )
+            .with_title("Override Has No Target"),
+        );
+    }
+
+    fn report_inherited_member_collision(
+        &mut self,
+        class: &str,
+        member: &str,
+        span: Span,
+        inherited_class: &ClassType<TypeId>,
+        inherited_span: Span,
+    ) {
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0727",
+                format!(
+                    "`{class}::{member}` cannot hide inherited member `{}::{member}`",
+                    inherited_class.name
+                ),
+                span,
+            )
+            .with_title("Inherited Member Cannot Be Hidden")
+            .with_related(inherited_span, "the inherited member is declared here"),
+        );
     }
 
     fn collect_enums(&mut self) {
@@ -3663,7 +4555,6 @@ impl<'program> Checker<'program> {
             }
             self.enums.insert(declaration.name.clone(), definition);
         }
-        self.finalize_enum_metadata();
     }
 
     fn check_enum(&mut self, _declaration: &EnumDecl) {}
@@ -3760,7 +4651,14 @@ impl<'program> Checker<'program> {
                     .map(|case| {
                         case.payload
                             .iter()
-                            .map(|field| semantic_layout_shape(&self.types, field.ty, &layouts))
+                            .map(|field| {
+                                semantic_layout_shape(
+                                    &self.types,
+                                    field.ty,
+                                    &layouts,
+                                    &self.classes,
+                                )
+                            })
                             .collect::<Option<Vec<_>>>()
                     })
                     .collect::<Option<Vec<_>>>();
@@ -4404,14 +5302,7 @@ impl<'program> Checker<'program> {
         match self.types.kind(ty) {
             TypeKind::Error => true,
             TypeKind::Class(class) => {
-                self.classes
-                    .get(&class.name)
-                    .is_some_and(|info| info.implements(BuiltinInterface::Error))
-                    || self.program.items.iter().any(|item| {
-                        matches!(item, Item::Class(declaration)
-                        if declaration.name == class.name
-                            && declaration.implements.iter().any(|name| name == "Error"))
-                    })
+                self.class_implements_builtin(&class.name, BuiltinInterface::Error)
             }
             _ => false,
         }
@@ -4676,7 +5567,8 @@ impl<'program> Checker<'program> {
             }
             Expr::StaticCall {
                 qualifier, method, ..
-            } => Self::static_qualifier_class_name(qualifier, method_context)
+            } => self
+                .static_qualifier_class_name(qualifier, method_context)
                 .and_then(|class_name| self.classes.get(&class_name))
                 .and_then(|class| class.methods.get(method))
                 .and_then(|info| info.return_borrow),
@@ -5408,13 +6300,6 @@ impl<'program> Checker<'program> {
     fn check_class(&mut self, class_decl: &ClassDecl) {
         self.type_parameter_scopes
             .push(type_parameter_scope(&class_decl.type_params));
-        if class_decl.parent.is_some() {
-            self.diagnostics.push(Diagnostic::new(
-                "E0476",
-                "class inheritance is accepted syntax but `extends` semantics are not available in this compiler version",
-                class_decl.parent_span.unwrap_or(class_decl.span),
-            ));
-        }
         for member in &class_decl.members {
             match member {
                 ClassMember::Property(property) => {
@@ -6129,28 +7014,24 @@ impl<'program> Checker<'program> {
         declared: &[TypeId],
         observed: &CheckedEffectSet,
     ) {
-        let uncovered = observed
-            .ordered
-            .iter()
-            .copied()
-            .filter(|effect| {
-                let resolved = self.types.resolved(*effect);
-                if crate::checked_effects::is_test_assertion_effect(&resolved) {
-                    false
-                } else {
-                    function.name == "__destruct"
-                        || !crate::checked_effects::is_ambient_io_effect(&resolved)
-                }
-            })
+        let mut uncovered = Vec::new();
+        for effect in observed.ordered.iter().copied() {
+            let resolved = self.types.resolved(effect);
+            if crate::checked_effects::is_test_assertion_effect(&resolved)
+                || (function.name != "__destruct"
+                    && crate::checked_effects::is_ambient_io_effect(&resolved))
+            {
+                continue;
+            }
             // The effective signature includes inferred ambient transport for
             // ABI lowering. Destructors still cannot let any checked Error
             // escape, so that runtime profile must never count as an authored
             // declaration satisfying the lifecycle boundary.
-            .filter(|effect| {
-                function.name == "__destruct"
-                    || !Self::checked_error_type_covers(&self.types, declared, *effect)
-            })
-            .collect::<Vec<_>>();
+            if function.name != "__destruct" && self.checked_error_type_covers(declared, effect) {
+                continue;
+            }
+            uncovered.push(effect);
+        }
         if uncovered.is_empty() {
             return;
         }
@@ -6190,14 +7071,22 @@ impl<'program> Checker<'program> {
         );
     }
 
-    fn checked_error_type_covers(
-        types: &TypeRegistry,
-        covering: &[TypeId],
-        effect: TypeId,
-    ) -> bool {
-        covering.iter().any(|candidate| {
-            *candidate == effect || matches!(types.kind(*candidate), TypeKind::Error)
-        })
+    fn checked_error_type_covers(&mut self, covering: &[TypeId], effect: TypeId) -> bool {
+        for candidate in covering {
+            if *candidate == effect || matches!(self.types.kind(*candidate), TypeKind::Error) {
+                return true;
+            }
+            let (TypeKind::Class(candidate), TypeKind::Class(effect)) = (
+                self.types.kind(*candidate).clone(),
+                self.types.kind(effect).clone(),
+            ) else {
+                continue;
+            };
+            if self.class_is_subtype(&effect, &candidate) {
+                return true;
+            }
+        }
+        false
     }
 
     fn record_checked_effects(&mut self, effects: impl IntoIterator<Item = TypeId>, span: Span) {
@@ -7080,9 +7969,27 @@ impl<'program> Checker<'program> {
             }
             let catches_all = matches!(self.types.kind(catch_type), TypeKind::Error);
             let catch_set = [catch_type];
-            let reachable = protected.ordered.iter().any(|effect| {
-                matches!(self.types.kind(*effect), TypeKind::Error)
-                    || Self::checked_error_type_covers(&self.types, &catch_set, *effect)
+            if seen_catches
+                .iter()
+                .copied()
+                .any(|earlier| self.checked_error_type_covers(&[earlier], catch_type))
+            {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0628",
+                        format!(
+                            "catch for `{}` is unreachable because an earlier catch already covers it",
+                            self.types.display(catch_type)
+                        ),
+                        catch.ty_span,
+                    )
+                    .with_title("Catch Is Unreachable"),
+                );
+                continue;
+            }
+            let reachable = protected.ordered.iter().copied().any(|effect| {
+                matches!(self.types.kind(effect), TypeKind::Error)
+                    || self.checked_error_type_covers(&catch_set, effect)
             });
             if !reachable {
                 self.diagnostics.push(
@@ -7101,9 +8008,12 @@ impl<'program> Checker<'program> {
                 uncovered.ordered.clear();
                 saw_error_catch = true;
             } else {
-                uncovered.ordered.retain(|effect| {
-                    !Self::checked_error_type_covers(&self.types, &catch_set, *effect)
-                });
+                let effects = std::mem::take(&mut uncovered.ordered);
+                for effect in effects {
+                    if !self.checked_error_type_covers(&catch_set, effect) {
+                        uncovered.ordered.push(effect);
+                    }
+                }
             }
             seen_catches.push(catch_type);
 
@@ -8240,7 +9150,7 @@ impl<'program> Checker<'program> {
         args: &[Argument],
         method_context: Option<&MethodContext>,
     ) {
-        let Some(class_name) = Self::static_qualifier_class_name(qualifier, method_context) else {
+        let Some(class_name) = self.static_qualifier_class_name(qualifier, method_context) else {
             return;
         };
         let params = self
@@ -10559,6 +11469,10 @@ impl<'program> Checker<'program> {
         let function = FunctionDecl {
             access: MemberAccess::External,
             access_span: None,
+            is_open: false,
+            open_span: None,
+            is_override: false,
+            override_span: None,
             writable_this: false,
             writable_span: None,
             is_static: true,
@@ -10573,6 +11487,7 @@ impl<'program> Checker<'program> {
                 .map(|return_type| return_type.ty.clone()),
             throws: None,
             body,
+            modifier_prefix_span: closure.span,
             span: closure.span,
         };
         let borrow =
@@ -11556,18 +12471,21 @@ impl<'program> Checker<'program> {
             Expr::StaticMember {
                 qualifier: StaticQualifier::Class(class_name),
                 member,
+                span,
                 ..
-            } => self
-                .const_evaluation
-                .values
-                .get(&crate::const_eval::ConstKey::Class {
-                    class_name: class_name.clone(),
-                    name: member.clone(),
-                })
-                .and_then(|value| match &value.value {
-                    crate::const_eval::ConstValue::Bool(value) => Some(*value),
-                    _ => None,
-                }),
+            } => {
+                let class_name = self.static_member_targets.get(span).unwrap_or(class_name);
+                self.const_evaluation
+                    .values
+                    .get(&crate::const_eval::ConstKey::Class {
+                        class_name: class_name.clone(),
+                        name: member.clone(),
+                    })
+                    .and_then(|value| match &value.value {
+                        crate::const_eval::ConstValue::Bool(value) => Some(*value),
+                        _ => None,
+                    })
+            }
             _ => None,
         };
         match value {
@@ -11784,31 +12702,28 @@ impl<'program> Checker<'program> {
                     *shape_valid = false;
                 }
                 let (base, nullable) = self.match_base_type(scrutinee_ty);
-                let compatible = matches!(self.types.kind(scrutinee_ty), TypeKind::Mixed)
-                    || (nullable && self.is_assignable(base, pattern_ty));
-                if !compatible {
-                    if base == pattern_ty && !nullable {
-                        self.diagnostics.push(
-                            Diagnostic::new(
-                                "E0589",
-                                format!(
-                                    "type pattern `{}` is always true for this scrutinee",
-                                    self.types.display(pattern_ty)
-                                ),
-                                pattern_span,
-                            )
-                            .with_title("Unreachable Match Arm")
-                            .with_help(
-                                "use the value directly instead of matching its existing type",
+                let always_true = base == pattern_ty && !nullable;
+                let compatible = self.exact_type_test_can_match(scrutinee_ty, pattern_ty);
+                if always_true {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0589",
+                            format!(
+                                "type pattern `{}` is always true for this scrutinee",
+                                self.types.display(pattern_ty)
                             ),
-                        );
-                    } else {
-                        self.incompatible_match_pattern(
-                            &format!("type `{}`", self.types.display(pattern_ty)),
-                            scrutinee_ty,
                             pattern_span,
-                        );
-                    }
+                        )
+                        .with_title("Unreachable Match Arm")
+                        .with_help("use the value directly instead of matching its existing type"),
+                    );
+                    *shape_valid = false;
+                } else if !compatible {
+                    self.incompatible_match_pattern(
+                        &format!("type `{}`", self.types.display(pattern_ty)),
+                        scrutinee_ty,
+                        pattern_span,
+                    );
                     *shape_valid = false;
                 }
                 let resolved = self.types.resolved(pattern_ty);
@@ -12067,6 +12982,7 @@ impl<'program> Checker<'program> {
             Expr::StaticMember {
                 qualifier: StaticQualifier::Class(class_name),
                 member,
+                span,
                 ..
             } => self
                 .const_evaluation
@@ -12075,6 +12991,7 @@ impl<'program> Checker<'program> {
                 .copied()
                 .map(crate::const_eval::ConstValue::Enum)
                 .or_else(|| {
+                    let class_name = self.static_member_targets.get(span).unwrap_or(class_name);
                     self.const_evaluation
                         .values
                         .get(&crate::const_eval::ConstKey::Class {
@@ -12927,11 +13844,7 @@ impl<'program> Checker<'program> {
                 DisplayConversionKind::Primitive
             }
             TypeKind::Class(class) => {
-                if self
-                    .classes
-                    .get(&class.name)
-                    .is_some_and(|class| class.implements(BuiltinInterface::Displayable))
-                {
+                if self.class_implements_builtin(&class.name, BuiltinInterface::Displayable) {
                     DisplayConversionKind::DisplayableClass
                 } else {
                     DisplayConversionKind::NonDisplayableClass
@@ -12958,7 +13871,7 @@ impl<'program> Checker<'program> {
         );
     }
 
-    fn is_equality_compatible(&self, left: TypeId, right: TypeId) -> bool {
+    fn is_equality_compatible(&mut self, left: TypeId, right: TypeId) -> bool {
         if self.type_contains_mixed(left) || self.type_contains_mixed(right) {
             return false;
         }
@@ -13265,6 +14178,246 @@ impl<'program> Checker<'program> {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    fn specialized_parent_type(&mut self, class: &ClassType<TypeId>) -> Option<ClassType<TypeId>> {
+        let parent = self.classes.get(&class.name)?.parent.clone()?;
+        let substitutions = self.class_type_substitutions(class);
+        Some(ClassType::new(
+            parent.name,
+            parent
+                .arguments
+                .into_iter()
+                .map(|argument| self.substitute_type_id(argument, &substitutions))
+                .collect(),
+        ))
+    }
+
+    fn specialized_ancestor_types(&mut self, class: &ClassType<TypeId>) -> Vec<ClassType<TypeId>> {
+        let mut ancestors = Vec::new();
+        let mut current = class.clone();
+        let mut visited = HashSet::new();
+        while visited.insert(current.name.clone()) {
+            let Some(parent) = self.specialized_parent_type(&current) else {
+                break;
+            };
+            ancestors.push(parent.clone());
+            current = parent;
+        }
+        ancestors
+    }
+
+    fn class_is_subtype(&mut self, value: &ClassType<TypeId>, target: &ClassType<TypeId>) -> bool {
+        value == target
+            || self
+                .specialized_ancestor_types(value)
+                .iter()
+                .any(|ancestor| ancestor == target)
+    }
+
+    fn override_return_is_compatible(&mut self, target: TypeId, value: TypeId) -> bool {
+        if target == value {
+            return true;
+        }
+        match (
+            self.types.kind(target).clone(),
+            self.types.kind(value).clone(),
+        ) {
+            (TypeKind::Class(target), TypeKind::Class(value)) => {
+                self.class_is_subtype(&value, &target)
+            }
+            (TypeKind::Nullable(target), TypeKind::Nullable(value)) => {
+                match (
+                    self.types.kind(target).clone(),
+                    self.types.kind(value).clone(),
+                ) {
+                    (TypeKind::Class(target), TypeKind::Class(value)) => {
+                        self.class_is_subtype(&value, &target)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn class_implements_builtin(&self, class_name: &str, interface: BuiltinInterface) -> bool {
+        let mut current = Some(class_name);
+        let mut visited = HashSet::new();
+        while let Some(name) = current {
+            if !visited.insert(name) {
+                return false;
+            }
+            let interface_name = match interface {
+                BuiltinInterface::Displayable => "Displayable",
+                BuiltinInterface::Error => "Error",
+            };
+            if self.program.items.iter().any(|item| {
+                matches!(item, Item::Class(declaration)
+                    if declaration.name == name
+                        && declaration.implements.iter().any(|implemented| implemented == interface_name))
+            }) {
+                return true;
+            }
+            let Some(class) = self.classes.get(name) else {
+                return false;
+            };
+            if class.implements(interface) {
+                return true;
+            }
+            current = class.parent.as_ref().map(|parent| parent.name.as_str());
+        }
+        false
+    }
+
+    fn lookup_inherited_member(
+        &mut self,
+        parent: &ClassType<TypeId>,
+        name: &str,
+    ) -> Option<(ClassType<TypeId>, MemberDeclaration)> {
+        let mut current = Some(parent.clone());
+        let mut visited = HashSet::new();
+        while let Some(class) = current {
+            if !visited.insert(class.name.clone()) {
+                return None;
+            }
+            let info = self.classes.get(&class.name)?.clone();
+            if let Some(member) = info.members.get(name).cloned() {
+                let internal = match member.kind {
+                    MemberKind::InstanceProperty | MemberKind::PromotedProperty => info
+                        .properties
+                        .get(name)
+                        .is_some_and(|property| property.access == MemberAccess::Internal),
+                    MemberKind::StaticProperty => info
+                        .static_properties
+                        .get(name)
+                        .is_some_and(|property| property.access == MemberAccess::Internal),
+                    MemberKind::Constant => info
+                        .constants
+                        .get(name)
+                        .is_some_and(|constant| constant.access == MemberAccess::Internal),
+                    MemberKind::InstanceMethod | MemberKind::StaticMethod => info
+                        .methods
+                        .get(name)
+                        .is_some_and(|method| method.access == MemberAccess::Internal),
+                };
+                if !internal && !matches!(name, "__construct" | "__destruct") {
+                    return Some((class, member));
+                }
+            }
+            current = self.specialized_parent_type(&class);
+        }
+        None
+    }
+
+    fn validate_override_contract(
+        &mut self,
+        class_name: &str,
+        method: &MethodInfo,
+        inherited_class: &ClassType<TypeId>,
+        inherited: &MethodInfo,
+    ) -> bool {
+        let generic_valid = method.type_params.len() == inherited.type_params.len()
+            && method
+                .type_params
+                .iter()
+                .zip(&inherited.type_params)
+                .all(|(child, parent)| {
+                    child.constraints.len() == parent.constraints.len()
+                        && child.constraints.iter().zip(&parent.constraints).all(
+                            |(child_constraint, parent_constraint)| {
+                                type_refs_alpha_equivalent(
+                                    child_constraint,
+                                    parent_constraint,
+                                    &method.type_params,
+                                    &inherited.type_params,
+                                )
+                            },
+                        )
+                });
+        let alpha_substitutions = method
+            .type_params
+            .iter()
+            .zip(&inherited.type_params)
+            .map(|(child, parent)| {
+                (
+                    child.name.clone(),
+                    self.types
+                        .intern(TypeKind::TypeParameter(parent.name.clone())),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let child_parameter_types = method
+            .params
+            .iter()
+            .map(|parameter| self.substitute_type_id(parameter.ty, &alpha_substitutions))
+            .collect::<Vec<_>>();
+        let same_parameters = method.params.len() == inherited.params.len()
+            && method
+                .params
+                .iter()
+                .zip(&inherited.params)
+                .zip(child_parameter_types)
+                .all(|((child, parent), child_ty)| {
+                    child.name == parent.name
+                        && child_ty == parent.ty
+                        && child.take == parent.take
+                        && child.writable == parent.writable
+                });
+        let defaults_omitted = method.params.iter().all(|parameter| !parameter.has_default);
+        let receiver_valid = !matches!(
+            (inherited.receiver_mode, method.receiver_mode),
+            (Some(ReceiverMode::Readonly), Some(ReceiverMode::Writable))
+        );
+        let child_return = self.substitute_type_id(method.return_ty, &alpha_substitutions);
+        let return_valid = self.override_return_is_compatible(inherited.return_ty, child_return);
+        let child_effects = method
+            .checked_effects
+            .iter()
+            .map(|effect| self.substitute_type_id(*effect, &alpha_substitutions))
+            .collect::<Vec<_>>();
+        let effects_valid = child_effects.iter().all(|effect| {
+            inherited.checked_effects.iter().any(|allowed| {
+                if effect == allowed {
+                    return true;
+                }
+                match (
+                    self.types.kind(*allowed).clone(),
+                    self.types.kind(*effect).clone(),
+                ) {
+                    (TypeKind::Class(parent), TypeKind::Class(child)) => {
+                        self.class_is_subtype(&child, &parent)
+                    }
+                    _ => false,
+                }
+            })
+        });
+        if same_parameters
+            && defaults_omitted
+            && receiver_valid
+            && return_valid
+            && effects_valid
+            && generic_valid
+            && method.access == MemberAccess::External
+            && !method.is_static
+        {
+            return true;
+        }
+
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0729",
+                format!(
+                    "override on `{class_name}` does not preserve the contract of `{}'s` open method",
+                    inherited_class.name
+                ),
+                method.declaration,
+            )
+            .with_title("Override Contract Does Not Match")
+            .with_related(inherited.declaration, "the inherited open contract is declared here")
+            .with_help("match parameter names, types, ownership, generic arity, receiver access, defaults, return, and checked effects"),
+        );
+        false
     }
 
     fn substitute_type_id(
@@ -14369,15 +15522,16 @@ impl<'program> Checker<'program> {
             return;
         };
         let class_name = class_type.name.clone();
-        let Some(class_info) = self.classes.get(&class_name).cloned() else {
+        if !self.classes.contains_key(&class_name) {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
                 format!("unknown class `{class_name}`"),
                 span,
             ));
             return;
-        };
-        let Some(method_info) = class_info.methods.get(method).cloned() else {
+        }
+        let Some((declaring_class, method_info)) = self.lookup_instance_method(&class_type, method)
+        else {
             self.diagnostics.push(Diagnostic::new(
                 "E0304",
                 format!("unknown method `{class_name}::{method}`"),
@@ -14386,15 +15540,17 @@ impl<'program> Checker<'program> {
             return;
         };
 
-        let class_type_id = self.types.intern(TypeKind::Class(class_type.clone()));
+        let class_type_id = self.types.intern(TypeKind::Class(declaring_class.clone()));
         let ResolvedType::Class(resolved_class_type) = self.types.resolved(class_type_id) else {
             unreachable!("interned class type must resolve as a class");
         };
+        self.record_method_call_target(span, &method_info, false);
         self.call_targets.insert(
             span,
             CallableTarget::Method {
                 class_type: resolved_class_type,
                 method_name: method.to_string(),
+                direct_parent: false,
             },
         );
         self.record_callable_dependency(method_info.declaration);
@@ -14412,7 +15568,7 @@ impl<'program> Checker<'program> {
         }
 
         if matches!(method_info.access, MemberAccess::Internal)
-            && !self.can_access_internal_member(&class_name, span, method_context)
+            && !self.can_access_internal_member(&declaring_class.name, span, method_context)
         {
             self.diagnostics.push(Diagnostic::new(
                 "E0307",
@@ -14437,7 +15593,6 @@ impl<'program> Checker<'program> {
             }
         }
 
-        let method_info = self.specialize_method_for_class(&method_info, &class_type);
         let method_info = self.instantiate_generic_method_call(
             &format!("method `{class_name}::{method}`"),
             &method_info,
@@ -14902,15 +16057,22 @@ impl<'program> Checker<'program> {
             return;
         }
 
-        let Some(class_info) = self.classes.get(class_name).cloned() else {
+        if !self.classes.contains_key(class_name) {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
                 format!("unknown class `{class_name}`"),
                 access.span,
             ));
             return;
+        }
+        let Some(requested_class) =
+            self.static_access_class_type(access.qualifier, class_name, method_context)
+        else {
+            return;
         };
-        let Some(method_info) = class_info.methods.get(access.member).cloned() else {
+        let Some((declaring_class, method_info)) =
+            self.lookup_static_method(&requested_class, access.member)
+        else {
             self.diagnostics.push(Diagnostic::new(
                 "E0304",
                 format!("unknown method `{class_name}::{}`", access.member),
@@ -14919,28 +16081,33 @@ impl<'program> Checker<'program> {
             return;
         };
 
-        let target_class = if matches!(access.qualifier, StaticQualifier::SelfType) {
-            let class_type = self.symbolic_class_type(class_name);
-            match self.types.resolved(class_type) {
-                ResolvedType::Class(class_type) => class_type,
-                _ => unreachable!("symbolic declaring class type must resolve as a class"),
-            }
-        } else {
-            ClassType::new(class_name, Vec::new())
+        let parent_qualified = matches!(access.qualifier, StaticQualifier::Parent);
+        let target_class_id = self.types.intern(TypeKind::Class(declaring_class.clone()));
+        let ResolvedType::Class(resolved_target_class) = self.types.resolved(target_class_id)
+        else {
+            unreachable!("resolved method target must remain a class")
         };
+        self.record_method_call_target(access.span, &method_info, parent_qualified);
         self.call_targets.insert(
             access.span,
             CallableTarget::Method {
-                class_type: target_class,
+                class_type: resolved_target_class,
                 method_name: access.member.to_string(),
+                direct_parent: parent_qualified,
             },
         );
         self.record_callable_dependency(method_info.declaration);
-        if self.check_direct_lifecycle_method_call(class_name, access.member, access.span) {
+        if !(parent_qualified && access.member == "__construct")
+            && self.check_direct_lifecycle_method_call(
+                &declaring_class.name,
+                access.member,
+                access.span,
+            )
+        {
             return;
         }
 
-        if !method_info.is_static {
+        if !method_info.is_static && !parent_qualified {
             self.diagnostics.push(Diagnostic::new(
                 "E0487",
                 format!(
@@ -14953,7 +16120,7 @@ impl<'program> Checker<'program> {
         }
 
         if matches!(method_info.access, MemberAccess::Internal)
-            && !self.can_access_internal_member(class_name, access.span, method_context)
+            && !self.can_access_internal_member(&declaring_class.name, access.span, method_context)
         {
             self.diagnostics.push(Diagnostic::new(
                 "E0307",
@@ -15095,44 +16262,7 @@ impl<'program> Checker<'program> {
             self.check_enum_case_member(&definition, access);
             return;
         }
-        let Some(class_info) = self.classes.get(class_name) else {
-            self.diagnostics.push(Diagnostic::new(
-                "E0305",
-                format!("unknown class `{class_name}`"),
-                access.span,
-            ));
-            return;
-        };
-        let member_access = class_info
-            .constants
-            .get(access.member)
-            .map(|constant| constant.access)
-            .or_else(|| {
-                class_info
-                    .static_properties
-                    .get(access.member)
-                    .map(|property| property.access)
-            });
-        let Some(member_access) = member_access else {
-            self.diagnostics.push(Diagnostic::new(
-                "E0488",
-                format!("unknown static member `{class_name}::{}`", access.member),
-                access.span,
-            ));
-            return;
-        };
-        if member_access == MemberAccess::Internal
-            && !self.can_access_internal_member(class_name, access.span, method_context)
-        {
-            self.diagnostics.push(Diagnostic::new(
-                "E0307",
-                format!(
-                    "static member `{class_name}::{}` is internal",
-                    access.member
-                ),
-                access.span,
-            ));
-        }
+        self.check_resolved_static_member(access, class_name, method_context);
     }
 
     fn check_enum_case_member(&mut self, definition: &EnumDefinition, access: StaticAccess<'_>) {
@@ -15262,9 +16392,8 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> Option<AssignmentTarget> {
         let class_name = self.resolve_static_qualifier(access, method_context)?;
-        self.check_resolved_static_member(&class_name, access.member, access.span, method_context);
-        let class_info = self.classes.get(&class_name)?;
-        if class_info.constants.contains_key(access.member) {
+        let (_, member) = self.check_resolved_static_member(access, &class_name, method_context)?;
+        let StaticMemberInfo::Property(property) = member else {
             self.diagnostics.push(Diagnostic::new(
                 "E0489",
                 format!(
@@ -15274,8 +16403,7 @@ impl<'program> Checker<'program> {
                 access.span,
             ));
             return None;
-        }
-        let property = class_info.static_properties.get(access.member)?.clone();
+        };
         if !property.writable {
             self.diagnostics.push(Diagnostic::new(
                 "E0202",
@@ -15344,12 +16472,33 @@ impl<'program> Checker<'program> {
                     None
                 }),
             StaticQualifier::Parent => {
-                self.diagnostics.push(Diagnostic::unsupported_stage(
-                    "E0496",
-                    "generalized `parent::member()` syntax is accepted; parent implementation semantics land in Stage 34",
-                    access.span,
-                ));
-                None
+                let Some(context) = method_context else {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0731",
+                            "`parent::` is only available inside a derived class method",
+                            access.span,
+                        )
+                        .with_title("Parent Has No Class Context"),
+                    );
+                    return None;
+                };
+                let Some(parent) = self
+                    .classes
+                    .get(&context.class_name)
+                    .and_then(|class| class.parent.as_ref())
+                else {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0731",
+                            format!("class `{}` has no parent", context.class_name),
+                            access.qualifier_span,
+                        )
+                        .with_title("Parent Does Not Exist"),
+                    );
+                    return None;
+                };
+                Some(parent.name.clone())
             }
             StaticQualifier::InvalidStatic => {
                 self.diagnostics.push(
@@ -15370,46 +16519,49 @@ impl<'program> Checker<'program> {
 
     fn check_resolved_static_member(
         &mut self,
+        access: StaticAccess<'_>,
         class_name: &str,
-        member: &str,
-        span: Span,
         method_context: Option<&MethodContext>,
-    ) {
-        let Some(class_info) = self.classes.get(class_name) else {
+    ) -> Option<(ClassType<TypeId>, StaticMemberInfo)> {
+        if !self.classes.contains_key(class_name) {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
                 format!("unknown class `{class_name}`"),
-                span,
+                access.span,
             ));
-            return;
-        };
-        let access = class_info
-            .constants
-            .get(member)
-            .map(|constant| constant.access)
-            .or_else(|| {
-                class_info
-                    .static_properties
-                    .get(member)
-                    .map(|property| property.access)
-            });
-        let Some(access) = access else {
+            return None;
+        }
+        let requested_class =
+            self.static_access_class_type(access.qualifier, class_name, method_context)?;
+        let Some((declaring_class, member_info)) =
+            self.lookup_static_member(&requested_class, access.member)
+        else {
             self.diagnostics.push(Diagnostic::new(
                 "E0488",
-                format!("unknown static member `{class_name}::{member}`"),
-                span,
+                format!("unknown static member `{class_name}::{}`", access.member),
+                access.span,
             ));
-            return;
+            return None;
         };
-        if access == MemberAccess::Internal
-            && !self.can_access_internal_member(class_name, span, method_context)
+        self.static_member_targets
+            .insert(access.span, declaring_class.name.clone());
+        let member_access = match &member_info {
+            StaticMemberInfo::Constant(constant) => constant.access,
+            StaticMemberInfo::Property(property) => property.access,
+        };
+        if member_access == MemberAccess::Internal
+            && !self.can_access_internal_member(&declaring_class.name, access.span, method_context)
         {
             self.diagnostics.push(Diagnostic::new(
                 "E0307",
-                format!("static member `{class_name}::{member}` is internal"),
-                span,
+                format!(
+                    "static member `{class_name}::{}` is internal",
+                    access.member
+                ),
+                access.span,
             ));
         }
+        Some((declaring_class, member_info))
     }
 
     fn check_cross_kind_intrinsic_argument(
@@ -15563,11 +16715,13 @@ impl<'program> Checker<'program> {
         let ResolvedType::Class(resolved_class_type) = self.types.resolved(class_type_id) else {
             unreachable!("interned constructor class type must resolve as a class");
         };
+        self.record_method_call_target(span, &constructor, false);
         self.call_targets.insert(
             span,
             CallableTarget::Method {
                 class_type: resolved_class_type,
                 method_name: "__construct".to_string(),
+                direct_parent: false,
             },
         );
         self.record_callable_dependency(constructor.declaration);
@@ -15584,6 +16738,17 @@ impl<'program> Checker<'program> {
         if self.diagnostics.len() == diagnostics_before {
             self.record_checked_effects(constructor.checked_effects, span);
         }
+    }
+
+    fn record_method_call_target(&mut self, span: Span, method: &MethodInfo, direct_parent: bool) {
+        self.method_call_targets.insert(
+            span,
+            MethodCallSemanticInfo {
+                declaration: method.declaration,
+                virtual_root: method.virtual_root,
+                direct_parent,
+            },
+        );
     }
 
     fn check_call_arguments(
@@ -15804,6 +16969,9 @@ impl<'program> Checker<'program> {
         );
         let specialized = MethodInfo {
             declaration: method.declaration,
+            is_open: method.is_open,
+            is_override: method.is_override,
+            virtual_root: method.virtual_root,
             access: method.access,
             receiver_mode: method.receiver_mode,
             return_borrow: method.return_borrow,
@@ -16577,8 +17745,15 @@ impl<'program> Checker<'program> {
             }
             Expr::This { .. } | Expr::PropertyAccess { .. } => false,
             Expr::StaticMember {
-                qualifier, member, ..
-            } => Self::static_qualifier_class_name(qualifier, method_context)
+                qualifier,
+                member,
+                span,
+                ..
+            } => self
+                .static_member_targets
+                .get(span)
+                .cloned()
+                .or_else(|| self.static_qualifier_class_name(qualifier, method_context))
                 .and_then(|class_name| self.classes.get(&class_name))
                 .is_none_or(|class| !class.static_properties.contains_key(member)),
             _ => true,
@@ -16688,15 +17863,17 @@ impl<'program> Checker<'program> {
         }
         let class_type = self.expr_class_type(object, scopes, method_context)?;
         let class_name = class_type.name.clone();
-        let Some(class_info) = self.classes.get(&class_name) else {
+        if !self.classes.contains_key(&class_name) {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
                 format!("unknown class `{class_name}`"),
                 span,
             ));
             return None;
-        };
-        let Some(property_info) = class_info.properties.get(property).cloned() else {
+        }
+        let Some((declaring_class, property_info)) =
+            self.lookup_instance_property(&class_type, property)
+        else {
             self.diagnostics.push(Diagnostic::new(
                 "E0303",
                 format!("unknown property `{class_name}::{property}`"),
@@ -16705,9 +17882,8 @@ impl<'program> Checker<'program> {
             return None;
         };
 
-        let property_info = self.specialize_property_for_class(&property_info, &class_type);
         if matches!(property_info.access, MemberAccess::Internal)
-            && !self.can_access_internal_member(&class_name, span, method_context)
+            && !self.can_access_internal_member(&declaring_class.name, span, method_context)
         {
             self.diagnostics.push(Diagnostic::new(
                 "E0306",
@@ -16719,29 +17895,154 @@ impl<'program> Checker<'program> {
         Some((class_name, property_info))
     }
 
+    fn lookup_instance_property(
+        &mut self,
+        class: &ClassType<TypeId>,
+        property: &str,
+    ) -> Option<(ClassType<TypeId>, PropertyInfo)> {
+        let requested_class = class.name.clone();
+        let mut current = Some(class.clone());
+        let mut visited = HashSet::new();
+        while let Some(class) = current {
+            if !visited.insert(class.name.clone()) {
+                return None;
+            }
+            let info = self.classes.get(&class.name)?.clone();
+            if let Some(property_info) = info.properties.get(property).cloned() {
+                if property_info.access == MemberAccess::External || class.name == requested_class {
+                    let property_info = self.specialize_property_for_class(&property_info, &class);
+                    return Some((class, property_info));
+                }
+            }
+            current = self.specialized_parent_type(&class);
+        }
+        None
+    }
+
+    fn lookup_instance_method(
+        &mut self,
+        class: &ClassType<TypeId>,
+        method: &str,
+    ) -> Option<(ClassType<TypeId>, MethodInfo)> {
+        let requested_class = class.name.clone();
+        let mut current = Some(class.clone());
+        let mut visited = HashSet::new();
+        while let Some(class) = current {
+            if !visited.insert(class.name.clone()) {
+                return None;
+            }
+            let info = self.classes.get(&class.name)?.clone();
+            if let Some(method_info) = info.methods.get(method).cloned() {
+                if class.name == requested_class
+                    || (method_info.access == MemberAccess::External
+                        && !matches!(method, "__construct" | "__destruct"))
+                {
+                    let method_info = self.specialize_method_for_class(&method_info, &class);
+                    return Some((class, method_info));
+                }
+            }
+            current = self.specialized_parent_type(&class);
+        }
+        None
+    }
+
+    fn static_access_class_type(
+        &mut self,
+        qualifier: &StaticQualifier,
+        class_name: &str,
+        method_context: Option<&MethodContext>,
+    ) -> Option<ClassType<TypeId>> {
+        match qualifier {
+            StaticQualifier::Parent => {
+                let context = method_context?;
+                let current = self.symbolic_class_type(&context.class_name);
+                let TypeKind::Class(current) = self.types.kind(current).clone() else {
+                    return None;
+                };
+                self.specialized_parent_type(&current)
+            }
+            StaticQualifier::SelfType => {
+                let class_type = self.symbolic_class_type(class_name);
+                let TypeKind::Class(class_type) = self.types.kind(class_type).clone() else {
+                    return None;
+                };
+                Some(class_type)
+            }
+            StaticQualifier::Class(_) => Some(ClassType::new(class_name, Vec::new())),
+            StaticQualifier::InvalidStatic => None,
+        }
+    }
+
+    fn lookup_static_method(
+        &mut self,
+        class: &ClassType<TypeId>,
+        method: &str,
+    ) -> Option<(ClassType<TypeId>, MethodInfo)> {
+        let requested_class = class.name.clone();
+        let mut current = Some(class.clone());
+        let mut visited = HashSet::new();
+        while let Some(class) = current {
+            if !visited.insert(class.name.clone()) {
+                return None;
+            }
+            let info = self.classes.get(&class.name)?.clone();
+            if let Some(method_info) = info.methods.get(method).cloned() {
+                if class.name == requested_class
+                    || (method_info.access == MemberAccess::External
+                        && !matches!(method, "__construct" | "__destruct"))
+                {
+                    let method_info = self.specialize_method_for_class(&method_info, &class);
+                    return Some((class, method_info));
+                }
+            }
+            current = self.specialized_parent_type(&class);
+        }
+        None
+    }
+
+    fn lookup_static_member(
+        &mut self,
+        class: &ClassType<TypeId>,
+        member: &str,
+    ) -> Option<(ClassType<TypeId>, StaticMemberInfo)> {
+        let requested_class = class.name.clone();
+        let mut current = Some(class.clone());
+        let mut visited = HashSet::new();
+        while let Some(class) = current {
+            if !visited.insert(class.name.clone()) {
+                return None;
+            }
+            let info = self.classes.get(&class.name)?.clone();
+            if let Some(mut constant_info) = info.constants.get(member).cloned() {
+                if class.name == requested_class || constant_info.access == MemberAccess::External {
+                    constant_info.ty = self.substitute_type_id(
+                        constant_info.ty,
+                        &self.class_type_substitutions(&class),
+                    );
+                    return Some((class, StaticMemberInfo::Constant(constant_info)));
+                }
+            }
+            if let Some(mut property_info) = info.static_properties.get(member).cloned() {
+                if class.name == requested_class || property_info.access == MemberAccess::External {
+                    property_info.ty = self.substitute_type_id(
+                        property_info.ty,
+                        &self.class_type_substitutions(&class),
+                    );
+                    return Some((class, StaticMemberInfo::Property(property_info)));
+                }
+            }
+            current = self.specialized_parent_type(&class);
+        }
+        None
+    }
+
     fn can_access_internal_member(
         &self,
         declaring_class: &str,
-        use_span: Span,
+        _use_span: Span,
         method_context: Option<&MethodContext>,
     ) -> bool {
-        if method_context.is_some_and(|context| context.class_name == declaring_class) {
-            return true;
-        }
-        let using_package = self
-            .compilation_contexts
-            .get(&use_span.source)
-            .map(|context| &context.package)
-            .unwrap_or(&self.compilation_context.package);
-        self.global_symbols
-            .declarations
-            .iter()
-            .find(|declaration| declaration.qualified_name == declaring_class)
-            .and_then(|declaration| match &declaration.id.owner {
-                crate::names::GlobalSymbolOwner::Package(package) => Some(package),
-                crate::names::GlobalSymbolOwner::CompilerKnown(_) => None,
-            })
-            .is_some_and(|declaring_package| declaring_package == using_package)
+        method_context.is_some_and(|context| context.class_name == declaring_class)
     }
 
     fn type_parameter_has_constraint(&self, parameter: &str, required: &str) -> bool {
@@ -17800,10 +19101,9 @@ impl<'program> Checker<'program> {
                 | TypeKind::Bool
                 | TypeKind::String
                 | TypeKind::Unknown => true,
-                TypeKind::Class(class) => self
-                    .classes
-                    .get(&class.name)
-                    .is_some_and(|info| info.implements(BuiltinInterface::Displayable)),
+                TypeKind::Class(class) => {
+                    self.class_implements_builtin(&class.name, BuiltinInterface::Displayable)
+                }
                 _ => false,
             },
             _ => false,
@@ -18014,6 +19314,24 @@ impl<'program> Checker<'program> {
             Expr::Grouped { expr, .. } => {
                 self.is_expr_assignable_impl(target, expr, scopes, method_context, false)
             }
+            Expr::New { shared: true, .. } => self.is_contextual_shared_construction_assignable(
+                target,
+                value_expr,
+                scopes,
+                method_context,
+            ),
+            Expr::StaticCall {
+                qualifier,
+                method,
+                args,
+                ..
+            } if method == "from" => self.is_contextual_collection_from_assignable(
+                target,
+                qualifier,
+                args,
+                scopes,
+                method_context,
+            ),
             Expr::Array { elements, .. } => {
                 self.is_array_literal_assignable(target, elements, scopes, method_context)
             }
@@ -18025,6 +19343,63 @@ impl<'program> Checker<'program> {
                 self.is_assignable(target, value)
             }
         }
+    }
+
+    fn is_contextual_shared_construction_assignable(
+        &mut self,
+        target: TypeId,
+        value_expr: &Expr,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let target = match self.types.kind(target).clone() {
+            TypeKind::Nullable(inner) => inner,
+            _ => target,
+        };
+        let TypeKind::SharedHandle(SharedHandleKind::SharedReference, target_payload) =
+            self.types.kind(target).clone()
+        else {
+            return false;
+        };
+        let value = self.infer_expr_type(value_expr, scopes, method_context);
+        let TypeKind::SharedHandle(SharedHandleKind::SharedReference, value_payload) =
+            self.types.kind(value).clone()
+        else {
+            return false;
+        };
+
+        self.is_assignable(target_payload, value_payload)
+    }
+
+    fn is_contextual_collection_from_assignable(
+        &mut self,
+        target: TypeId,
+        qualifier: &StaticQualifier,
+        args: &[Argument],
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> bool {
+        let target = match self.types.kind(target) {
+            TypeKind::Nullable(inner) => *inner,
+            _ => target,
+        };
+        let Some(class_name) = self.static_qualifier_class_name(qualifier, method_context) else {
+            return false;
+        };
+        let source_target = match (class_name.as_str(), self.types.kind(target).clone()) {
+            ("Set", TypeKind::Set(element))
+            | ("SortedSet", TypeKind::SortedSet(element))
+            | ("PriorityQueue", TypeKind::PriorityQueue(element))
+            | ("Deque", TypeKind::Deque(element)) => self.types.intern(TypeKind::List(element)),
+            ("SortedDictionary", TypeKind::SortedDictionary(key, value)) => {
+                self.types.intern(TypeKind::Dictionary(key, value))
+            }
+            _ => return false,
+        };
+        let [argument] = args else {
+            return false;
+        };
+        self.is_expr_assignable(source_target, &argument.value, scopes, method_context)
     }
 
     fn contextualize_scalar_literals(&mut self, target: TypeId, value_expr: &Expr) -> Option<bool> {
@@ -18284,7 +19659,11 @@ impl<'program> Checker<'program> {
         matches!(self.types.kind(ty), TypeKind::Unknown)
     }
 
-    fn is_assignable(&self, target: TypeId, value: TypeId) -> bool {
+    fn invariant_type_matches(&self, target: TypeId, value: TypeId) -> bool {
+        target == value || self.is_unknown_type(target) || self.is_unknown_type(value)
+    }
+
+    fn is_assignable(&mut self, target: TypeId, value: TypeId) -> bool {
         if target == value {
             return true;
         }
@@ -18321,37 +19700,42 @@ impl<'program> Checker<'program> {
                 | TypeKind::PriorityQueue(_)
                 | TypeKind::Deque(_),
             ) => true,
-            (TypeKind::Class(target), TypeKind::Class(value)) => target == value,
+            (TypeKind::Class(target), TypeKind::Class(value)) => {
+                self.class_is_subtype(&value, &target)
+            }
             (TypeKind::Function(target), TypeKind::Function(value)) => {
                 self.function_type_compatibility(&target, &value).is_ok()
             }
-            (TypeKind::Error, TypeKind::Class(value)) => self
-                .classes
-                .get(&value.name)
-                .is_some_and(|class| class.implements(BuiltinInterface::Error)),
-            (TypeKind::TypedArray(target), TypeKind::TypedArray(value)) => {
-                self.is_assignable(target, value)
+            (TypeKind::Error, TypeKind::Class(value)) => {
+                self.class_implements_builtin(&value.name, BuiltinInterface::Error)
             }
-            (TypeKind::List(target), TypeKind::List(value)) => self.is_assignable(target, value),
+            (TypeKind::TypedArray(target), TypeKind::TypedArray(value)) => {
+                self.invariant_type_matches(target, value)
+            }
+            (TypeKind::List(target), TypeKind::List(value)) => {
+                self.invariant_type_matches(target, value)
+            }
             (
                 TypeKind::Dictionary(target_key, target_value),
                 TypeKind::Dictionary(value_key, value_value),
             ) => {
-                self.is_assignable(target_key, value_key)
-                    && self.is_assignable(target_value, value_value)
+                self.invariant_type_matches(target_key, value_key)
+                    && self.invariant_type_matches(target_value, value_value)
             }
             (
                 TypeKind::SortedDictionary(target_key, target_value),
                 TypeKind::SortedDictionary(value_key, value_value),
             ) => {
-                self.is_assignable(target_key, value_key)
-                    && self.is_assignable(target_value, value_value)
+                self.invariant_type_matches(target_key, value_key)
+                    && self.invariant_type_matches(target_value, value_value)
             }
-            (TypeKind::Set(target), TypeKind::Set(value)) => self.is_assignable(target, value),
+            (TypeKind::Set(target), TypeKind::Set(value)) => {
+                self.invariant_type_matches(target, value)
+            }
             (TypeKind::SortedSet(target), TypeKind::SortedSet(value))
             | (TypeKind::PriorityQueue(target), TypeKind::PriorityQueue(value))
             | (TypeKind::Deque(target), TypeKind::Deque(value)) => {
-                self.is_assignable(target, value)
+                self.invariant_type_matches(target, value)
             }
             // Shared handles are assignable only within the same handle kind, so the
             // families stay disjoint (record 0106) while a symbolic payload still
@@ -18362,8 +19746,7 @@ impl<'program> Checker<'program> {
             ) if target_kind == value_kind => {
                 // An unresolved payload parameter matches its concrete
                 // specialization; the binding itself is checked by inference.
-                matches!(self.types.kind(target), TypeKind::TypeParameter(_))
-                    || self.is_assignable(target, value)
+                matches!(self.types.kind(target), TypeKind::TypeParameter(_)) || target == value
             }
             (TypeKind::TypeParameter(target), TypeKind::TypeParameter(value)) => target == value,
             _ => false,
@@ -18505,6 +19888,7 @@ impl<'program> Checker<'program> {
                 object,
                 property,
                 null_safe,
+                span,
                 ..
             } => {
                 if let Some(result) = self.shared_handle_property_type(
@@ -18534,16 +19918,9 @@ impl<'program> Checker<'program> {
                 let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
                     return self.types.unknown();
                 };
-                let property = self
-                    .classes
-                    .get(&class_type.name)
-                    .and_then(|class_info| class_info.properties.get(property))
-                    .cloned();
-                let result = property
-                    .map(|property| {
-                        self.specialize_property_for_class(&property, &class_type)
-                            .ty
-                    })
+                let result = self
+                    .lookup_instance_property(&class_type, property)
+                    .map(|(_, property)| property.ty)
                     .unwrap_or_else(|| self.types.unknown());
                 let result = if *null_safe
                     && !matches!(self.types.kind(result), TypeKind::Void | TypeKind::Unknown)
@@ -18556,7 +19933,11 @@ impl<'program> Checker<'program> {
                 } else {
                     result
                 };
-                result
+                if *null_safe {
+                    result
+                } else {
+                    self.flow_narrowed_type(result, result, *span, method_context)
+                }
             }
             Expr::MethodCall {
                 object,
@@ -18602,16 +19983,9 @@ impl<'program> Checker<'program> {
                 let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
                     return self.types.unknown();
                 };
-                let method_info = self
-                    .classes
-                    .get(&class_type.name)
-                    .and_then(|class_info| class_info.methods.get(method))
-                    .cloned();
-                let result = method_info
-                    .map(|method| {
-                        self.specialize_method_for_class(&method, &class_type)
-                            .return_ty
-                    })
+                let result = self
+                    .lookup_instance_method(&class_type, method)
+                    .map(|(_, method)| method.return_ty)
                     .unwrap_or_else(|| self.types.unknown());
                 let result = self.generic_call_result_type(*span, result);
                 if *null_safe
@@ -18664,7 +20038,7 @@ impl<'program> Checker<'program> {
                 span,
                 ..
             } => {
-                let Some(class_name) = Self::static_qualifier_class_name(qualifier, method_context)
+                let Some(class_name) = self.static_qualifier_class_name(qualifier, method_context)
                 else {
                     return self.types.unknown();
                 };
@@ -18763,18 +20137,44 @@ impl<'program> Checker<'program> {
                 if class_name == "Bytes" && method == "fromArray" {
                     return self.types.intern(TypeKind::Bytes);
                 }
-                let result = self
-                    .classes
-                    .get(&class_name)
-                    .and_then(|class_info| class_info.methods.get(method))
-                    .map(|method| method.return_ty)
-                    .unwrap_or_else(|| self.types.unknown());
+                let target = self.call_targets.get(span).and_then(|target| match target {
+                    CallableTarget::Method { class_type, .. } => Some(class_type.clone()),
+                    CallableTarget::Function { .. } => None,
+                });
+                let result = if let Some(target) = target {
+                    let target = ClassType::new(
+                        target.name,
+                        target
+                            .arguments
+                            .iter()
+                            .map(|argument| self.types.intern_resolved(argument))
+                            .collect(),
+                    );
+                    let method = self
+                        .classes
+                        .get(&target.name)
+                        .and_then(|class_info| class_info.methods.get(method))
+                        .cloned();
+                    method
+                        .map(|method| self.specialize_method_for_class(&method, &target).return_ty)
+                        .unwrap_or_else(|| self.types.unknown())
+                } else {
+                    let requested =
+                        self.static_access_class_type(qualifier, &class_name, method_context);
+                    requested
+                        .and_then(|requested| self.lookup_static_method(&requested, method))
+                        .map(|(_, method)| method.return_ty)
+                        .unwrap_or_else(|| self.types.unknown())
+                };
                 self.generic_call_result_type(*span, result)
             }
             Expr::StaticMember {
-                qualifier, member, ..
+                qualifier,
+                member,
+                span,
+                ..
             } => {
-                let Some(class_name) = Self::static_qualifier_class_name(qualifier, method_context)
+                let Some(class_name) = self.static_qualifier_class_name(qualifier, method_context)
                 else {
                     return self.types.unknown();
                 };
@@ -18787,18 +20187,17 @@ impl<'program> Checker<'program> {
                     }
                     return self.types.unknown();
                 }
-                let ty = self.classes.get(&class_name).and_then(|class_info| {
-                    class_info
-                        .constants
-                        .get(member)
-                        .map(|constant| constant.ty)
-                        .or_else(|| {
-                            class_info
-                                .static_properties
-                                .get(member)
-                                .map(|property| property.ty)
-                        })
-                });
+                let ty = self
+                    .static_access_class_type(qualifier, &class_name, method_context)
+                    .and_then(|requested| self.lookup_static_member(&requested, member))
+                    .map(|(declaring_class, member)| {
+                        self.static_member_targets
+                            .insert(*span, declaring_class.name);
+                        match member {
+                            StaticMemberInfo::Constant(constant) => constant.ty,
+                            StaticMemberInfo::Property(property) => property.ty,
+                        }
+                    });
                 ty.unwrap_or_else(|| {
                     let key = crate::const_eval::ConstKey::Class {
                         class_name,
@@ -20559,13 +21958,18 @@ impl<'program> Checker<'program> {
     }
 
     fn static_qualifier_class_name(
+        &self,
         qualifier: &StaticQualifier,
         method_context: Option<&MethodContext>,
     ) -> Option<String> {
         match qualifier {
             StaticQualifier::Class(name) => Some(name.clone()),
             StaticQualifier::SelfType => method_context.map(|context| context.class_name.clone()),
-            StaticQualifier::Parent | StaticQualifier::InvalidStatic => None,
+            StaticQualifier::Parent => method_context
+                .and_then(|context| self.classes.get(&context.class_name))
+                .and_then(|class| class.parent.as_ref())
+                .map(|parent| parent.name.clone()),
+            StaticQualifier::InvalidStatic => None,
         }
     }
 
@@ -20901,11 +22305,24 @@ impl<'program> Checker<'program> {
             .collect()
     }
 
-    fn exact_type_test_can_match(&self, value: TypeId, tested: TypeId) -> bool {
-        match self.types.kind(value).clone() {
-            TypeKind::Mixed | TypeKind::Unknown => true,
-            TypeKind::Nullable(inner) => {
+    fn exact_type_test_can_match(&mut self, value: TypeId, tested: TypeId) -> bool {
+        match (
+            self.types.kind(value).clone(),
+            self.types.kind(tested).clone(),
+        ) {
+            (TypeKind::Mixed | TypeKind::Unknown, _) => true,
+            (TypeKind::Nullable(inner), TypeKind::Class(tested)) => {
+                match self.types.kind(inner).clone() {
+                    TypeKind::Class(value) => self.class_is_subtype(&tested, &value),
+                    TypeKind::Mixed => true,
+                    _ => false,
+                }
+            }
+            (TypeKind::Nullable(inner), _) => {
                 inner == tested || matches!(self.types.kind(inner), TypeKind::Mixed)
+            }
+            (TypeKind::Class(value), TypeKind::Class(tested)) => {
+                self.class_is_subtype(&tested, &value)
             }
             _ => value == tested,
         }
@@ -21138,22 +22555,6 @@ impl<'program> Checker<'program> {
             self.diagnostics.push(Diagnostic::unsupported_stage(
                 "E0510",
                 "interface `is` tests are accepted syntax; interface conformance tests land in Stage 35",
-                span,
-            ));
-            return;
-        }
-
-        if self.program.items.iter().any(|item| {
-            matches!(
-                item,
-                Item::Class(class)
-                    if (class.name == ty.name && class.parent.is_some())
-                        || class.parent.as_deref() == Some(ty.name.as_str())
-            )
-        }) {
-            self.diagnostics.push(Diagnostic::unsupported_stage(
-                "E0509",
-                "class-hierarchy `is` tests are accepted syntax; subtype tests land in Stage 34",
                 span,
             ));
             return;

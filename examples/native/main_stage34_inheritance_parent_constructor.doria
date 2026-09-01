@@ -1,0 +1,14 @@
+open class Base
+{
+    int $value;
+    function __construct(int $input) { $this->value = $input; }
+}
+class Child extends Base
+{
+    function __construct() { parent::__construct(42); }
+}
+function main(): void
+{
+    let $value = new Child();
+    echo "parent ctor {$value->value}\n";
+}

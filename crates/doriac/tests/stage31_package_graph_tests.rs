@@ -854,7 +854,7 @@ fn complete_and_partial_graphs_classify_missing_symbols_differently() {
 }
 
 #[test]
-fn package_internal_types_and_members_are_visible_across_same_package_files() {
+fn package_internal_types_are_visible_across_same_package_files() {
     let entry = "acme/application:main.doria";
     let document = plan(
         vec![package(
@@ -876,7 +876,7 @@ fn package_internal_types_and_members_are_visible_across_same_package_files() {
     provider.insert(
         "acme/application",
         "Person.doria",
-        "internal class Person { internal function value(): int { return 42; } }",
+        "internal class Person { function value(): int { return 42; } }",
     );
 
     let graph = load_compilation_graph(&document, &provider).expect("valid package graph");

@@ -7,6 +7,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+#[cfg(windows)]
+use std::process::Output;
+
 use crate::backend::{BackendError, NativeProfile};
 use crate::{codegen_cranelift, mir, runtime_artifact};
 
@@ -159,11 +164,42 @@ fn invoke_linker(
     let mut command = Command::new(&linker);
     command.args(&arguments);
 
-    let output = command.output().map_err(|error| {
-        BackendError::new(format!(
-            "linker/toolchain failure: failed to run `{linker}`: {error}"
-        ))
-    })?;
+    let output = match command.output() {
+        Ok(output) => output,
+        Err(error) => {
+            #[cfg(windows)]
+            if error.kind() == std::io::ErrorKind::NotFound
+                && msvc_host
+                && !cc_is_set
+                && is_msvc_style_compiler_driver(&linker)
+            {
+                match invoke_with_discovered_msvc(&linker, &arguments) {
+                    Ok(Some(output)) => output,
+                    Ok(None) => {
+                        return Err(BackendError::new(format!(
+                            "linker/toolchain failure: failed to run `{linker}`: {error}\n\
+                             help: install the Visual Studio C++ build tools or run from a Visual Studio developer shell"
+                        )));
+                    }
+                    Err(discovery_error) => {
+                        return Err(BackendError::new(format!(
+                            "linker/toolchain failure: failed to run `{linker}`: {error}\n\
+                             Visual Studio toolchain discovery also failed: {discovery_error}"
+                        )));
+                    }
+                }
+            } else {
+                return Err(BackendError::new(format!(
+                    "linker/toolchain failure: failed to run `{linker}`: {error}"
+                )));
+            }
+
+            #[cfg(not(windows))]
+            return Err(BackendError::new(format!(
+                "linker/toolchain failure: failed to run `{linker}`: {error}"
+            )));
+        }
+    };
 
     if output.status.success() {
         return Ok((
@@ -194,6 +230,174 @@ fn invoke_linker(
             output.status, details
         )))
     }
+}
+
+#[cfg(windows)]
+fn invoke_with_discovered_msvc(
+    linker: &str,
+    arguments: &[OsString],
+) -> Result<Option<Output>, String> {
+    let Some(environment) = discover_msvc_environment()? else {
+        return Ok(None);
+    };
+    let executable = executable_from_environment(linker, &environment)
+        .ok_or_else(|| format!("`{linker}` was absent from the discovered Visual Studio PATH"))?;
+
+    let mut command = Command::new(&executable);
+    command.args(arguments).envs(environment);
+    command.output().map(Some).map_err(|error| {
+        format!(
+            "failed to run discovered linker `{}`: {error}",
+            executable.display()
+        )
+    })
+}
+
+#[cfg(windows)]
+fn executable_from_environment(
+    executable: &str,
+    environment: &[(OsString, OsString)],
+) -> Option<PathBuf> {
+    environment
+        .iter()
+        .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("PATH"))
+        .and_then(|(_, path)| {
+            env::split_paths(path)
+                .map(|directory| directory.join(executable))
+                .find(|candidate| candidate.is_file())
+        })
+}
+
+#[cfg(windows)]
+fn discover_msvc_environment() -> Result<Option<Vec<(OsString, OsString)>>, String> {
+    let Some(vsdevcmd) = locate_vsdevcmd()? else {
+        return Ok(None);
+    };
+    let architecture = if cfg!(target_arch = "aarch64") {
+        "arm64"
+    } else {
+        "amd64"
+    };
+    let command_line = format!(
+        "call \"{}\" -no_logo -arch={architecture} -host_arch={architecture} >nul && set",
+        vsdevcmd.display()
+    );
+    let command_interpreter = env::var_os("COMSPEC").unwrap_or_else(|| OsString::from("cmd.exe"));
+    let mut command = Command::new(command_interpreter);
+    command.args(["/d", "/u", "/c"]).raw_arg(&command_line);
+    let output = command
+        .output()
+        .map_err(|error| format!("failed to query `{}`: {error}", vsdevcmd.display()))?;
+
+    if !output.status.success() {
+        let stderr = decode_utf16le(&output.stderr)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&output.stderr).into_owned());
+        return Err(format!(
+            "`{}` exited with status {}{}{}",
+            vsdevcmd.display(),
+            output.status,
+            if stderr.trim().is_empty() { "" } else { ": " },
+            stderr.trim()
+        ));
+    }
+
+    parse_utf16le_environment(&output.stdout).map(Some)
+}
+
+#[cfg(windows)]
+fn locate_vsdevcmd() -> Result<Option<PathBuf>, String> {
+    if let Some(install_dir) = env::var_os("VSINSTALLDIR") {
+        let candidate = PathBuf::from(install_dir)
+            .join("Common7")
+            .join("Tools")
+            .join("VsDevCmd.bat");
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    let mut vswhere_candidates = Vec::new();
+    for variable in ["ProgramFiles(x86)", "ProgramFiles"] {
+        let Some(program_files) = env::var_os(variable) else {
+            continue;
+        };
+        let candidate = PathBuf::from(program_files)
+            .join("Microsoft Visual Studio")
+            .join("Installer")
+            .join("vswhere.exe");
+        if !vswhere_candidates.contains(&candidate) {
+            vswhere_candidates.push(candidate);
+        }
+    }
+
+    let required_component = if cfg!(target_arch = "aarch64") {
+        "Microsoft.VisualStudio.Component.VC.Tools.ARM64"
+    } else {
+        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+    };
+    for vswhere in vswhere_candidates {
+        if !vswhere.is_file() {
+            continue;
+        }
+        let output = Command::new(&vswhere)
+            .args([
+                "-latest",
+                "-products",
+                "*",
+                "-requires",
+                required_component,
+                "-property",
+                "installationPath",
+            ])
+            .output()
+            .map_err(|error| format!("failed to run `{}`: {error}", vswhere.display()))?;
+        if !output.status.success() {
+            continue;
+        }
+        let installation = String::from_utf8_lossy(&output.stdout);
+        let Some(installation) = installation.lines().find(|line| !line.trim().is_empty()) else {
+            continue;
+        };
+        let candidate = PathBuf::from(installation.trim())
+            .join("Common7")
+            .join("Tools")
+            .join("VsDevCmd.bat");
+        if candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn parse_utf16le_environment(bytes: &[u8]) -> Result<Vec<(OsString, OsString)>, String> {
+    let text = decode_utf16le(bytes)?;
+
+    Ok(text
+        .lines()
+        .filter_map(|line| {
+            let (name, value) = line.split_once('=')?;
+            (!name.is_empty()).then(|| (OsString::from(name), OsString::from(value)))
+        })
+        .collect())
+}
+
+#[cfg(windows)]
+fn decode_utf16le(bytes: &[u8]) -> Result<String, String> {
+    if !bytes.len().is_multiple_of(2) {
+        return Err("Visual Studio environment output was not valid UTF-16LE".to_string());
+    }
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let mut words = pairs
+        .iter()
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect::<Vec<_>>();
+    if words.first() == Some(&0xfeff) {
+        words.remove(0);
+    }
+    String::from_utf16(&words)
+        .map_err(|error| format!("Visual Studio environment output was not valid UTF-16: {error}"))
 }
 
 fn cleanup_temp_artifacts(object_path: &Path, executable_path: &Path) {
@@ -403,5 +607,58 @@ mod tests {
         );
         assert_eq!(default_linker(false), "cc");
         assert_eq!(default_linker(true), "cl.exe");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn visual_studio_environment_parser_preserves_values_and_skips_drive_entries() {
+        let text = "PATH=C:\\Tools\r\nLIB=C:\\SDK=Preview\r\n=C:=C:\\repo\r\n";
+        let bytes = text
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            parse_utf16le_environment(&bytes).expect("parse environment"),
+            vec![
+                (OsString::from("PATH"), OsString::from("C:\\Tools")),
+                (OsString::from("LIB"), OsString::from("C:\\SDK=Preview")),
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_lookup_uses_the_discovered_path_case_insensitively() {
+        let temporary = unique_temp_stem();
+        fs::create_dir(&temporary).expect("create executable probe directory");
+        let executable = temporary.join("doriac-discovery-test.exe");
+        fs::write(&executable, []).expect("write executable probe");
+        let environment = vec![(OsString::from("Path"), temporary.clone().into_os_string())];
+
+        assert_eq!(
+            executable_from_environment("doriac-discovery-test.exe", &environment),
+            Some(executable.clone())
+        );
+
+        fs::remove_dir_all(temporary).expect("remove executable probe directory");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn installed_visual_studio_environment_contains_the_default_linker() {
+        let environment = match discover_msvc_environment() {
+            Ok(Some(environment)) => environment,
+            Ok(None) => {
+                eprintln!("Visual Studio C++ build tools are not installed; skipping discovery");
+                return;
+            }
+            Err(error) => panic!("discover Visual Studio C++ build tools: {error}"),
+        };
+
+        assert!(
+            executable_from_environment("cl.exe", &environment).is_some(),
+            "the discovered Visual Studio PATH should contain cl.exe"
+        );
     }
 }

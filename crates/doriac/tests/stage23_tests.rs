@@ -921,3 +921,149 @@ function main(): void throws Doria\Std\Io\IoError
         .count();
     assert_eq!(removals, 1);
 }
+
+#[test]
+fn constructor_non_null_assignment_narrows_nullable_collection_properties() {
+    let source = r#"
+enum Key: string { case Value = "value"; }
+
+class Holder
+{
+    internal writable ?Dictionary<string, string> $values = null;
+
+    function __construct()
+    {
+        $this->values = [Key::Value->value => "ready"];
+        echo $this->values[Key::Value->value];
+    }
+}
+
+function main(): void { let $holder = new Holder(); }
+"#;
+    let program = doriac::lower_source_to_mir("nullable-property.doria", source)
+        .expect("a dominating constructor assignment should narrow the nullable property");
+    doriac::mir_validation::validate_program(&program)
+        .expect("the non-null property read must carry a validated constructor proof");
+    assert_eq!(
+        doriac::mir_interpreter::interpret(&program)
+            .expect("the narrowed property should execute in the interpreter")
+            .stdout,
+        b"ready"
+    );
+    assert!(!doriac::codegen_cranelift::lower_mir_to_object(&program)
+        .expect("Cranelift should lower the narrowed nullable property")
+        .is_empty());
+    #[cfg(feature = "llvm-backend")]
+    assert!(!doriac::codegen_llvm::lower_mir_to_object(&program)
+        .expect("LLVM should lower the narrowed nullable property")
+        .is_empty());
+
+    let mut malformed = program;
+    let constructor = malformed
+        .functions
+        .iter_mut()
+        .find(|function| function.name == "Holder::__construct")
+        .expect("fixture should contain the Holder constructor");
+    let replacement = constructor
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find_map(|statement| match statement {
+            doriac::mir::Statement::AssignProperty {
+                value:
+                    doriac::mir::Rvalue::NullableCollection(
+                        doriac::mir::NullableCollectionExpression::Collection(value),
+                    ),
+                kind: doriac::mir::PropertyWriteKind::Replace,
+                ..
+            } => Some(value.collection()),
+            _ => None,
+        })
+        .expect("fixture should contain the non-null property replacement");
+    let statement = constructor
+        .blocks
+        .iter_mut()
+        .flat_map(|block| &mut block.statements)
+        .find(|statement| {
+            matches!(
+                statement,
+                doriac::mir::Statement::AssignProperty {
+                    kind: doriac::mir::PropertyWriteKind::Replace,
+                    ..
+                }
+            )
+        })
+        .expect("fixture should contain the property replacement");
+    let doriac::mir::Statement::AssignProperty { value, .. } = statement else {
+        unreachable!();
+    };
+    *value = doriac::mir::Rvalue::NullableCollection(
+        doriac::mir::NullableCollectionExpression::Null(replacement),
+    );
+    let error = doriac::mir_validation::validate_program(&malformed)
+        .expect_err("a non-null property assumption without its assignment must be malformed");
+    assert!(error
+        .message
+        .contains("without a dominating non-null assignment"));
+}
+
+#[test]
+fn constructor_property_narrowing_joins_and_invalidates_soundly() {
+    let partial = r#"
+class Holder
+{
+    writable ?List<int> $values = null;
+    function __construct(bool $condition)
+    {
+        if ($condition) { $this->values = [1]; }
+        echo $this->values[0];
+    }
+}
+"#;
+    assert!(diagnostics(partial)
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0520"));
+
+    let reassigned = partial.replace(
+        "if ($condition) { $this->values = [1]; }",
+        "$this->values = [1]; $this->values = null;",
+    );
+    assert!(diagnostics(&reassigned)
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0520"));
+
+    let mutating_call = r#"
+class Holder
+{
+    writable ?List<int> $values = null;
+    writable function clear(): void { $this->values = null; }
+    function __construct()
+    {
+        $this->values = [1];
+        $this->clear();
+        echo $this->values[0];
+    }
+}
+"#;
+    assert!(diagnostics(mutating_call)
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0520"));
+
+    doriac::lower_source_to_mir(
+        "nullable-property-joined.doria",
+        r#"
+class Holder
+{
+    writable ?List<int> $values = null;
+    function __construct(bool $condition)
+    {
+        if ($condition) { $this->values = [1]; }
+        else { $this->values = [2]; }
+        echo $this->values[0];
+    }
+}
+function main(): void { let $holder = new Holder(true); }
+"#,
+    )
+    .expect("non-null assignments on every incoming path should preserve narrowing");
+}

@@ -197,7 +197,8 @@ payload from production archives, and pass parity before the unsuffixed
 ## Invalidated Elsewhere
 
 - `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md`: all three
-  slices, Stage 33, and Phase F are complete, with Stage 34 next.
+  slices, Stage 33, Phase F, the Native Testing Foundation, and Stage 34 are
+  complete, with Stage 35 next.
 - Decisions 0117, 0118, and 0124: deferred spellings and implementation status.
 - `SPEC.md` and `README.md`: current Baton schema-2 project behavior.
 - Doria authority guards: decision existence, public spellings, implementation

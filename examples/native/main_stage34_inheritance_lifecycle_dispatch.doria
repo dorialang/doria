@@ -1,0 +1,11 @@
+open class Base
+{
+    function __construct() { $this->hook(); }
+    open function hook(): void { echo "base ctor\n"; }
+}
+class Child extends Base
+{
+    function __construct() { parent::__construct(); $this->hook(); }
+    override function hook(): void { echo "child body\n"; }
+}
+function main(): void { let $value = new Child(); }

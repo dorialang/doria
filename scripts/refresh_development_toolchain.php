@@ -42,10 +42,16 @@ if (!is_file($languageServerRoot . DIRECTORY_SEPARATOR . 'scripts' . DIRECTORY_S
     fail("Doria language-server repository not found at:\n    {$languageServerRoot}");
 }
 
-require_clean_repository($root, 'Doria compiler');
-require_clean_repository($languageServerRoot, 'Doria language server');
-
 $commit = trim(capture(['git', 'rev-parse', 'HEAD'], $root));
+$compilerStatus = repository_status($root);
+$compilerRevision = $compilerStatus === ''
+    ? $commit
+    : development_revision($root, $commit);
+$languageServerCommit = trim(capture(['git', 'rev-parse', 'HEAD'], $languageServerRoot));
+$languageServerStatus = repository_status($languageServerRoot);
+$languageServerRevision = $languageServerStatus === ''
+    ? $languageServerCommit
+    : development_revision($languageServerRoot, $languageServerCommit);
 $cargoRoot = cargo_install_root();
 $executableSuffix = PHP_OS_FAMILY === 'Windows' ? '.exe' : '';
 $compiler = $cargoRoot . DIRECTORY_SEPARATOR . 'bin' . DIRECTORY_SEPARATOR . 'doriac'
@@ -63,7 +69,7 @@ $installTarget = $managedTarget
     . DIRECTORY_SEPARATOR
     . 'toolchain-install';
 $environment['CARGO_TARGET_DIR'] = $installTarget;
-$environment['DORIA_BUILD_COMMIT'] = $commit;
+$environment['DORIA_BUILD_COMMIT'] = $compilerRevision;
 
 $installCompiler = [
     'cargo',
@@ -106,20 +112,20 @@ run(['cargo', 'clean', '--target-dir', $installTarget], $root, $environment);
 verify_installed_native_compiler($compiler);
 
 $compilerIdentity = decode_json(capture([$compiler, '--version', '--json'], $root));
-if (($compilerIdentity['commit'] ?? null) !== $commit) {
+if (($compilerIdentity['commit'] ?? null) !== $compilerRevision) {
     fail(
-        "installed doriac identifies commit "
+        "installed doriac identifies compiler revision "
         . describe($compilerIdentity['commit'] ?? null)
-        . ", expected {$commit}"
+        . ", expected {$compilerRevision}"
     );
 }
 
 $serverIdentity = decode_json(capture([$languageServer, '--version', '--json'], $root));
-if (($serverIdentity['compilerCommit'] ?? null) !== $commit) {
+if (($serverIdentity['compilerCommit'] ?? null) !== $compilerRevision) {
     fail(
-        "installed doria-lsp embeds compiler commit "
+        "installed doria-lsp embeds compiler revision "
         . describe($serverIdentity['compilerCommit'] ?? null)
-        . ", expected {$commit}"
+        . ", expected {$compilerRevision}"
     );
 }
 
@@ -128,17 +134,65 @@ require_unshadowed('doria-lsp' . $executableSuffix, $languageServer);
 
 fwrite(
     STDOUT,
-    "\nDevelopment toolchain refreshed from commit {$commit}:\n"
+    "\nDevelopment toolchain refreshed:\n"
+        . "    compiler source: {$compilerRevision}\n"
+        . "    language-server source: {$languageServerRevision}\n"
         . "    {$compiler}\n"
         . "    {$languageServer}\n"
 );
 
-function require_clean_repository(string $path, string $label): void
+function repository_status(string $path): string
 {
-    $status = capture(['git', 'status', '--porcelain'], $path);
-    if (trim($status) !== '') {
-        fail("{$label} repository must be committed and clean before refreshing installed tools.");
+    return trim(capture(
+        ['git', 'status', '--porcelain=v1', '--untracked-files=all'],
+        $path,
+    ));
+}
+
+/**
+ * Identify the exact source tree Cargo will compile. Clean development builds
+ * keep their Git commit; dirty builds use this value to invalidate every
+ * compiler-revision-keyed cache without masquerading as the HEAD commit.
+ */
+function development_revision(string $path, string $commit): string
+{
+    $listing = capture(
+        ['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'],
+        $path,
+    );
+    $files = array_values(array_filter(
+        explode("\0", $listing),
+        static fn (string $file): bool => $file !== '',
+    ));
+    sort($files, SORT_STRING);
+
+    $hash = hash_init('sha256');
+    hash_update($hash, "doria-development-revision-v1\0{$commit}\0");
+    foreach ($files as $relative) {
+        $absolute = $path . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $relative);
+        hash_update($hash, $relative . "\0");
+        if (is_link($absolute)) {
+            $target = readlink($absolute);
+            hash_update($hash, "link\0" . ($target === false ? '' : $target) . "\0");
+            continue;
+        }
+        if (!is_file($absolute)) {
+            hash_update($hash, "missing\0");
+            continue;
+        }
+
+        $mode = fileperms($absolute);
+        hash_update($hash, 'file:' . (($mode !== false && ($mode & 0111) !== 0) ? 'x' : '-') . "\0");
+        $stream = fopen($absolute, 'rb');
+        if ($stream === false) {
+            fail("could not read development source while fingerprinting:\n    {$absolute}");
+        }
+        hash_update_stream($hash, $stream);
+        fclose($stream);
+        hash_update($hash, "\0");
     }
+
+    return 'dev-' . hash_final($hash);
 }
 
 /** @param list<string> $command @param array<string, string>|null $environment */

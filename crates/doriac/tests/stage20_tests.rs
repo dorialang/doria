@@ -289,7 +289,7 @@ function main(): int { return answer(); }
 fn constant_initializers_use_normal_static_access_diagnostics() {
     let cases = [
         ("const VALUE = self::OTHER;", "E0492"),
-        ("class Base { const VALUE = parent::OTHER; }", "E0496"),
+        ("class Base { const VALUE = parent::OTHER; }", "E0731"),
         ("class Base { const VALUE = static::OTHER; }", "E0495"),
         ("class Base { static int $value = static::OTHER; }", "E0495"),
         (
@@ -416,7 +416,7 @@ function main(): void throws Doria\Std\Io\IoError
 }
 
 #[test]
-fn internal_access_is_package_wide_for_every_member_kind() {
+fn member_internal_access_is_declaring_class_only_for_every_member_kind() {
     doriac::check_source(
         "same-class.doria",
         r#"
@@ -446,8 +446,11 @@ class Vault
         "class Vault { internal static int $value = 1; } function main(): int { return Vault::value; }",
         "class Vault { internal function __construct() {} } function main(): void { let $vault = new Vault(); }",
     ] {
-        doriac::check_source("same-package.doria", source)
-            .expect("the declaring package may access every internal member kind");
+        let found = doriac::check_source("same-package.doria", source)
+            .expect_err("same-package code cannot access another class's internal member");
+        assert!(found.iter().any(|diagnostic| {
+            matches!(diagnostic.code, "E0306" | "E0307" | "E0308")
+        }));
     }
 }
 
@@ -934,11 +937,12 @@ function main(): void throws Doria\Std\Io\IoError { echo Vault::reveal(); }
         "class Counter { static int $value = 1; static function change(): void { self::value = 2; } }",
         "E0202",
     );
-    doriac::check_source(
+    let found = doriac::check_source(
         "same-package.doria",
         "class Vault { internal static function secret(): int { return 1; } } function main(): int { return Vault::secret(); }",
     )
-    .expect("the declaring package may access an internal static method");
+    .expect_err("member-level internal access is declaring-class-only");
+    assert!(found.iter().any(|diagnostic| diagnostic.code == "E0307"));
 }
 
 #[test]
@@ -1122,9 +1126,7 @@ fn reserved_and_two_clock_qualifiers_are_structural_not_parser_errors() {
             .count(),
         0
     );
-    assert!(parent.iter().any(|diagnostic| {
-        diagnostic.code == "E0496" && diagnostic.message.contains("Stage 34")
-    }));
+    assert!(parent.iter().any(|diagnostic| diagnostic.code == "E0731"));
 
     let trait_source = r#"
 trait UsesLimit

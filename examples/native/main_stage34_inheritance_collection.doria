@@ -1,0 +1,13 @@
+open class Item
+{
+    open function value(): int { return 1; }
+}
+class Answer extends Item
+{
+    override function value(): int { return 42; }
+}
+function main(): void
+{
+    List<Item> $items = [new Answer()];
+    echo "collection {$items[0]->value()}\n";
+}

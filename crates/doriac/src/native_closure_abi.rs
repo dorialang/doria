@@ -220,7 +220,9 @@ pub fn environment_layout(
                 size: pointer_size,
                 align: pointer_size,
             },
-            mir::ClosureEnvironmentStorage::Owned => type_layout(field.ty, pointer_size),
+            mir::ClosureEnvironmentStorage::Owned => {
+                environment_value_layout(program, field.ty, pointer_size)
+            }
         };
         offset = align_up(offset, field_layout.align)?;
         let field_live_bit = (field.storage == mir::ClosureEnvironmentStorage::Owned
@@ -302,6 +304,27 @@ pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
             size: pointer_size,
             align: pointer_size,
         },
+    }
+}
+
+fn environment_value_layout(
+    program: &mir::Program,
+    ty: mir::Type,
+    pointer_size: u32,
+) -> NativeLayout {
+    match ty {
+        mir::Type::Class(class) | mir::Type::NullableClass(class)
+            if program
+                .classes
+                .get(class.0)
+                .is_some_and(|definition| definition.is_open) =>
+        {
+            NativeLayout {
+                size: pointer_size * 2,
+                align: pointer_size,
+            }
+        }
+        _ => type_layout(ty, pointer_size),
     }
 }
 

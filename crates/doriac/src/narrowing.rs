@@ -38,6 +38,7 @@ enum CallExecution {
 #[derive(Default)]
 struct Resolution {
     uses: HashMap<Span, BindingId>,
+    property_uses: HashMap<Span, BindingId>,
     declarations: HashMap<usize, BindingId>,
     declaration_types: HashMap<BindingId, Option<TypeRef>>,
     declaration_callable_modes: HashMap<BindingId, ParamModes>,
@@ -46,6 +47,8 @@ struct Resolution {
     nullability: NullabilityCatalog,
     member_classes: MemberClassCatalog,
     closure_bodies: Vec<(Block, Span)>,
+    entry_facts: BTreeMap<BindingId, Fact>,
+    constructor_properties: HashMap<String, BindingId>,
 }
 
 #[derive(Default)]
@@ -528,7 +531,15 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
         span: top_level_span,
     };
     if !top_level.statements.is_empty() {
-        analyze_body(&top_level, &[], top_level_span, None, &mut facts, &catalog);
+        analyze_body(
+            &top_level,
+            &[],
+            top_level_span,
+            None,
+            None,
+            &mut facts,
+            &catalog,
+        );
     }
 
     for item in &program.items {
@@ -537,7 +548,7 @@ pub fn analyze_program(program: &Program) -> FactsByUse {
             Item::Class(class) => {
                 for member in &class.members {
                     if let crate::ast::ClassMember::Method(method) = member {
-                        analyze_function(method, Some(&class.name), &mut facts, &catalog);
+                        analyze_function(method, Some(class), &mut facts, &catalog);
                     }
                 }
             }
@@ -574,7 +585,7 @@ fn statement_span(statement: &Stmt) -> Span {
 
 fn analyze_function(
     function: &FunctionDecl,
-    current_class: Option<&str>,
+    current_class: Option<&crate::ast::ClassDecl>,
     facts: &mut FactsByUse,
     catalog: &FlowCatalog,
 ) {
@@ -582,7 +593,8 @@ fn analyze_function(
         &function.body,
         &function.params,
         function.span,
-        current_class,
+        current_class.map(|class| class.name.as_str()),
+        current_class.filter(|_| function.name == "__construct"),
         facts,
         catalog,
     );
@@ -593,6 +605,7 @@ fn analyze_body(
     params: &[Param],
     span: Span,
     current_class: Option<&str>,
+    constructor_class: Option<&crate::ast::ClassDecl>,
     facts: &mut FactsByUse,
     catalog: &FlowCatalog,
 ) {
@@ -600,6 +613,7 @@ fn analyze_body(
         body,
         params,
         current_class,
+        constructor_class,
         &catalog.nullability,
         &catalog.member_classes,
     );
@@ -658,7 +672,7 @@ impl ForwardAnalysis for NarrowingAnalysis<'_> {
     fn entry_state(&self) -> Self::State {
         State {
             reachable: true,
-            facts: BTreeMap::new(),
+            facts: self.resolution.entry_facts.clone(),
         }
     }
 
@@ -864,7 +878,7 @@ fn transfer_assignment(
 ) {
     kill_mutated_call_arguments(target, state, resolution, mutations);
     kill_mutated_call_arguments(value, state, resolution, mutations);
-    if let Some(binding) = variable_binding(target, resolution) {
+    if let Some(binding) = place_binding(target, resolution) {
         if matches!(op, crate::ast::AssignOp::Assign) {
             set_from_value(binding, value, state, resolution, nullability);
         } else {
@@ -874,14 +888,24 @@ fn transfer_assignment(
 }
 
 fn mark_mutated_scalar_non_null(target: &Expr, state: &mut State, resolution: &Resolution) {
-    if let Some(binding) = variable_binding(target, resolution) {
+    if let Some(binding) = place_binding(target, resolution) {
         state.facts.insert(binding, Fact::NonNull);
     }
 }
 
 fn kill_target(target: &Expr, state: &mut State, resolution: &Resolution) {
-    if let Some(binding) = variable_binding(target, resolution) {
+    if matches!(ungroup(target), Expr::This { .. }) {
+        kill_constructor_property_facts(state, resolution);
+        return;
+    }
+    if let Some(binding) = place_binding(target, resolution) {
         state.facts.remove(&binding);
+    }
+}
+
+fn kill_constructor_property_facts(state: &mut State, resolution: &Resolution) {
+    for binding in resolution.constructor_properties.values() {
+        state.facts.remove(binding);
     }
 }
 
@@ -962,6 +986,9 @@ fn kill_mutated_call_arguments(
                     *state = joined_state(state, &evaluated);
                 }
                 CallExecution::Always => apply_arguments(state),
+            }
+            if matches!(ungroup(object), Expr::This { .. }) {
+                kill_constructor_property_facts(state, resolution);
             }
         }
         Expr::FunctionCall { name, args, .. } => {
@@ -1047,7 +1074,7 @@ fn kill_mutated_call_arguments(
             }
 
             let mut fallback = state.clone();
-            if let Some(binding) = variable_binding(left, resolution) {
+            if let Some(binding) = place_binding(left, resolution) {
                 fallback.facts.insert(binding, Fact::Null);
             }
             kill_mutated_call_arguments(right, &mut fallback, resolution, mutations);
@@ -1241,7 +1268,7 @@ fn kill_arguments_for_modes(
 }
 
 fn assume_non_null(expr: &Expr, state: &mut State, resolution: &Resolution) {
-    if let Some(binding) = variable_binding(expr, resolution) {
+    if let Some(binding) = place_binding(expr, resolution) {
         if !matches!(state.facts.get(&binding), Some(Fact::Exact(_))) {
             state.facts.insert(binding, Fact::NonNull);
         }
@@ -1337,11 +1364,18 @@ fn expression_fact(
             property,
             null_safe,
             ..
-        } => (!null_safe)
-            .then(|| nullability.instance_property_is_non_null(object, property, resolution, state))
-            .flatten()
-            .filter(|non_null| *non_null)
-            .map(|_| Fact::NonNull),
+        } => place_binding(value, resolution)
+            .and_then(|binding| state.facts.get(&binding).cloned())
+            .or_else(|| {
+                (!null_safe)
+                    .then(|| {
+                        nullability
+                            .instance_property_is_non_null(object, property, resolution, state)
+                    })
+                    .flatten()
+                    .filter(|non_null| *non_null)
+                    .map(|_| Fact::NonNull)
+            }),
         Expr::StaticMember {
             qualifier, member, ..
         } => nullability
@@ -1409,8 +1443,8 @@ fn apply_condition(condition: &Expr, truth: bool, state: &mut State, resolution:
             );
             let non_null = truth != equality;
             let variable = match (ungroup(left), ungroup(right)) {
-                (Expr::Variable { .. }, Expr::Null { .. }) => variable_binding(left, resolution),
-                (Expr::Null { .. }, Expr::Variable { .. }) => variable_binding(right, resolution),
+                (_, Expr::Null { .. }) => place_binding(left, resolution),
+                (Expr::Null { .. }, _) => place_binding(right, resolution),
                 _ => None,
             };
             if let Some(variable) = variable {
@@ -1420,7 +1454,7 @@ fn apply_condition(condition: &Expr, truth: bool, state: &mut State, resolution:
             }
         }
         Expr::IsType { expr, ty, .. } if truth => {
-            if let Some(variable) = variable_binding(expr, resolution) {
+            if let Some(variable) = place_binding(expr, resolution) {
                 state.facts.insert(variable, Fact::Exact(ty.clone()));
             }
         }
@@ -1538,8 +1572,15 @@ fn collect_expr(
     }
 
     match expr {
-        Expr::PropertyAccess { object, .. }
-        | Expr::Grouped { expr: object, .. }
+        Expr::PropertyAccess { object, span, .. } => {
+            if let Some(binding) = resolution.property_uses.get(span) {
+                if let Some(fact) = state.facts.get(binding) {
+                    facts.insert(*span, fact.clone());
+                }
+            }
+            collect_expr(object, state, resolution, mutations, facts)
+        }
+        Expr::Grouped { expr: object, .. }
         | Expr::Unary { expr: object, .. }
         | Expr::IsType { expr: object, .. } => {
             collect_expr(object, state, resolution, mutations, facts)
@@ -1558,7 +1599,7 @@ fn collect_expr(
                 kill_arguments_for_modes(args, modes, &mut state, resolution);
                 state
             };
-            match call_execution(*null_safe, object, &state, resolution) {
+            let mut result = match call_execution(*null_safe, object, &state, resolution) {
                 CallExecution::Never => state,
                 CallExecution::Maybe => {
                     let mut evaluated = state.clone();
@@ -1567,7 +1608,11 @@ fn collect_expr(
                     joined_state(&state, &evaluated)
                 }
                 CallExecution::Always => collect_arguments(&state, facts),
+            };
+            if matches!(ungroup(object), Expr::This { .. }) {
+                kill_constructor_property_facts(&mut result, resolution);
             }
+            result
         }
         Expr::FunctionCall { name, args, .. } => {
             let mut state = collect_expr_sequence(args, state, resolution, mutations, facts);
@@ -1652,7 +1697,7 @@ fn collect_expr(
             let left_fact = expression_fact(left, &left_state, resolution, &resolution.nullability);
             let mut fallback_input = left_state.clone();
             if !matches!(left_fact, Some(Fact::NonNull | Fact::Exact(_))) {
-                if let Some(binding) = variable_binding(left, resolution) {
+                if let Some(binding) = place_binding(left, resolution) {
                     fallback_input.facts.insert(binding, Fact::Null);
                 }
             }
@@ -1790,6 +1835,15 @@ fn variable_binding(expr: &Expr, resolution: &Resolution) -> Option<BindingId> {
     resolution.uses.get(span).copied()
 }
 
+fn place_binding(expr: &Expr, resolution: &Resolution) -> Option<BindingId> {
+    variable_binding(expr, resolution).or_else(|| {
+        let Expr::PropertyAccess { span, .. } = ungroup(expr) else {
+            return None;
+        };
+        resolution.property_uses.get(span).copied()
+    })
+}
+
 fn callable_parameter_modes(expr: &Expr, arity: usize, resolution: &Resolution) -> ParamModes {
     let function = match ungroup(expr) {
         Expr::Variable { .. } => {
@@ -1885,7 +1939,7 @@ fn apply_match_pattern_fact(
     state: &mut State,
     resolution: &Resolution,
 ) {
-    let Some(binding) = variable_binding(scrutinee, resolution) else {
+    let Some(binding) = place_binding(scrutinee, resolution) else {
         return;
     };
     match pattern {
@@ -1979,6 +2033,23 @@ fn ungroup(mut expr: &Expr) -> &Expr {
     expr
 }
 
+fn initial_value_fact(expr: &Expr) -> Option<Fact> {
+    match ungroup(expr) {
+        Expr::Null { .. } => Some(Fact::Null),
+        Expr::String { .. }
+        | Expr::InterpolatedString { .. }
+        | Expr::Int { .. }
+        | Expr::Float { .. }
+        | Expr::Bool { .. }
+        | Expr::Array { .. }
+        | Expr::ArrayRepeat { .. }
+        | Expr::Range { .. }
+        | Expr::New { .. }
+        | Expr::Closure(_) => Some(Fact::NonNull),
+        _ => None,
+    }
+}
+
 struct Resolver {
     next_binding: usize,
     scopes: Vec<HashMap<String, BindingId>>,
@@ -1990,6 +2061,7 @@ impl Resolver {
         body: &Block,
         params: &[Param],
         current_class: Option<&str>,
+        constructor_class: Option<&crate::ast::ClassDecl>,
         nullability: &NullabilityCatalog,
         member_classes: &MemberClassCatalog,
     ) -> Resolution {
@@ -2003,6 +2075,40 @@ impl Resolver {
                 ..Resolution::default()
             },
         };
+        if let Some(class) = constructor_class {
+            for member in &class.members {
+                let crate::ast::ClassMember::Property(property) = member else {
+                    continue;
+                };
+                if property.is_static {
+                    continue;
+                }
+                let binding = resolver.declare_unscoped(Some(property.ty.clone()));
+                resolver
+                    .resolution
+                    .constructor_properties
+                    .insert(property.name.clone(), binding);
+                if let Some(fact) = property.initializer.as_ref().and_then(initial_value_fact) {
+                    resolver.resolution.entry_facts.insert(binding, fact);
+                }
+            }
+            for parameter in params
+                .iter()
+                .filter(|parameter| parameter.promoted_access.is_some())
+            {
+                let binding = resolver.declare_unscoped(Some(parameter.ty.clone()));
+                resolver
+                    .resolution
+                    .constructor_properties
+                    .insert(parameter.name.clone(), binding);
+                if !parameter.ty.nullable {
+                    resolver
+                        .resolution
+                        .entry_facts
+                        .insert(binding, Fact::NonNull);
+                }
+            }
+        }
         for parameter in params {
             resolver.declare(
                 &parameter.name,
@@ -2015,13 +2121,18 @@ impl Resolver {
     }
 
     fn declare(&mut self, name: &str, span_start: usize, ty: Option<TypeRef>) -> BindingId {
-        let id = BindingId(self.next_binding);
-        self.next_binding += 1;
+        let id = self.declare_unscoped(ty);
         self.scopes
             .last_mut()
             .expect("scope")
             .insert(name.to_string(), id);
         self.resolution.declarations.insert(span_start, id);
+        id
+    }
+
+    fn declare_unscoped(&mut self, ty: Option<TypeRef>) -> BindingId {
+        let id = BindingId(self.next_binding);
+        self.next_binding += 1;
         if let Some(ty) = ty.as_ref() {
             let class_name = if ty.name == "self" {
                 self.resolution
@@ -2228,6 +2339,22 @@ impl Resolver {
             return;
         }
         match expr {
+            Expr::PropertyAccess {
+                object,
+                property,
+                span,
+                ..
+            } if matches!(ungroup(object), Expr::This { .. }) => {
+                self.resolve_expr(object);
+                if let Some(binding) = self
+                    .resolution
+                    .constructor_properties
+                    .get(property)
+                    .copied()
+                {
+                    self.resolution.property_uses.insert(*span, binding);
+                }
+            }
             Expr::PropertyAccess { object, .. }
             | Expr::Grouped { expr: object, .. }
             | Expr::Unary { expr: object, .. }

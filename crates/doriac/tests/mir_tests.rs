@@ -197,6 +197,7 @@ fn conditional_program(condition: Condition, then_status: i64, else_status: i64)
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
             parameter_modes: Vec::new(),
@@ -893,6 +894,7 @@ fn interpreter_reports_arithmetic_overflow_as_runtime_panic() {
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
             parameter_modes: Vec::new(),
@@ -1573,6 +1575,7 @@ fn explicitly_limited_interpreter_stops_repeated_mir_state_cycles() {
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
             parameter_modes: Vec::new(),
@@ -3071,6 +3074,7 @@ fn explicitly_limited_interpreter_can_bound_call_frames() {
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
             parameter_modes: Vec::new(),
@@ -3682,11 +3686,29 @@ function main(): void
     .expect("a constructor that always panics never exposes an incomplete object");
     doriac::mir_validation::validate_program(&program)
         .expect("unreachable initialization must not be required by MIR validation");
-    let constructor = &program.functions[0];
-    assert!(constructor.blocks.iter().all(|block| block
-        .statements
+    let message = program
+        .classes
         .iter()
-        .all(|statement| !matches!(statement, doriac::mir::Statement::AssignProperty { .. }))));
+        .find(|class| class.name == "Message")
+        .expect("Message metadata");
+    let text = message
+        .properties
+        .iter()
+        .find(|property| property.name == "text")
+        .expect("Message::text metadata")
+        .id;
+    let constructor = program
+        .functions
+        .iter()
+        .find(|function| function.name == "Message::__construct")
+        .expect("Message constructor MIR");
+    assert!(constructor
+        .blocks
+        .iter()
+        .all(|block| block.statements.iter().all(|statement| !matches!(
+            statement,
+            doriac::mir::Statement::AssignProperty { property, .. } if *property == text
+        ))));
 }
 
 #[test]
@@ -3884,10 +3906,24 @@ function main(): void
         .find(|class| class.name == "Parent")
         .expect("Parent metadata");
     let parent_id = parent.id;
+    let promoted_properties = parent
+        .properties
+        .iter()
+        .map(|property| property.id)
+        .collect::<std::collections::HashSet<_>>();
     parent.properties.clear();
     parent.layout = compute_class_layout(parent_id, [], std::mem::size_of::<usize>() as u32);
     for function in &mut program.functions {
         for block in &mut function.blocks {
+            if function.name == "Parent::__construct" {
+                block.statements.retain(|statement| {
+                    !matches!(
+                        statement,
+                        Statement::AssignProperty { property, .. }
+                            if promoted_properties.contains(property)
+                    )
+                });
+            }
             for statement in &mut block.statements {
                 if let Statement::AssignLocal {
                     value:

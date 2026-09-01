@@ -1779,6 +1779,59 @@ it("catch assertion", function (): void {
 }
 
 #[test]
+fn stage34_virtual_dispatch_preserves_test_assertion_effects() {
+    let source = r#"
+use Doria\Std\Test\{expect, it};
+
+internal open class BaseVerifier
+{
+    open function verify(): void {}
+}
+
+internal class ChildVerifier extends BaseVerifier
+{
+    override function verify(): void
+    {
+        expect(true)->toBeTrue();
+        echo "verified\n";
+    }
+}
+
+it("virtual assertion", function (): void {
+    BaseVerifier $verifier = new ChildVerifier();
+    $verifier->verify();
+});
+"#;
+    assert_behavioral_output_on_every_enabled_backend(source, b"verified\n");
+}
+
+#[test]
+fn stage34_throw_matchers_accept_error_superclass_inspectors() {
+    let source = r#"
+use Doria\Std\Test\{expect, it};
+
+internal open class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+
+internal class Missing extends Failure
+{
+    function __construct() { parent::__construct("missing"); }
+}
+
+it("hierarchy throw inspector", function (): void {
+    let $throws = function (): void { throw new Missing(); };
+    expect($throws)->toThrow(function (Failure $error): void {
+        expect($error->message)->toEqual("missing");
+        echo "inspected\n";
+    });
+});
+"#;
+    assert_behavioral_output_on_every_enabled_backend(source, b"inspected\n");
+}
+
+#[test]
 fn plain_development_helpers_can_catch_assertion_errors() {
     let source = r#"
 use Doria\Std\Test\{AssertionError, fail};

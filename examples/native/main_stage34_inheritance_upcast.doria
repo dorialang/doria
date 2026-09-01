@@ -1,0 +1,10 @@
+open class Base
+{
+    open function value(): int { return 1; }
+}
+class Child extends Base
+{
+    override function value(): int { return 42; }
+}
+function accept(Base $value): int { return $value->value(); }
+function main(): void { echo "upcast {accept(new Child())}\n"; }

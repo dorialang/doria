@@ -494,6 +494,10 @@ impl Elaborator<'_> {
         self.generated.push(Item::Function(ast::FunctionDecl {
             access: MemberAccess::Internal,
             access_span: None,
+            is_open: false,
+            open_span: None,
+            is_override: false,
+            override_span: None,
             writable_this: false,
             writable_span: None,
             is_static: false,
@@ -505,6 +509,7 @@ impl Elaborator<'_> {
             return_type: Some(TypeRef::named("void")),
             throws: None,
             body,
+            modifier_prefix_span: function_span,
             span: function_span,
         }));
         self.facts.generated_function_spans.insert(function_span);

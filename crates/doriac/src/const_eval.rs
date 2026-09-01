@@ -106,6 +106,7 @@ pub struct Evaluation {
     pub enum_cases: HashMap<(String, String), EnumValue>,
     pub enum_names: HashMap<String, EnumId>,
     payload_cases: HashMap<(String, String), PayloadCaseSchema>,
+    class_parents: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -141,6 +142,7 @@ pub fn evaluate_parameter_default(
         enum_cases: evaluation.enum_cases.clone(),
         enum_names: evaluation.enum_names.clone(),
         payload_cases: evaluation.payload_cases.clone(),
+        class_parents: evaluation.class_parents.clone(),
     };
     let value = evaluator.evaluate_expr(expr, Some(expected), &requester)?;
     evaluator.diagnostics.is_empty().then_some(value.value)
@@ -160,6 +162,7 @@ pub fn evaluate_string_expression(evaluation: &Evaluation, expr: &Expr) -> Optio
         enum_cases: evaluation.enum_cases.clone(),
         enum_names: evaluation.enum_names.clone(),
         payload_cases: evaluation.payload_cases.clone(),
+        class_parents: evaluation.class_parents.clone(),
     };
     let value = evaluator.evaluate_expr(expr, Some(ConstType::String), &requester)?;
     match value.value {
@@ -195,6 +198,7 @@ pub fn evaluate_attribute_value(
         enum_cases: evaluation.enum_cases.clone(),
         enum_names: evaluation.enum_names.clone(),
         payload_cases: evaluation.payload_cases.clone(),
+        class_parents: evaluation.class_parents.clone(),
     };
     let value = evaluator.evaluate_expr(expr, Some(expected), &requester);
     if let Some(value) = value.filter(|_| evaluator.diagnostics.is_empty()) {
@@ -291,6 +295,7 @@ pub(crate) fn evaluate_program_with_diagnostics(
             enum_cases: evaluator.enum_cases,
             enum_names: evaluator.enum_names,
             payload_cases: evaluator.payload_cases,
+            class_parents: evaluator.class_parents,
         },
         evaluator.diagnostics,
     )
@@ -304,6 +309,7 @@ struct Evaluator {
     enum_cases: HashMap<(String, String), EnumValue>,
     enum_names: HashMap<String, EnumId>,
     payload_cases: HashMap<(String, String), PayloadCaseSchema>,
+    class_parents: HashMap<String, String>,
 }
 
 impl Evaluator {
@@ -316,7 +322,17 @@ impl Evaluator {
             enum_cases: HashMap::new(),
             enum_names: HashMap::new(),
             payload_cases: HashMap::new(),
+            class_parents: HashMap::new(),
         };
+        for item in &program.items {
+            if let Item::Class(declaration) = item {
+                if let Some(parent) = &declaration.parent {
+                    evaluator
+                        .class_parents
+                        .insert(declaration.name.clone(), parent.name.clone());
+                }
+            }
+        }
         for item in &program.items {
             if let Item::Enum(declaration) = item {
                 let next = evaluator.enum_names.len();
@@ -597,17 +613,17 @@ impl Evaluator {
                 {
                     return Some(TypedValue::new(ConstValue::Enum(value)));
                 }
-                let constant = ConstKey::Class {
+                let constant = self.inherited_key(ConstKey::Class {
                     class_name: class_name.clone(),
                     name: member.clone(),
-                };
+                });
                 if self.nodes.contains_key(&constant) || self.states.contains_key(&constant) {
                     self.reference(&constant, *span, requester)
                 } else {
-                    let static_key = ConstKey::Static {
+                    let static_key = self.inherited_key(ConstKey::Static {
                         class_name: class_name.clone(),
                         name: member.clone(),
-                    };
+                    });
                     if !requester.static_initializer {
                         self.invalid(*span, "constant expressions cannot read static properties");
                         None
@@ -757,8 +773,40 @@ impl Evaluator {
         match qualifier {
             StaticQualifier::Class(name) => Some(name.clone()),
             StaticQualifier::SelfType => requester.declaring_class.clone(),
-            StaticQualifier::Parent | StaticQualifier::InvalidStatic => None,
+            StaticQualifier::Parent => requester
+                .declaring_class
+                .as_ref()
+                .and_then(|class_name| self.class_parents.get(class_name))
+                .cloned(),
+            StaticQualifier::InvalidStatic => None,
         }
+    }
+
+    fn inherited_key(&self, key: ConstKey) -> ConstKey {
+        let (kind, class_name, name) = match &key {
+            ConstKey::Class { class_name, name } => (false, class_name, name),
+            ConstKey::Static { class_name, name } => (true, class_name, name),
+            ConstKey::TopLevel(_) => return key,
+        };
+        let mut current = class_name.clone();
+        while let Some(parent) = self.class_parents.get(&current) {
+            let candidate = if kind {
+                ConstKey::Static {
+                    class_name: parent.clone(),
+                    name: name.clone(),
+                }
+            } else {
+                ConstKey::Class {
+                    class_name: parent.clone(),
+                    name: name.clone(),
+                }
+            };
+            if self.nodes.contains_key(&candidate) || self.states.contains_key(&candidate) {
+                return candidate;
+            }
+            current = parent.clone();
+        }
+        key
     }
 
     fn reference(
@@ -767,11 +815,12 @@ impl Evaluator {
         span: Span,
         requester: &EvaluationRequester,
     ) -> Option<TypedValue> {
+        let key = self.inherited_key(key.clone());
         let declaration = self
             .nodes
-            .get(key)
+            .get(&key)
             .map(|node| (node.access, node.writable))
-            .or_else(|| match self.states.get(key) {
+            .or_else(|| match self.states.get(&key) {
                 Some(State::Done(value)) => Some((value.access, value.writable)),
                 Some(State::Visiting(_) | State::Failed) | None => None,
             });
@@ -792,7 +841,7 @@ impl Evaluator {
             );
             return None;
         }
-        let declaring_class = match key {
+        let declaring_class = match &key {
             ConstKey::Class { class_name, .. } | ConstKey::Static { class_name, .. } => {
                 Some(class_name.as_str())
             }
@@ -806,7 +855,7 @@ impl Evaluator {
             );
             return None;
         }
-        self.evaluate_key(key).map(|value| TypedValue {
+        self.evaluate_key(&key).map(|value| TypedValue {
             value: value.value,
             ty: value.ty,
         })

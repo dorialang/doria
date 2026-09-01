@@ -1505,8 +1505,11 @@ function create(): Person
 }
 "#,
     ] {
-        doriac::check_source("test.doria", source)
-            .expect("same-package internal constructor access should succeed");
+        let diagnostics = doriac::check_source("test.doria", source)
+            .expect_err("member-level internal access is declaring-class-only");
+        assert!(diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0307"));
     }
 }
 
@@ -2328,21 +2331,18 @@ fn reserves_displayable_and_defers_general_interfaces() {
 }
 
 #[test]
-fn resolves_same_file_class_workflow_names_before_later_stage_boundaries() {
+fn resolves_same_file_inheritance_while_interfaces_remain_deferred() {
     let diagnostics = doriac::check_source(
         "test.doria",
         r#"
 namespace Vendor\App;
-class Base {}
+open class Base {}
 interface Printable {}
 class Child extends Base implements Printable {}
 "#,
     )
-    .expect_err("inheritance and interface conformance are not implemented yet");
+    .expect_err("interface conformance is not implemented yet");
 
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == "E0476" && diagnostic.message.contains("extends")));
     assert!(diagnostics
         .iter()
         .any(|diagnostic| diagnostic.code == "E0464" && diagnostic.message.contains("interface")));
@@ -3581,8 +3581,8 @@ class Parser
 }
 
 #[test]
-fn allows_same_package_access_to_internal_members() {
-    doriac::check_source(
+fn rejects_same_package_access_to_declaring_class_internal_members() {
+    let diagnostics = doriac::check_source(
         "test.doria",
         r#"
 class Person
@@ -3623,7 +3623,13 @@ string $direct = reveal($person);
 string $throughClass = $inspector->reveal($person);
 "#,
     )
-    .expect("same-package internal member access should succeed");
+    .expect_err("member-level internal access is declaring-class-only");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0306"));
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0307"));
 }
 
 #[test]

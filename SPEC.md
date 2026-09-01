@@ -134,7 +134,7 @@ See Decision 0116 for the current control-flow authority.
 
 ### Source organization and compiler directives
 
-The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0127 fixes the implemented normal path/Git dependency resolver, SemVer validation, one-version graph, strict deterministic lockfile, dependency commands, global Git cache, offline policy, multi-package plans, and receipt identities. Decision 0128 fixes and implements canonical dependency source descriptors, workspaces, development graphs, tests, processors, generated-source ownership, graph inspection, and project inventory. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. All three Stage 33 slices and Phase F are complete. Native Testing Foundation Slices 1 through 3 are complete, the foundation is complete, and Stage 34 single class inheritance is next. The Pre-Stage-45 Doria-native Baton transition remains scheduled.
+The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0127 fixes the implemented normal path/Git dependency resolver, SemVer validation, one-version graph, strict deterministic lockfile, dependency commands, global Git cache, offline policy, multi-package plans, and receipt identities. Decision 0128 fixes and implements canonical dependency source descriptors, workspaces, development graphs, tests, processors, generated-source ownership, graph inspection, and project inventory. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. All three Stage 33 slices and Phase F are complete. Native Testing Foundation Slices 1 through 3 are complete, the foundation is complete, and Stage 34 single class inheritance is complete and Stage 35 interfaces and traits is next. The Pre-Stage-45 Doria-native Baton transition remains scheduled.
 
 Namespaces define logical symbol ownership and declaration scope. They are part of semantic name resolution, not source inclusion, package resolution, build orchestration, or runtime loading.
 
@@ -626,11 +626,13 @@ function withName(string $name): self
 }
 ```
 
-`parent::member()` is accepted grammar, but parent lookup and dispatch are Stage
-34 semantics and are currently diagnosed as unsupported before Doria IR.
-Trait-local `self::member` also parses under the accepted-language clock, while
-trait composition remains Stage 35. `static::` is permanently rejected with a
-fix to `self::`; Doria has no late static binding.
+`parent::member()` directly names the immediate parent implementation or
+accessible static member. Instance calls use the current complete-object
+pointer and bypass virtual dispatch. `parent::__construct(...)` is the one
+lifecycle protocol form; `parent::__destruct()` is invalid. Trait-local
+`self::member` parses under the accepted-language clock, while trait composition
+remains Stage 35. `static::` is permanently rejected with a fix to `self::`;
+Doria has no late static binding.
 
 Writing a writable static inside `__construct` is ordinary static mutation.
 Constructor init access applies only to `$this` and the instance under
@@ -951,10 +953,11 @@ short-circuit control flow, assignments, loops, and branch joins; a fact is
 available after a join only when every incoming path proves it. Ordinary member
 access on a possibly-null class value is an error until the value is narrowed.
 
-Stage 22 exact class tests do not perform subtype or interface conformance.
-Hierarchy `is` is deferred to Stage 34 and interface `is` to Stage 35; those
-forms parse and receive stage-named diagnostics. Core exact type-binding match
-patterns use the same Stage 22 exact-type narrowing facts.
+For class targets, `is` and match type patterns test whether the dynamic class
+is the target or a descendant. The narrowed value preserves ownership, borrow
+mode, provenance, and the existing non-null proof. Interface conformance tests
+remain deferred to Stage 35. Primitive, string, enum, and closed non-hierarchy
+tests retain their exact Stage 22 behavior.
 
 Nullable concrete classes use a null pointer for absence. Other nullable values
 use an explicit presence word and payload. `?T` keeps `T`'s ownership class:
@@ -1563,19 +1566,63 @@ trait HasSlug
 
 Current semantic checking reports trait declarations as unsupported until Stage 35. The accepted grammar preserves member bodies such as `self::MAX_DEPTH` without false parser errors. Traits may eventually be composed into classes or other traits with `uses`. Trait conflict-resolution rules, aliasing, access changes through trait composition, trait property rules, trait static member rules, trait abstract method requirements, and whether PHP-style `insteadof` / `as` are accepted exactly remain future design work.
 
-Doria will support `extends` for inheritance:
+Doria implements single class inheritance. Classes are closed by default;
+subclassing requires an `open class`, and a class may have at most one direct
+parent:
 
 ```doria
-class Post extends Model
+open class Model
 {
 }
 
-interface JsonRenderable extends Renderable
+class Post extends Model
 {
 }
 ```
 
-Likely direction: a class may extend at most one class, and an interface may extend one or more interfaces. Constructor inheritance, initialization order, override rules, virtual dispatch layout, final/sealed behavior, runtime layout, and ABI remain future design work.
+Methods are nonvirtual by default. `open function` creates a virtual slot and
+`override function` is mandatory when replacing it. Override parameter names,
+types, ownership modes, generic constraints, and generic arity match exactly;
+the root declaration owns defaults; receiver access may weaken from writable to
+readonly but not strengthen; class returns may be covariant through ordinary
+assignment compatibility; and checked Errors may narrow but not widen.
+
+```doria
+open class Model
+{
+    open function save(): void throws StorageError
+    {
+    }
+}
+
+class Post extends Model
+{
+    override function save(): void throws StorageError
+    {
+    }
+}
+```
+
+Qualified and generic parent types are accepted and monomorphized. Generic
+classes remain invariant. Externally accessible members participate in
+inherited lookup; declaring-class `internal` members do not. Doria has no
+`protected`, abstract classes, multiple class inheritance, unchecked cast,
+`final`, `sealed`, or late-static-binding surface.
+
+Construction allocates one complete object, evaluates `new` arguments once,
+and executes class phases root to derived. A required parent constructor call
+must be the derived constructor's first source-level statement. Destruction
+runs derived to root, dropping each class phase's remaining properties in
+reverse order and freeing the allocation once. During construction or
+destruction, `$this` virtual calls stop at the currently active class phase.
+
+The heap payload remains headerless and data-only. Closed exact class values
+remain one-word payload pointers. A statically open class value carries the
+payload pointer and a static hierarchy-descriptor pointer; an upcast constructs
+that carrier without allocating or copying the object. Parent-prefix property
+layout keeps inherited offsets stable. Decision 0130 defines hierarchy
+resolution, parent calls, construction, destruction, dispatch, narrowing,
+checked Error coverage, and backend obligations in full.
 
 Doria will support `implements` for compiler-checked interface conformance:
 

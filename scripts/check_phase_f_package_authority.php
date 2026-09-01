@@ -80,7 +80,9 @@ $require($namespacePath, $namespace, [
     'through several includes or both autoload',
     'canonical publishable identity is lowercase `vendor/package`',
     'Package identity and Doria namespace identity are separate',
-    '`internal` means accessible anywhere inside the declaring package',
+    'On global declarations, `internal` means accessible anywhere inside the',
+    'Class-member `internal` remains the declaring-class-only member visibility',
+    'inheritance does not make an internal parent member visible',
     'Several packages may',
     'Duplicate fully qualified symbols are compile errors',
     'versioned JSON build plan',
@@ -138,7 +140,8 @@ $require($batonPath, $baton, [
     'are complete',
     'Native Testing Foundation Slices 1 through 3 are complete',
     'foundation is complete',
-    'Stage 34 is next',
+    'Stage 34 is complete',
+    'Stage 35 is next',
 ]);
 $require($slice1Path, $slice1, [
     '**Status:** Accepted',
@@ -201,7 +204,8 @@ $require($pipelinePath, $pipeline, [
     'Native Testing Foundation Slice 1 — Complete',
     'Native Testing Foundation Slice 2 — Complete',
     'Native Testing Foundation Slice 3 — Complete',
-    'Stage 34 Single Class Inheritance — Next',
+    'Stage 34 Single Class Inheritance — Complete',
+    'Stage 35 Interfaces And Traits — Next',
 ]);
 $require($auditPath, $audit, [
     'Resolved. Decision 0117',

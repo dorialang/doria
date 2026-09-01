@@ -47,3 +47,11 @@ Rejected. Classes are identity-bearing, owned heap values. Inline layout is reta
 The compiler owns one canonical class-layout model used by MIR validation, the interpreter, Cranelift, and LLVM. The runtime supplies allocation and deallocation primitives but does not own source-level class metadata or generic reference counting.
 
 Allocation failure follows decision 0083. Destruction order and the point at which the payload is freed follow decision 0081.
+
+## Stage 34 Amendment
+
+Decision 0130 preserves the headerless data-only payload and the one-word closed
+exact value. A statically open class value uses a private two-word data-pointer
+and static-descriptor carrier; the descriptor is per concrete specialization,
+never stored per object. Parent-prefix layout, allocation-free upcasts, virtual
+slots, and dynamic drop therefore add no object header or runtime reflection.

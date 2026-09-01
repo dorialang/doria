@@ -52,20 +52,20 @@ use crate::native_abi::{
     MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID,
     NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
     READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD,
-    SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN, STRING_ASSERTION_DIFFERENCE,
-    STRING_ASSERTION_QUOTE, STRING_BYTE_LENGTH, STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS,
-    STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH,
-    STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES,
-    STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8,
-    STRING_GRAPHEME_LENGTH, STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY,
-    STRING_JOIN, STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER,
-    STRING_LOWER_FIRST, STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT,
-    STRING_REPLACE, STRING_RETAIN, STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH,
-    STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END,
-    STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
-    WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
+    SHARED_PAYLOAD_DESCRIPTOR, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
+    STRING_ASSERTION_DIFFERENCE, STRING_ASSERTION_QUOTE, STRING_BYTE_LENGTH, STRING_COMPARE,
+    STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES,
+    STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE,
+    STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64,
+    STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF,
+    STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF,
+    STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END,
+    STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE,
+    STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM,
+    STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR,
+    STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
     WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS, WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK,
-    WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
+    WRITABLE_SHARED_PAYLOAD_DESCRIPTOR, WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
     WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
     WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_RETAIN,
     WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES,
@@ -82,6 +82,7 @@ struct DeclaredNativeItems<'a> {
     collection_drop_function_ids: &'a [FuncId],
     closure_drop_function_ids: &'a [FuncId],
     closure_descriptor_ids: &'a [DataId],
+    class_descriptor_ids: &'a [DataId],
     static_ids: &'a [DataId],
 }
 
@@ -109,7 +110,7 @@ pub(crate) fn lower_validated_mir_to_object(
 
     let mut function_ids = Vec::with_capacity(program.functions.len());
     for function in &program.functions {
-        let signature = function_signature(&mut module, function)?;
+        let signature = function_signature(&mut module, program, function)?;
         let function_id = module
             .declare_function(&function_symbol(function), Linkage::Local, &signature)
             .map_err(|error| backend_failure(error.to_string()))?;
@@ -124,13 +125,25 @@ pub(crate) fn lower_validated_mir_to_object(
         &function_ids,
         &closure_drop_function_ids,
     )?;
-    let static_ids = define_static_data(&mut module, program, &class_drop_function_ids)?;
+    let class_descriptor_ids = define_class_descriptors(
+        &mut module,
+        program,
+        &function_ids,
+        &class_drop_function_ids,
+    )?;
+    let static_ids = define_static_data(
+        &mut module,
+        program,
+        &class_drop_function_ids,
+        &class_descriptor_ids,
+    )?;
     let declarations = DeclaredNativeItems {
         function_ids: &function_ids,
         class_drop_function_ids: &class_drop_function_ids,
         collection_drop_function_ids: &collection_drop_function_ids,
         closure_drop_function_ids: &closure_drop_function_ids,
         closure_descriptor_ids: &closure_descriptor_ids,
+        class_descriptor_ids: &class_descriptor_ids,
         static_ids: &static_ids,
     };
 
@@ -287,8 +300,220 @@ fn define_closure_descriptors(
         .collect()
 }
 
+fn define_class_descriptors(
+    module: &mut ObjectModule,
+    program: &mir::Program,
+    function_ids: &[FuncId],
+    class_drop_function_ids: &[FuncId],
+) -> Result<Vec<DataId>, BackendError> {
+    let pointer_bytes = usize::from(module.target_config().pointer_bytes());
+    let descriptor_ids = program
+        .classes
+        .iter()
+        .map(|class| {
+            module
+                .declare_data(
+                    &format!("__doria_class_descriptor_{}", class.id.0),
+                    Linkage::Local,
+                    false,
+                    false,
+                )
+                .map_err(|error| backend_failure(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for class in &program.classes {
+        let ancestry_id = module
+            .declare_data(
+                &format!("__doria_class_ancestry_{}", class.id.0),
+                Linkage::Local,
+                false,
+                false,
+            )
+            .map_err(|error| backend_failure(error.to_string()))?;
+        let mut ancestry = vec![0_u8; program.classes.len().div_ceil(8).max(1)];
+        for member in std::iter::once(class.id).chain(class.ancestors.iter().copied()) {
+            ancestry[member.0 / 8] |= 1 << (member.0 % 8);
+        }
+        let mut ancestry_data = DataDescription::new();
+        ancestry_data.set_align(1);
+        ancestry_data.define(ancestry.into_boxed_slice());
+        module
+            .define_data(ancestry_id, &ancestry_data)
+            .map_err(|error| backend_failure(error.to_string()))?;
+
+        let vtable_id = if class.virtual_methods.is_empty() {
+            None
+        } else {
+            let id = module
+                .declare_data(
+                    &format!("__doria_class_vtable_{}", class.id.0),
+                    Linkage::Local,
+                    false,
+                    false,
+                )
+                .map_err(|error| backend_failure(error.to_string()))?;
+            let mut table = DataDescription::new();
+            table.set_align(pointer_bytes as u64);
+            table.define(vec![0; pointer_bytes * class.virtual_methods.len()].into_boxed_slice());
+            for (slot, function) in class.virtual_methods.iter().enumerate() {
+                let function = *function_ids.get(function.0).ok_or_else(|| {
+                    malformed_mir(format!("virtual function{} was not declared", function.0))
+                })?;
+                let function = module.declare_func_in_data(function, &mut table);
+                table.write_function_addr((slot * pointer_bytes) as u32, function);
+            }
+            module
+                .define_data(id, &table)
+                .map_err(|error| backend_failure(error.to_string()))?;
+            Some(id)
+        };
+
+        let mut descriptor = DataDescription::new();
+        descriptor.set_align(pointer_bytes as u64);
+        let mut bytes = vec![0; pointer_bytes * 5];
+        bytes[pointer_bytes..pointer_bytes * 2]
+            .copy_from_slice(&(class.id.0 as u64).to_le_bytes()[..pointer_bytes]);
+        descriptor.define(bytes.into_boxed_slice());
+        if let Some(parent) = class.parent {
+            let parent = *descriptor_ids.get(parent.0).ok_or_else(|| {
+                malformed_mir(format!(
+                    "class{} parent descriptor was not declared",
+                    parent.0
+                ))
+            })?;
+            let parent = module.declare_data_in_data(parent, &mut descriptor);
+            descriptor.write_data_addr(0, parent, 0);
+        }
+        let drop_function = *class_drop_function_ids.get(class.id.0).ok_or_else(|| {
+            malformed_mir(format!(
+                "class{} drop function was not declared",
+                class.id.0
+            ))
+        })?;
+        let drop_function = module.declare_func_in_data(drop_function, &mut descriptor);
+        descriptor.write_function_addr((pointer_bytes * 2) as u32, drop_function);
+        if let Some(vtable_id) = vtable_id {
+            let vtable = module.declare_data_in_data(vtable_id, &mut descriptor);
+            descriptor.write_data_addr((pointer_bytes * 3) as u32, vtable, 0);
+        }
+        let ancestry = module.declare_data_in_data(ancestry_id, &mut descriptor);
+        descriptor.write_data_addr((pointer_bytes * 4) as u32, ancestry, 0);
+        module
+            .define_data(descriptor_ids[class.id.0], &descriptor)
+            .map_err(|error| backend_failure(error.to_string()))?;
+    }
+    Ok(descriptor_ids)
+}
+
+fn class_uses_open_carrier(program: &mir::Program, class: crate::class_layout::ClassId) -> bool {
+    program
+        .classes
+        .get(class.0)
+        .is_some_and(|definition| definition.is_open)
+}
+
+fn type_uses_two_word_collection_storage(program: &mir::Program, ty: mir::Type) -> bool {
+    matches!(
+        ty,
+        mir::Type::Error
+            | mir::Type::NullableError
+            | mir::Type::Function(_)
+            | mir::Type::NullableFunction(_)
+    ) || match ty {
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+            class_uses_open_carrier(program, class)
+        }
+        _ => false,
+    }
+}
+
+fn mir_class_is_subtype(
+    program: &mir::Program,
+    value: crate::class_layout::ClassId,
+    target: crate::class_layout::ClassId,
+) -> bool {
+    value == target
+        || program
+            .classes
+            .get(value.0)
+            .is_some_and(|class| class.ancestors.contains(&target))
+}
+
+fn lower_open_class_type_test_to_branch(
+    builder: &mut FunctionBuilder,
+    object: Value,
+    descriptor: Value,
+    target: crate::class_layout::ClassId,
+    then_block: Block,
+    else_block: Block,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let zero = builder.ins().iconst(pointer, 0);
+    let present = builder.ins().icmp(IntCC::NotEqual, object, zero);
+    let inspect = builder.create_block();
+    builder.ins().brif(present, inspect, &[], else_block, &[]);
+    builder.switch_to_block(inspect);
+    let ancestry = builder.ins().load(
+        pointer,
+        cranelift_codegen::ir::MachMemFlags::trusted(),
+        descriptor,
+        i32::from(resources.module.target_config().pointer_bytes()) * 4,
+    );
+    let byte = builder.ins().load(
+        types::I8,
+        cranelift_codegen::ir::MachMemFlags::trusted(),
+        ancestry,
+        i32::try_from(target.0 / 8)
+            .map_err(|_| malformed_mir("class hierarchy bitmap offset exceeds i32"))?,
+    );
+    let mask = builder.ins().iconst(types::I8, 1_i64 << (target.0 % 8));
+    let matched = builder.ins().band(byte, mask);
+    builder
+        .ins()
+        .brif(matched, then_block, &[], else_block, &[]);
+    Ok(())
+}
+
+fn class_descriptor_address(
+    builder: &mut FunctionBuilder,
+    class: crate::class_layout::ClassId,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<Value, BackendError> {
+    let id = *resources
+        .class_descriptor_ids
+        .get(class.0)
+        .ok_or_else(|| malformed_mir(format!("class{} descriptor was not declared", class.0)))?;
+    let global = resources.module.declare_data_in_func(id, builder.func);
+    Ok(builder
+        .ins()
+        .symbol_value(resources.module.target_config().pointer_type(), global))
+}
+
+fn class_value_for_static_type(
+    builder: &mut FunctionBuilder,
+    object: Value,
+    descriptor: Option<Value>,
+    static_class: crate::class_layout::ClassId,
+    dynamic_class: crate::class_layout::ClassId,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredValue, BackendError> {
+    if class_uses_open_carrier(resources.program, static_class) {
+        Ok(LoweredValue::OpenClass {
+            object,
+            descriptor: descriptor
+                .map(Ok)
+                .unwrap_or_else(|| class_descriptor_address(builder, dynamic_class, resources))?,
+        })
+    } else {
+        Ok(LoweredValue::Single(object))
+    }
+}
+
 fn function_signature(
     module: &mut ObjectModule,
+    program: &mir::Program,
     function: &mir::Function,
 ) -> Result<Signature, BackendError> {
     let mut signature = module.make_signature();
@@ -300,6 +525,15 @@ fn function_signature(
     }
     for (index, parameter) in function.params.iter().enumerate() {
         let ty = local_in(function, *parameter)?.ty;
+        if index == 0 && function.uses_virtual_receiver_abi() {
+            signature
+                .params
+                .push(AbiParam::new(module.target_config().pointer_type()));
+            signature
+                .params
+                .push(AbiParam::new(module.target_config().pointer_type()));
+            continue;
+        }
         if function.closure.is_some()
             && !matches!(ty, mir::Type::ClosureEnvironment(_))
             && function.parameter_modes[index] == mir::FunctionParameterMode::Writable
@@ -310,6 +544,7 @@ fn function_signature(
         } else {
             append_type_abi_params(
                 &mut signature.params,
+                program,
                 ty,
                 module.target_config().pointer_type(),
             );
@@ -324,6 +559,7 @@ fn function_signature(
         ) {
             append_type_abi_params(
                 &mut signature.returns,
+                program,
                 ty,
                 module.target_config().pointer_type(),
             );
@@ -374,13 +610,16 @@ fn scalar_abi_param(ty: mir::ScalarType) -> AbiParam {
     }
 }
 
-fn append_type_abi_params(params: &mut Vec<AbiParam>, ty: mir::Type, pointer_type: ClifType) {
+fn append_type_abi_params(
+    params: &mut Vec<AbiParam>,
+    program: &mir::Program,
+    ty: mir::Type,
+    pointer_type: ClifType,
+) {
     match ty {
         mir::Type::Scalar(ty) => params.push(scalar_abi_param(ty)),
         mir::Type::String
         | mir::Type::Mixed
-        | mir::Type::Class(_)
-        | mir::Type::NullableClass(_)
         | mir::Type::NullableMixed
         | mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
@@ -398,6 +637,15 @@ fn append_type_abi_params(params: &mut Vec<AbiParam>, ty: mir::Type, pointer_typ
         | mir::Type::NullableCollection(_)
         | mir::Type::PayloadEnum(_)
         | mir::Type::NullablePayloadEnum(_) => {
+            params.push(AbiParam::new(pointer_type));
+        }
+        mir::Type::Class(class) | mir::Type::NullableClass(class)
+            if class_uses_open_carrier(program, class) =>
+        {
+            params.push(AbiParam::new(pointer_type));
+            params.push(AbiParam::new(pointer_type));
+        }
+        mir::Type::Class(_) | mir::Type::NullableClass(_) => {
             params.push(AbiParam::new(pointer_type));
         }
         mir::Type::Error | mir::Type::NullableError => {
@@ -424,20 +672,33 @@ fn append_type_abi_params(params: &mut Vec<AbiParam>, ty: mir::Type, pointer_typ
 enum LoweredValue {
     Single(Value),
     Nullable { present: Value, payload: Value },
+    OpenClass { object: Value, descriptor: Value },
 }
 
 impl LoweredValue {
     fn single(self) -> Result<Value, BackendError> {
         match self {
             Self::Single(value) => Ok(value),
-            Self::Nullable { .. } => Err(malformed_mir("expected a single backend value")),
+            Self::Nullable { .. } | Self::OpenClass { .. } => {
+                Err(malformed_mir("expected a single backend value"))
+            }
         }
     }
 
     fn nullable(self) -> Result<(Value, Value), BackendError> {
         match self {
             Self::Nullable { present, payload } => Ok((present, payload)),
-            Self::Single(_) => Err(malformed_mir("expected a nullable backend value")),
+            Self::Single(_) | Self::OpenClass { .. } => {
+                Err(malformed_mir("expected a nullable backend value"))
+            }
+        }
+    }
+
+    fn class_parts(self) -> Result<(Value, Option<Value>), BackendError> {
+        match self {
+            Self::Single(object) => Ok((object, None)),
+            Self::OpenClass { object, descriptor } => Ok((object, Some(descriptor))),
+            Self::Nullable { .. } => Err(malformed_mir("expected a class backend value")),
         }
     }
 
@@ -448,6 +709,17 @@ impl LoweredValue {
                 values.push(present);
                 values.push(payload);
             }
+            Self::OpenClass { object, descriptor } => {
+                values.push(object);
+                values.push(descriptor);
+            }
+        }
+    }
+
+    fn abi_value_count(self) -> usize {
+        match self {
+            Self::Single(_) => 1,
+            Self::Nullable { .. } | Self::OpenClass { .. } => 2,
         }
     }
 }
@@ -530,6 +802,7 @@ fn define_static_data(
     module: &mut ObjectModule,
     program: &mir::Program,
     class_drop_function_ids: &[FuncId],
+    class_descriptor_ids: &[DataId],
 ) -> Result<Vec<DataId>, BackendError> {
     let pointer_bytes = usize::from(module.target_config().pointer_bytes());
     let mut ids = Vec::with_capacity(program.statics.len());
@@ -678,7 +951,7 @@ fn define_static_data(
             .map_err(|error| backend_failure(error.to_string()))?;
         let mut description = DataDescription::new();
         description.set_align(pointer_bytes as u64);
-        let mut bytes = Vec::with_capacity(pointer_bytes * 8);
+        let mut bytes = Vec::with_capacity(pointer_bytes * 9);
         append_target_word(&mut bytes, 0, pointer_bytes);
         append_target_word(&mut bytes, descriptor.type_name.len() as u64, pointer_bytes);
         append_target_word(&mut bytes, u64::from(message.offset), pointer_bytes);
@@ -700,6 +973,7 @@ fn define_static_data(
                 .map_or(0, |_| crate::native_abi::ASSERTION_ERROR_DESCRIPTOR_MAGIC),
             pointer_bytes,
         );
+        append_target_word(&mut bytes, 0, pointer_bytes);
         description.define(bytes.into_boxed_slice());
         let type_name_reference = module.declare_data_in_data(type_name_id, &mut description);
         description.write_data_addr(0, type_name_reference, 0);
@@ -709,6 +983,12 @@ fn define_static_data(
             let offsets_reference = module.declare_data_in_data(offsets_id, &mut description);
             description.write_data_addr((pointer_bytes * 6) as u32, offsets_reference, 0);
         }
+        let class_descriptor_id = *class_descriptor_ids
+            .get(descriptor.class.0)
+            .ok_or_else(|| malformed_mir("Error class descriptor was not declared"))?;
+        let class_descriptor_reference =
+            module.declare_data_in_data(class_descriptor_id, &mut description);
+        description.write_data_addr((pointer_bytes * 8) as u32, class_descriptor_reference, 0);
         module
             .define_data(id, &description)
             .map_err(|error| backend_failure(error.to_string()))?;
@@ -810,13 +1090,14 @@ fn define_function(
         class_drop_function_ids,
         collection_drop_function_ids,
         closure_descriptor_ids,
+        class_descriptor_ids,
         static_ids,
         ..
     } = declarations;
     let function_id = *function_ids
         .get(function.id.0)
         .ok_or_else(|| malformed_mir(format!("function{} was not declared", function.id.0)))?;
-    let signature = function_signature(module, function)?;
+    let signature = function_signature(module, program, function)?;
     let mut context = module.make_context();
     context.func.signature = signature;
     let mut builder_context = FunctionBuilderContext::new();
@@ -841,6 +1122,16 @@ fn define_function(
                         StackSlotKind::ExplicitSlot,
                         bytes,
                         bytes.trailing_zeros() as u8,
+                    )))
+                }
+                mir::Type::Class(class) | mir::Type::NullableClass(class)
+                    if class_uses_open_carrier(program, class) =>
+                {
+                    let pointer_bytes = u32::from(module.target_config().pointer_bytes());
+                    Some(builder.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        pointer_bytes * 2,
+                        pointer_bytes.trailing_zeros() as u8,
                     )))
                 }
                 mir::Type::String
@@ -926,7 +1217,7 @@ fn define_function(
             .map(|_| {
                 builder.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    pointer_bytes,
+                    pointer_bytes * 2,
                     pointer_bytes.trailing_zeros() as u8,
                 ))
             })
@@ -938,13 +1229,25 @@ fn define_function(
         ));
 
         builder.switch_to_block(entry);
-        initialize_locals(&mut builder, function, &local_slots, module.target_config())?;
+        initialize_locals(
+            &mut builder,
+            program,
+            function,
+            &local_slots,
+            module.target_config(),
+        )?;
         let zero = builder.ins().iconst(pointer_type, 0);
         for slot in &deferred_class_temporary_slots {
             builder.ins().stack_store(pointer_type, zero, *slot, 0);
         }
-        let writable_parameter_addresses =
-            bind_parameters(&mut builder, function, &local_slots, entry, pointer_type)?;
+        let writable_parameter_addresses = bind_parameters(
+            &mut builder,
+            program,
+            function,
+            &local_slots,
+            entry,
+            pointer_type,
+        )?;
         let signature_plan = native_closure_abi::NativeCallableSignaturePlan::direct(function);
         let parent_frame = builder.block_params(entry)[signature_plan
             .index_of(native_closure_abi::NativeCallableHiddenInput::CurrentFrame)
@@ -1064,6 +1367,7 @@ fn define_function(
             class_drop_function_ids,
             collection_drop_function_ids,
             closure_descriptor_ids,
+            class_descriptor_ids,
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses,
@@ -1120,6 +1424,7 @@ fn define_class_drop_function(
         class_drop_function_ids,
         collection_drop_function_ids,
         closure_descriptor_ids,
+        class_descriptor_ids,
         static_ids,
         ..
     } = declarations;
@@ -1147,6 +1452,7 @@ fn define_class_drop_function(
             class_drop_function_ids,
             collection_drop_function_ids,
             closure_descriptor_ids,
+            class_descriptor_ids,
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
@@ -1189,6 +1495,7 @@ fn define_collection_drop_function(
         class_drop_function_ids,
         collection_drop_function_ids,
         closure_descriptor_ids,
+        class_descriptor_ids,
         static_ids,
         ..
     } = declarations;
@@ -1216,6 +1523,7 @@ fn define_collection_drop_function(
             class_drop_function_ids,
             collection_drop_function_ids,
             closure_descriptor_ids,
+            class_descriptor_ids,
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
@@ -1259,7 +1567,9 @@ fn define_closure_drop_function(
         collection_drop_function_ids,
         closure_drop_function_ids,
         closure_descriptor_ids,
+        class_descriptor_ids,
         static_ids,
+        ..
     } = declarations;
     let function_id = *closure_drop_function_ids
         .get(descriptor.id.0)
@@ -1294,6 +1604,7 @@ fn define_closure_drop_function(
             class_drop_function_ids,
             collection_drop_function_ids,
             closure_descriptor_ids,
+            class_descriptor_ids,
             closure_environment_slots: &closure_environment_slots,
             closure_bound_fields: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
@@ -1376,6 +1687,7 @@ fn define_closure_drop_function(
 
 fn initialize_locals(
     builder: &mut FunctionBuilder,
+    program: &mir::Program,
     function: &mir::Function,
     slots: &[Option<StackSlot>],
     frontend_config: TargetFrontendConfig,
@@ -1405,6 +1717,16 @@ fn initialize_locals(
             }
             mir::Type::Scalar(mir::ScalarType::Bool) => builder.ins().iconst(types::I8, 0),
             mir::Type::Scalar(mir::ScalarType::Enum(_)) => builder.ins().iconst(types::I32, 0),
+            mir::Type::Class(class) | mir::Type::NullableClass(class)
+                if class_uses_open_carrier(program, class) =>
+            {
+                let zero = builder.ins().iconst(pointer_type, 0);
+                let slot = local_slot(slots, local.id)?;
+                builder
+                    .ins()
+                    .stack_store(pointer_type, zero, slot, pointer_type.bytes() as i32);
+                zero
+            }
             mir::Type::String
             | mir::Type::Mixed
             | mir::Type::Class(_)
@@ -1449,6 +1771,7 @@ fn initialize_locals(
 
 fn bind_parameters(
     builder: &mut FunctionBuilder,
+    program: &mir::Program,
     function: &mir::Function,
     slots: &[Option<StackSlot>],
     entry: Block,
@@ -1464,12 +1787,27 @@ fn bind_parameters(
         let first = params
             .next()
             .ok_or_else(|| malformed_mir("function parameter is missing an ABI value"))?;
+        if index == 0 && function.uses_virtual_receiver_abi() {
+            let descriptor = params.next().ok_or_else(|| {
+                malformed_mir("virtual method receiver is missing its class descriptor")
+            })?;
+            builder.ins().stack_store(pointer_type, first, slot, 0);
+            if matches!(ty, mir::Type::Class(class) if class_uses_open_carrier(program, class)) {
+                builder.ins().stack_store(
+                    pointer_type,
+                    descriptor,
+                    slot,
+                    pointer_type.bytes() as i32,
+                );
+            }
+            continue;
+        }
         if function.closure.is_some()
             && !matches!(ty, mir::Type::ClosureEnvironment(_))
             && function.parameter_modes[index] == mir::FunctionParameterMode::Writable
         {
-            let value = load_lowered_from_address(builder, ty, first, pointer_type);
-            store_lowered_to_stack(builder, ty, slot, value, pointer_type)?;
+            let value = load_lowered_from_address(builder, program, ty, first, pointer_type);
+            store_lowered_to_stack(builder, program, ty, slot, value, pointer_type)?;
             writable_parameter_addresses.insert(*parameter, first);
             continue;
         }
@@ -1483,6 +1821,17 @@ fn bind_parameters(
                 payload.storage_size(matches!(ty, mir::Type::NullablePayloadEnum(_))),
                 pointer_type,
             );
+        } else if matches!(ty, mir::Type::Class(class) | mir::Type::NullableClass(class)
+            if class_uses_open_carrier(program, class))
+        {
+            builder.ins().stack_store(pointer_type, first, slot, 0);
+            let descriptor = params
+                .next()
+                .ok_or_else(|| malformed_mir("open class parameter is missing its descriptor"))?;
+            builder
+                .ins()
+                .stack_store(pointer_type, descriptor, slot, pointer_type.bytes() as i32);
+            continue;
         } else {
             builder.ins().stack_store(pointer_type, first, slot, 0);
         }
@@ -1585,12 +1934,16 @@ fn cleanup_class_locals(
         .collect::<Vec<_>>();
     for (local, class) in class_locals {
         let slot = local_slot(resources.local_slots, local)?;
-        let value = builder
-            .ins()
-            .stack_load(pointer_type, pointer_type, slot, 0);
+        let ty = local_definition(resources.program, resources.function_id, local)?.ty;
+        let value = load_lowered_from_stack(builder, resources.program, ty, slot, pointer_type);
         let zero = builder.ins().iconst(pointer_type, 0);
         builder.ins().stack_store(pointer_type, zero, slot, 0);
-        lower_drop_class_value_checked(builder, value, class, resources)?;
+        if class_uses_open_carrier(resources.program, class) {
+            builder
+                .ins()
+                .stack_store(pointer_type, zero, slot, pointer_type.bytes() as i32);
+        }
+        lower_drop_class_carrier_checked(builder, value, class, resources)?;
     }
     Ok(())
 }
@@ -1615,7 +1968,22 @@ fn emit_deferred_class_temporary_drops(
         builder.ins().stack_store(pointer, zero, *slot, 0);
         match temporary {
             DeferredOwnedTemporary::Class(class) => {
-                lower_drop_class_value_checked(builder, value, *class, resources)?;
+                let carrier = if class_uses_open_carrier(resources.program, *class) {
+                    let descriptor =
+                        builder
+                            .ins()
+                            .stack_load(pointer, pointer, *slot, pointer.bytes() as i32);
+                    builder
+                        .ins()
+                        .stack_store(pointer, zero, *slot, pointer.bytes() as i32);
+                    LoweredValue::OpenClass {
+                        object: value,
+                        descriptor,
+                    }
+                } else {
+                    LoweredValue::Single(value)
+                };
+                lower_drop_class_carrier_checked(builder, carrier, *class, resources)?;
             }
             DeferredOwnedTemporary::Collection(collection) => {
                 lower_drop_collection_value(builder, value, *collection, resources)?;
@@ -1634,14 +2002,14 @@ fn emit_deferred_class_temporary_drops(
     Ok(())
 }
 
-fn defer_or_drop_class_temporary(
+fn defer_or_drop_class_carrier_temporary(
     builder: &mut FunctionBuilder,
-    value: Value,
+    value: LoweredValue,
     class: crate::class_layout::ClassId,
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     if !resources.defer_class_temporary_drops {
-        return lower_drop_class_value_checked(builder, value, class, resources);
+        return lower_drop_class_carrier_checked(builder, value, class, resources);
     }
     let slot = *resources
         .deferred_class_temporary_slots
@@ -1649,7 +2017,13 @@ fn defer_or_drop_class_temporary(
         .ok_or_else(|| malformed_mir("class temporary stack-slot capacity was exhausted"))?;
     resources.deferred_class_temporary_slot_cursor += 1;
     let pointer = resources.module.target_config().pointer_type();
-    builder.ins().stack_store(pointer, value, slot, 0);
+    let (object, descriptor) = value.class_parts()?;
+    builder.ins().stack_store(pointer, object, slot, 0);
+    if let Some(descriptor) = descriptor {
+        builder
+            .ins()
+            .stack_store(pointer, descriptor, slot, pointer.bytes() as i32);
+    }
     resources
         .deferred_class_temporary_drops
         .push((slot, DeferredOwnedTemporary::Class(class)));
@@ -2091,6 +2465,7 @@ struct LoweringResources<'module, 'program> {
     class_drop_function_ids: &'program [FuncId],
     collection_drop_function_ids: &'program [FuncId],
     closure_descriptor_ids: &'program [DataId],
+    class_descriptor_ids: &'program [DataId],
     closure_environment_slots: &'program [Option<StackSlot>],
     closure_bound_fields: HashMap<mir::LocalId, BoundClosureField>,
     borrow_home_addresses: HashMap<mir::LocalId, Value>,
@@ -2230,6 +2605,7 @@ fn lower_bind_closure_environment(
         native_closure_abi::environment_layout(resources.program, logical_id, pointer.bytes())?;
     let environment = load_lowered_from_stack(
         builder,
+        resources.program,
         mir::Type::ClosureEnvironment(Some(logical_id)),
         local_slot(resources.local_slots, environment_local)?,
         pointer,
@@ -2259,9 +2635,16 @@ fn lower_bind_closure_environment(
             ),
             mir::ClosureEnvironmentStorage::Owned => field_address,
         };
-        let value = load_lowered_from_address(builder, field.ty, place, pointer);
+        let value = load_lowered_from_address(builder, resources.program, field.ty, place, pointer);
         let target_slot = local_slot(resources.local_slots, *target)?;
-        store_lowered_to_stack(builder, field.ty, target_slot, value, pointer)?;
+        store_lowered_to_stack(
+            builder,
+            resources.program,
+            field.ty,
+            target_slot,
+            value,
+            pointer,
+        )?;
         if matches!(field.ty, mir::Type::String | mir::Type::NullableString) {
             let offset = if field.ty == mir::Type::NullableString {
                 pointer.bytes() as i32
@@ -2328,13 +2711,26 @@ fn sync_writable_closure_captures(
     let pointer = resources.module.target_config().pointer_type();
     for (local, field) in bindings {
         let slot = local_slot(resources.local_slots, local)?;
-        let new = load_lowered_from_stack(builder, field.ty, slot, pointer);
+        let new = load_lowered_from_stack(builder, resources.program, field.ty, slot, pointer);
         match field.ty {
             mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {
-                store_lowered_to_address(builder, field.ty, field.address, new, pointer)?;
+                store_lowered_to_address(
+                    builder,
+                    resources.program,
+                    field.ty,
+                    field.address,
+                    new,
+                    pointer,
+                )?;
             }
             mir::Type::String | mir::Type::NullableString => {
-                let old = load_lowered_from_address(builder, field.ty, field.address, pointer);
+                let old = load_lowered_from_address(
+                    builder,
+                    resources.program,
+                    field.ty,
+                    field.address,
+                    pointer,
+                );
                 let old_string = if field.ty == mir::Type::NullableString {
                     old.nullable()?.1
                 } else {
@@ -2360,16 +2756,37 @@ fn sync_writable_closure_captures(
                 } else {
                     LoweredValue::Single(retained)
                 };
-                store_lowered_to_address(builder, field.ty, field.address, replacement, pointer)?;
+                store_lowered_to_address(
+                    builder,
+                    resources.program,
+                    field.ty,
+                    field.address,
+                    replacement,
+                    pointer,
+                )?;
                 release_string(builder, old_string, resources)?;
                 builder.ins().jump(done, &[]);
                 builder.switch_to_block(done);
             }
             mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
-                sync_writable_two_word_capture(builder, field, slot, new, pointer)?;
+                sync_writable_two_word_capture(
+                    builder,
+                    resources.program,
+                    field,
+                    slot,
+                    new,
+                    pointer,
+                )?;
             }
             mir::Type::Error | mir::Type::NullableError => {
-                sync_writable_two_word_capture(builder, field, slot, new, pointer)?;
+                sync_writable_two_word_capture(
+                    builder,
+                    resources.program,
+                    field,
+                    slot,
+                    new,
+                    pointer,
+                )?;
             }
             mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
                 let nullable = matches!(field.ty, mir::Type::NullablePayloadEnum(_));
@@ -2406,7 +2823,14 @@ fn sync_writable_closure_captures(
             | mir::Type::WritableSharedReferenceAccess(_)
             | mir::Type::NullableReadonlySharedReferenceAccess(_)
             | mir::Type::NullableWritableSharedReferenceAccess(_) => {
-                sync_writable_pointer_capture(builder, field, slot, new.single()?, pointer)?;
+                sync_writable_pointer_capture(
+                    builder,
+                    resources.program,
+                    field,
+                    slot,
+                    new.single()?,
+                    pointer,
+                )?;
             }
             mir::Type::ClosureEnvironment(_) => {
                 return Err(malformed_mir(
@@ -2420,18 +2844,20 @@ fn sync_writable_closure_captures(
 
 fn sync_writable_two_word_capture(
     builder: &mut FunctionBuilder,
+    program: &mir::Program,
     field: BoundClosureField,
     slot: StackSlot,
     new: LoweredValue,
     pointer: ClifType,
 ) -> Result<(), BackendError> {
-    store_lowered_to_address(builder, field.ty, field.address, new, pointer)?;
+    store_lowered_to_address(builder, program, field.ty, field.address, new, pointer)?;
     clear_function_carrier_stack(builder, slot, pointer);
     Ok(())
 }
 
 fn sync_writable_pointer_capture(
     builder: &mut FunctionBuilder,
+    program: &mir::Program,
     field: BoundClosureField,
     slot: StackSlot,
     new: Value,
@@ -2439,6 +2865,7 @@ fn sync_writable_pointer_capture(
 ) -> Result<(), BackendError> {
     store_lowered_to_address(
         builder,
+        program,
         field.ty,
         field.address,
         LoweredValue::Single(new),
@@ -2466,6 +2893,7 @@ fn lower_statement(
             let slot = local_slot(resources.local_slots, *local)?;
             let carrier = load_lowered_from_stack(
                 builder,
+                resources.program,
                 local_definition(resources.program, resources.function_id, *local)?.ty,
                 slot,
                 pointer,
@@ -2510,9 +2938,22 @@ fn lower_statement(
                 let field_address = builder
                     .ins()
                     .iadd_imm_u(source_address, i64::from(layout.offset));
-                let value = load_lowered_from_address(builder, field.ty, field_address, pointer);
+                let value = load_lowered_from_address(
+                    builder,
+                    resources.program,
+                    field.ty,
+                    field_address,
+                    pointer,
+                );
                 let target_slot = local_slot(resources.local_slots, *target)?;
-                store_lowered_to_stack(builder, field.ty, target_slot, value, pointer)?;
+                store_lowered_to_stack(
+                    builder,
+                    resources.program,
+                    field.ty,
+                    target_slot,
+                    value,
+                    pointer,
+                )?;
                 if matches!(mode, mir::MatchBindingMode::ConsumedArm)
                     && field.ty.has_move_ownership()
                 {
@@ -2591,7 +3032,14 @@ fn lower_statement(
                     }
                 };
                 let slot = local_slot(resources.local_slots, *target)?;
-                store_lowered_to_stack(builder, definition.ty, slot, value, pointer)?;
+                store_lowered_to_stack(
+                    builder,
+                    resources.program,
+                    definition.ty,
+                    slot,
+                    value,
+                    pointer,
+                )?;
             }
         }
         mir::Statement::AssignLocal { target, value } => {
@@ -2603,92 +3051,167 @@ fn lower_statement(
                 definition.owned || resources.writable_parameter_addresses.contains_key(target);
             let old_error = (owns_replaced_value
                 && matches!(definition.ty, mir::Type::Error | mir::Type::NullableError))
-            .then(|| load_lowered_from_stack(builder, definition.ty, slot, pointer));
+            .then(|| {
+                load_lowered_from_stack(builder, resources.program, definition.ty, slot, pointer)
+            });
             let old_function = (owns_replaced_value
                 && matches!(
                     definition.ty,
                     mir::Type::Function(_) | mir::Type::NullableFunction(_)
                 ))
-            .then(|| load_lowered_from_stack(builder, definition.ty, slot, pointer));
-            let old_value = match definition.ty {
-                mir::Type::String => Some((
-                    load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
-                    None,
-                )),
-                mir::Type::NullableString => Some((
-                    load_lowered_from_stack(builder, definition.ty, slot, pointer)
-                        .nullable()?
-                        .1,
-                    None,
-                )),
+            .then(|| {
+                load_lowered_from_stack(builder, resources.program, definition.ty, slot, pointer)
+            });
+            let old_class = match definition.ty {
                 mir::Type::Class(class) | mir::Type::NullableClass(class)
                     if owns_replaced_value =>
                 {
                     Some((
-                        load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
-                        Some(class),
+                        load_lowered_from_stack(
+                            builder,
+                            resources.program,
+                            definition.ty,
+                            slot,
+                            pointer,
+                        ),
+                        class,
                     ))
-                }
-                mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_)
-                    if owns_replaced_value =>
-                {
-                    Some((
-                        load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
-                        None,
-                    ))
-                }
-                mir::Type::WeakReference(_)
-                | mir::Type::NullableWeakReference(_)
-                | mir::Type::WritableSharedReference(_)
-                | mir::Type::WritableWeakReference(_)
-                | mir::Type::NullableWritableSharedReference(_)
-                | mir::Type::NullableWritableWeakReference(_)
-                | mir::Type::ReadonlySharedReferenceAccess(_)
-                | mir::Type::WritableSharedReferenceAccess(_)
-                | mir::Type::NullableReadonlySharedReferenceAccess(_)
-                | mir::Type::NullableWritableSharedReferenceAccess(_)
-                    if owns_replaced_value =>
-                {
-                    Some((
-                        load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
-                        None,
-                    ))
-                }
-                mir::Type::Mixed | mir::Type::NullableMixed if owns_replaced_value => Some((
-                    load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
-                    None,
-                )),
-                mir::Type::Collection(_) | mir::Type::NullableCollection(_)
-                    if owns_replaced_value =>
-                {
-                    Some((
-                        load_lowered_from_stack(builder, definition.ty, slot, pointer).single()?,
-                        None,
-                    ))
-                }
-                mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
-                    if owns_replaced_value =>
-                {
-                    let nullable = matches!(definition.ty, mir::Type::NullablePayloadEnum(_));
-                    let old = create_payload_storage(builder, payload, nullable, resources);
-                    let address = builder.ins().stack_addr(pointer, slot, 0);
-                    copy_inline_bytes(
-                        builder,
-                        old,
-                        address,
-                        payload.storage_size(nullable),
-                        pointer,
-                    );
-                    Some((old, None))
                 }
                 _ => None,
             };
-            store_lowered_to_stack(builder, definition.ty, slot, new_value, pointer)?;
+            let old_value: Option<(Value, Option<crate::class_layout::ClassId>)> =
+                match definition.ty {
+                    mir::Type::String => Some((
+                        load_lowered_from_stack(
+                            builder,
+                            resources.program,
+                            definition.ty,
+                            slot,
+                            pointer,
+                        )
+                        .single()?,
+                        None,
+                    )),
+                    mir::Type::NullableString => Some((
+                        load_lowered_from_stack(
+                            builder,
+                            resources.program,
+                            definition.ty,
+                            slot,
+                            pointer,
+                        )
+                        .nullable()?
+                        .1,
+                        None,
+                    )),
+                    mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_)
+                        if owns_replaced_value =>
+                    {
+                        Some((
+                            load_lowered_from_stack(
+                                builder,
+                                resources.program,
+                                definition.ty,
+                                slot,
+                                pointer,
+                            )
+                            .single()?,
+                            None,
+                        ))
+                    }
+                    mir::Type::WeakReference(_)
+                    | mir::Type::NullableWeakReference(_)
+                    | mir::Type::WritableSharedReference(_)
+                    | mir::Type::WritableWeakReference(_)
+                    | mir::Type::NullableWritableSharedReference(_)
+                    | mir::Type::NullableWritableWeakReference(_)
+                    | mir::Type::ReadonlySharedReferenceAccess(_)
+                    | mir::Type::WritableSharedReferenceAccess(_)
+                    | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                    | mir::Type::NullableWritableSharedReferenceAccess(_)
+                        if owns_replaced_value =>
+                    {
+                        Some((
+                            load_lowered_from_stack(
+                                builder,
+                                resources.program,
+                                definition.ty,
+                                slot,
+                                pointer,
+                            )
+                            .single()?,
+                            None,
+                        ))
+                    }
+                    mir::Type::Mixed | mir::Type::NullableMixed if owns_replaced_value => Some((
+                        load_lowered_from_stack(
+                            builder,
+                            resources.program,
+                            definition.ty,
+                            slot,
+                            pointer,
+                        )
+                        .single()?,
+                        None,
+                    )),
+                    mir::Type::Collection(_) | mir::Type::NullableCollection(_)
+                        if owns_replaced_value =>
+                    {
+                        Some((
+                            load_lowered_from_stack(
+                                builder,
+                                resources.program,
+                                definition.ty,
+                                slot,
+                                pointer,
+                            )
+                            .single()?,
+                            None,
+                        ))
+                    }
+                    mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload)
+                        if owns_replaced_value =>
+                    {
+                        let nullable = matches!(definition.ty, mir::Type::NullablePayloadEnum(_));
+                        let old = create_payload_storage(builder, payload, nullable, resources);
+                        let address = builder.ins().stack_addr(pointer, slot, 0);
+                        copy_inline_bytes(
+                            builder,
+                            old,
+                            address,
+                            payload.storage_size(nullable),
+                            pointer,
+                        );
+                        Some((old, None))
+                    }
+                    _ => None,
+                };
+            store_lowered_to_stack(
+                builder,
+                resources.program,
+                definition.ty,
+                slot,
+                new_value,
+                pointer,
+            )?;
             if let Some(address) = resources.writable_parameter_addresses.get(target).copied() {
-                let current = load_lowered_from_stack(builder, definition.ty, slot, pointer);
-                store_lowered_to_address(builder, definition.ty, address, current, pointer)?;
+                let current = load_lowered_from_stack(
+                    builder,
+                    resources.program,
+                    definition.ty,
+                    slot,
+                    pointer,
+                );
+                store_lowered_to_address(
+                    builder,
+                    resources.program,
+                    definition.ty,
+                    address,
+                    current,
+                    pointer,
+                )?;
             }
-            if let Some((old, class)) = old_value {
+            if let Some((old, _class)) = old_value {
                 if let mir::Type::Collection(collection)
                 | mir::Type::NullableCollection(collection) = definition.ty
                 {
@@ -2707,8 +3230,6 @@ fn lower_statement(
                     lower_drop_shared_value(builder, old, true, resources)?;
                 } else if let Some(symbol) = writable_shared_release_symbol(definition.ty) {
                     lower_drop_writable_shared_value(builder, old, symbol, resources)?;
-                } else if let Some(class) = class {
-                    lower_drop_class_value_checked(builder, old, class, resources)?;
                 } else if let mir::Type::PayloadEnum(payload) = definition.ty {
                     lower_drop_payload_enum_at(builder, old, payload, false, resources)?;
                 } else if let mir::Type::NullablePayloadEnum(payload) = definition.ty {
@@ -2716,6 +3237,9 @@ fn lower_statement(
                 } else {
                     release_string(builder, old, resources)?;
                 }
+            }
+            if let Some((old, class)) = old_class {
+                lower_drop_class_carrier_checked(builder, old, class, resources)?;
             }
             if let Some(old) = old_error {
                 lower_drop_error_value(builder, old, resources)?;
@@ -2867,7 +3391,13 @@ fn lower_statement(
                     mir::Type::Error | mir::Type::NullableError
                 ))
             .then(|| {
-                load_lowered_from_address(builder, property_definition.ty, address, pointer_type)
+                load_lowered_from_address(
+                    builder,
+                    resources.program,
+                    property_definition.ty,
+                    address,
+                    pointer_type,
+                )
             });
             let old_function = (replaces
                 && matches!(
@@ -2875,14 +3405,31 @@ fn lower_statement(
                     mir::Type::Function(_) | mir::Type::NullableFunction(_)
                 ))
             .then(|| {
-                load_lowered_from_address(builder, property_definition.ty, address, pointer_type)
+                load_lowered_from_address(
+                    builder,
+                    resources.program,
+                    property_definition.ty,
+                    address,
+                    pointer_type,
+                )
             });
+            let old_class = match property_definition.ty {
+                mir::Type::Class(class) | mir::Type::NullableClass(class) if replaces => Some((
+                    load_lowered_from_address(
+                        builder,
+                        resources.program,
+                        property_definition.ty,
+                        address,
+                        pointer_type,
+                    ),
+                    class,
+                )),
+                _ => None,
+            };
             let old_value = if replaces {
                 match property_definition.ty {
                     mir::Type::String
                     | mir::Type::Mixed
-                    | mir::Type::Class(_)
-                    | mir::Type::NullableClass(_)
                     | mir::Type::NullableMixed
                     | mir::Type::SharedReference(_)
                     | mir::Type::WeakReference(_)
@@ -2900,6 +3447,7 @@ fn lower_statement(
                     | mir::Type::NullableCollection(_) => Some(
                         load_lowered_from_address(
                             builder,
+                            resources.program,
                             property_definition.ty,
                             address,
                             pointer_type,
@@ -2909,6 +3457,7 @@ fn lower_statement(
                     mir::Type::NullableString => Some(
                         load_lowered_from_address(
                             builder,
+                            resources.program,
                             property_definition.ty,
                             address,
                             pointer_type,
@@ -2931,6 +3480,8 @@ fn lower_statement(
                     }
                     mir::Type::Scalar(_)
                     | mir::Type::NullableScalar(_)
+                    | mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
                     | mir::Type::Error
                     | mir::Type::NullableError => None,
                     mir::Type::Function(_) | mir::Type::NullableFunction(_) => None,
@@ -2945,6 +3496,7 @@ fn lower_statement(
             };
             store_lowered_to_address(
                 builder,
+                resources.program,
                 property_definition.ty,
                 address,
                 value,
@@ -2953,9 +3505,6 @@ fn lower_statement(
             match (property_definition.ty, old_value) {
                 (mir::Type::String | mir::Type::NullableString, Some(old_value)) => {
                     release_string(builder, old_value, resources)?;
-                }
-                (mir::Type::Class(class) | mir::Type::NullableClass(class), Some(old_value)) => {
-                    lower_drop_class_value_checked(builder, old_value, class, resources)?;
                 }
                 (
                     mir::Type::Collection(collection) | mir::Type::NullableCollection(collection),
@@ -2990,6 +3539,9 @@ fn lower_statement(
                 }
                 _ => {}
             }
+            if let Some((old, class)) = old_class {
+                lower_drop_class_carrier_checked(builder, old, class, resources)?;
+            }
             if let Some(old_error) = old_error {
                 lower_drop_error_value(builder, old_error, resources)?;
             }
@@ -3003,15 +3555,36 @@ fn lower_statement(
             let address = lower_static_address(builder, *target, resources)?;
             let pointer = resources.module.target_config().pointer_type();
             let old_error = matches!(property.ty, mir::Type::Error | mir::Type::NullableError)
-                .then(|| load_lowered_from_address(builder, property.ty, address, pointer));
+                .then(|| {
+                    load_lowered_from_address(
+                        builder,
+                        resources.program,
+                        property.ty,
+                        address,
+                        pointer,
+                    )
+                });
             let old_value = match property.ty {
                 mir::Type::String | mir::Type::Mixed | mir::Type::NullableMixed => Some(
-                    load_lowered_from_address(builder, property.ty, address, pointer).single()?,
+                    load_lowered_from_address(
+                        builder,
+                        resources.program,
+                        property.ty,
+                        address,
+                        pointer,
+                    )
+                    .single()?,
                 ),
                 mir::Type::NullableString => Some(
-                    load_lowered_from_address(builder, property.ty, address, pointer)
-                        .nullable()?
-                        .1,
+                    load_lowered_from_address(
+                        builder,
+                        resources.program,
+                        property.ty,
+                        address,
+                        pointer,
+                    )
+                    .nullable()?
+                    .1,
                 ),
                 mir::Type::PayloadEnum(payload) | mir::Type::NullablePayloadEnum(payload) => {
                     let nullable = matches!(property.ty, mir::Type::NullablePayloadEnum(_));
@@ -3027,7 +3600,14 @@ fn lower_statement(
                 }
                 _ => None,
             };
-            store_lowered_to_address(builder, property.ty, address, new_value, pointer)?;
+            store_lowered_to_address(
+                builder,
+                resources.program,
+                property.ty,
+                address,
+                new_value,
+                pointer,
+            )?;
             if let Some(old_value) = old_value {
                 if matches!(property.ty, mir::Type::Mixed | mir::Type::NullableMixed) {
                     lower_drop_mixed_value(builder, old_value, resources)?;
@@ -3046,20 +3626,22 @@ fn lower_statement(
         mir::Statement::DropClass { local, .. } => {
             let pointer_type = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder
-                .ins()
-                .stack_load(pointer_type, pointer_type, slot, 0);
-            let zero = builder.ins().iconst(pointer_type, 0);
-            builder.ins().stack_store(pointer_type, zero, slot, 0);
-            let (mir::Type::Class(class) | mir::Type::NullableClass(class)) =
-                local_definition(resources.program, resources.function_id, *local)?.ty
-            else {
+            let ty = local_definition(resources.program, resources.function_id, *local)?.ty;
+            let (mir::Type::Class(class) | mir::Type::NullableClass(class)) = ty else {
                 return Err(malformed_mir(format!(
                     "drop local{} did not target a class local",
                     local.0
                 )));
             };
-            lower_drop_class_value_checked(builder, value, class, resources)?;
+            let value = load_lowered_from_stack(builder, resources.program, ty, slot, pointer_type);
+            let zero = builder.ins().iconst(pointer_type, 0);
+            builder.ins().stack_store(pointer_type, zero, slot, 0);
+            if class_uses_open_carrier(resources.program, class) {
+                builder
+                    .ins()
+                    .stack_store(pointer_type, zero, slot, pointer_type.bytes() as i32);
+            }
+            lower_drop_class_carrier_checked(builder, value, class, resources)?;
         }
         mir::Statement::DropString { local } => {
             let pointer = resources.module.target_config().pointer_type();
@@ -3180,8 +3762,14 @@ fn lower_statement(
         mir::Statement::EnsureErrorOrigin { error, origin } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *error)?;
-            let (object, descriptor) =
-                load_lowered_from_stack(builder, mir::Type::Error, slot, pointer).nullable()?;
+            let (object, descriptor) = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::Error,
+                slot,
+                pointer,
+            )
+            .nullable()?;
             let flags = cranelift_codegen::ir::MachMemFlags::trusted();
             let origin_offset =
                 builder
@@ -3203,11 +3791,38 @@ fn lower_statement(
         mir::Statement::ExtractErrorObject { target, error, .. } => {
             let pointer = resources.module.target_config().pointer_type();
             let error_slot = local_slot(resources.local_slots, *error)?;
-            let (object, _) =
-                load_lowered_from_stack(builder, mir::Type::Error, error_slot, pointer)
-                    .nullable()?;
+            let (object, error_descriptor) = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::Error,
+                error_slot,
+                pointer,
+            )
+            .nullable()?;
             let target_slot = local_slot(resources.local_slots, *target)?;
             builder.ins().stack_store(pointer, object, target_slot, 0);
+            let mir::Type::Class(target_class) = local_in(
+                function_in(resources.program, resources.function_id)?,
+                *target,
+            )?
+            .ty
+            else {
+                return Err(malformed_mir("Error catch target is not a class"));
+            };
+            if class_uses_open_carrier(resources.program, target_class) {
+                let dynamic_class_descriptor = builder.ins().load(
+                    pointer,
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    error_descriptor,
+                    (pointer.bytes() * 8) as i32,
+                );
+                builder.ins().stack_store(
+                    pointer,
+                    dynamic_class_descriptor,
+                    target_slot,
+                    pointer.bytes() as i32,
+                );
+            }
             let zero = builder.ins().iconst(pointer, 0);
             builder.ins().stack_store(pointer, zero, error_slot, 0);
             builder
@@ -3217,7 +3832,13 @@ fn lower_statement(
         mir::Statement::DropError { local } => {
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = load_lowered_from_stack(builder, mir::Type::Error, slot, pointer);
+            let value = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::Error,
+                slot,
+                pointer,
+            );
             let zero = builder.ins().iconst(pointer, 0);
             builder.ins().stack_store(pointer, zero, slot, 0);
             builder
@@ -3278,6 +3899,7 @@ fn lower_error_origin_address(
 
 fn load_lowered_from_stack(
     builder: &mut FunctionBuilder,
+    program: &mir::Program,
     ty: mir::Type,
     slot: StackSlot,
     pointer: ClifType,
@@ -3311,6 +3933,19 @@ fn load_lowered_from_stack(
         mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
             LoweredValue::Single(builder.ins().stack_addr(pointer, slot, 0))
         }
+        mir::Type::Class(class) | mir::Type::NullableClass(class)
+            if class_uses_open_carrier(program, class) =>
+        {
+            LoweredValue::OpenClass {
+                object: builder.ins().stack_load(pointer, pointer, slot, 0),
+                descriptor: builder.ins().stack_load(
+                    pointer,
+                    pointer,
+                    slot,
+                    pointer.bytes() as i32,
+                ),
+            }
+        }
         mir::Type::String
         | mir::Type::Mixed
         | mir::Type::Class(_)
@@ -3338,6 +3973,7 @@ fn load_lowered_from_stack(
 
 fn store_lowered_to_stack(
     builder: &mut FunctionBuilder,
+    program: &mir::Program,
     ty: mir::Type,
     slot: StackSlot,
     value: LoweredValue,
@@ -3367,6 +4003,17 @@ fn store_lowered_to_stack(
                 .ins()
                 .stack_store(pointer, payload, slot, pointer.bytes() as i32);
         }
+        mir::Type::Class(class) | mir::Type::NullableClass(class)
+            if class_uses_open_carrier(program, class) =>
+        {
+            let (object, descriptor) = value.class_parts()?;
+            let descriptor = descriptor
+                .ok_or_else(|| malformed_mir("open class storage received no class descriptor"))?;
+            builder.ins().stack_store(pointer, object, slot, 0);
+            builder
+                .ins()
+                .stack_store(pointer, descriptor, slot, pointer.bytes() as i32);
+        }
         _ => {
             builder.ins().stack_store(pointer, value.single()?, slot, 0);
         }
@@ -3376,6 +4023,7 @@ fn store_lowered_to_stack(
 
 fn load_lowered_from_address(
     builder: &mut FunctionBuilder,
+    program: &mir::Program,
     ty: mir::Type,
     address: Value,
     pointer: ClifType,
@@ -3410,6 +4058,16 @@ fn load_lowered_from_address(
         mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => {
             LoweredValue::Single(address)
         }
+        mir::Type::Class(class) | mir::Type::NullableClass(class)
+            if class_uses_open_carrier(program, class) =>
+        {
+            LoweredValue::OpenClass {
+                object: builder.ins().load(pointer, flags, address, 0),
+                descriptor: builder
+                    .ins()
+                    .load(pointer, flags, address, pointer.bytes() as i32),
+            }
+        }
         mir::Type::String
         | mir::Type::Mixed
         | mir::Type::Class(_)
@@ -3437,6 +4095,7 @@ fn load_lowered_from_address(
 
 fn store_lowered_to_address(
     builder: &mut FunctionBuilder,
+    program: &mir::Program,
     ty: mir::Type,
     address: Value,
     value: LoweredValue,
@@ -3465,6 +4124,17 @@ fn store_lowered_to_address(
             builder
                 .ins()
                 .store(flags, payload, address, pointer.bytes() as i32);
+        }
+        mir::Type::Class(class) | mir::Type::NullableClass(class)
+            if class_uses_open_carrier(program, class) =>
+        {
+            let (object, descriptor) = value.class_parts()?;
+            let descriptor = descriptor
+                .ok_or_else(|| malformed_mir("open class storage received no class descriptor"))?;
+            builder.ins().store(flags, object, address, 0);
+            builder
+                .ins()
+                .store(flags, descriptor, address, pointer.bytes() as i32);
         }
         _ => {
             builder.ins().store(flags, value.single()?, address, 0);
@@ -3562,6 +4232,7 @@ fn lower_terminator(
             }) {
                 store_lowered_to_address(
                     builder,
+                    resources.program,
                     expression.ty(),
                     destination,
                     value,
@@ -3708,9 +4379,36 @@ fn lower_terminator(
             {
                 values.push(home);
             }
-            values.extend(lowered.abi_values.iter().copied());
-            let callee = declared_function(builder, resources, *function)?;
-            let call = builder.ins().call(callee, &values);
+            append_lowered_call_abi(builder, callee_definition, &lowered, &mut values, resources)?;
+            let call = if let Some(slot) = callee_definition.virtual_slot {
+                let receiver = lowered
+                    .arguments
+                    .first()
+                    .ok_or_else(|| malformed_mir("checked virtual call has no receiver"))?;
+                if let Some(descriptor) = receiver.class_parts()?.1 {
+                    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+                    let vtable = builder.ins().load(
+                        pointer,
+                        flags,
+                        descriptor,
+                        (pointer.bytes() * 3) as i32,
+                    );
+                    let entry =
+                        builder
+                            .ins()
+                            .load(pointer, flags, vtable, (pointer.bytes() * slot) as i32);
+                    let signature =
+                        function_signature(resources.module, resources.program, callee_definition)?;
+                    let signature = builder.import_signature(signature);
+                    builder.ins().call_indirect(signature, entry, &values)
+                } else {
+                    let callee = declared_function(builder, resources, *function)?;
+                    builder.ins().call(callee, &values)
+                }
+            } else {
+                let callee = declared_function(builder, resources, *function)?;
+                builder.ins().call(callee, &values)
+            };
             let status = *builder
                 .inst_results(call)
                 .first()
@@ -3764,11 +4462,25 @@ fn lower_terminator(
             let (object, lowered) =
                 lower_class_allocation(builder, *class, properties, args, resources)?;
             let error_slot = local_slot(resources.local_slots, *error)?;
+            let constructor_definition = function_in(resources.program, *constructor)?;
+            let receiver_ty =
+                local_in(constructor_definition, constructor_definition.params[0])?.ty;
+            let receiver = match receiver_ty {
+                mir::Type::Class(receiver_class) => class_value_for_static_type(
+                    builder,
+                    object,
+                    None,
+                    receiver_class,
+                    *class,
+                    resources,
+                )?,
+                _ => LoweredValue::Single(object),
+            };
             let mut values = vec![
                 resources.current_frame,
                 builder.ins().stack_addr(pointer, error_slot, 0),
-                object,
             ];
+            receiver.append_to(&mut values);
             values.extend(lowered.abi_values.iter().copied());
             let callee = declared_function(builder, resources, *constructor)?;
             let call = builder.ins().call(callee, &values);
@@ -3792,12 +4504,26 @@ fn lower_terminator(
                 .ins()
                 .brif(succeeded, success_store, &[], failure_status, &[]);
             builder.switch_to_block(success_store);
-            builder.ins().stack_store(
-                pointer,
-                object,
+            let result_ty = local_definition(resources.program, resources.function_id, *result)?.ty;
+            let result_value = match result_ty {
+                mir::Type::Class(result_class) => class_value_for_static_type(
+                    builder,
+                    object,
+                    None,
+                    result_class,
+                    *class,
+                    resources,
+                )?,
+                _ => LoweredValue::Single(object),
+            };
+            store_lowered_to_stack(
+                builder,
+                resources.program,
+                result_ty,
                 local_slot(resources.local_slots, *result)?,
-                0,
-            );
+                result_value,
+                pointer,
+            )?;
             builder.ins().jump(block_for(blocks, *success)?, &[]);
 
             builder.switch_to_block(failure_status);
@@ -3863,8 +4589,21 @@ fn lower_terminator(
                 .ok_or_else(|| malformed_mir("checked propagation has no caller Error out slot"))?;
             let pointer = resources.module.target_config().pointer_type();
             let slot = local_slot(resources.local_slots, *error)?;
-            let value = load_lowered_from_stack(builder, mir::Type::Error, slot, pointer);
-            store_lowered_to_address(builder, mir::Type::Error, destination, value, pointer)?;
+            let value = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::Error,
+                slot,
+                pointer,
+            );
+            store_lowered_to_address(
+                builder,
+                resources.program,
+                mir::Type::Error,
+                destination,
+                value,
+                pointer,
+            )?;
             let zero = builder.ins().iconst(pointer, 0);
             builder.ins().stack_store(pointer, zero, slot, 0);
             builder
@@ -4183,7 +4922,8 @@ fn lower_indirect_call(
     values.push(environment);
     values.extend(lowered.abi_values.iter().copied());
     let entry = load_closure_entry(builder, descriptor, pointer);
-    let signature = indirect_function_signature(resources.module, &function_type);
+    let signature =
+        indirect_function_signature(resources.module, resources.program, &function_type);
     let signature = builder.import_signature(signature);
     let call = builder.ins().call_indirect(signature, entry, &values);
     let call_results = builder.inst_results(call).to_vec();
@@ -4241,7 +4981,8 @@ fn lower_checked_indirect_call(
     values.push(environment);
     values.extend(lowered.abi_values.iter().copied());
     let entry = load_closure_entry(builder, descriptor, pointer);
-    let signature = indirect_function_signature(resources.module, &function_type);
+    let signature =
+        indirect_function_signature(resources.module, resources.program, &function_type);
     let signature = builder.import_signature(signature);
     let call = builder.ins().call_indirect(signature, entry, &values);
     let status = *builder
@@ -4286,6 +5027,7 @@ fn load_closure_entry(
 
 fn indirect_function_signature(
     module: &mut ObjectModule,
+    program: &mir::Program,
     function_type: &mir::FunctionType,
 ) -> Signature {
     let pointer = module.target_config().pointer_type();
@@ -4298,7 +5040,7 @@ fn indirect_function_signature(
         if parameter.mode == mir::FunctionParameterMode::Writable {
             signature.params.push(AbiParam::new(pointer));
         } else {
-            append_type_abi_params(&mut signature.params, parameter.ty, pointer);
+            append_type_abi_params(&mut signature.params, program, parameter.ty, pointer);
         }
     }
     if plan.checked {
@@ -4308,7 +5050,7 @@ fn indirect_function_signature(
             ty,
             mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
         ) {
-            append_type_abi_params(&mut signature.returns, ty, pointer);
+            append_type_abi_params(&mut signature.returns, program, ty, pointer);
         }
     }
     signature
@@ -4358,7 +5100,7 @@ fn store_indirect_result(
     };
     let pointer = resources.module.target_config().pointer_type();
     let slot = local_slot(resources.local_slots, target)?;
-    store_lowered_to_stack(builder, ty, slot, value, pointer)
+    store_lowered_to_stack(builder, resources.program, ty, slot, value, pointer)
 }
 
 fn cleanup_indirect_call_arguments(
@@ -4386,7 +5128,7 @@ fn cleanup_indirect_call_arguments(
         }
         let value = lowered.arguments[index];
         if let Some(class) = argument.owned_temporary_class() {
-            defer_or_drop_class_temporary(builder, value.single()?, class, resources)?;
+            defer_or_drop_class_carrier_temporary(builder, value, class, resources)?;
         } else if let Some(collection) = argument.owned_temporary_collection() {
             defer_or_drop_collection_temporary(builder, value.single()?, collection, resources)?;
         } else if let Some(shared) = argument.owned_temporary_shared() {
@@ -4626,6 +5368,7 @@ fn lower_checked_io_error_object(
     let descriptor = lower_error_descriptor_address(builder, descriptor, resources)?;
     store_lowered_to_address(
         builder,
+        resources.program,
         mir::Type::Error,
         error_address,
         LoweredValue::Nullable {
@@ -4653,6 +5396,7 @@ fn store_known_property(
     let address = lower_property_address_from_value(builder, object, property.id, resources)?;
     store_lowered_to_address(
         builder,
+        resources.program,
         property.ty,
         address,
         value,
@@ -4820,11 +5564,9 @@ fn lower_rvalue(
         mir::Rvalue::NullableError(value) => {
             lower_nullable_error_expression(builder, value, resources)
         }
-        mir::Rvalue::Class(value) => {
-            lower_class_expression(builder, value, resources).map(LoweredValue::Single)
-        }
+        mir::Rvalue::Class(value) => lower_class_expression(builder, value, resources),
         mir::Rvalue::NullableClass(value) => {
-            lower_nullable_class_expression(builder, value, resources).map(LoweredValue::Single)
+            lower_nullable_class_expression(builder, value, resources)
         }
         mir::Rvalue::SharedReference(value) => {
             lower_shared_reference_expression(builder, value, resources).map(LoweredValue::Single)
@@ -4914,6 +5656,7 @@ fn lower_function_expression(
             let slot = local_slot(resources.local_slots, *local)?;
             let value = load_lowered_from_stack(
                 builder,
+                resources.program,
                 mir::Type::Function(expression.function_type()),
                 slot,
                 pointer,
@@ -4929,6 +5672,7 @@ fn lower_function_expression(
             let address = lower_property_address(builder, *object, *property, resources)?;
             Ok(load_lowered_from_address(
                 builder,
+                resources.program,
                 mir::Type::Function(expression.function_type()),
                 address,
                 pointer,
@@ -5061,7 +5805,14 @@ fn lower_closure_environment_create(
                     ));
                 }
                 let value = lower_rvalue(builder, value, resources)?;
-                store_lowered_to_address(builder, field.ty, address, value, pointer)?;
+                store_lowered_to_address(
+                    builder,
+                    resources.program,
+                    field.ty,
+                    address,
+                    value,
+                    pointer,
+                )?;
                 if let Some(bit) = field_layout.live_bit {
                     set_environment_live_bit(builder, environment, bit, true);
                 }
@@ -5289,6 +6040,7 @@ fn lower_nullable_function_expression(
             let slot = local_slot(resources.local_slots, *local)?;
             let value = load_lowered_from_stack(
                 builder,
+                resources.program,
                 mir::Type::NullableFunction(expression.function_type()),
                 slot,
                 pointer,
@@ -5304,6 +6056,7 @@ fn lower_nullable_function_expression(
             let address = lower_property_address(builder, *object, *property, resources)?;
             Ok(load_lowered_from_address(
                 builder,
+                resources.program,
                 mir::Type::NullableFunction(expression.function_type()),
                 address,
                 pointer,
@@ -5403,7 +6156,13 @@ fn lower_error_expression(
     match expression {
         mir::ErrorExpression::Local { local, transfer } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = load_lowered_from_stack(builder, mir::Type::Error, slot, pointer);
+            let value = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::Error,
+                slot,
+                pointer,
+            );
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
                 builder.ins().stack_store(pointer, zero, slot, 0);
@@ -5415,7 +6174,13 @@ fn lower_error_expression(
         }
         mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = load_lowered_from_stack(builder, mir::Type::NullableError, slot, pointer);
+            let value = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::NullableError,
+                slot,
+                pointer,
+            );
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
                 builder.ins().stack_store(pointer, zero, slot, 0);
@@ -5426,12 +6191,16 @@ fn lower_error_expression(
             Ok(value)
         }
         mir::ErrorExpression::FromClass { object, descriptor } => Ok(LoweredValue::Nullable {
-            present: lower_class_expression(builder, object, resources)?,
+            present: lower_class_expression(builder, object, resources)?
+                .class_parts()?
+                .0,
             payload: lower_error_descriptor_address(builder, *descriptor, resources)?,
         }),
         mir::ErrorExpression::FromNullableClass { object, descriptor } => {
+            let (object, _) =
+                lower_nullable_class_expression(builder, object, resources)?.class_parts()?;
             Ok(LoweredValue::Nullable {
-                present: lower_nullable_class_expression(builder, object, resources)?,
+                present: object,
                 payload: lower_error_descriptor_address(builder, *descriptor, resources)?,
             })
         }
@@ -5471,8 +6240,14 @@ fn lower_error_expression(
         ),
         mir::ErrorExpression::MixedPayload { mixed, transfer } => {
             let slot = local_slot(resources.local_slots, *mixed)?;
-            let mixed_value =
-                load_lowered_from_stack(builder, mir::Type::Mixed, slot, pointer).single()?;
+            let mixed_value = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::Mixed,
+                slot,
+                pointer,
+            )
+            .single()?;
             let word = runtime_call(
                 builder,
                 MIXED_PAYLOAD,
@@ -5535,7 +6310,13 @@ fn lower_nullable_error_expression(
         }
         mir::NullableErrorExpression::Local { local, transfer } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = load_lowered_from_stack(builder, mir::Type::NullableError, slot, pointer);
+            let value = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::NullableError,
+                slot,
+                pointer,
+            );
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
                 builder.ins().stack_store(pointer, zero, slot, 0);
@@ -5551,8 +6332,13 @@ fn lower_nullable_error_expression(
             transfer,
         } => {
             let address = lower_property_address(builder, *object, *property, resources)?;
-            let value =
-                load_lowered_from_address(builder, mir::Type::NullableError, address, pointer);
+            let value = load_lowered_from_address(
+                builder,
+                resources.program,
+                mir::Type::NullableError,
+                address,
+                pointer,
+            );
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
                 let flags = cranelift_codegen::ir::MachMemFlags::trusted();
@@ -5655,6 +6441,7 @@ fn lower_two_word_collection_index(
     };
     Ok(load_lowered_from_address(
         builder,
+        resources.program,
         definition.value,
         address,
         pointer,
@@ -5710,7 +6497,7 @@ fn lower_nullable_two_word_collection_get(
         types::I8,
         i64::from(matches!(
             definition.value,
-            mir::Type::NullableError | mir::Type::NullableFunction(_)
+            mir::Type::NullableError | mir::Type::NullableFunction(_) | mir::Type::NullableClass(_)
         )),
     );
     runtime_call(
@@ -5755,6 +6542,9 @@ fn lower_nullable_two_word_collection_get(
         mir::Type::Function(function) | mir::Type::NullableFunction(function) => {
             mir::Type::NullableFunction(function)
         }
+        mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+            mir::Type::NullableClass(class)
+        }
         ty => {
             return Err(malformed_mir(format!(
                 "type {ty} does not use two-word nullable collection access"
@@ -5763,6 +6553,7 @@ fn lower_nullable_two_word_collection_get(
     };
     Ok(load_lowered_from_address(
         builder,
+        resources.program,
         result_type,
         raw,
         pointer,
@@ -5809,6 +6600,7 @@ fn lower_payload_enum_expression(
                     .iadd_imm_u(address, i64::from(field_layout.offset));
                 store_lowered_to_address(
                     builder,
+                    resources.program,
                     field_definition.ty,
                     field_address,
                     value,
@@ -6097,8 +6889,14 @@ fn lower_payload_enum_place(
             ));
         }
         let mixed_slot = local_slot(resources.local_slots, *mixed)?;
-        let mixed_value =
-            load_lowered_from_stack(builder, mir::Type::Mixed, mixed_slot, pointer).single()?;
+        let mixed_value = load_lowered_from_stack(
+            builder,
+            resources.program,
+            mir::Type::Mixed,
+            mixed_slot,
+            pointer,
+        )
+        .single()?;
         let payload_word = runtime_call(
             builder,
             MIXED_PAYLOAD,
@@ -6635,8 +7433,8 @@ fn lower_value_at_address_equal(
             })
         }
         mir::Type::NullableScalar(scalar) => {
-            let left = load_lowered_from_address(builder, ty, left, pointer);
-            let right = load_lowered_from_address(builder, ty, right, pointer);
+            let left = load_lowered_from_address(builder, resources.program, ty, left, pointer);
+            let right = load_lowered_from_address(builder, resources.program, ty, right, pointer);
             let (left_present, left_value) = left.nullable()?;
             let (right_present, right_value) = right.nullable()?;
             let presence_equal = builder
@@ -6669,10 +7467,10 @@ fn lower_value_at_address_equal(
             Ok(builder.ins().icmp(IntCC::Equal, compared, zero))
         }
         mir::Type::NullableString => {
-            let left = load_lowered_from_address(builder, ty, left, pointer)
+            let left = load_lowered_from_address(builder, resources.program, ty, left, pointer)
                 .nullable()?
                 .1;
-            let right = load_lowered_from_address(builder, ty, right, pointer)
+            let right = load_lowered_from_address(builder, resources.program, ty, right, pointer)
                 .nullable()?
                 .1;
             runtime_call(
@@ -6780,12 +7578,12 @@ fn lower_drop_value_at_address(
     let flags = cranelift_codegen::ir::MachMemFlags::trusted();
     match ty {
         mir::Type::Error | mir::Type::NullableError => {
-            let value = load_lowered_from_address(builder, ty, address, pointer);
+            let value = load_lowered_from_address(builder, resources.program, ty, address, pointer);
             lower_drop_error_value(builder, value, resources)
         }
         mir::Type::String | mir::Type::NullableString => {
             let value = if ty == mir::Type::NullableString {
-                load_lowered_from_address(builder, ty, address, pointer)
+                load_lowered_from_address(builder, resources.program, ty, address, pointer)
                     .nullable()?
                     .1
             } else {
@@ -6794,8 +7592,8 @@ fn lower_drop_value_at_address(
             release_string(builder, value, resources)
         }
         mir::Type::Class(class) | mir::Type::NullableClass(class) => {
-            let value = builder.ins().load(pointer, flags, address, 0);
-            lower_drop_class_value_checked(builder, value, class, resources)
+            let value = load_lowered_from_address(builder, resources.program, ty, address, pointer);
+            lower_drop_class_carrier_checked(builder, value, class, resources)
         }
         mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
             let value = builder.ins().load(pointer, flags, address, 0);
@@ -6842,7 +7640,7 @@ fn lower_drop_value_at_address(
             lower_drop_writable_shared_value(builder, value, symbol, resources)
         }
         mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
-            let value = load_lowered_from_address(builder, ty, address, pointer);
+            let value = load_lowered_from_address(builder, resources.program, ty, address, pointer);
             lower_drop_function_carrier(builder, value, resources)
         }
         mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
@@ -6951,6 +7749,9 @@ fn lower_nullable_collection_parts(
             let present = builder.ins().icmp(IntCC::NotEqual, payload, zero);
             Ok((present, payload, payload_ty))
         }
+        LoweredValue::OpenClass { .. } => Err(malformed_mir(
+            "open class carrier reached nullable collection scalar lowering",
+        )),
     }
 }
 
@@ -7451,7 +8252,14 @@ fn lower_two_word_collection_literal(
             )?
             .ok_or_else(|| backend_failure("aggregate collection insertion produced no slot"))?
         };
-        store_lowered_to_address(builder, definition.value, destination, value, pointer)?;
+        store_lowered_to_address(
+            builder,
+            resources.program,
+            definition.value,
+            destination,
+            value,
+            pointer,
+        )?;
     }
     if stage26_collection_kind(definition.kind).is_some() {
         runtime_call(
@@ -7575,13 +8383,7 @@ fn lower_collection_expression(
             entries,
         } => {
             let definition = collection_definition(resources.program, *collection)?.clone();
-            if matches!(
-                definition.value,
-                mir::Type::Error
-                    | mir::Type::NullableError
-                    | mir::Type::Function(_)
-                    | mir::Type::NullableFunction(_)
-            ) {
+            if type_uses_two_word_collection_storage(resources.program, definition.value) {
                 return lower_two_word_collection_literal(builder, &definition, entries, resources);
             }
             if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
@@ -8305,13 +9107,7 @@ fn lower_collection_add(
     } else {
         None
     };
-    if matches!(
-        definition.value,
-        mir::Type::Error
-            | mir::Type::NullableError
-            | mir::Type::Function(_)
-            | mir::Type::NullableFunction(_)
-    ) {
+    if type_uses_two_word_collection_storage(resources.program, definition.value) {
         if op == mir::CollectionMutationOp::Remove {
             return Err(malformed_mir(
                 "aggregate remove-by-value requires a collection equality capability",
@@ -8355,7 +9151,14 @@ fn lower_collection_add(
             )?
             .ok_or_else(|| backend_failure("aggregate collection insertion produced no slot"))?
         };
-        store_lowered_to_address(builder, definition.value, destination, value, pointer)?;
+        store_lowered_to_address(
+            builder,
+            resources.program,
+            definition.value,
+            destination,
+            value,
+            pointer,
+        )?;
         return Ok(());
     }
     if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
@@ -8630,13 +9433,7 @@ fn lower_collection_set(
     let definition = collection_definition(resources.program, collection_type)?.clone();
     let collection_value = lower_collection_pointer(builder, collection, resources)?;
     let index = lower_rvalue(builder, index, resources)?.single()?;
-    if matches!(
-        definition.value,
-        mir::Type::Error
-            | mir::Type::NullableError
-            | mir::Type::Function(_)
-            | mir::Type::NullableFunction(_)
-    ) {
+    if type_uses_two_word_collection_storage(resources.program, definition.value) {
         let replacement = lower_rvalue(builder, value, resources)?;
         let destination = if let Some(key_type) = definition.key.filter(|_| !positional) {
             lower_two_word_dictionary_write_slot(
@@ -8675,7 +9472,14 @@ fn lower_collection_set(
             lower_drop_value_at_address(builder, definition.value, destination, resources)?;
             destination
         };
-        store_lowered_to_address(builder, definition.value, destination, replacement, pointer)?;
+        store_lowered_to_address(
+            builder,
+            resources.program,
+            definition.value,
+            destination,
+            replacement,
+            pointer,
+        )?;
         return Ok(());
     }
     if let Some((ty, nullable)) = payload_enum_storage(definition.value) {
@@ -9396,7 +10200,7 @@ fn lower_drop_stored_value(
         }
         mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
             let pointer = resources.module.target_config().pointer_type();
-            let carrier = load_lowered_from_address(builder, ty, value, pointer);
+            let carrier = load_lowered_from_address(builder, resources.program, ty, value, pointer);
             lower_drop_function_carrier(builder, carrier, resources)
         }
         mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => Ok(()),
@@ -9533,13 +10337,7 @@ fn lower_finish_collection_value(
     builder.switch_to_block(body);
     let one = builder.ins().iconst(pointer, 1);
     let index = builder.ins().isub(remaining, one);
-    if matches!(
-        definition.value,
-        mir::Type::Error
-            | mir::Type::NullableError
-            | mir::Type::Function(_)
-            | mir::Type::NullableFunction(_)
-    ) {
+    if type_uses_two_word_collection_storage(resources.program, definition.value) {
         let index_word = if pointer == types::I64 {
             index
         } else {
@@ -9651,61 +10449,150 @@ fn lower_class_expression(
     builder: &mut FunctionBuilder,
     expression: &mir::ClassExpression,
     resources: &mut LoweringResources<'_, '_>,
-) -> Result<Value, BackendError> {
+) -> Result<LoweredValue, BackendError> {
     let pointer_type = resources.module.target_config().pointer_type();
     match expression {
         mir::ClassExpression::Local {
-            local, transfer, ..
+            class,
+            local,
+            transfer,
         } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder
-                .ins()
-                .stack_load(pointer_type, pointer_type, slot, 0);
+            let local_ty = local_definition(resources.program, resources.function_id, *local)?.ty;
+            let value =
+                load_lowered_from_stack(builder, resources.program, local_ty, slot, pointer_type);
+            let (object, descriptor) = value.class_parts()?;
+            let dynamic_class = match local_ty {
+                mir::Type::Class(actual) | mir::Type::NullableClass(actual) => actual,
+                _ => return Err(malformed_mir("class expression local has another type")),
+            };
             if *transfer {
                 let zero = builder.ins().iconst(pointer_type, 0);
                 builder.ins().stack_store(pointer_type, zero, slot, 0);
+                if class_uses_open_carrier(resources.program, dynamic_class) {
+                    builder.ins().stack_store(
+                        pointer_type,
+                        zero,
+                        slot,
+                        pointer_type.bytes() as i32,
+                    );
+                }
             }
-            Ok(value)
+            class_value_for_static_type(
+                builder,
+                object,
+                descriptor,
+                *class,
+                dynamic_class,
+                resources,
+            )
         }
         mir::ClassExpression::NullableLocalAssumeNonNull {
-            local, transfer, ..
+            class,
+            local,
+            transfer,
         } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder
-                .ins()
-                .stack_load(pointer_type, pointer_type, slot, 0);
+            let local_ty = local_definition(resources.program, resources.function_id, *local)?.ty;
+            let value =
+                load_lowered_from_stack(builder, resources.program, local_ty, slot, pointer_type);
+            let (object, descriptor) = value.class_parts()?;
             if *transfer {
                 let zero = builder.ins().iconst(pointer_type, 0);
                 builder.ins().stack_store(pointer_type, zero, slot, 0);
+                if class_uses_open_carrier(resources.program, *class) {
+                    builder.ins().stack_store(
+                        pointer_type,
+                        zero,
+                        slot,
+                        pointer_type.bytes() as i32,
+                    );
+                }
             }
-            Ok(value)
+            let dynamic_class = match local_ty {
+                mir::Type::Class(actual) | mir::Type::NullableClass(actual) => actual,
+                _ => return Err(malformed_mir("nullable class local has another type")),
+            };
+            class_value_for_static_type(
+                builder,
+                object,
+                descriptor,
+                *class,
+                dynamic_class,
+                resources,
+            )
         }
         mir::ClassExpression::Property {
-            object, property, ..
+            class,
+            object,
+            property,
         } => {
             let address = lower_property_address(builder, *object, *property, resources)?;
-            Ok(builder.ins().load(
-                pointer_type,
-                cranelift_codegen::ir::MachMemFlags::trusted(),
+            let property_ty = property_definition(resources.program, *property)?.ty;
+            let value = load_lowered_from_address(
+                builder,
+                resources.program,
+                property_ty,
                 address,
-                0,
-            ))
+                pointer_type,
+            );
+            let (object, descriptor) = value.class_parts()?;
+            let dynamic_class = match property_ty {
+                mir::Type::Class(actual) | mir::Type::NullableClass(actual) => actual,
+                _ => return Err(malformed_mir("class property has another type")),
+            };
+            class_value_for_static_type(
+                builder,
+                object,
+                descriptor,
+                *class,
+                dynamic_class,
+                resources,
+            )
         }
-        mir::ClassExpression::Call { function, args, .. } => {
-            lower_function_call(builder, *function, args, resources)?
-                .ok_or_else(|| malformed_mir("class call produced no result"))?
-                .single()
+        mir::ClassExpression::Call {
+            class,
+            function,
+            args,
+            ..
+        } => {
+            let value = lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("class call produced no result"))?;
+            let (object, descriptor) = value.class_parts()?;
+            let actual = match function_in(resources.program, *function)?.return_type {
+                mir::ReturnType::Value(mir::Type::Class(actual)) => actual,
+                _ => return Err(malformed_mir("class call has another return type")),
+            };
+            class_value_for_static_type(builder, object, descriptor, *class, actual, resources)
         }
         mir::ClassExpression::New {
             class,
+            concrete_class,
             properties,
             constructor,
             args,
         } => {
             let (object, lowered_args) =
-                lower_class_allocation(builder, *class, properties, args, resources)?;
+                lower_class_allocation(builder, *concrete_class, properties, args, resources)?;
             if let Some(constructor) = constructor {
-                let mut constructor_args = vec![resources.current_frame, object];
+                let receiver_ty = local_in(
+                    function_in(resources.program, *constructor)?,
+                    function_in(resources.program, *constructor)?.params[0],
+                )?
+                .ty;
+                let receiver = match receiver_ty {
+                    mir::Type::Class(receiver_class) => class_value_for_static_type(
+                        builder,
+                        object,
+                        None,
+                        receiver_class,
+                        *concrete_class,
+                        resources,
+                    )?,
+                    _ => LoweredValue::Single(object),
+                };
+                let mut constructor_args = vec![resources.current_frame];
+                receiver.append_to(&mut constructor_args);
                 constructor_args.extend(lowered_args.abi_values.iter().copied());
                 let callee = declared_function(builder, resources, *constructor)?;
                 builder.ins().call(callee, &constructor_args);
@@ -9756,27 +10643,39 @@ fn lower_class_expression(
                                 ))
                             })?;
                     if !promoted && !local_in(constructor_definition, parameter)?.owned {
-                        let value = lowered_args.arguments[index].single()?;
+                        let value = lowered_args.arguments[index];
                         if let Some(class) = argument.owned_temporary_class() {
-                            defer_or_drop_class_temporary(builder, value, class, resources)?;
+                            defer_or_drop_class_carrier_temporary(
+                                builder, value, class, resources,
+                            )?;
                         } else if let Some(collection) = argument.owned_temporary_collection() {
                             defer_or_drop_collection_temporary(
-                                builder, value, collection, resources,
+                                builder,
+                                value.single()?,
+                                collection,
+                                resources,
                             )?;
                         } else if let Some(shared) = argument.owned_temporary_shared() {
                             defer_or_drop_owned_shared_temporary(
-                                builder, value, shared, resources,
+                                builder,
+                                value.single()?,
+                                shared,
+                                resources,
                             )?;
                         } else if let Some((payload, nullable)) =
                             argument.owned_temporary_payload_enum()
                         {
                             lower_drop_payload_enum_at(
-                                builder, value, payload, nullable, resources,
+                                builder,
+                                value.single()?,
+                                payload,
+                                nullable,
+                                resources,
                             )?;
                         } else if argument.mixed_ownership().has_shell() {
                             defer_or_cleanup_mixed_temporary(
                                 builder,
-                                value,
+                                value.single()?,
                                 argument.mixed_ownership(),
                                 resources,
                             )?;
@@ -9796,7 +10695,7 @@ fn lower_class_expression(
                     release_string(builder, string, resources)?;
                 }
             }
-            Ok(object)
+            class_value_for_static_type(builder, object, None, *class, *concrete_class, resources)
         }
         mir::ClassExpression::Coalesce {
             left,
@@ -9807,71 +10706,119 @@ fn lower_class_expression(
             let left_owned = left.owned_temporary_class().is_some();
             let right_owned = right.owned_temporary_class().is_some();
             let left = lower_nullable_class_expression(builder, left, resources)?;
+            let (left_object, left_descriptor) = left.class_parts()?;
             let zero = builder.ins().iconst(pointer_type, 0);
-            let present = builder.ins().icmp(IntCC::NotEqual, left, zero);
+            let present = builder.ins().icmp(IntCC::NotEqual, left_object, zero);
             let left_block = builder.create_block();
             let right_block = builder.create_block();
             let done = builder.create_block();
+            builder.append_block_param(done, pointer_type);
+            builder.append_block_param(done, pointer_type);
             builder.append_block_param(done, pointer_type);
             builder.append_block_param(done, pointer_type);
             builder
                 .ins()
                 .brif(present, left_block, &[], right_block, &[]);
             builder.switch_to_block(left_block);
-            let left_temporary = if left_owned { left } else { zero };
+            let left_temporary = if left_owned { left_object } else { zero };
+            let left_descriptor = left_descriptor.unwrap_or(class_descriptor_address(
+                builder,
+                expression.class(),
+                resources,
+            )?);
             builder.ins().jump(
                 done,
-                &[BlockArg::Value(left), BlockArg::Value(left_temporary)],
+                &[
+                    BlockArg::Value(left_object),
+                    BlockArg::Value(left_temporary),
+                    BlockArg::Value(left_descriptor),
+                    BlockArg::Value(if left_owned { left_descriptor } else { zero }),
+                ],
             );
             builder.switch_to_block(right_block);
             let right = lower_class_expression(builder, right, resources)?;
-            let right_temporary = if right_owned { right } else { zero };
+            let (right_object, right_descriptor) = right.class_parts()?;
+            let right_temporary = if right_owned { right_object } else { zero };
+            let right_descriptor = right_descriptor.unwrap_or(class_descriptor_address(
+                builder,
+                expression.class(),
+                resources,
+            )?);
             builder.ins().jump(
                 done,
-                &[BlockArg::Value(right), BlockArg::Value(right_temporary)],
+                &[
+                    BlockArg::Value(right_object),
+                    BlockArg::Value(right_temporary),
+                    BlockArg::Value(right_descriptor),
+                    BlockArg::Value(if right_owned { right_descriptor } else { zero }),
+                ],
             );
             builder.switch_to_block(done);
             let result = builder.block_params(done)[0];
             if !transfer && (left_owned || right_owned) {
-                defer_or_drop_class_temporary(
+                let temporary = class_value_for_static_type(
                     builder,
                     builder.block_params(done)[1],
+                    Some(builder.block_params(done)[3]),
+                    expression.class(),
+                    expression.class(),
+                    resources,
+                )?;
+                defer_or_drop_class_carrier_temporary(
+                    builder,
+                    temporary,
                     expression.class(),
                     resources,
                 )?;
             }
-            Ok(result)
+            class_value_for_static_type(
+                builder,
+                result,
+                Some(builder.block_params(done)[2]),
+                expression.class(),
+                expression.class(),
+                resources,
+            )
         }
         mir::ClassExpression::CollectionIndex {
             collection,
             index,
             transfer,
             positional,
-            ..
-        } => lower_collection_index(
-            builder,
-            *collection,
-            index,
-            *transfer,
-            *positional,
-            resources,
-        ),
+            class,
+        } => {
+            if class_uses_open_carrier(resources.program, *class) {
+                lower_two_word_collection_index(
+                    builder,
+                    *collection,
+                    index,
+                    *positional,
+                    *transfer,
+                    resources,
+                )
+            } else {
+                lower_collection_index(
+                    builder,
+                    *collection,
+                    index,
+                    *transfer,
+                    *positional,
+                    resources,
+                )
+                .map(LoweredValue::Single)
+            }
+        }
         mir::ClassExpression::MixedPayload {
             mixed,
             class,
             transfer,
         } => {
             if *transfer {
-                return lower_take_mixed_payload(
-                    builder,
-                    *mixed,
-                    mir::MixedTag::Class(*class),
-                    resources,
-                );
+                return lower_take_mixed_class_payload(builder, *mixed, *class, resources);
             }
-            lower_mixed_payload(builder, *mixed, mir::MixedTag::Class(*class), resources)
+            lower_mixed_class_payload(builder, *mixed, *class, resources)
         }
-        mir::ClassExpression::SharedPayload { reference, .. } => {
+        mir::ClassExpression::SharedPayload { class, reference } => {
             let owned = reference.owned_temporary().is_some();
             let control = lower_shared_reference_expression(builder, reference, resources)?;
             let payload = runtime_call(
@@ -9883,14 +10830,57 @@ fn lower_class_expression(
                 resources,
             )?
             .ok_or_else(|| backend_failure("shared payload projection produced no result"))?;
+            let descriptor = if class_uses_open_carrier(resources.program, *class) {
+                Some(
+                    runtime_call(
+                        builder,
+                        SHARED_PAYLOAD_DESCRIPTOR,
+                        &[pointer_type],
+                        Some(pointer_type),
+                        &[control],
+                        resources,
+                    )?
+                    .ok_or_else(|| {
+                        backend_failure("shared payload descriptor projection produced no result")
+                    })?,
+                )
+            } else {
+                None
+            };
             if owned {
                 defer_or_drop_shared_temporary(builder, control, false, resources)?;
             }
-            Ok(payload)
+            class_value_for_static_type(builder, payload, descriptor, *class, *class, resources)
         }
         mir::ClassExpression::SharedAccessPayload {
-            access, writable, ..
-        } => lower_shared_access_payload(builder, *access, *writable, resources),
+            class,
+            access,
+            writable,
+        } => {
+            let payload = lower_shared_access_payload(builder, *access, *writable, resources)?;
+            let descriptor = if class_uses_open_carrier(resources.program, *class) {
+                let pointer = resources.module.target_config().pointer_type();
+                let control = lower_pointer_local(builder, *access, false, resources)?;
+                Some(
+                    runtime_call(
+                        builder,
+                        WRITABLE_SHARED_PAYLOAD_DESCRIPTOR,
+                        &[pointer],
+                        Some(pointer),
+                        &[control],
+                        resources,
+                    )?
+                    .ok_or_else(|| {
+                        backend_failure(
+                            "writable shared payload descriptor projection produced no result",
+                        )
+                    })?,
+                )
+            } else {
+                None
+            };
+            class_value_for_static_type(builder, payload, descriptor, *class, *class, resources)
+        }
     }
 }
 
@@ -9945,7 +10935,14 @@ fn lower_class_allocation(
         let address =
             lower_property_address_from_value(builder, object, property.property, resources)?;
         let property_definition = property_definition(resources.program, property.property)?;
-        store_lowered_to_address(builder, property_definition.ty, address, value, pointer)?;
+        store_lowered_to_address(
+            builder,
+            resources.program,
+            property_definition.ty,
+            address,
+            value,
+            pointer,
+        )?;
     }
     Ok((object, lowered_args))
 }
@@ -9993,19 +10990,24 @@ fn cleanup_constructor_arguments(
             ))
         })?;
         if !local_in(definition, parameter)?.owned {
-            let value = lowered.arguments[index].single()?;
+            let value = lowered.arguments[index];
             if let Some(class) = argument.owned_temporary_class() {
-                defer_or_drop_class_temporary(builder, value, class, resources)?;
+                defer_or_drop_class_carrier_temporary(builder, value, class, resources)?;
             } else if let Some(collection) = argument.owned_temporary_collection() {
-                defer_or_drop_collection_temporary(builder, value, collection, resources)?;
+                defer_or_drop_collection_temporary(
+                    builder,
+                    value.single()?,
+                    collection,
+                    resources,
+                )?;
             } else if let Some(shared) = argument.owned_temporary_shared() {
-                defer_or_drop_owned_shared_temporary(builder, value, shared, resources)?;
+                defer_or_drop_owned_shared_temporary(builder, value.single()?, shared, resources)?;
             } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
-                lower_drop_payload_enum_at(builder, value, payload, nullable, resources)?;
+                lower_drop_payload_enum_at(builder, value.single()?, payload, nullable, resources)?;
             } else if argument.mixed_ownership().has_shell() {
                 defer_or_cleanup_mixed_temporary(
                     builder,
-                    value,
+                    value.single()?,
                     argument.mixed_ownership(),
                     resources,
                 )?;
@@ -10051,19 +11053,35 @@ fn lower_shared_reference_expression(
     let pointer = resources.module.target_config().pointer_type();
     match expression {
         mir::SharedReferenceExpression::New { class, value } => {
-            let payload = lower_class_expression(builder, value, resources)?;
-            let drop_id = *resources
-                .class_drop_function_ids
-                .get(class.0)
-                .ok_or_else(|| malformed_mir("shared payload drop glue does not exist"))?;
-            let drop_ref = resources.module.declare_func_in_func(drop_id, builder.func);
-            let drop_fn = builder.ins().func_addr(pointer, drop_ref);
+            let (payload, descriptor) =
+                lower_class_expression(builder, value, resources)?.class_parts()?;
+            let zero = builder.ins().iconst(pointer, 0);
+            let drop_fn = if let Some(descriptor) = descriptor {
+                builder.ins().load(
+                    pointer,
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    descriptor,
+                    (pointer.bytes() * 2) as i32,
+                )
+            } else {
+                let drop_id = *resources
+                    .class_drop_function_ids
+                    .get(class.0)
+                    .ok_or_else(|| malformed_mir("shared payload drop glue does not exist"))?;
+                let drop_ref = resources.module.declare_func_in_func(drop_id, builder.func);
+                builder.ins().func_addr(pointer, drop_ref)
+            };
             runtime_call(
                 builder,
                 SHARED_CREATE,
-                &[pointer, pointer, pointer],
+                &[pointer, pointer, pointer, pointer],
                 Some(pointer),
-                &[resources.current_frame, payload, drop_fn],
+                &[
+                    resources.current_frame,
+                    payload,
+                    descriptor.unwrap_or(zero),
+                    drop_fn,
+                ],
                 resources,
             )?
             .ok_or_else(|| backend_failure("shared construction produced no result"))
@@ -10623,8 +11641,12 @@ fn lower_writable_shared_reference_expression(
     let pointer = resources.module.target_config().pointer_type();
     match expression {
         mir::WritableSharedReferenceExpression::New { payload, value } => {
-            let value = lower_rvalue(builder, value, resources)?.single()?;
-            let drop_function = match payload {
+            let lowered = lower_rvalue(builder, value, resources)?;
+            let (value, descriptor) = match payload {
+                mir::WritableSharedPayload::Class(_) => lowered.class_parts()?,
+                mir::WritableSharedPayload::Collection(_) => (lowered.single()?, None),
+            };
+            let static_drop_function = match payload {
                 mir::WritableSharedPayload::Class(class) => {
                     let id = *resources
                         .class_drop_function_ids
@@ -10645,13 +11667,28 @@ fn lower_writable_shared_reference_expression(
                     resources.module.declare_func_in_func(id, builder.func)
                 }
             };
-            let drop_function = builder.ins().func_addr(pointer, drop_function);
+            let drop_function = if let Some(descriptor) = descriptor {
+                builder.ins().load(
+                    pointer,
+                    cranelift_codegen::ir::MachMemFlags::trusted(),
+                    descriptor,
+                    (pointer.bytes() * 2) as i32,
+                )
+            } else {
+                builder.ins().func_addr(pointer, static_drop_function)
+            };
+            let zero = builder.ins().iconst(pointer, 0);
             runtime_call(
                 builder,
                 WRITABLE_SHARED_CREATE,
-                &[pointer, pointer, pointer],
+                &[pointer, pointer, pointer, pointer],
                 Some(pointer),
-                &[resources.current_frame, value, drop_function],
+                &[
+                    resources.current_frame,
+                    value,
+                    descriptor.unwrap_or(zero),
+                    drop_function,
+                ],
                 resources,
             )?
             .ok_or_else(|| backend_failure("writable shared construction produced no result"))
@@ -11393,14 +12430,24 @@ fn lower_nullable_class_expression(
     builder: &mut FunctionBuilder,
     expression: &mir::NullableClassExpression,
     resources: &mut LoweringResources<'_, '_>,
-) -> Result<Value, BackendError> {
+) -> Result<LoweredValue, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     match expression {
-        mir::NullableClassExpression::Null(_) => Ok(builder.ins().iconst(pointer, 0)),
+        mir::NullableClassExpression::Null(class) => {
+            let zero = builder.ins().iconst(pointer, 0);
+            if class_uses_open_carrier(resources.program, *class) {
+                Ok(LoweredValue::OpenClass {
+                    object: zero,
+                    descriptor: zero,
+                })
+            } else {
+                Ok(LoweredValue::Single(zero))
+            }
+        }
         mir::NullableClassExpression::Class(value) => {
             lower_class_expression(builder, value, resources)
         }
-        mir::NullableClassExpression::SharedPayload { reference, .. } => {
+        mir::NullableClassExpression::SharedPayload { class, reference } => {
             let owned = reference.owned_temporary().is_some();
             let control =
                 lower_nullable_shared_reference_expression(builder, reference, resources)?;
@@ -11412,79 +12459,128 @@ fn lower_nullable_class_expression(
                 false,
                 resources,
             )?;
+            let descriptor = if class_uses_open_carrier(resources.program, *class) {
+                Some(lower_null_safe_shared_call(
+                    builder,
+                    control,
+                    SHARED_PAYLOAD_DESCRIPTOR,
+                    "nullable shared payload descriptor projection",
+                    false,
+                    resources,
+                )?)
+            } else {
+                None
+            };
             if owned {
                 defer_or_drop_shared_temporary(builder, control, false, resources)?;
             }
-            Ok(payload)
+            class_value_for_static_type(builder, payload, descriptor, *class, *class, resources)
         }
         mir::NullableClassExpression::Local {
-            local, transfer, ..
+            class,
+            local,
+            transfer,
         } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = builder.ins().stack_load(pointer, pointer, slot, 0);
+            let ty = local_definition(resources.program, resources.function_id, *local)?.ty;
+            let value = load_lowered_from_stack(builder, resources.program, ty, slot, pointer);
+            let dynamic_class = match ty {
+                mir::Type::Class(actual) | mir::Type::NullableClass(actual) => actual,
+                _ => return Err(malformed_mir("nullable class local has another type")),
+            };
+            let (object, descriptor) = value.class_parts()?;
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
                 builder.ins().stack_store(pointer, zero, slot, 0);
+                if class_uses_open_carrier(resources.program, dynamic_class) {
+                    builder
+                        .ins()
+                        .stack_store(pointer, zero, slot, pointer.bytes() as i32);
+                }
             }
-            Ok(value)
+            class_value_for_static_type(
+                builder,
+                object,
+                descriptor,
+                *class,
+                dynamic_class,
+                resources,
+            )
         }
         mir::NullableClassExpression::Property {
             object, property, ..
         } => {
             let address = lower_property_address(builder, *object, *property, resources)?;
-            Ok(builder.ins().load(
-                pointer,
-                cranelift_codegen::ir::MachMemFlags::trusted(),
+            let ty = property_definition(resources.program, *property)?.ty;
+            Ok(load_lowered_from_address(
+                builder,
+                resources.program,
+                ty,
                 address,
-                0,
+                pointer,
             ))
         }
-        mir::NullableClassExpression::Call { function, args, .. } => {
-            lower_function_call(builder, *function, args, resources)?
-                .ok_or_else(|| malformed_mir("nullable-class call produced no result"))?
-                .single()
+        mir::NullableClassExpression::Call {
+            class,
+            function,
+            args,
+            ..
+        } => {
+            let value = lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("nullable-class call produced no result"))?;
+            let actual = match function_in(resources.program, *function)?.return_type {
+                mir::ReturnType::Value(mir::Type::NullableClass(actual)) => actual,
+                _ => return Err(malformed_mir("nullable class call has another return type")),
+            };
+            let (object, descriptor) = value.class_parts()?;
+            class_value_for_static_type(builder, object, descriptor, *class, actual, resources)
         }
         mir::NullableClassExpression::NullSafeProperty {
-            object, property, ..
+            class,
+            object,
+            property,
         } => {
             let owned_receiver = object.owned_temporary_class();
-            let object = lower_nullable_class_expression(builder, object, resources)?;
-            lower_null_safe_single(
+            let receiver = lower_nullable_class_expression(builder, object, resources)?;
+            lower_null_safe_class(
                 builder,
-                object,
-                pointer,
+                receiver,
+                *class,
                 owned_receiver,
                 resources,
                 |builder, resources| {
+                    let (object, _) = receiver.class_parts()?;
                     let address =
                         lower_property_address_from_value(builder, object, *property, resources)?;
-                    Ok(builder.ins().load(
-                        pointer,
-                        cranelift_codegen::ir::MachMemFlags::trusted(),
+                    let ty = property_definition(resources.program, *property)?.ty;
+                    Ok(load_lowered_from_address(
+                        builder,
+                        resources.program,
+                        ty,
                         address,
-                        0,
+                        pointer,
                     ))
                 },
             )
         }
         mir::NullableClassExpression::NullSafeCall {
+            class,
             object,
             function,
             args,
             ..
         } => {
             let owned_receiver = object.owned_temporary_class();
-            let object = lower_nullable_class_expression(builder, object, resources)?;
-            lower_null_safe_single(
+            let receiver = lower_nullable_class_expression(builder, object, resources)?;
+            lower_null_safe_class(
                 builder,
-                object,
-                pointer,
+                receiver,
+                *class,
                 owned_receiver,
                 resources,
                 |builder, resources| {
-                    lower_method_call_with_receiver(builder, object, *function, args, resources)?
-                        .ok_or_else(|| malformed_mir("null-safe class call produced no result"))?
-                        .single()
+                    lower_method_call_with_receiver(builder, receiver, *function, args, resources)?
+                        .ok_or_else(|| malformed_mir("null-safe class call produced no result"))
                 },
             )
         }
@@ -11497,38 +12593,71 @@ fn lower_nullable_class_expression(
             let left_owned = left.owned_temporary_class().is_some();
             let right_owned = right.owned_temporary_class().is_some();
             let left = lower_nullable_class_expression(builder, left, resources)?;
+            let (left_object, left_descriptor) = left.class_parts()?;
             let zero = builder.ins().iconst(pointer, 0);
-            let present = builder.ins().icmp(IntCC::NotEqual, left, zero);
+            let present = builder.ins().icmp(IntCC::NotEqual, left_object, zero);
             let left_block = builder.create_block();
             let right_block = builder.create_block();
             let done = builder.create_block();
             builder.append_block_param(done, pointer);
             builder.append_block_param(done, pointer);
+            let open = class_uses_open_carrier(resources.program, *class);
+            if open {
+                builder.append_block_param(done, pointer);
+                builder.append_block_param(done, pointer);
+            }
             builder
                 .ins()
                 .brif(present, left_block, &[], right_block, &[]);
             builder.switch_to_block(left_block);
-            let left_temporary = if left_owned { left } else { zero };
-            builder.ins().jump(
-                done,
-                &[BlockArg::Value(left), BlockArg::Value(left_temporary)],
-            );
+            let left_temporary = if left_owned { left_object } else { zero };
+            let mut left_args = vec![
+                BlockArg::Value(left_object),
+                BlockArg::Value(left_temporary),
+            ];
+            if open {
+                let descriptor = left_descriptor.ok_or_else(|| {
+                    malformed_mir("open nullable coalesce value has no class descriptor")
+                })?;
+                left_args.push(BlockArg::Value(descriptor));
+                left_args.push(BlockArg::Value(if left_owned { descriptor } else { zero }));
+            }
+            builder.ins().jump(done, &left_args);
             builder.switch_to_block(right_block);
             let right = lower_nullable_class_expression(builder, right, resources)?;
-            let right_temporary = if right_owned { right } else { zero };
-            builder.ins().jump(
-                done,
-                &[BlockArg::Value(right), BlockArg::Value(right_temporary)],
-            );
+            let (right_object, right_descriptor) = right.class_parts()?;
+            let right_temporary = if right_owned { right_object } else { zero };
+            let mut right_args = vec![
+                BlockArg::Value(right_object),
+                BlockArg::Value(right_temporary),
+            ];
+            if open {
+                let descriptor = right_descriptor.ok_or_else(|| {
+                    malformed_mir("open nullable coalesce fallback has no class descriptor")
+                })?;
+                right_args.push(BlockArg::Value(descriptor));
+                right_args.push(BlockArg::Value(if right_owned { descriptor } else { zero }));
+            }
+            builder.ins().jump(done, &right_args);
             builder.switch_to_block(done);
-            let result = builder.block_params(done)[0];
+            let result = if open {
+                LoweredValue::OpenClass {
+                    object: builder.block_params(done)[0],
+                    descriptor: builder.block_params(done)[2],
+                }
+            } else {
+                LoweredValue::Single(builder.block_params(done)[0])
+            };
             if !transfer && (left_owned || right_owned) {
-                defer_or_drop_class_temporary(
-                    builder,
-                    builder.block_params(done)[1],
-                    *class,
-                    resources,
-                )?;
+                let temporary = if open {
+                    LoweredValue::OpenClass {
+                        object: builder.block_params(done)[1],
+                        descriptor: builder.block_params(done)[3],
+                    }
+                } else {
+                    LoweredValue::Single(builder.block_params(done)[1])
+                };
+                defer_or_drop_class_carrier_temporary(builder, temporary, *class, resources)?;
             }
             Ok(result)
         }
@@ -11538,6 +12667,15 @@ fn lower_nullable_class_expression(
             key,
             access,
         } => {
+            if class_uses_open_carrier(resources.program, *class) {
+                return lower_nullable_two_word_collection_get(
+                    builder,
+                    *collection,
+                    key,
+                    *access,
+                    resources,
+                );
+            }
             let (_, payload) = lower_dictionary_get(
                 builder,
                 *collection,
@@ -11546,43 +12684,63 @@ fn lower_nullable_class_expression(
                 *access,
                 resources,
             )?;
-            Ok(payload)
+            class_value_for_static_type(builder, payload, None, *class, *class, resources)
         }
     }
 }
 
-fn lower_null_safe_single(
+fn lower_null_safe_class(
     builder: &mut FunctionBuilder,
-    object: Value,
-    result_type: ClifType,
+    receiver: LoweredValue,
+    result_class: crate::class_layout::ClassId,
     owned_receiver: Option<crate::class_layout::ClassId>,
     resources: &mut LoweringResources<'_, '_>,
     present_value: impl FnOnce(
         &mut FunctionBuilder,
         &mut LoweringResources<'_, '_>,
-    ) -> Result<Value, BackendError>,
-) -> Result<Value, BackendError> {
+    ) -> Result<LoweredValue, BackendError>,
+) -> Result<LoweredValue, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
+    let (object, _) = receiver.class_parts()?;
     if let Some(class) = owned_receiver {
-        defer_or_drop_class_temporary(builder, object, class, resources)?;
+        defer_or_drop_class_carrier_temporary(builder, receiver, class, resources)?;
     }
-    let present = presence_word(builder, object, pointer);
     let zero = builder.ins().iconst(pointer, 0);
-    let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
+    let present = builder.ins().icmp(IntCC::NotEqual, object, zero);
     let some = builder.create_block();
     let none = builder.create_block();
     let done = builder.create_block();
-    builder.append_block_param(done, result_type);
-    builder.ins().brif(is_present, some, &[], none, &[]);
+    builder.append_block_param(done, pointer);
+    let open = class_uses_open_carrier(resources.program, result_class);
+    if open {
+        builder.append_block_param(done, pointer);
+    }
+    builder.ins().brif(present, some, &[], none, &[]);
     builder.switch_to_block(some);
     let value = present_value(builder, resources)?;
-    builder.ins().jump(done, &[BlockArg::Value(value)]);
+    let (value_object, descriptor) = value.class_parts()?;
+    let mut args = vec![BlockArg::Value(value_object)];
+    if open {
+        args.push(BlockArg::Value(descriptor.ok_or_else(|| {
+            malformed_mir("open null-safe class result has no descriptor")
+        })?));
+    }
+    builder.ins().jump(done, &args);
     builder.switch_to_block(none);
-    let zero = builder.ins().iconst(result_type, 0);
-    builder.ins().jump(done, &[BlockArg::Value(zero)]);
+    let mut args = vec![BlockArg::Value(zero)];
+    if open {
+        args.push(BlockArg::Value(zero));
+    }
+    builder.ins().jump(done, &args);
     builder.switch_to_block(done);
-    let result = builder.block_params(done)[0];
-    Ok(result)
+    if open {
+        Ok(LoweredValue::OpenClass {
+            object: builder.block_params(done)[0],
+            descriptor: builder.block_params(done)[1],
+        })
+    } else {
+        Ok(LoweredValue::Single(builder.block_params(done)[0]))
+    }
 }
 
 fn lower_drop_class_value_checked(
@@ -11615,6 +12773,40 @@ fn lower_drop_class_value_checked(
     Ok(())
 }
 
+fn lower_drop_class_carrier_checked(
+    builder: &mut FunctionBuilder,
+    carrier: LoweredValue,
+    class: crate::class_layout::ClassId,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let (object, descriptor) = carrier.class_parts()?;
+    let Some(descriptor) = descriptor else {
+        return lower_drop_class_value_checked(builder, object, class, resources);
+    };
+    let pointer = resources.module.target_config().pointer_type();
+    let zero = builder.ins().iconst(pointer, 0);
+    let present = builder.ins().icmp(IntCC::NotEqual, object, zero);
+    let drop_block = builder.create_block();
+    let done = builder.create_block();
+    builder.ins().brif(present, drop_block, &[], done, &[]);
+    builder.switch_to_block(drop_block);
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let drop_function =
+        builder
+            .ins()
+            .load(pointer, flags, descriptor, (pointer.bytes() * 2) as i32);
+    let mut signature = resources.module.make_signature();
+    signature.params.push(AbiParam::new(pointer));
+    signature.params.push(AbiParam::new(pointer));
+    let signature = builder.import_signature(signature);
+    builder
+        .ins()
+        .call_indirect(signature, drop_function, &[resources.current_frame, object]);
+    builder.ins().jump(done, &[]);
+    builder.switch_to_block(done);
+    Ok(())
+}
+
 fn lower_drop_class_value(
     builder: &mut FunctionBuilder,
     object: Value,
@@ -11641,125 +12833,165 @@ fn lower_drop_class_value_impl(
     resources: &mut LoweringResources<'_, '_>,
 ) -> Result<(), BackendError> {
     let pointer_type = resources.module.target_config().pointer_type();
-    let class_definition = class_definition(resources.program, class)?;
-    if let Some(destructor) = class_definition.destructor.filter(|_| run_destructor) {
-        let callee = declared_function(builder, resources, destructor)?;
-        builder
-            .ins()
-            .call(callee, &[resources.current_frame, object]);
-    }
-    for property in class_definition.properties.iter().rev() {
-        let address = lower_property_address_from_value(builder, object, property.id, resources)?;
-        match property.ty {
-            mir::Type::Error | mir::Type::NullableError => {
-                let value = load_lowered_from_address(builder, property.ty, address, pointer_type);
-                lower_drop_error_value(builder, value, resources)?;
-            }
-            mir::Type::String | mir::Type::NullableString => {
-                let value = match property.ty {
-                    mir::Type::NullableString => {
-                        load_lowered_from_address(builder, property.ty, address, pointer_type)
+    let mut phase = Some(class);
+    while let Some(class) = phase {
+        let phase_definition = class_definition(resources.program, class)?.clone();
+        if let Some(destructor) = phase_definition.destructor.filter(|_| run_destructor) {
+            let callee = declared_function(builder, resources, destructor)?;
+            let mut args = vec![resources.current_frame];
+            class_value_for_static_type(builder, object, None, class, class, resources)?
+                .append_to(&mut args);
+            builder.ins().call(callee, &args);
+        }
+        let first_property = phase_definition
+            .parent
+            .map(|parent| {
+                class_definition(resources.program, parent).map(|class| class.properties.len())
+            })
+            .transpose()?
+            .unwrap_or(0);
+        for property in phase_definition.properties[first_property..].iter().rev() {
+            let address =
+                lower_property_address_from_value(builder, object, property.id, resources)?;
+            match property.ty {
+                mir::Type::Error | mir::Type::NullableError => {
+                    let value = load_lowered_from_address(
+                        builder,
+                        resources.program,
+                        property.ty,
+                        address,
+                        pointer_type,
+                    );
+                    lower_drop_error_value(builder, value, resources)?;
+                }
+                mir::Type::String | mir::Type::NullableString => {
+                    let value = match property.ty {
+                        mir::Type::NullableString => {
+                            load_lowered_from_address(
+                                builder,
+                                resources.program,
+                                property.ty,
+                                address,
+                                pointer_type,
+                            )
                             .nullable()?
                             .1
-                    }
-                    _ => load_lowered_from_address(builder, property.ty, address, pointer_type)
+                        }
+                        _ => load_lowered_from_address(
+                            builder,
+                            resources.program,
+                            property.ty,
+                            address,
+                            pointer_type,
+                        )
                         .single()?,
-                };
-                release_string(builder, value, resources)?;
-            }
-            mir::Type::Class(class) | mir::Type::NullableClass(class) => {
-                let value = builder.ins().load(
-                    pointer_type,
-                    cranelift_codegen::ir::MachMemFlags::trusted(),
-                    address,
-                    0,
-                );
-                lower_drop_class_value_checked(builder, value, class, resources)?;
-            }
-            mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
-                let value = builder.ins().load(
-                    pointer_type,
-                    cranelift_codegen::ir::MachMemFlags::trusted(),
-                    address,
-                    0,
-                );
-                lower_drop_collection_value(builder, value, collection, resources)?;
-            }
-            mir::Type::Mixed | mir::Type::NullableMixed => {
-                let value = builder.ins().load(
-                    pointer_type,
-                    cranelift_codegen::ir::MachMemFlags::trusted(),
-                    address,
-                    0,
-                );
-                lower_drop_mixed_value(builder, value, resources)?;
-            }
-            mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_) => {
-                let value = builder.ins().load(
-                    pointer_type,
-                    cranelift_codegen::ir::MachMemFlags::trusted(),
-                    address,
-                    0,
-                );
-                lower_drop_shared_value(builder, value, false, resources)?;
-            }
-            mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_) => {
-                let value = builder.ins().load(
-                    pointer_type,
-                    cranelift_codegen::ir::MachMemFlags::trusted(),
-                    address,
-                    0,
-                );
-                lower_drop_shared_value(builder, value, true, resources)?;
-            }
-            mir::Type::WritableSharedReference(_)
-            | mir::Type::NullableWritableSharedReference(_)
-            | mir::Type::WritableWeakReference(_)
-            | mir::Type::NullableWritableWeakReference(_)
-            | mir::Type::ReadonlySharedReferenceAccess(_)
-            | mir::Type::WritableSharedReferenceAccess(_)
-            | mir::Type::NullableReadonlySharedReferenceAccess(_)
-            | mir::Type::NullableWritableSharedReferenceAccess(_) => {
-                let value = builder.ins().load(
-                    pointer_type,
-                    cranelift_codegen::ir::MachMemFlags::trusted(),
-                    address,
-                    0,
-                );
-                let symbol = match property.ty {
-                    mir::Type::WritableSharedReference(_)
-                    | mir::Type::NullableWritableSharedReference(_) => WRITABLE_SHARED_RELEASE,
-                    mir::Type::WritableWeakReference(_)
-                    | mir::Type::NullableWritableWeakReference(_) => WRITABLE_SHARED_RELEASE_WEAK,
-                    mir::Type::ReadonlySharedReferenceAccess(_)
-                    | mir::Type::NullableReadonlySharedReferenceAccess(_) => {
-                        WRITABLE_SHARED_RELEASE_READONLY_ACCESS
-                    }
-                    mir::Type::WritableSharedReferenceAccess(_)
-                    | mir::Type::NullableWritableSharedReferenceAccess(_) => {
-                        WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS
-                    }
-                    _ => unreachable!(),
-                };
-                lower_drop_writable_shared_value(builder, value, symbol, resources)?;
-            }
-            mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {}
-            mir::Type::PayloadEnum(payload) => {
-                lower_drop_payload_enum_at(builder, address, payload, false, resources)?;
-            }
-            mir::Type::NullablePayloadEnum(payload) => {
-                lower_drop_payload_enum_at(builder, address, payload, true, resources)?;
-            }
-            mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
-                let value = load_lowered_from_address(builder, property.ty, address, pointer_type);
-                lower_drop_function_carrier(builder, value, resources)?;
-            }
-            mir::Type::ClosureEnvironment(_) => {
-                return Err(malformed_mir(
-                    "closure environment pointer reached a Doria property",
-                ));
+                    };
+                    release_string(builder, value, resources)?;
+                }
+                mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+                    let value = load_lowered_from_address(
+                        builder,
+                        resources.program,
+                        property.ty,
+                        address,
+                        pointer_type,
+                    );
+                    lower_drop_class_carrier_checked(builder, value, class, resources)?;
+                }
+                mir::Type::Collection(collection) | mir::Type::NullableCollection(collection) => {
+                    let value = builder.ins().load(
+                        pointer_type,
+                        cranelift_codegen::ir::MachMemFlags::trusted(),
+                        address,
+                        0,
+                    );
+                    lower_drop_collection_value(builder, value, collection, resources)?;
+                }
+                mir::Type::Mixed | mir::Type::NullableMixed => {
+                    let value = builder.ins().load(
+                        pointer_type,
+                        cranelift_codegen::ir::MachMemFlags::trusted(),
+                        address,
+                        0,
+                    );
+                    lower_drop_mixed_value(builder, value, resources)?;
+                }
+                mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_) => {
+                    let value = builder.ins().load(
+                        pointer_type,
+                        cranelift_codegen::ir::MachMemFlags::trusted(),
+                        address,
+                        0,
+                    );
+                    lower_drop_shared_value(builder, value, false, resources)?;
+                }
+                mir::Type::WeakReference(_) | mir::Type::NullableWeakReference(_) => {
+                    let value = builder.ins().load(
+                        pointer_type,
+                        cranelift_codegen::ir::MachMemFlags::trusted(),
+                        address,
+                        0,
+                    );
+                    lower_drop_shared_value(builder, value, true, resources)?;
+                }
+                mir::Type::WritableSharedReference(_)
+                | mir::Type::NullableWritableSharedReference(_)
+                | mir::Type::WritableWeakReference(_)
+                | mir::Type::NullableWritableWeakReference(_)
+                | mir::Type::ReadonlySharedReferenceAccess(_)
+                | mir::Type::WritableSharedReferenceAccess(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+                    let value = builder.ins().load(
+                        pointer_type,
+                        cranelift_codegen::ir::MachMemFlags::trusted(),
+                        address,
+                        0,
+                    );
+                    let symbol = match property.ty {
+                        mir::Type::WritableSharedReference(_)
+                        | mir::Type::NullableWritableSharedReference(_) => WRITABLE_SHARED_RELEASE,
+                        mir::Type::WritableWeakReference(_)
+                        | mir::Type::NullableWritableWeakReference(_) => {
+                            WRITABLE_SHARED_RELEASE_WEAK
+                        }
+                        mir::Type::ReadonlySharedReferenceAccess(_)
+                        | mir::Type::NullableReadonlySharedReferenceAccess(_) => {
+                            WRITABLE_SHARED_RELEASE_READONLY_ACCESS
+                        }
+                        mir::Type::WritableSharedReferenceAccess(_)
+                        | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+                            WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS
+                        }
+                        _ => unreachable!(),
+                    };
+                    lower_drop_writable_shared_value(builder, value, symbol, resources)?;
+                }
+                mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {}
+                mir::Type::PayloadEnum(payload) => {
+                    lower_drop_payload_enum_at(builder, address, payload, false, resources)?;
+                }
+                mir::Type::NullablePayloadEnum(payload) => {
+                    lower_drop_payload_enum_at(builder, address, payload, true, resources)?;
+                }
+                mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
+                    let value = load_lowered_from_address(
+                        builder,
+                        resources.program,
+                        property.ty,
+                        address,
+                        pointer_type,
+                    );
+                    lower_drop_function_carrier(builder, value, resources)?;
+                }
+                mir::Type::ClosureEnvironment(_) => {
+                    return Err(malformed_mir(
+                        "closure environment pointer reached a Doria property",
+                    ));
+                }
             }
         }
+        phase = phase_definition.parent;
     }
     let _ = runtime_call(
         builder,
@@ -11979,6 +13211,7 @@ fn lower_drop_mixed_value(
     )?;
     let carrier = load_lowered_from_address(
         builder,
+        resources.program,
         mir::Type::Function(mir::FunctionTypeId(0)),
         carrier_address,
         pointer,
@@ -11995,48 +13228,24 @@ fn lower_drop_mixed_value(
         .ins()
         .brif(is_class, class_block, &[], after_class, &[]);
     builder.switch_to_block(class_block);
-    let type_id = runtime_call(
-        builder,
-        MIXED_TYPE_ID,
-        &[pointer],
-        Some(types::I32),
-        &[value],
-        resources,
-    )?
-    .ok_or_else(|| backend_failure("mixed type-id read produced no result"))?;
-    let object = collection_word_to_value(
+    let carrier_address = collection_word_to_value(
         builder,
         payload,
         mir::Type::Class(crate::class_layout::ClassId(0)),
         pointer,
     )?;
-    let classes = resources
-        .program
-        .classes
-        .iter()
-        .map(|class| class.id)
-        .collect::<Vec<_>>();
-    if classes.is_empty() {
-        builder.ins().jump(after_class, &[]);
-    } else {
-        let checks = classes
-            .iter()
-            .map(|_| builder.create_block())
-            .collect::<Vec<_>>();
-        builder.ins().jump(checks[0], &[]);
-        for (index, class) in classes.iter().enumerate() {
-            let check = checks[index];
-            let next = checks.get(index + 1).copied().unwrap_or(after_class);
-            builder.switch_to_block(check);
-            let expected = builder.ins().iconst(types::I32, class.0 as i64);
-            let matches = builder.ins().icmp(IntCC::Equal, type_id, expected);
-            let drop_class = builder.create_block();
-            builder.ins().brif(matches, drop_class, &[], next, &[]);
-            builder.switch_to_block(drop_class);
-            lower_drop_class_value_checked(builder, object, *class, resources)?;
-            builder.ins().jump(after_class, &[]);
-        }
-    }
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let object = builder.ins().load(pointer, flags, carrier_address, 0);
+    let descriptor = builder
+        .ins()
+        .load(pointer, flags, carrier_address, pointer.bytes() as i32);
+    lower_drop_class_carrier_checked(
+        builder,
+        LoweredValue::OpenClass { object, descriptor },
+        crate::class_layout::ClassId(0),
+        resources,
+    )?;
+    builder.ins().jump(after_class, &[]);
 
     builder.switch_to_block(after_class);
     let payload_enum_block = builder.create_block();
@@ -12255,8 +13464,14 @@ fn lower_mixed_expression(
         mir::MixedExpression::Null => Ok(builder.ins().iconst(pointer, 0)),
         mir::MixedExpression::Local { local, transfer } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value =
-                load_lowered_from_stack(builder, mir::Type::Mixed, slot, pointer).single()?;
+            let value = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::Mixed,
+                slot,
+                pointer,
+            )
+            .single()?;
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
                 builder.ins().stack_store(pointer, zero, slot, 0);
@@ -12265,7 +13480,14 @@ fn lower_mixed_expression(
         }
         mir::MixedExpression::Property { object, property } => {
             let address = lower_property_address(builder, *object, *property, resources)?;
-            Ok(load_lowered_from_address(builder, mir::Type::Mixed, address, pointer).single()?)
+            Ok(load_lowered_from_address(
+                builder,
+                resources.program,
+                mir::Type::Mixed,
+                address,
+                pointer,
+            )
+            .single()?)
         }
         mir::MixedExpression::Call { function, args, .. } => {
             lower_function_call(builder, *function, args, resources)
@@ -12306,14 +13528,46 @@ fn lower_mixed_expression(
             payload_owned,
         } => {
             let class = value.class();
-            let payload = lower_class_expression(builder, value, resources)?;
-            lower_mixed_box(
+            let (object, descriptor) =
+                lower_class_expression(builder, value, resources)?.class_parts()?;
+            let descriptor = descriptor
+                .map(Ok)
+                .unwrap_or_else(|| class_descriptor_address(builder, class, resources))?;
+            let slot = builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                pointer.bytes() * 2,
+                pointer.bytes().trailing_zeros() as u8,
+            ));
+            builder.ins().stack_store(pointer, object, slot, 0);
+            builder
+                .ins()
+                .stack_store(pointer, descriptor, slot, pointer.bytes() as i32);
+            let source = builder.ins().stack_addr(pointer, slot, 0);
+            let exact_class = builder.ins().load(
+                pointer,
+                cranelift_codegen::ir::MachMemFlags::trusted(),
+                descriptor,
+                pointer.bytes() as i32,
+            );
+            let exact_class = builder.ins().ireduce(types::I32, exact_class);
+            let tag = builder.ins().iconst(types::I8, i64::from(MIXED_TAG_CLASS));
+            let size = builder
+                .ins()
+                .iconst(pointer, i64::from(pointer.bytes() * 2));
+            let alignment = builder.ins().iconst(pointer, i64::from(pointer.bytes()));
+            runtime_call(
                 builder,
-                mir::MixedTag::Class(class),
-                payload,
-                *payload_owned,
+                if *payload_owned {
+                    MIXED_NEW_AGGREGATE
+                } else {
+                    MIXED_NEW_AGGREGATE_BORROWED
+                },
+                &[types::I8, types::I32, pointer, pointer, pointer],
+                Some(pointer),
+                &[tag, exact_class, source, size, alignment],
                 resources,
-            )
+            )?
+            .ok_or_else(|| backend_failure("mixed class allocation produced no result"))
         }
         mir::MixedExpression::BoxPayloadEnum { value } => {
             let ty = value.ty();
@@ -12340,7 +13594,14 @@ fn lower_mixed_expression(
                 pointer.bytes() * 2,
                 pointer.bytes().trailing_zeros() as u8,
             ));
-            store_lowered_to_stack(builder, mir::Type::Error, slot, value, pointer)?;
+            store_lowered_to_stack(
+                builder,
+                resources.program,
+                mir::Type::Error,
+                slot,
+                value,
+                pointer,
+            )?;
             let source = builder.ins().stack_addr(pointer, slot, 0);
             let tag = builder.ins().iconst(types::I8, i64::from(MIXED_TAG_ERROR));
             let type_id = builder.ins().iconst(types::I32, 0);
@@ -12371,6 +13632,7 @@ fn lower_mixed_expression(
             ));
             store_lowered_to_stack(
                 builder,
+                resources.program,
                 mir::Type::Function(function_type),
                 slot,
                 value,
@@ -12483,8 +13745,14 @@ fn lower_nullable_mixed_expression(
         }
         mir::NullableMixedExpression::Local { local, transfer } => {
             let slot = local_slot(resources.local_slots, *local)?;
-            let value = load_lowered_from_stack(builder, mir::Type::NullableMixed, slot, pointer)
-                .single()?;
+            let value = load_lowered_from_stack(
+                builder,
+                resources.program,
+                mir::Type::NullableMixed,
+                slot,
+                pointer,
+            )
+            .single()?;
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
                 builder.ins().stack_store(pointer, zero, slot, 0);
@@ -12493,10 +13761,14 @@ fn lower_nullable_mixed_expression(
         }
         mir::NullableMixedExpression::Property { object, property } => {
             let address = lower_property_address(builder, *object, *property, resources)?;
-            Ok(
-                load_lowered_from_address(builder, mir::Type::NullableMixed, address, pointer)
-                    .single()?,
+            Ok(load_lowered_from_address(
+                builder,
+                resources.program,
+                mir::Type::NullableMixed,
+                address,
+                pointer,
             )
+            .single()?)
         }
         mir::NullableMixedExpression::Call { function, args, .. } => {
             lower_function_call(builder, *function, args, resources)
@@ -12551,7 +13823,9 @@ fn lower_mixed_payload(
 ) -> Result<Value, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     let slot = local_slot(resources.local_slots, mixed)?;
-    let mixed = load_lowered_from_stack(builder, mir::Type::Mixed, slot, pointer).single()?;
+    let mixed =
+        load_lowered_from_stack(builder, resources.program, mir::Type::Mixed, slot, pointer)
+            .single()?;
     let word = runtime_call(
         builder,
         MIXED_PAYLOAD,
@@ -12564,6 +13838,96 @@ fn lower_mixed_payload(
     collection_word_to_value(builder, word, tag.ty(), pointer)
 }
 
+fn lower_mixed_class_payload(
+    builder: &mut FunctionBuilder,
+    mixed: mir::LocalId,
+    class: crate::class_layout::ClassId,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredValue, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, mixed)?;
+    let mixed =
+        load_lowered_from_stack(builder, resources.program, mir::Type::Mixed, slot, pointer)
+            .single()?;
+    let payload = runtime_call(
+        builder,
+        MIXED_PAYLOAD,
+        &[pointer],
+        Some(types::I64),
+        &[mixed],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed class payload read produced no result"))?;
+    let address = collection_word_to_value(
+        builder,
+        payload,
+        mir::Type::Class(crate::class_layout::ClassId(0)),
+        pointer,
+    )?;
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let object = builder.ins().load(pointer, flags, address, 0);
+    let descriptor = builder
+        .ins()
+        .load(pointer, flags, address, pointer.bytes() as i32);
+    class_value_for_static_type(builder, object, Some(descriptor), class, class, resources)
+}
+
+fn lower_take_mixed_class_payload(
+    builder: &mut FunctionBuilder,
+    mixed: mir::LocalId,
+    class: crate::class_layout::ClassId,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<LoweredValue, BackendError> {
+    let pointer = resources.module.target_config().pointer_type();
+    let slot = local_slot(resources.local_slots, mixed)?;
+    let mixed_value =
+        load_lowered_from_stack(builder, resources.program, mir::Type::Mixed, slot, pointer)
+            .single()?;
+    let payload = runtime_call(
+        builder,
+        MIXED_PAYLOAD,
+        &[pointer],
+        Some(types::I64),
+        &[mixed_value],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed class payload read produced no result"))?;
+    let address = collection_word_to_value(
+        builder,
+        payload,
+        mir::Type::Class(crate::class_layout::ClassId(0)),
+        pointer,
+    )?;
+    let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+    let object = builder.ins().load(pointer, flags, address, 0);
+    let descriptor = builder
+        .ins()
+        .load(pointer, flags, address, pointer.bytes() as i32);
+    let zero = builder.ins().iconst(pointer, 0);
+    builder.ins().stack_store(pointer, zero, slot, 0);
+    let owns_final = runtime_call(
+        builder,
+        MIXED_RELEASE_OWNED,
+        &[pointer],
+        Some(types::I8),
+        &[mixed_value],
+        resources,
+    )?
+    .ok_or_else(|| backend_failure("mixed class payload take released no ownership claim"))?;
+    let zero_flag = builder.ins().iconst(types::I8, 0);
+    let not_final = builder.ins().icmp(IntCC::Equal, owns_final, zero_flag);
+    lower_panic_if_code_at_active_site(builder, not_final, "P1321", resources)?;
+    runtime_call(
+        builder,
+        MIXED_FREE,
+        &[pointer],
+        None,
+        &[mixed_value],
+        resources,
+    )?;
+    class_value_for_static_type(builder, object, Some(descriptor), class, class, resources)
+}
+
 fn lower_mixed_function_payload(
     builder: &mut FunctionBuilder,
     mixed: mir::LocalId,
@@ -12573,7 +13937,9 @@ fn lower_mixed_function_payload(
 ) -> Result<LoweredValue, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     let slot = local_slot(resources.local_slots, mixed)?;
-    let mixed_value = load_lowered_from_stack(builder, mir::Type::Mixed, slot, pointer).single()?;
+    let mixed_value =
+        load_lowered_from_stack(builder, resources.program, mir::Type::Mixed, slot, pointer)
+            .single()?;
     let payload_word = runtime_call(
         builder,
         MIXED_PAYLOAD,
@@ -12590,6 +13956,7 @@ fn lower_mixed_function_payload(
     };
     let value = load_lowered_from_address(
         builder,
+        resources.program,
         mir::Type::Function(function_type),
         address,
         pointer,
@@ -12620,58 +13987,6 @@ fn lower_mixed_function_payload(
     Ok(value)
 }
 
-fn lower_take_mixed_payload(
-    builder: &mut FunctionBuilder,
-    mixed: mir::LocalId,
-    tag: mir::MixedTag,
-    resources: &mut LoweringResources<'_, '_>,
-) -> Result<Value, BackendError> {
-    let pointer = resources.module.target_config().pointer_type();
-    let slot = local_slot(resources.local_slots, mixed)?;
-    let mixed_value = load_lowered_from_stack(builder, mir::Type::Mixed, slot, pointer).single()?;
-    let word = runtime_call(
-        builder,
-        MIXED_PAYLOAD,
-        &[pointer],
-        Some(types::I64),
-        &[mixed_value],
-        resources,
-    )?
-    .ok_or_else(|| backend_failure("mixed payload read produced no result"))?;
-    let payload = collection_word_to_value(builder, word, tag.ty(), pointer)?;
-    let zero = builder.ins().iconst(pointer, 0);
-    builder.ins().stack_store(pointer, zero, slot, 0);
-    let owns_final = runtime_call(
-        builder,
-        MIXED_RELEASE_OWNED,
-        &[pointer],
-        Some(types::I8),
-        &[mixed_value],
-        resources,
-    )?
-    .ok_or_else(|| backend_failure("mixed payload take released no ownership claim"))?;
-    // A move-type payload may only be moved out when this box holds the final owning
-    // claim. If another box still shares the owner (e.g. the collection this value was
-    // read from with `mixed $x = $items[0]`), or the box only borrows its payload,
-    // `release_owned` reports a non-final claim; moving the payload out anyway would
-    // hand ownership to the callee while the other holder later drops the same payload,
-    // a double free. Refuse it rather than corrupt memory.
-    if matches!(tag, mir::MixedTag::String | mir::MixedTag::Class(_)) {
-        let zero_flag = builder.ins().iconst(types::I8, 0);
-        let not_final = builder.ins().icmp(IntCC::Equal, owns_final, zero_flag);
-        lower_panic_if_code_at_active_site(builder, not_final, "P1321", resources)?;
-    }
-    runtime_call(
-        builder,
-        MIXED_FREE,
-        &[pointer],
-        None,
-        &[mixed_value],
-        resources,
-    )?;
-    Ok(payload)
-}
-
 fn lower_mixed_is(
     builder: &mut FunctionBuilder,
     mixed: &mir::MixedExpression,
@@ -12693,7 +14008,53 @@ fn lower_mixed_is(
     let (expected_tag, expected_type_id) = mixed_tag_value(tag);
     let expected_tag = builder.ins().iconst(types::I8, i64::from(expected_tag));
     let tag_matches = builder.ins().icmp(IntCC::Equal, actual_tag, expected_tag);
-    let result = if tag.has_structural_type_id() {
+    let result = if let mir::MixedTag::Class(target) = tag {
+        let inspect = builder.create_block();
+        let not_class = builder.create_block();
+        let done = builder.create_block();
+        builder.append_block_param(done, types::I8);
+        builder
+            .ins()
+            .brif(tag_matches, inspect, &[], not_class, &[]);
+        builder.switch_to_block(inspect);
+        let payload = runtime_call(
+            builder,
+            MIXED_PAYLOAD,
+            &[pointer],
+            Some(types::I64),
+            &[mixed_value],
+            resources,
+        )?
+        .ok_or_else(|| backend_failure("mixed class payload read produced no result"))?;
+        let address = collection_word_to_value(
+            builder,
+            payload,
+            mir::Type::Class(crate::class_layout::ClassId(0)),
+            pointer,
+        )?;
+        let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+        let descriptor = builder
+            .ins()
+            .load(pointer, flags, address, pointer.bytes() as i32);
+        let ancestry = builder
+            .ins()
+            .load(pointer, flags, descriptor, (pointer.bytes() * 4) as i32);
+        let byte = builder.ins().load(
+            types::I8,
+            flags,
+            ancestry,
+            i32::try_from(target.0 / 8)
+                .map_err(|_| malformed_mir("class hierarchy bitmap offset exceeds i32"))?,
+        );
+        let mask = builder.ins().iconst(types::I8, 1_i64 << (target.0 % 8));
+        let matched = builder.ins().band(byte, mask);
+        builder.ins().jump(done, &[BlockArg::Value(matched)]);
+        builder.switch_to_block(not_class);
+        let zero = builder.ins().iconst(types::I8, 0);
+        builder.ins().jump(done, &[BlockArg::Value(zero)]);
+        builder.switch_to_block(done);
+        builder.block_params(done)[0]
+    } else if tag.has_structural_type_id() {
         let actual_type_id = runtime_call(
             builder,
             MIXED_TYPE_ID,
@@ -13019,6 +14380,7 @@ fn lower_nullable_string_expression(
         mir::NullableStringExpression::Local(local) => {
             let value = load_lowered_from_stack(
                 builder,
+                resources.program,
                 mir::Type::NullableString,
                 local_slot(resources.local_slots, *local)?,
                 pointer,
@@ -13029,17 +14391,27 @@ fn lower_nullable_string_expression(
         }
         mir::NullableStringExpression::Static(id) => {
             let address = lower_static_address(builder, *id, resources)?;
-            let (present, payload) =
-                load_lowered_from_address(builder, mir::Type::NullableString, address, pointer)
-                    .nullable()?;
+            let (present, payload) = load_lowered_from_address(
+                builder,
+                resources.program,
+                mir::Type::NullableString,
+                address,
+                pointer,
+            )
+            .nullable()?;
             let payload = retain_string(builder, payload, resources)?;
             Ok(LoweredValue::Nullable { present, payload })
         }
         mir::NullableStringExpression::Property { object, property } => {
             let address = lower_property_address(builder, *object, *property, resources)?;
-            let (present, payload) =
-                load_lowered_from_address(builder, mir::Type::NullableString, address, pointer)
-                    .nullable()?;
+            let (present, payload) = load_lowered_from_address(
+                builder,
+                resources.program,
+                mir::Type::NullableString,
+                address,
+                pointer,
+            )
+            .nullable()?;
             let payload = retain_string(builder, payload, resources)?;
             Ok(LoweredValue::Nullable { present, payload })
         }
@@ -13090,10 +14462,12 @@ fn lower_nullable_string_expression(
                 owned_receiver,
                 resources,
                 |builder, resources| {
+                    let (object, _) = object.class_parts()?;
                     let address =
                         lower_property_address_from_value(builder, object, *property, resources)?;
                     let ty = property_definition(resources.program, *property)?.ty;
-                    let value = load_lowered_from_address(builder, ty, address, pointer);
+                    let value =
+                        load_lowered_from_address(builder, resources.program, ty, address, pointer);
                     match value {
                         LoweredValue::Single(payload) => Ok(LoweredValue::Single(retain_string(
                             builder, payload, resources,
@@ -13102,6 +14476,9 @@ fn lower_nullable_string_expression(
                             present,
                             payload: retain_string(builder, payload, resources)?,
                         }),
+                        LoweredValue::OpenClass { .. } => Err(malformed_mir(
+                            "open class carrier reached nullable string lowering",
+                        )),
                     }
                 },
             )
@@ -13183,6 +14560,7 @@ fn lower_nullable_scalar_expression(
         }
         mir::NullableScalarExpression::Local { local, .. } => Ok(load_lowered_from_stack(
             builder,
+            resources.program,
             mir::Type::NullableScalar(ty),
             local_slot(resources.local_slots, *local)?,
             pointer,
@@ -13193,6 +14571,7 @@ fn lower_nullable_scalar_expression(
             let address = lower_property_address(builder, *object, *property, resources)?;
             Ok(load_lowered_from_address(
                 builder,
+                resources.program,
                 mir::Type::NullableScalar(ty),
                 address,
                 pointer,
@@ -13202,6 +14581,7 @@ fn lower_nullable_scalar_expression(
             let address = lower_static_address(builder, *id, resources)?;
             Ok(load_lowered_from_address(
                 builder,
+                resources.program,
                 mir::Type::NullableScalar(ty),
                 address,
                 pointer,
@@ -13235,11 +14615,13 @@ fn lower_nullable_scalar_expression(
                 owned_receiver,
                 resources,
                 |builder, resources| {
+                    let (object, _) = object.class_parts()?;
                     let address =
                         lower_property_address_from_value(builder, object, *property, resources)?;
                     let property_ty = property_definition(resources.program, *property)?.ty;
                     Ok(load_lowered_from_address(
                         builder,
+                        resources.program,
                         property_ty,
                         address,
                         pointer,
@@ -13451,7 +14833,7 @@ fn clif_zero(builder: &mut FunctionBuilder, ty: ClifType) -> Value {
 
 fn lower_null_safe_nullable(
     builder: &mut FunctionBuilder,
-    object: Value,
+    receiver: LoweredValue,
     payload_type: ClifType,
     owned_receiver: Option<crate::class_layout::ClassId>,
     resources: &mut LoweringResources<'_, '_>,
@@ -13462,8 +14844,9 @@ fn lower_null_safe_nullable(
 ) -> Result<LoweredValue, BackendError> {
     let pointer = resources.module.target_config().pointer_type();
     if let Some(class) = owned_receiver {
-        defer_or_drop_class_temporary(builder, object, class, resources)?;
+        defer_or_drop_class_carrier_temporary(builder, receiver, class, resources)?;
     }
+    let (object, _) = receiver.class_parts()?;
     let present = presence_word(builder, object, pointer);
     let zero = builder.ins().iconst(pointer, 0);
     let is_present = builder.ins().icmp(IntCC::NotEqual, present, zero);
@@ -13478,6 +14861,11 @@ fn lower_null_safe_nullable(
     let (present, payload) = match value {
         LoweredValue::Single(payload) => (builder.ins().iconst(pointer, 1), payload),
         LoweredValue::Nullable { present, payload } => (present, payload),
+        LoweredValue::OpenClass { .. } => {
+            return Err(malformed_mir(
+                "open class carrier reached nullable scalar lowering",
+            ))
+        }
     };
     builder
         .ins()
@@ -13505,11 +14893,12 @@ fn lower_null_safe_statement_call(
 ) -> Result<(), BackendError> {
     let receiver = lower_nullable_class_expression(builder, object, resources)?;
     if let Some(class) = object.owned_temporary_class() {
-        defer_or_drop_class_temporary(builder, receiver, class, resources)?;
+        defer_or_drop_class_carrier_temporary(builder, receiver, class, resources)?;
     }
+    let (object, _) = receiver.class_parts()?;
     let pointer = resources.module.target_config().pointer_type();
     let zero = builder.ins().iconst(pointer, 0);
-    let present = builder.ins().icmp(IntCC::NotEqual, receiver, zero);
+    let present = builder.ins().icmp(IntCC::NotEqual, object, zero);
     let call_block = builder.create_block();
     let done = builder.create_block();
     builder.ins().brif(present, call_block, &[], done, &[]);
@@ -14661,6 +16050,7 @@ fn lower_call_args_with_optional_parameters(
             let address = closure_source_address(builder, local, resources)?;
             arguments.push(load_lowered_from_address(
                 builder,
+                resources.program,
                 argument.ty(),
                 address,
                 resources.module.target_config().pointer_type(),
@@ -15145,6 +16535,54 @@ fn set_active_panic_site(
         .store(flags, end, resources.current_frame, pointer_bytes * 10);
 }
 
+fn append_virtual_receiver_abi(
+    builder: &mut FunctionBuilder,
+    receiver: LoweredValue,
+    static_class: crate::class_layout::ClassId,
+    values: &mut Vec<Value>,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    let (object, descriptor) = receiver.class_parts()?;
+    values.push(object);
+    values.push(
+        descriptor
+            .map(Ok)
+            .unwrap_or_else(|| class_descriptor_address(builder, static_class, resources))?,
+    );
+    Ok(())
+}
+
+fn append_lowered_call_abi(
+    builder: &mut FunctionBuilder,
+    definition: &mir::Function,
+    lowered: &LoweredCallArgs,
+    values: &mut Vec<Value>,
+    resources: &mut LoweringResources<'_, '_>,
+) -> Result<(), BackendError> {
+    if !definition.uses_virtual_receiver_abi() {
+        values.extend(lowered.abi_values.iter().copied());
+        return Ok(());
+    }
+    let receiver = *lowered
+        .arguments
+        .first()
+        .ok_or_else(|| malformed_mir("virtual call has no receiver"))?;
+    let class = definition
+        .method
+        .as_ref()
+        .ok_or_else(|| malformed_mir("virtual callable has no method identity"))?
+        .class;
+    append_virtual_receiver_abi(builder, receiver, class, values, resources)?;
+    values.extend(
+        lowered
+            .abi_values
+            .iter()
+            .skip(receiver.abi_value_count())
+            .copied(),
+    );
+    Ok(())
+}
+
 fn lower_function_call(
     builder: &mut FunctionBuilder,
     function: mir::FunctionId,
@@ -15184,9 +16622,34 @@ fn lower_function_call_at(
     if let Some(home) = direct_call_borrow_home(builder, callee_definition, args, resources)? {
         values.push(home);
     }
-    values.extend(lowered.abi_values.iter().copied());
-    let callee = declared_function(builder, resources, function)?;
-    let call = builder.ins().call(callee, &values);
+    append_lowered_call_abi(builder, callee_definition, &lowered, &mut values, resources)?;
+    let call = if let Some(slot) = callee_definition.virtual_slot {
+        let receiver = lowered
+            .arguments
+            .first()
+            .ok_or_else(|| malformed_mir("virtual call has no receiver"))?;
+        if let Some(descriptor) = receiver.class_parts()?.1 {
+            let pointer = resources.module.target_config().pointer_type();
+            let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+            let vtable =
+                builder
+                    .ins()
+                    .load(pointer, flags, descriptor, (pointer.bytes() * 3) as i32);
+            let entry = builder
+                .ins()
+                .load(pointer, flags, vtable, (pointer.bytes() * slot) as i32);
+            let signature =
+                function_signature(resources.module, resources.program, callee_definition)?;
+            let signature = builder.import_signature(signature);
+            builder.ins().call_indirect(signature, entry, &values)
+        } else {
+            let callee = declared_function(builder, resources, function)?;
+            builder.ins().call(callee, &values)
+        }
+    } else {
+        let callee = declared_function(builder, resources, function)?;
+        builder.ins().call(callee, &values)
+    };
     let results = builder.inst_results(call);
     let result = match callee_definition.return_type {
         mir::ReturnType::Void => None,
@@ -15219,6 +16682,18 @@ fn lower_function_call_at(
             Some(LoweredValue::Single(payload_result.ok_or_else(|| {
                 malformed_mir("payload enum call has no result storage")
             })?))
+        }
+        mir::ReturnType::Value(mir::Type::Class(class) | mir::Type::NullableClass(class))
+            if class_uses_open_carrier(resources.program, class) =>
+        {
+            Some(LoweredValue::OpenClass {
+                object: *results
+                    .first()
+                    .ok_or_else(|| malformed_mir("open class call produced no object result"))?,
+                descriptor: *results.get(1).ok_or_else(|| {
+                    malformed_mir("open class call produced no descriptor result")
+                })?,
+            })
         }
         mir::ReturnType::Value(ty) => {
             let value = *results
@@ -15274,19 +16749,24 @@ fn cleanup_call_arguments(
             ))
         })?;
         if !local_in(callee_definition, parameter)?.owned {
-            let value = lowered.arguments[index].single()?;
+            let value = lowered.arguments[index];
             if let Some(class) = argument.owned_temporary_class() {
-                defer_or_drop_class_temporary(builder, value, class, resources)?;
+                defer_or_drop_class_carrier_temporary(builder, value, class, resources)?;
             } else if let Some(collection) = argument.owned_temporary_collection() {
-                defer_or_drop_collection_temporary(builder, value, collection, resources)?;
+                defer_or_drop_collection_temporary(
+                    builder,
+                    value.single()?,
+                    collection,
+                    resources,
+                )?;
             } else if let Some(shared) = argument.owned_temporary_shared() {
-                defer_or_drop_owned_shared_temporary(builder, value, shared, resources)?;
+                defer_or_drop_owned_shared_temporary(builder, value.single()?, shared, resources)?;
             } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
-                lower_drop_payload_enum_at(builder, value, payload, nullable, resources)?;
+                lower_drop_payload_enum_at(builder, value.single()?, payload, nullable, resources)?;
             } else if argument.mixed_ownership().has_shell() {
                 defer_or_cleanup_mixed_temporary(
                     builder,
-                    value,
+                    value.single()?,
                     argument.mixed_ownership(),
                     resources,
                 )?;
@@ -15362,7 +16842,7 @@ fn defer_or_drop_owned_shared_temporary(
 
 fn lower_method_call_with_receiver(
     builder: &mut FunctionBuilder,
-    receiver: Value,
+    receiver: LoweredValue,
     function: mir::FunctionId,
     args: &[mir::Rvalue],
     resources: &mut LoweringResources<'_, '_>,
@@ -15380,10 +16860,39 @@ fn lower_method_call_with_receiver(
         }
         _ => None,
     };
-    values.push(receiver);
+    if definition.uses_virtual_receiver_abi() {
+        let class = definition
+            .method
+            .as_ref()
+            .ok_or_else(|| malformed_mir("virtual callable has no method identity"))?
+            .class;
+        append_virtual_receiver_abi(builder, receiver, class, &mut values, resources)?;
+    } else {
+        receiver.append_to(&mut values);
+    }
     values.extend(lowered.abi_values.iter().copied());
-    let callee = declared_function(builder, resources, function)?;
-    let call = builder.ins().call(callee, &values);
+    let call = if let Some(slot) = definition.virtual_slot {
+        if let Some(descriptor) = receiver.class_parts()?.1 {
+            let pointer = resources.module.target_config().pointer_type();
+            let flags = cranelift_codegen::ir::MachMemFlags::trusted();
+            let vtable =
+                builder
+                    .ins()
+                    .load(pointer, flags, descriptor, (pointer.bytes() * 3) as i32);
+            let entry = builder
+                .ins()
+                .load(pointer, flags, vtable, (pointer.bytes() * slot) as i32);
+            let signature = function_signature(resources.module, resources.program, definition)?;
+            let signature = builder.import_signature(signature);
+            builder.ins().call_indirect(signature, entry, &values)
+        } else {
+            let callee = declared_function(builder, resources, function)?;
+            builder.ins().call(callee, &values)
+        }
+    } else {
+        let callee = declared_function(builder, resources, function)?;
+        builder.ins().call(callee, &values)
+    };
     let results = builder.inst_results(call);
     let result = match definition.return_type {
         mir::ReturnType::Void => None,
@@ -15414,6 +16923,18 @@ fn lower_method_call_with_receiver(
             Some(LoweredValue::Single(payload_result.ok_or_else(|| {
                 malformed_mir("payload enum method call has no result storage")
             })?))
+        }
+        mir::ReturnType::Value(mir::Type::Class(class) | mir::Type::NullableClass(class))
+            if class_uses_open_carrier(resources.program, class) =>
+        {
+            Some(LoweredValue::OpenClass {
+                object: *results.first().ok_or_else(|| {
+                    malformed_mir("open class method call produced no object result")
+                })?,
+                descriptor: *results.get(1).ok_or_else(|| {
+                    malformed_mir("open class method call produced no descriptor result")
+                })?,
+            })
         }
         mir::ReturnType::Value(ty) => {
             let value = *results
@@ -15452,19 +16973,24 @@ fn lower_method_call_with_receiver(
             ))
         })?;
         if !local_in(definition, parameter)?.owned {
-            let value = lowered.arguments[index].single()?;
+            let value = lowered.arguments[index];
             if let Some(class) = argument.owned_temporary_class() {
-                defer_or_drop_class_temporary(builder, value, class, resources)?;
+                defer_or_drop_class_carrier_temporary(builder, value, class, resources)?;
             } else if let Some(collection) = argument.owned_temporary_collection() {
-                defer_or_drop_collection_temporary(builder, value, collection, resources)?;
+                defer_or_drop_collection_temporary(
+                    builder,
+                    value.single()?,
+                    collection,
+                    resources,
+                )?;
             } else if let Some(shared) = argument.owned_temporary_shared() {
-                defer_or_drop_owned_shared_temporary(builder, value, shared, resources)?;
+                defer_or_drop_owned_shared_temporary(builder, value.single()?, shared, resources)?;
             } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
-                lower_drop_payload_enum_at(builder, value, payload, nullable, resources)?;
+                lower_drop_payload_enum_at(builder, value.single()?, payload, nullable, resources)?;
             } else if argument.mixed_ownership().has_shell() {
                 defer_or_cleanup_mixed_temporary(
                     builder,
-                    value,
+                    value.single()?,
                     argument.mixed_ownership(),
                     resources,
                 )?;
@@ -15778,14 +17304,49 @@ fn lower_condition_to_branch(
             let owned = value.owned_temporary_class();
             let value = lower_nullable_class_expression(builder, value, resources)?;
             if let Some(class) = owned {
-                defer_or_drop_class_temporary(builder, value, class, resources)?;
+                defer_or_drop_class_carrier_temporary(builder, value, class, resources)?;
             }
+            let (value, _) = value.class_parts()?;
             let pointer = resources.module.target_config().pointer_type();
             let zero = builder.ins().iconst(pointer, 0);
             let present = builder.ins().icmp(IntCC::NotEqual, value, zero);
             builder
                 .ins()
                 .brif(present, then_block, &[], else_block, &[]);
+        }
+        mir::BoolExpression::ClassIs { value, target } => {
+            let owned = value.owned_temporary_class();
+            let source_class = value.class();
+            let value = lower_nullable_class_expression(builder, value, resources)?;
+            if let Some(class) = owned {
+                defer_or_drop_class_carrier_temporary(builder, value, class, resources)?;
+            }
+            let (object, descriptor) = value.class_parts()?;
+            if class_uses_open_carrier(resources.program, source_class) {
+                lower_open_class_type_test_to_branch(
+                    builder,
+                    object,
+                    descriptor.ok_or_else(|| {
+                        malformed_mir("open class type test has no class descriptor")
+                    })?,
+                    *target,
+                    then_block,
+                    else_block,
+                    resources,
+                )?;
+            } else {
+                let matches = mir_class_is_subtype(resources.program, source_class, *target);
+                let pointer = resources.module.target_config().pointer_type();
+                let zero = builder.ins().iconst(pointer, 0);
+                let present = builder.ins().icmp(IntCC::NotEqual, object, zero);
+                if matches {
+                    builder
+                        .ins()
+                        .brif(present, then_block, &[], else_block, &[]);
+                } else {
+                    builder.ins().jump(else_block, &[]);
+                }
+            }
         }
         mir::BoolExpression::NullableCollectionIsPresent(value) => {
             let owned = value.owned_temporary_collection();

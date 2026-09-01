@@ -1,0 +1,15 @@
+open class Base
+{
+    const int LEFT = 20;
+    static writable int $right = 21;
+    static function total(): int { return self::LEFT + self::right; }
+}
+class Child extends Base
+{
+    static function answer(): int
+    {
+        parent::right += 1;
+        return parent::total();
+    }
+}
+function main(): void { echo "parent static {Child::answer()}\n"; }

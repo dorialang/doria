@@ -60,6 +60,16 @@ Unsupported-development diagnostics must distinguish valid-but-not-yet-covered
 Doria from invalid language. Backend limitations explain that language checking
 succeeded and that one output target could not preserve or emit the program.
 
+Inheritance diagnostics name the violated source contract, not an internal
+layout or dispatch mechanism. Point to both declarations when a closed parent,
+member collision, or incompatible override is involved. Missing `override` and
+redundant `open override` may offer exact modifier edits; signature, receiver,
+return, default, generic, and checked-effect incompatibilities require review
+unless the only safe edit is mechanically certain. Do not expose descriptor,
+carrier, thunk, slot, or vtable vocabulary as the user's mistake. Accepted
+interface and trait syntax remains a Stage 35 implementation boundary rather
+than being described as invalid Doria.
+
 ## Suggested fixes
 
 Every structured fix declares one applicability:

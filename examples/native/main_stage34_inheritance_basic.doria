@@ -1,0 +1,12 @@
+open class Base
+{
+    function value(): int { return 42; }
+}
+
+class Child extends Base {}
+
+function main(): void
+{
+    let $child = new Child();
+    echo "basic {$child->value()}\n";
+}

@@ -1035,8 +1035,28 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         mir::Type::NullableMixed => FieldType::NullableMixed,
         mir::Type::Error => FieldType::Error,
         mir::Type::NullableError => FieldType::NullableError,
-        mir::Type::Class(class) => FieldType::Class(class),
-        mir::Type::NullableClass(class) => FieldType::NullableClass(class),
+        mir::Type::Class(class) => {
+            if program
+                .classes
+                .get(class.0)
+                .is_some_and(|definition| definition.is_open)
+            {
+                FieldType::OpenClass(class)
+            } else {
+                FieldType::Class(class)
+            }
+        }
+        mir::Type::NullableClass(class) => {
+            if program
+                .classes
+                .get(class.0)
+                .is_some_and(|definition| definition.is_open)
+            {
+                FieldType::NullableOpenClass(class)
+            } else {
+                FieldType::NullableClass(class)
+            }
+        }
         mir::Type::SharedReference(class) => FieldType::SharedReference(class),
         mir::Type::WeakReference(class) => FieldType::WeakReference(class),
         mir::Type::NullableSharedReference(class) => FieldType::NullableSharedReference(class),
@@ -1284,6 +1304,7 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     validate_borrowed_user_locals(function, &reachable)?;
     validate_nullable_presence(program, function)?;
     validate_mixed_tag_proofs(program, function)?;
+    validate_class_refinement_proofs(program, function)?;
     validate_payload_case_proofs(program, function)?;
     validate_match_result_plans(function)?;
     validate_match_binding_plans(function)?;
@@ -3207,6 +3228,7 @@ fn validate_terminator(
                 function,
                 &mir::ClassExpression::New {
                     class: *class,
+                    concrete_class: *class,
                     properties: properties.clone(),
                     constructor: Some(*constructor),
                     args: args.clone(),
@@ -6026,14 +6048,18 @@ fn validate_collection_expression(
     let definition = collection_in(program, expression.collection())?;
     match expression {
         mir::CollectionExpression::Local {
-            local, transfer, ..
+            local,
+            transfer,
+            assume_non_null,
+            ..
         } => {
             let local = local_in(function, *local)?;
-            if !matches!(
-                local.ty,
-                mir::Type::Collection(found) | mir::Type::NullableCollection(found)
-                    if found == definition.id
-            ) {
+            let local_type_matches = match local.ty {
+                mir::Type::Collection(found) => found == definition.id && !assume_non_null,
+                mir::Type::NullableCollection(found) => found == definition.id && *assume_non_null,
+                _ => false,
+            };
+            if !local_type_matches {
                 return Err(malformed_mir("collection local expression type mismatch"));
             }
             if *transfer && !local.owned {
@@ -6107,7 +6133,10 @@ fn validate_collection_expression(
             validate_collection_index(program, function, source_type, index, *positional)
         }
         mir::CollectionExpression::Property {
-            object, property, ..
+            object,
+            property,
+            assume_non_null,
+            ..
         } => {
             let object = local_in(function, *object)?;
             let class = match object.ty {
@@ -6119,7 +6148,16 @@ fn validate_collection_expression(
                 }
             };
             let property = property_in(program, class, *property)?;
-            if property.ty != mir::Type::Collection(definition.id) {
+            let property_type_matches = match property.ty {
+                mir::Type::Collection(collection) => {
+                    collection == definition.id && !assume_non_null
+                }
+                mir::Type::NullableCollection(collection) => {
+                    collection == definition.id && *assume_non_null
+                }
+                _ => false,
+            };
+            if !property_type_matches {
                 return Err(malformed_mir(
                     "collection property expression type mismatch",
                 ));
@@ -7998,6 +8036,7 @@ struct ClassLocalAccesses<'a> {
     accesses: Vec<ClassLocalAccess<'a>>,
     nullable_assumptions: Vec<mir::LocalId>,
     mixed_assumptions: Vec<(mir::LocalId, mir::MixedTag)>,
+    class_assumptions: Vec<(mir::LocalId, crate::class_layout::ClassId)>,
 }
 
 impl<'a> ClassLocalAccesses<'a> {
@@ -8041,6 +8080,10 @@ impl<'a> ClassLocalAccesses<'a> {
         self.mixed_assumptions.push((local, tag));
     }
 
+    fn assume_class(&mut self, local: mir::LocalId, class: crate::class_layout::ClassId) {
+        self.class_assumptions.push((local, class));
+    }
+
     fn iter(&self) -> impl Iterator<Item = ClassLocalAccess<'a>> + '_ {
         self.accesses.iter().copied()
     }
@@ -8051,6 +8094,12 @@ impl<'a> ClassLocalAccesses<'a> {
 
     fn mixed_assumptions(&self) -> impl Iterator<Item = (mir::LocalId, mir::MixedTag)> + '_ {
         self.mixed_assumptions.iter().copied()
+    }
+
+    fn class_assumptions(
+        &self,
+    ) -> impl Iterator<Item = (mir::LocalId, crate::class_layout::ClassId)> + '_ {
+        self.class_assumptions.iter().copied()
     }
 
     fn borrowed(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
@@ -8669,6 +8718,11 @@ fn collect_collection_class_local_accesses<'a>(
         mir::CollectionExpression::StringIntrinsic(call) => {
             collect_rvalue_args_class_local_accesses(&call.args, accesses);
         }
+        mir::CollectionExpression::Local {
+            local,
+            assume_non_null: true,
+            ..
+        } => accesses.assume_nullable_present(*local),
         mir::CollectionExpression::Local { .. }
         | mir::CollectionExpression::SharedAccessPayload { .. }
         | mir::CollectionExpression::From { .. }
@@ -9065,6 +9119,13 @@ fn collect_class_expression_local_accesses<'a>(
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
+        mir::ClassExpression::Local { class, local, .. }
+        | mir::ClassExpression::NullableLocalAssumeNonNull { class, local, .. } => {
+            accesses.assume_class(*local, *class);
+        }
+        _ => {}
+    }
+    match value {
         mir::ClassExpression::Local {
             local,
             transfer: true,
@@ -9193,6 +9254,9 @@ fn collect_bool_class_local_accesses<'a>(
             collect_nullable_error_class_local_accesses(value, accesses);
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
+            collect_nullable_class_local_accesses(value, accesses);
+        }
+        mir::BoolExpression::ClassIs { value, .. } => {
             collect_nullable_class_local_accesses(value, accesses);
         }
         mir::BoolExpression::NullableCollectionIsPresent(value) => {
@@ -9790,7 +9854,7 @@ fn validate_nullable_presence(
 }
 
 fn validate_mixed_tag_proofs(
-    _program: &mir::Program,
+    program: &mir::Program,
     function: &mir::Function,
 ) -> Result<(), BackendError> {
     let mut entries = vec![None; function.blocks.len()];
@@ -9884,6 +9948,7 @@ fn validate_mixed_tag_proofs(
         };
         for statement in &block.statements {
             validate_mixed_tag_assumptions(
+                program,
                 function,
                 &collect_statement_class_local_accesses(statement),
                 &tags,
@@ -9891,9 +9956,123 @@ fn validate_mixed_tag_proofs(
             apply_mixed_tag_statement(function, statement, &mut tags)?;
         }
         validate_mixed_tag_assumptions(
+            program,
             function,
             &collect_terminator_class_local_accesses(&block.terminator),
             &tags,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn validate_class_refinement_proofs(
+    program: &mir::Program,
+    function: &mir::Function,
+) -> Result<(), BackendError> {
+    let mut entries = vec![None; function.blocks.len()];
+    entries[function.entry_block.0] = Some(HashMap::new());
+    let mut pending = VecDeque::from([function.entry_block]);
+
+    while let Some(block_id) = pending.pop_front() {
+        let block = block_in(function, block_id)?;
+        let Some(mut refinements) = entries[block_id.0].clone() else {
+            continue;
+        };
+        for statement in &block.statements {
+            apply_class_refinement_statement(function, statement, &mut refinements)?;
+        }
+
+        match &block.terminator {
+            mir::Terminator::Jump(target) => {
+                if merge_definite_class_refinements(&mut entries[target.0], &refinements) {
+                    pending.push_back(*target);
+                }
+            }
+            mir::Terminator::IndirectCall { continuation, .. } => {
+                if merge_definite_class_refinements(&mut entries[continuation.0], &refinements) {
+                    pending.push_back(*continuation);
+                }
+            }
+            mir::Terminator::Branch {
+                condition,
+                then_block,
+                else_block,
+            } => {
+                for (target, condition_value) in [(*then_block, true), (*else_block, false)] {
+                    if constant_bool_expression(condition)
+                        .is_some_and(|value| value != condition_value)
+                    {
+                        continue;
+                    }
+                    let mut outgoing = refinements.clone();
+                    apply_class_refinement_condition(condition, condition_value, &mut outgoing);
+                    if merge_definite_class_refinements(&mut entries[target.0], &outgoing) {
+                        pending.push_back(target);
+                    }
+                }
+            }
+            mir::Terminator::CheckedCall {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedIndirectCall {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedConstruct {
+                success, failure, ..
+            }
+            | mir::Terminator::CheckedIo {
+                success, failure, ..
+            } => {
+                for target in [*success, *failure] {
+                    if merge_definite_class_refinements(&mut entries[target.0], &refinements) {
+                        pending.push_back(target);
+                    }
+                }
+            }
+            mir::Terminator::ErrorSwitch {
+                cases,
+                catch_all,
+                fallback,
+                ..
+            } => {
+                let targets = cases
+                    .iter()
+                    .map(|(_, target)| *target)
+                    .chain(catch_all.iter().copied())
+                    .chain(std::iter::once(*fallback));
+                for target in targets {
+                    if merge_definite_class_refinements(&mut entries[target.0], &refinements) {
+                        pending.push_back(target);
+                    }
+                }
+            }
+            mir::Terminator::Return(_)
+            | mir::Terminator::ReturnVoid
+            | mir::Terminator::Panic { .. }
+            | mir::Terminator::Unreachable
+            | mir::Terminator::PropagateError { .. } => {}
+        }
+    }
+
+    for block in &function.blocks {
+        let Some(mut refinements) = entries[block.id.0].clone() else {
+            continue;
+        };
+        for statement in &block.statements {
+            validate_class_refinement_assumptions(
+                program,
+                function,
+                &collect_statement_class_local_accesses(statement),
+                &refinements,
+            )?;
+            apply_class_refinement_statement(function, statement, &mut refinements)?;
+        }
+        validate_class_refinement_assumptions(
+            program,
+            function,
+            &collect_terminator_class_local_accesses(&block.terminator),
+            &refinements,
         )?;
     }
 
@@ -11750,6 +11929,32 @@ fn merge_definite_mixed_tags(
     }
 }
 
+fn merge_definite_class_refinements(
+    destination: &mut Option<HashMap<mir::LocalId, crate::class_layout::ClassId>>,
+    incoming: &HashMap<mir::LocalId, crate::class_layout::ClassId>,
+) -> bool {
+    match destination {
+        Some(current) => {
+            let merged = current
+                .iter()
+                .filter_map(|(local, class)| {
+                    (incoming.get(local) == Some(class)).then_some((*local, *class))
+                })
+                .collect::<HashMap<_, _>>();
+            if *current == merged {
+                false
+            } else {
+                *current = merged;
+                true
+            }
+        }
+        None => {
+            *destination = Some(incoming.clone());
+            true
+        }
+    }
+}
+
 fn merge_definite_payload_cases(
     destination: &mut Option<HashMap<mir::LocalId, crate::enums::EnumCaseId>>,
     incoming: &HashMap<mir::LocalId, crate::enums::EnumCaseId>,
@@ -11938,6 +12143,38 @@ fn apply_mixed_tag_statement(
     Ok(())
 }
 
+fn apply_class_refinement_statement(
+    function: &mir::Function,
+    statement: &mir::Statement,
+    refinements: &mut HashMap<mir::LocalId, crate::class_layout::ClassId>,
+) -> Result<(), BackendError> {
+    match statement {
+        mir::Statement::AssignLocal { target, .. } => {
+            if matches!(
+                local_in(function, *target)?.ty,
+                mir::Type::Class(_) | mir::Type::NullableClass(_)
+            ) {
+                refinements.remove(target);
+            }
+        }
+        mir::Statement::AssignLocalGroup { targets, .. } => {
+            for target in targets {
+                if matches!(
+                    local_in(function, *target)?.ty,
+                    mir::Type::Class(_) | mir::Type::NullableClass(_)
+                ) {
+                    refinements.remove(target);
+                }
+            }
+        }
+        mir::Statement::DropClass { local, .. } => {
+            refinements.remove(local);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn apply_mixed_tag_condition(
     condition: &mir::BoolExpression,
     when_true: bool,
@@ -11965,6 +12202,46 @@ fn apply_mixed_tag_condition(
     }
 }
 
+fn apply_class_refinement_condition(
+    condition: &mir::BoolExpression,
+    when_true: bool,
+    refinements: &mut HashMap<mir::LocalId, crate::class_layout::ClassId>,
+) {
+    match condition {
+        mir::BoolExpression::ClassIs { value, target } => {
+            if let Some(local) = class_is_expression_local(value) {
+                if when_true {
+                    refinements.insert(local, *target);
+                } else {
+                    refinements.remove(&local);
+                }
+            }
+        }
+        mir::BoolExpression::Not(value) => {
+            apply_class_refinement_condition(value, !when_true, refinements)
+        }
+        mir::BoolExpression::Binary { op, left, right } => match (op, when_true) {
+            (mir::BoolBinaryOp::And, true) | (mir::BoolBinaryOp::Or, false) => {
+                apply_class_refinement_condition(left, when_true, refinements);
+                apply_class_refinement_condition(right, when_true, refinements);
+            }
+            _ => {}
+        },
+        _ => {}
+    }
+}
+
+fn class_is_expression_local(expression: &mir::NullableClassExpression) -> Option<mir::LocalId> {
+    match expression {
+        mir::NullableClassExpression::Local { local, .. } => Some(*local),
+        mir::NullableClassExpression::Class(
+            mir::ClassExpression::Local { local, .. }
+            | mir::ClassExpression::NullableLocalAssumeNonNull { local, .. },
+        ) => Some(*local),
+        _ => None,
+    }
+}
+
 fn mixed_expression_local(expression: &mir::MixedExpression) -> Option<mir::LocalId> {
     match expression {
         mir::MixedExpression::Local { local, .. } => Some(*local),
@@ -11973,16 +12250,53 @@ fn mixed_expression_local(expression: &mir::MixedExpression) -> Option<mir::Loca
 }
 
 fn validate_mixed_tag_assumptions(
+    program: &mir::Program,
     function: &mir::Function,
     accesses: &ClassLocalAccesses<'_>,
     tags: &HashMap<mir::LocalId, mir::MixedTag>,
 ) -> Result<(), BackendError> {
     for (local, tag) in accesses.mixed_assumptions() {
-        if tags.get(&local) != Some(&tag) {
+        let proven = tags.get(&local);
+        let valid = proven == Some(&tag)
+            || matches!(
+                (proven, tag),
+                (Some(mir::MixedTag::Class(actual)), mir::MixedTag::Class(target))
+                    if class_is_subtype(program, *actual, target)
+            );
+        if !valid {
             return Err(malformed_mir(format!(
                 "{} local local{} is unboxed as {tag} without a dominating exact `is` proof",
                 local_in(function, local)?.ty,
                 local.0,
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_class_refinement_assumptions(
+    program: &mir::Program,
+    function: &mir::Function,
+    accesses: &ClassLocalAccesses<'_>,
+    refinements: &HashMap<mir::LocalId, crate::class_layout::ClassId>,
+) -> Result<(), BackendError> {
+    for (local, target) in accesses.class_assumptions() {
+        let source = match local_in(function, local)?.ty {
+            mir::Type::Class(class) | mir::Type::NullableClass(class) => class,
+            _ => continue,
+        };
+        if class_is_subtype(program, source, target) {
+            continue;
+        }
+        let valid = refinements
+            .get(&local)
+            .is_some_and(|proven| class_is_subtype(program, *proven, target));
+        if !valid {
+            return Err(malformed_mir(format!(
+                "{} local local{} is narrowed to class#{} without a dominating hierarchy `is` proof",
+                local_in(function, local)?.ty,
+                local.0,
+                target.0,
             )));
         }
     }
@@ -12133,6 +12447,11 @@ fn apply_nullable_presence_condition(
                 set_nullable_presence(*local, when_true, present);
             }
         }
+        mir::BoolExpression::ClassIs { value, .. } if when_true => {
+            if let mir::NullableClassExpression::Local { local, .. } = value.as_ref() {
+                set_nullable_presence(*local, true, present);
+            }
+        }
         mir::BoolExpression::NullableCollectionIsPresent(value) => {
             if let mir::NullableCollectionExpression::Local { local, .. } = value.as_ref() {
                 set_nullable_presence(*local, when_true, present);
@@ -12145,6 +12464,30 @@ fn apply_nullable_presence_condition(
         }
         mir::BoolExpression::NullableWeakReferenceIsPresent(value) => {
             if let mir::NullableWeakReferenceExpression::Local { local, .. } = value.as_ref() {
+                set_nullable_presence(*local, when_true, present);
+            }
+        }
+        mir::BoolExpression::NullableWritableSharedReferenceIsPresent(value) => {
+            if let mir::NullableWritableSharedReferenceExpression::Local { local, .. } =
+                value.as_ref()
+            {
+                set_nullable_presence(*local, when_true, present);
+            }
+        }
+        mir::BoolExpression::NullableWritableWeakReferenceIsPresent(value) => {
+            if let mir::NullableWritableWeakReferenceExpression::Local { local, .. } =
+                value.as_ref()
+            {
+                set_nullable_presence(*local, when_true, present);
+            }
+        }
+        mir::BoolExpression::NullableMixedIsPresent(value) => {
+            if let mir::NullableMixedExpression::Local { local, .. } = value.as_ref() {
+                set_nullable_presence(*local, when_true, present);
+            }
+        }
+        mir::BoolExpression::NullableFunctionIsPresent(value) => {
+            if let mir::NullableFunctionExpression::Local { local, .. } = value.as_ref() {
                 set_nullable_presence(*local, when_true, present);
             }
         }
@@ -12369,10 +12712,18 @@ fn validate_class_expression(
             local, transfer, ..
         } => {
             let definition = local_in(function, *local)?;
-            if definition.ty != mir::Type::Class(class) {
+            let mir::Type::Class(actual) = definition.ty else {
                 return Err(malformed_mir(format!(
                     "class rvalue uses non-class local local{}",
                     local.0
+                )));
+            };
+            if !class_is_subtype(program, actual, class)
+                && !class_is_subtype(program, class, actual)
+            {
+                return Err(malformed_mir(format!(
+                    "class rvalue uses unrelated class#{} as class#{}",
+                    actual.0, class.0
                 )));
             }
             if *transfer && !definition.owned {
@@ -12387,9 +12738,16 @@ fn validate_class_expression(
             local, transfer, ..
         } => {
             let definition = local_in(function, *local)?;
-            if definition.ty != mir::Type::NullableClass(class) {
+            let mir::Type::NullableClass(actual) = definition.ty else {
                 return Err(malformed_mir(
-                    "nonnull class expression references another local type",
+                    "nonnull class expression references a non-nullable-class local",
+                ));
+            };
+            if !class_is_subtype(program, actual, class)
+                && !class_is_subtype(program, class, actual)
+            {
+                return Err(malformed_mir(
+                    "nonnull class expression uses an unrelated local type",
                 ));
             }
             if *transfer && !definition.owned {
@@ -12438,10 +12796,16 @@ fn validate_class_expression(
             ..
         } => {
             let callee = function_in(program, *callee)?;
-            if callee.return_type != mir::ReturnType::Value(mir::Type::Class(class)) {
+            let mir::ReturnType::Value(mir::Type::Class(actual)) = callee.return_type else {
                 return Err(malformed_mir(format!(
                     "class#{} call targets a function with another return type",
                     class.0
+                )));
+            };
+            if !class_is_subtype(program, actual, class) {
+                return Err(malformed_mir(format!(
+                    "class#{} call targets a function returning unrelated class#{}",
+                    class.0, actual.0
                 )));
             }
             let expected_return_borrow = infer_function_return_borrow(program, callee)?;
@@ -12454,15 +12818,29 @@ fn validate_class_expression(
             validate_call_args(program, function, callee, args)
         }
         mir::ClassExpression::New {
+            concrete_class,
             properties,
             args,
             constructor,
             ..
         } => {
-            if class_definition.constructor != *constructor {
+            let concrete_definition = program
+                .classes
+                .get(concrete_class.0)
+                .filter(|definition| definition.id == *concrete_class)
+                .ok_or_else(|| {
+                    malformed_mir(format!("unknown concrete class#{}", concrete_class.0))
+                })?;
+            if !class_is_subtype(program, *concrete_class, class) {
                 return Err(malformed_mir(format!(
-                    "class#{} new expression names the wrong constructor",
-                    class.0
+                    "class#{} new expression cannot construct class#{}",
+                    class.0, concrete_class.0
+                )));
+            }
+            if concrete_definition.constructor != *constructor {
+                return Err(malformed_mir(format!(
+                    "class#{} new expression names the wrong constructor for class#{}",
+                    class.0, concrete_class.0
                 )));
             }
             let constructor = constructor
@@ -12481,7 +12859,7 @@ fn validate_class_expression(
                         constructor.name
                     )));
                 };
-                if local_in(constructor, *receiver)?.ty != mir::Type::Class(class) {
+                if local_in(constructor, *receiver)?.ty != mir::Type::Class(*concrete_class) {
                     return Err(malformed_mir(format!(
                         "constructor {} has an incompatible implicit receiver",
                         constructor.name
@@ -12508,7 +12886,7 @@ fn validate_class_expression(
                         class.0, property.property.index
                     )));
                 }
-                let Some(definition) = class_definition
+                let Some(definition) = concrete_definition
                     .properties
                     .get(property.property.index)
                     .filter(|definition| definition.id == property.property)
@@ -12575,10 +12953,18 @@ fn validate_class_expression(
                             ))
                         })?;
                         validate_constructor_body_initializer(
+                            program,
                             constructor,
                             receiver,
                             property.property,
+                            definition.ty,
                             definition.writable,
+                            concrete_definition
+                                .parent
+                                .and_then(|parent| program.classes.get(parent.0))
+                                .is_some_and(|parent| {
+                                    property.property.index < parent.properties.len()
+                                }),
                         )?;
                         definition.ty
                     }
@@ -12607,8 +12993,8 @@ fn validate_class_expression(
                     )));
                 }
             }
-            if initialized.len() != class_definition.properties.len() {
-                let missing = class_definition
+            if initialized.len() != concrete_definition.properties.len() {
+                let missing = concrete_definition
                     .properties
                     .iter()
                     .find(|property| !initialized.contains(&property.id))
@@ -12645,7 +13031,7 @@ fn validate_class_expression(
                             .filter_map(|property| match property.source {
                                 mir::PropertyValueSource::ConstructorArgument(index)
                                     if matches!(
-                                        class_definition.properties[property.property.index].ty,
+                                        concrete_definition.properties[property.property.index].ty,
                                         mir::Type::Class(_) | mir::Type::NullableClass(_)
                                     ) =>
                                 {
@@ -12734,16 +13120,87 @@ fn validate_class_expression(
 }
 
 fn validate_constructor_body_initializer(
+    program: &mir::Program,
     constructor: &mir::Function,
     receiver: mir::LocalId,
     property: crate::class_layout::PropertyId,
+    property_type: mir::Type,
     writable: bool,
+    inherited: bool,
 ) -> Result<(), BackendError> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum State {
         Uninitialized,
         Initialized,
         MaybeInitialized,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Presence {
+        Unknown,
+        Null,
+        Present,
+    }
+    impl Presence {
+        fn join(self, incoming: Self) -> Self {
+            if self == incoming {
+                self
+            } else {
+                Self::Unknown
+            }
+        }
+
+        fn from_rvalue(value: &mir::Rvalue) -> Self {
+            match value {
+                mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Null(_)) => {
+                    Self::Null
+                }
+                mir::Rvalue::NullableCollection(value)
+                    if nullable_collection_expression_is_present(value, &HashSet::new()) =>
+                {
+                    Self::Present
+                }
+                _ => Self::Unknown,
+            }
+        }
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct PropertyState {
+        initialization: State,
+        presence: Presence,
+    }
+    impl PropertyState {
+        fn join(self, incoming: Self) -> Self {
+            Self {
+                initialization: self.initialization.join(incoming.initialization),
+                presence: self.presence.join(incoming.presence),
+            }
+        }
+
+        fn transfer_write(self, value: &mir::Rvalue) -> Self {
+            Self {
+                initialization: self.initialization.transfer_write(),
+                presence: Presence::from_rvalue(value),
+            }
+        }
+
+        fn after_write(
+            self,
+            kind: mir::PropertyWriteKind,
+            writable: bool,
+            constructor: &mir::Function,
+            property: crate::class_layout::PropertyId,
+            value: &mir::Rvalue,
+        ) -> Result<Self, BackendError> {
+            Ok(Self {
+                initialization: self.initialization.after_write(
+                    kind,
+                    writable,
+                    constructor,
+                    property,
+                )?,
+                presence: Presence::from_rvalue(value),
+            })
+        }
     }
     impl State {
         fn join(self, incoming: Self) -> Self {
@@ -12800,7 +13257,10 @@ fn validate_constructor_body_initializer(
     let (reachable, _) = reachable_blocks_and_predecessors(constructor, true)?;
     let mut inputs = vec![None; constructor.blocks.len()];
     let mut outputs = vec![None; constructor.blocks.len()];
-    inputs[constructor.entry_block.0] = Some(State::Uninitialized);
+    inputs[constructor.entry_block.0] = Some(PropertyState {
+        initialization: State::Uninitialized,
+        presence: Presence::Unknown,
+    });
     let mut pending = std::collections::VecDeque::from([constructor.entry_block]);
     let mut queued = vec![false; constructor.blocks.len()];
     queued[constructor.entry_block.0] = true;
@@ -12809,25 +13269,59 @@ fn validate_constructor_body_initializer(
         let block = block_in(constructor, block_id)?;
         let mut state = inputs[block_id.0].expect("queued constructor block has input state");
         for statement in &block.statements {
+            if statement_parent_constructor_call(program, constructor, statement) {
+                if inherited {
+                    state = PropertyState {
+                        initialization: State::Initialized,
+                        presence: Presence::Unknown,
+                    };
+                }
+                continue;
+            }
             if let mir::Statement::AssignProperty {
                 object,
                 property: assigned,
+                value,
                 ..
             } = statement
             {
                 if *object == receiver && *assigned == property {
-                    state = state.transfer_write();
+                    state = state.transfer_write(value);
                 }
             }
+            if statement_may_mutate_class_local(program, statement, receiver)? {
+                state.presence = Presence::Unknown;
+            }
+        }
+        if class_accesses_may_mutate_local(
+            program,
+            &collect_terminator_class_local_accesses(&block.terminator),
+            receiver,
+        )? {
+            state.presence = Presence::Unknown;
         }
         outputs[block_id.0] = Some(state);
         for successor in analysis_terminator_targets(&block.terminator, true) {
             if !reachable[successor.0] {
                 continue;
             }
+            let successor_state = if inherited
+                && terminator_parent_constructor_success(
+                    program,
+                    constructor,
+                    &block.terminator,
+                    successor,
+                ) {
+                PropertyState {
+                    initialization: State::Initialized,
+                    presence: Presence::Unknown,
+                }
+            } else {
+                state
+            };
             let changed = match inputs[successor.0] {
                 Some(current) => {
-                    let joined = current.join(state);
+                    let joined = current.join(successor_state);
                     if joined == current {
                         false
                     } else {
@@ -12836,7 +13330,7 @@ fn validate_constructor_body_initializer(
                     }
                 }
                 None => {
-                    inputs[successor.0] = Some(state);
+                    inputs[successor.0] = Some(successor_state);
                     true
                 }
             };
@@ -12854,7 +13348,16 @@ fn validate_constructor_body_initializer(
     {
         let mut state = inputs[block.id.0].expect("reachable constructor block state");
         for statement in &block.statements {
-            if state != State::Initialized
+            if statement_parent_constructor_call(program, constructor, statement) {
+                if inherited {
+                    state = PropertyState {
+                        initialization: State::Initialized,
+                        presence: Presence::Unknown,
+                    };
+                }
+                continue;
+            }
+            if state.initialization != State::Initialized
                 && statement_observes_property(statement, receiver, property)
             {
                 return Err(malformed_mir(format!(
@@ -12862,19 +13365,44 @@ fn validate_constructor_body_initializer(
                     constructor.name, property.index
                 )));
             }
+            if matches!(property_type, mir::Type::NullableCollection(_))
+                && state.presence != Presence::Present
+                && statement_assumes_collection_property_present(statement, receiver, property)
+            {
+                return Err(malformed_mir(format!(
+                    "constructor {} assumes nullable property{} is present without a dominating non-null assignment",
+                    constructor.name, property.index
+                )));
+            }
             if let mir::Statement::AssignProperty {
                 object,
                 property: assigned,
+                value,
                 kind,
                 ..
             } = statement
             {
                 if *object == receiver && *assigned == property {
-                    state = state.after_write(*kind, writable, constructor, property)?;
+                    state = state.after_write(*kind, writable, constructor, property, value)?;
                 }
             }
+            if statement_may_mutate_class_local(program, statement, receiver)? {
+                state.presence = Presence::Unknown;
+            }
         }
-        if state != State::Initialized
+        let parent_constructor_terminator =
+            terminator_parent_constructor_call(program, constructor, &block.terminator);
+        if matches!(property_type, mir::Type::NullableCollection(_))
+            && state.presence != Presence::Present
+            && terminator_assumes_collection_property_present(&block.terminator, receiver, property)
+        {
+            return Err(malformed_mir(format!(
+                "constructor {} assumes nullable property{} is present without a dominating non-null assignment",
+                constructor.name, property.index
+            )));
+        }
+        if state.initialization != State::Initialized
+            && !parent_constructor_terminator
             && terminator_observes_property(&block.terminator, receiver, property)
         {
             return Err(malformed_mir(format!(
@@ -12882,7 +13410,7 @@ fn validate_constructor_body_initializer(
                 constructor.name, property.index
             )));
         }
-        if state != State::Initialized
+        if state.initialization != State::Initialized
             && matches!(
                 block.terminator,
                 mir::Terminator::Return(_) | mir::Terminator::ReturnVoid
@@ -12895,6 +13423,198 @@ fn validate_constructor_body_initializer(
         }
     }
     Ok(())
+}
+
+fn statement_may_mutate_class_local(
+    program: &mir::Program,
+    statement: &mir::Statement,
+    receiver: mir::LocalId,
+) -> Result<bool, BackendError> {
+    class_accesses_may_mutate_local(
+        program,
+        &collect_statement_class_local_accesses(statement),
+        receiver,
+    )
+}
+
+fn class_accesses_may_mutate_local(
+    program: &mir::Program,
+    accesses: &ClassLocalAccesses<'_>,
+    receiver: mir::LocalId,
+) -> Result<bool, BackendError> {
+    for access in accesses.iter() {
+        let ClassLocalAccess::Call(callee, args, parameter_offset) = access else {
+            continue;
+        };
+        if borrowed_class_call_locals(program, callee, args, parameter_offset)?
+            .into_iter()
+            .any(|(local, mode)| local == receiver && matches!(mode, ClassBorrowMode::Writable))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn statement_assumes_collection_property_present(
+    statement: &mir::Statement,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match statement {
+        mir::Statement::AssignLocal { value, .. }
+        | mir::Statement::AssignLocalGroup { value, .. }
+        | mir::Statement::AssignStatic { value, .. }
+        | mir::Statement::AssignProperty { value, .. }
+        | mir::Statement::CollectionAdd { value, .. } => {
+            rvalue_assumes_collection_property_present(value, receiver, property)
+        }
+        mir::Statement::CallVoid { args, .. } | mir::Statement::CallBorrowed { args, .. } => args
+            .iter()
+            .any(|value| rvalue_assumes_collection_property_present(value, receiver, property)),
+        mir::Statement::CollectionSet { key, value, .. }
+        | mir::Statement::AssignCollectionIndex {
+            index: key, value, ..
+        } => {
+            rvalue_assumes_collection_property_present(key, receiver, property)
+                || rvalue_assumes_collection_property_present(value, receiver, property)
+        }
+        _ => false,
+    }
+}
+
+fn terminator_assumes_collection_property_present(
+    terminator: &mir::Terminator,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match terminator {
+        mir::Terminator::Return(value) => {
+            rvalue_assumes_collection_property_present(value, receiver, property)
+        }
+        mir::Terminator::CheckedCall { args, .. }
+        | mir::Terminator::IndirectCall { args, .. }
+        | mir::Terminator::CheckedIndirectCall { args, .. } => args
+            .iter()
+            .any(|value| rvalue_assumes_collection_property_present(value, receiver, property)),
+        mir::Terminator::CheckedConstruct {
+            properties, args, ..
+        } => {
+            properties.iter().any(|value| {
+                matches!(
+                    &value.source,
+                    mir::PropertyValueSource::Expression(value)
+                        if rvalue_assumes_collection_property_present(value, receiver, property)
+                )
+            }) || args
+                .iter()
+                .any(|value| rvalue_assumes_collection_property_present(value, receiver, property))
+        }
+        _ => false,
+    }
+}
+
+fn rvalue_assumes_collection_property_present(
+    value: &mir::Rvalue,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::Rvalue::Collection(value) => {
+            collection_assumes_property_present(value, receiver, property)
+        }
+        mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Collection(value)) => {
+            collection_assumes_property_present(value, receiver, property)
+        }
+        _ => false,
+    }
+}
+
+fn collection_assumes_property_present(
+    value: &mir::CollectionExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::CollectionExpression::Property {
+            object,
+            property: observed,
+            assume_non_null: true,
+            ..
+        } => *object == receiver && *observed == property,
+        mir::CollectionExpression::Literal { entries, .. } => entries.iter().any(|entry| {
+            entry.key.as_ref().is_some_and(|key| {
+                rvalue_assumes_collection_property_present(key, receiver, property)
+            }) || rvalue_assumes_collection_property_present(&entry.value, receiver, property)
+        }),
+        mir::CollectionExpression::Fill { value, .. } => {
+            rvalue_assumes_collection_property_present(value, receiver, property)
+        }
+        mir::CollectionExpression::Index { index, .. } => {
+            rvalue_assumes_collection_property_present(index, receiver, property)
+        }
+        mir::CollectionExpression::Call { args, .. } => args.iter().any(|argument| {
+            rvalue_assumes_collection_property_present(argument, receiver, property)
+        }),
+        mir::CollectionExpression::StringIntrinsic(call) => call.args.iter().any(|argument| {
+            rvalue_assumes_collection_property_present(argument, receiver, property)
+        }),
+        _ => false,
+    }
+}
+
+fn parent_constructor_target(
+    program: &mir::Program,
+    constructor: &mir::Function,
+) -> Option<mir::FunctionId> {
+    let method = constructor.method.as_ref()?;
+    (method.name == "__construct")
+        .then_some(())
+        .and_then(|()| program.classes.get(method.class.0))?
+        .parent
+        .and_then(|parent| program.classes.get(parent.0))?
+        .constructor
+}
+
+fn statement_parent_constructor_call(
+    program: &mir::Program,
+    constructor: &mir::Function,
+    statement: &mir::Statement,
+) -> bool {
+    let Some(parent) = parent_constructor_target(program, constructor) else {
+        return false;
+    };
+    matches!(
+        statement,
+        mir::Statement::CallVoid { function, .. } if *function == parent
+    )
+}
+
+fn terminator_parent_constructor_call(
+    program: &mir::Program,
+    constructor: &mir::Function,
+    terminator: &mir::Terminator,
+) -> bool {
+    let Some(parent) = parent_constructor_target(program, constructor) else {
+        return false;
+    };
+    matches!(
+        terminator,
+        mir::Terminator::CheckedCall { function, .. } if *function == parent
+    )
+}
+
+fn terminator_parent_constructor_success(
+    program: &mir::Program,
+    constructor: &mir::Function,
+    terminator: &mir::Terminator,
+    successor: mir::BlockId,
+) -> bool {
+    terminator_parent_constructor_call(program, constructor, terminator)
+        && matches!(
+            terminator,
+            mir::Terminator::CheckedCall { success, .. } if *success == successor
+        )
 }
 
 fn constructor_property_assignment_count(
@@ -14153,6 +14873,9 @@ fn bool_observes_property(
         mir::BoolExpression::NullableClassIsPresent(value) => {
             nullable_class_observes_property(value, receiver, property)
         }
+        mir::BoolExpression::ClassIs { value, .. } => {
+            nullable_class_observes_property(value, receiver, property)
+        }
         mir::BoolExpression::NullableFunctionIsPresent(value) => {
             nullable_function_observes_property(value, receiver, property)
         }
@@ -14414,11 +15137,22 @@ fn validate_call_args_shape(
     callee: &mir::Function,
     args: &[mir::Rvalue],
 ) -> Result<(), BackendError> {
-    if program
-        .classes
-        .iter()
-        .any(|class| class.constructor == Some(callee.id) || class.destructor == Some(callee.id))
-    {
+    let lifecycle_call = program.classes.iter().find_map(|class| {
+        (class.constructor == Some(callee.id))
+            .then_some((class.id, "__construct"))
+            .or_else(|| (class.destructor == Some(callee.id)).then_some((class.id, "__destruct")))
+    });
+    let valid_parent_constructor = lifecycle_call.is_some_and(|(callee_class, name)| {
+        name == "__construct"
+            && caller.method.as_ref().is_some_and(|method| {
+                method.name == "__construct"
+                    && program
+                        .classes
+                        .get(method.class.0)
+                        .is_some_and(|class| class.parent == Some(callee_class))
+            })
+    });
+    if lifecycle_call.is_some() && !valid_parent_constructor {
         return Err(malformed_mir(format!(
             "ordinary call targets lifecycle function {}",
             callee.name
@@ -14987,6 +15721,10 @@ fn validate_condition(
             validate_nullable_scalar_expression(program, function, value)
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
+            validate_nullable_class_expression(program, function, value)
+        }
+        mir::BoolExpression::ClassIs { value, target } => {
+            class_in(program, *target)?;
             validate_nullable_class_expression(program, function, value)
         }
         mir::BoolExpression::NullableFunctionIsPresent(value) => {
@@ -15893,9 +16631,14 @@ fn validate_nullable_class_expression(
             local, transfer, ..
         } => {
             let definition = local_in(function, *local)?;
-            if definition.ty != mir::Type::NullableClass(class) {
+            let mir::Type::NullableClass(actual) = definition.ty else {
                 return Err(malformed_mir(
-                    "nullable class references another local type",
+                    "nullable class references a non-nullable-class local",
+                ));
+            };
+            if !class_is_subtype(program, actual, class) {
+                return Err(malformed_mir(
+                    "nullable class references an unrelated local type",
                 ));
             }
             if *transfer && !definition.owned {
@@ -15919,8 +16662,14 @@ fn validate_nullable_class_expression(
             ..
         } => {
             let callee = function_in(program, *callee)?;
-            if callee.return_type != mir::ReturnType::Value(mir::Type::NullableClass(class)) {
+            let mir::ReturnType::Value(mir::Type::NullableClass(actual)) = callee.return_type
+            else {
                 return Err(malformed_mir("nullable class call has another return type"));
+            };
+            if !class_is_subtype(program, actual, class) {
+                return Err(malformed_mir(
+                    "nullable class call returns an unrelated class type",
+                ));
             }
             if *return_borrow != infer_function_return_borrow(program, callee)? {
                 return Err(malformed_mir(
@@ -16359,6 +17108,15 @@ fn class_in(program: &mir::Program, id: ClassId) -> Result<&mir::Class, BackendE
         .get(id.0)
         .filter(|class| class.id == id)
         .ok_or_else(|| malformed_mir(format!("ClassId class#{} does not exist", id.0)))
+}
+
+fn class_is_subtype(program: &mir::Program, value: ClassId, target: ClassId) -> bool {
+    value == target
+        || program
+            .classes
+            .get(value.0)
+            .filter(|class| class.id == value)
+            .is_some_and(|class| class.ancestors.contains(&target))
 }
 
 fn collection_in(

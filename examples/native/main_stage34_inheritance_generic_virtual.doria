@@ -1,0 +1,13 @@
+open class Identity
+{
+    open function value<T>(T $value): T { return $value; }
+}
+class ChildIdentity extends Identity
+{
+    override function value<U>(U $value): U { return $value; }
+}
+function main(): void
+{
+    Identity $identity = new ChildIdentity();
+    echo "generic virtual {$identity->value(42)} {$identity->value("ready")}\n";
+}

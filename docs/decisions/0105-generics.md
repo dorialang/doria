@@ -156,3 +156,10 @@ discharged here).
   instantiations are move types like all classes. This record aligns with them; an
   earlier draft's claim that an instantiation could be Copy is corrected — there
   are no user-defined Copy aggregates in v1.0.
+
+## Stage 34 Amendment
+
+Decision 0130 permits a qualified generic class type as the single parent and
+records the substitution at each hierarchy edge. Concrete hierarchies and
+virtual method specializations remain monomorphized and invariant; inheritance
+does not add variance, boxing, or runtime type-argument lookup.

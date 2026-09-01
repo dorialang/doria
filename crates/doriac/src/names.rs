@@ -1313,12 +1313,11 @@ impl<'a> Resolver<'a> {
     fn normalize_class(&mut self, class: &mut ClassDecl) {
         class.name = self.canonical_declaration_name(&class.name);
         if let Some(parent) = &mut class.parent {
-            let source_span = self.occurrence_span(parent, class.parent_span.unwrap_or(class.span));
-            if let Some(resolved) =
-                self.resolve_name(parent, source_span, GlobalReferenceRole::Extends, false)
-            {
-                *parent = resolved;
-            }
+            self.normalize_type(
+                parent,
+                class.parent_span.unwrap_or(class.span),
+                GlobalReferenceRole::Extends,
+            );
         }
         for interface in &mut class.implements {
             let source_span = self.occurrence_span(interface, class.span);

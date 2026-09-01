@@ -61,6 +61,17 @@ values may initialize owning properties or replace initialized writable owning
 properties, with the replacement acquired before the previous value is
 destroyed.
 
+Single class inheritance preserves those guarantees. Classes are closed unless
+declared `open`; methods are direct unless declared `open function`; and every
+replacement is explicit with `override function`. Construction runs parent
+phases before child phases, destruction runs child phases before parents, and
+`parent::member()` names the immediate parent implementation directly. Upcasts
+are implicit and allocation-free, while `is` and `match` perform checked
+hierarchy narrowing. Closed exact values keep the compact one-word class
+representation; open static types carry dynamic hierarchy identity without
+adding a header to each object. See
+[`docs/class-inheritance.md`](docs/class-inheritance.md).
+
 Bare `{ ... }` blocks provide an explicit shorter lifetime boundary when a value
 or access guard should be cleaned up before the surrounding function continues.
 
@@ -185,7 +196,9 @@ operate at compile time; Doria source loading is never lowered to runtime PHP.
 `doriac` accepts a strict versioned JSON build plan containing the selected
 target, explicit source inventory, package graph, source scopes, namespace
 mappings, and compiler profile. Every active source is checked as one package
-compilation graph, while `internal` remains visible only inside its package.
+compilation graph. Top-level `internal` declarations remain visible only inside
+their package; an `internal` class member remains visible only to its declaring
+class.
 The compiler-facing format and CLI forms are documented in
 [`docs/build-plan-schema.md`](docs/build-plan-schema.md).
 

@@ -52,7 +52,12 @@ Explicit `writable` on either lifecycle name is a declaration-site error. The fi
 
 ### Invocation
 
-Ordinary instance and static calls to either lifecycle name are rejected. Construction is expressed with `new Class(...)`, and destruction is compiler/runtime-invoked. The parent-first construction rule in the end-to-end plan reserves `parent::__construct(...)` as the parent-chain protocol form when inheritance is implemented. Stage 20 accepts generalized `parent::member()` grammar under the two-clocks rule, but parent lookup, constructor chaining, and direct parent-call semantics remain unsupported until Stage 34.
+Ordinary instance and static calls to either lifecycle name are rejected.
+Construction is expressed with `new Class(...)`, and destruction is
+compiler/runtime-invoked. Decision 0130 implements the one exception:
+`parent::__construct(...)` is the direct parent-chain protocol form and must be
+the first source-level child-constructor action when required. Parent lookup and
+direct parent-call semantics are otherwise governed by that decision.
 
 The PHP backend treats a lifecycle declaration with either rejected modifier reaching emission as a compiler-invariant violation. User source is rejected during semantic analysis before backend emission.
 
@@ -73,3 +78,6 @@ Rejected. This adds mandatory ceremony to nearly every constructor and makes the
 ## Consequences
 
 Lifecycle source shapes are finite and exhaustively testable. Invalid declarations fail before PHP emission, and editor/LSP clients can heal the pre-1.0 writable-spelling break in one edit. Constructor readonly initialization remains available without widening `$this`, while future ownership, destruction, inheritance, and definite-initialization work inherit an explicit protocol boundary rather than a backend-shaped magic-method exception.
+
+Decision 0130 preserves this lifecycle allowlist while composing class phases
+root to derived for construction and derived to root for destruction.

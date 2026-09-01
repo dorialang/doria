@@ -144,3 +144,8 @@ locals, not runtime finalizer allocation.
 - Function-type identity that includes ambient-only differences.
 - ABI selection based only on authored `throws` syntax.
 - Backend finalizer paths that resume an outcome superseded by a finalizer Error.
+
+Decision 0130 carries ambient and checked effect profiles through virtual
+slots. Reachable implementations determine the uniform slot ABI, while a proven
+exact direct or `parent::` call keeps its exact effect profile. Finalizer
+precedence and cleanup remain unchanged.

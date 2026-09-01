@@ -37,6 +37,45 @@ fn assert_malformed(program: &Program, expected: &str) {
     );
 }
 
+#[test]
+fn shared_validator_requires_a_dominating_hierarchy_proof_for_narrowed_class_locals() {
+    let source = r#"
+open class Shape {}
+class Circle extends Shape { function radius(): int { return 42; } }
+
+function main(): void
+{
+    Shape $shape = new Circle();
+    if ($shape is Circle) {
+        Circle $circle = $shape;
+        echo "{$circle->radius()}\n";
+    }
+}
+"#;
+    let mut program = doriac::lower_source_to_mir("hierarchy-proof.doria", source)
+        .expect("valid hierarchy narrowing should lower");
+    doriac::mir_validation::validate_program(&program)
+        .expect("the lowered hierarchy proof should dominate its narrowed use");
+
+    let condition = program
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .find_map(|block| match &mut block.terminator {
+            Terminator::Branch {
+                condition: condition @ BoolExpression::ClassIs { .. },
+                ..
+            } => Some(condition),
+            _ => None,
+        })
+        .expect("fixture should contain a hierarchy type test");
+    *condition = BoolExpression::Use {
+        operand: Operand::Scalar(ScalarValue::Bool(true)),
+    };
+
+    assert_malformed(&program, "without a dominating hierarchy `is` proof");
+}
+
 fn checked_call_mut(program: &mut Program) -> &mut Terminator {
     program
         .functions
@@ -1087,6 +1126,46 @@ function main(): void
 }
 
 #[test]
+fn shared_validator_requires_a_dominating_proof_for_narrowed_collection_locals() {
+    let source = r#"
+function first(?List<int> $values): int
+{
+    if ($values != null) { return countValues($values); }
+    return 0;
+}
+function countValues(List<int> $values): int { return $values->count; }
+function main(): void { echo "{first([42])}\n"; }
+"#;
+    let valid = doriac::lower_source_to_mir("nullable-collection.doria", source)
+        .expect("narrowed nullable collection should lower");
+    doriac::mir_validation::validate_program(&valid)
+        .expect("the null comparison should dominate the narrowed collection use");
+
+    let mut malformed = valid;
+    let condition = malformed
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .find_map(|block| match &mut block.terminator {
+            Terminator::Branch {
+                condition: condition @ BoolExpression::NullableCollectionIsPresent(_),
+                ..
+            } => Some(condition),
+            _ => None,
+        })
+        .expect("expected nullable collection guard branch");
+    *condition = BoolExpression::Use {
+        operand: Operand::Scalar(ScalarValue::Bool(true)),
+    };
+
+    let error = doriac::mir_validation::validate_program(&malformed)
+        .expect_err("a narrowed collection use without its proof must be malformed MIR");
+    assert!(error
+        .message
+        .contains("assumed non-null without a dominating presence proof"));
+}
+
+#[test]
 fn shared_validator_rejects_malformed_stage28a_control_flow_plans() {
     let source = r#"
 function choose(bool $ready): int
@@ -1903,6 +1982,7 @@ fn shared_validator_rejects_mixed_width_float_binary_operands() {
         name: "mixedWidth".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: Vec::new(),
         parameter_modes: Vec::new(),
@@ -2027,6 +2107,7 @@ fn shared_validator_rejects_a_float_element_read_of_another_type() {
         name: "first".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: Vec::new(),
         parameter_modes: Vec::new(),
@@ -2304,6 +2385,7 @@ fn shared_validator_rejects_consuming_string_intrinsic_collection_inputs() {
                     collection: CollectionTypeId(0),
                     local: LocalId(0),
                     transfer: true,
+                    assume_non_null: false,
                 }),
             ],
             result: Type::String,
@@ -2950,6 +3032,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
             name: name.to_string(),
             source_span: Default::default(),
             method: None,
+            virtual_slot: None,
             receiver_mode: None,
             params: vec![LocalId(0)],
             parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -2998,6 +3081,7 @@ fn shared_validator_preserves_implicit_display_borrows_across_format_arguments()
         function: FunctionId(1),
         args: vec![Rvalue::Class(ClassExpression::New {
             class: ClassId(0),
+            concrete_class: ClassId(0),
             properties: vec![PropertyValue {
                 property: label,
                 source: PropertyValueSource::Expression(Rvalue::String(StringExpression::Literal(
@@ -3053,6 +3137,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
         name: "makeOther".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![],
         parameter_modes: vec![],
@@ -3080,7 +3165,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
         .expect_err("class calls cannot lie about their return class");
     assert!(error
         .message
-        .contains("class#0 call targets a function with another return type"));
+        .contains("class#0 call targets a function returning unrelated class#1"));
 }
 
 #[test]
@@ -3094,6 +3179,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: vec![],
                 constructor: Some(FunctionId(1)),
                 args: vec![Rvalue::String(StringExpression::Literal(
@@ -3106,6 +3192,7 @@ fn shared_validator_skips_the_implicit_constructor_receiver() {
         name: "Message::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -3169,6 +3256,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: vec![PropertyValue {
                     property: child,
                     source: PropertyValueSource::ConstructorArgument(0),
@@ -3188,6 +3276,7 @@ fn shared_validator_requires_promoted_class_arguments_to_transfer_ownership() {
         name: "Parent::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -3246,6 +3335,7 @@ fn shared_validator_rejects_borrowing_and_transferring_one_class_local_in_a_call
         name: "borrowAndTake".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -3297,6 +3387,7 @@ fn shared_validator_enforces_writable_class_argument_rules() {
         name: "mutate".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -3385,6 +3476,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         name: "label".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -3410,6 +3502,7 @@ fn shared_validator_does_not_keep_nested_argument_borrows_alive() {
         name: "sink".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -3510,6 +3603,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         name: "probe".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -3537,6 +3631,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         name: "consume".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -3560,6 +3655,7 @@ fn shared_validator_preserves_constant_boolean_move_reachability() {
         name: "inspect".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -3616,6 +3712,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         name: "inspectWithLabel".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -3652,6 +3749,7 @@ fn shared_validator_tracks_nested_transfers_across_outer_call_arguments() {
         name: "consumeAndLabel".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -3725,6 +3823,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         name: "takeWithLabel".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -3834,6 +3933,7 @@ fn shared_validator_tracks_property_borrows_across_outer_call_arguments() {
         name: "update".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -3965,6 +4065,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: vec![
                     PropertyValue {
                         property: first,
@@ -3988,6 +4089,7 @@ fn shared_validator_rejects_reusing_a_moved_constructor_argument() {
         name: "Pair::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -4062,6 +4164,7 @@ fn shared_validator_rejects_reusing_a_class_local_for_properties() {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: vec![
                     PropertyValue {
                         property: first,
@@ -4138,6 +4241,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: [first, second]
                     .into_iter()
                     .map(|property| PropertyValue {
@@ -4165,6 +4269,7 @@ fn shared_validator_tracks_nested_transfers_across_property_initializers() {
         name: "relay".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -4222,6 +4327,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: vec![PropertyValue {
                     property: child,
                     source: PropertyValueSource::ConstructorArgument(0),
@@ -4239,6 +4345,7 @@ fn shared_validator_rejects_a_promoted_class_owner_also_owned_by_the_constructor
         name: "Parent::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -4280,6 +4387,7 @@ fn shared_validator_invalidates_promoted_class_aliases_after_property_replacemen
             property: child,
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(1),
+                concrete_class: ClassId(1),
                 properties: vec![],
                 constructor: None,
                 args: vec![],
@@ -4503,6 +4611,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: vec![PropertyValue {
                     property,
                     source: PropertyValueSource::ConstructorBody,
@@ -4530,6 +4639,7 @@ fn shared_validator_requires_constructor_body_initializers_on_every_return_path(
         name: "Message::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -4672,6 +4782,18 @@ function main(): void
         .expect("valid constructor writes should lower");
     doriac::mir_validation::validate_program(&valid)
         .expect("lowering should emit a valid conditional initialization plan");
+    let token_property = valid
+        .classes
+        .iter()
+        .find(|class| class.name == "Holder")
+        .and_then(|class| {
+            class
+                .properties
+                .iter()
+                .find(|property| property.name == "token")
+        })
+        .map(|property| property.id)
+        .expect("Holder::token property metadata");
 
     let mutate_kind = |program: &mut Program, index: usize, replacement: mir::PropertyWriteKind| {
         let constructor = program
@@ -4683,7 +4805,12 @@ function main(): void
             .blocks
             .iter_mut()
             .flat_map(|block| &mut block.statements)
-            .filter(|statement| matches!(statement, Statement::AssignProperty { .. }))
+            .filter(|statement| {
+                matches!(
+                    statement,
+                    Statement::AssignProperty { property, .. } if *property == token_property
+                )
+            })
             .nth(index)
             .expect("constructor property write should exist");
         let Statement::AssignProperty { kind, .. } = statement else {
@@ -4700,7 +4827,10 @@ function main(): void
     );
     assert_malformed(
         &replace_before_initialization,
-        "replaces property0 before it is definitely initialized",
+        &format!(
+            "replaces property{} before it is definitely initialized",
+            token_property.index
+        ),
     );
 
     let mut initialize_from_maybe_initialized = valid.clone();
@@ -4711,7 +4841,10 @@ function main(): void
     );
     assert_malformed(
         &initialize_from_maybe_initialized,
-        "initializes property0 more than once",
+        &format!(
+            "initializes property{} more than once",
+            token_property.index
+        ),
     );
 
     let mut conditional_write_without_merge = valid.clone();
@@ -4733,7 +4866,10 @@ function main(): void
     );
     assert_malformed(
         &replace_from_maybe_initialized,
-        "replaces property0 before it is definitely initialized",
+        &format!(
+            "replaces property{} before it is definitely initialized",
+            token_property.index
+        ),
     );
 
     let mut outside_constructor = class_program();
@@ -4910,6 +5046,7 @@ fn shared_validator_rejects_property_assignment_receiver_borrows_except_the_targ
         name: "update".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -5110,6 +5247,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         name: "missingClassParameter".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -5138,6 +5276,7 @@ fn shared_validator_rejects_unknown_classes_in_function_types() {
         name: "missingClass".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![],
         parameter_modes: vec![],
@@ -5172,6 +5311,7 @@ fn shared_validator_checks_lifecycle_metadata_even_when_unused() {
         name: "Class0::__destruct".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -5239,6 +5379,7 @@ fn shared_validator_rejects_transfers_into_borrowed_class_parameters() {
         name: "inspect".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -5285,6 +5426,7 @@ fn shared_validator_rejects_borrows_into_owned_class_parameters() {
         name: "consume".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -5319,6 +5461,7 @@ fn shared_validator_rejects_owned_parameters_as_return_borrow_sources() {
         name: "invalidBorrowReturn".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -5384,6 +5527,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         name: "identity".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -5411,6 +5555,7 @@ fn shared_validator_tracks_borrow_returning_outer_call_arguments() {
         name: "observeThenConsume".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -5470,6 +5615,7 @@ fn shared_validator_rejects_duplicate_class_local_transfers_in_one_call() {
         name: "consumeBoth".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -5588,6 +5734,7 @@ fn shared_validator_rejects_borrowed_class_rvalues_in_owning_slots() {
         name: "borrowedReturn".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![],
         parameter_modes: vec![],
@@ -5687,6 +5834,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: vec![PropertyValue {
                     property,
                     source: PropertyValueSource::ConstructorArgument(0),
@@ -5706,6 +5854,7 @@ fn shared_validator_treats_promoted_nullable_class_arguments_as_transfers() {
         name: "Holder::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -5794,6 +5943,7 @@ fn shared_validator_rejects_cleanup_and_assignment_of_borrowed_class_locals() {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: vec![],
                 constructor: None,
                 args: vec![],
@@ -5814,6 +5964,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
         name: "wrongShare".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -5875,6 +6026,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
                     class: ClassId(0),
                     value: Box::new(ClassExpression::New {
                         class: ClassId(0),
+                        concrete_class: ClassId(0),
                         properties: vec![],
                         constructor: None,
                         args: vec![],
@@ -5899,6 +6051,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         name: "wrongAcquire".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
@@ -6032,6 +6185,7 @@ fn valid_void_program() -> Program {
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
             parameter_modes: Vec::new(),
@@ -6063,6 +6217,10 @@ fn class_program() -> Program {
             id,
             name: format!("Class{}", id.0),
             source_span: Default::default(),
+            is_open: false,
+            parent: None,
+            ancestors: Vec::new(),
+            virtual_methods: Vec::new(),
             properties: vec![],
             layout: compute_class_layout(id, [], 8),
             constructor: None,
@@ -6120,6 +6278,7 @@ fn class_new_program() -> Program {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: vec![],
                 constructor: Some(FunctionId(1)),
                 args: vec![Rvalue::String(StringExpression::Literal(
@@ -6132,6 +6291,7 @@ fn class_new_program() -> Program {
         name: "Message::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -6189,6 +6349,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
             target: LocalId(0),
             value: Rvalue::Class(ClassExpression::New {
                 class: ClassId(0),
+                concrete_class: ClassId(0),
                 properties: vec![PropertyValue {
                     property: child,
                     source: PropertyValueSource::ConstructorArgument(0),
@@ -6206,6 +6367,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         name: "Parent::__construct".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0), LocalId(1)],
         parameter_modes: vec![
@@ -6235,6 +6397,7 @@ fn promoted_class_alias_program() -> (Program, PropertyId) {
         name: "inspect".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],

@@ -1,0 +1,13 @@
+open class Base
+{
+    open function value(): int { return 1; }
+}
+class Child extends Base
+{
+    override function value(): int { return 42; }
+}
+function main(): void
+{
+    Base $value = new Child();
+    echo "override {$value->value()}\n";
+}

@@ -55,9 +55,11 @@ Details: decision 0096 (primitive conformance), the interfaces/traits decision (
   is explicit through `implements Error` and requires an externally accessible
   readonly stored `string $message`; a promoted constructor property satisfies
   the contract. The erased value exposes readonly `message` and uses identity
-  equality. General interface execution and `SharedReference<Error>` remain
-  Stage 35 work. Decision 0119; Stage 29 Slice 1 semantic surface complete,
-  execution in Slice 2.
+  equality. A class extending an Error-conforming class remains conforming: a
+  parent `throws` contract, catch, and typed `toThrow` inspector cover
+  descendants while preserving the concrete Error identity. General interface
+  execution and `SharedReference<Error>` remain Stage 35 work. Decisions 0119
+  and 0130.
 
 Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096).
 

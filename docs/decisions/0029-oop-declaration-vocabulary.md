@@ -193,3 +193,10 @@ This decision does not implement:
 - PHP autoloading
 - PHP reflection behavior
 - PHP dynamic properties
+
+## Stage 34 Amendment
+
+Decision 0130 implements the class-inheritance portion of this vocabulary:
+closed-by-default classes, explicit `open`/`override`, one parent class,
+inherited lookup, parent construction, hierarchy narrowing, and virtual
+dispatch. Interface and trait semantics remain Stage 35 work.

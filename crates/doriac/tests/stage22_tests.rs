@@ -551,21 +551,14 @@ function main(): void throws Doria\Std\Io\IoError
 }
 
 #[test]
-fn hierarchy_and_interface_is_tests_fail_at_their_owned_stages() {
+fn hierarchy_is_is_implemented_while_interface_is_remains_deferred() {
     let hierarchy_source = r#"
-class Base {}
+open class Base {}
 class Child extends Base {}
 function inspect(mixed $value): bool { return $value is Base; }
 "#;
-    let hierarchy_diagnostics = diagnostics(hierarchy_source);
-    assert!(!hierarchy_diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code.starts_with('P')));
-    let hierarchy = hierarchy_diagnostics
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "E0509")
-        .expect("expected hierarchy-stage diagnostic");
-    assert!(hierarchy.message.contains("Stage 34"));
+    doriac::check_source("hierarchy-is.doria", hierarchy_source)
+        .expect("Stage 34 implements hierarchy-aware type tests");
 
     let interface_source = "function inspect(mixed $value): bool { return $value is Displayable; }";
     let interface_diagnostics = diagnostics(interface_source);

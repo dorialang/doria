@@ -1,0 +1,22 @@
+open class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+class Missing extends Failure
+{
+    function __construct() { parent::__construct("virtual"); }
+}
+open class Service
+{
+    open function run(): void throws Failure { throw new Failure("base"); }
+}
+class ChildService extends Service
+{
+    override function run(): void throws Missing { throw new Missing(); }
+}
+function main(): void
+{
+    Service $service = new ChildService();
+    try { $service->run(); }
+    catch (Failure $error) { echo "checked {$error->message}\n"; }
+}

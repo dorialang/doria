@@ -1,0 +1,14 @@
+open class Box<T>
+{
+    function __construct(take T $value) {}
+    function get(): T { return $this->value; }
+}
+class IntBox extends Box<int>
+{
+    function __construct(int $input) { parent::__construct($input); }
+}
+function main(): void
+{
+    Box<int> $box = new IntBox(42);
+    echo "generic parent {$box->get()}\n";
+}
