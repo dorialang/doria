@@ -388,8 +388,9 @@ fn decode_utf16le(bytes: &[u8]) -> Result<String, String> {
     if !bytes.len().is_multiple_of(2) {
         return Err("Visual Studio environment output was not valid UTF-16LE".to_string());
     }
-    let mut words = bytes
-        .chunks_exact(2)
+    let (pairs, _) = bytes.as_chunks::<2>();
+    let mut words = pairs
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect::<Vec<_>>();
     if words.first() == Some(&0xfeff) {
