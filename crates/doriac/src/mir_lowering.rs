@@ -12092,7 +12092,15 @@ fn hoist_argument_temporary(
 
 /// Read a temporary local back as an rvalue of its own type.
 fn read_local_as_rvalue(local: mir::LocalId, ty: mir::Type, transfer_owned: bool) -> mir::Rvalue {
-    let transfer = transfer_owned && ty.has_move_ownership();
+    // An owned destination needs an explicit enum copy even when the enum is
+    // source-level Copy. Borrowing its storage would leave managed payloads
+    // owned only by the source local.
+    let transfer = transfer_owned
+        && (ty.has_move_ownership()
+            || matches!(
+                ty,
+                mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
+            ));
     local_rvalue(local, ty, transfer)
 }
 

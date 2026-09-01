@@ -1,5 +1,6 @@
 use doriac::diagnostics::Diagnostic;
 use doriac::lexer::{Lexer, TokenKind};
+use doriac::mir;
 use doriac::source::SourceFile;
 use doriac::{ast, ast::Item};
 
@@ -499,6 +500,64 @@ function main(): void throws Doria\Std\Io\IoError
 "#,
     );
     assert_eq!(output.stdout, b"yx true true true\n");
+}
+
+#[test]
+fn promoted_properties_own_copies_of_copyable_payload_enums() {
+    let program = doriac::lower_source_to_mir(
+        "stage27-promoted-payload.doria",
+        r#"
+enum Label { case Text(string $value); }
+
+class LabelReader
+{
+    function __construct(Label $label) {}
+}
+
+class OptionalLabelReader
+{
+    function __construct(?Label $label) {}
+}
+
+function main(): void
+{
+    let $reader = new LabelReader(Label::Text("constructor"));
+    let $optional = new OptionalLabelReader(Label::Text("optional"));
+}
+"#,
+    )
+    .expect("copyable payload enum promotion should lower");
+
+    let promoted_value = |name: &str| {
+        program
+            .functions
+            .iter()
+            .find(|function| function.name == name)
+            .unwrap_or_else(|| panic!("missing constructor {name}"))
+            .blocks
+            .iter()
+            .flat_map(|block| &block.statements)
+            .find_map(|statement| match statement {
+                mir::Statement::AssignProperty { value, .. } => Some(value),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name} should initialize its promoted property"))
+    };
+
+    assert!(matches!(
+        promoted_value("LabelReader::__construct"),
+        mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+            mode: mir::PayloadEnumUseMode::Copy,
+            ..
+        })
+    ));
+    assert!(matches!(
+        promoted_value("OptionalLabelReader::__construct"),
+        mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
+            mode: mir::PayloadEnumUseMode::Copy,
+            ..
+        })
+    ));
 }
 
 #[test]
