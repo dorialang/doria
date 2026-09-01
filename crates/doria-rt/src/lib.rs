@@ -116,6 +116,7 @@ pub struct DrSharedControlV1 {
     strong_references: usize,
     weak_references: usize,
     payload: *mut u8,
+    payload_descriptor: *mut u8,
     drop_payload: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
 }
 
@@ -130,6 +131,7 @@ pub struct DrWritableSharedControlV1 {
     readonly_accesses: usize,
     writable_access_active: bool,
     payload: *mut u8,
+    payload_descriptor: *mut u8,
     drop_payload: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
 }
 
@@ -1189,6 +1191,7 @@ struct DrErrorDescriptorV1 {
     origin_offset: usize,
     assertion_offsets: usize,
     assertion_magic: usize,
+    class_descriptor: *const u8,
 }
 
 const ASSERTION_ERROR_DESCRIPTOR_MAGIC: usize = 0xA557_0004;
@@ -1364,6 +1367,24 @@ pub unsafe extern "C" fn dr_v2_shared_create(
     payload: *mut u8,
     drop_payload: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
 ) -> *mut DrSharedControlV1 {
+    dr_v3_shared_create(current_frame, payload, ptr::null_mut(), drop_payload)
+}
+
+/// Creates the first strong reference and preserves an optional dynamic-class
+/// descriptor alongside the headerless payload.
+///
+/// # Safety
+///
+/// `payload` and `drop_payload` have the same requirements as
+/// `dr_v2_shared_create`. A non-null `payload_descriptor` must remain static for
+/// the lifetime of the process.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_shared_create(
+    current_frame: *const DrStackFrameV2,
+    payload: *mut u8,
+    payload_descriptor: *mut u8,
+    drop_payload: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
+) -> *mut DrSharedControlV1 {
     let control = allocate(mem::size_of::<DrSharedControlV1>()).cast::<DrSharedControlV1>();
     if control.is_null() {
         panic_catalogued(current_frame, b"P1502");
@@ -1372,6 +1393,7 @@ pub unsafe extern "C" fn dr_v2_shared_create(
         strong_references: 1,
         weak_references: 0,
         payload,
+        payload_descriptor,
         drop_payload,
     });
     control
@@ -1415,6 +1437,7 @@ pub unsafe extern "C" fn dr_v2_shared_release(
     }
     let payload = (*control).payload;
     (*control).payload = ptr::null_mut();
+    (*control).payload_descriptor = ptr::null_mut();
     ((*control).drop_payload)(current_frame, payload);
     if (*control).weak_references == 0 {
         deallocate(control.cast());
@@ -1483,6 +1506,20 @@ pub unsafe extern "C" fn dr_v1_shared_payload(control: *const DrSharedControlV1)
     (*control).payload
 }
 
+/// Returns the optional dynamic-class descriptor stored with a shared payload.
+///
+/// # Safety
+///
+/// `control` must point to a live control block with a strong reference.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_shared_payload_descriptor(
+    control: *const DrSharedControlV1,
+) -> *mut u8 {
+    debug_assert!(!control.is_null());
+    debug_assert!((*control).strong_references != 0);
+    (*control).payload_descriptor
+}
+
 /// Creates the first writable-family strong reference for an owned payload.
 ///
 /// # Safety
@@ -1492,6 +1529,24 @@ pub unsafe extern "C" fn dr_v1_shared_payload(control: *const DrSharedControlV1)
 pub unsafe extern "C" fn dr_v2_writable_shared_create(
     current_frame: *const DrStackFrameV2,
     payload: *mut u8,
+    drop_payload: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
+) -> *mut DrWritableSharedControlV1 {
+    dr_v3_writable_shared_create(current_frame, payload, ptr::null_mut(), drop_payload)
+}
+
+/// Creates the first writable-family strong reference while preserving an
+/// optional dynamic-class descriptor.
+///
+/// # Safety
+///
+/// `payload` and `drop_payload` have the same requirements as
+/// `dr_v2_writable_shared_create`. A non-null `payload_descriptor` must remain
+/// static for the lifetime of the process.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_writable_shared_create(
+    current_frame: *const DrStackFrameV2,
+    payload: *mut u8,
+    payload_descriptor: *mut u8,
     drop_payload: unsafe extern "C" fn(*const DrStackFrameV2, *mut u8),
 ) -> *mut DrWritableSharedControlV1 {
     let control =
@@ -1505,6 +1560,7 @@ pub unsafe extern "C" fn dr_v2_writable_shared_create(
         readonly_accesses: 0,
         writable_access_active: false,
         payload,
+        payload_descriptor,
         drop_payload,
     });
     control
@@ -1549,6 +1605,7 @@ pub unsafe extern "C" fn dr_v2_writable_shared_release(
     debug_assert!(!(*control).writable_access_active);
     let payload = (*control).payload;
     (*control).payload = ptr::null_mut();
+    (*control).payload_descriptor = ptr::null_mut();
     ((*control).drop_payload)(current_frame, payload);
     if (*control).weak_references == 0 {
         deallocate(control.cast());
@@ -1722,6 +1779,21 @@ pub unsafe extern "C" fn dr_v1_writable_shared_writable_payload(
     debug_assert!((*control).writable_access_active);
     debug_assert!(!(*control).payload.is_null());
     (*control).payload
+}
+
+/// Returns the optional dynamic-class descriptor stored with a writable shared
+/// payload or access object.
+///
+/// # Safety
+///
+/// `control` must point to a live writable-family control block.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v3_writable_shared_payload_descriptor(
+    control: *const DrWritableSharedControlV1,
+) -> *mut u8 {
+    debug_assert!(!control.is_null());
+    debug_assert!((*control).strong_references != 0);
+    (*control).payload_descriptor
 }
 
 /// Invokes a generated Doria integer entry function and maps its result to a process status.
@@ -4645,13 +4717,42 @@ mod tests {
     #[test]
     fn shared_control_layouts_keep_writable_access_state_out_of_readonly_allocations() {
         let word = core::mem::size_of::<usize>();
-        assert_eq!(core::mem::size_of::<DrSharedControlV1>(), 4 * word);
-        assert_eq!(core::mem::size_of::<DrWritableSharedControlV1>(), 6 * word);
+        assert_eq!(core::mem::size_of::<DrSharedControlV1>(), 5 * word);
+        assert_eq!(core::mem::size_of::<DrWritableSharedControlV1>(), 7 * word);
         assert!(
             core::mem::size_of::<DrSharedControlV1>()
                 < core::mem::size_of::<DrWritableSharedControlV1>()
         );
         assert_eq!(core::mem::size_of::<*mut DrWritableSharedControlV1>(), word);
+    }
+
+    #[test]
+    fn shared_control_blocks_preserve_dynamic_class_descriptors() {
+        unsafe {
+            reset_shared_payload_drops();
+            let descriptor = core::ptr::NonNull::<u8>::dangling().as_ptr();
+
+            let payload = dr_v2_class_allocate(ptr::null(), 8, 8);
+            let readonly =
+                dr_v3_shared_create(ptr::null(), payload, descriptor, drop_test_shared_payload);
+            assert_eq!(dr_v3_shared_payload_descriptor(readonly), descriptor);
+            dr_v2_shared_release(ptr::null(), readonly);
+
+            let payload = dr_v2_class_allocate(ptr::null(), 8, 8);
+            let writable = dr_v3_writable_shared_create(
+                ptr::null(),
+                payload,
+                descriptor,
+                drop_test_shared_payload,
+            );
+            assert_eq!(
+                dr_v3_writable_shared_payload_descriptor(writable),
+                descriptor
+            );
+            dr_v2_writable_shared_release(ptr::null(), writable);
+
+            assert_eq!(shared_payload_drops(), 2);
+        }
     }
 
     #[test]

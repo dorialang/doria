@@ -86,3 +86,7 @@ Decision 0090 removed the temporary native-eligibility gate rather than normaliz
 
 Decision 0122 likewise removes the temporary move-in and replacement fence
 without weakening move-out, overlap, or writable-path invariants.
+
+Decision 0130 extends total property order to root-to-derived class phases.
+Upcasts transfer the same owned allocation without cloning, and derived-first
+cleanup preserves every existing move and acquire-before-drop obligation.

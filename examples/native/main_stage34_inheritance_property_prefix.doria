@@ -1,0 +1,14 @@
+open class Base
+{
+    int $left = 20;
+}
+class Child extends Base
+{
+    int $right = 22;
+    function total(): int { return $this->left + $this->right; }
+}
+function main(): void
+{
+    let $value = new Child();
+    echo "prefix {$value->total()}\n";
+}

@@ -53,6 +53,7 @@ fn exposes_compiler_resolved_method_targets() {
         Some(&CallableTarget::Method {
             class_type: doriac::types::ClassType::new("Greeter", Vec::new()),
             method_name: "greet".to_string(),
+            direct_parent: false,
         })
     );
 }
@@ -85,6 +86,7 @@ fn keeps_resolved_targets_when_other_semantic_diagnostics_exist() {
         Some(&CallableTarget::Method {
             class_type: doriac::types::ClassType::new("Greeter", Vec::new()),
             method_name: "greet".to_string(),
+            direct_parent: false,
         })
     );
 }

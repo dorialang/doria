@@ -296,3 +296,10 @@ visibility, shared argument binding, bounded constant evaluation, exact typed
 metadata, deterministic JSON, strict processor validation, HIR retention,
 metadata-free MIR/backends, runtime parity, and the absence of processor, test,
 PHP-export, and reflection activation.
+
+## Stage 34 Amendment
+
+Decision 0130 keeps attributes authored-only: parent class and method
+attributes are not copied onto descendants or overrides. Metadata schemas 1,
+2, and 3 and processor protocol version 1 remain exact; hierarchy descriptors,
+slots, offsets, thunks, and private type IDs are not public metadata.

@@ -1,0 +1,7 @@
+open class Shape { function base(): int { return 20; } }
+class Circle extends Shape { function child(): int { return 22; } }
+function main(): void
+{
+    Shape $shape = new Circle();
+    if ($shape is Circle) { echo "is {$shape->base() + $shape->child()}\n"; }
+}

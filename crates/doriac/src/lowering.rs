@@ -5,6 +5,7 @@ use crate::{ast, hir};
 struct ClassContext<'a> {
     name: &'a str,
     type_params: &'a [ast::TypeParamDecl],
+    parent: Option<&'a crate::types::TypeRef>,
 }
 
 impl ClassContext<'_> {
@@ -592,6 +593,7 @@ fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
     let class_context = ClassContext {
         name: &class_decl.name,
         type_params: &class_decl.type_params,
+        parent: class_decl.parent.as_ref(),
     };
     hir::ClassDecl {
         global_id: None,
@@ -599,14 +601,21 @@ fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
         package: crate::names::PackageIdentity::Standalone,
         access: class_decl.access,
         access_span: class_decl.access_span,
+        is_open: class_decl.is_open,
+        open_span: class_decl.open_span,
         name: class_decl.name.clone(),
         type_params: class_decl
             .type_params
             .iter()
             .map(|param| lower_type_param(param, Some(class_context)))
             .collect(),
-        parent: class_decl.parent.clone(),
+        parent: class_decl
+            .parent
+            .as_ref()
+            .map(|parent| lower_type_ref(parent, Some(class_context))),
+        extends_span: class_decl.extends_span,
         parent_span: class_decl.parent_span,
+        modifier_prefix_span: class_decl.modifier_prefix_span,
         implements: class_decl.implements.clone(),
         members: class_decl
             .members
@@ -679,6 +688,10 @@ fn lower_function(
         package: crate::names::PackageIdentity::Standalone,
         access: function.access,
         access_span: function.access_span,
+        is_open: function.is_open,
+        open_span: function.open_span,
+        is_override: function.is_override,
+        override_span: function.override_span,
         writable_this: function.writable_this,
         is_static: function.is_static,
         name: function.name.clone(),
@@ -714,6 +727,7 @@ fn lower_function(
         ambient_checked_effects: Vec::new(),
         test_assertion_checked_effects: Vec::new(),
         body: lower_block(&function.body, class_name),
+        modifier_prefix_span: function.modifier_prefix_span,
         span: function.span,
     }
 }
@@ -1375,8 +1389,13 @@ fn resolved_qualifier_name(
             .expect("checked `self::` access has a declaring class")
             .name
             .to_string(),
-        ast::StaticQualifier::Parent | ast::StaticQualifier::InvalidStatic => {
-            unreachable!("rejected or unsupported qualifier must not reach Doria IR lowering")
+        ast::StaticQualifier::Parent => class_name
+            .and_then(|context| context.parent)
+            .expect("checked `parent::` access has a parent class")
+            .name
+            .clone(),
+        ast::StaticQualifier::InvalidStatic => {
+            unreachable!("rejected qualifier must not reach Doria IR lowering")
         }
     }
 }

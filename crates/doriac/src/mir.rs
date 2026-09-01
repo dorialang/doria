@@ -315,6 +315,10 @@ pub struct Class {
     pub id: ClassId,
     pub name: String,
     pub source_span: Span,
+    pub is_open: bool,
+    pub parent: Option<ClassId>,
+    pub ancestors: Vec<ClassId>,
+    pub virtual_methods: Vec<FunctionId>,
     pub properties: Vec<Property>,
     pub layout: ClassLayout,
     pub constructor: Option<FunctionId>,
@@ -365,6 +369,7 @@ pub struct Function {
     pub name: String,
     pub source_span: Span,
     pub method: Option<MethodIdentity>,
+    pub virtual_slot: Option<u32>,
     pub receiver_mode: Option<ReceiverMode>,
     pub closure: Option<ClosureFunction>,
     pub params: Vec<LocalId>,
@@ -386,6 +391,7 @@ impl PartialEq for Function {
         self.id == other.id
             && self.name == other.name
             && self.method == other.method
+            && self.virtual_slot == other.virtual_slot
             && self.receiver_mode == other.receiver_mode
             && self.closure == other.closure
             && self.params == other.params
@@ -399,6 +405,12 @@ impl PartialEq for Function {
             && self.locals == other.locals
             && self.blocks == other.blocks
             && self.entry_block == other.entry_block
+    }
+}
+
+impl Function {
+    pub fn uses_virtual_receiver_abi(&self) -> bool {
+        self.virtual_slot.is_some() && self.receiver_mode.is_some()
     }
 }
 
@@ -3234,7 +3246,10 @@ pub enum ClassExpression {
         return_borrow: Option<ReturnBorrow>,
     },
     New {
+        /// The source-visible result type after any implicit upcast.
         class: ClassId,
+        /// The exact class whose storage and lifecycle are constructed.
+        concrete_class: ClassId,
         properties: Vec<PropertyValue>,
         constructor: Option<FunctionId>,
         args: Vec<Rvalue>,
@@ -3950,6 +3965,12 @@ pub enum BoolExpression {
     },
     NullableScalarIsPresent(Box<NullableScalarExpression>),
     NullableClassIsPresent(Box<NullableClassExpression>),
+    /// Tests the dynamic class carried by `value` against `target`, including
+    /// descendant matches. A null carrier never matches.
+    ClassIs {
+        value: Box<NullableClassExpression>,
+        target: ClassId,
+    },
     NullableCollectionIsPresent(Box<NullableCollectionExpression>),
     NullableSharedReferenceIsPresent(Box<NullableSharedReferenceExpression>),
     NullableWeakReferenceIsPresent(Box<NullableWeakReferenceExpression>),
@@ -5442,6 +5463,7 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
             nullable_scalar_class_temporary_capacity(value)
         }
         BoolExpression::NullableClassIsPresent(value) => nullable_class_temporary_capacity(value),
+        BoolExpression::ClassIs { value, .. } => nullable_class_temporary_capacity(value),
         BoolExpression::NullableCollectionIsPresent(value) => {
             nullable_collection_class_temporary_capacity(value)
         }
@@ -5506,6 +5528,21 @@ fn format_class_temporary_capacity(format: &FormatExpression) -> usize {
 
 impl fmt::Display for Program {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self
+            .classes
+            .iter()
+            .any(|class| !class.virtual_methods.is_empty())
+        {
+            writeln!(formatter, "class hierarchy:")?;
+            for class in &self.classes {
+                writeln!(
+                    formatter,
+                    "    class#{} {} parent {:?} ancestors {:?} vtable {:?}",
+                    class.id.0, class.name, class.parent, class.ancestors, class.virtual_methods
+                )?;
+            }
+            writeln!(formatter)?;
+        }
         if !self.function_types.is_empty() {
             writeln!(formatter, "function types:")?;
             for function_type in &self.function_types {
@@ -5539,6 +5576,9 @@ impl fmt::Display for Program {
 
 impl fmt::Display for Function {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(slot) = self.virtual_slot {
+            write!(formatter, "virtual-slot#{slot} ")?;
+        }
         write!(formatter, "function {}(", self.name)?;
         for (index, parameter) in self.params.iter().enumerate() {
             if index > 0 {
@@ -6827,6 +6867,9 @@ impl fmt::Display for BoolExpression {
                 Rvalue::NullableError((**value).clone())
             ),
             Self::NullableClassIsPresent(value) => write!(formatter, "present({value})"),
+            Self::ClassIs { value, target } => {
+                write!(formatter, "class-is({value}, class#{})", target.0)
+            }
             Self::NullableCollectionIsPresent(value) => {
                 write!(formatter, "present(?collection#{})", value.collection().0)
             }

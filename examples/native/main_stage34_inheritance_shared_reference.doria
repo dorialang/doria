@@ -1,0 +1,13 @@
+open class Item
+{
+    open function value(): int { return 1; }
+}
+class Answer extends Item
+{
+    override function value(): int { return 42; }
+}
+function main(): void
+{
+    SharedReference<Item> $item = shared new Answer();
+    echo "shared {$item->value()}\n";
+}

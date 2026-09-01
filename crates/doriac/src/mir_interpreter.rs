@@ -722,6 +722,10 @@ enum EvaluationTask {
     OwnNullableMixed(mir::MixedOwnership),
     NullableScalarIsPresent,
     NullableClassIsPresent(Option<crate::class_layout::ClassId>),
+    ClassIs {
+        target: crate::class_layout::ClassId,
+        owned: Option<crate::class_layout::ClassId>,
+    },
     NullableCollectionIsPresent(Option<mir::CollectionTypeId>),
     NullableSharedReferenceIsPresent(bool),
     NullableWeakReferenceIsPresent(bool),
@@ -956,6 +960,10 @@ enum EvaluationTask {
     DropFunction(mir::LocalId),
     DropFunctionValue(FunctionValue),
     DropObject {
+        object: usize,
+        class: crate::class_layout::ClassId,
+    },
+    DropObjectPhase {
         object: usize,
         class: crate::class_layout::ClassId,
     },
@@ -1491,6 +1499,7 @@ impl Interpreter<'_> {
                 }
                 for (target, value) in targets.into_iter().zip(values) {
                     assign_local(
+                        self.program,
                         &function.locals,
                         &mut self.current_frame_mut()?.locals,
                         target,
@@ -2019,20 +2028,22 @@ impl Interpreter<'_> {
                 descriptor,
             } => {
                 let value = self.take_error_local(error)?;
-                if value.descriptor != descriptor {
+                let actual_class = self.error_descriptor(value.descriptor)?.class;
+                let target_class = self.error_descriptor(descriptor)?.class;
+                if !class_is_subtype(self.program, actual_class, target_class) {
                     return Err(InterpreterError::new(
-                        "MIR exact catch extracted an Error with another descriptor",
+                        "MIR catch extracted an Error outside its class hierarchy",
                     ));
                 }
-                let class = self.error_descriptor(descriptor)?.class;
                 let function = function_in(self.program, self.current_frame()?.function)?;
                 let old = assign_local(
+                    self.program,
                     &function.locals,
                     &mut self.current_frame_mut()?.locals,
                     target,
                     LocalValue::Class {
                         object: value.object,
-                        class,
+                        class: actual_class,
                     },
                 )?;
                 if old.is_some() {
@@ -2643,7 +2654,7 @@ impl Interpreter<'_> {
                         "shared construction did not produce a class payload",
                     ));
                 };
-                if actual != class {
+                if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "shared construction produced another payload class",
                     ));
@@ -2651,7 +2662,7 @@ impl Interpreter<'_> {
                 let control = Rc::new(RefCell::new(SharedControlValue {
                     strong: 1,
                     weak: 0,
-                    payload: Some((object, class)),
+                    payload: Some((object, actual)),
                 }));
                 self.current_frame_mut()?
                     .values
@@ -2972,7 +2983,7 @@ impl Interpreter<'_> {
             }
             EvaluationTask::BuildWritableSharedReference(payload) => {
                 let value = self.pop_local_value()?;
-                if local_value_type(&value) != writable_payload_type(payload) {
+                if !local_value_matches_type(self.program, writable_payload_type(payload), &value) {
                     return Err(InterpreterError::new(
                         "writable shared construction produced another payload type",
                     ));
@@ -4182,14 +4193,17 @@ impl Interpreter<'_> {
                         "MIR indexed class produced another value type",
                     ));
                 };
-                if actual != class {
+                if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "MIR indexed class has another class type",
                     ));
                 }
                 self.current_frame_mut()?
                     .values
-                    .push(EvaluationValue::Class { object, class });
+                    .push(EvaluationValue::Class {
+                        object,
+                        class: actual,
+                    });
             }
             EvaluationTask::CollectionIndexShared {
                 collection,
@@ -4535,12 +4549,12 @@ impl Interpreter<'_> {
                         "nullable class payload is not a class",
                     ));
                 };
-                if actual != class {
+                if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "nullable class payload type mismatch",
                     ));
                 }
-                self.push_nullable_class(class, Some(object))?;
+                self.push_nullable_class(actual, Some(object))?;
             }
             EvaluationTask::BuildError(descriptor) => {
                 let value = self.pop_local_value()?;
@@ -4600,9 +4614,14 @@ impl Interpreter<'_> {
                 self.push_mixed(MixedValue::String(value))?;
             }
             EvaluationTask::BuildMixedClass(payload_owned) => {
-                let LocalValue::Class { object, class } = self.pop_local_value()? else {
+                let LocalValue::Class { object, .. } = self.pop_local_value()? else {
                     return Err(InterpreterError::new("mixed class payload is not a class"));
                 };
+                let class = self
+                    .heap
+                    .get(&object)
+                    .map(|value| value.class)
+                    .ok_or_else(|| InterpreterError::new("mixed class payload is not allocated"))?;
                 self.push_mixed(MixedValue::Class {
                     object,
                     class,
@@ -4675,6 +4694,20 @@ impl Interpreter<'_> {
                         .push(OwnedDrop::Class { object, class });
                 }
                 self.push_scalar(mir::ScalarValue::Bool(object.is_some()))?;
+            }
+            EvaluationTask::ClassIs { target, owned } => {
+                let (class, object) = self.pop_nullable_class()?;
+                if let (Some(object), Some(_)) = (object, owned) {
+                    self.current_frame_mut()?
+                        .statement_temporary_drops
+                        .push(OwnedDrop::Class { object, class });
+                }
+                let matches = object.is_some_and(|object| {
+                    self.heap
+                        .get(&object)
+                        .is_some_and(|value| class_is_subtype(self.program, value.class, target))
+                });
+                self.push_scalar(mir::ScalarValue::Bool(matches))?;
             }
             EvaluationTask::NullableFunctionIsPresent => {
                 let LocalValue::NullableFunction { value, .. } = self.pop_local_value()? else {
@@ -4807,7 +4840,12 @@ impl Interpreter<'_> {
                         "MIR mixed is expression produced another value type",
                     ));
                 };
-                let matches = value.tag() == Some(tag);
+                let matches = match (&value, tag) {
+                    (MixedValue::Class { class, .. }, mir::MixedTag::Class(target)) => {
+                        class_is_subtype(self.program, *class, target)
+                    }
+                    _ => value.tag() == Some(tag),
+                };
                 if ownership == mir::MixedOwnership::Owned {
                     self.queue_value_drops(LocalValue::Mixed(value))?;
                 }
@@ -5830,6 +5868,7 @@ impl Interpreter<'_> {
                 call_site,
             } => {
                 let args = self.take_call_arguments(argument_count)?;
+                let function = self.resolve_virtual_function(function, &args)?;
                 let mut drops = Vec::new();
                 for index in temporary_arg_drops {
                     collect_owned_objects_from_value(args[index].clone(), &mut drops);
@@ -5857,6 +5896,7 @@ impl Interpreter<'_> {
                 call_site,
             } => {
                 let args = self.take_call_arguments(argument_count)?;
+                let function = self.resolve_virtual_function(function, &args)?;
                 let mut drops = Vec::new();
                 for index in temporary_arg_drops {
                     collect_owned_objects_from_value(args[index].clone(), &mut drops);
@@ -5951,6 +5991,7 @@ impl Interpreter<'_> {
                     })
                     .flatten();
                 let old = assign_local(
+                    self.program,
                     &function.locals,
                     &mut self.current_frame_mut()?.locals,
                     target,
@@ -5977,6 +6018,7 @@ impl Interpreter<'_> {
                 let function = function_in(self.program, self.current_frame()?.function)?;
                 for target in targets {
                     let old = assign_local(
+                        self.program,
                         &function.locals,
                         &mut self.current_frame_mut()?.locals,
                         target,
@@ -6145,6 +6187,9 @@ impl Interpreter<'_> {
             }
             EvaluationTask::DropObject { object, class } => {
                 self.queue_object_drop(object, class)?;
+            }
+            EvaluationTask::DropObjectPhase { object, class } => {
+                self.queue_object_phase(object, class)?;
             }
             EvaluationTask::DropObjectProperties { object, class } => {
                 self.queue_object_property_drops(object, class)?;
@@ -6510,6 +6555,12 @@ impl Interpreter<'_> {
                 frame
                     .tasks
                     .push(EvaluationTask::NullableClassIsPresent(owned));
+                frame.tasks.push(EvaluationTask::NullableClass(*value));
+            }
+            mir::BoolExpression::ClassIs { value, target } => {
+                let owned = value.owned_temporary_class();
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ClassIs { target, owned });
                 frame.tasks.push(EvaluationTask::NullableClass(*value));
             }
             mir::BoolExpression::NullableFunctionIsPresent(value) => {
@@ -7925,19 +7976,29 @@ impl Interpreter<'_> {
                 } else {
                     read_local(&self.current_frame()?.locals, local)?.clone()
                 };
-                if local_value_type(&value) != mir::Type::Class(class) {
+                let LocalValue::Class {
+                    object,
+                    class: actual,
+                } = value
+                else {
                     return Err(InterpreterError::new(format!(
                         "MIR class expression expected class#{}, got {}",
                         class.0,
                         local_value_type(&value)
                     )));
-                }
-                let LocalValue::Class { object, class } = value else {
-                    unreachable!("checked class local value")
                 };
+                if !class_is_subtype(self.program, actual, class) {
+                    return Err(InterpreterError::new(format!(
+                        "MIR class expression cannot upcast class#{} to class#{}",
+                        actual.0, class.0
+                    )));
+                }
                 self.current_frame_mut()?
                     .values
-                    .push(EvaluationValue::Class { object, class });
+                    .push(EvaluationValue::Class {
+                        object,
+                        class: actual,
+                    });
             }
             mir::ClassExpression::Property {
                 class,
@@ -7955,7 +8016,7 @@ impl Interpreter<'_> {
                         property.index
                     )));
                 };
-                if actual != class {
+                if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(format!(
                         "MIR class property produced class#{}, expected class#{}",
                         actual.0, class.0
@@ -7981,7 +8042,8 @@ impl Interpreter<'_> {
                 )?;
             }
             mir::ClassExpression::New {
-                class,
+                class: _,
+                concrete_class,
                 properties,
                 constructor,
                 args,
@@ -8017,7 +8079,7 @@ impl Interpreter<'_> {
                     .count();
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::BuildClassNew {
-                    class,
+                    class: concrete_class,
                     properties: properties.clone(),
                     constructor,
                     argument_count: args.len(),
@@ -8060,14 +8122,17 @@ impl Interpreter<'_> {
                         "nonnull class expression observed null",
                     ));
                 };
-                if actual != class {
+                if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "nonnull class expression has another class",
                     ));
                 }
                 self.current_frame_mut()?
                     .values
-                    .push(EvaluationValue::Class { object, class });
+                    .push(EvaluationValue::Class {
+                        object,
+                        class: actual,
+                    });
             }
             mir::ClassExpression::Coalesce {
                 left,
@@ -8108,7 +8173,8 @@ impl Interpreter<'_> {
                 let value = if transfer {
                     match mixed_value_from_local(read_local(&self.current_frame()?.locals, mixed)?)
                     {
-                        Some(MixedValue::Class { class: actual, .. }) if *actual == class => {}
+                        Some(MixedValue::Class { class: actual, .. })
+                            if class_is_subtype(self.program, *actual, class) => {}
                         Some(MixedValue::Class { .. }) => {
                             return Err(InterpreterError::new(
                                 "MIR mixed class payload observed another class",
@@ -8165,7 +8231,7 @@ impl Interpreter<'_> {
                         "MIR mixed class payload observed another tag",
                     ));
                 };
-                if actual != class {
+                if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "MIR mixed class payload observed another class",
                     ));
@@ -8191,7 +8257,10 @@ impl Interpreter<'_> {
                 }
                 self.current_frame_mut()?
                     .values
-                    .push(EvaluationValue::Class { object, class });
+                    .push(EvaluationValue::Class {
+                        object,
+                        class: actual,
+                    });
             }
             mir::ClassExpression::SharedPayload { class, reference } => {
                 let drop_receiver = reference.owned_temporary().is_some();
@@ -8214,14 +8283,17 @@ impl Interpreter<'_> {
                         "MIR shared access payload is not a class",
                     ));
                 };
-                if actual != class {
+                if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "MIR shared access payload has another class",
                     ));
                 }
                 self.current_frame_mut()?
                     .values
-                    .push(EvaluationValue::Class { object, class });
+                    .push(EvaluationValue::Class {
+                        object,
+                        class: actual,
+                    });
             }
         }
         Ok(())
@@ -10142,12 +10214,12 @@ impl Interpreter<'_> {
                         "nullable class local has another type",
                     ));
                 };
-                if actual != class {
+                if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "nullable class local has another class",
                     ));
                 }
-                self.push_nullable_class(class, object)?;
+                self.push_nullable_class(actual, object)?;
             }
             mir::NullableClassExpression::Property {
                 object, property, ..
@@ -10161,12 +10233,12 @@ impl Interpreter<'_> {
                         "nullable class property has another type",
                     ));
                 };
-                if actual != class {
+                if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "nullable class property has another class",
                     ));
                 }
-                self.push_nullable_class(class, object)?;
+                self.push_nullable_class(actual, object)?;
             }
             mir::NullableClassExpression::Call { function, args, .. } => {
                 self.queue_call(
@@ -10677,17 +10749,13 @@ impl Interpreter<'_> {
             .zip(args.iter().cloned())
             .zip(argument_places.iter().copied())
         {
-            let definition = local_in(function, *parameter)?;
-            if local_value_type(&value) != definition.ty {
-                return Err(InterpreterError::new(format!(
-                    "MIR function {} parameter local{} expects {}, got {}",
-                    function.name,
-                    parameter.0,
-                    definition.ty,
-                    local_value_type(&value)
-                )));
-            }
-            let _ = assign_local(&function.locals, &mut locals, *parameter, value)?;
+            let _ = assign_local(
+                self.program,
+                &function.locals,
+                &mut locals,
+                *parameter,
+                value,
+            )?;
             local_origins[parameter.0] = origin;
         }
         block_in(function, function.entry_block)?;
@@ -10717,6 +10785,41 @@ impl Interpreter<'_> {
             write_back_writable_parameters,
         });
         Ok(())
+    }
+
+    fn resolve_virtual_function(
+        &self,
+        function: mir::FunctionId,
+        args: &[LocalValue],
+    ) -> Result<mir::FunctionId, InterpreterError> {
+        let callee = function_in(self.program, function)?;
+        let Some(slot) = callee.virtual_slot else {
+            return Ok(function);
+        };
+        let Some(LocalValue::Class { object, .. }) = args.first() else {
+            return Err(InterpreterError::new(
+                "virtual method call has no class receiver",
+            ));
+        };
+        let dynamic_class = self
+            .heap
+            .get(object)
+            .ok_or_else(|| InterpreterError::new("virtual receiver is not allocated"))?
+            .class;
+        let dispatch_class = self
+            .frames
+            .last()
+            .and_then(|frame| function_in(self.program, frame.function).ok())
+            .and_then(|caller| {
+                let method = caller.method.as_ref()?;
+                matches!(method.name.as_str(), "__construct" | "__destruct").then_some(method.class)
+            })
+            .unwrap_or(dynamic_class);
+        class_in(self.program, dispatch_class)?
+            .virtual_methods
+            .get(slot as usize)
+            .copied()
+            .ok_or_else(|| InterpreterError::new("virtual method slot does not exist"))
     }
 
     fn push_checked_frame(
@@ -10817,6 +10920,7 @@ impl Interpreter<'_> {
         block_in(caller, target)?;
         if let Some((local, value)) = assignment {
             let old = assign_local(
+                self.program,
                 &caller.locals,
                 &mut self.current_frame_mut()?.locals,
                 local,
@@ -11198,6 +11302,7 @@ impl Interpreter<'_> {
         }
         for (field, target, value, origin, owned) in values {
             assign_local(
+                self.program,
                 &function.locals,
                 &mut self.current_frame_mut()?.locals,
                 target,
@@ -11504,21 +11609,14 @@ impl Interpreter<'_> {
             let caller = function_in(self.program, caller_id)?;
             block_in(caller, target)?;
             if let Some((local, value)) = assignment {
-                let expected = local_in(caller, local)?.ty;
-                if local_value_type(&value) != expected {
-                    return Err(InterpreterError::new(format!(
-                        "checked call local{} expects {}, got {}",
-                        local.0,
-                        expected,
-                        local_value_type(&value)
-                    )));
-                }
-                let slot = self
-                    .current_frame_mut()?
-                    .locals
-                    .get_mut(local.0)
-                    .ok_or_else(|| InterpreterError::new("checked call local does not exist"))?;
-                if slot.replace(value).is_some() && local_in(caller, local)?.owned {
+                let replaced = assign_local(
+                    self.program,
+                    &caller.locals,
+                    &mut self.current_frame_mut()?.locals,
+                    local,
+                    value,
+                )?;
+                if replaced.is_some() && local_in(caller, local)?.owned {
                     return Err(InterpreterError::new(
                         "checked call overwrote an occupied owned result local",
                     ));
@@ -11545,7 +11643,7 @@ impl Interpreter<'_> {
         };
         match (expectation, outcome) {
             (ReturnExpectation::Value(expected), FunctionOutcome::Value(value)) => {
-                if local_value_type(&value) != expected {
+                if !local_value_matches_type(self.program, expected, &value) {
                     return Err(InterpreterError::new(format!(
                         "MIR scalar call expected {expected}, returned {}",
                         local_value_type(&value)
@@ -11554,7 +11652,7 @@ impl Interpreter<'_> {
                 self.push_local_value(value)?;
             }
             (ReturnExpectation::Discard(expected), FunctionOutcome::Value(value)) => {
-                if local_value_type(&value) != expected {
+                if !local_value_matches_type(self.program, expected, &value) {
                     return Err(InterpreterError::new(format!(
                         "MIR discarded call expected {expected}, returned {}",
                         local_value_type(&value)
@@ -11785,6 +11883,7 @@ impl Interpreter<'_> {
                 match (result, value) {
                     (Some(local), Some(value)) => {
                         let replaced = assign_local(
+                            self.program,
                             &function.locals,
                             &mut self.current_frame_mut()?.locals,
                             local,
@@ -11807,6 +11906,7 @@ impl Interpreter<'_> {
             }
             CheckedIoResult::Error(value) => {
                 let replaced = assign_local(
+                    self.program,
                     &function.locals,
                     &mut self.current_frame_mut()?.locals,
                     error,
@@ -13614,7 +13714,7 @@ impl Interpreter<'_> {
         let object_value = self.heap.get(&object_id).ok_or_else(|| {
             InterpreterError::new(format!("MIR object {object_id} is not allocated"))
         })?;
-        if object_value.class != property.class {
+        if !class_is_subtype(self.program, object_value.class, property.class) {
             return Err(InterpreterError::new(format!(
                 "MIR property access expected class#{} but object has class#{}",
                 property.class.0, object_value.class.0
@@ -13655,7 +13755,7 @@ impl Interpreter<'_> {
         let object_value = self.heap.get_mut(&object_id).ok_or_else(|| {
             InterpreterError::new(format!("MIR object {object_id} is not allocated"))
         })?;
-        if object_value.class != property.class {
+        if !class_is_subtype(self.program, object_value.class, property.class) {
             return Err(InterpreterError::new(format!(
                 "MIR property assignment expected class#{} but object has class#{}",
                 property.class.0, object_value.class.0
@@ -13704,7 +13804,7 @@ impl Interpreter<'_> {
         let object_value = self.heap.get_mut(&object_id).ok_or_else(|| {
             InterpreterError::new(format!("MIR object {object_id} is not allocated"))
         })?;
-        if object_value.class != property.class {
+        if !class_is_subtype(self.program, object_value.class, property.class) {
             return Err(InterpreterError::new(
                 "MIR property transfer uses another class layout",
             ));
@@ -13904,22 +14004,32 @@ impl Interpreter<'_> {
     fn queue_object_drop(
         &mut self,
         object: usize,
-        class: crate::class_layout::ClassId,
+        static_class: crate::class_layout::ClassId,
     ) -> Result<(), InterpreterError> {
         let value = self.heap.get(&object).ok_or_else(|| {
             InterpreterError::new(format!("MIR object {object} is not allocated"))
         })?;
-        if value.class != class {
+        let class = value.class;
+        if !class_is_subtype(self.program, class, static_class) {
             return Err(InterpreterError::new(format!(
                 "MIR drop expected class#{} but object has class#{}",
-                class.0, value.class.0
+                static_class.0, class.0
             )));
         }
-        let destructor = class_in(self.program, class)?.destructor;
         let frame = self.current_frame_mut()?;
         frame
             .tasks
             .push(EvaluationTask::FreeObject { object, class });
+        self.queue_object_phase(object, class)
+    }
+
+    fn queue_object_phase(
+        &mut self,
+        object: usize,
+        class: crate::class_layout::ClassId,
+    ) -> Result<(), InterpreterError> {
+        let destructor = class_in(self.program, class)?.destructor;
+        let frame = self.current_frame_mut()?;
         frame
             .tasks
             .push(EvaluationTask::DropObjectProperties { object, class });
@@ -13941,20 +14051,35 @@ impl Interpreter<'_> {
         object: usize,
         class: crate::class_layout::ClassId,
     ) -> Result<(), InterpreterError> {
+        let class_definition = class_in(self.program, class)?;
+        let parent = class_definition.parent;
+        let first_property = parent
+            .map(|parent| class_in(self.program, parent).map(|class| class.properties.len()))
+            .transpose()?
+            .unwrap_or(0);
+        let property_count = class_definition.properties.len();
         let object_value = self.heap.get_mut(&object).ok_or_else(|| {
             InterpreterError::new(format!("MIR object {object} is not allocated"))
         })?;
-        if object_value.class != class {
+        if !class_is_subtype(self.program, object_value.class, class) {
             return Err(InterpreterError::new(format!(
                 "MIR property drop expected class#{} but object has class#{}",
                 class.0, object_value.class.0
             )));
         }
         let mut drops = Vec::new();
-        for property in &mut object_value.properties {
+        for property in &mut object_value.properties[first_property..property_count] {
             if let Some(value) = property.take() {
                 collect_owned_objects_from_value(value, &mut drops);
             }
+        }
+        if let Some(parent) = parent {
+            self.current_frame_mut()?
+                .tasks
+                .push(EvaluationTask::DropObjectPhase {
+                    object,
+                    class: parent,
+                });
         }
         for drop in drops {
             self.push_owned_drop_task(drop)?;
@@ -15318,6 +15443,20 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
     }
 }
 
+fn local_value_matches_type(
+    program: &mir::Program,
+    expected: mir::Type,
+    value: &LocalValue,
+) -> bool {
+    match (expected, value) {
+        (mir::Type::Class(expected), LocalValue::Class { class, .. })
+        | (mir::Type::NullableClass(expected), LocalValue::NullableClass { class, .. }) => {
+            class_is_subtype(program, *class, expected)
+        }
+        _ => local_value_type(value) == expected,
+    }
+}
+
 fn writable_payload_type(payload: mir::WritableSharedPayload) -> mir::Type {
     match payload {
         mir::WritableSharedPayload::Class(class) => mir::Type::Class(class),
@@ -16056,6 +16195,7 @@ fn read_local(
 }
 
 fn assign_local(
+    program: &mir::Program,
     definitions: &[mir::Local],
     locals: &mut [Option<LocalValue>],
     id: mir::LocalId,
@@ -16079,10 +16219,12 @@ fn assign_local(
         (mir::Type::NullableScalar(expected), LocalValue::NullableScalar { ty, .. }) if expected == *ty
     ) || matches!(
         (definition.ty, &value),
-        (mir::Type::Class(expected), LocalValue::Class { class, .. }) if expected == *class
+        (mir::Type::Class(expected), LocalValue::Class { class, .. })
+            if class_is_subtype(program, *class, expected)
     ) || matches!(
         (definition.ty, &value),
-        (mir::Type::NullableClass(expected), LocalValue::NullableClass { class, .. }) if expected == *class
+        (mir::Type::NullableClass(expected), LocalValue::NullableClass { class, .. })
+            if class_is_subtype(program, *class, expected)
     ) || matches!(
         (definition.ty, &value),
         (mir::Type::SharedReference(expected), LocalValue::SharedReference { class, .. }) if expected == *class
@@ -16296,6 +16438,19 @@ fn class_in(
         .get(id.0)
         .filter(|class| class.id == id)
         .ok_or_else(|| InterpreterError::new(format!("MIR ClassId class{} does not exist", id.0)))
+}
+
+fn class_is_subtype(
+    program: &mir::Program,
+    value: crate::class_layout::ClassId,
+    target: crate::class_layout::ClassId,
+) -> bool {
+    value == target
+        || program
+            .classes
+            .get(value.0)
+            .filter(|class| class.id == value)
+            .is_some_and(|class| class.ancestors.contains(&target))
 }
 
 fn local_in(function: &mir::Function, id: mir::LocalId) -> Result<&mir::Local, InterpreterError> {

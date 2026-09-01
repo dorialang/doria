@@ -14,7 +14,8 @@
   Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Complete;
   Stage 33 Slice 3 — Complete; Stage 33 — Complete; Phase F — Complete;
   Native Testing Foundation Slices 1 Through 3 — Complete; Foundation — Complete;
-  Stage 34 Single Class Inheritance — Next;
+  Stage 34 Single Class Inheritance — Complete;
+  Stage 35 Interfaces And Traits — Next;
   E0641, E0671, And E0672 — Historical And Reserved
 - **Scope:** Package source discovery, file layout, compilation inputs, package
   visibility, and the Baton-to-compiler boundary
@@ -242,15 +243,20 @@ single-binary shorthand remains `kind = "binary"` with one `entry`. Decision
 0126 fixes `[targets.library]`, `[[targets.binary]]`, `--library`, and
 `--binary <name>` as the additional target and selection spellings.
 
-## Package-Wide `internal`
+## Package-Wide Global `internal`
 
-`internal` means accessible anywhere inside the declaring package and
-inaccessible to every other package. The boundary spans files, namespaces,
-main and development roots, and generated package sources. Package-owned tests
-may use package internals. Dependencies may not.
+On global declarations, `internal` means accessible anywhere inside the
+declaring package and inaccessible to every other package. The boundary spans
+files, namespaces, main and development roots, and generated package sources.
+Package-owned tests may use package-internal global declarations. Dependencies
+may not.
+
+Class-member `internal` remains the declaring-class-only member visibility
+defined by the object model. Package compilation does not widen a member's
+visibility, and inheritance does not make an internal parent member visible.
 
 A workspace never merges the access boundaries of its member packages.
-`internal` is not file-private, namespace-private, or workspace-private.
+Global `internal` is not file-private, namespace-private, or workspace-private.
 
 ## Namespaces Across Packages
 
@@ -381,7 +387,7 @@ package graph, package-wide visibility, strict source layout, include-once,
 multi-source diagnostics and lowering, backend execution, and in-memory
 incremental inputs. Stages 31 and 32 and all three Stage 33 slices are complete.
 Stage 33 and Phase F are complete. Native Testing Foundation Slices 1 through 3
-and the foundation are complete, and Stage 34 is next. The completed
+and the foundation are complete, and Stage 34 is complete and Stage 35 is next. The completed
 Baton contract remains frozen in
 `dorialang/baton-php` rather than selecting Baton's permanent implementation
 language. The mandatory native transition remains separately scheduled before
@@ -415,3 +421,8 @@ and single-package plans under Decision 0126. Dependency resolution, lockfiles,
 workspaces, processors, package caches, and registry behavior remain later Stage
 33 work in the PHP UX bootstrap. Porting the completed behavior to production
 Doria Baton is owned by Decision 0124's Pre-Stage-45 transition.
+
+Decision 0130 makes the resolved parent type and hierarchy edges part of the
+package graph and incremental fingerprint. Parent visibility follows ordinary
+package/dependency rules; package-wide global `internal` is unchanged, while a
+class member marked `internal` remains visible only to its declaring class.

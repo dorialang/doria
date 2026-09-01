@@ -159,7 +159,10 @@ class Child extends Vendor\Base implements Vendor\Contracts\Printable
     let Item::Class(class) = &program.items[0] else {
         panic!("expected class declaration");
     };
-    assert_eq!(class.parent.as_deref(), Some("Vendor\\Base"));
+    assert_eq!(
+        class.parent.as_ref().map(|parent| parent.name.as_str()),
+        Some("Vendor\\Base")
+    );
     assert_eq!(class.implements, ["Vendor\\Contracts\\Printable"]);
     let ClassMember::Method(method) = &class.members[0] else {
         panic!("expected method declaration");

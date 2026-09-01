@@ -90,6 +90,21 @@ fn lowers_void_main_to_object() {
 }
 
 #[test]
+fn lowers_uniform_virtual_receivers_for_closed_overrides() {
+    for source in [
+        include_str!(
+            "../../../examples/native/main_stage34_inheritance_writable_shared_reference.doria"
+        ),
+        include_str!("../../../examples/native/main_stage34_inheritance_checked_virtual.doria"),
+        include_str!(
+            "../../../examples/native/main_stage34_inheritance_devirtualized_exact_call.doria"
+        ),
+    ] {
+        assert_object(source);
+    }
+}
+
+#[test]
 fn lowers_integer_local_arithmetic_to_object() {
     assert_object(include_str!(
         "../../../examples/native/main_int_arithmetic.doria"
@@ -405,6 +420,7 @@ fn rejects_mixed_width_float_binary_operands() {
         name: "mixedWidth".to_string(),
         source_span: Default::default(),
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         params: Vec::new(),
         parameter_modes: Vec::new(),
@@ -473,6 +489,7 @@ fn void_program() -> Program {
             name: "main".to_string(),
             source_span: Default::default(),
             method: None,
+            virtual_slot: None,
             receiver_mode: None,
             params: Vec::new(),
             parameter_modes: Vec::new(),

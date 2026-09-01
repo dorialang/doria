@@ -957,9 +957,6 @@ fn emit_php_closure_runtime(
     program: Option<&mir::Program>,
     output: &mut String,
 ) {
-    if !plan.requires_runtime {
-        return;
-    }
     output.push_str(PHP_CLOSURE_BASE_RUNTIME);
     if plan.descriptors.is_empty() {
         return;
@@ -2050,12 +2047,66 @@ function __doria_printf(
                 .then_some(*span)
         })
         .collect();
+    let mut classes_with_php_constructors = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Class(class)
+                if class.members.iter().any(|member| {
+                    matches!(member, ClassMember::Method(method) if method.name == "__construct")
+                        || matches!(
+                            member,
+                            ClassMember::Property(property)
+                                if !property.is_static
+                                    && property.initializer.as_ref().is_some_and(|value| {
+                                        is_payload_enum_expression(value, &program.semantic_info)
+                                            || requires_php_runtime_property_initializer(
+                                                value,
+                                                &program.semantic_info,
+                                            )
+                                            .is_some()
+                                    })
+                        )
+                }) =>
+            {
+                Some(class.name.clone())
+            }
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let (mut classes_with_php_destructors, payload_enums_with_php_destructors) =
+        php_explicit_drop_types(program);
+    loop {
+        let mut changed = false;
+        for class in program.items.iter().filter_map(|item| match item {
+            Item::Class(class) => Some(class),
+            _ => None,
+        }) {
+            let Some(parent) = &class.parent else {
+                continue;
+            };
+            if classes_with_php_constructors.contains(&parent.name) {
+                changed |= classes_with_php_constructors.insert(class.name.clone());
+            }
+            if classes_with_php_destructors.contains(&parent.name) {
+                changed |= classes_with_php_destructors.insert(class.name.clone());
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     let mut scopes = PhpNameScopes::new(
-        static_properties,
-        payload_unit_cases,
-        payload_top_constants,
-        payload_class_constants,
-        payload_enum_expressions,
+        PhpScopeSymbols {
+            static_properties,
+            payload_unit_cases,
+            payload_top_constants,
+            payload_class_constants,
+            payload_enum_expressions,
+            classes_with_php_constructors,
+            classes_with_php_destructors,
+            payload_enums_with_php_destructors,
+        },
         closure_plan,
     );
     scopes.matches = program.semantic_info.matches.clone();
@@ -2066,6 +2117,18 @@ function __doria_printf(
     scopes.mixed_box_plans = program.semantic_info.mixed_box_plans.clone();
     scopes.throw_error_types = program.semantic_info.throw_error_types.clone();
     scopes.catch_error_types = program.semantic_info.catch_error_types.clone();
+    scopes.direct_parent_calls = program
+        .semantic_info
+        .call_targets
+        .iter()
+        .filter_map(|(span, target)| match target {
+            crate::semantics::CallableTarget::Method {
+                direct_parent: true,
+                ..
+            } => Some(*span),
+            _ => None,
+        })
+        .collect();
     scopes.const_evaluation = program.semantic_info.const_evaluation.clone();
     scopes.payload_case_tags = program
         .semantic_info
@@ -2260,12 +2323,6 @@ fn validate_function(
             function.span,
         )]));
     }
-    if is_method && function.name == "__destruct" {
-        return Err(unsupported_ownership_shape(
-            function.span,
-            "deterministic scope-based `__destruct` timing",
-        ));
-    }
     if is_method
         && matches!(function.name.as_str(), "__construct" | "__destruct")
         && (function.is_static || function.writable_this)
@@ -2321,6 +2378,118 @@ fn is_move_type(ty: &TypeRef, semantic_info: &SemanticInfo) -> bool {
             .classes
             .iter()
             .any(|class| class.name == ty.name)
+}
+
+fn php_type_ref_needs_explicit_drop(
+    ty: &TypeRef,
+    classes: &HashSet<String>,
+    payload_enums: &HashSet<String>,
+    type_parameters: &HashSet<String>,
+) -> bool {
+    ty.function.is_some()
+        || ty.name == "mixed"
+        || classes.contains(&ty.name)
+        || payload_enums.contains(&ty.name)
+        || type_parameters.contains(&ty.name)
+        || ty.type_arguments().any(|argument| {
+            php_type_ref_needs_explicit_drop(argument, classes, payload_enums, type_parameters)
+        })
+}
+
+fn php_explicit_drop_types(program: &Program) -> (HashSet<String>, HashSet<String>) {
+    let classes = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Class(class) => Some(class),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let enums = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Enum(declaration) => Some(declaration),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut drop_classes = classes
+        .iter()
+        .filter(|class| {
+            class.members.iter().any(
+                |member| matches!(member, ClassMember::Method(method) if method.name == "__destruct"),
+            )
+        })
+        .map(|class| class.name.clone())
+        .collect::<HashSet<_>>();
+    let mut drop_enums = HashSet::new();
+
+    loop {
+        let mut changed = false;
+        for declaration in &enums {
+            let type_parameters = declaration
+                .type_params
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect::<HashSet<_>>();
+            if declaration.cases.iter().any(|case| {
+                case.payload.iter().any(|field| {
+                    php_type_ref_needs_explicit_drop(
+                        &field.ty,
+                        &drop_classes,
+                        &drop_enums,
+                        &type_parameters,
+                    )
+                })
+            }) {
+                changed |= drop_enums.insert(declaration.name.clone());
+            }
+        }
+        for class in &classes {
+            let type_parameters = class
+                .type_params
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect::<HashSet<_>>();
+            let owns_observable_value = class.members.iter().any(|member| match member {
+                ClassMember::Property(property) if !property.is_static => {
+                    php_type_ref_needs_explicit_drop(
+                        &property.ty,
+                        &drop_classes,
+                        &drop_enums,
+                        &type_parameters,
+                    )
+                }
+                ClassMember::Method(method) if method.name == "__construct" => {
+                    method.params.iter().any(|parameter| {
+                        parameter.promoted_access.is_some()
+                            && php_type_ref_needs_explicit_drop(
+                                &parameter.ty,
+                                &drop_classes,
+                                &drop_enums,
+                                &type_parameters,
+                            )
+                    })
+                }
+                _ => false,
+            });
+            if owns_observable_value {
+                changed |= drop_classes.insert(class.name.clone());
+            }
+        }
+        for class in &classes {
+            let Some(parent) = &class.parent else {
+                continue;
+            };
+            if drop_classes.contains(&class.name) || drop_classes.contains(&parent.name) {
+                changed |= drop_classes.insert(class.name.clone());
+                changed |= drop_classes.insert(parent.name.clone());
+            }
+        }
+        if !changed {
+            return (drop_classes, drop_enums);
+        }
+    }
 }
 
 fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
@@ -2716,6 +2885,7 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             method,
             args,
             span,
+            ..
         } => {
             if class_name == "String" {
                 validate_arguments(args, semantic_info)?;
@@ -3028,6 +3198,7 @@ fn requires_php_runtime_property_initializer(
             class_name,
             member,
             span,
+            ..
         } if semantic_info
             .const_evaluation
             .values
@@ -3212,16 +3383,24 @@ fn is_stage23_runtime_type(ty: &ResolvedType) -> bool {
 }
 
 #[derive(Debug, Clone)]
-struct PhpNameScopes {
-    scopes: Vec<HashMap<String, String>>,
-    mixed_bindings: Vec<HashSet<String>>,
-    used_php_names: HashSet<String>,
-    next_mangled_id: usize,
+struct PhpScopeSymbols {
     static_properties: HashSet<(String, String)>,
     payload_unit_cases: HashSet<(String, String)>,
     payload_top_constants: HashSet<String>,
     payload_class_constants: HashSet<(String, String)>,
     payload_enum_expressions: HashSet<Span>,
+    classes_with_php_constructors: HashSet<String>,
+    classes_with_php_destructors: HashSet<String>,
+    payload_enums_with_php_destructors: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+struct PhpNameScopes {
+    scopes: Vec<HashMap<String, String>>,
+    mixed_bindings: Vec<HashSet<String>>,
+    used_php_names: HashSet<String>,
+    next_mangled_id: usize,
+    symbols: PhpScopeSymbols,
     payload_case_tags: HashMap<crate::enums::EnumCaseId, u32>,
     matches: HashMap<Span, MatchSemanticInfo>,
     whens: HashMap<Span, WhenSemanticInfo>,
@@ -3231,10 +3410,11 @@ struct PhpNameScopes {
     mixed_box_plans: HashMap<Span, crate::semantics::MixedBoxPlan>,
     throw_error_types: HashMap<Span, ResolvedType>,
     catch_error_types: HashMap<Span, ResolvedType>,
+    direct_parent_calls: HashSet<Span>,
     const_evaluation: Evaluation,
     closure_plan: Rc<PhpClosurePlan>,
     binding_places: Vec<HashMap<BindingId, PhpBindingPlace>>,
-    owned_function_cells: Vec<Vec<String>>,
+    owned_cells: Vec<Vec<String>>,
     current_callable: Option<String>,
 }
 
@@ -3261,24 +3441,13 @@ impl PhpBindingPlace {
 }
 
 impl PhpNameScopes {
-    fn new(
-        static_properties: HashSet<(String, String)>,
-        payload_unit_cases: HashSet<(String, String)>,
-        payload_top_constants: HashSet<String>,
-        payload_class_constants: HashSet<(String, String)>,
-        payload_enum_expressions: HashSet<Span>,
-        closure_plan: Rc<PhpClosurePlan>,
-    ) -> Self {
+    fn new(symbols: PhpScopeSymbols, closure_plan: Rc<PhpClosurePlan>) -> Self {
         Self {
             scopes: vec![HashMap::new()],
             mixed_bindings: vec![HashSet::new()],
             used_php_names: HashSet::new(),
             next_mangled_id: 0,
-            static_properties,
-            payload_unit_cases,
-            payload_top_constants,
-            payload_class_constants,
-            payload_enum_expressions,
+            symbols,
             payload_case_tags: HashMap::new(),
             matches: HashMap::new(),
             whens: HashMap::new(),
@@ -3288,23 +3457,17 @@ impl PhpNameScopes {
             mixed_box_plans: HashMap::new(),
             throw_error_types: HashMap::new(),
             catch_error_types: HashMap::new(),
+            direct_parent_calls: HashSet::new(),
             const_evaluation: Evaluation::default(),
             closure_plan,
             binding_places: vec![HashMap::new()],
-            owned_function_cells: vec![Vec::new()],
+            owned_cells: vec![Vec::new()],
             current_callable: None,
         }
     }
 
     fn expression_scope(&self) -> Self {
-        let mut scopes = Self::new(
-            self.static_properties.clone(),
-            self.payload_unit_cases.clone(),
-            self.payload_top_constants.clone(),
-            self.payload_class_constants.clone(),
-            self.payload_enum_expressions.clone(),
-            Rc::clone(&self.closure_plan),
-        );
+        let mut scopes = Self::new(self.symbols.clone(), Rc::clone(&self.closure_plan));
         scopes.payload_case_tags = self.payload_case_tags.clone();
         scopes.matches = self.matches.clone();
         scopes.whens = self.whens.clone();
@@ -3314,46 +3477,50 @@ impl PhpNameScopes {
         scopes.mixed_box_plans = self.mixed_box_plans.clone();
         scopes.throw_error_types = self.throw_error_types.clone();
         scopes.catch_error_types = self.catch_error_types.clone();
+        scopes.direct_parent_calls = self.direct_parent_calls.clone();
         scopes.const_evaluation = self.const_evaluation.clone();
         scopes.current_callable = self.current_callable.clone();
         scopes
     }
 
     fn is_static_property(&self, class_name: &str, member: &str) -> bool {
-        self.static_properties
+        self.symbols
+            .static_properties
             .contains(&(class_name.to_string(), member.to_string()))
     }
 
     fn is_payload_unit_case(&self, enum_name: &str, case_name: &str) -> bool {
-        self.payload_unit_cases
+        self.symbols
+            .payload_unit_cases
             .contains(&(enum_name.to_string(), case_name.to_string()))
     }
 
     fn is_payload_top_constant(&self, name: &str) -> bool {
-        self.payload_top_constants.contains(name)
+        self.symbols.payload_top_constants.contains(name)
     }
 
     fn is_payload_class_constant(&self, class_name: &str, name: &str) -> bool {
-        self.payload_class_constants
+        self.symbols
+            .payload_class_constants
             .contains(&(class_name.to_string(), name.to_string()))
     }
 
     fn is_payload_enum_expression(&self, expr: &Expr) -> bool {
-        self.payload_enum_expressions.contains(&expr.span())
+        self.symbols.payload_enum_expressions.contains(&expr.span())
     }
 
     fn push(&mut self) {
         self.scopes.push(HashMap::new());
         self.mixed_bindings.push(HashSet::new());
         self.binding_places.push(HashMap::new());
-        self.owned_function_cells.push(Vec::new());
+        self.owned_cells.push(Vec::new());
     }
 
     fn pop(&mut self) {
         self.scopes.pop();
         self.mixed_bindings.pop();
         self.binding_places.pop();
-        self.owned_function_cells.pop();
+        self.owned_cells.pop();
     }
 
     fn declare(&mut self, name: &str) -> String {
@@ -3433,29 +3600,25 @@ impl PhpNameScopes {
         self.closure_plan.cell_bindings.contains(&binding)
     }
 
-    fn own_function_cell(&mut self, php_name: String) {
-        self.owned_function_cells
+    fn own_cell(&mut self, php_name: String) {
+        self.owned_cells
             .last_mut()
             .expect("PHP emitter always has an ownership scope")
             .push(php_name);
     }
 
-    fn current_function_cells(&self) -> &[String] {
-        self.owned_function_cells
+    fn current_owned_cells(&self) -> &[String] {
+        self.owned_cells
             .last()
             .expect("PHP emitter always has an ownership scope")
     }
 
-    fn all_function_cells(&self) -> impl DoubleEndedIterator<Item = &String> {
-        self.owned_function_cells
-            .iter()
-            .flat_map(|scope| scope.iter())
+    fn all_owned_cells(&self) -> impl DoubleEndedIterator<Item = &String> {
+        self.owned_cells.iter().flat_map(|scope| scope.iter())
     }
 
-    fn has_owned_function_cells(&self) -> bool {
-        self.owned_function_cells
-            .iter()
-            .any(|scope| !scope.is_empty())
+    fn has_owned_cells(&self) -> bool {
+        self.owned_cells.iter().any(|scope| !scope.is_empty())
     }
 
     fn callable_identity(&self) -> String {
@@ -3554,9 +3717,14 @@ fn emit_item(
     match item {
         Item::Class(class_decl) => emit_class(class_decl, semantic_info, output, indent, scopes),
         Item::Enum(enum_decl) => emit_enum(enum_decl, output, indent, scopes),
-        Item::Function(function) => {
-            emit_function(function, semantic_info, output, indent, false, scopes, &[])
-        }
+        Item::Function(function) => emit_function(
+            function,
+            semantic_info,
+            output,
+            indent,
+            scopes,
+            PhpFunctionEmission::default(),
+        ),
         Item::Constant(constant) => emit_constant(
             constant,
             None,
@@ -3713,18 +3881,48 @@ fn emit_class(
     indent: usize,
     scopes: &PhpNameScopes,
 ) {
-    let function_properties = class_decl
+    let type_parameters = class_decl
+        .type_params
+        .iter()
+        .map(|parameter| parameter.name.clone())
+        .collect::<HashSet<_>>();
+    let mut owned_properties = class_decl
         .members
         .iter()
         .filter_map(|member| match member {
             ClassMember::Property(property)
-                if !property.is_static && resolved_type_ref_is_function(&property.ty) =>
+                if !property.is_static
+                    && php_type_ref_needs_explicit_drop(
+                        &property.ty,
+                        &scopes.symbols.classes_with_php_destructors,
+                        &scopes.symbols.payload_enums_with_php_destructors,
+                        &type_parameters,
+                    ) =>
             {
                 Some(property.name.clone())
             }
             _ => None,
         })
         .collect::<Vec<_>>();
+    owned_properties.extend(class_decl.members.iter().flat_map(|member| {
+        match member {
+            ClassMember::Method(method) if method.name == "__construct" => method
+                .params
+                .iter()
+                .filter(|parameter| {
+                    parameter.promoted_access.is_some()
+                        && php_type_ref_needs_explicit_drop(
+                            &parameter.ty,
+                            &scopes.symbols.classes_with_php_destructors,
+                            &scopes.symbols.payload_enums_with_php_destructors,
+                            &type_parameters,
+                        )
+                })
+                .map(|parameter| parameter.name.clone())
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        }
+    }));
     let instance_initializers = class_decl
         .members
         .iter()
@@ -3746,6 +3944,19 @@ fn emit_class(
         })
         .collect::<Vec<_>>();
     let mut has_constructor = false;
+    let mut has_destructor = false;
+    let parent_has_constructor = class_decl.parent.as_ref().is_some_and(|parent| {
+        scopes
+            .symbols
+            .classes_with_php_constructors
+            .contains(&parent.name)
+    });
+    let parent_has_destructor = class_decl.parent.as_ref().is_some_and(|parent| {
+        scopes
+            .symbols
+            .classes_with_php_destructors
+            .contains(&parent.name)
+    });
     let is_error = class_decl
         .implements
         .iter()
@@ -3766,10 +3977,19 @@ fn emit_class(
     } else {
         format!(" implements {}", interfaces.join(", "))
     };
+    let extends = class_decl
+        .parent
+        .as_ref()
+        .map_or_else(String::new, |parent| {
+            format!(" extends {}", php_symbol_name(&parent.name))
+        });
     writeln(
         output,
         indent,
-        &format!("class {}{implements}", php_symbol_name(&class_decl.name)),
+        &format!(
+            "class {}{extends}{implements}",
+            php_symbol_name(&class_decl.name)
+        ),
     );
     writeln(output, indent, "{");
     if is_error {
@@ -3884,6 +4104,7 @@ fn emit_class(
             ),
             ClassMember::Method(method) => {
                 has_constructor |= method.name == "__construct";
+                has_destructor |= method.name == "__destruct";
                 let initializers = if method.name == "__construct" {
                     instance_initializers.as_slice()
                 } else {
@@ -3903,9 +4124,22 @@ fn emit_class(
                     semantic_info,
                     output,
                     indent + 1,
-                    true,
                     scopes,
-                    initializers,
+                    PhpFunctionEmission {
+                        is_method: true,
+                        property_initializers: initializers,
+                        invoke_parent_constructor: parent_has_constructor
+                            && emitted_method.name == "__construct",
+                        invoke_parent_destructor: parent_has_destructor
+                            && emitted_method.name == "__destruct",
+                        manual_promotions: class_decl.parent.is_some()
+                            && emitted_method.name == "__construct",
+                        drop_properties: if emitted_method.name == "__destruct" {
+                            owned_properties.as_slice()
+                        } else {
+                            &[]
+                        },
+                    },
                 )
             }
             ClassMember::Constant(constant) => emit_constant(
@@ -3918,9 +4152,12 @@ fn emit_class(
         }
         output.push('\n');
     }
-    if !has_constructor && !instance_initializers.is_empty() {
+    if !has_constructor && (!instance_initializers.is_empty() || parent_has_constructor) {
         writeln(output, indent + 1, "public function __construct()");
         writeln(output, indent + 1, "{");
+        if parent_has_constructor {
+            writeln(output, indent + 2, "parent::__construct();");
+        }
         for (name, initializer) in &instance_initializers {
             writeln(
                 output,
@@ -3934,19 +4171,22 @@ fn emit_class(
         writeln(output, indent + 1, "}");
         output.push('\n');
     }
-    if !function_properties.is_empty() {
+    if !has_destructor && (!owned_properties.is_empty() || parent_has_destructor) {
         writeln(output, indent + 1, "public function __destruct()");
         writeln(output, indent + 1, "{");
         writeln(output, indent + 2, "global $__doria_panicking;");
         writeln(output, indent + 2, "if ($__doria_panicking) { return; }");
-        for property in function_properties.iter().rev() {
+        for property in owned_properties.iter().rev() {
             writeln(
                 output,
                 indent + 2,
                 &format!(
-                    "if (isset($this->{property})) {{ $__doriaPropertyValue = $this->{property}; __doria_drop_value($__doriaPropertyValue); }}"
+                    "if (isset($this->{property})) {{ $__doriaPropertyValue = $this->{property}; unset($this->{property}); __doria_drop_value($__doriaPropertyValue); }}"
                 ),
             );
+        }
+        if parent_has_destructor {
+            writeln(output, indent + 2, "parent::__destruct();");
         }
         writeln(output, indent + 1, "}");
         output.push('\n');
@@ -4008,6 +4248,31 @@ fn emit_class(
             ),
         );
     }
+}
+
+fn constructor_starts_with_parent_call(
+    function: &FunctionDecl,
+    semantic_info: &SemanticInfo,
+) -> bool {
+    matches!(
+        function.body.statements.first(),
+        Some(Stmt::Expr {
+            expr:
+                Expr::StaticCall {
+                    method,
+                    span,
+                    ..
+                },
+            ..
+        }) if method == "__construct"
+            && matches!(
+                semantic_info.call_target(*span),
+                Some(crate::semantics::CallableTarget::Method {
+                    direct_parent: true,
+                    ..
+                })
+            )
+    )
 }
 
 fn emit_closure_entries(
@@ -4109,14 +4374,14 @@ fn emit_closure_entry(
             );
         }
         if parameter.take && resolved_type_ref_is_function(&parameter.ty) {
-            scopes.own_function_cell(parameter.name.clone());
+            scopes.own_cell(parameter.name.clone());
         }
     }
 
     match &closure.body {
         ClosureBody::Expression(expr) => {
             let result = scopes.fresh_temp("__doria_closure_result");
-            let owns_result = resolved_is_function_type(&semantic.inferred_return_type);
+            let owns_result = resolved_type_needs_php_drop(&semantic.inferred_return_type, &scopes);
             writeln(
                 output,
                 indent + 1,
@@ -4324,15 +4589,32 @@ fn emit_const_value(value: &ConstValue, evaluation: &Evaluation) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct PhpFunctionEmission<'a> {
+    is_method: bool,
+    property_initializers: &'a [(&'a str, &'a Expr)],
+    invoke_parent_constructor: bool,
+    invoke_parent_destructor: bool,
+    manual_promotions: bool,
+    drop_properties: &'a [String],
+}
+
 fn emit_function(
     function: &FunctionDecl,
     semantic_info: &SemanticInfo,
     output: &mut String,
     indent: usize,
-    is_method: bool,
     shared_scopes: &PhpNameScopes,
-    property_initializers: &[(&str, &Expr)],
+    emission: PhpFunctionEmission<'_>,
 ) {
+    let PhpFunctionEmission {
+        is_method,
+        property_initializers,
+        invoke_parent_constructor,
+        invoke_parent_destructor,
+        manual_promotions,
+        drop_properties,
+    } = emission;
     let mut scopes = shared_scopes.expression_scope();
     let callable_plan = scopes
         .closure_plan
@@ -4388,6 +4670,7 @@ fn emit_function(
                     &semantic_info.const_evaluation,
                     &scopes,
                     uses_cell,
+                    !manual_promotions,
                 )
             })
             .collect::<Vec<_>>()
@@ -4464,11 +4747,13 @@ fn emit_function(
                 ),
             );
         }
-        if param.promoted_access.is_some() && uses_cell {
-            let value = if param.take && resolved_type_ref_is_function(&param.ty) {
+        if param.promoted_access.is_some() && (uses_cell || manual_promotions) {
+            let value = if uses_cell && param.take && resolved_type_ref_is_function(&param.ty) {
                 format!("__doria_take_cell(${})", param.name)
-            } else {
+            } else if uses_cell {
                 format!("${}->value", param.name)
+            } else {
+                format!("${}", param.name)
             };
             writeln(
                 output,
@@ -4477,7 +4762,25 @@ fn emit_function(
             );
         }
         if resolved_type_ref_is_function(&param.ty) && param.take {
-            scopes.own_function_cell(param.name.clone());
+            scopes.own_cell(param.name.clone());
+        }
+    }
+    let explicit_parent_constructor =
+        invoke_parent_constructor && constructor_starts_with_parent_call(function, semantic_info);
+    if invoke_parent_constructor {
+        if explicit_parent_constructor {
+            emit_statement(
+                function
+                    .body
+                    .statements
+                    .first()
+                    .expect("explicit parent constructor call is present"),
+                output,
+                body_indent,
+                &mut scopes,
+            );
+        } else {
+            writeln(output, body_indent, "parent::__construct();");
         }
     }
     for (name, initializer) in property_initializers {
@@ -4487,10 +4790,55 @@ fn emit_function(
             &format!("$this->{name} = {};", emit_expr(initializer, &scopes)),
         );
     }
-    for statement in &function.body.statements {
-        emit_statement(statement, output, body_indent, &mut scopes);
+    let routes_destructor_cleanup = invoke_parent_destructor || !drop_properties.is_empty();
+    let statement_indent = if routes_destructor_cleanup {
+        writeln(output, body_indent, "try");
+        writeln(output, body_indent, "{");
+        body_indent + 1
+    } else {
+        body_indent
+    };
+    for statement in function
+        .body
+        .statements
+        .iter()
+        .skip(usize::from(explicit_parent_constructor))
+    {
+        emit_statement(statement, output, statement_indent, &mut scopes);
     }
-    emit_current_function_cell_cleanup(output, body_indent, &scopes);
+    emit_current_function_cell_cleanup(output, statement_indent, &scopes);
+    if routes_destructor_cleanup {
+        writeln(output, body_indent, "}");
+        writeln(output, body_indent, "finally");
+        writeln(output, body_indent, "{");
+        let cleanup_indent = if invoke_parent_destructor && !drop_properties.is_empty() {
+            writeln(output, body_indent + 1, "try");
+            writeln(output, body_indent + 1, "{");
+            body_indent + 2
+        } else {
+            body_indent + 1
+        };
+        for property in drop_properties.iter().rev() {
+            let temporary = scopes.fresh_temp("__doria_property_value");
+            writeln(
+                output,
+                cleanup_indent,
+                &format!(
+                    "if (isset($this->{property})) {{ ${temporary} = $this->{property}; unset($this->{property}); __doria_drop_value(${temporary}); }}"
+                ),
+            );
+        }
+        if invoke_parent_destructor && !drop_properties.is_empty() {
+            writeln(output, body_indent + 1, "}");
+            writeln(output, body_indent + 1, "finally");
+            writeln(output, body_indent + 1, "{");
+            writeln(output, body_indent + 2, "parent::__destruct();");
+            writeln(output, body_indent + 1, "}");
+        } else if invoke_parent_destructor {
+            writeln(output, body_indent + 1, "parent::__destruct();");
+        }
+        writeln(output, body_indent, "}");
+    }
     scopes.pop();
     if checked_entry {
         writeln(output, indent + 1, "}");
@@ -4512,9 +4860,14 @@ fn emit_param(
     evaluation: &Evaluation,
     scopes: &PhpNameScopes,
     uses_cell: bool,
+    emit_promotion: bool,
 ) -> String {
     let mut output = String::new();
-    if let Some(access) = param.promoted_access.as_ref().filter(|_| !uses_cell) {
+    if let Some(access) = param
+        .promoted_access
+        .as_ref()
+        .filter(|_| !uses_cell && emit_promotion)
+    {
         output.push_str(emit_member_access(access));
         output.push(' ');
     }
@@ -4654,12 +5007,22 @@ fn emit_statement(
     match statement {
         Stmt::Block(block) => emit_block(block, output, indent, scopes),
         Stmt::VarDecl(decl) => {
-            let owns_function = decl.ty.as_ref().is_some_and(resolved_type_ref_is_function)
+            let binding_ownership = decl
+                .bindings
+                .iter()
+                .map(|binding| {
+                    scopes
+                        .binding_for_declaration(&binding.name, binding.span)
+                        .and_then(|binding| scopes.source_type(binding))
+                        .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes))
+                })
+                .collect::<Vec<_>>();
+            let owns_value = binding_ownership.iter().copied().any(|owns| owns)
                 || scopes
                     .expression_types
                     .get(&decl.initializer.span())
-                    .is_some_and(resolved_is_function_type);
-            let initializer = if owns_function {
+                    .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes));
+            let initializer = if owns_value {
                 emit_owned_expr(&decl.initializer, scopes)
             } else {
                 emit_expr(&decl.initializer, scopes)
@@ -4675,7 +5038,7 @@ fn emit_statement(
                     &decl.bindings[0],
                     &initializer,
                     binding_is_mixed,
-                    owns_function,
+                    binding_ownership[0],
                     output,
                     indent,
                     scopes,
@@ -4683,12 +5046,12 @@ fn emit_statement(
             } else {
                 let temporary = scopes.fresh_temp("__doria_grouped_value");
                 writeln(output, indent, &format!("${temporary} = {initializer};"));
-                for binding in &decl.bindings {
+                for (binding, owns_binding) in decl.bindings.iter().zip(binding_ownership) {
                     emit_local_binding(
                         binding,
                         &format!("${temporary}"),
                         binding_is_mixed,
-                        owns_function,
+                        owns_binding,
                         output,
                         indent,
                         scopes,
@@ -4699,7 +5062,7 @@ fn emit_statement(
         }
         Stmt::Assignment(assignment) => {
             if assignment.op == AssignOp::Assign
-                && assignment_target_is_function(&assignment.target, scopes)
+                && assignment_target_needs_php_drop(&assignment.target, scopes)
             {
                 let replacement = emit_owned_expr(&assignment.value, scopes);
                 if let Some(cell) = assignment_target_cell(&assignment.target, scopes) {
@@ -4713,9 +5076,16 @@ fn emit_statement(
                     let temporary = scopes.fresh_temp("__doria_replacement");
                     let old = scopes.fresh_temp("__doria_replaced");
                     writeln(output, indent, &format!("${temporary} = {replacement};"));
-                    writeln(output, indent, &format!("${old} = {target};"));
-                    writeln(output, indent, &format!("{target} = ${temporary};"));
-                    writeln(output, indent, &format!("__doria_drop_value(${old});"));
+                    writeln(output, indent, &format!("if (isset({target}))"));
+                    writeln(output, indent, "{");
+                    writeln(output, indent + 1, &format!("${old} = {target};"));
+                    writeln(output, indent + 1, &format!("{target} = ${temporary};"));
+                    writeln(output, indent + 1, &format!("__doria_drop_value(${old});"));
+                    writeln(output, indent, "}");
+                    writeln(output, indent, "else");
+                    writeln(output, indent, "{");
+                    writeln(output, indent + 1, &format!("{target} = ${temporary};"));
+                    writeln(output, indent, "}");
                 }
                 return;
             }
@@ -4773,8 +5143,8 @@ fn emit_statement(
                 let owns_result = scopes
                     .expression_types
                     .get(&expr.span())
-                    .is_some_and(resolved_is_function_type);
-                if owns_result || scopes.has_owned_function_cells() {
+                    .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes));
+                if owns_result || scopes.has_owned_cells() {
                     let result = scopes.fresh_temp("__doria_return");
                     writeln(
                         output,
@@ -5598,22 +5968,58 @@ fn resolved_is_function_type(ty: &ResolvedType) -> bool {
     }
 }
 
-fn assignment_target_is_function(target: &Expr, scopes: &PhpNameScopes) -> bool {
+fn resolved_type_needs_php_drop(ty: &ResolvedType, scopes: &PhpNameScopes) -> bool {
+    match ty {
+        ResolvedType::Mixed
+        | ResolvedType::Error
+        | ResolvedType::Function(_)
+        | ResolvedType::TypeParameter(_) => true,
+        ResolvedType::Enum(enum_type) => scopes
+            .symbols
+            .payload_enums_with_php_destructors
+            .contains(&enum_type.name),
+        ResolvedType::Class(class_type) => scopes
+            .symbols
+            .classes_with_php_destructors
+            .contains(&class_type.name),
+        ResolvedType::TypedArray(element)
+        | ResolvedType::List(element)
+        | ResolvedType::Set(element)
+        | ResolvedType::SortedSet(element)
+        | ResolvedType::PriorityQueue(element)
+        | ResolvedType::Deque(element) => resolved_type_needs_php_drop(element, scopes),
+        ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
+            resolved_type_needs_php_drop(key, scopes) || resolved_type_needs_php_drop(value, scopes)
+        }
+        ResolvedType::Nullable(inner) => resolved_type_needs_php_drop(inner, scopes),
+        ResolvedType::Void
+        | ResolvedType::Bytes
+        | ResolvedType::Integer(_)
+        | ResolvedType::Float(_)
+        | ResolvedType::String
+        | ResolvedType::Bool
+        | ResolvedType::Null
+        | ResolvedType::SharedHandle(_, _)
+        | ResolvedType::Unsupported => false,
+    }
+}
+
+fn assignment_target_needs_php_drop(target: &Expr, scopes: &PhpNameScopes) -> bool {
     match target {
-        Expr::Grouped { expr, .. } => assignment_target_is_function(expr, scopes),
+        Expr::Grouped { expr, .. } => assignment_target_needs_php_drop(expr, scopes),
         Expr::Variable { span, .. } => scopes
             .binding_for_use(*span)
             .and_then(|binding| scopes.source_type(binding))
-            .is_some_and(resolved_is_function_type),
+            .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes)),
         Expr::PropertyAccess { span, .. } => scopes
             .closure_plan
             .property_write_types
             .get(span)
-            .is_some_and(resolved_is_function_type),
+            .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes)),
         _ => scopes
             .expression_types
             .get(&target.span())
-            .is_some_and(resolved_is_function_type),
+            .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes)),
     }
 }
 
@@ -5621,7 +6027,7 @@ fn emit_local_binding(
     declaration: &VarBinding,
     initializer: &str,
     binding_is_mixed: bool,
-    owns_function: bool,
+    owns_value: bool,
     output: &mut String,
     indent: usize,
     scopes: &mut PhpNameScopes,
@@ -5631,7 +6037,7 @@ fn emit_local_binding(
     if binding_is_mixed {
         scopes.mark_mixed(&declaration.name);
     }
-    if binding.is_some_and(|binding| scopes.needs_cell(binding)) {
+    if owns_value || binding.is_some_and(|binding| scopes.needs_cell(binding)) {
         writeln(
             output,
             indent,
@@ -5641,8 +6047,8 @@ fn emit_local_binding(
             binding.expect("checked binding exists"),
             PhpBindingPlace::Cell(php_name.clone()),
         );
-        if owns_function {
-            scopes.own_function_cell(php_name);
+        if owns_value {
+            scopes.own_cell(php_name);
         }
     } else {
         writeln(output, indent, &format!("${php_name} = {initializer};"));
@@ -5682,13 +6088,13 @@ fn emit_owned_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
 }
 
 fn emit_current_function_cell_cleanup(output: &mut String, indent: usize, scopes: &PhpNameScopes) {
-    for cell in scopes.current_function_cells().iter().rev() {
+    for cell in scopes.current_owned_cells().iter().rev() {
         writeln(output, indent, &format!("__doria_drop_cell(${cell});"));
     }
 }
 
 fn emit_all_function_cell_cleanup(output: &mut String, indent: usize, scopes: &PhpNameScopes) {
-    for cell in scopes.all_function_cells().rev() {
+    for cell in scopes.all_owned_cells().rev() {
         writeln(output, indent, &format!("__doria_drop_cell(${cell});"));
     }
 }
@@ -6335,9 +6741,14 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
                     }
                 }
             }
+            let qualifier = if scopes.direct_parent_calls.contains(span) {
+                "parent".to_string()
+            } else {
+                php_symbol_name(class_name)
+            };
             format!(
                 "{}::{method}({})",
-                php_symbol_name(class_name),
+                qualifier,
                 emit_arguments_for_call(args, *span, scopes)
             )
         }
@@ -6775,6 +7186,22 @@ fn php_exact_type_test_for_source(
     source: &ResolvedType,
     exact: &ResolvedType,
 ) -> String {
+    if let ResolvedType::Class(class) = exact {
+        let target = php_symbol_name(&class.name);
+        return match source {
+            ResolvedType::Mixed => {
+                format!("__doria_mixed_value({value}) instanceof {target}")
+            }
+            ResolvedType::Nullable(inner) if matches!(inner.as_ref(), ResolvedType::Mixed) => {
+                format!("{value} !== null && __doria_mixed_value({value}) instanceof {target}")
+            }
+            ResolvedType::Class(_) => format!("{value} instanceof {target}"),
+            ResolvedType::Nullable(inner) if matches!(inner.as_ref(), ResolvedType::Class(_)) => {
+                format!("{value} !== null && {value} instanceof {target}")
+            }
+            _ => "false".to_string(),
+        };
+    }
     match source {
         ResolvedType::Mixed => format!(
             "__doria_mixed_is({value}, {})",

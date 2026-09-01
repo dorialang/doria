@@ -433,19 +433,52 @@ impl Parser {
 
     fn parse_item(&mut self) -> Option<Item> {
         let attributes = self.parse_attribute_groups()?;
+        let open_span = self
+            .match_kind(&TokenKind::Open)
+            .then(|| self.previous().span);
+        let override_span = self
+            .match_kind(&TokenKind::Override)
+            .then(|| self.previous().span);
+        if let (Some(open), Some(overridden)) = (open_span, override_span) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "`open` and `override` cannot be combined",
+                    open.merge(overridden),
+                )
+                .with_title("Open And Override Cannot Be Combined"),
+            );
+        }
+        let declaration_start = open_span
+            .or(override_span)
+            .map_or_else(|| self.peek().span.start, |span| span.start);
         let item = if self.match_kind(&TokenKind::Class) {
-            self.parse_class(MemberAccess::External, self.previous().span.start)
+            if let Some(span) = override_span {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "`override` can modify only an instance method",
+                        span,
+                    )
+                    .with_title("Override Modifier Is Not Valid Here"),
+                );
+            }
+            self.parse_class(MemberAccess::External, open_span, declaration_start)
                 .map(Item::Class)
         } else if self.match_kind(&TokenKind::Enum) {
+            self.reject_type_modifier(open_span, override_span, "an enum");
             self.parse_enum(MemberAccess::External, self.previous().span.start)
                 .map(Item::Enum)
         } else if self.match_kind(&TokenKind::Interface) {
+            self.reject_type_modifier(open_span, override_span, "an interface");
             self.parse_interface(MemberAccess::External, self.previous().span.start)
                 .map(Item::Interface)
         } else if self.match_kind(&TokenKind::Trait) {
+            self.reject_type_modifier(open_span, override_span, "a trait");
             self.parse_trait(MemberAccess::External, self.previous().span.start)
                 .map(Item::Trait)
         } else if self.match_kind(&TokenKind::Internal) {
+            self.reject_type_modifier(open_span, override_span, "`internal`");
             self.parse_internal_item(self.previous().span)
         } else if self.check(&TokenKind::Function)
             && self
@@ -454,13 +487,31 @@ impl Parser {
                 .is_some_and(Self::is_callable_name_token)
         {
             self.advance();
-            self.parse_function(MemberAccess::External, None, None, self.previous().span)
-                .map(Item::Function)
+            self.parse_function_with_modifiers(
+                MemberAccess::External,
+                open_span,
+                override_span,
+                None,
+                None,
+                self.span(declaration_start, self.previous().span.end),
+            )
+            .map(Item::Function)
         } else if self.match_kind(&TokenKind::Const) {
+            self.reject_type_modifier(open_span, override_span, "a constant");
             let start = self.previous().span.start;
             self.parse_const_decl(MemberAccess::External, start)
                 .map(Item::Constant)
         } else {
+            if let Some(span) = open_span.or(override_span) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "P0001",
+                        "declaration modifier is not followed by a declaration",
+                        span,
+                    )
+                    .with_title("Declaration Modifier Is Incomplete"),
+                );
+            }
             self.parse_statement().map(Item::Statement)
         };
         if let Some(item) = &item {
@@ -471,6 +522,26 @@ impl Parser {
             }
         }
         item
+    }
+
+    fn reject_type_modifier(
+        &mut self,
+        open_span: Option<Span>,
+        override_span: Option<Span>,
+        target: &str,
+    ) {
+        if let Some(span) = open_span {
+            self.diagnostics.push(
+                Diagnostic::new("P0001", format!("`open` cannot modify {target}"), span)
+                    .with_title("Open Modifier Is Not Valid Here"),
+            );
+        }
+        if let Some(span) = override_span {
+            self.diagnostics.push(
+                Diagnostic::new("P0001", format!("`override` cannot modify {target}"), span)
+                    .with_title("Override Modifier Is Not Valid Here"),
+            );
+        }
     }
 
     fn parse_attribute_groups(&mut self) -> Option<Vec<AttributeGroup>> {
@@ -746,16 +817,28 @@ impl Parser {
             self.reject_attribute_after_modifier(internal_span);
             let _ = self.parse_attribute_groups();
         }
+        let open_span = self
+            .match_kind(&TokenKind::Open)
+            .then(|| self.previous().span);
+        let override_span = self
+            .match_kind(&TokenKind::Override)
+            .then(|| self.previous().span);
         if self.match_kind(&TokenKind::Class) {
-            self.parse_class(MemberAccess::Internal, internal_span.start)
+            if let Some(span) = override_span {
+                self.reject_type_modifier(None, Some(span), "a class");
+            }
+            self.parse_class(MemberAccess::Internal, open_span, internal_span.start)
                 .map(Item::Class)
         } else if self.match_kind(&TokenKind::Enum) {
+            self.reject_type_modifier(open_span, override_span, "an enum");
             self.parse_enum(MemberAccess::Internal, internal_span.start)
                 .map(Item::Enum)
         } else if self.match_kind(&TokenKind::Interface) {
+            self.reject_type_modifier(open_span, override_span, "an interface");
             self.parse_interface(MemberAccess::Internal, internal_span.start)
                 .map(Item::Interface)
         } else if self.match_kind(&TokenKind::Trait) {
+            self.reject_type_modifier(open_span, override_span, "a trait");
             self.parse_trait(MemberAccess::Internal, internal_span.start)
                 .map(Item::Trait)
         } else if self.check(&TokenKind::Function)
@@ -765,9 +848,17 @@ impl Parser {
                 .is_some_and(Self::is_callable_name_token)
         {
             self.advance();
-            self.parse_function(MemberAccess::Internal, None, None, internal_span)
-                .map(Item::Function)
+            self.parse_function_with_modifiers(
+                MemberAccess::Internal,
+                open_span,
+                override_span,
+                None,
+                None,
+                internal_span.merge(self.previous().span),
+            )
+            .map(Item::Function)
         } else if self.match_kind(&TokenKind::Const) {
+            self.reject_type_modifier(open_span, override_span, "a constant");
             self.parse_const_decl(MemberAccess::Internal, internal_span.start)
                 .map(Item::Constant)
         } else {
@@ -879,19 +970,25 @@ impl Parser {
         Some(fields)
     }
 
-    fn parse_class(&mut self, access: MemberAccess, start: usize) -> Option<ClassDecl> {
+    fn parse_class(
+        &mut self,
+        access: MemberAccess,
+        open_span: Option<Span>,
+        start: usize,
+    ) -> Option<ClassDecl> {
         let name = self.expect_type_declaration_name("expected class name")?;
         let name_span = self.previous().span;
         let type_params = self.parse_type_params()?;
-        let (parent, parent_span) = if self.match_kind(&TokenKind::Extends) {
-            let parent_start = self.previous().span.start;
-            let parent = self.expect_qualified_name("expected parent class after `extends`")?;
+        let (parent, extends_span, parent_span) = if self.match_kind(&TokenKind::Extends) {
+            let extends_span = self.previous().span;
+            let parent = self.parse_type_ref()?;
             (
                 Some(parent),
-                Some(self.span(parent_start, self.previous().span.end)),
+                Some(extends_span),
+                Some(self.span(extends_span.start, self.previous().span.end)),
             )
         } else {
-            (None, None)
+            (None, None, None)
         };
         let mut implements = Vec::new();
         if self.match_kind(&TokenKind::Implements) {
@@ -923,11 +1020,15 @@ impl Parser {
         Some(ClassDecl {
             access,
             access_span: self.access_span(&access, start),
+            is_open: open_span.is_some(),
+            open_span,
             name,
             name_span,
             type_params,
             parent,
+            extends_span,
             parent_span,
+            modifier_prefix_span: self.span(start, name_span.start),
             implements,
             members,
             span: self.span(start, end),
@@ -1000,6 +1101,22 @@ impl Parser {
             }
             return member;
         }
+        let open_span = self
+            .match_kind(&TokenKind::Open)
+            .then(|| self.previous().span);
+        let override_span = self
+            .match_kind(&TokenKind::Override)
+            .then(|| self.previous().span);
+        if let (Some(open), Some(overridden)) = (open_span, override_span) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "`open` and `override` cannot be combined",
+                    open.merge(overridden),
+                )
+                .with_title("Open And Override Cannot Be Combined"),
+            );
+        }
         let static_span = self
             .match_kind(&TokenKind::Static)
             .then(|| self.previous().span);
@@ -1020,7 +1137,21 @@ impl Parser {
             self.advance();
             let start = self.previous().span.start;
             let member = self
-                .parse_function(access, writable_span, static_span, self.span(start, start))
+                .parse_function_with_modifiers(
+                    access,
+                    open_span,
+                    override_span,
+                    writable_span,
+                    static_span,
+                    self.span(
+                        open_span
+                            .or(override_span)
+                            .or(static_span)
+                            .or(writable_span)
+                            .map_or(start, |span| span.start),
+                        start,
+                    ),
+                )
                 .map(ClassMember::Method);
             if let Some(member) = &member {
                 self.attach_member_attributes(attributes, member);
@@ -1099,9 +1230,11 @@ impl Parser {
         })
     }
 
-    fn parse_function(
+    fn parse_function_with_modifiers(
         &mut self,
         access: MemberAccess,
+        open_span: Option<Span>,
+        override_span: Option<Span>,
         writable_span: Option<Span>,
         static_span: Option<Span>,
         start_span: Span,
@@ -1144,6 +1277,10 @@ impl Parser {
         Some(FunctionDecl {
             access,
             access_span: self.access_span(&access, start_span.start),
+            is_open: open_span.is_some(),
+            open_span,
+            is_override: override_span.is_some(),
+            override_span,
             writable_this: writable_span.is_some(),
             writable_span,
             is_static: static_span.is_some(),
@@ -1155,6 +1292,7 @@ impl Parser {
             return_type,
             throws,
             body,
+            modifier_prefix_span: self.span(start, name_span.start),
             span,
         })
     }
@@ -4673,6 +4811,8 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Fn => "fn",
         TokenKind::Const => "const",
         TokenKind::Internal => "internal",
+        TokenKind::Open => "open",
+        TokenKind::Override => "override",
         TokenKind::Static => "static",
         TokenKind::SelfType => "self",
         TokenKind::Parent => "parent",

@@ -365,7 +365,7 @@ including ambient I/O, through the same propagation and cleanup model. Stages
 30 through 32 and the Decision 0123 corrective beat are complete. All three
 Stage 33 slices and Phase F are complete under Decisions 0126 through 0128;
 Native Testing Foundation Slices 1 through 3 are complete, the Native Testing
-Foundation is complete, and Stage 34 is next.
+Foundation is complete, and Stage 34 is complete and Stage 35 is next.
 
 ## Explicit Exclusions
 
@@ -419,5 +419,10 @@ remain unchanged.
 - Decision 0122 implements owned-property move-in and writable replacement.
   E0472 remains reachable only for the separate move-out boundary.
 - The pre-Stage-30 closure grammar slice is complete. Stage 30 closure semantics,
-  Stage 31 namespaces, Stage 34 inheritance, Stage 35 interfaces, Stage 36a
+  Stage 31 namespaces, Stage 35 interfaces, Stage 36a
   streams, and Stage 41 PHP-library conversion remain separate.
+
+Decision 0130 implements Error-class inheritance. A parent Error contract and
+catch cover descendants, catch ordering uses hierarchy coverage, and virtual
+slots transport the union-compatible checked ABI while each implementation may
+narrow its declared Error set.

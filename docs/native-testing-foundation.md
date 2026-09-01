@@ -15,7 +15,8 @@ Native Testing Foundation Slice 1 - Complete
 Native Testing Foundation Slice 2 - Complete
 Native Testing Foundation Slice 3 - Complete
 Native Testing Foundation - Complete
-Stage 34 Single Class Inheritance - Next
+Stage 34 Single Class Inheritance - Complete
+Stage 35 Interfaces And Traits - Next
 Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
@@ -350,7 +351,7 @@ all native/PHP profiles agree
 Baton never parses source
 editor tooling consumes compiler metadata
 Native Testing Foundation marked complete
-Stage 34 becomes next
+Stage 34 unblocked for its own implementation beat
 ```
 
 ## Deliberate Follow-Up Surface
@@ -380,7 +381,7 @@ They are deferred, not permanently rejected.
 ## Invalidated Elsewhere
 
 - `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md` place the
-  completed foundation before Stage 34.
+  completed foundation before the now-complete Stage 34.
 - `docs/stdlib-reference.md` records the delivered `Doria\Std\Test` surface.
 - `docs/self-hosting.md` records the complete native testing story.
 - Decision 0128 remains the Baton orchestration authority but is no longer the

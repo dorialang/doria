@@ -51,3 +51,11 @@ Drop elaboration must be path-sensitive and backend-independent. It tracks initi
 An RAII guard restores its resource on every structured exit, including an error escaping `main` once checked errors exist, but not on an abort-only panic. In particular, the future `Console::rawMode` guard cannot promise terminal restoration on panic. A minimal panic hook could provide that behavior later, but Stage 19 neither implements nor designs toward it.
 
 Decision 0082 defines how concrete class cleanup is represented natively. Decision 0083 defines the total property order and the move restrictions on which this destruction order depends.
+
+## Stage 34 Amendment
+
+Decision 0130 applies the same reverse-construction law across inheritance. A
+fully constructed object runs the most-derived destructor and drops that class
+phase before recursively destroying parent phases. Dynamic destruction through
+an open-class value selects the exact concrete drop path and frees the one
+complete allocation once.

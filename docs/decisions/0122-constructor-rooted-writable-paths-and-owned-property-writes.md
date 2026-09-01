@@ -167,3 +167,7 @@ parts of the operation.
 - Pipeline notes that list all owned-property transfer as pending.
 - Tooling diagnostics that reject either motivating program.
 
+Decision 0130 preserves these write capabilities independently in every
+root-to-derived constructor phase. Inherited writable paths retain their
+declaring property identity, and replacement still acquires the new value
+before dropping the old one.

@@ -1,0 +1,13 @@
+open class Rule
+{
+    open function accepted(): bool { return false; }
+}
+class ChildRule extends Rule
+{
+    override function accepted(): bool { return true; }
+}
+function main(): void
+{
+    Rule $rule = new ChildRule();
+    if ($rule->accepted()) { echo "assertion virtual\n"; }
+}

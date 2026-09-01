@@ -143,6 +143,7 @@ fn argument_values(args: &[hir::Argument]) -> Vec<&hir::Expr> {
 #[derive(Clone)]
 struct FunctionSignature {
     id: mir::FunctionId,
+    direct_id: Option<mir::FunctionId>,
     return_type: mir::ReturnType,
     return_borrow: Option<mir::ReturnBorrow>,
     parameter_types: Vec<mir::Type>,
@@ -646,6 +647,7 @@ fn specialize_callable_instance(
         CallableTarget::Method {
             class_type,
             method_name,
+            ..
         } => {
             let specialized =
                 substitute_resolved_type(&ResolvedType::Class(class_type.clone()), substitutions);
@@ -892,6 +894,74 @@ fn type_substitutions(
         },
     ));
     Ok(substitutions)
+}
+
+fn propagate_parent_constructor_effects(
+    semantic_info: &SemanticInfo,
+    class_ids: &ClassIds,
+    signatures: &mut HashMap<MethodInstanceKey, FunctionSignature>,
+    ordered: &mut [FunctionSignature],
+) {
+    loop {
+        let mut changed = false;
+        for class in &semantic_info.classes {
+            let Some(parent) = class
+                .parent
+                .as_ref()
+                .and_then(|parent| class_ids.get(parent))
+            else {
+                continue;
+            };
+            let parent_key = MethodInstanceKey {
+                class: *parent,
+                name: "__construct".to_string(),
+                arguments: Vec::new(),
+            };
+            let Some(parent_signature) = signatures.get(&parent_key).cloned() else {
+                continue;
+            };
+            let child_key = MethodInstanceKey {
+                class: class.id,
+                name: "__construct".to_string(),
+                arguments: Vec::new(),
+            };
+            let Some(child_signature) = signatures.get_mut(&child_key) else {
+                continue;
+            };
+            let before = child_signature.checked_effects.len();
+            extend_unique(
+                &mut child_signature.required_checked_effects,
+                parent_signature.required_checked_effects,
+            );
+            extend_unique(
+                &mut child_signature.ambient_checked_effects,
+                parent_signature.ambient_checked_effects,
+            );
+            extend_unique(
+                &mut child_signature.test_assertion_checked_effects,
+                parent_signature.test_assertion_checked_effects,
+            );
+            extend_unique(
+                &mut child_signature.checked_effects,
+                parent_signature.checked_effects,
+            );
+            if child_signature.checked_effects.len() != before {
+                ordered[child_signature.id.0] = child_signature.clone();
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+fn extend_unique<T: PartialEq>(target: &mut Vec<T>, values: impl IntoIterator<Item = T>) {
+    for value in values {
+        if !target.contains(&value) {
+            target.push(value);
+        }
+    }
 }
 
 fn substitute_generic_argument(
@@ -1310,75 +1380,126 @@ fn lower_program_impl(
         }
     }
     intern_aggregate_storage_types(&program.semantic_info, &class_ids, &mut collection_registry);
-    let property_initializers = program
-        .semantic_info
-        .classes
-        .iter()
-        .flat_map(|class_info| {
+    let mut property_initializers = HashMap::new();
+    for class_info in &program.semantic_info.classes {
+        let mut hierarchy = class_info.ancestors.iter().rev().collect::<Vec<_>>();
+        let concrete = crate::types::ClassType::new(
+            class_info.declaration_name.clone(),
+            class_info.arguments.clone(),
+        );
+        hierarchy.push(&concrete);
+        for hierarchy_class in hierarchy {
             let class = program
                 .items
                 .iter()
                 .find_map(|item| match item {
-                    hir::Item::Class(class) if class.name == class_info.declaration_name => {
-                        Some(class)
-                    }
+                    hir::Item::Class(class) if class.name == hierarchy_class.name => Some(class),
                     _ => None,
                 })
-                .expect("specialized class has a declaration");
+                .expect("specialized hierarchy class has a declaration");
             let substitutions = class
                 .type_params
                 .iter()
-                .zip(&class_info.arguments)
+                .zip(&hierarchy_class.arguments)
                 .map(|(parameter, argument)| (parameter.name.clone(), argument.clone()))
                 .collect::<HashMap<_, _>>();
-            class.members.iter().filter_map(move |member| match member {
-                hir::ClassMember::Property(property) if !property.is_static => {
-                    property.initializer.clone().map(|value| {
-                        let property_id = class_info
-                            .properties
-                            .iter()
-                            .find(|info| info.name == property.name)
-                            .expect("checked property has a stable identity")
-                            .id;
-                        (
-                            property_id,
-                            PropertyInitializer {
-                                class: class_info.id,
-                                expression: value,
-                                type_substitutions: substitutions.clone(),
-                                closure_plans: HashMap::new(),
-                            },
-                        )
-                    })
+            for member in &class.members {
+                let hir::ClassMember::Property(property) = member else {
+                    continue;
+                };
+                if property.is_static {
+                    continue;
                 }
-                hir::ClassMember::Property(_)
-                | hir::ClassMember::Method(_)
-                | hir::ClassMember::Constant(_) => None,
-            })
-        })
-        .collect::<HashMap<_, _>>();
-    let mut constructor_body_initializers = HashSet::new();
-    for class_info in &program.semantic_info.classes {
-        let class = program
-            .items
-            .iter()
-            .find_map(|item| match item {
-                hir::Item::Class(class) if class.name == class_info.declaration_name => Some(class),
-                _ => None,
-            })
-            .expect("specialized class has a declaration");
-        if !class.members.iter().any(|member| {
-            matches!(member, hir::ClassMember::Method(method) if method.name == "__construct")
-        }) {
-            continue;
-        }
-
-        for property in &class_info.properties {
-            if !property.promoted && !property_initializers.contains_key(&property.id) {
-                constructor_body_initializers.insert(property.id);
+                let Some(value) = property.initializer.clone() else {
+                    continue;
+                };
+                let property_id = class_info
+                    .properties
+                    .iter()
+                    .find(|info| info.name == property.name)
+                    .expect("checked hierarchy property has a stable identity")
+                    .id;
+                property_initializers.insert(
+                    property_id,
+                    PropertyInitializer {
+                        class: class_info.id,
+                        expression: value,
+                        type_substitutions: substitutions.clone(),
+                        closure_plans: HashMap::new(),
+                    },
+                );
             }
         }
     }
+    let synthetic_constructors = program
+        .items
+        .iter()
+        .filter_map(|item| {
+            let hir::Item::Class(class) = item else {
+                return None;
+            };
+            if class.members.iter().any(|member| {
+                matches!(member, hir::ClassMember::Method(method) if method.name == "__construct")
+            }) {
+                return None;
+            }
+
+            let mut checked_effects = Vec::new();
+            for initializer in class.members.iter().filter_map(|member| match member {
+                hir::ClassMember::Property(property) if !property.is_static => {
+                    property.initializer.as_ref()
+                }
+                _ => None,
+            }) {
+                for (span, effects) in &program.semantic_info.checked_effect_sites {
+                    if span.source == initializer.span().source
+                        && span.start >= initializer.span().start
+                        && span.end <= initializer.span().end
+                    {
+                        for effect in effects {
+                            if !checked_effects.contains(effect) {
+                                checked_effects.push(effect.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            let effect_profile =
+                crate::checked_effects::CheckedEffectProfile::classify(checked_effects.clone());
+            let span = Span::in_source(class.span.source, class.span.start, class.span.start);
+            Some((
+                class.name.clone(),
+                hir::FunctionDecl {
+                    global_id: None,
+                    source_identity: class.source_identity.clone(),
+                    package: class.package.clone(),
+                    access: hir::MemberAccess::External,
+                    access_span: None,
+                    is_open: false,
+                    open_span: None,
+                    is_override: false,
+                    override_span: None,
+                    writable_this: false,
+                    is_static: false,
+                    name: "__construct".to_string(),
+                    type_params: Vec::new(),
+                    params: Vec::new(),
+                    return_type: None,
+                    throws: None,
+                    checked_effects,
+                    required_checked_effects: effect_profile.required,
+                    ambient_checked_effects: effect_profile.ambient,
+                    test_assertion_checked_effects: effect_profile.test_assertion,
+                    body: hir::Block {
+                        statements: Vec::new(),
+                        span,
+                    },
+                    modifier_prefix_span: span,
+                    span,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
     let mut declarations = Vec::new();
 
     for item in &program.items {
@@ -1407,6 +1528,18 @@ fn lower_program_impl(
                                 class_arguments: &class_info.arguments,
                             });
                         }
+                    }
+                    if let Some((_, constructor)) = synthetic_constructors
+                        .iter()
+                        .find(|(name, _)| name == &class_decl.name)
+                    {
+                        declarations.push(CallableDecl {
+                            function: constructor,
+                            class: Some(class_info.id),
+                            receiver: Some(class_info.id),
+                            class_type_params: &class_decl.type_params,
+                            class_arguments: &class_info.arguments,
+                        });
                     }
                 }
             }
@@ -1455,6 +1588,23 @@ fn lower_program_impl(
 
     let instances =
         collect_callable_instances(program, &declarations, &class_ids, &program.semantic_info)?;
+    let direct_method_ids = instances
+        .iter()
+        .enumerate()
+        .filter(|(_, instance)| {
+            let declaration = declarations[instance.declaration];
+            declaration.class.is_some()
+                && (declaration.function.is_open || declaration.function.is_override)
+        })
+        .enumerate()
+        .map(|(direct_index, (function_index, _))| {
+            (
+                mir::FunctionId(function_index),
+                mir::FunctionId(instances.len() + direct_index),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let first_closure_function_id = instances.len() + direct_method_ids.len();
     let mut signatures = HashMap::new();
     let mut method_signatures = HashMap::new();
     let mut callable_signatures = Vec::new();
@@ -1513,6 +1663,7 @@ fn lower_program_impl(
                 is_entry: main_indices.contains(&instance.declaration),
             },
         )?;
+        signature.direct_id = direct_method_ids.get(&signature.id).copied();
         signature.method_class = declaration.class;
         signature.receiver_mode = declaration.receiver.map(|_| {
             if function.writable_this {
@@ -1542,6 +1693,12 @@ fn lower_program_impl(
         callable_signatures.push(signature);
         instance_substitutions.push(substitutions);
     }
+    propagate_parent_constructor_effects(
+        &program.semantic_info,
+        &class_ids,
+        &mut method_signatures,
+        &mut callable_signatures,
+    );
 
     for ty in program.semantic_info.expression_types.values() {
         let _ = intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
@@ -1578,7 +1735,7 @@ fn lower_program_impl(
             ),
             &mut ClosurePlanBuildContext {
                 containing_name: &containing_name,
-                first_function_id: instances.len(),
+                first_function_id: first_closure_function_id,
                 source: program
                     .source(declaration.function.span.source)
                     .unwrap_or(&source),
@@ -1592,7 +1749,6 @@ fn lower_program_impl(
         )?);
     }
 
-    let mut property_initializers = property_initializers;
     let mut property_ids = property_initializers.keys().copied().collect::<Vec<_>>();
     property_ids.sort();
     for property_id in property_ids {
@@ -1610,7 +1766,7 @@ fn lower_program_impl(
             collect_closure_expressions(None, std::iter::once(&initializer.expression)),
             &mut ClosurePlanBuildContext {
                 containing_name: &containing_name,
-                first_function_id: instances.len(),
+                first_function_id: first_closure_function_id,
                 source: program
                     .source(initializer.expression.span().source)
                     .unwrap_or(&source),
@@ -1652,7 +1808,6 @@ fn lower_program_impl(
             method_signatures: &method_signatures,
             semantic_info: &program.semantic_info,
             property_initializers: &property_initializers,
-            constructor_body_initializers: &constructor_body_initializers,
             static_ids: &static_ids,
             collection_registry: &collection_registry,
             enum_types: &class_ids.enum_types,
@@ -1677,6 +1832,19 @@ fn lower_program_impl(
         )?);
     }
 
+    let mut direct_methods = direct_method_ids.iter().collect::<Vec<_>>();
+    direct_methods.sort_by_key(|(function, _)| function.0);
+    for (function, direct) in direct_methods {
+        let mut implementation = functions
+            .get(function.0)
+            .expect("virtual method implementation exists")
+            .clone();
+        implementation.id = *direct;
+        implementation.name = format!("{}::<direct>", implementation.name);
+        implementation.virtual_slot = None;
+        functions.push(implementation);
+    }
+
     for ((instance, substitutions), closure_plans) in instances
         .iter()
         .zip(&instance_substitutions)
@@ -1693,7 +1861,6 @@ fn lower_program_impl(
                     method_signatures: &method_signatures,
                     semantic_info: &program.semantic_info,
                     property_initializers: &property_initializers,
-                    constructor_body_initializers: &constructor_body_initializers,
                     static_ids: &static_ids,
                     collection_registry: &collection_registry,
                     enum_types: &class_ids.enum_types,
@@ -1724,7 +1891,6 @@ fn lower_program_impl(
                     method_signatures: &method_signatures,
                     semantic_info: &program.semantic_info,
                     property_initializers: &property_initializers,
-                    constructor_body_initializers: &constructor_body_initializers,
                     static_ids: &static_ids,
                     collection_registry: &collection_registry,
                     enum_types: &class_ids.enum_types,
@@ -1738,6 +1904,60 @@ fn lower_program_impl(
                 metrics.as_deref_mut(),
             )?);
         }
+    }
+    let mut virtual_tables = HashMap::<ClassId, Vec<mir::FunctionId>>::new();
+    let mut function_virtual_slots = HashMap::<mir::FunctionId, u32>::new();
+    for class in &program.semantic_info.classes {
+        let mut hierarchy = class.ancestors.iter().rev().collect::<Vec<_>>();
+        let concrete = ClassType::new(class.declaration_name.clone(), class.arguments.clone());
+        hierarchy.push(&concrete);
+        let mut slots = Vec::<(String, mir::FunctionId)>::new();
+        for hierarchy_class in hierarchy {
+            let Some(class_id) = class_ids.get(hierarchy_class).copied() else {
+                continue;
+            };
+            let Some(declaration) = program.items.iter().find_map(|item| match item {
+                hir::Item::Class(declaration) if declaration.name == hierarchy_class.name => {
+                    Some(declaration)
+                }
+                _ => None,
+            }) else {
+                continue;
+            };
+            for member in &declaration.members {
+                let hir::ClassMember::Method(method) = member else {
+                    continue;
+                };
+                if !method.is_open && !method.is_override {
+                    continue;
+                }
+                let Some(function) = functions.iter().find(|function| {
+                    function.method.as_ref().is_some_and(|identity| {
+                        identity.class == class_id && identity.name == method.name
+                    })
+                }) else {
+                    continue;
+                };
+                let slot = if method.is_override {
+                    slots.iter().position(|(name, _)| name == &method.name)
+                } else {
+                    None
+                };
+                let slot = slot.unwrap_or_else(|| {
+                    slots.push((method.name.clone(), function.id));
+                    slots.len() - 1
+                });
+                slots[slot].1 = function.id;
+                function_virtual_slots.insert(function.id, slot as u32);
+            }
+        }
+        virtual_tables.insert(
+            class.id,
+            slots.into_iter().map(|(_, function)| function).collect(),
+        );
+    }
+    for function in &mut functions {
+        function.virtual_slot = function_virtual_slots.get(&function.id).copied();
     }
     let classes = program
         .semantic_info
@@ -1815,6 +2035,14 @@ fn lower_program_impl(
                 id: class.id,
                 name: class.name.clone(),
                 source_span,
+                is_open: class.is_open,
+                parent: class.parent.as_ref().and_then(|parent| class_ids.get(parent)).copied(),
+                ancestors: class
+                    .ancestors
+                    .iter()
+                    .filter_map(|ancestor| class_ids.get(ancestor).copied())
+                    .collect(),
+                virtual_methods: virtual_tables.remove(&class.id).unwrap_or_default(),
                 properties,
                 layout,
                 constructor: lifecycle("__construct"),
@@ -2565,30 +2793,14 @@ fn collect_function_signature(
         };
         let transfer_capable = parameter_type.has_move_ownership();
         let transfers = transfer_capable && param.take;
-        let owns = transfers && param.promoted_access.is_none();
-        let default = if param.default.is_some() {
-            Some(
-                semantic_info
-                    .parameter_defaults
-                    .get(&crate::const_eval::ParameterDefaultKey {
-                        function_start: function.span.start,
-                        parameter_index,
-                    })
-                    .cloned()
-                    .ok_or_else(|| {
-                        vec![Diagnostic::new(
-                            "I2001",
-                            format!(
-                                "checked default for parameter `${}` of `{}` is missing",
-                                param.name, function.name
-                            ),
-                            param.span,
-                        )]
-                    })?,
-            )
-        } else {
-            None
-        };
+        let owns = transfers;
+        let default = semantic_info
+            .parameter_defaults
+            .get(&crate::const_eval::ParameterDefaultKey {
+                function_start: function.span.start,
+                parameter_index,
+            })
+            .cloned();
         parameter_types.push(parameter_type);
         parameter_defaults.push(default);
         parameter_modes.push(if transfers {
@@ -2603,6 +2815,7 @@ fn collect_function_signature(
 
     Ok(FunctionSignature {
         id,
+        direct_id: None,
         return_type,
         return_borrow: semantic_info
             .return_borrows
@@ -2909,8 +3122,28 @@ fn field_type(ty: mir::Type, semantic_info: &SemanticInfo) -> Option<FieldType> 
         mir::Type::NullableString => Some(FieldType::NullableString),
         mir::Type::NullableMixed => Some(FieldType::NullableMixed),
         mir::Type::NullableError => Some(FieldType::NullableError),
-        mir::Type::Class(class) => Some(FieldType::Class(class)),
-        mir::Type::NullableClass(class) => Some(FieldType::NullableClass(class)),
+        mir::Type::Class(class) => Some(
+            if semantic_info
+                .classes
+                .get(class.0)
+                .is_some_and(|definition| definition.is_open)
+            {
+                FieldType::OpenClass(class)
+            } else {
+                FieldType::Class(class)
+            },
+        ),
+        mir::Type::NullableClass(class) => Some(
+            if semantic_info
+                .classes
+                .get(class.0)
+                .is_some_and(|definition| definition.is_open)
+            {
+                FieldType::NullableOpenClass(class)
+            } else {
+                FieldType::NullableClass(class)
+            },
+        ),
         mir::Type::SharedReference(class) => Some(FieldType::SharedReference(class)),
         mir::Type::WeakReference(class) => Some(FieldType::WeakReference(class)),
         mir::Type::NullableSharedReference(class) => {
@@ -2994,7 +3227,6 @@ struct FunctionLoweringInputs<'a> {
     method_signatures: &'a HashMap<MethodInstanceKey, FunctionSignature>,
     semantic_info: &'a SemanticInfo,
     property_initializers: &'a HashMap<crate::class_layout::PropertyId, PropertyInitializer>,
-    constructor_body_initializers: &'a HashSet<crate::class_layout::PropertyId>,
     static_ids: &'a HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: &'a CollectionRegistry,
     enum_types: &'a HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
@@ -3016,6 +3248,8 @@ fn lower_function(
 ) -> DiagnosticResult<mir::Function> {
     let mut context = LoweringContext::new(&inputs);
     context.current_class = class;
+    context.lifecycle_phase =
+        class.is_some() && matches!(function.name.as_str(), "__construct" | "__destruct");
     context.return_borrow = signature.return_borrow;
     let mut params = Vec::new();
     if let Some(class) = receiver {
@@ -3056,12 +3290,16 @@ fn lower_function(
         lower_statement_sequence(entry_prelude, signature.return_type, &mut context)?;
         context.push_scope();
     }
-    lower_function_body(
-        &function.body,
-        &function.name,
-        signature.return_type,
-        &mut context,
-    )?;
+    if function.name == "__construct" {
+        lower_constructor_function_body(function, signature.return_type, &mut context)?;
+    } else {
+        lower_function_body(
+            &function.body,
+            &function.name,
+            signature.return_type,
+            &mut context,
+        )?;
+    }
     if !signature.checked_effects.is_empty() {
         context.pop_error_target();
     }
@@ -3075,6 +3313,7 @@ fn lower_function(
             class,
             name: function.name.clone(),
         }),
+        virtual_slot: None,
         receiver_mode: receiver.map(|_| {
             if function.writable_this {
                 mir::ReceiverMode::Writable
@@ -3251,6 +3490,7 @@ fn lower_closure_function(
         name: format!("__doria_closure_{}", plan.descriptor.0),
         source_span: plan.expression.span,
         method: None,
+        virtual_slot: None,
         receiver_mode: None,
         closure: Some(mir::ClosureFunction {
             descriptor: plan.descriptor,
@@ -3323,6 +3563,173 @@ fn lower_function_body(
         }
     }
 
+    Ok(())
+}
+
+fn lower_constructor_function_body(
+    function: &hir::FunctionDecl,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let class = context
+        .current_class
+        .expect("constructor belongs to a class");
+    let parent = context
+        .class_info(class)
+        .and_then(|info| info.parent.clone());
+    let mut remaining = function.body.statements.as_slice();
+
+    if let Some(parent) = parent {
+        let parent = context.class_id_for_type(&parent).ok_or_else(|| {
+            vec![unsupported(
+                function.span,
+                "constructor parent has no concrete MIR class identity",
+            )]
+        })?;
+        if remaining
+            .first()
+            .is_some_and(|statement| is_parent_constructor_statement(statement, context))
+        {
+            lower_statement_sequence(&remaining[..1], return_type, context)?;
+            remaining = &remaining[1..];
+        } else if let Some(signature) = context.lookup_lifecycle(parent, "__construct") {
+            let mut args = lower_call_args_with_ownership(
+                "__construct",
+                &[],
+                signature.clone(),
+                function.span,
+                context,
+            )?;
+            let receiver = context.lookup_local("this", function.span)?;
+            args.insert(
+                0,
+                mir::Rvalue::Class(mir::ClassExpression::Local {
+                    class: parent,
+                    local: receiver,
+                    transfer: false,
+                }),
+            );
+            if signature.checked_effects.is_empty() {
+                context.push_statement(mir::Statement::CallVoid {
+                    function: signature.id,
+                    args,
+                    span: function.span,
+                });
+            } else {
+                lower_with_statement_temporaries(context, |context| {
+                    let _ = materialize_checked_signature_call(
+                        signature,
+                        args,
+                        function.span,
+                        false,
+                        context,
+                    )?;
+                    Ok(())
+                })?;
+            }
+        }
+    }
+
+    lower_constructor_phase_initializers(class, function.span, context)?;
+    lower_statement_sequence(remaining, return_type, context)?;
+    finish_function_fallthrough(&function.body, &function.name, return_type, context)
+}
+
+fn is_parent_constructor_statement(statement: &hir::Stmt, context: &LoweringContext) -> bool {
+    let hir::Stmt::Expr {
+        expr: hir::Expr::StaticCall { method, span, .. },
+        ..
+    } = statement
+    else {
+        return false;
+    };
+    method == "__construct" && context.call_target_is_direct_parent(*span)
+}
+
+fn lower_constructor_phase_initializers(
+    class: ClassId,
+    span: Span,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    let class_info = context
+        .class_info(class)
+        .expect("constructor class has semantic metadata")
+        .clone();
+    let own_properties = class_info
+        .properties
+        .iter()
+        .filter(|property| property.declaring_class == class_info.declaration_name)
+        .cloned()
+        .collect::<Vec<_>>();
+    let receiver = context.lookup_local("this", span)?;
+
+    for property in own_properties {
+        if !property.promoted && !context.property_initializers.contains_key(&property.id) {
+            continue;
+        }
+        lower_with_statement_temporaries(context, |context| {
+            let property_type = context.mir_resolved_type(&property.ty).ok_or_else(|| {
+                vec![unsupported(
+                    span,
+                    format!("property `${}` is not native-lowerable", property.name),
+                )]
+            })?;
+            let value = if property.promoted {
+                let parameter = context.lookup_local(&property.name, span)?;
+                read_local_as_rvalue(parameter, property_type, true)
+            } else {
+                let initializer = context
+                    .property_initializers
+                    .get(&property.id)
+                    .expect("initializer presence was checked")
+                    .clone();
+                let caller_substitutions = std::mem::replace(
+                    &mut context.type_substitutions,
+                    initializer.type_substitutions,
+                );
+                let caller_closure_plans =
+                    std::mem::replace(&mut context.closure_plans, initializer.closure_plans);
+                let value =
+                    lower_rvalue_as_expected(&initializer.expression, property_type, context);
+                context.closure_plans = caller_closure_plans;
+                context.type_substitutions = caller_substitutions;
+                value?
+            };
+            context.push_statement(mir::Statement::AssignProperty {
+                object: receiver,
+                property: property.id,
+                value,
+                kind: mir::PropertyWriteKind::Initialize,
+                span,
+            });
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+fn finish_function_fallthrough(
+    body: &hir::Block,
+    function_name: &str,
+    return_type: mir::ReturnType,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<()> {
+    if let Some(block) = context.current_block {
+        if !context.is_reachable(block) {
+            context.terminate_current(mir::Terminator::Unreachable);
+        } else if return_type == mir::ReturnType::Void {
+            context.cleanup_scopes_from(0);
+            context.terminate_current(mir::Terminator::ReturnVoid);
+        } else {
+            return Err(vec![Diagnostic::new(
+                "I1101",
+                format!(
+                    "internal compiler consistency error: checked int function `{function_name}` reaches MIR fallthrough"
+                ),
+                body.span,
+            )]);
+        }
+    }
     Ok(())
 }
 
@@ -3561,17 +3968,18 @@ fn lower_try_statement(
         match context.mir_resolved_type(&clause.error_type) {
             Some(mir::Type::Error) => catch_all = Some(entry),
             Some(mir::Type::Class(class)) => {
-                let descriptor = context
-                    .error_descriptor_ids
-                    .get(&class)
-                    .copied()
-                    .ok_or_else(|| {
-                        vec![unsupported(
-                            clause.span,
-                            "checked catch class has no runtime Error descriptor",
-                        )]
-                    })?;
-                cases.push((descriptor, entry));
+                let covered = context.error_descriptors_covered_by(class);
+                if covered.is_empty() {
+                    return Err(vec![unsupported(
+                        clause.span,
+                        "checked catch class has no runtime Error descriptor",
+                    )]);
+                }
+                for descriptor in covered {
+                    if !cases.iter().any(|(existing, _)| *existing == descriptor) {
+                        cases.push((descriptor, entry));
+                    }
+                }
             }
             _ => {
                 return Err(vec![unsupported(
@@ -3723,6 +4131,7 @@ fn lower_expression_statement(
         method,
         args,
         span: call_span,
+        ..
     } = expr
     {
         let (signature, args) =
@@ -4103,6 +4512,7 @@ fn lower_assertion_statement(
         value: mir::Rvalue::Error(mir::ErrorExpression::FromClass {
             object: Box::new(mir::ClassExpression::New {
                 class: error_class,
+                concrete_class: error_class,
                 properties,
                 constructor: Some(constructor.id),
                 args,
@@ -4429,11 +4839,15 @@ fn lower_caught_throw_assertion(
                         assertion.span,
                     )]
                 })?;
+            let covered = context.error_descriptors_covered_by(class);
             let matching = context.create_block();
             let wrong = context.create_block();
             context.terminate_current(mir::Terminator::ErrorSwitch {
                 error: caught,
-                cases: vec![(descriptor, matching)],
+                cases: covered
+                    .into_iter()
+                    .map(|descriptor| (descriptor, matching))
+                    .collect(),
                 catch_all: None,
                 fallback: wrong,
             });
@@ -6960,7 +7374,6 @@ struct LoweringContext<'semantic> {
     method_signatures: HashMap<MethodInstanceKey, FunctionSignature>,
     semantic_info: &'semantic SemanticInfo,
     property_initializers: HashMap<crate::class_layout::PropertyId, PropertyInitializer>,
-    constructor_body_initializers: HashSet<crate::class_layout::PropertyId>,
     static_ids: HashMap<(ClassId, String), (mir::StaticId, mir::Type)>,
     collection_registry: CollectionRegistry,
     enum_types: HashMap<crate::enums::EnumId, mir::PayloadEnumType>,
@@ -6969,6 +7382,7 @@ struct LoweringContext<'semantic> {
     error_origin_ids: HashMap<Span, mir::ErrorOriginId>,
     closure_plans: HashMap<crate::symbols::ClosureId, ClosureLoweringPlan>,
     current_class: Option<ClassId>,
+    lifecycle_phase: bool,
     locals: Vec<mir::Local>,
     replaceable_writable_parameters: HashSet<mir::LocalId>,
     local_scopes: Vec<HashMap<String, mir::LocalId>>,
@@ -7106,7 +7520,6 @@ impl<'semantic> LoweringContext<'semantic> {
             method_signatures: inputs.method_signatures.clone(),
             semantic_info: inputs.semantic_info,
             property_initializers: inputs.property_initializers.clone(),
-            constructor_body_initializers: inputs.constructor_body_initializers.clone(),
             static_ids: inputs.static_ids.clone(),
             collection_registry: inputs.collection_registry.clone(),
             enum_types: inputs.enum_types.clone(),
@@ -7115,6 +7528,7 @@ impl<'semantic> LoweringContext<'semantic> {
             error_origin_ids: inputs.error_origin_ids.clone(),
             closure_plans: inputs.closure_plans.clone(),
             current_class: None,
+            lifecycle_phase: false,
             locals: Vec::new(),
             replaceable_writable_parameters: HashSet::new(),
             local_scopes: vec![HashMap::new()],
@@ -7138,6 +7552,28 @@ impl<'semantic> LoweringContext<'semantic> {
             error_targets: Vec::new(),
             return_borrow: None,
         }
+    }
+
+    fn error_descriptors_covered_by(&self, target: ClassId) -> Vec<mir::ErrorDescriptorId> {
+        let mut covered = self
+            .semantic_info
+            .classes
+            .iter()
+            .filter(|candidate| {
+                candidate.id == target
+                    || candidate.ancestors.iter().any(|ancestor| {
+                        self.semantic_info
+                            .classes
+                            .iter()
+                            .find(|known| known.declaration_name == ancestor.name)
+                            .is_some_and(|ancestor| ancestor.id == target)
+                    })
+            })
+            .filter_map(|candidate| self.error_descriptor_ids.get(&candidate.id).copied())
+            .collect::<Vec<_>>();
+        covered.sort_by_key(|descriptor| descriptor.0);
+        covered.dedup();
+        covered
     }
 
     fn finish(
@@ -8008,11 +8444,35 @@ impl<'semantic> LoweringContext<'semantic> {
         self.class_id_for_type(&class_type)
     }
 
+    fn call_target_is_direct_parent(&self, span: Span) -> bool {
+        matches!(
+            self.semantic_info.call_targets.get(&span),
+            Some(CallableTarget::Method {
+                direct_parent: true,
+                ..
+            })
+        )
+    }
+
     fn class_info(&self, id: ClassId) -> Option<&crate::semantics::ClassSemanticInfo> {
         self.semantic_info
             .classes
             .iter()
             .find(|class| class.id == id)
+    }
+
+    fn class_is_subtype(&self, value: ClassId, target: ClassId) -> bool {
+        if value == target {
+            return true;
+        }
+        let Some(target) = self.class_info(target) else {
+            return false;
+        };
+        self.class_info(value).is_some_and(|class| {
+            class.ancestors.iter().any(|ancestor| {
+                ancestor.name == target.declaration_name && ancestor.arguments == target.arguments
+            })
+        })
     }
 
     fn collection_type(&self, id: mir::CollectionTypeId) -> &mir::CollectionType {
@@ -8072,9 +8532,16 @@ impl<'semantic> LoweringContext<'semantic> {
                 crate::const_eval::ConstKey::TopLevel(name.clone())
             }
             hir::Expr::StaticMember {
-                class_name, member, ..
+                class_name,
+                member,
+                span,
             } => crate::const_eval::ConstKey::Class {
-                class_name: class_name.clone(),
+                class_name: self
+                    .semantic_info
+                    .static_member_targets
+                    .get(span)
+                    .unwrap_or(class_name)
+                    .clone(),
                 name: member.clone(),
             },
             hir::Expr::Grouped { expr, .. } => return self.constant_decl(expr),
@@ -8109,6 +8576,12 @@ impl<'semantic> LoweringContext<'semantic> {
         member: &str,
         span: Span,
     ) -> DiagnosticResult<(mir::StaticId, mir::Type)> {
+        let class_name = self
+            .semantic_info
+            .static_member_targets
+            .get(&span)
+            .map(String::as_str)
+            .unwrap_or(class_name);
         let class = self
             .class_id_for_static_access(class_name)
             .ok_or_else(|| vec![unsupported(span, format!("unknown class `{class_name}`"))])?;
@@ -8256,6 +8729,25 @@ impl<'semantic> LoweringContext<'semantic> {
             return None;
         };
         self.native_type_ref(type_ref).map(|ty| (local, ty))
+    }
+
+    fn narrowed_class_local(&self, expr: &hir::Expr) -> Option<(mir::LocalId, ClassId)> {
+        let hir::Expr::Variable { name, span } = unparenthesized_place(expr) else {
+            return None;
+        };
+        let local = self.lookup_local(name, *span).ok()?;
+        let source = match self.local_type(local) {
+            mir::Type::Class(class) | mir::Type::NullableClass(class) => class,
+            _ => return None,
+        };
+        let crate::narrowing::Fact::Exact(type_ref) = self.flow_fact(expr)? else {
+            return None;
+        };
+        let mir::Type::Class(narrowed) = self.native_type_ref(type_ref)? else {
+            return None;
+        };
+        self.class_is_subtype(narrowed, source)
+            .then_some((local, narrowed))
     }
 
     fn coalesce_selection(&self, left: &hir::Expr) -> CoalesceSelection {
@@ -9171,6 +9663,7 @@ fn is_string_local_initializer(expr: &hir::Expr, context: &mut LoweringContext) 
             class_name,
             member,
             span,
+            ..
         } => context
             .static_property(class_name, member, *span)
             .is_ok_and(|(_, ty)| ty == mir::Type::String),
@@ -9361,6 +9854,7 @@ fn lower_scalar_place(
             class_name,
             member,
             span,
+            ..
         } => {
             let (id, ty) = context.static_property(class_name, member, *span)?;
             let mir::Type::Scalar(scalar) = ty else {
@@ -9432,6 +9926,7 @@ fn lower_assignment(
         class_name,
         member,
         span,
+        ..
     } = target
     {
         let (target, ty) = context.static_property(class_name, member, *span)?;
@@ -9741,6 +10236,7 @@ fn lower_string_expression(
             class_name,
             member,
             span,
+            ..
         } => {
             let (id, ty) = context.static_property(class_name, member, *span)?;
             if ty != mir::Type::String {
@@ -9829,6 +10325,7 @@ fn lower_string_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -9984,6 +10481,7 @@ fn lower_nullable_string_expression(
             class_name,
             member,
             span,
+            ..
         } => {
             let (id, ty) = context.static_property(class_name, member, *span)?;
             match ty {
@@ -10128,6 +10626,7 @@ fn lower_nullable_string_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -10230,6 +10729,7 @@ fn lower_nullable_scalar_expression(
         method,
         args,
         span,
+        ..
     } = unparenthesized_place(expr)
     {
         if method == "parse" {
@@ -10359,6 +10859,7 @@ fn lower_nullable_scalar_expression(
             class_name,
             member,
             span,
+            ..
         } => {
             if let mir::ScalarType::Enum(enum_id) = expected {
                 if let Some(value) = context.enum_case_value(class_name, member) {
@@ -10489,6 +10990,7 @@ fn lower_nullable_scalar_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -10660,7 +11162,7 @@ fn lower_nullable_class_expression(
                         }),
                     }
                 }
-                mir::Type::Class(class) if class == expected => {
+                mir::Type::Class(class) if context.class_is_subtype(class, expected) => {
                     Ok(mir::NullableClassExpression::Class(lower_class_expression(
                         expr, expected, transfer, context,
                     )?))
@@ -10864,6 +11366,7 @@ fn lower_nullable_class_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -11834,6 +12337,7 @@ fn lower_string_intrinsic_call(
             method,
             args,
             span,
+            ..
         } if class_name == "String" => {
             let kind = match method.as_str() {
                 "trim" => mir::StringIntrinsicKind::Trim,
@@ -12109,6 +12613,7 @@ fn string_intrinsic_signature(
     let count = parameters.len();
     Ok(FunctionSignature {
         id: mir::FunctionId(usize::MAX),
+        direct_id: None,
         return_type: mir::ReturnType::Value(result),
         return_borrow: None,
         parameter_types: parameters,
@@ -12175,13 +12680,14 @@ fn lower_instance_method_call(
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<(FunctionSignature, Vec<mir::Rvalue>)> {
-    let class = inferred_class_type(object, context).ok_or_else(|| {
+    let receiver_class = inferred_class_type(object, context).ok_or_else(|| {
         vec![unsupported(
             object.span(),
             "method receiver does not have a concrete native class type",
         )]
     })?;
-    let signature = context.lookup_method(class, method, span)?;
+    let class = context.call_target_class_id(span).unwrap_or(receiver_class);
+    let mut signature = context.lookup_method(class, method, span)?;
     if signature.receiver_mode.is_none() {
         return Err(vec![unsupported(
             span,
@@ -12197,6 +12703,11 @@ fn lower_instance_method_call(
         0,
         mir::Rvalue::Class(lower_class_expression(object, class, false, context)?),
     );
+    if context.lifecycle_phase && matches!(unparenthesized_place(object), hir::Expr::This { .. }) {
+        if let Some(direct) = signature.direct_id {
+            signature.id = direct;
+        }
+    }
     Ok((signature, lowered))
 }
 
@@ -12211,14 +12722,30 @@ fn lower_static_method_call(
         .call_target_class_id(span)
         .or_else(|| context.class_id_for_name(class_name))
         .ok_or_else(|| vec![unsupported(span, format!("unknown class `{class_name}`"))])?;
-    let signature = context.lookup_method(class, method, span)?;
+    let mut signature = context.lookup_method(class, method, span)?;
+    let direct_parent = context.call_target_is_direct_parent(span);
+    let mut lowered =
+        lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
     if signature.receiver_mode.is_some() {
-        return Err(vec![unsupported(
-            span,
-            format!("instance method `{class_name}::{method}` requires a receiver"),
-        )]);
+        if !direct_parent {
+            return Err(vec![unsupported(
+                span,
+                format!("instance method `{class_name}::{method}` requires a receiver"),
+            )]);
+        }
+        let receiver = context.lookup_local("this", span)?;
+        lowered.insert(
+            0,
+            mir::Rvalue::Class(mir::ClassExpression::Local {
+                class,
+                local: receiver,
+                transfer: false,
+            }),
+        );
+        if let Some(direct) = signature.direct_id {
+            signature.id = direct;
+        }
     }
-    let lowered = lower_call_args_with_ownership(method, args, signature.clone(), span, context)?;
     Ok((signature, lowered))
 }
 
@@ -12711,6 +13238,7 @@ fn lower_coalesce_rvalue(
             expected,
             result_transfer,
             left.span(),
+            context,
         )?
     };
     let present_value =
@@ -13225,6 +13753,42 @@ fn lower_match_pattern_to_blocks(
                     }),
                     tag: mixed_tag_for_type(narrowed, match_pattern_span(pattern))?,
                 },
+                mir::Type::Class(source) => {
+                    let mir::Type::Class(target) = narrowed else {
+                        return Err(vec![Diagnostic::new(
+                            "I2801",
+                            "class match pattern resolved to a non-class type",
+                            match_pattern_span(pattern),
+                        )]);
+                    };
+                    mir::BoolExpression::ClassIs {
+                        value: Box::new(mir::NullableClassExpression::Class(
+                            mir::ClassExpression::Local {
+                                class: source,
+                                local: scrutinee,
+                                transfer: false,
+                            },
+                        )),
+                        target,
+                    }
+                }
+                mir::Type::NullableClass(source) => {
+                    let mir::Type::Class(target) = narrowed else {
+                        return Err(vec![Diagnostic::new(
+                            "I2801",
+                            "nullable-class match pattern resolved to a non-class type",
+                            match_pattern_span(pattern),
+                        )]);
+                    };
+                    mir::BoolExpression::ClassIs {
+                        value: Box::new(mir::NullableClassExpression::Local {
+                            class: source,
+                            local: scrutinee,
+                            transfer: false,
+                        }),
+                        target,
+                    }
+                }
                 _ => match_presence_condition(scrutinee, scrutinee_type)?,
             };
             context.terminate_condition(condition, arm_block, next_block);
@@ -13557,8 +14121,14 @@ fn bind_match_arm(
             let cleanup = !matches!(mode, mir::MatchBindingMode::GuardView)
                 && (owned || matches!(ty, mir::Type::String | mir::Type::NullableString));
             let target = context.declare_pattern_local(&binding.name, ty, owned, cleanup);
-            let value =
-                narrowed_match_local_rvalue(scrutinee, scrutinee_type, ty, transfer, binding.span)?;
+            let value = narrowed_match_local_rvalue(
+                scrutinee,
+                scrutinee_type,
+                ty,
+                transfer,
+                binding.span,
+                context,
+            )?;
             context.push_statement(mir::Statement::AssignLocal { target, value });
         }
         _ => {}
@@ -13572,6 +14142,7 @@ fn narrowed_match_local_rvalue(
     narrowed: mir::Type,
     transfer: bool,
     span: Span,
+    context: &LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
     let value = match (source, narrowed) {
         (mir::Type::NullableScalar(source), mir::Type::Scalar(target)) if source == target => {
@@ -13583,8 +14154,19 @@ fn narrowed_match_local_rvalue(
         (mir::Type::NullableString, mir::Type::String) => {
             mir::Rvalue::String(mir::StringExpression::NullableLocalAssumeNonNull(local))
         }
-        (mir::Type::NullableClass(source), mir::Type::Class(target)) if source == target => {
+        (mir::Type::NullableClass(source), mir::Type::Class(target))
+            if context.class_is_subtype(target, source) =>
+        {
             mir::Rvalue::Class(mir::ClassExpression::NullableLocalAssumeNonNull {
+                class: target,
+                local,
+                transfer,
+            })
+        }
+        (mir::Type::Class(source), mir::Type::Class(target))
+            if context.class_is_subtype(target, source) =>
+        {
+            mir::Rvalue::Class(mir::ClassExpression::Local {
                 class: target,
                 local,
                 transfer,
@@ -14039,6 +14621,7 @@ fn lower_condition(
             class_name,
             member,
             span,
+            ..
         } => {
             let (id, ty) = context.static_property(class_name, member, *span)?;
             if ty != mir::Type::Scalar(mir::ScalarType::Bool) {
@@ -14291,6 +14874,7 @@ fn lower_condition(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -14468,6 +15052,32 @@ fn lower_is_condition(
     }
     let value_type = context.expression_type(expr)?;
     let result = match value_type {
+        mir::Type::NullableClass(class) => {
+            let mir::Type::Class(target) = tested_type else {
+                return Ok(evaluate_then_false(
+                    mir::BoolExpression::NullableClassIsPresent(Box::new(
+                        lower_nullable_class_presence_subject(expr, class, context)?,
+                    )),
+                ));
+            };
+            mir::BoolExpression::ClassIs {
+                value: Box::new(lower_nullable_class_presence_subject(expr, class, context)?),
+                target,
+            }
+        }
+        mir::Type::Class(class) => {
+            let mir::Type::Class(target) = tested_type else {
+                return Ok(mir::BoolExpression::Not(Box::new(
+                    lower_concrete_is_presence(expr, value_type, context)?,
+                )));
+            };
+            mir::BoolExpression::ClassIs {
+                value: Box::new(mir::NullableClassExpression::Class(lower_class_expression(
+                    expr, class, false, context,
+                )?)),
+                target,
+            }
+        }
         mir::Type::NullableScalar(ty) if tested_type == mir::Type::Scalar(ty) => {
             mir::BoolExpression::NullableScalarIsPresent(Box::new(
                 lower_nullable_scalar_presence_subject(expr, ty, context)?,
@@ -14479,11 +15089,6 @@ fn lower_is_condition(
                 left: Box::new(lower_nullable_string_presence_subject(expr, context)?),
                 right: Box::new(mir::NullableStringExpression::Null),
             }))
-        }
-        mir::Type::NullableClass(class) if tested_type == mir::Type::Class(class) => {
-            mir::BoolExpression::NullableClassIsPresent(Box::new(
-                lower_nullable_class_presence_subject(expr, class, context)?,
-            ))
         }
         mir::Type::NullableError if tested_type == mir::Type::Error => {
             mir::BoolExpression::NullableErrorIsPresent(Box::new(lower_nullable_error_expression(
@@ -14590,11 +15195,7 @@ fn lower_is_condition(
                 evaluate_then_false(present)
             }
         }
-        mir::Type::Scalar(_)
-        | mir::Type::String
-        | mir::Type::Class(_)
-        | mir::Type::Error
-        | mir::Type::Function(_) => {
+        mir::Type::Scalar(_) | mir::Type::String | mir::Type::Error | mir::Type::Function(_) => {
             let evaluated = lower_concrete_is_presence(expr, value_type, context)?;
             if value_type == tested_type {
                 evaluated
@@ -14614,11 +15215,6 @@ fn lower_is_condition(
                 right: Box::new(mir::NullableStringExpression::Null),
             },
         ))),
-        mir::Type::NullableClass(class) => {
-            evaluate_then_false(mir::BoolExpression::NullableClassIsPresent(Box::new(
-                lower_nullable_class_presence_subject(expr, class, context)?,
-            )))
-        }
         mir::Type::NullableError => {
             evaluate_then_false(mir::BoolExpression::NullableErrorIsPresent(Box::new(
                 lower_nullable_error_expression(expr, false, context)?,
@@ -15155,6 +15751,7 @@ fn lower_enum_expression(
             class_name,
             member,
             span,
+            ..
         } => {
             if let Some(value) = context.enum_case_value(class_name, member) {
                 if value.enum_id != enum_id {
@@ -15225,6 +15822,7 @@ fn lower_enum_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -15433,6 +16031,7 @@ fn lower_error_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -15613,6 +16212,7 @@ fn lower_nullable_error_expression(
                 method,
                 args,
                 span,
+                ..
             } => {
                 let (signature, args) =
                     lower_static_method_call(class_name, method, args, *span, context)?;
@@ -15835,6 +16435,7 @@ fn lower_function_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -16027,6 +16628,7 @@ fn lower_nullable_function_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -16409,6 +17011,7 @@ fn materialize_checked_call(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, lowered) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -17606,6 +18209,7 @@ fn lower_payload_enum_expression(
                 .collect::<DiagnosticResult<Vec<_>>>()?;
             let signature = FunctionSignature {
                 id: mir::FunctionId(usize::MAX),
+                direct_id: None,
                 return_type: mir::ReturnType::Value(mir::Type::PayloadEnum(ty)),
                 return_borrow: None,
                 parameter_names: case_definition
@@ -17683,6 +18287,7 @@ fn lower_payload_enum_expression(
         method,
         args,
         span,
+        ..
     } = expr
     {
         let (signature, args) = lower_static_method_call(class_name, method, args, *span, context)?;
@@ -17890,6 +18495,7 @@ fn lower_nullable_payload_enum_expression(
         method,
         args,
         span,
+        ..
     } = expr
     {
         let (signature, args) = lower_static_method_call(class_name, method, args, *span, context)?;
@@ -18033,6 +18639,7 @@ fn lower_mixed_expression(
         method,
         args,
         span,
+        ..
     } = expr
     {
         let (signature, args) = lower_static_method_call(class_name, method, args, *span, context)?;
@@ -18402,6 +19009,7 @@ fn lower_collection_expression(
             method,
             args,
             span,
+            ..
         } if class_name == "Bytes" && method == "fromArray" => {
             let [source] = argument_values(args)[..] else {
                 return Err(vec![unsupported(
@@ -18473,6 +19081,7 @@ fn lower_collection_expression(
             method,
             args,
             span,
+            ..
         } if !(matches!(
             class_name.as_str(),
             "Set" | "SortedDictionary" | "SortedSet" | "PriorityQueue" | "Deque"
@@ -18620,6 +19229,7 @@ fn lower_collection_expression(
             method,
             args,
             span,
+            ..
         } if matches!(
             class_name.as_str(),
             "Set" | "SortedDictionary" | "SortedSet" | "PriorityQueue" | "Deque"
@@ -20514,7 +21124,7 @@ fn lower_class_expression(
         hir::Expr::Variable { name, span } => {
             let local = context.lookup_local(name, *span)?;
             match context.local_type(local) {
-                mir::Type::Class(class) if class == expected => {
+                mir::Type::Class(class) if context.class_is_subtype(class, expected) => {
                     if transfer && !context.local_owns(local) {
                         return Err(vec![unsupported(
                             *span,
@@ -20527,7 +21137,43 @@ fn lower_class_expression(
                         transfer,
                     })
                 }
-                mir::Type::NullableClass(class) if class == expected => {
+                mir::Type::NullableClass(class) if context.class_is_subtype(class, expected) => {
+                    if transfer && !context.local_owns(local) {
+                        return Err(vec![unsupported(
+                            *span,
+                            format!("borrowed nullable class local `${name}` cannot be given away"),
+                        )]);
+                    }
+                    Ok(mir::ClassExpression::NullableLocalAssumeNonNull {
+                        class: expected,
+                        local,
+                        transfer,
+                    })
+                }
+                mir::Type::Class(source)
+                    if context.class_is_subtype(expected, source)
+                        && context.narrowed_class_local(expr).is_some_and(
+                            |(_, narrowed)| context.class_is_subtype(narrowed, expected),
+                        ) =>
+                {
+                    if transfer && !context.local_owns(local) {
+                        return Err(vec![unsupported(
+                            *span,
+                            format!("borrowed class local `${name}` cannot be given away"),
+                        )]);
+                    }
+                    Ok(mir::ClassExpression::Local {
+                        class: expected,
+                        local,
+                        transfer,
+                    })
+                }
+                mir::Type::NullableClass(source)
+                    if context.class_is_subtype(expected, source)
+                        && context.narrowed_class_local(expr).is_some_and(
+                            |(_, narrowed)| context.class_is_subtype(narrowed, expected),
+                        ) =>
+                {
                     if transfer && !context.local_owns(local) {
                         return Err(vec![unsupported(
                             *span,
@@ -20543,7 +21189,9 @@ fn lower_class_expression(
                 mir::Type::Mixed | mir::Type::NullableMixed
                     if context
                         .exact_mixed_local(expr)
-                        .is_some_and(|(_, narrowed)| narrowed == mir::Type::Class(expected)) =>
+                        .is_some_and(|(_, narrowed)| {
+                            matches!(narrowed, mir::Type::Class(class) if context.class_is_subtype(class, expected))
+                        }) =>
                 {
                     Ok(mir::ClassExpression::MixedPayload {
                         class: expected,
@@ -20553,7 +21201,34 @@ fn lower_class_expression(
                 }
                 _ => Err(vec![unsupported(
                     *span,
-                    format!("local `${name}` does not have the expected class type"),
+                    format!(
+                        "local `${name}` with MIR type `{}` does not have expected class#{} {:?} (known ancestors: {:?})",
+                        context.local_type(local),
+                        expected.0,
+                        context.class_info(expected).map(|info| (&info.declaration_name, &info.arguments)),
+                        match context.local_type(local) {
+                            mir::Type::Class(class) | mir::Type::NullableClass(class) => context
+                                .class_info(class)
+                                .map(|info| {
+                                    info.ancestors
+                                        .iter()
+                                        .map(|ancestor| {
+                                            (
+                                                &ancestor.name,
+                                                context.class_info(expected).map(|target| {
+                                                    ancestor.name == target.declaration_name
+                                                }),
+                                                &ancestor.arguments,
+                                                context.class_info(expected).map(|target| {
+                                                    ancestor.arguments == target.arguments
+                                                }),
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                }),
+                            _ => None,
+                        }
+                    ),
                 )]),
             }
         }
@@ -20562,7 +21237,13 @@ fn lower_class_expression(
                 return Err(vec![unsupported(*span, "`$this` cannot be given away")]);
             }
             let local = context.lookup_local("this", *span)?;
-            if context.local_type(local) != mir::Type::Class(expected) {
+            let mir::Type::Class(actual) = context.local_type(local) else {
+                return Err(vec![unsupported(
+                    *span,
+                    "`$this` does not have a class type",
+                )]);
+            };
+            if !context.class_is_subtype(actual, expected) {
                 return Err(vec![unsupported(
                     *span,
                     "`$this` does not have the expected class type",
@@ -20598,7 +21279,13 @@ fn lower_class_expression(
                 )]);
             }
             let (object, property, property_type) = lower_property_place(expr, context)?;
-            if property_type != mir::Type::Class(expected) {
+            let mir::Type::Class(actual) = property_type else {
+                return Err(vec![unsupported(
+                    *span,
+                    "class property does not have the expected class type",
+                )]);
+            };
+            if !context.class_is_subtype(actual, expected) {
                 return Err(vec![unsupported(
                     *span,
                     "class property does not have the expected class type",
@@ -20657,7 +21344,7 @@ fn lower_class_expression(
                     format!("`{class_type}` is not a native class type"),
                 )]);
             };
-            if class != expected {
+            if !context.class_is_subtype(class, expected) {
                 return Err(vec![unsupported(
                     *span,
                     format!("constructor for `{class_name}` does not produce expected class"),
@@ -20706,13 +21393,14 @@ fn lower_class_expression(
                 context.current_block = Some(success);
                 context.track_statement_owned_local(result, mir::Type::Class(class));
                 return Ok(mir::ClassExpression::Local {
-                    class,
+                    class: expected,
                     local: result,
                     transfer,
                 });
             }
             Ok(mir::ClassExpression::New {
-                class,
+                class: expected,
+                concrete_class: class,
                 properties,
                 constructor: constructor.map(|signature| signature.id),
                 args: constructor_args,
@@ -20720,7 +21408,13 @@ fn lower_class_expression(
         }
         hir::Expr::FunctionCall { name, args, span } => {
             let signature = context.lookup_function(name, *span)?;
-            if signature.return_type != mir::ReturnType::Value(mir::Type::Class(expected)) {
+            let mir::ReturnType::Value(mir::Type::Class(actual)) = signature.return_type else {
+                return Err(vec![unsupported(
+                    *span,
+                    format!("function `{name}` does not return the expected class"),
+                )]);
+            };
+            if !context.class_is_subtype(actual, expected) {
                 return Err(vec![unsupported(
                     *span,
                     format!("function `{name}` does not return the expected class"),
@@ -20742,7 +21436,13 @@ fn lower_class_expression(
         } => {
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *span, context)?;
-            if signature.return_type != mir::ReturnType::Value(mir::Type::Class(expected)) {
+            let mir::ReturnType::Value(mir::Type::Class(actual)) = signature.return_type else {
+                return Err(vec![unsupported(
+                    *span,
+                    "method does not return expected class",
+                )]);
+            };
+            if !context.class_is_subtype(actual, expected) {
                 return Err(vec![unsupported(
                     *span,
                     "method does not return expected class",
@@ -20760,10 +21460,17 @@ fn lower_class_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
-            if signature.return_type != mir::ReturnType::Value(mir::Type::Class(expected)) {
+            let mir::ReturnType::Value(mir::Type::Class(actual)) = signature.return_type else {
+                return Err(vec![unsupported(
+                    *span,
+                    "static method does not return expected class",
+                )]);
+            };
+            if !context.class_is_subtype(actual, expected) {
                 return Err(vec![unsupported(
                     *span,
                     "static method does not return expected class",
@@ -20958,6 +21665,7 @@ fn lower_shared_reference_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -21190,6 +21898,7 @@ fn lower_writable_shared_reference_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -21519,6 +22228,7 @@ fn lower_nullable_writable_shared_reference_expression(
             method,
             args,
             span,
+            ..
         } => {
             if context.expression_type(expr)?
                 != mir::Type::NullableWritableSharedReference(expected)
@@ -21872,6 +22582,7 @@ fn lower_shared_reference_access_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -22112,6 +22823,7 @@ fn lower_nullable_shared_reference_access_expression(
             method,
             args,
             span,
+            ..
         } => {
             if context.expression_type(expr)? != nullable_ty {
                 return Ok(mir::NullableSharedReferenceAccessExpression::Access(
@@ -22276,6 +22988,7 @@ fn lower_weak_reference_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -22587,6 +23300,7 @@ fn lower_nullable_shared_reference_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -22893,6 +23607,7 @@ fn lower_nullable_weak_reference_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -23209,105 +23924,12 @@ fn lower_new_property_values(
     properties
         .iter()
         .map(|property| {
-            if property.promoted {
-                let index = promoted_constructor_argument_index(class, &property.name, context)
-                    .ok_or_else(|| {
-                        vec![unsupported(
-                            Span::default(),
-                            format!(
-                                "promoted property `${}` has no constructor argument",
-                                property.name
-                            ),
-                        )]
-                    })?;
-                return Ok(mir::PropertyValue {
-                    property: property.id,
-                    source: mir::PropertyValueSource::ConstructorArgument(index),
-                });
-            }
-            if let Some(initializer) = context.property_initializers.get(&property.id).cloned() {
-                let property_type = context.mir_resolved_type(&property.ty).ok_or_else(|| {
-                    vec![unsupported(
-                        initializer.expression.span(),
-                        format!("property `${}` is not native-lowerable", property.name),
-                    )]
-                })?;
-                let caller_substitutions = std::mem::replace(
-                    &mut context.type_substitutions,
-                    initializer.type_substitutions,
-                );
-                let caller_closure_plans = std::mem::replace(
-                    &mut context.closure_plans,
-                    initializer.closure_plans,
-                );
-                let source =
-                    lower_rvalue_as_expected(&initializer.expression, property_type, context)
-                        .map(|value| materialize_property_initializer(value, context));
-                context.closure_plans = caller_closure_plans;
-                context.type_substitutions = caller_substitutions;
-                return Ok(mir::PropertyValue {
-                    property: property.id,
-                    source: mir::PropertyValueSource::Expression(source?),
-                });
-            }
-            if context
-                .constructor_body_initializers
-                .contains(&property.id)
-            {
-                return Ok(mir::PropertyValue {
-                    property: property.id,
-                    source: mir::PropertyValueSource::ConstructorBody,
-                });
-            }
-            Err(vec![unsupported(
-                Span::default(),
-                format!(
-                    "class property `${}` is not definitely initialized before construction completes",
-                    property.name
-                ),
-            )])
+            Ok(mir::PropertyValue {
+                property: property.id,
+                source: mir::PropertyValueSource::ConstructorBody,
+            })
         })
         .collect()
-}
-
-fn materialize_property_initializer(
-    value: mir::Rvalue,
-    context: &mut LoweringContext,
-) -> mir::Rvalue {
-    let ty = value.ty();
-    let local = if matches!(ty, mir::Type::String | mir::Type::NullableString) {
-        let local = context.declare_borrowed_temp(ty, false);
-        context
-            .statement_owned_locals
-            .last_mut()
-            .expect("property initializer requires a statement-temporary scope")
-            .push(DropObligation::String(local));
-        local
-    } else if user_local_type_owns_value(ty) {
-        context.declare_owned_temp(ty)
-    } else {
-        context.declare_borrowed_temp(ty, false)
-    };
-    context.push_statement(mir::Statement::AssignLocal {
-        target: local,
-        value,
-    });
-    read_local_as_rvalue(local, ty, true)
-}
-
-fn promoted_constructor_argument_index(
-    class: ClassId,
-    property_name: &str,
-    context: &mut LoweringContext,
-) -> Option<usize> {
-    let constructor = context.lookup_lifecycle(class, "__construct")?;
-    let class_info = context.class_info(class)?;
-    class_info
-        .properties
-        .iter()
-        .filter(|property| property.promoted)
-        .position(|property| property.name == property_name)
-        .filter(|index| *index < constructor.parameter_types.len())
 }
 
 fn lower_float_expression(
@@ -23467,6 +24089,7 @@ fn lower_float_expression(
             class_name,
             member,
             span,
+            ..
         } => {
             let (id, static_ty) = context.static_property(class_name, member, *span)?;
             if static_ty != mir::Type::Scalar(mir::ScalarType::Float(ty)) {
@@ -23548,6 +24171,7 @@ fn lower_float_expression(
             method,
             args,
             span,
+            ..
         } if class_name == "Int" && method == "toFloat" => {
             let [value] = argument_values(args)[..] else {
                 return Err(vec![Diagnostic::new(
@@ -23565,6 +24189,7 @@ fn lower_float_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;
@@ -23847,6 +24472,7 @@ fn lower_integer_expression(
             class_name,
             member,
             span,
+            ..
         } => {
             let (id, static_ty) = context.static_property(class_name, member, *span)?;
             if static_ty != mir::Type::Scalar(mir::ScalarType::Integer(ty)) {
@@ -23904,6 +24530,7 @@ fn lower_integer_expression(
             method,
             args,
             span,
+            ..
         } if class_name == "Float" && method == "toInt" => {
             let [value] = argument_values(args)[..] else {
                 return Err(vec![Diagnostic::new(
@@ -23923,6 +24550,7 @@ fn lower_integer_expression(
             method,
             args,
             span,
+            ..
         } if method == "from" && IntegerType::from_companion_name(class_name).is_some() => {
             let [value] = argument_values(args)[..] else {
                 return Err(vec![Diagnostic::new(
@@ -23954,6 +24582,7 @@ fn lower_integer_expression(
             method,
             args,
             span,
+            ..
         } => {
             let (signature, args) =
                 lower_static_method_call(class_name, method, args, *span, context)?;

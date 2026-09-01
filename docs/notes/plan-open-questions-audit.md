@@ -32,7 +32,26 @@
 
 ## Already settled / correctly scheduled (not open — do not re-decide)
 
-Most of the plan's "(… decision, unauthored)" markers are large features whose **design is sketched and stage is assigned**; they need a record authored, not a decision made: inheritance (34), interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO (post-29), concurrency/async (Phase H). Closures are no longer in that list: decision 0120 requires explicit `with` capture lists, and the pre-Stage-30 grammar slice is complete and owns accepted lexer/parser/AST syntax; Decision 0121 settles and implements the remaining Stage 30 model. Checked errors are complete under decision 0119 across all three Stage 29 slices. Namespace/package-graph authority and Baton's manifest/resolver authority are settled by decisions 0117 and 0118; decision 0124 separately settles the PHP UX-bootstrap role, mandatory Pre-Stage-45 Doria-native transition, parity cutover, and unsuffixed `2026.03.1` release blocker. Enums and complete core match are settled by decisions 0114 and 0115. Decision 0125 settles and implements typed attributes, bounded const-evaluated metadata, the no-runtime-reflection boundary, and the strict processor protocol. The versioning scheme (§11) is fully specified in-plan. These are **settled or scheduled subjects, not open questions**, and are out of scope for this audit.
+Most of the plan's "(… decision, unauthored)" markers are large features whose
+**design is sketched and stage is assigned**; they need a record authored, not a
+decision made: interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO
+(post-29), and concurrency/async (Phase H). Inheritance is no longer in that
+list: Decision 0130 settles and implements Stage 34. Closures are likewise
+settled by Decisions 0120 and 0121:
+
+- decision 0120 requires explicit `with` capture lists;
+- the pre-Stage-30 grammar slice is complete and owns accepted lexer/parser/AST syntax.
+
+Checked errors are complete under Decision 0119 across all three Stage 29
+slices. Namespace/package-graph authority and Baton's
+manifest/resolver authority are settled by Decisions 0117 and 0118; Decision
+0124 separately settles the PHP UX-bootstrap role, mandatory Pre-Stage-45
+Doria-native transition, parity cutover, and unsuffixed `2026.03.1` release
+blocker. Enums and complete core match are settled by Decisions 0114 and 0115.
+Decision 0125 settles and implements typed attributes, bounded const-evaluated
+metadata, the no-runtime-reflection boundary, and the strict processor protocol.
+The versioning scheme (§11) is fully specified in-plan. These are **settled or
+scheduled subjects, not open questions**, and are out of scope for this audit.
 
 ## Open questions (answerable now)
 
@@ -75,8 +94,9 @@ package graphs, include resolution, package visibility, and multi-source
 lowering are implemented. Stage 32 is complete under Decision 0125. Stage 33
 Slices 1 through 3 and Phase F are complete under Decisions 0126 through 0128;
 Native Testing Foundation Slices 1 through 3 are complete, the foundation is
-complete, and Stage 34 is next. Decision 0124 separately binds the
-Pre-Stage-45 Doria-native port, parity and release cutover, and the unsuffixed
+complete, and Stage 34 is complete and Stage 35 is next. Decision 0124
+separately binds the Pre-Stage-45 Doria-native port, parity and release cutover,
+and the unsuffixed
 `2026.03.1` blocker. Stage 30 is complete and E0641 remains historical and
 reserved.
 

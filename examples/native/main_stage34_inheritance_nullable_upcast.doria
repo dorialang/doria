@@ -1,0 +1,13 @@
+open class Base
+{
+    open function value(): int { return 1; }
+}
+class Child extends Base
+{
+    override function value(): int { return 42; }
+}
+function main(): void
+{
+    ?Base $value = new Child();
+    if ($value != null) { echo "nullable {$value->value()}\n"; }
+}

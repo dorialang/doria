@@ -226,11 +226,15 @@ pub struct InterfaceDecl {
 pub struct ClassDecl {
     pub access: MemberAccess,
     pub access_span: Option<Span>,
+    pub is_open: bool,
+    pub open_span: Option<Span>,
     pub name: String,
     pub name_span: Span,
     pub type_params: Vec<TypeParamDecl>,
-    pub parent: Option<String>,
+    pub parent: Option<TypeRef>,
+    pub extends_span: Option<Span>,
     pub parent_span: Option<Span>,
+    pub modifier_prefix_span: Span,
     pub implements: Vec<String>,
     pub members: Vec<ClassMember>,
     pub span: Span,
@@ -275,6 +279,10 @@ pub struct ConstDecl {
 pub struct FunctionDecl {
     pub access: MemberAccess,
     pub access_span: Option<Span>,
+    pub is_open: bool,
+    pub open_span: Option<Span>,
+    pub is_override: bool,
+    pub override_span: Option<Span>,
     pub writable_this: bool,
     pub writable_span: Option<Span>,
     pub is_static: bool,
@@ -286,6 +294,7 @@ pub struct FunctionDecl {
     pub return_type: Option<TypeRef>,
     pub throws: Option<ThrowsClause>,
     pub body: Block,
+    pub modifier_prefix_span: Span,
     pub span: Span,
 }
 

@@ -4217,6 +4217,27 @@ function main(): int
     }
 }
 
+#[test]
+fn closed_override_uses_the_uniform_virtual_receiver_abi() {
+    if !host_linker_is_available() {
+        eprintln!(
+            "native inheritance integration test unavailable: host linker `{}` was not found",
+            host_linker()
+        );
+        return;
+    }
+
+    let output = temp_executable_path("stage34-virtual-receiver");
+    compile_native_source(
+        include_str!(
+            "../../../examples/native/main_stage34_inheritance_writable_shared_reference.doria"
+        ),
+        &output,
+    );
+    assert_native_run_output(&output, "stage34-virtual-receiver", b"writable shared 42\n");
+    let _ = fs::remove_file(output);
+}
+
 fn assert_native_run_output(output: &Path, stem: &str, expected_stdout: &[u8]) {
     let run = run_native_executable(output).expect("native executable should run");
     assert_eq!(run.status.code(), Some(0), "{stem}");

@@ -163,3 +163,11 @@ rescheduled to Stage 25a, so it is outside the Stage 21 acceptance criterion.
   gate can lift.
 - MIR lowering assumptions that only one unconditional top-level assignment can
   satisfy a constructor-body property obligation.
+
+## Stage 34 Amendment
+
+Decision 0130 composes this analysis per class phase. Parent construction and
+definite initialization complete before child property initialization; failure
+cleans only initialized child state and completed parent state. Required parent
+arguments use one first-statement `parent::__construct(...)` call and are never
+forwarded implicitly.

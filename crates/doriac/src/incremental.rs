@@ -454,7 +454,9 @@ fn append_item_signature(surface: &mut String, item: &Item, source_text: &str) {
             surface.push_str(&class.name);
             append_type_params(surface, &class.type_params);
             surface.push_str("extends:");
-            surface.push_str(class.parent.as_deref().unwrap_or(""));
+            if let Some(parent) = &class.parent {
+                surface.push_str(&parent.to_string());
+            }
             surface.push_str("implements:");
             for implemented in &class.implements {
                 surface.push_str(implemented);

@@ -1,0 +1,17 @@
+open class Root
+{
+    open function label(): string { return "root"; }
+}
+open class Middle extends Root
+{
+    override function label(): string { return "middle"; }
+}
+class Leaf extends Middle
+{
+    override function label(): string { return "leaf"; }
+}
+function main(): void
+{
+    Root $value = new Leaf();
+    echo "three {$value->label()}\n";
+}

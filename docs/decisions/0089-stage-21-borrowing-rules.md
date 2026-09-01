@@ -125,3 +125,7 @@ convention.
 - The Stage 19 temporary native-eligibility gate, now removed by decision 0090.
 - Any checker or MIR path that treats a `$this`-derived collection/property
   projection as an owned return or loses its original borrow root.
+
+Decision 0130 extends these provenance rules through implicit class upcasts and
+hierarchy narrowing. Readonly and writable borrows retain their access mode and
+original root; inheritance never turns a borrow into ownership.

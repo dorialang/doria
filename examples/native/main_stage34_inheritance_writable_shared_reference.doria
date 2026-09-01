@@ -1,0 +1,18 @@
+open class Counter
+{
+    writable int $value = 20;
+    open writable function add(int $amount): void { $this->value += $amount; }
+}
+class AnswerCounter extends Counter
+{
+    override writable function add(int $amount): void { parent::add($amount); }
+}
+function main(): void
+{
+    let $owner = new WritableSharedReference<Counter>(new AnswerCounter());
+    {
+        let writable $access = $owner->acquireWritableAccess();
+        $access->add(22);
+    }
+    echo "writable shared {$owner->acquireReadonlyAccess()->value}\n";
+}

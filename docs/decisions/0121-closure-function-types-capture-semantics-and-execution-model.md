@@ -66,7 +66,8 @@ Stage 32 — Complete
 Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Complete; Stage 33 Slice 3 — Complete
 Stage 33 — Complete; Phase F — Complete
 Native Testing Foundation Slices 1 Through 3 — Complete; Foundation — Complete
-Stage 34 — Next
+Stage 34 — Complete
+Stage 35 — Next
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping
@@ -660,3 +661,7 @@ the accepted semantics or deferrals.
   collection matrix, writable-callback fixture, tests, and release lock are
   synchronized with executing compiler support. Stage 30h changes no accepted
   public contract.
+
+Decision 0130 applies ordinary class upcast and hierarchy-carrier rules to
+captured values, function parameters, and returns without changing closure
+ownership, effect identity, environment layout, or cleanup order.

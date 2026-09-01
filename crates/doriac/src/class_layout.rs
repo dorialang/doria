@@ -30,6 +30,8 @@ pub enum FieldType {
     NullableError,
     Class(ClassId),
     NullableClass(ClassId),
+    OpenClass(ClassId),
+    NullableOpenClass(ClassId),
     SharedReference(ClassId),
     WeakReference(ClassId),
     NullableSharedReference(ClassId),
@@ -133,7 +135,9 @@ pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
         FieldType::Error
         | FieldType::NullableError
         | FieldType::Function
-        | FieldType::NullableFunction => (pointer_size * 2, pointer_size),
+        | FieldType::NullableFunction
+        | FieldType::OpenClass(_)
+        | FieldType::NullableOpenClass(_) => (pointer_size * 2, pointer_size),
         FieldType::String
         | FieldType::Mixed
         | FieldType::NullableMixed

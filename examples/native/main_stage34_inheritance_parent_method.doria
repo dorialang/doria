@@ -1,0 +1,13 @@
+open class Base
+{
+    open function value(): int { return 20; }
+}
+class Child extends Base
+{
+    override function value(): int { return parent::value() + 22; }
+}
+function main(): void
+{
+    let $value = new Child();
+    echo "parent method {$value->value()}\n";
+}

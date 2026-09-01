@@ -1,0 +1,14 @@
+open class Failure implements Error
+{
+    function __construct(string $message) {}
+}
+class Missing extends Failure
+{
+    function __construct() { parent::__construct("missing"); }
+}
+function fail(): void throws Missing { throw new Missing(); }
+function main(): void
+{
+    try { fail(); }
+    catch (Failure $error) { echo "catch {$error->message}\n"; }
+}

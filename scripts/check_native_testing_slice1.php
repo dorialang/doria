@@ -37,7 +37,8 @@ $required = [
         'Native Testing Foundation Slice 1 - Complete',
         'Native Testing Foundation Slice 2 - Complete',
         'Native Testing Foundation Slice 3 - Complete',
-        'Stage 34 Single Class Inheritance - Next',
+        'Stage 34 Single Class Inheritance - Complete',
+        'Stage 35 Interfaces And Traits - Next',
         'no runtime registration',
         'no Baton source parsing',
     ],
@@ -127,16 +128,6 @@ foreach (['name == "describe"', 'name == "it"', 'name == "test"'] as $rawMatch) 
 foreach (['testing', 'effects', 'semantics', 'mir', 'runtime'] as $key) {
     if (str_contains($contents[$key], 'E0710')) {
         $failures[] = "{$files[$key]}: historical E0710 still has a live compiler/runtime route";
-    }
-}
-
-$crateIterator = new RecursiveIteratorIterator(
-    new RecursiveDirectoryIterator($root . '/crates', FilesystemIterator::SKIP_DOTS),
-);
-foreach ($crateIterator as $entry) {
-    $relative = str_replace('\\', '/', substr($entry->getPathname(), strlen($root) + 1));
-    if (preg_match('/(?:stage[_-]?34|inheritance)/i', $relative) === 1) {
-        $failures[] = "{$relative}: Stage 34 implementation landed in the testing-foundation closure commit";
     }
 }
 

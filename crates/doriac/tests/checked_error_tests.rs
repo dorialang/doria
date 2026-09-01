@@ -349,7 +349,7 @@ function handled(): void
     }}
 }}
 
-function open(): void throws Error
+function propagate(): void throws Error
 {{
     try {{
         first();
@@ -488,7 +488,7 @@ class Service
         throw new Failure("method");
     }}
 
-    static function open(): void throws Failure
+    static function connect(): void throws Failure
     {{
         throw new Failure("static");
     }}
@@ -498,7 +498,7 @@ function run(): void throws Failure
 {{
     let $service = new Service();
     $service->load();
-    Service::open();
+    Service::connect();
 }}
 "#,
         error_class("Failure")

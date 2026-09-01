@@ -24,7 +24,6 @@ pub(crate) struct PhpClosureDescriptor {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PhpClosurePlan {
-    pub(crate) requires_runtime: bool,
     pub(crate) descriptors: HashMap<ClosureId, PhpClosureDescriptor>,
     pub(crate) layouts: HashMap<mir::ClosureEnvironmentLayoutId, mir::ClosureEnvironmentLayout>,
     pub(crate) function_types: HashMap<mir::FunctionTypeId, mir::FunctionType>,
@@ -175,9 +174,6 @@ impl PhpClosurePlan {
             .collect();
 
         Self {
-            requires_runtime: !program.semantic_info.function_types_by_span.is_empty()
-                || !program.semantic_info.closures.is_empty()
-                || !program.semantic_info.callable_value_calls.is_empty(),
             descriptors,
             layouts: mir
                 .into_iter()
@@ -945,6 +941,7 @@ fn collect_call_targets(program: &hir::Program) -> HashMap<Span, Span> {
                 crate::semantics::CallableTarget::Method {
                     class_type,
                     method_name,
+                    ..
                 } => methods.get(&(class_type.name.clone(), method_name.clone())),
             }?;
             Some((*span, *start))

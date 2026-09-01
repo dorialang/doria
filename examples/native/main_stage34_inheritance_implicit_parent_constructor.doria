@@ -1,0 +1,14 @@
+open class Base
+{
+    int $left = 20;
+    function __construct() {}
+}
+class Child extends Base
+{
+    int $right = 22;
+}
+function main(): void
+{
+    let $value = new Child();
+    echo "implicit {$value->left + $value->right}\n";
+}

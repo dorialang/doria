@@ -92,6 +92,59 @@ function main(): void
 }
 
 #[test]
+fn virtual_receivers_use_one_slot_abi_for_open_roots_and_closed_overrides() {
+    let program = doriac::lower_source_to_mir(
+        "llvm-virtual-receiver.doria",
+        include_str!(
+            "../../../examples/native/main_stage34_inheritance_writable_shared_reference.doria"
+        ),
+    )
+    .expect("inheritance source should lower");
+    let override_function = program
+        .functions
+        .iter()
+        .find(|function| function.name == "AnswerCounter::add" && function.virtual_slot.is_some())
+        .expect("closed override implementation");
+    let direct_function = program
+        .functions
+        .iter()
+        .find(|function| function.name == "AnswerCounter::add::<direct>")
+        .expect("closed exact-call implementation");
+    assert!(override_function.uses_virtual_receiver_abi());
+    assert!(!direct_function.uses_virtual_receiver_abi());
+
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
+        .expect("virtual receiver source should lower to LLVM IR");
+    let override_symbol = doriac::native_abi::function_symbol(override_function);
+    let override_definition = ir
+        .lines()
+        .find(|line| line.contains(&format!("@{override_symbol}(")))
+        .expect("closed override LLVM definition");
+    assert!(
+        override_definition.contains("{ ptr, ptr }"),
+        "vtable implementation does not use the uniform receiver carrier:\n{override_definition}"
+    );
+    let direct_symbol = doriac::native_abi::function_symbol(direct_function);
+    let direct_definition = ir
+        .lines()
+        .find(|line| line.contains(&format!("@{direct_symbol}(")))
+        .expect("closed direct LLVM definition");
+    assert!(
+        !direct_definition.contains("{ ptr, ptr }"),
+        "closed direct implementation lost its compact receiver ABI:\n{direct_definition}"
+    );
+
+    for source in [
+        include_str!("../../../examples/native/main_stage34_inheritance_checked_virtual.doria"),
+        include_str!(
+            "../../../examples/native/main_stage34_inheritance_devirtualized_exact_call.doria"
+        ),
+    ] {
+        assert_object(source);
+    }
+}
+
+#[test]
 fn checked_error_ir_uses_status_out_slots_static_metadata_and_entry_scratch() {
     let source = include_str!("../../../examples/native/main_checked_error_catch.doria");
     let program = doriac::lower_source_to_mir("llvm-checked-errors.doria", source)
@@ -614,6 +667,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 name: "main".to_string(),
                 source_span: Default::default(),
                 method: None,
+                virtual_slot: None,
                 receiver_mode: None,
                 params: Vec::new(),
                 parameter_modes: Vec::new(),
@@ -637,6 +691,7 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
                 name: "mixedWidth".to_string(),
                 source_span: Default::default(),
                 method: None,
+                virtual_slot: None,
                 receiver_mode: None,
                 params: Vec::new(),
                 parameter_modes: Vec::new(),

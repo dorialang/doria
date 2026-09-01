@@ -1,0 +1,13 @@
+open class Reporter
+{
+    open function report(): void {}
+}
+class ConsoleReporter extends Reporter
+{
+    override function report(): void { echo "ambient virtual\n"; }
+}
+function main(): void
+{
+    Reporter $reporter = new ConsoleReporter();
+    $reporter->report();
+}

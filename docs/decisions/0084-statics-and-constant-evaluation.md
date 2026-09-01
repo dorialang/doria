@@ -57,9 +57,10 @@ in a method return or other type position it denotes that same concrete class.
 Stage 20 adds no inheritance covariance or late binding to `self`.
 
 The grammar accepts generalized `parent::member()` in Stage 20 so editor and LSP
-parsing follow the accepted language clock. Its inheritance lookup and dispatch
-semantics land in Stage 34, so current checking produces a Stage 34 unsupported
-diagnostic before MIR. Trait methods likewise preserve `self::member`
+parsing follow the accepted language clock. Decision 0130 now implements direct
+immediate-parent lookup for accessible constants, static properties, static
+methods, instance methods, and constructor chaining. Statics remain nonvirtual
+and retain declaring-class storage. Trait methods preserve `self::member`
 structurally, while trait composition remains a Stage 35 semantic feature.
 
 `static::` is permanently invalid and receives a machine-applicable fix that
@@ -231,3 +232,6 @@ editor grammars, examples, parity fixtures, tests, and language documentation.
 - Parser diagnostics that treat generalized `parent::member()` or trait-local
   `self::member` as malformed syntax rather than accepted-but-unsupported
   semantics.
+
+Decision 0130 retires the Stage-34 unsupported route for valid parent access;
+the Stage-35 trait boundary remains.
