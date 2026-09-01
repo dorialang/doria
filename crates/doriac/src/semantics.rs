@@ -127,6 +127,13 @@ pub struct SemanticInfo {
     pub given_preludes: HashMap<Span, GivenSemanticInfo>,
     /// Compiler-resolved callable target for each user-defined call expression.
     pub call_targets: HashMap<Span, CallableTarget>,
+    /// Compiler-owned hierarchy identity for every checked method declaration.
+    ///
+    /// Tooling uses this table to relate override families without rebuilding
+    /// inheritance or virtual-dispatch semantics from syntax.
+    pub method_hierarchy: HashMap<Span, MethodHierarchySemanticInfo>,
+    /// Exact declaration and virtual-family identity selected at each method call.
+    pub method_call_targets: HashMap<Span, MethodCallSemanticInfo>,
     /// Declaring class selected for inherited static-property and class-constant access.
     /// HIR lowering canonicalizes storage through this map instead of reproducing
     /// hierarchy lookup in each backend.
@@ -207,6 +214,7 @@ pub struct CallableParameterSemanticInfo {
     pub r#type: ResolvedType,
     pub take: bool,
     pub writable: bool,
+    pub has_default: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -340,6 +348,27 @@ pub enum CallableTarget {
         method_name: String,
         direct_parent: bool,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MethodHierarchySemanticInfo {
+    pub declaring_class: String,
+    pub name: String,
+    pub declaration: Span,
+    pub is_open: bool,
+    pub is_override: bool,
+    pub virtual_root: Option<Span>,
+    pub overridden_declaration: Option<Span>,
+    pub access: MemberAccess,
+    pub receiver_mode: Option<ReceiverMode>,
+    pub is_static: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MethodCallSemanticInfo {
+    pub declaration: Span,
+    pub virtual_root: Option<Span>,
+    pub direct_parent: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -805,6 +834,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     let closure_ownership = ownership_analysis.closures;
     let return_borrows = ownership_analysis.return_borrows;
     checker.diagnostics.extend(ownership_analysis.diagnostics);
+    let method_hierarchy = collect_method_hierarchy_semantics(&checker);
     let classes = collect_ordered_class_semantics(program, &mut checker);
     let enums = collect_ordered_enum_semantics(&checker);
     let callable_signatures = checker
@@ -823,6 +853,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
                             r#type: checker.types.resolved(parameter.ty),
                             take: parameter.take,
                             writable: parameter.writable,
+                            has_default: parameter.has_default,
                         })
                         .collect(),
                     return_type: checker.types.resolved(signature.return_ty),
@@ -851,6 +882,8 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             whens: checker.whens,
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
+            method_hierarchy,
+            method_call_targets: checker.method_call_targets,
             static_member_targets: checker.static_member_targets,
             generic_call_specializations: checker.generic_call_specializations,
             constrained_display_calls: checker.constrained_display_calls,
@@ -927,6 +960,37 @@ fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo
                         .expect("an empty recovery enum layout is finite")
                 }),
             }
+        })
+        .collect()
+}
+
+fn collect_method_hierarchy_semantics(
+    checker: &Checker<'_>,
+) -> HashMap<Span, MethodHierarchySemanticInfo> {
+    checker
+        .classes
+        .iter()
+        .flat_map(|(class_name, class)| {
+            class.methods.iter().map(move |(method_name, method)| {
+                (
+                    method.declaration,
+                    MethodHierarchySemanticInfo {
+                        declaring_class: class_name.clone(),
+                        name: method_name.clone(),
+                        declaration: method.declaration,
+                        is_open: method.is_open,
+                        is_override: method.is_override,
+                        virtual_root: method.virtual_root,
+                        overridden_declaration: checker
+                            .overridden_declarations
+                            .get(&method.declaration)
+                            .copied(),
+                        access: method.access,
+                        receiver_mode: method.receiver_mode,
+                        is_static: method.is_static,
+                    },
+                )
+            })
         })
         .collect()
 }
@@ -1616,6 +1680,7 @@ struct Checker<'program> {
     whens: HashMap<Span, WhenSemanticInfo>,
     given_preludes: HashMap<Span, GivenSemanticInfo>,
     call_targets: HashMap<Span, CallableTarget>,
+    method_call_targets: HashMap<Span, MethodCallSemanticInfo>,
     static_member_targets: HashMap<Span, String>,
     generic_call_specializations: HashMap<Span, GenericSpecialization>,
     constrained_display_calls: HashSet<Span>,
@@ -1632,6 +1697,7 @@ struct Checker<'program> {
     parameter_defaults:
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
     override_roots: HashMap<Span, Span>,
+    overridden_declarations: HashMap<Span, Span>,
     flow_facts: crate::narrowing::FactsByUse,
     contextual_expression_types: HashMap<Span, TypeId>,
     when_contexts: Vec<WhenCheckContext>,
@@ -2418,6 +2484,7 @@ impl<'program> Checker<'program> {
             whens: HashMap::new(),
             given_preludes: HashMap::new(),
             call_targets: HashMap::new(),
+            method_call_targets: HashMap::new(),
             static_member_targets: HashMap::new(),
             generic_call_specializations: HashMap::new(),
             constrained_display_calls: HashSet::new(),
@@ -2433,6 +2500,7 @@ impl<'program> Checker<'program> {
             const_evaluation,
             parameter_defaults: HashMap::new(),
             override_roots: HashMap::new(),
+            overridden_declarations: HashMap::new(),
             flow_facts: crate::narrowing::analyze_program(program),
             contextual_expression_types: HashMap::new(),
             when_contexts: Vec::new(),
@@ -3836,6 +3904,7 @@ impl<'program> Checker<'program> {
                         name,
                         method.declaration,
                         root,
+                        inherited_method.declaration,
                         &inherited_method.params,
                     );
                 }
@@ -3849,6 +3918,7 @@ impl<'program> Checker<'program> {
         method_name: &str,
         declaration: Span,
         virtual_root: Span,
+        overridden_declaration: Span,
         inherited_params: &[ParamInfo],
     ) {
         if let Some(method) = self
@@ -3868,6 +3938,8 @@ impl<'program> Checker<'program> {
             }
         }
         self.override_roots.insert(declaration, virtual_root);
+        self.overridden_declarations
+            .insert(declaration, overridden_declaration);
     }
 
     fn materialize_override_parameter_defaults(&mut self) {
@@ -15364,6 +15436,7 @@ impl<'program> Checker<'program> {
         let ResolvedType::Class(resolved_class_type) = self.types.resolved(class_type_id) else {
             unreachable!("interned class type must resolve as a class");
         };
+        self.record_method_call_target(span, &method_info, false);
         self.call_targets.insert(
             span,
             CallableTarget::Method {
@@ -15906,6 +15979,7 @@ impl<'program> Checker<'program> {
         else {
             unreachable!("resolved method target must remain a class")
         };
+        self.record_method_call_target(access.span, &method_info, parent_qualified);
         self.call_targets.insert(
             access.span,
             CallableTarget::Method {
@@ -16533,6 +16607,7 @@ impl<'program> Checker<'program> {
         let ResolvedType::Class(resolved_class_type) = self.types.resolved(class_type_id) else {
             unreachable!("interned constructor class type must resolve as a class");
         };
+        self.record_method_call_target(span, &constructor, false);
         self.call_targets.insert(
             span,
             CallableTarget::Method {
@@ -16555,6 +16630,17 @@ impl<'program> Checker<'program> {
         if self.diagnostics.len() == diagnostics_before {
             self.record_checked_effects(constructor.checked_effects, span);
         }
+    }
+
+    fn record_method_call_target(&mut self, span: Span, method: &MethodInfo, direct_parent: bool) {
+        self.method_call_targets.insert(
+            span,
+            MethodCallSemanticInfo {
+                declaration: method.declaration,
+                virtual_root: method.virtual_root,
+                direct_parent,
+            },
+        );
     }
 
     fn check_call_arguments(
