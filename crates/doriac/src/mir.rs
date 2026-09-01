@@ -2743,6 +2743,7 @@ pub enum CollectionExpression {
         collection: CollectionTypeId,
         local: LocalId,
         transfer: bool,
+        assume_non_null: bool,
     },
     Literal {
         collection: CollectionTypeId,
@@ -2767,6 +2768,7 @@ pub enum CollectionExpression {
         collection: CollectionTypeId,
         object: LocalId,
         property: PropertyId,
+        assume_non_null: bool,
     },
     SharedAccessPayload {
         collection: CollectionTypeId,

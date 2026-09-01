@@ -6048,14 +6048,18 @@ fn validate_collection_expression(
     let definition = collection_in(program, expression.collection())?;
     match expression {
         mir::CollectionExpression::Local {
-            local, transfer, ..
+            local,
+            transfer,
+            assume_non_null,
+            ..
         } => {
             let local = local_in(function, *local)?;
-            if !matches!(
-                local.ty,
-                mir::Type::Collection(found) | mir::Type::NullableCollection(found)
-                    if found == definition.id
-            ) {
+            let local_type_matches = match local.ty {
+                mir::Type::Collection(found) => found == definition.id && !assume_non_null,
+                mir::Type::NullableCollection(found) => found == definition.id && *assume_non_null,
+                _ => false,
+            };
+            if !local_type_matches {
                 return Err(malformed_mir("collection local expression type mismatch"));
             }
             if *transfer && !local.owned {
@@ -6129,7 +6133,10 @@ fn validate_collection_expression(
             validate_collection_index(program, function, source_type, index, *positional)
         }
         mir::CollectionExpression::Property {
-            object, property, ..
+            object,
+            property,
+            assume_non_null,
+            ..
         } => {
             let object = local_in(function, *object)?;
             let class = match object.ty {
@@ -6141,7 +6148,16 @@ fn validate_collection_expression(
                 }
             };
             let property = property_in(program, class, *property)?;
-            if property.ty != mir::Type::Collection(definition.id) {
+            let property_type_matches = match property.ty {
+                mir::Type::Collection(collection) => {
+                    collection == definition.id && !assume_non_null
+                }
+                mir::Type::NullableCollection(collection) => {
+                    collection == definition.id && *assume_non_null
+                }
+                _ => false,
+            };
+            if !property_type_matches {
                 return Err(malformed_mir(
                     "collection property expression type mismatch",
                 ));
@@ -8702,6 +8718,11 @@ fn collect_collection_class_local_accesses<'a>(
         mir::CollectionExpression::StringIntrinsic(call) => {
             collect_rvalue_args_class_local_accesses(&call.args, accesses);
         }
+        mir::CollectionExpression::Local {
+            local,
+            assume_non_null: true,
+            ..
+        } => accesses.assume_nullable_present(*local),
         mir::CollectionExpression::Local { .. }
         | mir::CollectionExpression::SharedAccessPayload { .. }
         | mir::CollectionExpression::From { .. }
@@ -12775,10 +12796,16 @@ fn validate_class_expression(
             ..
         } => {
             let callee = function_in(program, *callee)?;
-            if callee.return_type != mir::ReturnType::Value(mir::Type::Class(class)) {
+            let mir::ReturnType::Value(mir::Type::Class(actual)) = callee.return_type else {
                 return Err(malformed_mir(format!(
                     "class#{} call targets a function with another return type",
                     class.0
+                )));
+            };
+            if !class_is_subtype(program, actual, class) {
+                return Err(malformed_mir(format!(
+                    "class#{} call targets a function returning unrelated class#{}",
+                    class.0, actual.0
                 )));
             }
             let expected_return_borrow = infer_function_return_borrow(program, callee)?;
@@ -12930,6 +12957,7 @@ fn validate_class_expression(
                             constructor,
                             receiver,
                             property.property,
+                            definition.ty,
                             definition.writable,
                             concrete_definition
                                 .parent
@@ -13096,6 +13124,7 @@ fn validate_constructor_body_initializer(
     constructor: &mir::Function,
     receiver: mir::LocalId,
     property: crate::class_layout::PropertyId,
+    property_type: mir::Type,
     writable: bool,
     inherited: bool,
 ) -> Result<(), BackendError> {
@@ -13104,6 +13133,74 @@ fn validate_constructor_body_initializer(
         Uninitialized,
         Initialized,
         MaybeInitialized,
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Presence {
+        Unknown,
+        Null,
+        Present,
+    }
+    impl Presence {
+        fn join(self, incoming: Self) -> Self {
+            if self == incoming {
+                self
+            } else {
+                Self::Unknown
+            }
+        }
+
+        fn from_rvalue(value: &mir::Rvalue) -> Self {
+            match value {
+                mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Null(_)) => {
+                    Self::Null
+                }
+                mir::Rvalue::NullableCollection(value)
+                    if nullable_collection_expression_is_present(value, &HashSet::new()) =>
+                {
+                    Self::Present
+                }
+                _ => Self::Unknown,
+            }
+        }
+    }
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    struct PropertyState {
+        initialization: State,
+        presence: Presence,
+    }
+    impl PropertyState {
+        fn join(self, incoming: Self) -> Self {
+            Self {
+                initialization: self.initialization.join(incoming.initialization),
+                presence: self.presence.join(incoming.presence),
+            }
+        }
+
+        fn transfer_write(self, value: &mir::Rvalue) -> Self {
+            Self {
+                initialization: self.initialization.transfer_write(),
+                presence: Presence::from_rvalue(value),
+            }
+        }
+
+        fn after_write(
+            self,
+            kind: mir::PropertyWriteKind,
+            writable: bool,
+            constructor: &mir::Function,
+            property: crate::class_layout::PropertyId,
+            value: &mir::Rvalue,
+        ) -> Result<Self, BackendError> {
+            Ok(Self {
+                initialization: self.initialization.after_write(
+                    kind,
+                    writable,
+                    constructor,
+                    property,
+                )?,
+                presence: Presence::from_rvalue(value),
+            })
+        }
     }
     impl State {
         fn join(self, incoming: Self) -> Self {
@@ -13160,7 +13257,10 @@ fn validate_constructor_body_initializer(
     let (reachable, _) = reachable_blocks_and_predecessors(constructor, true)?;
     let mut inputs = vec![None; constructor.blocks.len()];
     let mut outputs = vec![None; constructor.blocks.len()];
-    inputs[constructor.entry_block.0] = Some(State::Uninitialized);
+    inputs[constructor.entry_block.0] = Some(PropertyState {
+        initialization: State::Uninitialized,
+        presence: Presence::Unknown,
+    });
     let mut pending = std::collections::VecDeque::from([constructor.entry_block]);
     let mut queued = vec![false; constructor.blocks.len()];
     queued[constructor.entry_block.0] = true;
@@ -13171,20 +13271,34 @@ fn validate_constructor_body_initializer(
         for statement in &block.statements {
             if statement_parent_constructor_call(program, constructor, statement) {
                 if inherited {
-                    state = State::Initialized;
+                    state = PropertyState {
+                        initialization: State::Initialized,
+                        presence: Presence::Unknown,
+                    };
                 }
                 continue;
             }
             if let mir::Statement::AssignProperty {
                 object,
                 property: assigned,
+                value,
                 ..
             } = statement
             {
                 if *object == receiver && *assigned == property {
-                    state = state.transfer_write();
+                    state = state.transfer_write(value);
                 }
             }
+            if statement_may_mutate_class_local(program, statement, receiver)? {
+                state.presence = Presence::Unknown;
+            }
+        }
+        if class_accesses_may_mutate_local(
+            program,
+            &collect_terminator_class_local_accesses(&block.terminator),
+            receiver,
+        )? {
+            state.presence = Presence::Unknown;
         }
         outputs[block_id.0] = Some(state);
         for successor in analysis_terminator_targets(&block.terminator, true) {
@@ -13198,7 +13312,10 @@ fn validate_constructor_body_initializer(
                     &block.terminator,
                     successor,
                 ) {
-                State::Initialized
+                PropertyState {
+                    initialization: State::Initialized,
+                    presence: Presence::Unknown,
+                }
             } else {
                 state
             };
@@ -13233,11 +13350,14 @@ fn validate_constructor_body_initializer(
         for statement in &block.statements {
             if statement_parent_constructor_call(program, constructor, statement) {
                 if inherited {
-                    state = State::Initialized;
+                    state = PropertyState {
+                        initialization: State::Initialized,
+                        presence: Presence::Unknown,
+                    };
                 }
                 continue;
             }
-            if state != State::Initialized
+            if state.initialization != State::Initialized
                 && statement_observes_property(statement, receiver, property)
             {
                 return Err(malformed_mir(format!(
@@ -13245,21 +13365,43 @@ fn validate_constructor_body_initializer(
                     constructor.name, property.index
                 )));
             }
+            if matches!(property_type, mir::Type::NullableCollection(_))
+                && state.presence != Presence::Present
+                && statement_assumes_collection_property_present(statement, receiver, property)
+            {
+                return Err(malformed_mir(format!(
+                    "constructor {} assumes nullable property{} is present without a dominating non-null assignment",
+                    constructor.name, property.index
+                )));
+            }
             if let mir::Statement::AssignProperty {
                 object,
                 property: assigned,
+                value,
                 kind,
                 ..
             } = statement
             {
                 if *object == receiver && *assigned == property {
-                    state = state.after_write(*kind, writable, constructor, property)?;
+                    state = state.after_write(*kind, writable, constructor, property, value)?;
                 }
+            }
+            if statement_may_mutate_class_local(program, statement, receiver)? {
+                state.presence = Presence::Unknown;
             }
         }
         let parent_constructor_terminator =
             terminator_parent_constructor_call(program, constructor, &block.terminator);
-        if state != State::Initialized
+        if matches!(property_type, mir::Type::NullableCollection(_))
+            && state.presence != Presence::Present
+            && terminator_assumes_collection_property_present(&block.terminator, receiver, property)
+        {
+            return Err(malformed_mir(format!(
+                "constructor {} assumes nullable property{} is present without a dominating non-null assignment",
+                constructor.name, property.index
+            )));
+        }
+        if state.initialization != State::Initialized
             && !parent_constructor_terminator
             && terminator_observes_property(&block.terminator, receiver, property)
         {
@@ -13268,7 +13410,7 @@ fn validate_constructor_body_initializer(
                 constructor.name, property.index
             )));
         }
-        if state != State::Initialized
+        if state.initialization != State::Initialized
             && matches!(
                 block.terminator,
                 mir::Terminator::Return(_) | mir::Terminator::ReturnVoid
@@ -13281,6 +13423,144 @@ fn validate_constructor_body_initializer(
         }
     }
     Ok(())
+}
+
+fn statement_may_mutate_class_local(
+    program: &mir::Program,
+    statement: &mir::Statement,
+    receiver: mir::LocalId,
+) -> Result<bool, BackendError> {
+    class_accesses_may_mutate_local(
+        program,
+        &collect_statement_class_local_accesses(statement),
+        receiver,
+    )
+}
+
+fn class_accesses_may_mutate_local(
+    program: &mir::Program,
+    accesses: &ClassLocalAccesses<'_>,
+    receiver: mir::LocalId,
+) -> Result<bool, BackendError> {
+    for access in accesses.iter() {
+        let ClassLocalAccess::Call(callee, args, parameter_offset) = access else {
+            continue;
+        };
+        if borrowed_class_call_locals(program, callee, args, parameter_offset)?
+            .into_iter()
+            .any(|(local, mode)| local == receiver && matches!(mode, ClassBorrowMode::Writable))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn statement_assumes_collection_property_present(
+    statement: &mir::Statement,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match statement {
+        mir::Statement::AssignLocal { value, .. }
+        | mir::Statement::AssignLocalGroup { value, .. }
+        | mir::Statement::AssignStatic { value, .. }
+        | mir::Statement::AssignProperty { value, .. }
+        | mir::Statement::CollectionAdd { value, .. } => {
+            rvalue_assumes_collection_property_present(value, receiver, property)
+        }
+        mir::Statement::CallVoid { args, .. } | mir::Statement::CallBorrowed { args, .. } => args
+            .iter()
+            .any(|value| rvalue_assumes_collection_property_present(value, receiver, property)),
+        mir::Statement::CollectionSet { key, value, .. }
+        | mir::Statement::AssignCollectionIndex {
+            index: key, value, ..
+        } => {
+            rvalue_assumes_collection_property_present(key, receiver, property)
+                || rvalue_assumes_collection_property_present(value, receiver, property)
+        }
+        _ => false,
+    }
+}
+
+fn terminator_assumes_collection_property_present(
+    terminator: &mir::Terminator,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match terminator {
+        mir::Terminator::Return(value) => {
+            rvalue_assumes_collection_property_present(value, receiver, property)
+        }
+        mir::Terminator::CheckedCall { args, .. }
+        | mir::Terminator::IndirectCall { args, .. }
+        | mir::Terminator::CheckedIndirectCall { args, .. } => args
+            .iter()
+            .any(|value| rvalue_assumes_collection_property_present(value, receiver, property)),
+        mir::Terminator::CheckedConstruct {
+            properties, args, ..
+        } => {
+            properties.iter().any(|value| {
+                matches!(
+                    &value.source,
+                    mir::PropertyValueSource::Expression(value)
+                        if rvalue_assumes_collection_property_present(value, receiver, property)
+                )
+            }) || args
+                .iter()
+                .any(|value| rvalue_assumes_collection_property_present(value, receiver, property))
+        }
+        _ => false,
+    }
+}
+
+fn rvalue_assumes_collection_property_present(
+    value: &mir::Rvalue,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::Rvalue::Collection(value) => {
+            collection_assumes_property_present(value, receiver, property)
+        }
+        mir::Rvalue::NullableCollection(mir::NullableCollectionExpression::Collection(value)) => {
+            collection_assumes_property_present(value, receiver, property)
+        }
+        _ => false,
+    }
+}
+
+fn collection_assumes_property_present(
+    value: &mir::CollectionExpression,
+    receiver: mir::LocalId,
+    property: crate::class_layout::PropertyId,
+) -> bool {
+    match value {
+        mir::CollectionExpression::Property {
+            object,
+            property: observed,
+            assume_non_null: true,
+            ..
+        } => *object == receiver && *observed == property,
+        mir::CollectionExpression::Literal { entries, .. } => entries.iter().any(|entry| {
+            entry.key.as_ref().is_some_and(|key| {
+                rvalue_assumes_collection_property_present(key, receiver, property)
+            }) || rvalue_assumes_collection_property_present(&entry.value, receiver, property)
+        }),
+        mir::CollectionExpression::Fill { value, .. } => {
+            rvalue_assumes_collection_property_present(value, receiver, property)
+        }
+        mir::CollectionExpression::Index { index, .. } => {
+            rvalue_assumes_collection_property_present(index, receiver, property)
+        }
+        mir::CollectionExpression::Call { args, .. } => args.iter().any(|argument| {
+            rvalue_assumes_collection_property_present(argument, receiver, property)
+        }),
+        mir::CollectionExpression::StringIntrinsic(call) => call.args.iter().any(|argument| {
+            rvalue_assumes_collection_property_present(argument, receiver, property)
+        }),
+        _ => false,
+    }
 }
 
 fn parent_constructor_target(
@@ -16351,9 +16631,14 @@ fn validate_nullable_class_expression(
             local, transfer, ..
         } => {
             let definition = local_in(function, *local)?;
-            if definition.ty != mir::Type::NullableClass(class) {
+            let mir::Type::NullableClass(actual) = definition.ty else {
                 return Err(malformed_mir(
-                    "nullable class references another local type",
+                    "nullable class references a non-nullable-class local",
+                ));
+            };
+            if !class_is_subtype(program, actual, class) {
+                return Err(malformed_mir(
+                    "nullable class references an unrelated local type",
                 ));
             }
             if *transfer && !definition.owned {
@@ -16377,8 +16662,14 @@ fn validate_nullable_class_expression(
             ..
         } => {
             let callee = function_in(program, *callee)?;
-            if callee.return_type != mir::ReturnType::Value(mir::Type::NullableClass(class)) {
+            let mir::ReturnType::Value(mir::Type::NullableClass(actual)) = callee.return_type
+            else {
                 return Err(malformed_mir("nullable class call has another return type"));
+            };
+            if !class_is_subtype(program, actual, class) {
+                return Err(malformed_mir(
+                    "nullable class call returns an unrelated class type",
+                ));
             }
             if *return_borrow != infer_function_return_borrow(program, callee)? {
                 return Err(malformed_mir(

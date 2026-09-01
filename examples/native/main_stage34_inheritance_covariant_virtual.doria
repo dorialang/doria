@@ -1,0 +1,31 @@
+open class Animal
+{
+    open function name(): string { return "animal"; }
+}
+
+class Dog extends Animal
+{
+    override function name(): string { return "dog"; }
+}
+
+open class Factory
+{
+    open function create(): Animal { return new Animal(); }
+    open function maybeCreate(): ?Animal { return null; }
+}
+
+class DogFactory extends Factory
+{
+    override function create(): Dog { return new Dog(); }
+    override function maybeCreate(): ?Dog { return new Dog(); }
+}
+
+function main(): void
+{
+    Factory $factory = new DogFactory();
+    Animal $animal = $factory->create();
+    ?Animal $maybe = $factory->maybeCreate();
+    echo "covariant {$animal->name()}";
+    if ($maybe != null) { echo " {$maybe->name()}"; }
+    echo "\n";
+}

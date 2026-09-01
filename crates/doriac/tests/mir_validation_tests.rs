@@ -1126,6 +1126,46 @@ function main(): void
 }
 
 #[test]
+fn shared_validator_requires_a_dominating_proof_for_narrowed_collection_locals() {
+    let source = r#"
+function first(?List<int> $values): int
+{
+    if ($values != null) { return countValues($values); }
+    return 0;
+}
+function countValues(List<int> $values): int { return $values->count; }
+function main(): void { echo "{first([42])}\n"; }
+"#;
+    let valid = doriac::lower_source_to_mir("nullable-collection.doria", source)
+        .expect("narrowed nullable collection should lower");
+    doriac::mir_validation::validate_program(&valid)
+        .expect("the null comparison should dominate the narrowed collection use");
+
+    let mut malformed = valid;
+    let condition = malformed
+        .functions
+        .iter_mut()
+        .flat_map(|function| &mut function.blocks)
+        .find_map(|block| match &mut block.terminator {
+            Terminator::Branch {
+                condition: condition @ BoolExpression::NullableCollectionIsPresent(_),
+                ..
+            } => Some(condition),
+            _ => None,
+        })
+        .expect("expected nullable collection guard branch");
+    *condition = BoolExpression::Use {
+        operand: Operand::Scalar(ScalarValue::Bool(true)),
+    };
+
+    let error = doriac::mir_validation::validate_program(&malformed)
+        .expect_err("a narrowed collection use without its proof must be malformed MIR");
+    assert!(error
+        .message
+        .contains("assumed non-null without a dominating presence proof"));
+}
+
+#[test]
 fn shared_validator_rejects_malformed_stage28a_control_flow_plans() {
     let source = r#"
 function choose(bool $ready): int
@@ -2345,6 +2385,7 @@ fn shared_validator_rejects_consuming_string_intrinsic_collection_inputs() {
                     collection: CollectionTypeId(0),
                     local: LocalId(0),
                     transfer: true,
+                    assume_non_null: false,
                 }),
             ],
             result: Type::String,
@@ -3124,7 +3165,7 @@ fn shared_validator_requires_class_calls_to_return_the_declared_class() {
         .expect_err("class calls cannot lie about their return class");
     assert!(error
         .message
-        .contains("class#0 call targets a function with another return type"));
+        .contains("class#0 call targets a function returning unrelated class#1"));
 }
 
 #[test]

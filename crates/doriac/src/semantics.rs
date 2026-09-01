@@ -3446,6 +3446,7 @@ impl<'program> Checker<'program> {
                 break;
             }
         }
+        self.close_virtual_ambient_effects(&mut ambient);
         ambient.retain(|_, effects| !effects.is_empty());
         ambient
     }
@@ -3464,8 +3465,36 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+        self.close_virtual_ambient_effects(&mut ambient);
         ambient.retain(|_, effects| !effects.is_empty());
         ambient
+    }
+
+    fn close_virtual_ambient_effects(&self, ambient: &mut HashMap<Span, Vec<ResolvedType>>) {
+        loop {
+            let mut changed = false;
+            for (declaration, root) in &self.override_roots {
+                let family = ambient
+                    .get(root)
+                    .into_iter()
+                    .flatten()
+                    .chain(ambient.get(declaration).into_iter().flatten())
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for member in [root, declaration] {
+                    let effects = ambient.entry(*member).or_default();
+                    for effect in &family {
+                        if !effects.contains(effect) {
+                            effects.push(effect.clone());
+                            changed = true;
+                        }
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
     }
 
     fn apply_ambient_effect_seed(&mut self) {
@@ -14186,6 +14215,32 @@ impl<'program> Checker<'program> {
                 .any(|ancestor| ancestor == target)
     }
 
+    fn override_return_is_compatible(&mut self, target: TypeId, value: TypeId) -> bool {
+        if target == value {
+            return true;
+        }
+        match (
+            self.types.kind(target).clone(),
+            self.types.kind(value).clone(),
+        ) {
+            (TypeKind::Class(target), TypeKind::Class(value)) => {
+                self.class_is_subtype(&value, &target)
+            }
+            (TypeKind::Nullable(target), TypeKind::Nullable(value)) => {
+                match (
+                    self.types.kind(target).clone(),
+                    self.types.kind(value).clone(),
+                ) {
+                    (TypeKind::Class(target), TypeKind::Class(value)) => {
+                        self.class_is_subtype(&value, &target)
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn class_implements_builtin(&self, class_name: &str, interface: BuiltinInterface) -> bool {
         let mut current = Some(class_name);
         let mut visited = HashSet::new();
@@ -14315,15 +14370,7 @@ impl<'program> Checker<'program> {
             (Some(ReceiverMode::Readonly), Some(ReceiverMode::Writable))
         );
         let child_return = self.substitute_type_id(method.return_ty, &alpha_substitutions);
-        let return_valid = match (
-            self.types.kind(inherited.return_ty).clone(),
-            self.types.kind(child_return).clone(),
-        ) {
-            (TypeKind::Class(parent), TypeKind::Class(child)) => {
-                self.class_is_subtype(&child, &parent)
-            }
-            _ => inherited.return_ty == child_return,
-        };
+        let return_valid = self.override_return_is_compatible(inherited.return_ty, child_return);
         let child_effects = method
             .checked_effects
             .iter()
@@ -19841,6 +19888,7 @@ impl<'program> Checker<'program> {
                 object,
                 property,
                 null_safe,
+                span,
                 ..
             } => {
                 if let Some(result) = self.shared_handle_property_type(
@@ -19885,7 +19933,11 @@ impl<'program> Checker<'program> {
                 } else {
                     result
                 };
-                result
+                if *null_safe {
+                    result
+                } else {
+                    self.flow_narrowed_type(result, result, *span, method_context)
+                }
             }
             Expr::MethodCall {
                 object,

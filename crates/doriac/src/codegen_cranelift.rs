@@ -12484,16 +12484,28 @@ fn lower_nullable_class_expression(
             let slot = local_slot(resources.local_slots, *local)?;
             let ty = local_definition(resources.program, resources.function_id, *local)?.ty;
             let value = load_lowered_from_stack(builder, resources.program, ty, slot, pointer);
+            let dynamic_class = match ty {
+                mir::Type::Class(actual) | mir::Type::NullableClass(actual) => actual,
+                _ => return Err(malformed_mir("nullable class local has another type")),
+            };
+            let (object, descriptor) = value.class_parts()?;
             if *transfer {
                 let zero = builder.ins().iconst(pointer, 0);
                 builder.ins().stack_store(pointer, zero, slot, 0);
-                if class_uses_open_carrier(resources.program, *class) {
+                if class_uses_open_carrier(resources.program, dynamic_class) {
                     builder
                         .ins()
                         .stack_store(pointer, zero, slot, pointer.bytes() as i32);
                 }
             }
-            Ok(value)
+            class_value_for_static_type(
+                builder,
+                object,
+                descriptor,
+                *class,
+                dynamic_class,
+                resources,
+            )
         }
         mir::NullableClassExpression::Property {
             object, property, ..
@@ -12508,9 +12520,20 @@ fn lower_nullable_class_expression(
                 pointer,
             ))
         }
-        mir::NullableClassExpression::Call { function, args, .. } => {
-            lower_function_call(builder, *function, args, resources)?
-                .ok_or_else(|| malformed_mir("nullable-class call produced no result"))
+        mir::NullableClassExpression::Call {
+            class,
+            function,
+            args,
+            ..
+        } => {
+            let value = lower_function_call(builder, *function, args, resources)?
+                .ok_or_else(|| malformed_mir("nullable-class call produced no result"))?;
+            let actual = match function_in(resources.program, *function)?.return_type {
+                mir::ReturnType::Value(mir::Type::NullableClass(actual)) => actual,
+                _ => return Err(malformed_mir("nullable class call has another return type")),
+            };
+            let (object, descriptor) = value.class_parts()?;
+            class_value_for_static_type(builder, object, descriptor, *class, actual, resources)
         }
         mir::NullableClassExpression::NullSafeProperty {
             class,

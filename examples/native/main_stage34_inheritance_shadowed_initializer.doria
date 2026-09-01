@@ -1,0 +1,19 @@
+open class Parent
+{
+    internal string $label = "parent";
+
+    function parentLabel(): string { return $this->label; }
+}
+
+class Child extends Parent
+{
+    internal string $label = "child";
+
+    function childLabel(): string { return $this->label; }
+}
+
+function main(): void
+{
+    let $value = new Child();
+    echo "initializers {$value->parentLabel()} {$value->childLabel()}\n";
+}

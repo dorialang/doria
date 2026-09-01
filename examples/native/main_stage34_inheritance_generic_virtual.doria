@@ -9,5 +9,5 @@ class ChildIdentity extends Identity
 function main(): void
 {
     Identity $identity = new ChildIdentity();
-    echo "generic virtual {$identity->value(42)}\n";
+    echo "generic virtual {$identity->value(42)} {$identity->value("ready")}\n";
 }

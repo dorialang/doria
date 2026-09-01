@@ -189,6 +189,8 @@ function check_stage34_inheritance(string $root): array
         'parser_preserves_open_override_and_generic_parent_syntax',
         'hierarchy_validation_rejects_closed_cycles_invalid_overrides_and_constructor_protocols',
         'error_hierarchy_coverage_and_dynamic_catches_use_ancestor_contracts',
+        'covariant_virtual_returns_and_shadowed_initializers_execute_in_mir',
+        'automatic_effects_are_closed_over_the_entire_virtual_family',
         'deep_hierarchies_and_many_virtual_slots_have_stable_linear_metadata',
     ]);
     $require($paths['mirTests'], $files['mirTests'], [
@@ -200,8 +202,8 @@ function check_stage34_inheritance(string $root): array
     ]);
 
     $examples = glob($root . '/examples/native/main_stage34_inheritance_*.doria');
-    if (!is_array($examples) || count($examples) !== 30) {
-        $failures[] = 'examples/native: Stage 34 requires exactly 30 durable inheritance fixtures';
+    if (!is_array($examples) || count($examples) !== 32) {
+        $failures[] = 'examples/native: Stage 34 requires exactly 32 durable inheritance fixtures';
     } else {
         foreach ($examples as $example) {
             $relative = 'examples/native/' . basename($example);

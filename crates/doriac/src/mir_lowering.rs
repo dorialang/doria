@@ -180,6 +180,19 @@ struct MethodInstanceKey {
     arguments: Vec<GenericArgument>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct VirtualMethodSlotKey {
+    name: String,
+    arguments: Vec<GenericArgument>,
+}
+
+#[derive(Clone, Debug)]
+struct VirtualMethodSlot {
+    key: VirtualMethodSlotKey,
+    contract: mir::FunctionId,
+    implementation: mir::FunctionId,
+}
+
 #[derive(Clone)]
 struct PropertyInitializer {
     class: ClassId,
@@ -1416,7 +1429,9 @@ fn lower_program_impl(
                 let property_id = class_info
                     .properties
                     .iter()
-                    .find(|info| info.name == property.name)
+                    .find(|info| {
+                        info.declaring_class == hierarchy_class.name && info.name == property.name
+                    })
                     .expect("checked hierarchy property has a stable identity")
                     .id;
                 property_initializers.insert(
@@ -1791,6 +1806,7 @@ fn lower_program_impl(
     });
     let entry = selected_entry.unwrap_or(mir::FunctionId(usize::MAX));
     let mut functions = Vec::with_capacity(instances.len());
+    let mut function_instance_arguments = HashMap::new();
     for (((instance, signature), substitutions), closure_plans) in instances
         .iter()
         .zip(callable_signatures)
@@ -1817,6 +1833,7 @@ fn lower_program_impl(
             closure_plans,
             closure_environment_layouts: &closure_environment_layouts,
         };
+        let function_id = signature.id;
         functions.push(lower_function(
             declaration.function,
             signature,
@@ -1830,6 +1847,7 @@ fn lower_program_impl(
             },
             metrics.as_deref_mut(),
         )?);
+        function_instance_arguments.insert(function_id, instance.arguments.clone());
     }
 
     let mut direct_methods = direct_method_ids.iter().collect::<Vec<_>>();
@@ -1907,11 +1925,12 @@ fn lower_program_impl(
     }
     let mut virtual_tables = HashMap::<ClassId, Vec<mir::FunctionId>>::new();
     let mut function_virtual_slots = HashMap::<mir::FunctionId, u32>::new();
+    let mut virtual_return_adapters = HashMap::new();
     for class in &program.semantic_info.classes {
         let mut hierarchy = class.ancestors.iter().rev().collect::<Vec<_>>();
         let concrete = ClassType::new(class.declaration_name.clone(), class.arguments.clone());
         hierarchy.push(&concrete);
-        let mut slots = Vec::<(String, mir::FunctionId)>::new();
+        let mut slots = Vec::<VirtualMethodSlot>::new();
         for hierarchy_class in hierarchy {
             let Some(class_id) = class_ids.get(hierarchy_class).copied() else {
                 continue;
@@ -1931,29 +1950,68 @@ fn lower_program_impl(
                 if !method.is_open && !method.is_override {
                     continue;
                 }
-                let Some(function) = functions.iter().find(|function| {
-                    function.method.as_ref().is_some_and(|identity| {
-                        identity.class == class_id && identity.name == method.name
+                let mut specializations = functions
+                    .iter()
+                    .filter(|function| {
+                        function.method.as_ref().is_some_and(|identity| {
+                            identity.class == class_id && identity.name == method.name
+                        }) && function_instance_arguments.contains_key(&function.id)
                     })
-                }) else {
-                    continue;
-                };
-                let slot = if method.is_override {
-                    slots.iter().position(|(name, _)| name == &method.name)
-                } else {
-                    None
-                };
-                let slot = slot.unwrap_or_else(|| {
-                    slots.push((method.name.clone(), function.id));
-                    slots.len() - 1
-                });
-                slots[slot].1 = function.id;
-                function_virtual_slots.insert(function.id, slot as u32);
+                    .map(|function| function.id)
+                    .collect::<Vec<_>>();
+                specializations.sort_by_key(|function| function.0);
+                for function_id in specializations {
+                    let key = VirtualMethodSlotKey {
+                        name: method.name.clone(),
+                        arguments: function_instance_arguments[&function_id].clone(),
+                    };
+                    let existing = method
+                        .is_override
+                        .then(|| slots.iter().position(|slot| slot.key == key))
+                        .flatten();
+                    let slot = existing.unwrap_or_else(|| {
+                        slots.push(VirtualMethodSlot {
+                            key: key.clone(),
+                            contract: function_id,
+                            implementation: function_id,
+                        });
+                        slots.len() - 1
+                    });
+                    let contract_id = slots[slot].contract;
+                    let implementation_id = if contract_id != function_id
+                        && functions[contract_id.0].return_type
+                            != functions[function_id.0].return_type
+                    {
+                        let adapter_key = (contract_id, function_id);
+                        if let Some(adapter) = virtual_return_adapters.get(&adapter_key) {
+                            *adapter
+                        } else {
+                            let direct = direct_method_ids[&function_id];
+                            let adapter = mir::FunctionId(functions.len());
+                            let contract = functions[contract_id.0].clone();
+                            let implementation = functions[function_id.0].clone();
+                            functions.push(build_virtual_return_adapter(
+                                adapter,
+                                slot as u32,
+                                &contract,
+                                &implementation,
+                                direct,
+                            )?);
+                            virtual_return_adapters.insert(adapter_key, adapter);
+                            adapter
+                        }
+                    } else {
+                        function_id
+                    };
+                    slots[slot].implementation = implementation_id;
+                    function_virtual_slots.insert(function_id, slot as u32);
+                    function_virtual_slots.insert(implementation_id, slot as u32);
+                }
             }
         }
         virtual_tables.insert(
             class.id,
-            slots.into_iter().map(|(_, function)| function).collect(),
+            slots.into_iter().map(|slot| slot.implementation).collect(),
         );
     }
     for function in &mut functions {
@@ -3344,6 +3402,226 @@ fn lower_function(
         blocks,
         entry_block: mir::BlockId(0),
     })
+}
+
+fn build_virtual_return_adapter(
+    id: mir::FunctionId,
+    slot: u32,
+    contract: &mir::Function,
+    implementation: &mir::Function,
+    direct_implementation: mir::FunctionId,
+) -> DiagnosticResult<mir::Function> {
+    let mut locals = Vec::with_capacity(implementation.params.len() + 2);
+    let mut params = Vec::with_capacity(implementation.params.len());
+    for parameter in &implementation.params {
+        let source = implementation
+            .locals
+            .get(parameter.0)
+            .expect("method parameter has a local definition");
+        let local = mir::LocalId(locals.len());
+        let mut definition = source.clone();
+        definition.id = local;
+        locals.push(definition);
+        params.push(local);
+    }
+    let args = params
+        .iter()
+        .enumerate()
+        .map(|(index, local)| {
+            let ty = locals[local.0].ty;
+            let transfer = index != 0
+                && implementation.parameter_modes[index] == mir::FunctionParameterMode::Take
+                && ty.has_move_ownership();
+            local_rvalue(*local, ty, transfer)
+        })
+        .collect::<Vec<_>>();
+    let span = implementation.source_span;
+    let actual = match implementation.return_type {
+        mir::ReturnType::Value(ty) => ty,
+        mir::ReturnType::Void => {
+            return Err(vec![unsupported(
+                span,
+                "a virtual return adapter requires a value-returning implementation",
+            )]);
+        }
+    };
+    let target = match contract.return_type {
+        mir::ReturnType::Value(ty) => ty,
+        mir::ReturnType::Void => {
+            return Err(vec![unsupported(
+                span,
+                "a virtual return adapter requires a value-returning contract",
+            )]);
+        }
+    };
+
+    let blocks = if implementation.checked_effects.is_empty() {
+        vec![mir::BasicBlock {
+            id: mir::BlockId(0),
+            statements: Vec::new(),
+            terminator: mir::Terminator::Return(virtual_adapter_call_result(
+                target,
+                actual,
+                direct_implementation,
+                implementation.return_borrow,
+                args,
+                span,
+            )?),
+        }]
+    } else {
+        if contract.checked_effects.is_empty() {
+            return Err(vec![unsupported(
+                span,
+                "a checked virtual implementation requires checked transport on its root contract",
+            )]);
+        }
+        let result = mir::LocalId(locals.len());
+        locals.push(mir::Local {
+            id: result,
+            name: "__virtual_result".to_string(),
+            ty: actual,
+            writable: true,
+            owned: implementation.return_borrow.is_none() && actual.has_move_ownership(),
+            synthetic: true,
+        });
+        let error = mir::LocalId(locals.len());
+        locals.push(mir::Local {
+            id: error,
+            name: "__virtual_error".to_string(),
+            ty: mir::Type::Error,
+            writable: true,
+            owned: true,
+            synthetic: true,
+        });
+        vec![
+            mir::BasicBlock {
+                id: mir::BlockId(0),
+                statements: Vec::new(),
+                terminator: mir::Terminator::CheckedCall {
+                    function: direct_implementation,
+                    args,
+                    result: Some(result),
+                    error,
+                    success: mir::BlockId(1),
+                    failure: mir::BlockId(2),
+                    span,
+                },
+            },
+            mir::BasicBlock {
+                id: mir::BlockId(1),
+                statements: Vec::new(),
+                terminator: mir::Terminator::Return(virtual_adapter_local_result(
+                    result,
+                    target,
+                    actual,
+                    implementation.return_borrow.is_none(),
+                    span,
+                )?),
+            },
+            mir::BasicBlock {
+                id: mir::BlockId(2),
+                statements: Vec::new(),
+                terminator: mir::Terminator::PropagateError { error },
+            },
+        ]
+    };
+
+    Ok(mir::Function {
+        id,
+        name: format!("{}::<virtual-return-adapter>", implementation.name),
+        source_span: span,
+        method: implementation.method.clone(),
+        virtual_slot: Some(slot),
+        receiver_mode: implementation.receiver_mode,
+        closure: None,
+        params,
+        parameter_modes: implementation.parameter_modes.clone(),
+        return_type: contract.return_type,
+        return_borrow: contract.return_borrow,
+        required_checked_effects: contract.required_checked_effects.clone(),
+        ambient_checked_effects: contract.ambient_checked_effects.clone(),
+        test_assertion_checked_effects: contract.test_assertion_checked_effects.clone(),
+        checked_effects: contract.checked_effects.clone(),
+        locals,
+        blocks,
+        entry_block: mir::BlockId(0),
+    })
+}
+
+fn virtual_adapter_call_result(
+    target: mir::Type,
+    actual: mir::Type,
+    function: mir::FunctionId,
+    return_borrow: Option<mir::ReturnBorrow>,
+    args: Vec<mir::Rvalue>,
+    span: Span,
+) -> DiagnosticResult<mir::Rvalue> {
+    match (target, actual) {
+        (mir::Type::Class(target), mir::Type::Class(_)) => {
+            Ok(mir::Rvalue::Class(mir::ClassExpression::Call {
+                class: target,
+                function,
+                args,
+                return_borrow,
+            }))
+        }
+        (mir::Type::NullableClass(target), mir::Type::NullableClass(_)) => Ok(
+            mir::Rvalue::NullableClass(mir::NullableClassExpression::Call {
+                class: target,
+                function,
+                args,
+                return_borrow,
+            }),
+        ),
+        (mir::Type::NullableClass(target), mir::Type::Class(_)) => Ok(mir::Rvalue::NullableClass(
+            mir::NullableClassExpression::Class(mir::ClassExpression::Call {
+                class: target,
+                function,
+                args,
+                return_borrow,
+            }),
+        )),
+        _ => Err(vec![unsupported(
+            span,
+            "virtual return adaptation requires covariant class return types",
+        )]),
+    }
+}
+
+fn virtual_adapter_local_result(
+    local: mir::LocalId,
+    target: mir::Type,
+    actual: mir::Type,
+    transfer: bool,
+    span: Span,
+) -> DiagnosticResult<mir::Rvalue> {
+    match (target, actual) {
+        (mir::Type::Class(target), mir::Type::Class(_)) => {
+            Ok(mir::Rvalue::Class(mir::ClassExpression::Local {
+                class: target,
+                local,
+                transfer,
+            }))
+        }
+        (mir::Type::NullableClass(target), mir::Type::NullableClass(_)) => Ok(
+            mir::Rvalue::NullableClass(mir::NullableClassExpression::Local {
+                class: target,
+                local,
+                transfer,
+            }),
+        ),
+        (mir::Type::NullableClass(target), mir::Type::Class(_)) => Ok(mir::Rvalue::NullableClass(
+            mir::NullableClassExpression::Class(mir::ClassExpression::Local {
+                class: target,
+                local,
+                transfer,
+            }),
+        )),
+        _ => Err(vec![unsupported(
+            span,
+            "virtual return adaptation requires covariant class return types",
+        )]),
+    }
 }
 
 fn entry_process_body(function: &hir::FunctionDecl, prelude: &[hir::Stmt]) -> hir::Block {
@@ -8491,6 +8769,7 @@ impl<'semantic> LoweringContext<'semantic> {
         self.class_info(class)?
             .properties
             .iter()
+            .rev()
             .find(|property| property.name == name)
     }
 
@@ -12993,6 +13272,7 @@ fn local_rvalue(local: mir::LocalId, ty: mir::Type, transfer: bool) -> mir::Rval
                 collection,
                 local,
                 transfer,
+                assume_non_null: false,
             })
         }
         mir::Type::NullableCollection(collection) => {
@@ -14187,6 +14467,7 @@ fn narrowed_match_local_rvalue(
                 collection: target,
                 local,
                 transfer,
+                assume_non_null: true,
             })
         }
         (mir::Type::NullableSharedReference(source), mir::Type::SharedReference(target))
@@ -18977,6 +19258,7 @@ fn lower_collection_expression(
                 collection: expected,
                 local,
                 transfer,
+                assume_non_null: narrowed_nullable,
             })
         }
         hir::Expr::PropertyAccess { span, .. } => {
@@ -18987,7 +19269,11 @@ fn lower_collection_expression(
                 )]);
             }
             let (object, property, property_type) = lower_property_place(expr, context)?;
-            if property_type != mir::Type::Collection(expected) {
+            if !matches!(
+                property_type,
+                mir::Type::Collection(collection) | mir::Type::NullableCollection(collection)
+                    if collection == expected
+            ) {
                 return Err(vec![unsupported(
                     *span,
                     "collection property does not have the expected collection type",
@@ -18997,6 +19283,7 @@ fn lower_collection_expression(
                 collection: expected,
                 object,
                 property,
+                assume_non_null: matches!(property_type, mir::Type::NullableCollection(_)),
             })
         }
         hir::Expr::MethodCall {
@@ -19405,6 +19692,7 @@ fn lower_nullable_collection_expression(
                             collection: expected,
                             object,
                             property,
+                            assume_non_null: false,
                         },
                     ))
                 }

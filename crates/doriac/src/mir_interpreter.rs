@@ -6202,7 +6202,7 @@ impl Interpreter<'_> {
             }
             EvaluationTask::ReturnValue(expected) => {
                 let value = self.pop_local_value()?;
-                if local_value_type(&value) != expected {
+                if !local_value_matches_type(self.program, expected, &value) {
                     return Err(InterpreterError::new(format!(
                         "MIR return evaluation produced {}, expected {expected}",
                         local_value_type(&value)
@@ -9806,6 +9806,7 @@ impl Interpreter<'_> {
                 collection,
                 local,
                 transfer,
+                ..
             } => {
                 let value = if transfer {
                     self.current_frame_mut()?
@@ -9892,6 +9893,7 @@ impl Interpreter<'_> {
                 collection,
                 object,
                 property,
+                ..
             } => {
                 let LocalValue::Collection(value) = self.read_property(object, property)? else {
                     return Err(InterpreterError::new(
@@ -9903,6 +9905,7 @@ impl Interpreter<'_> {
                         "MIR collection property has another collection type",
                     ));
                 }
+                let value = value.assume_non_null()?;
                 self.current_frame_mut()?
                     .values
                     .push(EvaluationValue::Collection(value));

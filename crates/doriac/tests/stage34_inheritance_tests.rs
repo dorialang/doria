@@ -181,10 +181,50 @@ function main(): void
         "open class A { open function f(int $x): int { return $x; } } class B extends A { override function f(take int $x): int { return $x; } }",
         "open class A { open function f(int $x): int { return $x; } } class B extends A { override function f(int $y): int { return $y; } }",
         "open class A { open function f(): A { return new A(); } } class B extends A { override function f(): mixed { return 1; } }",
+        "open class A { open function f(): mixed { return 1; } } class B extends A { override function f(): int { return 1; } }",
+        "open class A { open function f(): ?A { return null; } } class B extends A { override function f(): B { return new B(); } }",
         "open class A { open function f(): void {} } class B extends A { override writable function f(): void {} }",
     ] {
         assert_diagnostic(source, "E0729");
     }
+}
+
+#[test]
+fn covariant_virtual_returns_and_shadowed_initializers_execute_in_mir() {
+    let covariant =
+        include_str!("../../../examples/native/main_stage34_inheritance_covariant_virtual.doria");
+    assert_eq!(interpret(covariant).stdout, b"covariant dog dog\n");
+
+    let initializers = include_str!(
+        "../../../examples/native/main_stage34_inheritance_shadowed_initializer.doria"
+    );
+    assert_eq!(
+        interpret(initializers).stdout,
+        b"initializers parent child\n"
+    );
+}
+
+#[test]
+fn automatic_effects_are_closed_over_the_entire_virtual_family() {
+    let source =
+        include_str!("../../../examples/native/main_stage34_inheritance_ambient_virtual.doria");
+    let program = doriac::lower_source_to_mir("ambient-virtual.doria", source)
+        .expect("automatic effects on an override must reach the root dispatch contract");
+    let profiles = program
+        .functions
+        .iter()
+        .filter(|function| {
+            function.virtual_slot.is_some()
+                && function
+                    .method
+                    .as_ref()
+                    .is_some_and(|method| method.name == "report")
+        })
+        .map(|function| function.checked_effects.clone())
+        .collect::<Vec<_>>();
+    assert!(profiles.len() >= 2);
+    assert!(!profiles[0].is_empty(), "{profiles:?}");
+    assert!(profiles.iter().all(|profile| profile == &profiles[0]));
 }
 
 #[test]
