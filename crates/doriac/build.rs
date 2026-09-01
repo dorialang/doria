@@ -112,7 +112,7 @@ fn main() {
     // Letting cargo resolve the runtime removes the guess rather than improving
     // it. Cargo knows the features `doria-rt` declares and the explicitly
     // requested profile, and it writes each archive to exactly one path.
-    let runtime_target_dir = out_dir.join("doria-rt-target");
+    let runtime_target_dir = runtime_target_dir(&out_dir);
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
     for profile in ["debug", "release"] {
         let output = out_dir.join("doria-rt").join(profile).join(filename);
@@ -133,6 +133,26 @@ fn main() {
             output.display()
         );
     }
+}
+
+/// Keep the nested Cargo target separate from the outer build's lock while
+/// avoiding another complete target tree below Cargo's already-deep `OUT_DIR`.
+/// The latter reaches Windows' legacy 260-character boundary in ordinary
+/// source checkout paths before a dependency build script can be linked.
+fn runtime_target_dir(out_dir: &Path) -> PathBuf {
+    let profile_dir = out_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .unwrap_or_else(|| panic!("unexpected Cargo OUT_DIR layout: {}", out_dir.display()));
+    let target_or_triple_dir = profile_dir.parent().unwrap_or_else(|| {
+        panic!(
+            "Cargo profile has no target parent: {}",
+            profile_dir.display()
+        )
+    });
+
+    target_or_triple_dir.join("doria-rt")
 }
 
 #[allow(clippy::too_many_arguments)]
