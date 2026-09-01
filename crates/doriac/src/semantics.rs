@@ -149,6 +149,9 @@ pub struct SemanticInfo {
     pub(crate) constrained_display_calls: HashSet<Span>,
     /// Stable nominal class identities and the total Stage 19 property order.
     pub classes: Vec<ClassSemanticInfo>,
+    /// Declaration-level hierarchy facts for every class, including generic
+    /// classes that have not yet been instantiated in executable code.
+    pub class_hierarchy: HashMap<Span, ClassHierarchySemanticInfo>,
     /// Stable nominal enum identities and declaration-order case metadata.
     pub enums: Vec<EnumSemanticInfo>,
     /// Values produced by the bounded Stage 20 constant evaluator.
@@ -388,6 +391,16 @@ pub struct ClassSemanticInfo {
     pub ancestors: Vec<ClassType<ResolvedType>>,
     pub builtin_interfaces: Vec<BuiltinInterface>,
     pub properties: Vec<PropertySemanticInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClassHierarchySemanticInfo {
+    pub declaration: Span,
+    pub name: String,
+    pub is_open: bool,
+    pub generic_parameter_count: usize,
+    pub parent: Option<ClassType<ResolvedType>>,
+    pub ancestors: Vec<String>,
 }
 
 impl ClassSemanticInfo {
@@ -834,6 +847,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     let closure_ownership = ownership_analysis.closures;
     let return_borrows = ownership_analysis.return_borrows;
     checker.diagnostics.extend(ownership_analysis.diagnostics);
+    let class_hierarchy = collect_class_hierarchy_semantics(&checker);
     let method_hierarchy = collect_method_hierarchy_semantics(&checker);
     let classes = collect_ordered_class_semantics(program, &mut checker);
     let enums = collect_ordered_enum_semantics(&checker);
@@ -888,6 +902,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             generic_call_specializations: checker.generic_call_specializations,
             constrained_display_calls: checker.constrained_display_calls,
             classes,
+            class_hierarchy,
             enums,
             const_evaluation: checker.const_evaluation,
             parameter_defaults: checker.parameter_defaults,
@@ -991,6 +1006,52 @@ fn collect_method_hierarchy_semantics(
                     },
                 )
             })
+        })
+        .collect()
+}
+
+fn collect_class_hierarchy_semantics(
+    checker: &Checker<'_>,
+) -> HashMap<Span, ClassHierarchySemanticInfo> {
+    checker
+        .classes
+        .iter()
+        .map(|(class_name, class)| {
+            let parent = class.parent.as_ref().map(|parent| {
+                ClassType::new(
+                    parent.name.clone(),
+                    parent
+                        .arguments
+                        .iter()
+                        .map(|argument| checker.types.resolved(*argument))
+                        .collect(),
+                )
+            });
+            let mut ancestors = Vec::new();
+            let mut current = class.parent.as_ref().map(|parent| parent.name.as_str());
+            let mut visited = HashSet::new();
+            while let Some(name) = current {
+                if !visited.insert(name) {
+                    break;
+                }
+                ancestors.push(name.to_string());
+                current = checker
+                    .classes
+                    .get(name)
+                    .and_then(|ancestor| ancestor.parent.as_ref())
+                    .map(|parent| parent.name.as_str());
+            }
+            (
+                class.declaration,
+                ClassHierarchySemanticInfo {
+                    declaration: class.declaration,
+                    name: class_name.clone(),
+                    is_open: class.is_open,
+                    generic_parameter_count: class.type_params.len(),
+                    parent,
+                    ancestors,
+                },
+            )
         })
         .collect()
 }

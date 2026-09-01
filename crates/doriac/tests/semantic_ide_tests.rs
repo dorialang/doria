@@ -132,6 +132,8 @@ class Leaf extends Middle
     override function value(int $input): int { return $input + 1; }
     function run(): int { return $this->value(); }
 }
+
+open class Generic<T> {}
 "#;
     let program = doriac::parse_source("hierarchy.doria", source).expect("source should parse");
     let root = method_declaration_span(&program, "Root", "value");
@@ -144,6 +146,23 @@ class Leaf extends Middle
         "{:#?}",
         analysis.diagnostics
     );
+    let generic = analysis
+        .info
+        .class_hierarchy
+        .values()
+        .find(|class| class.name == "Generic")
+        .expect("uninstantiated generic class hierarchy fact");
+    assert!(generic.is_open);
+    assert_eq!(generic.generic_parameter_count, 1);
+    assert!(generic.parent.is_none());
+    let leaf_class = analysis
+        .info
+        .class_hierarchy
+        .values()
+        .find(|class| class.name == "Leaf")
+        .expect("derived class hierarchy fact");
+    assert_eq!(leaf_class.ancestors, ["Middle", "Root"]);
+
     let root_info = &analysis.info.method_hierarchy[&root];
     assert!(root_info.is_open);
     assert!(!root_info.is_override);
