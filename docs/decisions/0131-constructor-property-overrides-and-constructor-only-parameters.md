@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Accepted:** 2026-09-02
-- **Implementation Status:** In Progress By Post-Stage-34 Constructor Parameter Roles Corrective Beat
+- **Implementation Status:** Implemented By Post-Stage-34 Constructor Parameter Roles Corrective Beat
 - **Amends:** Decisions 0080, 0081, 0083, 0086, 0089, 0090, 0098, 0122, 0125, and 0130
 
 ## Context

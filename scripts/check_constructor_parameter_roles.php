@@ -56,6 +56,7 @@ function check_constructor_parameter_roles(string $root): array
     $require($paths['decision'], $files['decision'], [
         '# Decision 0131:',
         '**Status:** Accepted',
+        '**Implementation Status:** Implemented By Post-Stage-34 Constructor Parameter Roles Corrective Beat',
         '`parameter` is a reserved keyword',
         '`param` remains an identifier',
         'zero object fields',
@@ -108,13 +109,15 @@ function check_constructor_parameter_roles(string $root): array
     $require($paths['metadata'], $files['metadata'], ['schema version 1', 'schema version 2', 'schema version 3']);
     $require($paths['plan'], $files['plan'], [
         'Constructor Parameter Roles',
+        'Constructor Parameter Roles Corrective Beat — Complete',
         'Indexed Foreach And Scalar Display',
         'decision remains unauthored',
         'Stage 35 — Interfaces And Traits — Next',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
-        'Constructor Parameter Roles Corrective Beat',
+        'Constructor Parameter Roles Corrective Beat — Complete.',
+        'Indexed Foreach And Scalar Display Corrective Beat — Next.',
         'Stage 35 Interfaces And Traits — Next.',
     ]);
     $forbid($paths['decision'], $files['decision'], [
@@ -122,6 +125,14 @@ function check_constructor_parameter_roles(string $root): array
         'runtime reflection is required',
         'Stage 35 is implemented',
     ]);
+    foreach (['decision', 'plan', 'pipeline'] as $key) {
+        $forbid($paths[$key], $files[$key], [
+            'Compiler Complete; Tooling Pending',
+            'compiler-complete and tooling-pending',
+            'Next After Tooling Closure',
+            'Next after tooling closure',
+        ]);
+    }
     if (glob($root . '/docs/decisions/0132-*.md') !== []) {
         $failures[] = 'docs/decisions: Decision 0132 must remain unused during this corrective beat';
     }
