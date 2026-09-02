@@ -4072,11 +4072,12 @@ fn emit_class(
             continue;
         };
         let callable_plan = scopes.closure_plan.callable_definition(method.span);
+        let manual_promotions = class_decl.parent.is_some() && method.name == "__construct";
         for (index, parameter) in method.params.iter().enumerate() {
             let Some(access) = parameter.constructor_role.promoted_access() else {
                 continue;
             };
-            if !callable_parameter_uses_cell(callable_plan, index) {
+            if !manual_promotions && !callable_parameter_uses_cell(callable_plan, index) {
                 continue;
             }
             writeln(
@@ -4720,7 +4721,7 @@ fn emit_function(
                 emit_const_value(default, &semantic_info.const_evaluation)
             ),
         );
-        if param.constructor_role.is_promoted() {
+        if param.constructor_role.is_promoted() && !manual_promotions {
             writeln(
                 output,
                 body_indent + 1,
@@ -4747,7 +4748,7 @@ fn emit_function(
                 ),
             );
         }
-        if param.constructor_role.is_promoted() && (uses_cell || manual_promotions) {
+        if param.constructor_role.is_promoted() && uses_cell && !manual_promotions {
             let value = if uses_cell && param.take && resolved_type_ref_is_function(&param.ty) {
                 format!("__doria_take_cell(${})", param.name)
             } else if uses_cell {
@@ -4781,6 +4782,26 @@ fn emit_function(
             );
         } else {
             writeln(output, body_indent, "parent::__construct();");
+        }
+    }
+    if manual_promotions {
+        for (index, param) in function.params.iter().enumerate() {
+            if !param.constructor_role.is_promoted() {
+                continue;
+            }
+            let uses_cell = callable_parameter_uses_cell(callable_plan.as_ref(), index);
+            let value = if uses_cell && param.take && resolved_type_ref_is_function(&param.ty) {
+                format!("__doria_take_cell(${})", param.name)
+            } else if uses_cell {
+                format!("${}->value", param.name)
+            } else {
+                format!("${}", param.name)
+            };
+            writeln(
+                output,
+                body_indent,
+                &format!("$this->{} = {value};", param.name),
+            );
         }
     }
     for (name, initializer) in property_initializers {

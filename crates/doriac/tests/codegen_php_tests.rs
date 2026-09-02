@@ -3894,7 +3894,7 @@ class Child extends Base
 {
     string $normalized;
 
-    function __construct(override string $title, parameter string $raw)
+    function __construct(override string $title, parameter string $raw, string $category)
     {
         parent::__construct($title);
         $this->normalized = $raw;
@@ -3903,14 +3903,24 @@ class Child extends Base
 
 function main(): void
 {
-    let $child = new Child("title", "value");
+    let $child = new Child("title", "value", "article");
 }
 "#;
     let php = doriac::compile_source_to_php("constructor-roles.doria", source)
         .expect("constructor roles should compile to PHP");
     assert!(php.contains("class Child extends Base"));
-    assert!(php.contains("public function __construct(string $title, string $raw)"));
+    assert!(
+        php.contains("public function __construct(string $title, string $raw, string $category)")
+    );
+    assert!(php.contains("public string $category;"));
     assert!(php.contains("parent::__construct($title);"));
+    let parent_call = php
+        .find("parent::__construct($title);")
+        .expect("parent constructor call");
+    let child_promotion = php
+        .find("$this->category = $category;")
+        .expect("manual child promotion");
+    assert!(parent_call < child_promotion);
     assert!(!php.contains("public string $raw"));
     assert_eq!(php.matches("public string $title").count(), 1);
 }
