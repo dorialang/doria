@@ -4260,7 +4260,16 @@ impl<'program> Checker<'program> {
             span,
         )
         .with_title("Override Parameter Has No Property Target")
-        .with_help("remove `override` or name an inherited external instance property");
+        .with_help("remove `override` or name an inherited external instance property")
+        .with_structured_fix(
+            "Remove The Invalid Override",
+            FixApplicability::MachineApplicable,
+            vec![FixEdit {
+                source: DiagnosticSource::Current,
+                span,
+                replacement: String::new(),
+            }],
+        );
         if let Some(conflicting_member) = conflicting_member {
             diagnostic = diagnostic.with_related(
                 conflicting_member,

@@ -1471,7 +1471,19 @@ impl Parser {
                 )
                 .with_title("Constructor Parameter Role Is Duplicated")
                 .with_help("remove the duplicate role marker")
-                .with_fix(duplicate.span, ""),
+                .with_structured_fix(
+                    "Remove Duplicate Role Markers",
+                    FixApplicability::MachineApplicable,
+                    authored_roles
+                        .iter()
+                        .skip(1)
+                        .map(|role| FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: role.span,
+                            replacement: String::new(),
+                        })
+                        .collect(),
+                ),
             );
         } else if authored_roles.len() > 1 {
             let span = authored_roles
@@ -1521,6 +1533,118 @@ impl Parser {
                 parameter_span: authored_roles[0].span,
             };
         }
+        let ownership_modifier_insert = self.span(self.peek().span.start, self.peek().span.start);
+        let mut take_span = None;
+        let mut writable_span = None;
+        while self.check(&TokenKind::Take) || self.check(&TokenKind::Writable) {
+            let token = self.advance().clone();
+            match token.kind {
+                TokenKind::Take if take_span.is_none() => take_span = Some(token.span),
+                TokenKind::Writable if writable_span.is_none() => writable_span = Some(token.span),
+                TokenKind::Take => self.error("duplicate `take` parameter modifier", token.span),
+                TokenKind::Writable => {
+                    self.error("duplicate `writable` parameter modifier", token.span)
+                }
+                _ => unreachable!("modifier loop accepts only take/writable"),
+            }
+        }
+        if matches!(
+            self.peek().kind,
+            TokenKind::Internal | TokenKind::Override | TokenKind::Parameter
+        ) {
+            let misplaced = self.advance().clone();
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0740",
+                    "a constructor parameter role must precede its ownership mode",
+                    misplaced.span,
+                )
+                .with_title("Constructor Parameter Role Is Misordered")
+                .with_help(
+                    "write attributes, then the role, then `writable` or `take`, then the type",
+                )
+                .with_structured_fix(
+                    "Move The Role Before The Ownership Mode",
+                    FixApplicability::MachineApplicable,
+                    vec![
+                        FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: ownership_modifier_insert,
+                            replacement: format!("{} ", token_name(&misplaced.kind)),
+                        },
+                        FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: misplaced.span,
+                            replacement: String::new(),
+                        },
+                    ],
+                ),
+            );
+            constructor_role = match misplaced.kind {
+                TokenKind::Internal => ConstructorParameterRole::Promoted {
+                    access: MemberAccess::Internal,
+                    access_span: Some(misplaced.span),
+                },
+                TokenKind::Override => ConstructorParameterRole::InheritedPropertyOverride {
+                    override_span: misplaced.span,
+                },
+                TokenKind::Parameter => ConstructorParameterRole::ConstructorOnly {
+                    parameter_span: misplaced.span,
+                },
+                _ => unreachable!("misplaced role token is exact"),
+            };
+        }
+        if self.check(&TokenKind::AttributeOpen) {
+            self.reject_attribute_after_modifier(self.peek().span);
+            let _ = self.parse_attribute_groups();
+        }
+        let type_start = self.peek().span.start;
+        let ty = self.parse_type_ref()?;
+        let type_span = self.span(type_start, self.previous().span.end);
+        if matches!(
+            self.peek().kind,
+            TokenKind::Internal | TokenKind::Override | TokenKind::Parameter
+        ) {
+            let misplaced = self.advance().clone();
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0740",
+                    "a constructor parameter role must precede its type",
+                    misplaced.span,
+                )
+                .with_title("Constructor Parameter Role Is Misordered")
+                .with_help("write the role before the parameter mode and type")
+                .with_structured_fix(
+                    "Move The Role Before The Parameter Type",
+                    FixApplicability::MachineApplicable,
+                    vec![
+                        FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: ownership_modifier_insert,
+                            replacement: format!("{} ", token_name(&misplaced.kind)),
+                        },
+                        FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: misplaced.span,
+                            replacement: String::new(),
+                        },
+                    ],
+                ),
+            );
+            constructor_role = match misplaced.kind {
+                TokenKind::Internal => ConstructorParameterRole::Promoted {
+                    access: MemberAccess::Internal,
+                    access_span: Some(misplaced.span),
+                },
+                TokenKind::Override => ConstructorParameterRole::InheritedPropertyOverride {
+                    override_span: misplaced.span,
+                },
+                TokenKind::Parameter => ConstructorParameterRole::ConstructorOnly {
+                    parameter_span: misplaced.span,
+                },
+                _ => unreachable!("misplaced role token is exact"),
+            };
+        }
         if !is_constructor {
             match constructor_role {
                 ConstructorParameterRole::Promoted {
@@ -1566,86 +1690,6 @@ impl Parser {
                 } => {}
             }
             constructor_role = ConstructorParameterRole::Ordinary;
-        }
-        let ownership_modifier_insert = self.span(self.peek().span.start, self.peek().span.start);
-        let mut take_span = None;
-        let mut writable_span = None;
-        while self.check(&TokenKind::Take) || self.check(&TokenKind::Writable) {
-            let token = self.advance().clone();
-            match token.kind {
-                TokenKind::Take if take_span.is_none() => take_span = Some(token.span),
-                TokenKind::Writable if writable_span.is_none() => writable_span = Some(token.span),
-                TokenKind::Take => self.error("duplicate `take` parameter modifier", token.span),
-                TokenKind::Writable => {
-                    self.error("duplicate `writable` parameter modifier", token.span)
-                }
-                _ => unreachable!("modifier loop accepts only take/writable"),
-            }
-        }
-        if matches!(
-            self.peek().kind,
-            TokenKind::Internal | TokenKind::Override | TokenKind::Parameter
-        ) {
-            let misplaced = self.advance().clone();
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0740",
-                    "a constructor parameter role must precede its ownership mode",
-                    misplaced.span,
-                )
-                .with_title("Constructor Parameter Role Is Misordered")
-                .with_help(
-                    "write attributes, then the role, then `writable` or `take`, then the type",
-                ),
-            );
-            constructor_role = match misplaced.kind {
-                TokenKind::Internal => ConstructorParameterRole::Promoted {
-                    access: MemberAccess::Internal,
-                    access_span: Some(misplaced.span),
-                },
-                TokenKind::Override => ConstructorParameterRole::InheritedPropertyOverride {
-                    override_span: misplaced.span,
-                },
-                TokenKind::Parameter => ConstructorParameterRole::ConstructorOnly {
-                    parameter_span: misplaced.span,
-                },
-                _ => unreachable!("misplaced role token is exact"),
-            };
-        }
-        if self.check(&TokenKind::AttributeOpen) {
-            self.reject_attribute_after_modifier(self.peek().span);
-            let _ = self.parse_attribute_groups();
-        }
-        let type_start = self.peek().span.start;
-        let ty = self.parse_type_ref()?;
-        let type_span = self.span(type_start, self.previous().span.end);
-        if matches!(
-            self.peek().kind,
-            TokenKind::Internal | TokenKind::Override | TokenKind::Parameter
-        ) {
-            let misplaced = self.advance().clone();
-            self.diagnostics.push(
-                Diagnostic::new(
-                    "E0740",
-                    "a constructor parameter role must precede its type",
-                    misplaced.span,
-                )
-                .with_title("Constructor Parameter Role Is Misordered")
-                .with_help("write the role before the parameter mode and type"),
-            );
-            constructor_role = match misplaced.kind {
-                TokenKind::Internal => ConstructorParameterRole::Promoted {
-                    access: MemberAccess::Internal,
-                    access_span: Some(misplaced.span),
-                },
-                TokenKind::Override => ConstructorParameterRole::InheritedPropertyOverride {
-                    override_span: misplaced.span,
-                },
-                TokenKind::Parameter => ConstructorParameterRole::ConstructorOnly {
-                    parameter_span: misplaced.span,
-                },
-                _ => unreachable!("misplaced role token is exact"),
-            };
         }
         if self.match_kind(&TokenKind::Ampersand) {
             self.error(

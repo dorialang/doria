@@ -1,5 +1,5 @@
 use doriac::ast::{ClassMember, ConstructorParameterRole, Item};
-use doriac::diagnostics::FixApplicability;
+use doriac::diagnostics::{DiagnosticFix, FixApplicability};
 use doriac::lexer::TokenKind;
 use doriac::mir;
 use doriac::types::ResolvedType;
@@ -27,6 +27,16 @@ fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
 
 fn source_text(source: &str, span: doriac::source::Span) -> &str {
     &source[span.start..span.end]
+}
+
+fn apply_fix(source: &str, fix: &DiagnosticFix) -> String {
+    let mut result = source.to_string();
+    let mut edits = fix.edits.clone();
+    edits.sort_by_key(|edit| std::cmp::Reverse((edit.span.start, edit.span.end)));
+    for edit in edits {
+        result.replace_range(edit.span.start..edit.span.end, &edit.replacement);
+    }
+    result
 }
 
 #[test]
@@ -334,6 +344,20 @@ fn constructor_parameter_role_diagnostics_are_causal_and_actionable() {
     );
     assert_eq!(diagnostic.fixes[1].edits[0].replacement, "parameter ");
 
+    let invalid_override = "class A { function __construct(override string $name) {} }";
+    let invalid_override_diagnostic = diagnostics(invalid_override)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "E0741")
+        .expect("invalid override diagnostic");
+    assert_eq!(invalid_override_diagnostic.fixes.len(), 1);
+    assert_eq!(
+        invalid_override_diagnostic.fixes[0].applicability,
+        FixApplicability::MachineApplicable
+    );
+    let corrected = apply_fix(invalid_override, &invalid_override_diagnostic.fixes[0]);
+    doriac::check_source("stage34.doria", corrected)
+        .expect("removing an invalid override must produce valid promotion syntax");
+
     for (source, code) in [
         ("class A { function __construct(override string $name) {} }", "E0741"),
         ("open class A { function __construct(string $name) {} } class B extends A { function __construct(override int $name) { parent::__construct(\"x\"); } }", "E0742"),
@@ -347,6 +371,58 @@ fn constructor_parameter_role_diagnostics_are_causal_and_actionable() {
     ] {
         assert_diagnostic(source, code);
     }
+}
+
+#[test]
+fn constructor_parameter_role_recovery_and_fixes_are_complete() {
+    let ordinary = "function f(take parameter string $value): void {}";
+    let ordinary_diagnostics = diagnostics(ordinary);
+    assert!(
+        ordinary_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0740"),
+        "the authored order remains independently actionable"
+    );
+    assert!(
+        ordinary_diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.code == "E0737"),
+        "a misplaced role must still be rejected outside constructors"
+    );
+
+    for source in [
+        "class A { function __construct(writable parameter int $value) {} }",
+        "class A { function __construct(int parameter $value) {} }",
+    ] {
+        let diagnostic = diagnostics(source)
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "E0740")
+            .expect("misordered role diagnostic");
+        assert_eq!(diagnostic.fixes.len(), 1);
+        assert_eq!(
+            diagnostic.fixes[0].applicability,
+            FixApplicability::MachineApplicable
+        );
+        assert_eq!(diagnostic.fixes[0].edits.len(), 2);
+        let corrected = apply_fix(source, &diagnostic.fixes[0]);
+        doriac::check_source("stage34.doria", corrected)
+            .expect("the structured role move must resolve the diagnostic");
+    }
+
+    let repeated = "class A { function __construct(parameter parameter parameter int $value) {} }";
+    let diagnostic = diagnostics(repeated)
+        .into_iter()
+        .find(|diagnostic| diagnostic.code == "E0744")
+        .expect("duplicate role diagnostic");
+    assert_eq!(diagnostic.fixes.len(), 1);
+    assert_eq!(
+        diagnostic.fixes[0].applicability,
+        FixApplicability::MachineApplicable
+    );
+    assert_eq!(diagnostic.fixes[0].edits.len(), 2);
+    let corrected = apply_fix(repeated, &diagnostic.fixes[0]);
+    doriac::check_source("stage34.doria", corrected)
+        .expect("the duplicate-role fix must remove every redundant marker");
 }
 
 #[test]
