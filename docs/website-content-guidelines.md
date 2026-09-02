@@ -122,5 +122,8 @@ Guardrails:
 
 - Prefer `function __construct(string $name) { }` over declaring `string $name;` and assigning `$this->name = $name;`.
 - Use promoted modifiers such as `writable`, `internal`, and `internal writable` to teach mutability and API surface.
-- Use manual constructor assignment only when the stored property has a different name, or when the constructor validates, normalizes, transforms, or accepts ownership into a differently named field.
+- Teach `override string $title` when a derived constructor reuses an inherited external property; keep the explicit first `parent::__construct($title)` call.
+- Teach `parameter string $raw` when an input exists only during construction, including manual validation or transformation into an explicit property.
+- Use manual constructor assignment only with `parameter` when the stored property has a different name, or when the constructor validates, normalizes, transforms, or accepts ownership into a differently named field.
+- Do not rename a child parameter merely to evade an inherited-property collision; role markers express the semantic intent without hidden storage.
 - Do not use PHP visibility modifiers such as `public`, `private`, or `protected` in Doria examples.

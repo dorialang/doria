@@ -63,3 +63,9 @@ Lexer/parser (accept `name:` at call sites, per §0 two-clocks), semantic analys
 - 0086's note that required-after-optional waits on named arguments — the enabling feature now exists.
 - 0095's deferral target "the named-arguments slice" — is Stage 23a; variadics remain deferred *from* it.
 - Any assumption that Stage 32 attributes will define their own named-argument syntax.
+
+## Post-Stage-34 Constructor-Role Amendment
+
+Decision 0131 preserves constructor parameter names as named-argument API for
+all roles. `override` and `parameter` do not remove parameters from binding and
+do not infer or synthesize parent-constructor forwarding.

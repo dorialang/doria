@@ -171,3 +171,10 @@ Decision 0130 preserves these write capabilities independently in every
 root-to-derived constructor phase. Inherited writable paths retain their
 declaring property identity, and replacement still acquires the new value
 before dropping the old one.
+
+## Post-Stage-34 Constructor-Role Amendment
+
+Decision 0131 creates no implicit writable path for an override parameter. The
+root inherited property keeps its original mutability, and a constructor-only
+parameter may initialize or replace an explicit property only through the same
+checked explicit write rules defined here.

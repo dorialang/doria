@@ -78,10 +78,15 @@ static methods, and class constants participate in inherited lookup.
 Constructors and destructors use the lifecycle protocol instead of ordinary
 inheritance.
 
-An inherited external property, constant, static member, or nonopen instance
-method cannot be hidden or redeclared. An inherited open method can be replaced
-only by a valid override. Doria's single member namespace remains in force
-across member kinds.
+An inherited external property cannot be hidden and cannot gain duplicate
+storage. Decision 0131 permits a compatible constructor parameter marked
+`override` to redeclare the inherited-property relationship while the root
+property remains the one logical member and physical storage slot. This is
+compile-time property-family metadata, not virtual property dispatch. Constants,
+static members, nonopen instance methods, incompatible properties, and explicit
+class-body property redeclarations still cannot be hidden or redeclared. An
+inherited open method can be replaced only by a valid method override. Doria's
+single member namespace remains in force across member kinds.
 
 An `internal` member is visible only to its declaring class. It is not
 inherited-visible, cannot be accessed or overridden by a child, and cannot be
@@ -294,7 +299,7 @@ controlled timing evidence remains nonblocking.
 
 This decision does not implement interfaces, traits, `uses`, abstract members,
 multiple inheritance, `protected`, `final`, `sealed`, `static::`, unchecked
-casts, property overriding, property hooks, attribute inheritance, runtime
+casts, class-body or virtual property overriding, property hooks, attribute inheritance, runtime
 reflection, generic variance, default generic arguments, stable separately
 compiled class ABI, or Stage 35/35a behavior.
 

@@ -67,7 +67,12 @@ replacement is explicit with `override function`. Construction runs parent
 phases before child phases, destruction runs child phases before parents, and
 `parent::member()` names the immediate parent implementation directly. Upcasts
 are implicit and allocation-free, while `is` and `match` perform checked
-hierarchy narrowing. Closed exact values keep the compact one-word class
+hierarchy narrowing. Constructor promotion remains the concise default. A
+derived constructor uses `override string $title` to reuse one inherited property
+and still calls `parent::__construct($title)` explicitly; it uses
+`parameter string $raw` when an input should exist only during construction.
+Neither form creates hidden duplicate storage, and actual property hiding remains
+an error. Closed exact values keep the compact one-word class
 representation; open static types carry dynamic hierarchy identity without
 adding a header to each object. See
 [`docs/class-inheritance.md`](docs/class-inheritance.md).

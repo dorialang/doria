@@ -1072,7 +1072,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                         &param.ty,
                                         &class.type_params,
                                     );
-                                    if param.promoted_access.is_some() {
+                                    if param.constructor_role.is_promoted() {
                                         properties.insert(
                                             (class.name.clone(), param.name.clone()),
                                             PropertyInfo {
@@ -2060,7 +2060,7 @@ impl Checker<'_> {
                     borrowed_place: !param.take,
                     borrow_root: None,
                     writable: param.writable,
-                    state: if param.take && param.promoted_access.is_some() {
+                    state: if param.take && param.constructor_role.is_promoted() {
                         State::Given { at: param.span }
                     } else if param.take {
                         State::Owned

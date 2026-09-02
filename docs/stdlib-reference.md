@@ -1,5 +1,10 @@
 # Standard library reference — the planned surface
 
+Constructor parameter roles are core-language syntax, not standard-library
+members. `parameter` is a keyword and `param` is not an alias. Attribute-class
+schema binding continues to include promoted, override, and constructor-only
+callable parameters without executing their constructors.
+
 > Documentation role: the at-a-glance catalogue of Doria's **core** and **standard-library** surface — every companion, interface, collection, free function, and `Doria\Std\*` module, with its purpose and known member surface. This is the *inventory*; the end-to-end plan §9 owns the *direction and rationale*, and each decision record owns the *precise contract*. Both are linked from every entry. This is the **planned** surface: some members are settled in a record, others are marked *(surface TBD in …)* until their decision is authored. It grows as decisions land — keep it in sync when a stdlib record is authored or amended.
 
 Two layers (plan §9): **core** (no I/O, always available) and **std** (hosted under the reserved `Doria\Std` namespace, per the namespace-model decision). Both are written in Doria as early as self-hosting allows.

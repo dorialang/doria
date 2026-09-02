@@ -303,3 +303,11 @@ Decision 0130 keeps attributes authored-only: parent class and method
 attributes are not copied onto descendants or overrides. Metadata schemas 1,
 2, and 3 and processor protocol version 1 remain exact; hierarchy descriptors,
 slots, offsets, thunks, and private type IDs are not public metadata.
+
+## Post-Stage-34 Constructor-Role Amendment
+
+Decision 0131 keeps one authored application per parameter. Actual promotion
+retains `Parameter` plus `PromotedProperty`; constructor-only and inherited-
+property override parameters carry `Parameter` only. Their names, types, and
+defaults remain attribute-schema inputs. Metadata schemas 1, 2, and 3 and
+processor protocol version 1 remain unchanged.

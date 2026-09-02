@@ -1,5 +1,7 @@
 use crate::ast::*;
-use crate::diagnostics::{Diagnostic, DiagnosticResult};
+use crate::diagnostics::{
+    Diagnostic, DiagnosticResult, DiagnosticSource, FixApplicability, FixEdit,
+};
 use crate::lexer::{Lexer, StringQuoteKind, Token, TokenKind};
 use crate::source::{NameSegmentRef, QualifiedNameRef, SourceFile, SourceId, Span};
 use crate::string_literal::{decode_escape, interpolation_close};
@@ -25,6 +27,17 @@ struct ParserCheckpoint {
     qualified_names_len: usize,
     attributes_len: usize,
     diagnostics_len: usize,
+}
+
+#[derive(Clone, Copy)]
+struct FunctionModifiers {
+    access: MemberAccess,
+    open_span: Option<Span>,
+    override_span: Option<Span>,
+    writable_span: Option<Span>,
+    static_span: Option<Span>,
+    start_span: Span,
+    is_member: bool,
 }
 
 impl Parser {
@@ -487,14 +500,15 @@ impl Parser {
                 .is_some_and(Self::is_callable_name_token)
         {
             self.advance();
-            self.parse_function_with_modifiers(
-                MemberAccess::External,
+            self.parse_function_with_modifiers(FunctionModifiers {
+                access: MemberAccess::External,
                 open_span,
                 override_span,
-                None,
-                None,
-                self.span(declaration_start, self.previous().span.end),
-            )
+                writable_span: None,
+                static_span: None,
+                start_span: self.span(declaration_start, self.previous().span.end),
+                is_member: false,
+            })
             .map(Item::Function)
         } else if self.match_kind(&TokenKind::Const) {
             self.reject_type_modifier(open_span, override_span, "a constant");
@@ -848,14 +862,15 @@ impl Parser {
                 .is_some_and(Self::is_callable_name_token)
         {
             self.advance();
-            self.parse_function_with_modifiers(
-                MemberAccess::Internal,
+            self.parse_function_with_modifiers(FunctionModifiers {
+                access: MemberAccess::Internal,
                 open_span,
                 override_span,
-                None,
-                None,
-                internal_span.merge(self.previous().span),
-            )
+                writable_span: None,
+                static_span: None,
+                start_span: internal_span.merge(self.previous().span),
+                is_member: false,
+            })
             .map(Item::Function)
         } else if self.match_kind(&TokenKind::Const) {
             self.reject_type_modifier(open_span, override_span, "a constant");
@@ -1137,13 +1152,13 @@ impl Parser {
             self.advance();
             let start = self.previous().span.start;
             let member = self
-                .parse_function_with_modifiers(
+                .parse_function_with_modifiers(FunctionModifiers {
                     access,
                     open_span,
                     override_span,
                     writable_span,
                     static_span,
-                    self.span(
+                    start_span: self.span(
                         open_span
                             .or(override_span)
                             .or(static_span)
@@ -1151,7 +1166,8 @@ impl Parser {
                             .map_or(start, |span| span.start),
                         start,
                     ),
-                )
+                    is_member: true,
+                })
                 .map(ClassMember::Method);
             if let Some(member) = &member {
                 self.attach_member_attributes(attributes, member);
@@ -1232,13 +1248,17 @@ impl Parser {
 
     fn parse_function_with_modifiers(
         &mut self,
-        access: MemberAccess,
-        open_span: Option<Span>,
-        override_span: Option<Span>,
-        writable_span: Option<Span>,
-        static_span: Option<Span>,
-        start_span: Span,
+        modifiers: FunctionModifiers,
     ) -> Option<FunctionDecl> {
+        let FunctionModifiers {
+            access,
+            open_span,
+            override_span,
+            writable_span,
+            static_span,
+            start_span,
+            is_member,
+        } = modifiers;
         let start = start_span.start;
         let name = self.expect_callable_name("expected function name")?;
         let name_span = self.previous().span;
@@ -1248,7 +1268,7 @@ impl Parser {
         let mut params = Vec::new();
         if !self.check(&TokenKind::RightParen) {
             loop {
-                params.push(self.parse_param(name == "__construct")?);
+                params.push(self.parse_param(is_member && name == "__construct")?);
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }
@@ -1427,16 +1447,92 @@ impl Parser {
     fn parse_param(&mut self, is_constructor: bool) -> Option<Param> {
         let attributes = self.parse_attribute_groups()?;
         let start = self.peek().span.start;
-        if !is_constructor && self.check(&TokenKind::Internal) {
-            let span = self.advance().span;
-            self.error(
-                "`internal` is only valid on class members and constructor-promoted properties",
-                span,
-            );
-            return None;
+        let mut authored_roles = Vec::new();
+        while matches!(
+            self.peek().kind,
+            TokenKind::Internal | TokenKind::Override | TokenKind::Parameter
+        ) {
+            authored_roles.push(self.advance().clone());
         }
-
-        let access = self.parse_member_access();
+        let duplicate_role = authored_roles.len() > 1
+            && authored_roles
+                .iter()
+                .all(|role| role.kind == authored_roles[0].kind);
+        if duplicate_role {
+            let duplicate = &authored_roles[1];
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0744",
+                    format!(
+                        "duplicate `{}` constructor parameter role",
+                        token_name(&duplicate.kind)
+                    ),
+                    duplicate.span,
+                )
+                .with_title("Constructor Parameter Role Is Duplicated")
+                .with_help("remove the duplicate role marker")
+                .with_structured_fix(
+                    "Remove Duplicate Role Markers",
+                    FixApplicability::MachineApplicable,
+                    authored_roles
+                        .iter()
+                        .skip(1)
+                        .map(|role| FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: role.span,
+                            replacement: String::new(),
+                        })
+                        .collect(),
+                ),
+            );
+        } else if authored_roles.len() > 1 {
+            let span = authored_roles
+                .iter()
+                .skip(1)
+                .fold(authored_roles[0].span, |span, role| span.merge(role.span));
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0739",
+                    "a constructor parameter can declare only one role",
+                    span,
+                )
+                .with_title("Constructor Parameter Roles Conflict")
+                .with_help("choose exactly one of `internal`, `override`, or `parameter`")
+                .with_structured_fix(
+                    "Remove The Conflicting Role",
+                    FixApplicability::RequiresReview,
+                    vec![FixEdit {
+                        source: DiagnosticSource::Current,
+                        span: authored_roles[1].span,
+                        replacement: String::new(),
+                    }],
+                ),
+            );
+        }
+        let explicit_role = authored_roles.first();
+        let mut constructor_role = match explicit_role.map(|token| &token.kind) {
+            Some(TokenKind::Internal) => ConstructorParameterRole::Promoted {
+                access: MemberAccess::Internal,
+                access_span: explicit_role.map(|token| token.span),
+            },
+            Some(TokenKind::Override) => ConstructorParameterRole::InheritedPropertyOverride {
+                override_span: explicit_role.expect("override role token exists").span,
+            },
+            Some(TokenKind::Parameter) => ConstructorParameterRole::ConstructorOnly {
+                parameter_span: explicit_role.expect("parameter role token exists").span,
+            },
+            Some(_) => unreachable!("constructor role loop accepts only role keywords"),
+            None if is_constructor => ConstructorParameterRole::Promoted {
+                access: MemberAccess::External,
+                access_span: None,
+            },
+            None => ConstructorParameterRole::Ordinary,
+        };
+        if authored_roles.len() > 1 && !duplicate_role {
+            constructor_role = ConstructorParameterRole::ConstructorOnly {
+                parameter_span: authored_roles[0].span,
+            };
+        }
         let ownership_modifier_insert = self.span(self.peek().span.start, self.peek().span.start);
         let mut take_span = None;
         let mut writable_span = None;
@@ -1452,11 +1548,149 @@ impl Parser {
                 _ => unreachable!("modifier loop accepts only take/writable"),
             }
         }
+        if matches!(
+            self.peek().kind,
+            TokenKind::Internal | TokenKind::Override | TokenKind::Parameter
+        ) {
+            let misplaced = self.advance().clone();
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0740",
+                    "a constructor parameter role must precede its ownership mode",
+                    misplaced.span,
+                )
+                .with_title("Constructor Parameter Role Is Misordered")
+                .with_help(
+                    "write attributes, then the role, then `writable` or `take`, then the type",
+                )
+                .with_structured_fix(
+                    "Move The Role Before The Ownership Mode",
+                    FixApplicability::MachineApplicable,
+                    vec![
+                        FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: ownership_modifier_insert,
+                            replacement: format!("{} ", token_name(&misplaced.kind)),
+                        },
+                        FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: misplaced.span,
+                            replacement: String::new(),
+                        },
+                    ],
+                ),
+            );
+            constructor_role = match misplaced.kind {
+                TokenKind::Internal => ConstructorParameterRole::Promoted {
+                    access: MemberAccess::Internal,
+                    access_span: Some(misplaced.span),
+                },
+                TokenKind::Override => ConstructorParameterRole::InheritedPropertyOverride {
+                    override_span: misplaced.span,
+                },
+                TokenKind::Parameter => ConstructorParameterRole::ConstructorOnly {
+                    parameter_span: misplaced.span,
+                },
+                _ => unreachable!("misplaced role token is exact"),
+            };
+        }
         if self.check(&TokenKind::AttributeOpen) {
             self.reject_attribute_after_modifier(self.peek().span);
             let _ = self.parse_attribute_groups();
         }
+        let type_start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
+        let type_span = self.span(type_start, self.previous().span.end);
+        if matches!(
+            self.peek().kind,
+            TokenKind::Internal | TokenKind::Override | TokenKind::Parameter
+        ) {
+            let misplaced = self.advance().clone();
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0740",
+                    "a constructor parameter role must precede its type",
+                    misplaced.span,
+                )
+                .with_title("Constructor Parameter Role Is Misordered")
+                .with_help("write the role before the parameter mode and type")
+                .with_structured_fix(
+                    "Move The Role Before The Parameter Type",
+                    FixApplicability::MachineApplicable,
+                    vec![
+                        FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: ownership_modifier_insert,
+                            replacement: format!("{} ", token_name(&misplaced.kind)),
+                        },
+                        FixEdit {
+                            source: DiagnosticSource::Current,
+                            span: misplaced.span,
+                            replacement: String::new(),
+                        },
+                    ],
+                ),
+            );
+            constructor_role = match misplaced.kind {
+                TokenKind::Internal => ConstructorParameterRole::Promoted {
+                    access: MemberAccess::Internal,
+                    access_span: Some(misplaced.span),
+                },
+                TokenKind::Override => ConstructorParameterRole::InheritedPropertyOverride {
+                    override_span: misplaced.span,
+                },
+                TokenKind::Parameter => ConstructorParameterRole::ConstructorOnly {
+                    parameter_span: misplaced.span,
+                },
+                _ => unreachable!("misplaced role token is exact"),
+            };
+        }
+        if !is_constructor {
+            match constructor_role {
+                ConstructorParameterRole::Promoted {
+                    access_span: Some(span),
+                    ..
+                } => self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0737",
+                        "`internal` parameter promotion is valid only in a concrete class constructor",
+                        span,
+                    )
+                    .with_title("Promoted Parameter Is Not Valid Here")
+                    .with_help("ordinary function and method parameters do not promote properties")
+                    .with_fix(span, ""),
+                ),
+                ConstructorParameterRole::InheritedPropertyOverride { override_span } => {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0738",
+                            "`override` on a parameter is valid only in a derived concrete class constructor",
+                            override_span,
+                        )
+                        .with_title("Override Parameter Is Not Valid Here")
+                        .with_help("remove `override` from the ordinary parameter")
+                        .with_fix(override_span, ""),
+                    );
+                }
+                ConstructorParameterRole::ConstructorOnly { parameter_span } => {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0737",
+                            "`parameter` is valid only in a concrete class constructor",
+                            parameter_span,
+                        )
+                        .with_title("Constructor-Only Parameter Is Not Valid Here")
+                        .with_help("ordinary function and method parameters already declare only parameters")
+                        .with_fix(parameter_span, ""),
+                    );
+                }
+                ConstructorParameterRole::Ordinary
+                | ConstructorParameterRole::Promoted {
+                    access_span: None, ..
+                } => {}
+            }
+            constructor_role = ConstructorParameterRole::Ordinary;
+        }
         if self.match_kind(&TokenKind::Ampersand) {
             self.error(
                 "Doria does not support PHP-style parameter references; use `writable` for an exclusive borrow or `take` for ownership transfer",
@@ -1470,23 +1704,28 @@ impl Parser {
         } else {
             None
         };
+        let default_span = default.as_ref().map(Expr::span);
 
         let end = default.as_ref().map(Expr::span).unwrap_or(name_span).end;
 
         let param = Param {
-            promoted_access: is_constructor.then_some(access),
+            constructor_role,
+            role_and_mode_prefix_span: self.span(start, type_start),
             take: take_span.is_some(),
             take_span,
             writable: writable_span.is_some(),
             writable_span,
             ownership_modifier_insert,
             ty,
+            type_span,
             name,
+            name_span,
             default,
+            default_span,
             span: self.span(start, end),
         };
         let mut roles = vec![AttributeTargetRole::Parameter];
-        if is_constructor {
+        if constructor_role.is_promoted() {
             roles.push(AttributeTargetRole::PromotedProperty);
         }
         self.attach_attributes(
@@ -4813,6 +5052,7 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Internal => "internal",
         TokenKind::Open => "open",
         TokenKind::Override => "override",
+        TokenKind::Parameter => "parameter",
         TokenKind::Static => "static",
         TokenKind::SelfType => "self",
         TokenKind::Parent => "parent",

@@ -150,7 +150,7 @@ impl MemberClassCatalog {
                             for parameter in method
                                 .params
                                 .iter()
-                                .filter(|parameter| parameter.promoted_access.is_some())
+                                .filter(|parameter| parameter.constructor_role.is_promoted())
                             {
                                 if let Some(result) = class_name_in(&parameter.ty, &class.name) {
                                     catalog.properties.insert(
@@ -211,11 +211,9 @@ impl NullabilityCatalog {
                                     );
                                 }
                                 if method.name == "__construct" {
-                                    for parameter in method
-                                        .params
-                                        .iter()
-                                        .filter(|parameter| parameter.promoted_access.is_some())
-                                    {
+                                    for parameter in method.params.iter().filter(|parameter| {
+                                        parameter.constructor_role.is_promoted()
+                                    }) {
                                         catalog.record_property(
                                             &class.name,
                                             &parameter.name,
@@ -2094,7 +2092,7 @@ impl Resolver {
             }
             for parameter in params
                 .iter()
-                .filter(|parameter| parameter.promoted_access.is_some())
+                .filter(|parameter| parameter.constructor_role.is_promoted())
             {
                 let binding = resolver.declare_unscoped(Some(parameter.ty.clone()));
                 resolver
@@ -2575,7 +2573,7 @@ class Owner
         let crate::ast::ClassMember::Method(constructor) = &mut owner.members[1] else {
             panic!("expected constructor");
         };
-        constructor.params[0].promoted_access = None;
+        constructor.params[0].constructor_role = crate::ast::ConstructorParameterRole::Ordinary;
 
         let catalog = MemberClassCatalog::from_program(&program);
         assert_eq!(

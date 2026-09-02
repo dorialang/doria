@@ -1,5 +1,11 @@
 # Doria Self-Hosting Plan
 
+Decision 0131's constructor parameter roles are part of the compiler-owned class
+model required by any self-hosted frontend: default/internal parameters promote,
+`override` reuses one inherited root property, and `parameter` remains callable-
+only. A bootstrap compiler must not reconstruct these roles from names or emit
+duplicate layout, initialization, or cleanup.
+
 > Documentation role: supporting design note.
 > Source-of-truth hierarchy: `docs/doria-end-to-end-plan.md` owns future sequencing; accepted `docs/decisions/*.md` files own topic-level decisions. This note is subordinate to both.
 

@@ -188,7 +188,9 @@ fn constructor_parameter_is_still_a_promoted_property_in_the_ast() {
             ClassMember::Method(method) if method.name == "__construct" => Some(method),
             _ => None,
         });
-    assert!(constructor.unwrap().params[0].promoted_access.is_some());
+    assert!(constructor.unwrap().params[0]
+        .constructor_role
+        .is_promoted());
 }
 
 #[test]

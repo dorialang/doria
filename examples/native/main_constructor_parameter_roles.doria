@@ -1,0 +1,32 @@
+open class Envelope<T>
+{
+    function __construct(take T $payload, string $label)
+    {
+    }
+}
+
+class TextEnvelope extends Envelope<string>
+{
+    string $normalized;
+
+    function __construct(
+        override take string $payload,
+        override string $label,
+        parameter string $raw,
+        int $rank = 1,
+    ) {
+        parent::__construct($payload, $label);
+        $this->normalized = $raw . "!";
+    }
+
+    function describe(): string
+    {
+        return $this->label . ":" . $this->normalized . ":{$this->rank}";
+    }
+}
+
+function main(): void
+{
+    let $value = new TextEnvelope("payload", "ready", "trimmed");
+    echo $value->describe() . "\n";
+}

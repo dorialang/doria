@@ -129,3 +129,7 @@ convention.
 Decision 0130 extends these provenance rules through implicit class upcasts and
 hierarchy narrowing. Readonly and writable borrows retain their access mode and
 original root; inheritance never turns a borrow into ownership.
+
+Decision 0131 likewise keeps constructor-only and inherited-property override
+parameters on ordinary parameter provenance. Their compile-time role creates no
+property alias, owner, field, or cleanup fact.

@@ -50,12 +50,15 @@ doriac metadata source.doria
 doriac metadata --build-plan build-plan.json
 doriac metadata source.doria --schema-version 2
 doriac metadata --build-plan build-plan.json --schema-version 2
+doriac metadata source.doria --schema-version 3
+doriac metadata --build-plan build-plan.json --schema-version 3
 ```
 
 The command emits one deterministic JSON document to stdout. Schema version 1 remains the default,
 and explicit `--schema-version 1` is byte-identical to that
-default. Decision 0128 adds strict schema version 2 for Baton test discovery;
-unknown versions are rejected.
+default. Decision 0128 adds strict schema version 2 for Baton test discovery,
+and Decision 0129 adds strict schema version 3 for Native Testing discovery and
+execution facts. Unknown versions are rejected.
 It produces no backend artifact, invokes no processor, writes no generated
 source, and does not modify input files. Blocking diagnostics follow the
 ordinary CLI diagnostic rules.

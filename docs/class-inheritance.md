@@ -34,6 +34,27 @@ class Post extends Model
 }
 ```
 
+When a child accepts an input corresponding to an inherited external property,
+it marks that parameter `override`. The root property remains the one storage
+slot and the parent phase remains responsible for initializing it:
+
+```doria
+class Article extends Document
+{
+    function __construct(override string $title, parameter string $source)
+    {
+        parent::__construct($title);
+        echo $source;
+    }
+}
+```
+
+`parameter` opts out of promotion for constructor-only inputs. Neither marker
+forwards arguments implicitly. An internal parent property is not an override
+target; a child may independently declare the same spelling because the two
+fields retain distinct declaring-class identities. Explicit class-body hiding
+and incompatible promoted collisions remain E0727 errors.
+
 A class has at most one direct parent. Parent names may be qualified and may
 instantiate generic classes. Generic hierarchies are monomorphized and remain
 invariant.

@@ -1659,7 +1659,7 @@ Doria is PHP-shaped, not PHP++. Accepting PHP-shaped OOP declaration syntax does
 
 OOP declaration vocabulary is accepted separately from final visibility semantics. Doria's accepted early member model remains default-accessible plus `internal`: class members are accessible by default, `internal` controls API surface, and `writable` controls mutation.
 
-Constructor property promotion is supported in the current vertical slice. Constructor parameters are promoted to externally accessible properties by default unless marked `internal`:
+Constructor property promotion is supported. Constructor parameters are promoted to externally accessible properties by default; `internal` creates an internal promoted property. In a derived constructor, `override` declares a parameter relationship to one exact inherited external instance property without adding storage or a second automatic write. `parameter` declares a constructor-only input and no property. Roles precede `writable` or `take`; those modes describe the input and do not change an inherited property's contract:
 
 ```doria
 function __construct(
@@ -1669,6 +1669,32 @@ function __construct(
 ) {
 }
 ```
+
+```doria
+open class Document
+{
+    function __construct(string $title) {}
+}
+
+class Article extends Document
+{
+    function __construct(override string $title, parameter string $source)
+    {
+        parent::__construct($title);
+        echo $source;
+    }
+}
+```
+
+`override` requires an exact inherited external instance-property target after
+generic substitution. The root property remains the one logical member, layout
+slot, initializer, and cleanup obligation. `parameter` remains in constructor
+arity, named arguments, defaults, attributes, ownership analysis, and body scope,
+but never enters member lookup, layout, initialization, or drop order. A
+constructor-only Move value follows ordinary parameter borrowing and does not
+require `take` unless ownership is actually transferred. Actual Move-value
+promotion retains its `take` requirement. `parameter` is the reserved spelling;
+`param` is not an alias. Decision 0131 is authoritative.
 
 Constructor init access supports direct initialization of uninitialized properties inside constructor bodies:
 

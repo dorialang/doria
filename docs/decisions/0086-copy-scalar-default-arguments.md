@@ -155,3 +155,9 @@ tests, the language specification, status documentation, and the master plan.
   checking.
 - The temporary E0498 message that rejected every string default without
   distinguishing readonly borrowing from writable or consuming parameters.
+
+## Post-Stage-34 Constructor-Role Amendment
+
+Decision 0131 applies the same caller-side default splice to promoted,
+constructor-only, and inherited-property override parameters. A child default is
+callable API only; it neither changes nor implicitly forwards a parent default.

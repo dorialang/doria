@@ -41,6 +41,7 @@ pub fn lower_program_with_semantics(
     }
     apply_checked_error_semantics(&mut items, &semantic_info);
     apply_global_identities(&mut items, &semantic_info);
+    apply_constructor_parameter_semantics(&mut items, &semantic_info);
 
     let test_suites = semantic_info.test_semantics.suites.clone();
     let tests = semantic_info.test_semantics.tests.clone();
@@ -67,6 +68,39 @@ pub fn lower_program_with_semantics(
         test_suites,
         tests,
     })
+}
+
+fn apply_constructor_parameter_semantics(
+    items: &mut [hir::Item],
+    semantic_info: &crate::semantics::SemanticInfo,
+) {
+    for item in items {
+        let hir::Item::Class(class) = item else {
+            continue;
+        };
+        for member in &mut class.members {
+            let hir::ClassMember::Method(method) = member else {
+                continue;
+            };
+            for parameter in &mut method.params {
+                let Some(info) = semantic_info.constructor_parameters.get(&parameter.span) else {
+                    continue;
+                };
+                if let crate::semantics::ConstructorParameterSemanticRole::InheritedPropertyOverride {
+                    declaring_class,
+                    property_name,
+                    declaration,
+                } = &info.role
+                {
+                    parameter.inherited_property = Some(hir::InheritedPropertyIdentity {
+                        declaring_class: declaring_class.clone(),
+                        property_name: property_name.clone(),
+                        declaration: *declaration,
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn apply_global_identities(
@@ -753,15 +787,31 @@ fn lower_type_param(
 
 fn lower_param(param: &ast::Param, class_name: Option<ClassContext<'_>>) -> hir::Param {
     hir::Param {
-        promoted_access: param.promoted_access,
+        constructor_role: match param.constructor_role {
+            ast::ConstructorParameterRole::Ordinary => hir::ConstructorParameterRole::Ordinary,
+            ast::ConstructorParameterRole::Promoted { access, .. } => {
+                hir::ConstructorParameterRole::Promoted { access }
+            }
+            ast::ConstructorParameterRole::InheritedPropertyOverride { .. } => {
+                hir::ConstructorParameterRole::InheritedPropertyOverride
+            }
+            ast::ConstructorParameterRole::ConstructorOnly { .. } => {
+                hir::ConstructorParameterRole::ConstructorOnly
+            }
+        },
+        inherited_property: None,
+        role_and_mode_prefix_span: param.role_and_mode_prefix_span,
         take: param.take,
         writable: param.writable,
         ty: lower_type_ref(&param.ty, class_name),
+        type_span: param.type_span,
         name: param.name.clone(),
+        name_span: param.name_span,
         default: param
             .default
             .as_ref()
             .map(|expr| lower_expr(expr, class_name)),
+        default_span: param.default_span,
         span: param.span,
     }
 }

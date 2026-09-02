@@ -14,6 +14,7 @@ examples/native/main_boolean_condition_42.doria
 examples/native/main_break_continue_42.doria
 examples/native/main_collection_clear.doria
 examples/native/main_collection_clear_ownership.doria
+examples/native/main_constructor_parameter_roles.doria
 examples/native/main_divide_by_zero_panic.doria
 examples/native/main_display_conversion.doria
 examples/native/main_early_return_search_42.doria
