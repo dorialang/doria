@@ -81,3 +81,9 @@ Lifecycle source shapes are finite and exhaustively testable. Invalid declaratio
 
 Decision 0130 preserves this lifecycle allowlist while composing class phases
 root to derived for construction and derived to root for destruction.
+
+## Post-Stage-34 Amendment
+
+Decision 0131 adds constructor-parameter roles without widening the lifecycle
+allowlist. Only actual promoted parameters initialize class state; `override`
+and `parameter` remain ordinary callable inputs and add no property write.

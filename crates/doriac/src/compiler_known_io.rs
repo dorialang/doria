@@ -1,6 +1,6 @@
 use crate::ast::{
-    Block, ClassDecl, ClassMember, EnumCaseDecl, EnumDecl, EnumPayloadField, Expr, FunctionDecl,
-    Item, MemberAccess, Param, Program,
+    Block, ClassDecl, ClassMember, ConstructorParameterRole, EnumCaseDecl, EnumDecl,
+    EnumPayloadField, Expr, FunctionDecl, Item, MemberAccess, Param, Program,
 };
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::lexer::{Lexer, TokenKind};
@@ -361,7 +361,11 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
     let params = properties
         .iter()
         .map(|(ty, property, nullable)| Param {
-            promoted_access: Some(MemberAccess::External),
+            constructor_role: ConstructorParameterRole::Promoted {
+                access: MemberAccess::External,
+                access_span: None,
+            },
+            role_and_mode_prefix_span: span,
             take: false,
             take_span: None,
             writable: false,
@@ -372,8 +376,11 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
             } else {
                 TypeRef::named(*ty)
             },
+            type_span: span,
             name: (*property).to_string(),
+            name_span: span,
             default: nullable.then_some(Expr::Null { span }),
+            default_span: nullable.then_some(span),
             span,
         })
         .collect();

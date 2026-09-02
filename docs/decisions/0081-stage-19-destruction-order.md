@@ -59,3 +59,9 @@ fully constructed object runs the most-derived destructor and drops that class
 phase before recursively destroying parent phases. Dynamic destruction through
 an open-class value selects the exact concrete drop path and frees the one
 complete allocation once.
+
+## Post-Stage-34 Constructor-Role Amendment
+
+Decision 0131 preserves total property order by excluding inherited-property
+override and constructor-only parameters. The root property remains one cleanup
+obligation; owned callable parameters use ordinary frame cleanup until moved.

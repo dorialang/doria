@@ -1,5 +1,10 @@
 # End-to-end plan — open-questions audit
 
+Decision 0131 resolves the post-Stage-34 constructor-property question: default
+and internal parameters promote; `override` reuses one exact inherited external
+property; `parameter` is constructor-only. Indexed foreach remains the next
+corrective beat and its next decision record remains unauthored.
+
 > Documentation role: working note / findings for Andrew's decision. A
 > design-completeness sweep of `docs/doria-end-to-end-plan.md` (plus SPEC and the
 > decision records it cites) for open questions that are **answerable now** — not

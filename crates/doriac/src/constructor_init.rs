@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::ast::{
     AssignOp, ClassDecl, ClassMember, Expr, ForIncrement, ForInitializer, InterpolatedStringPart,
@@ -40,6 +40,7 @@ struct Property {
     name: String,
     writable: bool,
     preinitialized: bool,
+    same_named_constructor_only_parameter: bool,
 }
 
 struct AssignmentSite<'a> {
@@ -143,6 +144,16 @@ fn check_class(
     catch_error_types: &crate::checked_effects::CatchTypeMap,
     analysis: &mut Analysis,
 ) {
+    let constructor = class.members.iter().find_map(|member| match member {
+        ClassMember::Method(method) if method.name == "__construct" => Some(method),
+        _ => None,
+    });
+    let constructor_only_names = constructor
+        .into_iter()
+        .flat_map(|constructor| &constructor.params)
+        .filter(|parameter| parameter.constructor_role.is_constructor_only())
+        .map(|parameter| parameter.name.as_str())
+        .collect::<HashSet<_>>();
     let mut properties = class
         .members
         .iter()
@@ -151,22 +162,25 @@ fn check_class(
                 name: property.name.clone(),
                 writable: property.writable,
                 preinitialized: property.initializer.is_some(),
+                same_named_constructor_only_parameter: constructor_only_names
+                    .contains(property.name.as_str()),
             }),
             _ => None,
         })
         .collect::<Vec<_>>();
-    let constructor = class.members.iter().find_map(|member| match member {
-        ClassMember::Method(method) if method.name == "__construct" => Some(method),
-        _ => None,
-    });
     if let Some(constructor) = constructor {
-        properties.extend(constructor.params.iter().filter_map(|parameter| {
-            parameter.promoted_access.as_ref().map(|_| Property {
-                name: parameter.name.clone(),
-                writable: parameter.writable,
-                preinitialized: true,
-            })
-        }));
+        properties.extend(
+            constructor
+                .params
+                .iter()
+                .filter(|parameter| parameter.constructor_role.is_promoted())
+                .map(|parameter| Property {
+                    name: parameter.name.clone(),
+                    writable: parameter.writable,
+                    preinitialized: true,
+                    same_named_constructor_only_parameter: false,
+                }),
+        );
     }
     if properties.is_empty() {
         return;
@@ -735,23 +749,47 @@ fn report_incomplete_exit(
     for (property, init) in properties.iter().zip(&state.properties) {
         match init {
             InitState::Initialized => {}
-            InitState::Uninitialized => diagnostics.push(Diagnostic::new(
-                "E0500",
+            InitState::Uninitialized => diagnostics.push(property_init_diagnostic(
+                class,
+                property,
+                span,
                 format!(
                     "property `{}::{}` is not initialized before {exit} completes",
                     class.name, property.name
                 ),
-                span,
             )),
-            InitState::MaybeInitialized => diagnostics.push(Diagnostic::new(
-                "E0500",
+            InitState::MaybeInitialized => diagnostics.push(property_init_diagnostic(
+                class,
+                property,
+                span,
                 format!(
                     "property `{}::{}` is not initialized on every path before {exit} completes",
                     class.name, property.name
                 ),
-                span,
             )),
         }
+    }
+}
+
+fn property_init_diagnostic(
+    class: &ClassDecl,
+    property: &Property,
+    span: Span,
+    message: String,
+) -> Diagnostic {
+    let diagnostic = Diagnostic::new("E0500", message, span);
+    if property.same_named_constructor_only_parameter {
+        diagnostic
+            .with_note(format!(
+                "`${}` is a constructor-only parameter and does not initialize `{}::{}`",
+                property.name, class.name, property.name
+            ))
+            .with_help(format!(
+                "initialize the property explicitly with `$this->{} = ${}`, or use ordinary promotion when the parameter should declare the property",
+                property.name, property.name
+            ))
+    } else {
+        diagnostic
     }
 }
 

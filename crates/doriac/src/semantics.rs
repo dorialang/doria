@@ -132,6 +132,14 @@ pub struct SemanticInfo {
     /// Tooling uses this table to relate override families without rebuilding
     /// inheritance or virtual-dispatch semantics from syntax.
     pub method_hierarchy: HashMap<Span, MethodHierarchySemanticInfo>,
+    /// Canonical role and inherited-property identity for constructor parameters.
+    /// Tooling and HIR consume this table instead of inferring promotion or
+    /// inheritance from parameter spelling.
+    pub constructor_parameters: HashMap<Span, ConstructorParameterSemanticInfo>,
+    /// Compile-time property-family authority. One entry corresponds to one
+    /// physical root property; override parameters are related declarations,
+    /// never additional fields.
+    pub property_families: HashMap<Span, PropertyFamilySemanticInfo>,
     /// Exact declaration and virtual-family identity selected at each method call.
     pub method_call_targets: HashMap<Span, MethodCallSemanticInfo>,
     /// Declaring class selected for inherited static-property and class-constant access.
@@ -218,6 +226,35 @@ pub struct CallableParameterSemanticInfo {
     pub take: bool,
     pub writable: bool,
     pub has_default: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructorParameterSemanticInfo {
+    pub role: ConstructorParameterSemanticRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConstructorParameterSemanticRole {
+    Promoted {
+        access: MemberAccess,
+    },
+    InheritedPropertyOverride {
+        declaring_class: String,
+        property_name: String,
+        declaration: Span,
+    },
+    ConstructorOnly,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PropertyFamilySemanticInfo {
+    pub root_declaring_class: String,
+    pub root_property_name: String,
+    pub root_declaration: Span,
+    pub ty: ResolvedType,
+    pub writable: bool,
+    pub access: MemberAccess,
+    pub override_parameters: Vec<Span>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -851,6 +888,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     let method_hierarchy = collect_method_hierarchy_semantics(&checker);
     let classes = collect_ordered_class_semantics(program, &mut checker);
     let enums = collect_ordered_enum_semantics(&checker);
+    let property_families = collect_property_family_semantics(&checker);
     let callable_signatures = checker
         .function_signatures
         .iter()
@@ -897,6 +935,8 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             given_preludes: checker.given_preludes,
             call_targets: checker.call_targets,
             method_hierarchy,
+            constructor_parameters: checker.constructor_parameters,
+            property_families,
             method_call_targets: checker.method_call_targets,
             static_member_targets: checker.static_member_targets,
             generic_call_specializations: checker.generic_call_specializations,
@@ -1008,6 +1048,48 @@ fn collect_method_hierarchy_semantics(
             })
         })
         .collect()
+}
+
+fn collect_property_family_semantics(
+    checker: &Checker<'_>,
+) -> HashMap<Span, PropertyFamilySemanticInfo> {
+    let mut families = HashMap::<Span, PropertyFamilySemanticInfo>::new();
+    for (parameter_span, parameter) in &checker.constructor_parameters {
+        let ConstructorParameterSemanticRole::InheritedPropertyOverride {
+            declaring_class,
+            property_name,
+            declaration,
+        } = &parameter.role
+        else {
+            continue;
+        };
+        let Some(property) = checker
+            .classes
+            .get(declaring_class)
+            .and_then(|class| class.properties.get(property_name))
+        else {
+            continue;
+        };
+        families
+            .entry(*declaration)
+            .or_insert_with(|| PropertyFamilySemanticInfo {
+                root_declaring_class: declaring_class.clone(),
+                root_property_name: property_name.clone(),
+                root_declaration: *declaration,
+                ty: checker.types.resolved(property.ty),
+                writable: property.writable,
+                access: property.access,
+                override_parameters: Vec::new(),
+            })
+            .override_parameters
+            .push(*parameter_span);
+    }
+    for family in families.values_mut() {
+        family
+            .override_parameters
+            .sort_by_key(|span| (span.source.0, span.start, span.end));
+    }
+    families
 }
 
 fn collect_class_hierarchy_semantics(
@@ -1163,18 +1245,20 @@ fn collect_ordered_class_semantics(
                         .members
                         .iter()
                         .find_map(|member| match member {
-                            ClassMember::Method(method) if method.name == "__construct" => {
-                                Some(method.params.iter().filter_map(|param| {
-                                    param.promoted_access.as_ref().map(|_| {
+                            ClassMember::Method(method) if method.name == "__construct" => Some(
+                                method
+                                    .params
+                                    .iter()
+                                    .filter(|param| param.constructor_role.is_promoted())
+                                    .map(|param| {
                                         (
                                             hierarchy_class.name.clone(),
                                             param.name.clone(),
                                             param.writable,
                                             true,
                                         )
-                                    })
-                                }))
-                            }
+                                    }),
+                            ),
                             _ => None,
                         });
                 let mut declared = explicit.collect::<Vec<_>>();
@@ -1759,6 +1843,7 @@ struct Checker<'program> {
         HashMap<crate::const_eval::ParameterDefaultKey, crate::const_eval::ConstValue>,
     override_roots: HashMap<Span, Span>,
     overridden_declarations: HashMap<Span, Span>,
+    constructor_parameters: HashMap<Span, ConstructorParameterSemanticInfo>,
     flow_facts: crate::narrowing::FactsByUse,
     contextual_expression_types: HashMap<Span, TypeId>,
     when_contexts: Vec<WhenCheckContext>,
@@ -2562,6 +2647,7 @@ impl<'program> Checker<'program> {
             parameter_defaults: HashMap::new(),
             override_roots: HashMap::new(),
             overridden_declarations: HashMap::new(),
+            constructor_parameters: HashMap::new(),
             flow_facts: crate::narrowing::analyze_program(program),
             contextual_expression_types: HashMap::new(),
             when_contexts: Vec::new(),
@@ -3751,7 +3837,7 @@ impl<'program> Checker<'program> {
 
                         if method.name == "__construct" {
                             for param in &method.params {
-                                if param.promoted_access.is_some() {
+                                if param.constructor_role.is_promoted() {
                                     self.declare_promoted_property(
                                         &mut info,
                                         &class_decl.name,
@@ -3906,6 +3992,7 @@ impl<'program> Checker<'program> {
                 continue;
             }
             let Some(parent) = class_info.parent.clone() else {
+                self.validate_constructor_parameter_roles(declaration, &class_info, None);
                 for (name, method) in &class_info.methods {
                     if method.is_override {
                         self.report_missing_override_target(&declaration.name, name, method);
@@ -3913,6 +4000,7 @@ impl<'program> Checker<'program> {
                 }
                 continue;
             };
+            self.validate_constructor_parameter_roles(declaration, &class_info, Some(&parent));
             for (name, member) in &class_info.members {
                 let Some((declaring_class, inherited)) =
                     self.lookup_inherited_member(&parent, name)
@@ -3925,6 +4013,40 @@ impl<'program> Checker<'program> {
                     continue;
                 };
                 let Some(method) = class_info.methods.get(name) else {
+                    let compatible_promoted_property = if member.kind
+                        == MemberKind::PromotedProperty
+                        && matches!(
+                            inherited.kind,
+                            MemberKind::InstanceProperty | MemberKind::PromotedProperty
+                        ) {
+                        let child = class_info.properties.get(name);
+                        let inherited_property = self
+                            .classes
+                            .get(&declaring_class.name)
+                            .and_then(|class| class.properties.get(name))
+                            .cloned()
+                            .map(|property| {
+                                self.specialize_property_for_class(&property, &declaring_class)
+                            });
+                        matches!(
+                            (child, inherited_property),
+                            (Some(child), Some(inherited))
+                                if child.access == MemberAccess::External
+                                    && inherited.ty == child.ty
+                        )
+                    } else {
+                        false
+                    };
+                    if compatible_promoted_property {
+                        self.report_constructor_property_role_required(
+                            &declaration.name,
+                            name,
+                            member.span,
+                            &declaring_class,
+                            inherited.span,
+                        );
+                        continue;
+                    }
                     self.report_inherited_member_collision(
                         &declaration.name,
                         name,
@@ -4000,6 +4122,194 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+    }
+
+    fn validate_constructor_parameter_roles(
+        &mut self,
+        declaration: &ClassDecl,
+        class_info: &ClassInfo,
+        parent: Option<&ClassType<TypeId>>,
+    ) {
+        let Some(constructor) = declaration.members.iter().find_map(|member| match member {
+            ClassMember::Method(method) if method.name == "__construct" => Some(method),
+            _ => None,
+        }) else {
+            return;
+        };
+        let parameter_types = class_info
+            .methods
+            .get("__construct")
+            .map(|method| method.params.clone())
+            .unwrap_or_default();
+
+        for (index, parameter) in constructor.params.iter().enumerate() {
+            let role = match parameter.constructor_role {
+                ConstructorParameterRole::Promoted { access, .. } => {
+                    Some(ConstructorParameterSemanticRole::Promoted { access })
+                }
+                ConstructorParameterRole::ConstructorOnly { .. } => {
+                    Some(ConstructorParameterSemanticRole::ConstructorOnly)
+                }
+                ConstructorParameterRole::Ordinary => None,
+                ConstructorParameterRole::InheritedPropertyOverride { override_span } => {
+                    let Some(parent) = parent else {
+                        self.report_constructor_parameter_override_without_target(
+                            &declaration.name,
+                            &parameter.name,
+                            override_span,
+                            None,
+                        );
+                        continue;
+                    };
+                    let Some((declaring_class, inherited_member)) =
+                        self.lookup_inherited_member(parent, &parameter.name)
+                    else {
+                        self.report_constructor_parameter_override_without_target(
+                            &declaration.name,
+                            &parameter.name,
+                            override_span,
+                            None,
+                        );
+                        continue;
+                    };
+                    if !matches!(
+                        inherited_member.kind,
+                        MemberKind::InstanceProperty | MemberKind::PromotedProperty
+                    ) {
+                        self.report_constructor_parameter_override_without_target(
+                            &declaration.name,
+                            &parameter.name,
+                            override_span,
+                            Some(inherited_member.span),
+                        );
+                        continue;
+                    }
+                    let inherited_property = self
+                        .classes
+                        .get(&declaring_class.name)
+                        .and_then(|class| class.properties.get(&parameter.name))
+                        .cloned()
+                        .map(|property| {
+                            self.specialize_property_for_class(&property, &declaring_class)
+                        });
+                    let Some(inherited_property) = inherited_property else {
+                        self.report_constructor_parameter_override_without_target(
+                            &declaration.name,
+                            &parameter.name,
+                            override_span,
+                            Some(inherited_member.span),
+                        );
+                        continue;
+                    };
+                    let Some(child) = parameter_types.get(index) else {
+                        continue;
+                    };
+                    if child.ty != inherited_property.ty {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0742",
+                                format!(
+                                    "constructor parameter `{}` has type `{}`, but inherited property `{}::{}` has type `{}`",
+                                    parameter.name,
+                                    self.types.display(child.ty),
+                                    declaring_class.name,
+                                    parameter.name,
+                                    self.types.display(inherited_property.ty),
+                                ),
+                                parameter.span,
+                            )
+                            .with_title("Override Parameter Type Does Not Match Property")
+                            .with_related(
+                                inherited_property.declaration_span,
+                                "the inherited external property is declared here",
+                            )
+                            .with_help(
+                                "use the exact inherited property type after generic substitution",
+                            ),
+                        );
+                        continue;
+                    }
+                    Some(
+                        ConstructorParameterSemanticRole::InheritedPropertyOverride {
+                            declaring_class: declaring_class.name,
+                            property_name: parameter.name.clone(),
+                            declaration: inherited_property.declaration_span,
+                        },
+                    )
+                }
+            };
+            if let Some(role) = role {
+                self.constructor_parameters
+                    .insert(parameter.span, ConstructorParameterSemanticInfo { role });
+            }
+        }
+    }
+
+    fn report_constructor_parameter_override_without_target(
+        &mut self,
+        class: &str,
+        parameter: &str,
+        span: Span,
+        conflicting_member: Option<Span>,
+    ) {
+        let mut diagnostic = Diagnostic::new(
+            "E0741",
+            format!(
+                "constructor parameter `{class}::{parameter}` uses `override`, but no inherited external instance property matches"
+            ),
+            span,
+        )
+        .with_title("Override Parameter Has No Property Target")
+        .with_help("remove `override` or name an inherited external instance property");
+        if let Some(conflicting_member) = conflicting_member {
+            diagnostic = diagnostic.with_related(
+                conflicting_member,
+                "this inherited member is not an external instance property",
+            );
+        }
+        self.diagnostics.push(diagnostic);
+    }
+
+    fn report_constructor_property_role_required(
+        &mut self,
+        class: &str,
+        property: &str,
+        span: Span,
+        inherited_class: &ClassType<TypeId>,
+        inherited_span: Span,
+    ) {
+        let insertion = Span::in_source(span.source, span.start, span.start);
+        self.diagnostics.push(
+            Diagnostic::new(
+                "E0743",
+                format!(
+                    "constructor parameter `{class}::{property}` would redeclare inherited property `{}::{property}`",
+                    inherited_class.name
+                ),
+                span,
+            )
+            .with_title("Constructor Parameter Role Is Required")
+            .with_related(inherited_span, "the inherited external property is declared here")
+            .with_help("add `override` to reuse the inherited property")
+            .with_structured_fix(
+                "Reuse The Inherited Property",
+                FixApplicability::MachineApplicable,
+                vec![FixEdit {
+                    source: DiagnosticSource::Current,
+                    span: insertion,
+                    replacement: "override ".to_string(),
+                }],
+            )
+            .with_structured_fix(
+                "Keep This As A Constructor-Only Parameter",
+                FixApplicability::RequiresReview,
+                vec![FixEdit {
+                    source: DiagnosticSource::Current,
+                    span: insertion,
+                    replacement: "parameter ".to_string(),
+                }],
+            ),
+        );
     }
 
     fn complete_override_contract(
@@ -5628,7 +5938,7 @@ impl<'program> Checker<'program> {
                 );
             }
 
-            if param.promoted_access.is_some() && self.type_is_move_type(ty) && !param.take {
+            if param.constructor_role.is_promoted() && self.type_is_move_type(ty) && !param.take {
                 let diagnostic = Diagnostic::new(
                     "E0468",
                     format!(
@@ -6601,7 +6911,10 @@ impl<'program> Checker<'program> {
         info.properties.insert(
             param.name.clone(),
             PropertyInfo {
-                access: param.promoted_access.unwrap_or(MemberAccess::External),
+                access: param
+                    .constructor_role
+                    .promoted_access()
+                    .expect("only promoted parameters declare properties"),
                 writable: param.writable,
                 ty,
                 init_state: PropertyInitState::PromotedParameter,
@@ -11441,15 +11754,19 @@ impl<'program> Checker<'program> {
             .parameters
             .iter()
             .map(|parameter| Param {
-                promoted_access: None,
+                constructor_role: ConstructorParameterRole::Ordinary,
+                role_and_mode_prefix_span: parameter.type_span,
                 take: parameter.take,
                 take_span: parameter.take_span,
                 writable: parameter.writable,
                 writable_span: parameter.writable_span,
                 ownership_modifier_insert: parameter.type_span,
                 ty: parameter.ty.clone(),
+                type_span: parameter.type_span,
                 name: parameter.name.clone(),
+                name_span: parameter.name_span,
                 default: None,
+                default_span: None,
                 span: parameter.span,
             })
             .collect();

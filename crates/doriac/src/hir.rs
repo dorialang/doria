@@ -231,13 +231,46 @@ pub struct TypeParamDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
-    pub promoted_access: Option<MemberAccess>,
+    pub constructor_role: ConstructorParameterRole,
+    pub inherited_property: Option<InheritedPropertyIdentity>,
+    pub role_and_mode_prefix_span: Span,
     pub take: bool,
     pub writable: bool,
     pub ty: TypeRef,
+    pub type_span: Span,
     pub name: String,
+    pub name_span: Span,
     pub default: Option<Expr>,
+    pub default_span: Option<Span>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InheritedPropertyIdentity {
+    pub declaring_class: String,
+    pub property_name: String,
+    pub declaration: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstructorParameterRole {
+    Ordinary,
+    Promoted { access: MemberAccess },
+    InheritedPropertyOverride,
+    ConstructorOnly,
+}
+
+impl ConstructorParameterRole {
+    pub const fn is_promoted(self) -> bool {
+        matches!(self, Self::Promoted { .. })
+    }
+
+    pub const fn promoted_access(self) -> Option<MemberAccess> {
+        match self {
+            Self::Promoted { access } => Some(access),
+            Self::Ordinary | Self::InheritedPropertyOverride | Self::ConstructorOnly => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -2462,7 +2462,7 @@ fn php_explicit_drop_types(program: &Program) -> (HashSet<String>, HashSet<Strin
                 }
                 ClassMember::Method(method) if method.name == "__construct" => {
                     method.params.iter().any(|parameter| {
-                        parameter.promoted_access.is_some()
+                        parameter.constructor_role.is_promoted()
                             && php_type_ref_needs_explicit_drop(
                                 &parameter.ty,
                                 &drop_classes,
@@ -3910,7 +3910,7 @@ fn emit_class(
                 .params
                 .iter()
                 .filter(|parameter| {
-                    parameter.promoted_access.is_some()
+                    parameter.constructor_role.is_promoted()
                         && php_type_ref_needs_explicit_drop(
                             &parameter.ty,
                             &scopes.symbols.classes_with_php_destructors,
@@ -4073,7 +4073,7 @@ fn emit_class(
         };
         let callable_plan = scopes.closure_plan.callable_definition(method.span);
         for (index, parameter) in method.params.iter().enumerate() {
-            let Some(access) = parameter.promoted_access.as_ref() else {
+            let Some(access) = parameter.constructor_role.promoted_access() else {
                 continue;
             };
             if !callable_parameter_uses_cell(callable_plan, index) {
@@ -4084,7 +4084,7 @@ fn emit_class(
                 indent + 1,
                 &format!(
                     "{} {} ${};",
-                    emit_member_access(access),
+                    emit_member_access(&access),
                     php_type(&parameter.ty),
                     parameter.name
                 ),
@@ -4720,7 +4720,7 @@ fn emit_function(
                 emit_const_value(default, &semantic_info.const_evaluation)
             ),
         );
-        if param.promoted_access.is_some() {
+        if param.constructor_role.is_promoted() {
             writeln(
                 output,
                 body_indent + 1,
@@ -4747,7 +4747,7 @@ fn emit_function(
                 ),
             );
         }
-        if param.promoted_access.is_some() && (uses_cell || manual_promotions) {
+        if param.constructor_role.is_promoted() && (uses_cell || manual_promotions) {
             let value = if uses_cell && param.take && resolved_type_ref_is_function(&param.ty) {
                 format!("__doria_take_cell(${})", param.name)
             } else if uses_cell {
@@ -4864,11 +4864,11 @@ fn emit_param(
 ) -> String {
     let mut output = String::new();
     if let Some(access) = param
-        .promoted_access
-        .as_ref()
+        .constructor_role
+        .promoted_access()
         .filter(|_| !uses_cell && emit_promotion)
     {
-        output.push_str(emit_member_access(access));
+        output.push_str(emit_member_access(&access));
         output.push(' ');
     }
     let payload_default = matches!(evaluated_default, Some(ConstValue::PayloadEnum(_)));

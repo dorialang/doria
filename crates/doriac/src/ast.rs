@@ -321,16 +321,58 @@ pub struct TypeParamDecl {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
-    pub promoted_access: Option<MemberAccess>,
+    pub constructor_role: ConstructorParameterRole,
+    pub role_and_mode_prefix_span: Span,
     pub take: bool,
     pub take_span: Option<Span>,
     pub writable: bool,
     pub writable_span: Option<Span>,
     pub ownership_modifier_insert: Span,
     pub ty: TypeRef,
+    pub type_span: Span,
     pub name: String,
+    pub name_span: Span,
     pub default: Option<Expr>,
+    pub default_span: Option<Span>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstructorParameterRole {
+    Ordinary,
+    Promoted {
+        access: MemberAccess,
+        access_span: Option<Span>,
+    },
+    InheritedPropertyOverride {
+        override_span: Span,
+    },
+    ConstructorOnly {
+        parameter_span: Span,
+    },
+}
+
+impl ConstructorParameterRole {
+    pub const fn is_promoted(self) -> bool {
+        matches!(self, Self::Promoted { .. })
+    }
+
+    pub const fn promoted_access(self) -> Option<MemberAccess> {
+        match self {
+            Self::Promoted { access, .. } => Some(access),
+            Self::Ordinary
+            | Self::InheritedPropertyOverride { .. }
+            | Self::ConstructorOnly { .. } => None,
+        }
+    }
+
+    pub const fn is_override(self) -> bool {
+        matches!(self, Self::InheritedPropertyOverride { .. })
+    }
+
+    pub const fn is_constructor_only(self) -> bool {
+        matches!(self, Self::ConstructorOnly { .. })
+    }
 }
 
 /// The name written before a named call argument (`name: value`), with the

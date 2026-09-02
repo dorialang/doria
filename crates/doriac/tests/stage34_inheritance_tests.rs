@@ -1,4 +1,6 @@
-use doriac::ast::{ClassMember, Item};
+use doriac::ast::{ClassMember, ConstructorParameterRole, Item};
+use doriac::diagnostics::FixApplicability;
+use doriac::lexer::TokenKind;
 use doriac::mir;
 use doriac::types::ResolvedType;
 
@@ -21,6 +23,26 @@ fn lower(source: &str) -> mir::Program {
 
 fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
     doriac::mir_interpreter::interpret(&lower(source)).expect("Stage 34 MIR should interpret")
+}
+
+fn source_text(source: &str, span: doriac::source::Span) -> &str {
+    &source[span.start..span.end]
+}
+
+#[test]
+fn parameter_is_a_keyword_without_reserving_param_or_text_occurrences() {
+    let tokens = doriac::lex_source(
+        "constructor-roles.doria",
+        "parameter param parameterValue override // parameter\n\"parameter\"",
+    )
+    .expect("constructor role vocabulary should lex");
+    assert!(matches!(tokens[0].kind, TokenKind::Parameter));
+    assert!(matches!(tokens[1].kind, TokenKind::Identifier(ref name) if name == "param"));
+    assert!(matches!(tokens[2].kind, TokenKind::Identifier(ref name) if name == "parameterValue"));
+    assert!(matches!(tokens[3].kind, TokenKind::Override));
+    assert!(
+        matches!(tokens[4].kind, TokenKind::StringLiteral { ref value, .. } if value == "parameter")
+    );
 }
 
 #[test]
@@ -100,6 +122,258 @@ fn hierarchy_validation_rejects_closed_cycles_invalid_overrides_and_constructor_
     ] {
         assert_diagnostic(source, code);
     }
+}
+
+#[test]
+fn constructor_parameter_roles_are_explicit_and_source_preserving() {
+    let source = r#"
+open class Base<T>
+{
+    function __construct(take T $value) {}
+}
+
+class Child extends Base<List<int>>
+{
+    function __construct(
+        override take List<int> $value,
+        parameter writable string $label,
+        internal int $count = 0,
+    ) {
+        parent::__construct($value);
+        $label = $label . "!";
+    }
+}
+"#;
+    let program = doriac::parse_source("constructor-roles.doria", source)
+        .expect("constructor parameter roles should parse");
+    let child = program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Class(class) if class.name == "Child" => Some(class),
+            _ => None,
+        })
+        .expect("child class");
+    let constructor = child
+        .members
+        .iter()
+        .find_map(|member| match member {
+            ClassMember::Method(method) if method.name == "__construct" => Some(method),
+            _ => None,
+        })
+        .expect("child constructor");
+    assert!(constructor.params[0].constructor_role.is_override());
+    assert!(constructor.params[1].constructor_role.is_constructor_only());
+    assert!(constructor.params[2].constructor_role.is_promoted());
+
+    let overridden = &constructor.params[0];
+    assert_eq!(
+        source_text(source, overridden.role_and_mode_prefix_span),
+        "override take "
+    );
+    assert_eq!(
+        source_text(source, overridden.take_span.expect("take span")),
+        "take"
+    );
+    assert_eq!(source_text(source, overridden.type_span), "List<int>");
+    assert_eq!(source_text(source, overridden.name_span), "$value");
+    assert_eq!(
+        source_text(source, overridden.span),
+        "override take List<int> $value"
+    );
+    assert!(matches!(
+        overridden.constructor_role,
+        ConstructorParameterRole::InheritedPropertyOverride { override_span }
+            if source_text(source, override_span) == "override"
+    ));
+
+    let constructor_only = &constructor.params[1];
+    assert_eq!(
+        source_text(source, constructor_only.role_and_mode_prefix_span),
+        "parameter writable "
+    );
+    assert_eq!(
+        source_text(
+            source,
+            constructor_only.writable_span.expect("writable span")
+        ),
+        "writable"
+    );
+    assert_eq!(source_text(source, constructor_only.type_span), "string");
+    assert_eq!(source_text(source, constructor_only.name_span), "$label");
+    assert!(matches!(
+        constructor_only.constructor_role,
+        ConstructorParameterRole::ConstructorOnly { parameter_span }
+            if source_text(source, parameter_span) == "parameter"
+    ));
+
+    let promoted = &constructor.params[2];
+    assert_eq!(
+        source_text(source, promoted.role_and_mode_prefix_span),
+        "internal "
+    );
+    assert_eq!(
+        source_text(source, promoted.default_span.expect("default span")),
+        "0"
+    );
+}
+
+#[test]
+fn constructor_parameter_roles_reuse_storage_or_create_no_storage() {
+    let source = r#"
+open class Document
+{
+    function __construct(string $title) {}
+    open function heading(): string { return $this->title; }
+}
+
+class Article extends Document
+{
+    string $normalized;
+
+    function __construct(override string $title, parameter string $raw)
+    {
+        parent::__construct($title);
+        $this->normalized = $raw . "!";
+    }
+
+    override function heading(): string { return $this->title . ":" . $this->normalized; }
+}
+
+function main(): void
+{
+    let $article = new Article("Doria", "ready");
+    echo $article->heading() . "\n";
+}
+"#;
+    let output = interpret(source);
+    assert_eq!(output.stdout, b"Doria:ready!\n");
+
+    let hir = doriac::lower_source("constructor-roles.doria", source)
+        .expect("constructor roles should lower to HIR");
+    let class = hir
+        .items
+        .iter()
+        .find_map(|item| match item {
+            doriac::hir::Item::Class(class) if class.name == "Article" => Some(class),
+            _ => None,
+        })
+        .expect("article HIR");
+    let properties = class
+        .members
+        .iter()
+        .filter(|member| matches!(member, doriac::hir::ClassMember::Property(_)))
+        .count();
+    assert_eq!(
+        properties, 1,
+        "override and parameter roles add no child storage"
+    );
+    let constructor = class
+        .members
+        .iter()
+        .find_map(|member| match member {
+            doriac::hir::ClassMember::Method(method) if method.name == "__construct" => {
+                Some(method)
+            }
+            _ => None,
+        })
+        .expect("article constructor HIR");
+    let target = constructor.params[0]
+        .inherited_property
+        .as_ref()
+        .expect("override must carry canonical inherited property identity");
+    assert_eq!(target.declaring_class, "Document");
+    assert_eq!(target.property_name, "title");
+    assert!(constructor.params[1].inherited_property.is_none());
+
+    let (_, analysis) = doriac::analyze_source_for_ide("constructor-roles.doria", source)
+        .expect("constructor roles should analyze");
+    let family = analysis
+        .info
+        .property_families
+        .values()
+        .find(|family| family.root_property_name == "title")
+        .expect("inherited title property family");
+    assert_eq!(family.root_declaring_class, "Document");
+    assert_eq!(family.override_parameters.len(), 1);
+    let article = analysis
+        .info
+        .classes
+        .iter()
+        .find(|class| class.declaration_name == "Article")
+        .expect("article class semantics");
+    assert_eq!(
+        article
+            .properties
+            .iter()
+            .filter(|property| property.name == "title")
+            .count(),
+        1,
+        "the inherited property family must map to one physical property"
+    );
+}
+
+#[test]
+fn constructor_parameter_role_diagnostics_are_causal_and_actionable() {
+    let missing = diagnostics(
+        "open class A { function __construct(string $name) {} } class B extends A { function __construct(string $name) { parent::__construct($name); } }",
+    );
+    let diagnostic = missing
+        .iter()
+        .find(|diagnostic| diagnostic.code == "E0743")
+        .expect("missing role diagnostic");
+    assert_eq!(diagnostic.fixes.len(), 2);
+    assert_eq!(
+        diagnostic.fixes[0].applicability,
+        FixApplicability::MachineApplicable
+    );
+    assert_eq!(diagnostic.fixes[0].edits[0].replacement, "override ");
+    assert_eq!(
+        diagnostic.fixes[1].applicability,
+        FixApplicability::RequiresReview
+    );
+    assert_eq!(diagnostic.fixes[1].edits[0].replacement, "parameter ");
+
+    for (source, code) in [
+        ("class A { function __construct(override string $name) {} }", "E0741"),
+        ("open class A { function __construct(string $name) {} } class B extends A { function __construct(override int $name) { parent::__construct(\"x\"); } }", "E0742"),
+        ("function f(parameter string $value): void {}", "E0737"),
+        ("function f(override string $value): void {}", "E0738"),
+        ("class A { function __construct(internal parameter string $value) {} }", "E0739"),
+        ("class A { function __construct(writable parameter string $value) {} }", "E0740"),
+        ("class A { function __construct(parameter parameter string $value) {} }", "E0744"),
+        ("open class A { function __construct(string $value) {} } class B extends A { function __construct(override override string $value) { parent::__construct($value); } }", "E0744"),
+        ("open class A { function __construct(string $name) {} } class B extends A { function __construct(int $name) { parent::__construct(\"name\"); } }", "E0727"),
+    ] {
+        assert_diagnostic(source, code);
+    }
+}
+
+#[test]
+fn constructor_only_move_parameters_use_ordinary_borrowing_rules() {
+    let accepted = r#"
+class Payload { function value(): int { return 7; } }
+class Inspector
+{
+    function __construct(parameter Payload $payload)
+    {
+        echo "{$payload->value()}\n";
+    }
+}
+function main(): void
+{
+    let $payload = new Payload();
+    let $inspector = new Inspector($payload);
+    echo "{$payload->value()}\n";
+}
+"#;
+    let output = interpret(accepted);
+    assert_eq!(output.stdout, b"7\n7\n");
+
+    assert_diagnostic(
+        "class Payload {} class Owner { function __construct(Payload $payload) {} }",
+        "E0468",
+    );
 }
 
 #[test]

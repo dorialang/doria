@@ -3881,3 +3881,36 @@ function main(): void
     assert!(!php.contains("Base::__construct(\"typed\")"));
     assert!(!php.contains("Base::describe()"));
 }
+
+#[test]
+fn php_backend_emits_constructor_roles_as_ordinary_parameters() {
+    let source = r#"
+open class Base
+{
+    function __construct(string $title) {}
+}
+
+class Child extends Base
+{
+    string $normalized;
+
+    function __construct(override string $title, parameter string $raw)
+    {
+        parent::__construct($title);
+        $this->normalized = $raw;
+    }
+}
+
+function main(): void
+{
+    let $child = new Child("title", "value");
+}
+"#;
+    let php = doriac::compile_source_to_php("constructor-roles.doria", source)
+        .expect("constructor roles should compile to PHP");
+    assert!(php.contains("class Child extends Base"));
+    assert!(php.contains("public function __construct(string $title, string $raw)"));
+    assert!(php.contains("parent::__construct($title);"));
+    assert!(!php.contains("public string $raw"));
+    assert_eq!(php.matches("public string $title").count(), 1);
+}

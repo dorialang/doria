@@ -171,3 +171,10 @@ definite initialization complete before child property initialization; failure
 cleans only initialized child state and completed parent state. Required parent
 arguments use one first-statement `parent::__construct(...)` call and are never
 forwarded implicitly.
+
+## Post-Stage-34 Constructor-Role Amendment
+
+Decision 0131 admits only actual new promoted properties into a child phase's
+preinitialized set. Override parameters rely on the validated parent phase;
+constructor-only parameters satisfy no property obligation, including a
+same-named explicit property, so E0500 remains authoritative.

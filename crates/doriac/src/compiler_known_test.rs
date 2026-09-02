@@ -1,4 +1,7 @@
-use crate::ast::{Block, ClassDecl, ClassMember, FunctionDecl, Item, MemberAccess, Param, Program};
+use crate::ast::{
+    Block, ClassDecl, ClassMember, ConstructorParameterRole, FunctionDecl, Item, MemberAccess,
+    Param, Program,
+};
 use crate::diagnostics::{Diagnostic, DiagnosticResult};
 use crate::lexer::{Lexer, Token, TokenKind};
 use crate::names::{CompilerSymbolIdentity, GlobalSymbolFacts, GlobalSymbolId, GlobalSymbolOwner};
@@ -158,15 +161,22 @@ pub fn augment_program(program: &Program) -> Program {
     }
     let span = Span::in_source(crate::compiler_known_io::SYNTHETIC_SOURCE_ID, 6, 7);
     let property = |ty: &str, name: &str, access| Param {
-        promoted_access: Some(access),
+        constructor_role: ConstructorParameterRole::Promoted {
+            access,
+            access_span: None,
+        },
+        role_and_mode_prefix_span: span,
         take: false,
         take_span: None,
         writable: false,
         writable_span: None,
         ownership_modifier_insert: span,
         ty: TypeRef::named(ty),
+        type_span: span,
         name: name.to_string(),
+        name_span: span,
         default: None,
+        default_span: None,
         span,
     };
     let mut params = vec![property("string", "message", MemberAccess::External)];

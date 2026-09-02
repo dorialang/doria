@@ -122,6 +122,51 @@ function main(): void {}
 }
 
 #[test]
+fn constructor_parameter_attributes_follow_storage_roles_exactly() {
+    let source = r#"
+#[Attribute]
+class Field {}
+
+open class Base
+{
+    function __construct(#[Field] string $inherited) {}
+}
+
+class Child extends Base
+{
+    function __construct(
+        #[Field] string $external,
+        #[Field] internal string $internal,
+        #[Field] override string $inherited,
+        #[Field] parameter string $temporary,
+    ) {
+        parent::__construct($inherited);
+    }
+}
+"#;
+    let program = doriac::parse_source("constructor-role-attributes.doria", source)
+        .expect("constructor role attributes should parse");
+    let roles = program
+        .attributes
+        .iter()
+        .filter(|attachment| attachment.target.kind == AttributeTargetKind::Parameter)
+        .map(|attachment| attachment.target.roles.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(roles.len(), 5);
+    assert_eq!(
+        roles[0],
+        vec![
+            AttributeTargetRole::Parameter,
+            AttributeTargetRole::PromotedProperty
+        ]
+    );
+    assert_eq!(roles[1], roles[0]);
+    assert_eq!(roles[2], roles[0]);
+    assert_eq!(roles[3], vec![AttributeTargetRole::Parameter]);
+    assert_eq!(roles[4], vec![AttributeTargetRole::Parameter]);
+}
+
+#[test]
 fn parser_attaches_attributes_to_the_complete_stage32_target_surface() {
     let source = r#"
 #[Test]

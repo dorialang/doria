@@ -1,5 +1,11 @@
 # Doria diagnostic style
 
+Constructor-role diagnostics preserve intent rather than suggesting a renamed
+parameter. A compatible inherited-property collision offers a machine-applicable
+`override` insertion and a reviewed `parameter` alternative; E0727 remains for
+actual hiding. Role placement, order, duplicates, and conflicts receive causal
+fixes that never invent parent forwarding or property assignments.
+
 This guide is normative for compiler diagnostics and for every consumer of the
 compiler's structured diagnostic model.
 

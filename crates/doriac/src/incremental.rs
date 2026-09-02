@@ -551,8 +551,16 @@ fn append_function_signature(
     append_type_params(surface, &function.type_params);
     for parameter in &function.params {
         surface.push_str("param:");
-        if let Some(access) = parameter.promoted_access {
-            append_access(surface, access);
+        match parameter.constructor_role {
+            crate::ast::ConstructorParameterRole::Ordinary => surface.push('o'),
+            crate::ast::ConstructorParameterRole::Promoted { access, .. } => {
+                surface.push('p');
+                append_access(surface, access);
+            }
+            crate::ast::ConstructorParameterRole::InheritedPropertyOverride { .. } => {
+                surface.push('v')
+            }
+            crate::ast::ConstructorParameterRole::ConstructorOnly { .. } => surface.push('c'),
         }
         surface.push(if parameter.take {
             't'

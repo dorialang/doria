@@ -40,6 +40,7 @@ require_once __DIR__ . '/check_stage33_slice1_baton_authority.php';
 require_once __DIR__ . '/check_stage33_slice2_dependencies_and_lockfile.php';
 require_once __DIR__ . '/check_stage33_slice3_phase_f.php';
 require_once __DIR__ . '/check_stage34_inheritance.php';
+require_once __DIR__ . '/check_constructor_parameter_roles.php';
 
 $root = dirname(__DIR__);
 $failures = check_stream_io_completeness($root);
@@ -64,6 +65,7 @@ array_push($failures, ...check_stage33_slice1_baton_authority($root));
 array_push($failures, ...check_stage33_slice2_dependencies_and_lockfile($root));
 array_push($failures, ...check_stage33_slice3_phase_f($root));
 array_push($failures, ...check_stage34_inheritance($root));
+array_push($failures, ...check_constructor_parameter_roles($root));
 
 // Keys are "path:line:number". Keep this empty unless the repository contains
 // a verified decision-shaped token that is not a citation. Every entry requires

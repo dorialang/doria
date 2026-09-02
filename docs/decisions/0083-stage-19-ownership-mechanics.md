@@ -90,3 +90,10 @@ without weakening move-out, overlap, or writable-path invariants.
 Decision 0130 extends total property order to root-to-derived class phases.
 Upcasts transfer the same owned allocation without cloning, and derived-first
 cleanup preserves every existing move and acquire-before-drop obligation.
+
+## Post-Stage-34 Constructor-Role Amendment
+
+Decision 0131 narrows the Move-value `take` requirement to actual property
+promotion. Constructor-only and inherited-property override parameters follow
+ordinary readonly, writable, and `take` parameter ownership rules and never
+become property owners merely because they occur in `__construct`.

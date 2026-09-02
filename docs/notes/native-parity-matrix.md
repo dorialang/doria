@@ -207,6 +207,7 @@ three execution paths.
 | Native compile without execution preflight | Covered | Covered | Covered | Covered | Infinite-loop source compiles but is excluded from executable parity. |
 | Native lowering source | MIR | MIR | MIR | Covered | `codegen_cranelift` and `codegen_llvm` consume validated MIR with no HIR or retired-smoke dependency. |
 | Complete differential harness | Manifest-driven | Manifest-driven | Manifest-driven | Covered | CI requires a runtime artifact and linker; stdout, stderr, and status are exact. |
+| Constructor parameter roles | Covered | Covered | Covered | Covered | `main_constructor_parameter_roles.doria` combines generic inherited-property override, constructor-only input, actual promotion, explicit parent forwarding, exact output, and one root storage family without duplicate initialization or cleanup. |
 
 ## Retirement Gate
 
