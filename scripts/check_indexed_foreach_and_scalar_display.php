@@ -32,6 +32,7 @@ function check_indexed_foreach_and_scalar_display(string $root): array
 
     $paths = [
         'decision' => 'docs/decisions/0132-indexed-sequence-foreach-bindings-and-scalar-display-materialization.md',
+        'explicitTypesDecision' => 'docs/decisions/0133-explicit-foreach-binding-types.md',
         'decision131' => 'docs/decisions/0131-constructor-property-overrides-and-constructor-only-parameters.md',
         'plan' => 'docs/doria-end-to-end-plan.md',
         'pipeline' => 'docs/notes/current-pipeline.md',
@@ -69,7 +70,15 @@ function check_indexed_foreach_and_scalar_display(string $root): array
         'Decision 0104',
         'metadata schemas 1, 2, and 3',
         'processor protocol version 1',
-        'The next record number',
+    ]);
+    $require($paths['explicitTypesDecision'], $files['explicitTypesDecision'], [
+        '# Decision 0133:',
+        '**Status:** Accepted',
+        'Implemented By The Post-Stage-34 Explicit Foreach Binding Types Corrective Beat',
+        'Every authored foreach binding has an explicit type',
+        'Foreach Binding Type Is Required',
+        'Source with E0748 does not enter HIR',
+        'The next decision-record',
     ]);
     $require($paths['decision131'], $files['decision131'], [
         '**Implementation Status:** Implemented By Post-Stage-34 Constructor Parameter Roles Corrective Beat',
@@ -77,12 +86,14 @@ function check_indexed_foreach_and_scalar_display(string $root): array
     $require($paths['plan'], $files['plan'], [
         'Stage 34 — Single Class Inheritance — Complete',
         'Indexed Foreach And Scalar Display Corrective Beat — Complete',
+        'Explicit Foreach Binding Types Corrective Beat — Complete',
         'Stage 35 — Interfaces And Traits — Next',
         'Stage 36 Property Hooks — Scheduled',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
         'Indexed Foreach And Scalar Display Corrective Beat — Complete.',
+        'Explicit Foreach Binding Types Corrective Beat — Complete.',
         'Stage 35 Interfaces And Traits — Next.',
         'Stage 36 Property Hooks — Scheduled.',
     ]);
@@ -110,6 +121,8 @@ function check_indexed_foreach_and_scalar_display(string $root): array
         'E0745',
         'E0746',
         'E0747',
+        'E0748',
+        'require_foreach_binding_type',
     ]);
     $require($paths['hir'], $files['hir'], [
         'iteration_kind: crate::semantics::ForeachIterationKind',
@@ -144,8 +157,10 @@ function check_indexed_foreach_and_scalar_display(string $root): array
         'parser_preserves_neutral_bindings_and_exact_authored_spans',
         'semantic_facts_distinguish_sequence_indexes_dictionary_keys_and_value_only_sources',
         'invalid_first_bindings_are_rejected_with_local_machine_fixes_and_no_backend_error',
+        'every_foreach_binding_requires_an_explicit_type_with_local_fixes',
+        'explicit_binding_types_cover_every_iterable_family_and_element_shape',
         'malformed_foreach_roles_ordinals_and_binding_sources_are_rejected',
-        'indexed_sequences_execute_with_property_roots_inference_and_control_flow',
+        'indexed_sequences_execute_with_property_roots_and_control_flow',
         'php_uses_a_compiler_owned_sequence_ordinal_and_preserves_dictionary_keys',
         'canonical_scalar_display_materializes_ordinary_strings',
     ]);
@@ -155,7 +170,7 @@ function check_indexed_foreach_and_scalar_display(string $root): array
     ]);
     $require($paths['indexedFixture'], $files['indexedFixture'], [
         '$this->contents as int $line',
-        'foreach ($words as $index => $word)',
+        'foreach ($words as int $index => string $word)',
         'continue;',
         'break;',
         'Dictionary<string, int>',
@@ -169,7 +184,7 @@ function check_indexed_foreach_and_scalar_display(string $root): array
         '0.0 / 0.0',
         '1.0 / 0.0',
     ]);
-    $require($paths['catalogue'], $files['catalogue'], ['E0745', 'E0746', 'E0747']);
+    $require($paths['catalogue'], $files['catalogue'], ['E0745', 'E0746', 'E0747', 'E0748']);
     $require($paths['metadata'], $files['metadata'], [
         'schema version 1',
         'schema version 2',
@@ -179,11 +194,15 @@ function check_indexed_foreach_and_scalar_display(string $root): array
     $require($paths['temporaryRestrictions'], $files['temporaryRestrictions'], [
         '| Indexed sequence `foreach` first bindings',
         '| Complete | Decision 0132 | Post-Stage-34 corrective beat |',
+        '| Explicit `foreach` binding types',
+        '| Complete | Decision 0133 | Post-Stage-34 corrective beat |',
     ]);
-
-    foreach (glob($root . '/docs/decisions/0133-*.md') ?: [] as $path) {
-        $failures[] = str_replace($root . '/', '', $path) . ': Decision 0133 must remain unused';
-    }
+    $forbid($paths['decision'], $files['decision'], ['inferred or explicit element type']);
+    $forbid($paths['plan'], $files['plan'], ['typed/inferred/property-rooted']);
+    $forbid($paths['indexedFixture'], $files['indexedFixture'], [
+        'as $index =>',
+        'as $word)',
+    ]);
     foreach (glob($root . '/docs/decisions/*property-hook*.md') ?: [] as $path) {
         $failures[] = str_replace($root . '/', '', $path) . ': property-hook authority is out of scope';
     }

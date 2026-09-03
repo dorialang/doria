@@ -146,7 +146,7 @@ future pass does not re-propose them as oversights.
 |-------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | `getOrDefault`, `tryGetValue`, entry APIs             | `$d->get($k) ?? $default` already expresses this exactly. A method would be a second spelling for one idea                                                                                       |
 | `isSubsetOf`, `isSupersetOf`, `overlaps`, `setEquals` | `$a->difference($b)->isEmpty` is correct and readable. It costs one allocation, which is a performance argument, not an ergonomics one — reopen it with profiling evidence, not by analogy to C# |
-| `addAll`, `extend`, `merge`                           | `foreach ($src as $v) { $dst->add($v); }` is three clear lines, and bulk-move ownership is genuinely unsettled until `Cloneable` at Stage 35                                                     |
+| `addAll`, `extend`, `merge`                           | `foreach ($src as T $v) { $dst->add($v); }` is three clear lines, and bulk-move ownership is genuinely unsettled until `Cloneable` at Stage 35                                                   |
 | `sort`, `sortBy`, `reverse`                           | Ordering is what `SortedSet`/`SortedDictionary` are for; comparator-driven sorting belongs with closures at Stage 30                                                                             |
 | `Deque::remove`, `removeAt`, `insertAt`               | Middle mutation is not what a deque is for, and the runtime's shift path is not ring-aware (see §7)                                                                                              |
 | Range and slice queries over sorted types             | 0100 deferred these; they remain deferred, and they need a range/slice value type that v1.0 does not have                                                                                        |
@@ -188,7 +188,7 @@ For `T[]` the claim is not merely unnecessary but **syntactically impossible** �
 on an array type. 0100 asserts a form the grammar cannot express.
 
 The cross-type conversion case (a `List` from a `Set`, say) is real, but it is
-served by `foreach ($source as $v) { $target->add($v); }` — three clear lines,
+served by `foreach ($source as T $v) { $target->add($v); }` — three clear lines,
 and the same standard that excludes `addAll` above. When the Stage 35 iteration
 protocol makes `keys` / `values` storable, conversion is worth revisiting as
 **one general mechanism**, not as a per-type `::from` overload added now.

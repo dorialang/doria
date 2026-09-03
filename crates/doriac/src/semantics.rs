@@ -8298,6 +8298,7 @@ impl<'program> Checker<'program> {
                         let inferred = plan
                             .first_binding_type
                             .expect("non-value-only foreach plan must have a first-binding type");
+                        self.require_foreach_binding_type(first_binding, inferred);
                         first_binding.ty.as_ref().map_or(inferred, |ty| {
                             let annotated_ty = self.resolve_type_ref(
                                 ty,
@@ -8368,6 +8369,7 @@ impl<'program> Checker<'program> {
                             annotated_ty
                         })
                 };
+                self.require_foreach_binding_type(&foreach.value_binding, iterable_value_ty);
                 if dictionary_projection.is_some() && foreach.value_binding.writable {
                     self.diagnostics.push(Diagnostic::new(
                         "E0522",
@@ -15217,6 +15219,37 @@ impl<'program> Checker<'program> {
         }
     }
 
+    fn require_foreach_binding_type(&mut self, binding: &ForeachBinding, inferred: TypeId) {
+        if binding.ty.is_some() || self.is_unknown_type(inferred) {
+            return;
+        }
+
+        let inferred_name = self.types.display(inferred);
+        let mut diagnostic = Diagnostic::new(
+            "E0748",
+            format!(
+                "foreach binding `${}` requires an explicit type; this binding has type `{inferred_name}`",
+                binding.name
+            ),
+            binding.name_span,
+        )
+        .with_title("Foreach Binding Type Is Required")
+        .with_explanation(
+            "A foreach binding declares a loop-local variable. Doria requires its type to be visible at the declaration site.",
+        );
+
+        let insertion = Span::in_source(
+            binding.name_span.source,
+            binding.name_span.start,
+            binding.name_span.start,
+        );
+        diagnostic = diagnostic
+            .with_help(format!("write `{inferred_name} ${}`", binding.name))
+            .with_fix(insertion, format!("{inferred_name} "));
+
+        self.diagnostics.push(diagnostic);
+    }
+
     fn check_sequence_index_binding_type(&mut self, target: TypeId, value: TypeId, span: Span) {
         if self.is_unknown_type(target) || self.is_unknown_type(value) {
             return;
@@ -21983,6 +22016,16 @@ impl<'program> Checker<'program> {
                 "keys" | "values",
             )
         ) {
+            let binding_type = match (self.types.kind(ty), property) {
+                (TypeKind::Dictionary(key, _) | TypeKind::SortedDictionary(key, _), "keys") => {
+                    self.types.display(*key)
+                }
+                (
+                    TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value),
+                    "values",
+                ) => self.types.display(*value),
+                _ => unreachable!("dictionary projection was established above"),
+            };
             self.diagnostics.push(
                 Diagnostic::new(
                     "E0522",
@@ -21992,7 +22035,7 @@ impl<'program> Checker<'program> {
                     span,
                 )
                 .with_help(format!(
-                    "iterate it with `foreach ($dictionary->{property} as $value)` or build an owned copy explicitly"
+                    "iterate it with `foreach ($dictionary->{property} as {binding_type} $value)` or build an owned copy explicitly"
                 )),
             );
             return;

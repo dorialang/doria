@@ -112,12 +112,12 @@ through the Stage 22 flow model. Naming follows the §9.1 charter.
 | `has(K): bool` | readonly | key membership |
 | `keys` / `values` | readonly projections | `foreach`-only, insertion order; **not storable** (see below) |
 | `count` / `isEmpty` | readonly properties | |
-| `foreach ($d as $k => $v)` / `as $v` | readonly / writable borrows | **insertion order** (0092) |
+| `foreach ($d as K $k => V $v)` / `as V $v` | readonly / writable borrows | **insertion order** (0092, with explicit binding types per 0133) |
 
 **`keys` / `values` are `foreach`-only projections, not storable values (v1.0).**
 Each is a readonly, insertion-ordered projection of the dictionary's keys or
 values, usable **only as the iterable in a `foreach` head** — `foreach ($d->keys
-as $k)`, `foreach ($d->values as $v)` — where it borrows `$d` for the loop's
+as K $k)`, `foreach ($d->values as V $v)` — where it borrows `$d` for the loop's
 duration and yields element borrows. It has **no nameable, storable type in
 v1.0**: binding one (`let $ks = $d->keys`) or using it anywhere but a `foreach`
 iterable position is a diagnostic directing the user to iterate it, or to build an
@@ -127,7 +127,7 @@ when that protocol lands, `keys`/`values` can be **upgraded** to return a
 first-class storable iterator **without breaking any `foreach` caller** (an
 additive change). An owned copy is an explicit, later, copying operation
 (`List::from($d->keys)` once projections are accepted `::from` sources) — deferred,
-not v1.0. Writable value mutation stays on the main `foreach ($d as $k => $v)`
+not v1.0. Writable value mutation stays on the main `foreach ($d as K $k => writable V $v)`
 form; `values` is readonly.
 
 ### `Set<T>`
@@ -140,7 +140,7 @@ form; `values` is readonly.
 | `contains(T): bool` | readonly | membership |
 | `union` / `intersect` / `difference(Set<T>): Set<T>` | readonly | return a **new owned** set; receiver and argument unchanged |
 | `count` / `isEmpty` | readonly properties | |
-| `foreach ($s as $e)` | readonly borrow only | insertion order (0092) |
+| `foreach ($s as T $e)` | readonly borrow only | insertion order (0092, with explicit binding types per 0133) |
 
 `isSubsetOf` / `isSupersetOf` predicates are deferred (not required for v1.0).
 

@@ -233,7 +233,7 @@ each exposes iteration over the heap (C# `UnorderedItems`, Rust `BinaryHeap::ite
 |--------------------|-------------------------------------------|-----------------------------------------------------------------------------------------|
 | `getOrDefault`     | `$d->get($k) ?? $default`                 | `??` already covers it exactly. Adding a method would be a second spelling for one idea |
 | `isSubsetOf` etc.  | `$a->difference($b)->isEmpty`             | Correct and readable; only costs an allocation                                          |
-| `addAll` / `merge` | `foreach ($src as $v) { $dst->add($v); }` | Three clear lines, and bulk-move ownership is genuinely unsettled until `Cloneable`     |
+| `addAll` / `merge` | `foreach ($src as T $v) { $dst->add($v); }` | Three clear lines, and bulk-move ownership is genuinely unsettled until `Cloneable`   |
 | `sort` / `reverse` | `SortedSet` / `SortedDictionary` exist    | Ordering is what the `Sorted` family is *for*; comparator sorting belongs with closures |
 
 ### Deliberate design, not oversight

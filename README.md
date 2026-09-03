@@ -98,10 +98,11 @@ callback's exact checked Errors. `map` may produce owned Move values, while
 `filter` remains limited to Copy elements until an explicit cloning capability
 exists. Other collection families do not expose these algorithms.
 
-Two-binding `foreach` makes collection roles explicit without adding tuple or
-iterator allocation. `List<T>` and `T[]` provide a readonly zero-based `int`
-index; dictionaries provide their actual readonly key. Other current iterable
-families remain value-only. Indexed property-rooted sequences are borrowed once,
+Every `foreach` binding has an explicit type. Two-binding `foreach` makes
+collection roles explicit without adding tuple or iterator allocation:
+`foreach ($items as int $index => Item $item)`. `List<T>` and `T[]` provide a
+readonly zero-based `int` index; dictionaries provide their actual readonly key.
+Other current iterable families remain value-only. Indexed property-rooted sequences are borrowed once,
 and existing writable value iteration remains governed separately by exclusive
 access.
 

@@ -265,16 +265,16 @@ for (let writable $i = 0; $i < 10; $i++) {
 `foreach` is preferred for collections and ranges. Integer ranges use `..` for inclusive ranges and `..<` for exclusive-end ranges:
 
 ```doria
-foreach (0..10 as $i) {
+foreach (0..10 as int $i) {
     echo $i;
 }
 
-foreach (0..<10 as $i) {
+foreach (0..<10 as int $i) {
     echo $i;
 }
 ```
 
-`0..10` produces `0` through `10`. `0..<10` produces `0` through `9`. Range endpoints must be `int` expressions. The variable after `as` is a readonly loop-local binding for each iteration and does not leak outside the `foreach` body.
+`0..10` produces `0` through `10`. `0..<10` produces `0` through `9`. Range endpoints must be `int` expressions. Every `foreach` binding requires an explicit type. The variable after `as` is a readonly loop-local binding for each iteration and does not leak outside the `foreach` body.
 
 The optional first binding in the PHP-shaped two-binding form has a checked role:
 
@@ -292,7 +292,8 @@ sets, sorted sets, deques, and dictionary key/value projections are value-only.
 `PriorityQueue<T>` and `Bytes` are not iterable. A property-rooted sequence is
 evaluated and borrowed once, not moved or copied. Writable value iteration
 retains its existing exclusive-access rules; a first binding is never writable.
-Decision 0132 is authoritative.
+Decisions 0132 and 0133 are authoritative. Decision 0132 defines iterable roles;
+Decision 0133 requires an explicit authored type on every foreach binding.
 
 Standalone `++` and `--` mutation statements require a declared writable `int` target:
 
@@ -1842,7 +1843,7 @@ function main(): void
 function main(List<string> $args): int
 {
     printf("count=%d\n", $args->count);
-    foreach ($args as $argument) {
+    foreach ($args as string $argument) {
         echo $argument;
         echo "\n";
     }

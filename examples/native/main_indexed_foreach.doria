@@ -23,7 +23,7 @@ class Window
 
 function printIndexes<T>(List<T> $values): void
 {
-    foreach ($values as $index => $value) {
+    foreach ($values as int $index => T $value) {
         echo "generic {$index}\n";
     }
 }
@@ -34,7 +34,7 @@ function main(): void
     $window->render();
 
     List<string> $words = ["one", "two"];
-    foreach ($words as $index => $word) {
+    foreach ($words as int $index => string $word) {
         echo "list {$index}:{$word}\n";
     }
 

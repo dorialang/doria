@@ -2,7 +2,7 @@ function main(): int
 {
     let writable $count = 0;
 
-    foreach (0..<3 as $outer) {
+    foreach (0..<3 as int $outer) {
         for (let writable $inner = 0; $inner < 2; $inner++) {
             $count++;
         }

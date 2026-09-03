@@ -78,7 +78,7 @@ function scenario(): void throws Doria\Std\Io\IoError
         echo "condition ready\n";
     }
 
-    foreach (0..<2 as $index) {
+    foreach (0..<2 as int $index) {
         let $foreach = new Token("foreach");
         if ($index == 0) {
             continue;

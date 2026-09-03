@@ -132,9 +132,9 @@ function main(): void
     string[] $array = ["b"];
     Dictionary<string, int> $map = ["answer" => 42];
     Set<int> $set = Set::from([1]);
-    foreach ($list as $i => $value) {}
+    foreach ($list as int $i => string $value) {}
     foreach ($array as int $i => string $value) {}
-    foreach ($map as $key => $value) {}
+    foreach ($map as string $key => int $value) {}
     foreach ($set as int $value) {}
 }
 "#;
@@ -180,6 +180,135 @@ function main(): void
     assert_eq!(facts[3].iterable_family, ForeachIterableFamily::Set);
     assert_eq!(facts[3].iteration_kind, SemanticIterationKind::ValueOnly);
     assert_eq!(facts[3].first_binding_type, None);
+}
+
+#[test]
+fn every_foreach_binding_requires_an_explicit_type_with_local_fixes() {
+    let source = r#"
+function main(): void
+{
+    List<string> $items = ["a"];
+    foreach ($items as $index => $item) {}
+    foreach ($items as int $index => $item) {}
+    foreach ($items as $item) {}
+    foreach (0..<2 as $number) {}
+}
+"#;
+    let diagnostics = errors(source)
+        .into_iter()
+        .filter(|diagnostic| diagnostic.code == "E0748")
+        .collect::<Vec<_>>();
+    assert_eq!(diagnostics.len(), 5, "{diagnostics:#?}");
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| diagnostic.title == "Foreach Binding Type Is Required"));
+    assert_eq!(
+        diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.fixes[0].edits[0].replacement.as_str())
+            .collect::<Vec<_>>(),
+        ["int ", "string ", "string ", "string ", "int "]
+    );
+    assert!(diagnostics.iter().all(|diagnostic| {
+        diagnostic.fixes[0].applicability == FixApplicability::MachineApplicable
+    }));
+
+    let lowering = doriac::lower_source_to_mir("indexed-foreach.doria", source)
+        .expect_err("missing foreach types must fail before MIR");
+    assert!(lowering.iter().all(|diagnostic| diagnostic.code == "E0748"));
+}
+
+#[test]
+fn explicit_binding_types_cover_every_iterable_family_and_element_shape() {
+    for (source, expected_replacements) in [
+        (
+            r#"
+function main(): void
+{
+    List<string> $list = ["a"];
+    string[] $array = ["b"];
+    foreach ($list as $index => $value) {}
+    foreach ($array as $index => $value) {}
+}
+"#,
+            vec!["int ", "string ", "int ", "string "],
+        ),
+        (
+            r#"
+function main(): void
+{
+    Dictionary<string, int> $dictionary = ["a" => 1];
+    SortedDictionary<int, string> $sorted = SortedDictionary::from([1 => "a"]);
+    foreach ($dictionary as $key => $value) {}
+    foreach ($sorted as $key => $value) {}
+}
+"#,
+            vec!["string ", "int ", "int ", "string "],
+        ),
+        (
+            r#"
+function main(): void
+{
+    Set<int> $set = Set::from([1]);
+    SortedSet<int> $sorted = SortedSet::from([1]);
+    Deque<string> $deque = Deque::from(["a"]);
+    foreach ($set as $value) {}
+    foreach ($sorted as $value) {}
+    foreach ($deque as $value) {}
+}
+"#,
+            vec!["int ", "int ", "string "],
+        ),
+        (
+            r#"
+function main(): void
+{
+    Dictionary<string, int> $dictionary = ["a" => 1];
+    foreach ($dictionary->keys as $key) {}
+    foreach ($dictionary->values as $value) {}
+}
+"#,
+            vec!["string ", "int "],
+        ),
+        (
+            r#"
+function visit<T>(List<T> $items): void
+{
+    foreach ($items as $item) {}
+}
+"#,
+            vec!["T "],
+        ),
+        (
+            r#"
+function main(): void
+{
+    List<?int> $nullable = [null];
+    writable List<string> $writable = ["a"];
+    foreach ($nullable as $value) {}
+    foreach ($writable as writable $value) {}
+}
+"#,
+            vec!["?int ", "string "],
+        ),
+    ] {
+        let diagnostics = errors(source);
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            vec!["E0748"; expected_replacements.len()],
+            "{diagnostics:#?}"
+        );
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.fixes[0].edits[0].replacement.as_str())
+                .collect::<Vec<_>>(),
+            expected_replacements
+        );
+    }
 }
 
 #[test]
@@ -360,7 +489,7 @@ function main(): void
 }
 
 #[test]
-fn indexed_sequences_execute_with_property_roots_inference_and_control_flow() {
+fn indexed_sequences_execute_with_property_roots_and_control_flow() {
     let source = r#"
 class Window
 {
@@ -381,7 +510,7 @@ function main(): void
     let $window = new Window();
     $window->render();
     string[] $letters = ["a", "b"];
-    foreach ($letters as $index => $letter) {
+    foreach ($letters as int $index => string $letter) {
         echo "{$index}{$letter}";
         if ($index == 0) { continue; }
         break;

@@ -4,6 +4,7 @@
 - **Accepted:** 2026-09-02
 - **Implementation Status:** Implemented By The Post-Stage-34 Indexed Foreach And Scalar Display Corrective Beat
 - **Amends:** Decisions 0009, 0045, 0079, 0089, 0092, 0100, 0104, 0113, and 0116
+- **Amended By:** Decision 0133, which requires an explicit type on every foreach binding
 
 ## Context
 
@@ -17,8 +18,9 @@ an ordinary reusable `string`.
 
 ## Decision
 
-The syntax remains `foreach ($iterable as $first => $value)`. The AST calls the
-optional source position `first_binding`; it does not assign a semantic role.
+The two-binding shape remains `foreach ($iterable as FirstType $first => ValueType $value)`;
+Decision 0133 requires both authored types. The AST calls the optional source
+position `first_binding`; it does not assign a semantic role.
 Checked semantics classify the iterable once and record one compiler-owned
 iteration plan consumed by HIR, MIR, backends, and language tooling.
 
@@ -63,9 +65,11 @@ Dictionary first bindings remain actual keys. No ordinal replaces or accompanies
 the key, and no three-binding form is introduced. Existing key equality,
 hashing, ordering, readonly behavior, and value borrowing remain unchanged.
 
-Value bindings preserve their inferred or explicit element type, readonly-by-
-default behavior, nullable and generic substitutions, and existing writable
-element access. Writable values still require a writable iterable path and the
+Value bindings preserve their checked element type, readonly-by-default
+behavior, nullable and generic substitutions, and existing writable element
+access. Decision 0133 requires that checked type to be authored explicitly on
+every foreach binding; compiler inference is diagnostic recovery, not accepted
+source syntax. Writable values still require a writable iterable path and the
 current exclusive-borrow rules. Sequence indexes never become writable. Move
 elements are borrowed rather than moved out by ordinary `foreach`.
 
@@ -154,5 +158,7 @@ Decisions 0130 and 0131 remain unchanged.
 - Website examples may teach indexed `List<T>` and `T[]` iteration and reusable
   display strings after their compiler/toolchain pin is refreshed. This
   repository does not coordinate that website update.
-- Stage 35 remains the next numbered language stage. The next record number
-  remains unallocated, and property hooks remain scheduled and unimplemented.
+- Decision 0133 supersedes the inferred-binding allowance without changing this
+  record's iterable-role matrix or execution model.
+- Stage 35 remains the next numbered language stage, and property hooks remain
+  scheduled and unimplemented.

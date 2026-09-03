@@ -447,7 +447,7 @@ foreach ($items as string $item) {
             r#"
 function first(mixed[] $items)
 {
-    foreach ($items as $item) {
+    foreach ($items as mixed $item) {
         return $item;
     }
 }
@@ -470,7 +470,7 @@ class Box
 
     function leak()
     {
-        foreach ($this->items as $item) {
+        foreach ($this->items as mixed $item) {
             return $item;
         }
     }
@@ -492,7 +492,7 @@ echo [[$payload], [1]];
             r#"
 function first(mixed[] $items)
 {
-    foreach ($items as $item) {
+    foreach ($items as mixed $item) {
         return $item;
     }
 }
@@ -520,7 +520,7 @@ class Box
 
     function leak()
     {
-        foreach ($this->items as $item) {
+        foreach ($this->items as mixed $item) {
             return $item;
         }
     }
@@ -546,7 +546,7 @@ class Box
 
     function leak()
     {
-        foreach ($this->items as $item) {
+        foreach ($this->items as mixed $item) {
             return $item;
         }
     }
@@ -571,7 +571,7 @@ class Box
 
     function leak()
     {
-        foreach ($this->items as $item) {
+        foreach ($this->items as mixed $item) {
             return $item;
         }
     }
@@ -591,7 +591,7 @@ class Box
 
 function first(Box $box)
 {
-    foreach ($box->items as $item) {
+    foreach ($box->items as mixed $item) {
         return $item;
     }
 }
@@ -2611,11 +2611,11 @@ fn checks_stage_9_foreach_range_semantics() {
         r#"
 function main(): void
 {
-    foreach (0..<10 as $i) {
+    foreach (0..<10 as int $i) {
         let $copy = $i;
     }
 
-    foreach ((0..10) as $j) {
+    foreach ((0..10) as int $j) {
         let $copy = $j;
     }
 }
@@ -2656,7 +2656,7 @@ fn rejects_invalid_stage_9_foreach_ranges() {
         r#"
 function main(): void
 {
-    foreach (0..10 as $i) {
+    foreach (0..10 as int $i) {
         $i++;
     }
 }
@@ -2668,7 +2668,7 @@ function main(): void
         r#"
 function main(): int
 {
-    foreach (0..10 as $i) {
+    foreach (0..10 as int $i) {
     }
 
     return $i;
@@ -2681,7 +2681,7 @@ function main(): int
         r#"
 function main(): void
 {
-    foreach ("0"..10 as $i) {
+    foreach ("0"..10 as int $i) {
     }
 }
 "#,

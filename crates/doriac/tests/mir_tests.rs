@@ -2368,7 +2368,7 @@ fn for_initializers_and_foreach_bindings_preserve_shadowed_outer_locals() {
     for (let writable $i = 0; $i < 2; $i++) {
     }
 
-    foreach (0..<2 as $i) {
+    foreach (0..<2 as int $i) {
     }
 
     return $i;
@@ -2388,7 +2388,7 @@ fn interprets_grouped_range_with_stage_11b_expression_bounds() {
     let $end = 4;
     let writable $count = 0;
 
-    foreach (($start - 1)..<($end + 1) as $i) {
+    foreach (($start - 1)..<($end + 1) as int $i) {
         $count++;
     }
 
@@ -2407,7 +2407,7 @@ fn inclusive_range_stops_before_incrementing_past_int64_max() {
 {
     let writable $count = 0;
 
-    foreach (9223372036854775807..9223372036854775807 as $i) {
+    foreach (9223372036854775807..9223372036854775807 as int $i) {
         $count++;
     }
 
@@ -2426,7 +2426,7 @@ fn inclusive_range_continue_stops_before_incrementing_past_int64_max() {
 {
     let writable $count = 0;
 
-    foreach (9223372036854775807..9223372036854775807 as $i) {
+    foreach (9223372036854775807..9223372036854775807 as int $i) {
         $count++;
         continue;
     }
@@ -2449,7 +2449,7 @@ fn mixed_nested_loops_use_innermost_break_and_continue_targets() {
 
     while ($outer < 2) {
         for (let writable $inner = 0; $inner < 2; $inner++) {
-            foreach (0..<3 as $item) {
+            foreach (0..<3 as int $item) {
                 if ($item < 2) {
                     continue;
                 }
@@ -2479,7 +2479,7 @@ fn interpreter_preserves_stdout_across_for_and_foreach_iterations() {
         echo "x";
     }
 
-    foreach (0..<2 as $i) {
+    foreach (0..<2 as int $i) {
         echo "y";
     }
 }
@@ -2535,7 +2535,7 @@ fn lowers_early_return_inside_range_foreach() {
     let output = interpret(
         r#"function main(): int
 {
-    foreach (0..<10 as $i) {
+    foreach (0..<10 as int $i) {
         if ($i == 3) {
             return $i;
         }
@@ -2554,7 +2554,7 @@ fn rejects_range_foreach_first_bindings_before_mir() {
     let key_value = unsupported_after_parsing(
         r#"function main(): void
 {
-    foreach (0..<10 as $key => $value) {
+    foreach (0..<10 as int $key => int $value) {
     }
 }
 "#,
@@ -2652,7 +2652,7 @@ fn range_foreach_binding_remains_readonly_before_mir_lowering() {
         "test.doria",
         r#"function main(): void
 {
-    foreach (0..<10 as $i) {
+    foreach (0..<10 as int $i) {
         $i++;
     }
 }
@@ -3213,7 +3213,7 @@ fn stage_11g_lowers_string_echo_inside_loop_blocks() {
         echo $mark;
     }
 
-    foreach (0..<1 as $i) {
+    foreach (0..<1 as int $i) {
         echo $mark;
     }
 }

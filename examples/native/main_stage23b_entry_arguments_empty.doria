@@ -5,7 +5,7 @@ function main(List<string> $args): int
     printf("count=%d\n", $args->count);
     printf("empty=%s\n", $args->isEmpty);
 
-    foreach ($args as $argument) {
+    foreach ($args as string $argument) {
         echo "unexpected=";
         echo $argument;
         echo "\n";
