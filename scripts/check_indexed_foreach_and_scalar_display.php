@@ -48,6 +48,7 @@ function check_indexed_foreach_and_scalar_display(string $root): array
         'displayFixture' => 'examples/native/main_scalar_display_materialization.doria',
         'catalogue' => 'crates/doria-diagnostic-catalogue/src/lib.rs',
         'metadata' => 'docs/attribute-metadata-protocol.md',
+        'temporaryRestrictions' => 'docs/notes/temporary-language-restrictions-audit.md',
     ];
     $files = [];
     foreach ($paths as $key => $path) {
@@ -57,7 +58,7 @@ function check_indexed_foreach_and_scalar_display(string $root): array
     $require($paths['decision'], $files['decision'], [
         '# Decision 0132:',
         '**Status:** Accepted',
-        'Compiler Implemented; Tooling Coordination Pending',
+        'Implemented By The Post-Stage-34 Indexed Foreach And Scalar Display Corrective Beat',
         '`List<T>`',
         '`T[]`',
         '`Dictionary<K, V>`',
@@ -75,13 +76,15 @@ function check_indexed_foreach_and_scalar_display(string $root): array
     ]);
     $require($paths['plan'], $files['plan'], [
         'Stage 34 — Single Class Inheritance — Complete',
-        'Indexed Foreach And Scalar Display Corrective Beat — Compiler Implemented; Tooling Coordination Pending',
+        'Indexed Foreach And Scalar Display Corrective Beat — Complete',
         'Stage 35 — Interfaces And Traits — Next',
+        'Stage 36 Property Hooks — Scheduled',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
-        'Indexed Foreach And Scalar Display Corrective Beat — Compiler Implemented; Tooling Coordination Pending.',
+        'Indexed Foreach And Scalar Display Corrective Beat — Complete.',
         'Stage 35 Interfaces And Traits — Next.',
+        'Stage 36 Property Hooks — Scheduled.',
     ]);
 
     $require($paths['ast'], $files['ast'], [
@@ -172,6 +175,10 @@ function check_indexed_foreach_and_scalar_display(string $root): array
         'schema version 2',
         'schema version 3',
         'protocol remains version 1',
+    ]);
+    $require($paths['temporaryRestrictions'], $files['temporaryRestrictions'], [
+        '| Indexed sequence `foreach` first bindings',
+        '| Complete | Decision 0132 | Post-Stage-34 corrective beat |',
     ]);
 
     foreach (glob($root . '/docs/decisions/0133-*.md') ?: [] as $path) {

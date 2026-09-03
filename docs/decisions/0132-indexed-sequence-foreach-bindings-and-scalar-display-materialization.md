@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Accepted:** 2026-09-02
-- **Implementation Status:** Compiler Implemented; Tooling Coordination Pending
+- **Implementation Status:** Implemented By The Post-Stage-34 Indexed Foreach And Scalar Display Corrective Beat
 - **Amends:** Decisions 0009, 0045, 0079, 0089, 0092, 0100, 0104, 0113, and 0116
 
 ## Context

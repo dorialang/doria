@@ -117,7 +117,7 @@ function check_constructor_parameter_roles(string $root): array
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
         'Constructor Parameter Roles Corrective Beat — Complete.',
-        'Indexed Foreach And Scalar Display Corrective Beat — Compiler Implemented; Tooling Coordination Pending.',
+        'Indexed Foreach And Scalar Display Corrective Beat — Complete.',
         'Stage 35 Interfaces And Traits — Next.',
     ]);
     $forbid($paths['decision'], $files['decision'], [
