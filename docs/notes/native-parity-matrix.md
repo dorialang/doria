@@ -97,10 +97,12 @@ three execution paths.
 | Stage 28a base `do ... while` | Covered | Covered | Covered | Covered | The body precedes the first strict-bool condition and `continue` targets that condition through the shared CFG. |
 | Stage 28a control-flow `finally` | Covered | Covered | Covered | Covered | Shared MIR finalizer regions route normal completion, `when` yield, return, break, and crossed continue exactly once; same-loop continue skips its loop finalizer, nested regions run inner-to-outer, and fatal panic bypasses cleanup. |
 | Integer range `foreach` | Covered | Covered | Covered | Covered | Inclusive/exclusive ranges and terminal overflow guards are covered. |
+| Indexed sequence `foreach` | Covered | Covered | Covered | Covered | `main_indexed_foreach.doria` covers zero-based List/T[] indexes, property roots, inferred and explicit bindings, continue/break, writable values, generic/Move values, and Dictionary/SortedDictionary actual-key regressions. Shared MIR validates one compiler-owned ordinal and positional sequence access; PHP never derives the index from host keys. |
 | Top-level integer helpers | Covered | Covered | Covered | Covered | Parameters and returns preserve every declared width and signedness. |
 | Void helper calls | Covered | Covered | Covered | Covered | Shared stdout preserves source call order. |
 | Runtime string locals, rebinding, parameters, returns and calls | Covered | Covered | Covered | Covered | Immutable UTF-8 Copy values use the private refcounted runtime ABI. |
 | Runtime concat and primitive display | Covered | Covered | Covered | Covered | Decimal integers, shortest-round-trip floats, lowercase bools, and current interpolation agree exactly. |
+| Reusable scalar-display strings | Covered | Covered | Covered | Covered | `main_scalar_display_materialization.doria` assigns, returns, passes, stores, nests, concatenates, and formats canonical signed/unsigned/fixed integer, binary32/binary64, bool, negative-zero, NaN, and infinity display text. |
 | Arithmetic expression interpolation | Covered | Covered | Covered | Covered | `main_expression_interpolation.doria` produces exact `sum: 42` bytes. |
 | Function-call interpolation | Covered | Covered | Covered | Covered | Ordinary calls lower inside interpolation without a second expression grammar. |
 | Interpolation exactly-once evaluation | Covered | Covered | Covered | Covered | Side-effecting calls execute once per embedded expression. |

@@ -2946,42 +2946,54 @@ impl Parser {
         let iterable = self.parse_expression()?;
         self.expect(TokenKind::As, "expected `as` in foreach")?;
         let first = self.parse_foreach_binding()?;
-        let (key, value) = if self.match_kind(&TokenKind::FatArrow) {
-            let value = self.parse_foreach_binding()?;
-            (Some(first), value)
+        let (first_binding, value_binding) = if self.match_kind(&TokenKind::FatArrow) {
+            let value_binding = self.parse_foreach_binding()?;
+            (Some(first), value_binding)
         } else {
             (None, first)
         };
         self.expect(TokenKind::RightParen, "expected `)` after foreach bindings")?;
         let body = self.parse_block()?;
         let span = self.span(start, body.span.end);
-        Some(Stmt::Foreach(ForeachStmt {
+        Some(Stmt::Foreach(Box::new(ForeachStmt {
             iterable,
-            key,
-            value,
+            first_binding,
+            value_binding,
             body,
             span,
-        }))
+        })))
     }
 
     fn parse_foreach_binding(&mut self) -> Option<ForeachBinding> {
-        let writable = self.match_kind(&TokenKind::Writable);
-        if let Some((name, span)) = self.consume_variable() {
+        let writable_span = self
+            .match_kind(&TokenKind::Writable)
+            .then(|| self.previous().span);
+        let writable = writable_span.is_some();
+        if let Some((name, name_span)) = self.consume_variable() {
             return Some(ForeachBinding {
                 writable,
+                writable_span,
                 ty: None,
+                type_span: None,
                 name,
-                span,
+                name_span,
+                span: writable_span.map_or(name_span, |modifier| modifier.merge(name_span)),
             });
         }
 
+        let type_start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
-        let (name, span) = self.expect_variable("expected foreach binding variable")?;
+        let type_span = self.span(type_start, self.previous().span.end);
+        let (name, name_span) = self.expect_variable("expected foreach binding variable")?;
+        let start = writable_span.map_or(type_span.start, |modifier| modifier.start);
         Some(ForeachBinding {
             writable,
+            writable_span,
             ty: Some(ty),
+            type_span: Some(type_span),
             name,
-            span,
+            name_span,
+            span: self.span(start, name_span.end),
         })
     }
 

@@ -294,7 +294,7 @@ pub enum Stmt {
     For(Box<ForStmt>),
     Break { span: Span },
     Continue { span: Span },
-    Foreach(ForeachStmt),
+    Foreach(Box<ForeachStmt>),
     Increment(IncrementStmt),
     Expr { expr: Expr, span: Span },
 }
@@ -444,8 +444,12 @@ pub struct IncrementStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForeachStmt {
     pub iterable: Expr,
-    pub key: Option<ForeachBinding>,
-    pub value: ForeachBinding,
+    pub iteration_kind: crate::semantics::ForeachIterationKind,
+    pub iterable_family: crate::semantics::ForeachIterableFamily,
+    pub first_binding_type: Option<crate::types::ResolvedType>,
+    pub value_binding_type: crate::types::ResolvedType,
+    pub first_binding: Option<ForeachBinding>,
+    pub value_binding: ForeachBinding,
     pub body: Block,
     pub span: Span,
 }
@@ -455,6 +459,7 @@ pub struct ForeachBinding {
     pub writable: bool,
     pub ty: Option<TypeRef>,
     pub name: String,
+    pub span: Span,
 }
 
 /// A single call-site argument in Doria IR. Arguments remain in source (written)

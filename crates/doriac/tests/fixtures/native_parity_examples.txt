@@ -44,6 +44,7 @@ examples/native/main_function_loop_42.doria
 examples/native/main_if_42.doria
 examples/native/main_if_else_42.doria
 examples/native/main_if_fallthrough_42.doria
+examples/native/main_indexed_foreach.doria
 examples/native/main_int8_negation_overflow_panic.doria
 examples/native/main_int_arithmetic.doria
 examples/native/main_int_echo_success.doria
@@ -304,3 +305,4 @@ examples/native/main_constructor_checked_property_replacement.doria
 examples/native/main_constructor_property_write_order.doria
 examples/native/main_stage31_namespaces.doria
 examples/native/main_stage32_attributes.doria
+examples/native/main_scalar_display_materialization.doria

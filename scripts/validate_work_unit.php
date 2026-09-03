@@ -152,6 +152,7 @@ function default_commands(string $root, string $target): array
         command(['cargo', 'build', '-p', 'doriac', '--bin', 'doriac', '--locked'], $target),
         command(['cargo', 'clippy', '--workspace', '--all-targets', '--locked', '--', '-D', 'warnings'], $target),
         command(['cargo', 'test', '--workspace', '--all-targets', '--locked'], $target),
+        command(['php', 'scripts/check_indexed_foreach_and_scalar_display.php'], $target),
         command([$executable, 'check', 'examples/php/person.doria'], $target),
         command([$executable, 'hir', 'examples/php/person.doria'], $target, true),
         command([$executable, 'compile', 'examples/native/main_return_zero.doria', '--target', 'native', '--out', $native . DIRECTORY_SEPARATOR . 'main_return_zero'], $target),

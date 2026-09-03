@@ -98,6 +98,18 @@ callback's exact checked Errors. `map` may produce owned Move values, while
 `filter` remains limited to Copy elements until an explicit cloning capability
 exists. Other collection families do not expose these algorithms.
 
+Two-binding `foreach` makes collection roles explicit without adding tuple or
+iterator allocation. `List<T>` and `T[]` provide a readonly zero-based `int`
+index; dictionaries provide their actual readonly key. Other current iterable
+families remain value-only. Indexed property-rooted sequences are borrowed once,
+and existing writable value iteration remains governed separately by exclusive
+access.
+
+Canonical display contexts produce ordinary reusable strings. Interpolation,
+string-anchored concatenation, and `%s` results can be assigned, returned,
+passed, and stored. Doria still does not implicitly coerce a scalar in ordinary
+assignment or calls, and it does not add primitive `toString` methods or casts.
+
 When a graph genuinely needs several owners, Doria provides an explicit escape
 hatch rather than changing the default model. `shared new Node()` creates a
 readonly `SharedReference<Node>`; writable shared graphs use

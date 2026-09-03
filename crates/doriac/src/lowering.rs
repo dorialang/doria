@@ -287,6 +287,12 @@ fn apply_statement_checked_error_semantics(
             apply_block_checked_error_semantics(&mut statement.body, semantic_info)
         }
         hir::Stmt::Foreach(statement) => {
+            if let Some(info) = semantic_info.foreach_loops.get(&statement.span) {
+                statement.iteration_kind = info.iteration_kind;
+                statement.iterable_family = info.iterable_family;
+                statement.first_binding_type = info.first_binding_type.clone();
+                statement.value_binding_type = info.value_binding_type.clone();
+            }
             apply_expr_checked_error_semantics(&mut statement.iterable, semantic_info);
             apply_block_checked_error_semantics(&mut statement.body, semantic_info)
         }
@@ -934,16 +940,20 @@ fn lower_stmt(statement: &ast::Stmt, class_name: Option<ClassContext<'_>>) -> hi
         })),
         ast::Stmt::Break { span } => hir::Stmt::Break { span: *span },
         ast::Stmt::Continue { span } => hir::Stmt::Continue { span: *span },
-        ast::Stmt::Foreach(foreach) => hir::Stmt::Foreach(hir::ForeachStmt {
+        ast::Stmt::Foreach(foreach) => hir::Stmt::Foreach(Box::new(hir::ForeachStmt {
             iterable: lower_expr(&foreach.iterable, class_name),
-            key: foreach
-                .key
+            iteration_kind: crate::semantics::ForeachIterationKind::ValueOnly,
+            iterable_family: crate::semantics::ForeachIterableFamily::Other,
+            first_binding_type: None,
+            value_binding_type: crate::types::ResolvedType::Unsupported,
+            first_binding: foreach
+                .first_binding
                 .as_ref()
                 .map(|binding| lower_foreach_binding(binding, class_name)),
-            value: lower_foreach_binding(&foreach.value, class_name),
+            value_binding: lower_foreach_binding(&foreach.value_binding, class_name),
             body: lower_block(&foreach.body, class_name),
             span: foreach.span,
-        }),
+        })),
         ast::Stmt::Increment(increment) => hir::Stmt::Increment(hir::IncrementStmt {
             target: lower_expr(&increment.target, class_name),
             op: increment.op.clone(),
@@ -1072,6 +1082,7 @@ fn lower_foreach_binding(
         writable: binding.writable,
         ty: binding.ty.as_ref().map(|ty| lower_type_ref(ty, class_name)),
         name: binding.name.clone(),
+        span: binding.span,
     }
 }
 

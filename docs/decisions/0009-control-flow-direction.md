@@ -120,3 +120,8 @@ Decision 0115 settles `match`: match selects one expression by pattern, while
 Use Decision 0116, not this direction note alone, for current implementation.
 Stage 28a Slice 2 implements executable `finally` through shared finalizer
 regions and structured-exit routing.
+
+Decision 0132 clarifies the optional first `foreach` binding: `List<T>` and
+`T[]` expose a zero-based readonly sequence index, Dictionary families expose
+their actual readonly key, and the other accepted iterable families remain
+value-only.

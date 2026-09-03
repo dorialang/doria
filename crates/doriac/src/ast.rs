@@ -415,7 +415,7 @@ pub enum Stmt {
     For(Box<ForStmt>),
     Break { span: Span },
     Continue { span: Span },
-    Foreach(ForeachStmt),
+    Foreach(Box<ForeachStmt>),
     Increment(IncrementStmt),
     Expr { expr: Expr, span: Span },
 }
@@ -601,8 +601,8 @@ pub enum IncrementPosition {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForeachStmt {
     pub iterable: Expr,
-    pub key: Option<ForeachBinding>,
-    pub value: ForeachBinding,
+    pub first_binding: Option<ForeachBinding>,
+    pub value_binding: ForeachBinding,
     pub body: Block,
     pub span: Span,
 }
@@ -610,8 +610,11 @@ pub struct ForeachStmt {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ForeachBinding {
     pub writable: bool,
+    pub writable_span: Option<Span>,
     pub ty: Option<TypeRef>,
+    pub type_span: Option<Span>,
     pub name: String,
+    pub name_span: Span,
     pub span: Span,
 }
 

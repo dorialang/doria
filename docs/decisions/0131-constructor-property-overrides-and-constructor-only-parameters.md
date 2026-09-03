@@ -146,6 +146,4 @@ interfaces, traits, or Stage 35 execution.
   named or transformed explicit property should use `parameter`.
 - Official language tooling must consume compiler-owned role and property-family
   facts and keep same-named parameter and property symbols distinct.
-- The previously authored indexed-foreach corrective prompt cannot consume
-  Decision 0131. The next free decision number remains unused and must be
-  allocated mechanically when that record is authored.
+- The indexed-foreach corrective work does not consume Decision 0131. Decision 0132 owns that separate subject; the next record number remains unallocated.

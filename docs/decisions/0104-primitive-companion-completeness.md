@@ -147,3 +147,8 @@ sweep), and SPEC when `Bool::parse` implements.
   hovers while `Float`/`Bool`/`String` do not) — the sweep must make companion
   hover coverage uniform, over surface that actually exists (so `Bool::parse` once
   it lands, not before).
+
+Decision 0132 confirms that canonical display expressions materialize ordinary
+strings without changing this matrix. Primitive companion `toString`, primitive
+instance `toString`, `String::from` scalar overloads, and scalar casts remain
+absent.

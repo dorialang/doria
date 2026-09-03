@@ -2833,6 +2833,9 @@ fn validate_statement(
                 }
                 Ok(())
             }
+            mir::ControlFlowPlan::Foreach(plan) => {
+                validate_foreach_plan_types(program, function, plan)
+            }
             mir::ControlFlowPlan::Finalizer(plan) => {
                 block_in(function, plan.activation)?;
                 block_in(function, plan.entry)?;
@@ -10633,6 +10636,9 @@ fn validate_control_flow_plans(
                         }
                     }
                 }
+                mir::ControlFlowPlan::Foreach(plan) => {
+                    validate_foreach_plan_cfg(program, function, block.id, plan)?;
+                }
                 mir::ControlFlowPlan::Finalizer(plan) => {
                     if let Some(parent) = plan.parent {
                         if parent.0 >= plan.id.0 || !finalizer_ids.contains(&parent) {
@@ -10650,6 +10656,273 @@ fn validate_control_flow_plans(
         }
     }
     Ok(())
+}
+
+fn validate_foreach_plan_types(
+    program: &mir::Program,
+    function: &mir::Function,
+    plan: &mir::ForeachPlan,
+) -> Result<(), BackendError> {
+    let collection = collection_in(program, plan.collection_type)?;
+    let collection_local = local_in(function, plan.collection)?;
+    if collection_local.ty != mir::Type::Collection(plan.collection_type) {
+        return Err(malformed_mir(
+            "foreach plan collection local has a different collection type",
+        ));
+    }
+    let index = local_in(function, plan.index)?;
+    if index.ty != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
+        || !index.synthetic
+        || !index.writable
+    {
+        return Err(malformed_mir(
+            "foreach ordinal must be a writable synthetic int local",
+        ));
+    }
+    let value = local_in(function, plan.value_binding)?;
+    let expected_value = match plan.projection {
+        mir::ForeachProjection::Keys => collection
+            .key
+            .ok_or_else(|| malformed_mir("foreach keys projection has no key type"))?,
+        mir::ForeachProjection::Main | mir::ForeachProjection::Values => collection.value,
+    };
+    if value.ty != expected_value || value.writable != plan.value_writable {
+        return Err(malformed_mir(
+            "foreach value binding disagrees with the collection element plan",
+        ));
+    }
+    if plan.projection != mir::ForeachProjection::Main
+        && (!collection.kind.is_dictionary()
+            || plan.iteration_kind != mir::ForeachIterationKind::ValueOnly
+            || plan.first_binding.is_some()
+            || plan.value_writable)
+    {
+        return Err(malformed_mir(
+            "dictionary projection foreach must be readonly and value-only",
+        ));
+    }
+    match plan.iteration_kind {
+        mir::ForeachIterationKind::SequenceIndex => {
+            if !matches!(
+                collection.kind,
+                mir::CollectionKind::List | mir::CollectionKind::TypedArray
+            ) || plan.projection != mir::ForeachProjection::Main
+            {
+                return Err(malformed_mir(
+                    "sequence-index foreach requires a List or typed array",
+                ));
+            }
+            if let Some(first) = plan.first_binding {
+                let first = local_in(function, first)?;
+                if first.ty != mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
+                    || first.writable
+                    || first.owned
+                {
+                    return Err(malformed_mir(
+                        "sequence index binding must be a readonly Copy int local",
+                    ));
+                }
+            }
+        }
+        mir::ForeachIterationKind::DictionaryKey => {
+            if !collection.kind.is_dictionary() || plan.projection != mir::ForeachProjection::Main {
+                return Err(malformed_mir(
+                    "dictionary-key foreach requires a Dictionary collection",
+                ));
+            }
+            if let Some(first) = plan.first_binding {
+                let key = collection
+                    .key
+                    .ok_or_else(|| malformed_mir("Dictionary foreach has no key type"))?;
+                let first = local_in(function, first)?;
+                if first.ty != key || first.writable {
+                    return Err(malformed_mir(
+                        "Dictionary key binding has an incompatible type or access mode",
+                    ));
+                }
+            }
+        }
+        mir::ForeachIterationKind::ValueOnly => {
+            if plan.first_binding.is_some() || !collection.kind.supports_foreach() {
+                return Err(malformed_mir(
+                    "value-only foreach retained a first binding or noniterable collection",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_foreach_plan_cfg(
+    program: &mir::Program,
+    function: &mir::Function,
+    anchor: mir::BlockId,
+    plan: &mir::ForeachPlan,
+) -> Result<(), BackendError> {
+    validate_foreach_plan_types(program, function, plan)?;
+    for id in [plan.setup, plan.header, plan.body, plan.update, plan.exit] {
+        block_in(function, id)?;
+    }
+    let setup = block_in(function, plan.setup)?;
+    let zero_initializers = setup
+        .statements
+        .iter()
+        .filter(|statement| {
+            matches!(
+                statement,
+                mir::Statement::AssignLocal {
+                    target,
+                    value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+                        mir::IntegerExpression::Use {
+                            ty: IntegerType::Int64,
+                            operand: mir::Operand::Scalar(mir::ScalarValue::Integer(value)),
+                        },
+                    )),
+                } if *target == plan.index && value.bits == 0
+            )
+        })
+        .count();
+    let header_is_positional = matches!(
+        &block_in(function, plan.header)?.terminator,
+        mir::Terminator::Branch {
+            condition: mir::BoolExpression::Compare {
+                op: mir::CompareOp::Less,
+                left,
+                right,
+            },
+            then_block,
+            else_block,
+        } if *then_block == plan.body
+            && *else_block == plan.exit
+            && value_expression_reads_integer_local(left, plan.index)
+            && matches!(
+                right.as_ref(),
+                mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                    ty: IntegerType::Int64,
+                    operand: mir::Operand::CollectionLength(collection),
+                }) if *collection == plan.collection
+            )
+    );
+    let increments = function
+        .blocks
+        .iter()
+        .flat_map(|block| &block.statements)
+        .filter(|statement| {
+            matches!(
+                statement,
+                mir::Statement::AssignLocal {
+                    target,
+                    value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+                        mir::IntegerExpression::Binary {
+                            ty: IntegerType::Int64,
+                            op: mir::IntegerBinaryOp::Add,
+                            left,
+                            right,
+                            ..
+                        },
+                    )),
+                } if *target == plan.index
+                    && integer_expression_reads_local(left, plan.index)
+                    && integer_expression_is_constant(right, 1)
+            )
+        })
+        .count();
+    let body = block_in(function, plan.body)?;
+    let first_binding_values = plan.first_binding.map_or_else(Vec::new, |first| {
+        body.statements
+            .iter()
+            .filter_map(|statement| match statement {
+                mir::Statement::AssignLocal { target, value } if *target == first => Some(value),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    });
+    let first_binding_is_established = match (plan.first_binding, plan.iteration_kind) {
+        (None, _) => true,
+        (Some(_), mir::ForeachIterationKind::SequenceIndex) => {
+            first_binding_values.len() == 1
+                && rvalue_reads_integer_local(first_binding_values[0], plan.index)
+        }
+        (Some(_), mir::ForeachIterationKind::DictionaryKey) => {
+            first_binding_values.len() == 1
+                && rvalue_reads_collection_key_at(
+                    first_binding_values[0],
+                    plan.collection,
+                    plan.index,
+                )
+        }
+        (Some(_), mir::ForeachIterationKind::ValueOnly) => false,
+    };
+    if anchor != plan.setup
+        || zero_initializers != 1
+        || increments != 1
+        || !header_is_positional
+        || !first_binding_is_established
+        || !matches!(setup.terminator, mir::Terminator::Jump(target) if target == plan.header)
+        || !matches!(
+            block_in(function, plan.update)?.terminator,
+            mir::Terminator::Jump(target) if target == plan.header
+        )
+    {
+        return Err(malformed_mir(
+            "foreach plan does not describe one zero-based positional traversal CFG",
+        ));
+    }
+    for source in &plan.continue_sources {
+        if !matches!(
+            block_in(function, *source)?.terminator,
+            mir::Terminator::Jump(target) if target == plan.update
+        ) {
+            return Err(malformed_mir(
+                "foreach continue does not advance through the shared update block",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn rvalue_reads_integer_local(value: &mir::Rvalue, local: mir::LocalId) -> bool {
+    matches!(
+        value,
+        mir::Rvalue::Value(mir::ValueExpression::Integer(expression))
+            if integer_expression_reads_local(expression, local)
+    )
+}
+
+fn rvalue_reads_collection_key_at(
+    value: &mir::Rvalue,
+    collection: mir::LocalId,
+    index: mir::LocalId,
+) -> bool {
+    let operand = match value {
+        mir::Rvalue::Value(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+            operand,
+            ..
+        }))
+        | mir::Rvalue::Value(mir::ValueExpression::Float(mir::FloatExpression::Use {
+            operand,
+            ..
+        }))
+        | mir::Rvalue::Value(mir::ValueExpression::Bool(mir::BoolExpression::Use { operand }))
+        | mir::Rvalue::Value(mir::ValueExpression::Enum(mir::EnumExpression::Use {
+            operand,
+            ..
+        })) => operand,
+        mir::Rvalue::String(mir::StringExpression::CollectionKeyAt {
+            collection: candidate,
+            offset,
+        }) => {
+            return *candidate == collection && rvalue_reads_integer_local(offset, index);
+        }
+        _ => return false,
+    };
+    matches!(
+        operand,
+        mir::Operand::CollectionKeyAt {
+            collection: candidate,
+            offset,
+        } if *candidate == collection && rvalue_reads_integer_local(offset, index)
+    )
 }
 
 fn validate_list_algorithm_types(

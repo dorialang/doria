@@ -249,6 +249,10 @@ re-proposed:
   AGENTS.md; `Deque` subsumes both.
 - **No non-panicking `$l[i]`.** Two clear idioms (assertive index, `?T` method)
   beat one blurred one.
+- **First `foreach` bindings are family-specific.** Decision 0132 gives
+  `List<T>` and `T[]` a readonly zero-based `int` sequence index and preserves
+  actual keys for Dictionary families. Ranges, sets, deques, and Dictionary
+  projections remain value-only; stable order alone does not imply an index.
 - **`keys`/`values` are not storable.** Deliberately deferred to the Stage 35
   iteration protocol so they can be upgraded additively.
 - **`List`, `Dictionary`, and `T[]` are built by literal, not by `::from`.**

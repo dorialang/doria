@@ -2601,7 +2601,7 @@ fn intern_block_collection_types(
                 );
             }
             hir::Stmt::Foreach(foreach) => {
-                if let Some(binding) = &foreach.key {
+                if let Some(binding) = &foreach.first_binding {
                     if let Some(ty) = &binding.ty {
                         let _ = mir_type_ref_with_substitutions(
                             ty,
@@ -2611,7 +2611,7 @@ fn intern_block_collection_types(
                         );
                     }
                 }
-                if let Some(ty) = &foreach.value.ty {
+                if let Some(ty) = &foreach.value_binding.ty {
                     let _ =
                         mir_type_ref_with_substitutions(ty, class_ids, collections, substitutions);
                 }
@@ -6710,13 +6710,13 @@ fn lower_foreach_statement(
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
     if let Some((start, end, inclusive)) = grouped_range_parts(&foreach.iterable) {
-        if foreach.key.is_some() {
+        if foreach.first_binding.is_some() {
             return Err(vec![unsupported(
                 foreach.span,
-                "integer range `foreach` does not support key bindings in native compilation",
+                "checked value-only range foreach retained an impossible first binding",
             )]);
         }
-        if let Some(ty) = &foreach.value.ty {
+        if let Some(ty) = &foreach.value_binding.ty {
             if integer_type_ref(ty).is_none() {
                 return Err(vec![unsupported(
                     foreach.span,
@@ -6780,6 +6780,16 @@ enum CollectionForeachProjection {
     Values,
 }
 
+impl From<CollectionForeachProjection> for mir::ForeachProjection {
+    fn from(value: CollectionForeachProjection) -> Self {
+        match value {
+            CollectionForeachProjection::Main => Self::Main,
+            CollectionForeachProjection::Keys => Self::Keys,
+            CollectionForeachProjection::Values => Self::Values,
+        }
+    }
+}
+
 fn dictionary_foreach_projection(
     expr: &hir::Expr,
 ) -> Option<(&hir::Expr, CollectionForeachProjection)> {
@@ -6807,6 +6817,7 @@ fn lower_collection_foreach_in_scope(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    let setup_block = context.current_block();
     let definition = context.collection_type(collection_type).clone();
     if projection != CollectionForeachProjection::Main && !definition.kind.is_dictionary() {
         return Err(vec![unsupported(
@@ -6814,13 +6825,13 @@ fn lower_collection_foreach_in_scope(
             "dictionary projections require Dictionary or SortedDictionary",
         )]);
     }
-    if projection != CollectionForeachProjection::Main && foreach.key.is_some() {
+    if projection != CollectionForeachProjection::Main && foreach.first_binding.is_some() {
         return Err(vec![unsupported(
             foreach.span,
             "dictionary projections do not support foreach key bindings",
         )]);
     }
-    if projection != CollectionForeachProjection::Main && foreach.value.writable {
+    if projection != CollectionForeachProjection::Main && foreach.value_binding.writable {
         return Err(vec![unsupported(
             foreach.span,
             "dictionary projections are readonly",
@@ -6837,18 +6848,42 @@ fn lower_collection_foreach_in_scope(
         )),
     });
 
-    let key_local = match (&foreach.key, definition.key, projection) {
-        (Some(binding), Some(key_type), CollectionForeachProjection::Main) => {
+    let first_local = match (&foreach.first_binding, foreach.iteration_kind, projection) {
+        (
+            Some(binding),
+            crate::semantics::ForeachIterationKind::SequenceIndex,
+            CollectionForeachProjection::Main,
+        ) => Some(context.declare_user_local(
+            &binding.name,
+            false,
+            mir::Type::Scalar(mir::ScalarType::Integer(index_type)),
+        )),
+        (
+            Some(binding),
+            crate::semantics::ForeachIterationKind::DictionaryKey,
+            CollectionForeachProjection::Main,
+        ) => {
+            let key_type = definition.key.ok_or_else(|| {
+                vec![unsupported(
+                    binding.span,
+                    "checked Dictionary-key foreach plan has no key type",
+                )]
+            })?;
             Some(context.declare_user_local_owned(&binding.name, false, key_type, false))
         }
-        (Some(_), None, CollectionForeachProjection::Main) => {
+        (None, _, _) => None,
+        (Some(binding), crate::semantics::ForeachIterationKind::ValueOnly, _) => {
             return Err(vec![unsupported(
-                foreach.span,
-                "foreach key bindings require a dictionary collection",
+                binding.span,
+                "checked value-only foreach plan retained an impossible first binding",
             )])
         }
-        (None, _, _) => None,
-        (Some(_), _, _) => unreachable!("projection key bindings were rejected above"),
+        (Some(binding), _, _) => {
+            return Err(vec![unsupported(
+                binding.span,
+                "dictionary projection retained an impossible first binding",
+            )])
+        }
     };
     let binding_type = match projection {
         CollectionForeachProjection::Keys => definition
@@ -6857,8 +6892,8 @@ fn lower_collection_foreach_in_scope(
         CollectionForeachProjection::Main | CollectionForeachProjection::Values => definition.value,
     };
     let value_local = context.declare_user_local_owned(
-        &foreach.value.name,
-        foreach.value.writable,
+        &foreach.value_binding.name,
+        foreach.value_binding.writable,
         binding_type,
         false,
     );
@@ -6889,7 +6924,9 @@ fn lower_collection_foreach_in_scope(
     // The key is only read when something actually consumes it. Computing it for
     // every dictionary iteration costs a read per element that a values-only
     // walk never uses.
-    let key = if key_local.is_some() || projection == CollectionForeachProjection::Keys {
+    let key = if foreach.iteration_kind == crate::semantics::ForeachIterationKind::DictionaryKey
+        || projection == CollectionForeachProjection::Keys
+    {
         definition
             .key
             .map(|key_type| collection_key_at_rvalue(collection, offset.clone(), key_type))
@@ -6898,8 +6935,15 @@ fn lower_collection_foreach_in_scope(
         None
     };
     context.current_block = Some(body_block);
-    if let (Some(target), Some(key)) = (key_local, key.clone()) {
-        context.push_statement(mir::Statement::AssignLocal { target, value: key });
+    if let Some(target) = first_local {
+        let value = match foreach.iteration_kind {
+            crate::semantics::ForeachIterationKind::SequenceIndex => offset.clone(),
+            crate::semantics::ForeachIterationKind::DictionaryKey => key
+                .clone()
+                .expect("a checked Dictionary-key foreach must produce a key"),
+            crate::semantics::ForeachIterationKind::ValueOnly => unreachable!(),
+        };
+        context.push_statement(mir::Statement::AssignLocal { target, value });
     }
     let binding_value = match projection {
         CollectionForeachProjection::Keys => key
@@ -6938,14 +6982,14 @@ fn lower_collection_foreach_in_scope(
     let body_result = lower_statement_sequence(&foreach.body.statements, return_type, context);
     let body_fallthrough = context.current_block;
     context.pop_scope();
-    context.pop_loop_targets();
+    let loop_targets = context.pop_loop_targets();
     body_result?;
     if let Some(block) = body_fallthrough {
         context.terminate_block(block, mir::Terminator::Jump(update_block));
     }
 
     context.current_block = Some(update_block);
-    if foreach.value.writable && projection == CollectionForeachProjection::Main {
+    if foreach.value_binding.writable && projection == CollectionForeachProjection::Main {
         match definition.value {
             mir::Type::Scalar(_)
             | mir::Type::String
@@ -7013,6 +7057,37 @@ fn lower_collection_foreach_in_scope(
         )),
     });
     context.terminate_current(mir::Terminator::Jump(header_block));
+    context.blocks[setup_block.0]
+        .statements
+        .push(mir::Statement::ControlFlowPlan(
+            mir::ControlFlowPlan::Foreach(mir::ForeachPlan {
+                collection,
+                collection_type,
+                iteration_kind: match foreach.iteration_kind {
+                    crate::semantics::ForeachIterationKind::ValueOnly => {
+                        mir::ForeachIterationKind::ValueOnly
+                    }
+                    crate::semantics::ForeachIterationKind::SequenceIndex => {
+                        mir::ForeachIterationKind::SequenceIndex
+                    }
+                    crate::semantics::ForeachIterationKind::DictionaryKey => {
+                        mir::ForeachIterationKind::DictionaryKey
+                    }
+                },
+                projection: projection.into(),
+                first_binding: first_local,
+                value_binding: value_local,
+                value_writable: foreach.value_binding.writable,
+                index: index_local,
+                setup: setup_block,
+                header: header_block,
+                body: body_block,
+                update: update_block,
+                exit: exit_block,
+                continue_sources: loop_targets.continue_sources,
+                source_span: foreach.span,
+            }),
+        ));
     context.current_block = context.is_reachable(exit_block).then_some(exit_block);
     Ok(())
 }
@@ -7377,7 +7452,7 @@ fn lower_range_foreach_in_scope(
     });
 
     let binding_local = context.declare_user_local(
-        &foreach.value.name,
+        &foreach.value_binding.name,
         false,
         mir::Type::Scalar(mir::ScalarType::Integer(integer_type)),
     );
@@ -7892,6 +7967,7 @@ impl<'semantic> LoweringContext<'semantic> {
                                 metrics.given_predicate_count += plan.predicates.len();
                             }
                             mir::ControlFlowPlan::DoWhile(_) => metrics.do_while_count += 1,
+                            mir::ControlFlowPlan::Foreach(_) => {}
                             mir::ControlFlowPlan::ListAlgorithm(_) => {}
                             mir::ControlFlowPlan::Finalizer(plan) => {
                                 metrics.finalizer_count += 1;

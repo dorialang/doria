@@ -2550,7 +2550,7 @@ fn lowers_early_return_inside_range_foreach() {
 }
 
 #[test]
-fn rejects_range_foreach_key_bindings_before_mir() {
+fn rejects_range_foreach_first_bindings_before_mir() {
     let key_value = unsupported_after_parsing(
         r#"function main(): void
 {
@@ -2559,7 +2559,7 @@ fn rejects_range_foreach_key_bindings_before_mir() {
 }
 "#,
     );
-    assert_stage_11g_unsupported(&key_value, "key bindings");
+    assert_stage_11g_unsupported(&key_value, "first binding");
 }
 
 #[test]

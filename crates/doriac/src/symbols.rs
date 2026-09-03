@@ -39,7 +39,7 @@ pub enum BindingKind {
     ClosureParameter,
     Local,
     GroupedLocal,
-    ForeachKey,
+    ForeachFirst,
     ForeachValue,
     MatchBinding,
     CatchBinding,

@@ -133,3 +133,8 @@ original root; inheritance never turns a borrow into ownership.
 Decision 0131 likewise keeps constructor-only and inherited-property override
 parameters on ordinary parameter provenance. Their compile-time role creates no
 property alias, owner, field, or cleanup fact.
+
+Decision 0132 applies the same provenance rule to indexed sequence iteration. A
+property-rooted `List<T>` is evaluated once and borrowed in place; its readonly
+Copy index creates no ownership or cleanup obligation, and its value binding
+retains the existing readonly or writable element-borrow mode.

@@ -505,3 +505,8 @@ durable parity fixtures, examples, and `dorialang/doria-language-server`.
   both a hash index. Plan §9 and `docs/stdlib-reference.md` may keep the wording.
   0100's `Hashable` requirement is now met by the runtime rather than unused.
   The audit's §5 carries the superseding note.
+
+Decision 0132 completes the separate first-binding question: List and typed
+arrays use a compiler-owned zero-based sequence index, Dictionary families keep
+actual keys, and the remaining iterable families retain their value-only
+surface. No collection member or storage representation changes.

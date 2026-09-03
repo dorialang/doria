@@ -1,0 +1,86 @@
+class Item
+{
+    function __construct(string $name)
+    {
+    }
+}
+
+class Window
+{
+    internal writable List<string> $contents = ["alpha", "skip", "gamma"];
+
+    function render(): void
+    {
+        foreach ($this->contents as int $line => string $content) {
+            if ($line == 1) {
+                continue;
+            }
+            echo "property {$line}:{$content}\n";
+        }
+        echo "property count {$this->contents->count}\n";
+    }
+}
+
+function printIndexes<T>(List<T> $values): void
+{
+    foreach ($values as $index => $value) {
+        echo "generic {$index}\n";
+    }
+}
+
+function main(): void
+{
+    let $window = new Window();
+    $window->render();
+
+    List<string> $words = ["one", "two"];
+    foreach ($words as $index => $word) {
+        echo "list {$index}:{$word}\n";
+    }
+
+    string[] $letters = ["a", "b", "c"];
+    foreach ($letters as int $index => string $letter) {
+        echo "array {$index}:{$letter}\n";
+        if ($index == 1) {
+            break;
+        }
+    }
+
+    writable List<int> $numbers = [10, 20];
+    foreach ($numbers as int $index => writable int $number) {
+        $number += $index;
+    }
+    foreach ($numbers as int $index => int $number) {
+        echo "number {$index}:{$number}\n";
+    }
+
+    List<Item> $items = [new Item("left"), new Item("right")];
+    foreach ($items as int $index => Item $item) {
+        echo "item {$index}:{$item->name}\n";
+    }
+    printIndexes($items);
+
+    Dictionary<string, int> $map = ["left" => 1, "right" => 2];
+    foreach ($map as string $key => int $value) {
+        echo "map {$key}:{$value}\n";
+    }
+
+    SortedDictionary<int, string> $sorted =
+        SortedDictionary::from([20 => "twenty", 10 => "ten"]);
+    foreach ($sorted as int $key => string $value) {
+        echo "sorted {$key}:{$value}\n";
+    }
+
+    foreach (0..<2 as int $value) {
+        echo "range {$value}\n";
+    }
+    foreach (Set::from([2, 1]) as int $value) {
+        echo "set {$value}\n";
+    }
+    foreach (SortedSet::from([2, 1]) as int $value) {
+        echo "sorted-set {$value}\n";
+    }
+    foreach (Deque::from(["front", "back"]) as string $value) {
+        echo "deque {$value}\n";
+    }
+}

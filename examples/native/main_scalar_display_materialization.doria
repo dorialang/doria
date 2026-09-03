@@ -1,0 +1,38 @@
+function acceptString(string $value): string
+{
+    return $value;
+}
+
+function describe(int $line, float $ratio): string
+{
+    return "{$line}|{$ratio}";
+}
+
+function main(): void
+{
+    int $signed = -42;
+    uint8 $unsigned = 255;
+    int16 $fixed = -32000;
+    float32 $small = 1.5;
+    float $large = 1.25;
+    float $negativeZero = -0.0;
+    float $nan = 0.0 / 0.0;
+    float $positiveInfinity = 1.0 / 0.0;
+    float $negativeInfinity = -1.0 / 0.0;
+    bool $enabled = true;
+
+    string $assigned = "{$signed}";
+    string $argument = acceptString("{$unsigned}|{$small}|{$enabled}");
+    List<string> $list = [$assigned, "" . $negativeZero, sprintf("%s", $large)];
+    string[] $array = [sprintf("%d", $fixed), sprintf("%.2f", $large)];
+
+    echo $argument . "\n";
+    echo describe(42, 1.5) . "\n";
+    foreach ($list as int $index => string $value) {
+        echo "L{$index}:{$value}\n";
+    }
+    foreach ($array as int $index => string $value) {
+        echo "A{$index}:{$value}\n";
+    }
+    echo "special {$nan}|{$positiveInfinity}|{$negativeInfinity}\n";
+}

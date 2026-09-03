@@ -1,0 +1,8 @@
+255|1.5|true
+42|1.5
+L0:-42
+L1:-0
+L2:1.25
+A0:-32000
+A1:1.25
+special NaN|Infinity|-Infinity

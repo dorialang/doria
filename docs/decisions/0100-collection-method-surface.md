@@ -282,3 +282,9 @@ Stage 30g updates SPEC for the implemented List algorithm members.
   a non-empty temporary specially, or equates `Comparable`/`Hashable` with
   duplicability — Stage 26 requires `Copy`, Stage 35 reopens this for
   `Cloneable`, and a consuming conversion remains separately deferred.
+
+Decision 0132 clarifies the built-in `foreach` contract: `List<T>` and `T[]`
+optionally bind a readonly zero-based `int` sequence index; Dictionary families
+bind their actual key; Set, SortedSet, Deque, and Dictionary projections remain
+value-only; PriorityQueue remains non-iterable. Writable value iteration is not
+widened by the presence of an index.

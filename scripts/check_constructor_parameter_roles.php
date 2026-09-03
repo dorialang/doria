@@ -63,7 +63,7 @@ function check_constructor_parameter_roles(string $root): array
         'E0727 remains',
         'schemas 1, 2, and 3',
         'processor protocol version 1',
-        'next free decision number remains unused',
+        'Decision 0132 owns that separate subject',
     ]);
     $require($paths['lexer'], $files['lexer'], ['Parameter,', '"parameter" => TokenKind::Parameter']);
     $forbid($paths['lexer'], $files['lexer'], ['"param" => TokenKind::Parameter']);
@@ -111,13 +111,13 @@ function check_constructor_parameter_roles(string $root): array
         'Constructor Parameter Roles',
         'Constructor Parameter Roles Corrective Beat — Complete',
         'Indexed Foreach And Scalar Display',
-        'decision remains unauthored',
+        'Decision 0132',
         'Stage 35 — Interfaces And Traits — Next',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
         'Constructor Parameter Roles Corrective Beat — Complete.',
-        'Indexed Foreach And Scalar Display Corrective Beat — Next.',
+        'Indexed Foreach And Scalar Display Corrective Beat — Compiler Implemented; Tooling Coordination Pending.',
         'Stage 35 Interfaces And Traits — Next.',
     ]);
     $forbid($paths['decision'], $files['decision'], [
@@ -132,9 +132,6 @@ function check_constructor_parameter_roles(string $root): array
             'Next After Tooling Closure',
             'Next after tooling closure',
         ]);
-    }
-    if (glob($root . '/docs/decisions/0132-*.md') !== []) {
-        $failures[] = 'docs/decisions: Decision 0132 must remain unused during this corrective beat';
     }
     return $failures;
 }
