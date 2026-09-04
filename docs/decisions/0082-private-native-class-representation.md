@@ -1,5 +1,9 @@
 # Decision 0082: Private Native Class Representation
 
+> **Stage 35 amendment:** Decision 0134 fixes two-word interface carriers,
+> static per-conformance vtables, allocation-free conversion, and exact dynamic
+> drop while preserving headerless concrete class payloads.
+
 Status: Accepted
 
 ## Context

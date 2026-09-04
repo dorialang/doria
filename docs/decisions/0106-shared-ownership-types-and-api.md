@@ -1,5 +1,9 @@
 # 0106 Shared ownership types and API
 
+> **Stage 35 amendment:** Decision 0134 requires interface payload support for
+> all six shared/weak/access families using the same control block, retained
+> interface vtable, invariant family, and existing access-lease rules.
+
 Status: Accepted
 
 ## Context

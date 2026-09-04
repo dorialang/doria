@@ -1,5 +1,9 @@
 # Decision 0079: Stage 18 Expression Interpolation and Displayable
 
+> **Stage 35 amendment:** Decision 0134 migrates `Displayable` onto the general
+> nominal interface carrier and dispatch machinery without changing its exact
+> `toString(): string` contract or creating implicit string conversion.
+
 Status: Accepted
 
 ## Context

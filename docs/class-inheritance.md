@@ -177,6 +177,8 @@ Doria does not add runtime reflection to implement inheritance.
 
 ## What Comes Next
 
-Stage 34 completes single class inheritance. General interfaces, traits,
-`implements`, trait composition, interface fat pointers, and public
-`Cloneable`/`Iterable<T>` conformance remain Stage 35 work.
+Stage 34 completes single class inheritance. Decision 0134 now fixes the Stage 35
+contract for nominal generic interfaces, two-word interface carriers,
+compile-time trait flattening, core value interfaces, and public iteration. Its
+five implementation slices remain separate from this completed class-hierarchy
+surface.

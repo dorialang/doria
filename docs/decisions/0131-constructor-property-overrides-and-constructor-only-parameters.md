@@ -1,5 +1,9 @@
 # Decision 0131: Constructor Property Overrides And Constructor-Only Parameters
 
+> **Stage 35 amendment:** Decision 0134 places flattened trait properties after
+> inherited storage and in exact class-body expansion order, before existing
+> promoted constructor-property ordering. It does not change constructor roles.
+
 - **Status:** Accepted
 - **Accepted:** 2026-09-02
 - **Implementation Status:** Implemented By Post-Stage-34 Constructor Parameter Roles Corrective Beat

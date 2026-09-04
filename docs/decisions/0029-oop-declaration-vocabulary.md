@@ -1,5 +1,9 @@
 # 0029 OOP declaration vocabulary
 
+> **Stage 35 amendment:** Decision 0134 fixes the complete nominal interface and
+> compile-time trait contract. Its later rules govern Stage 35 without changing
+> this record's declaration vocabulary.
+
 Status: Accepted
 
 Updated by: `docs/decisions/0030-trait-composition-uses-keyword.md` for trait-composition spelling.
@@ -121,13 +125,15 @@ class Post extends Model implements Renderable, JsonSerializable
 }
 ```
 
-Likely direction:
+Decision 0134 accepts the complete direction:
 
-- a class may implement one or more interfaces
-- interface conformance is checked by the compiler
-- Doria's PHP-shaped direction points toward nominal interface conformance
+- a class may implement one or more interfaces;
+- conformance is nominal and checked by the compiler;
+- method-name coincidence alone does not establish conformance;
+- inherited and trait-provided methods may satisfy an authored `implements`
+  contract under the exact substitution law.
 
-Exact conformance checking details remain future implementation work.
+Stage 35 Slice 1 owns implementation of those conformance facts and diagnostics.
 
 ## Trait Composition and uses
 
@@ -199,4 +205,5 @@ This decision does not implement:
 Decision 0130 implements the class-inheritance portion of this vocabulary:
 closed-by-default classes, explicit `open`/`override`, one parent class,
 inherited lookup, parent construction, hierarchy narrowing, and virtual
-dispatch. Interface and trait semantics remain Stage 35 work.
+dispatch. Decision 0134 fixes interface and trait semantics; their implementation
+remains Stage 35 work.

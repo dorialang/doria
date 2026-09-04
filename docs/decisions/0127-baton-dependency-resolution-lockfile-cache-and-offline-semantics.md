@@ -187,7 +187,7 @@ Stage 33 Slice 3 owns development dependencies, workspaces, graph
 commands, tests, processors, generated-source orchestration, incremental project
 inventory, and Phase F closure. Stage 33 and Phase F are complete. Native
 Testing Foundation Slices 1 through 3 and the foundation are complete, and
-Stage 34 is complete and Stage 35 is next.
+Stage 34 is complete and Stage 35 authority is accepted and Slice 1 is next.
 
 Decision 0124's mandatory Pre-Stage-45 transition remains scheduled. The clean
 `dorialang/baton` repository must parity-port every accepted Stage 33 behavior,
@@ -212,7 +212,7 @@ unsuffixed `2026.03.1` toolchain ships.
 
 - `docs/doria-end-to-end-plan.md` and `docs/notes/current-pipeline.md`: Stage 33
   Slices 1 through 3, Phase F, the Native Testing Foundation, and Stage 34 are
-  complete; Stage 35 is next.
+  complete; Stage 35 authority is accepted and Slice 1 is next.
 - Decisions 0117, 0118, 0124, 0125, and 0126: Stage 33 implementation status and
   the dependency/processor boundary.
 - `README.md` and `SPEC.md`: current Baton dependency, lockfile, cache, offline,

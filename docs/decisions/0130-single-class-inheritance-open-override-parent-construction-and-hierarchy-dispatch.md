@@ -1,5 +1,9 @@
 # Decision 0130: Single Class Inheritance, Open And Override, Parent Construction, And Hierarchy Dispatch
 
+> **Stage 35 amendment:** Decision 0134 reuses this record's substitution law,
+> class descriptors, virtual implementations, hierarchy narrowing, and dynamic
+> drop to define nominal interface conformance and trait/class precedence.
+
 - **Status:** Accepted
 - **Accepted:** 2026-09-01
 - **Implementation Status:** Implemented By Stage 34
@@ -316,7 +320,7 @@ compiled class ABI, or Stage 35/35a behavior.
   lifecycle-phase dispatch rather than one isolated class body.
 - Incremental fingerprints, compiler metadata clients, official editor tooling,
   active docs, parity matrices, examples, and mechanical guards must describe
-  Stage 34 as complete and Stage 35 as next.
+  Stage 34 as complete and Stage 35 authority as accepted with Slice 1 next.
 - The separate website later needs its class, override, parent construction,
   narrowing, Error hierarchy, performance, editor, and Stage-34 UAT surfaces
   synchronized; this compiler work does not modify that repository.

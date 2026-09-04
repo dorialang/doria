@@ -1,5 +1,9 @@
 # Decision 0100: Collection method surface
 
+> **Stage 35 amendment:** Decision 0134 fixes public value-only iteration and
+> widens preserving sequence/filter/set operations from Copy to Copy-or-
+> Cloneable without changing consuming collection operations.
+
 **Status:** Accepted, **amended by [0113](0113-collection-surface-completion.md)**
 (the receiver/ownership modes and missing-element contract settled here stand;
 0113 replaces this record's membership naming, adds the members left out, and

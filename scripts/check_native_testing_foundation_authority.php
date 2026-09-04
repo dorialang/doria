@@ -63,7 +63,7 @@ $requiredDecisionFacts = [
     'Baton schema-3 orchestration',
     'language-server presentation',
     'Stage 34 Single Class Inheritance - Complete',
-    'Stage 35 Interfaces And Traits - Next',
+    'Stage 35 Interfaces And Traits - Authority Accepted; Slice 1 Next',
     'Pre-Stage-45 Doria-Native Baton Transition - Scheduled',
     'This is a deferral, not a permanent rejection.',
 ];
@@ -74,7 +74,7 @@ $requiredReferenceFacts = [
     'Native Testing Foundation Slice 3 - Complete',
     'Native Testing Foundation - Complete',
     'Stage 34 Single Class Inheritance - Complete',
-    'Stage 35 Interfaces And Traits - Next',
+    'Stage 35 Interfaces And Traits - Authority Accepted; Slice 1 Next',
     'describe("Shopping Cart"',
     'expect($cart->total)->toEqual(0)',
     'expect($cart->items)->not->toContain',

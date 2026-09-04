@@ -78,7 +78,7 @@ function check_indexed_foreach_and_scalar_display(string $root): array
         'Every authored foreach binding has an explicit type',
         'Foreach Binding Type Is Required',
         'Source with E0748 does not enter HIR',
-        'The next decision-record',
+        'Decision 0134 accepts Stage 35 authority',
     ]);
     $require($paths['decision131'], $files['decision131'], [
         '**Implementation Status:** Implemented By Post-Stage-34 Constructor Parameter Roles Corrective Beat',
@@ -87,14 +87,14 @@ function check_indexed_foreach_and_scalar_display(string $root): array
         'Stage 34 — Single Class Inheritance — Complete',
         'Indexed Foreach And Scalar Display Corrective Beat — Complete',
         'Explicit Foreach Binding Types Corrective Beat — Complete',
-        'Stage 35 — Interfaces And Traits — Next',
+        'Stage 35 — Interfaces And Traits — Authority Accepted; Slice 1 Next',
         'Stage 36 Property Hooks — Scheduled',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
         'Indexed Foreach And Scalar Display Corrective Beat — Complete.',
         'Explicit Foreach Binding Types Corrective Beat — Complete.',
-        'Stage 35 Interfaces And Traits — Next.',
+        'Stage 35 Interfaces And Traits — Authority Accepted; Slice 1 Next.',
         'Stage 36 Property Hooks — Scheduled.',
     ]);
 

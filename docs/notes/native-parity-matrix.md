@@ -31,6 +31,15 @@ nullable endpoint paths, and registers
 adds backend-neutral in-place collection clearing and registers
 `main_collection_clear.doria`; no Decision 0113 member remains behind E0559.
 
+Decision 0134 accepts Stage 35 interface, trait, core-contract, and public-
+iteration authority without claiming executable coverage. Slices 2 through 5
+must add explicit matrix rows for two-word erased carriers, exact dynamic drop,
+nullable/mixed/shared transport, direct versus erased dispatch, Cloneable
+widening, user-defined iteration loans, and deterministic trait flattening as
+those paths become executable. Until then, each accepted but unimplemented path
+must stop before HIR with its precise slice diagnostic; `Covered` is not implied
+by the accepted decision.
+
 Stage 27 Slice 1 adds nominal unit and backed enum MIR and registers
 `main_unit_enums.doria`, `main_backed_enums.doria`, `main_nullable_enums.doria`,
 `main_enum_mixed.doria`, and `main_enum_constants_and_defaults.doria`. The

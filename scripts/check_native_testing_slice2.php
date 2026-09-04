@@ -43,7 +43,7 @@ $required = [
         'Native Testing Foundation Slice 3 - Complete',
         'Slice 3 - Collection/Error Expectations, Baton Reporting, And Tooling Closure',
         'Stage 34 Single Class Inheritance - Complete',
-        'Stage 35 Interfaces And Traits - Next',
+        'Stage 35 Interfaces And Traits - Authority Accepted; Slice 1 Next',
     ],
     'reference' => [
         'Baton regression integration',

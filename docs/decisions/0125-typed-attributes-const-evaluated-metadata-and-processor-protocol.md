@@ -1,5 +1,9 @@
 # Decision 0125: Typed Attributes, Const-Evaluated Metadata, And Processor Protocol
 
+> **Stage 35 amendment:** Decision 0134 keeps interface/trait attributes on one
+> authored target, records flattened origins privately, and exposes no slots,
+> offsets, vtables, or duplicate specialization applications in public metadata.
+
 - **Status:** Accepted
 - **Accepted:** 2026-08-27
 - **Date:** 2026-08-27

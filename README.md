@@ -91,12 +91,12 @@ counting; PHP uses explicit compiler-generated carriers, environments, and
 stable places rather than PHP automatic capture or references as language
 semantics.
 
-`List<T>` provides `map`, Copy-preserving `filter`, and writable-accumulator
+`List<T>` provides `map`, Copy-or-Cloneable-preserving `filter`, and writable-accumulator
 `reduce`. These methods borrow the source readonly, visit elements in insertion
 order, accept readonly- or writable-repeatable callbacks, and propagate the
 callback's exact checked Errors. `map` may produce owned Move values, while
-`filter` remains limited to Copy elements until an explicit cloning capability
-exists. Other collection families do not expose these algorithms.
+`filter` copies Copy elements or explicitly clones Cloneable elements. Other
+collection families do not expose these algorithms.
 
 Every `foreach` binding has an explicit type. Two-binding `foreach` makes
 collection roles explicit without adding tuple or iterator allocation:
@@ -140,6 +140,11 @@ runtime access-check cost.
   field is Copy; otherwise ownership moves with the enum. Backed values are
   explicit through readonly `value`, and enums never silently become integers,
   strings, objects, or display text.
+- **Nominal abstraction without object headers.** Decision 0134 requires classes
+  to explicitly author `implements`; concrete generic constraints remain statically dispatched;
+  deliberate interface erasure uses a two-word data/vtable value over the same
+  headerless allocation. Traits use `uses` and flatten at compile time, never as
+  runtime mixin objects.
 
 ## What people build with it
 

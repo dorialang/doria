@@ -77,6 +77,13 @@ The document contains:
 | `attributeClasses` | Compiler-known and user schema declarations |
 | `applications` | Ordered, resolved, typed attribute applications |
 
+Decision 0134 preserves one authored metadata application for interfaces,
+traits, and their authored members. Trait flattening and generic specialization
+create compiler-private origin facts, not duplicate public targets. Metadata
+does not expose interface slots, vtables, descriptors, trait layout offsets, or
+adaptation tables, and attributes are not accepted on `uses` or adaptation
+statements in Stage 35.
+
 Schema version 2 contains every schema-version-1 field plus `callables`. Each
 callable records one canonical attribute-target-compatible identity, name, kind,
 package, source, access, generic arity, ordered parameters, return type, required

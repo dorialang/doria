@@ -1,5 +1,9 @@
 # Decision 0119: Checked Errors, Error Values, Throws Effects, Propagation, And Runtime Outcomes
 
+> **Stage 35 amendment:** Decision 0134 unifies the Error carrier with general
+> interface values, permits Error subinterfaces, and preserves exact checked
+> effect transport, concrete identity, cleanup, and the stored-message exception.
+
 - **Status:** Accepted
 - **Accepted:** 2026-08-15
 - **Entrypoint inference amendment accepted:** 2026-08-18
@@ -61,8 +65,8 @@ ordinary explicitly typed field. `Error` values expose only readonly `message`
 through the erased interface. Equality is object identity; hashing, ordering,
 and structural field comparison are not implied.
 
-Concrete Error classes may use existing class sharing. `SharedReference<Error>`
-is deferred until Stage 35 general erased-interface payload support.
+Concrete Error classes may use existing class sharing. Decision 0134 assigns
+`SharedReference<Error>` to Stage 35 Slice 2's general erased-interface payload support.
 
 ## Runtime Representation
 
@@ -365,7 +369,7 @@ including ambient I/O, through the same propagation and cleanup model. Stages
 30 through 32 and the Decision 0123 corrective beat are complete. All three
 Stage 33 slices and Phase F are complete under Decisions 0126 through 0128;
 Native Testing Foundation Slices 1 through 3 are complete, the Native Testing
-Foundation is complete, and Stage 34 is complete and Stage 35 is next.
+Foundation is complete, and Stage 34 is complete and Stage 35 authority is accepted and Slice 1 is next.
 
 ## Explicit Exclusions
 

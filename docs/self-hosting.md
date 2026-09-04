@@ -106,7 +106,8 @@ failure differences, strict outcome classification and hierarchy reporting,
 and official tooling coordination. The foundation is complete. Stage 34 adds
 single class inheritance, explicit open/override dispatch, hierarchy narrowing,
 and parent-first construction without changing the headerless class payload or
-introducing runtime reflection. Stage 35 interfaces and traits is next.
+introducing runtime reflection. Decision 0134 accepts Stage 35 interface, trait,
+core value-contract, and public-iteration authority; Slice 1 is next.
 These are meaningful
 bootstrap advances, not a declaration that Doria is ready for a full compiler
 port; remaining language, library, and long-term IR requirements still govern

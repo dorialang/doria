@@ -72,9 +72,11 @@ member collision, or incompatible override is involved. Missing `override` and
 redundant `open override` may offer exact modifier edits; signature, receiver,
 return, default, generic, and checked-effect incompatibilities require review
 unless the only safe edit is mechanically certain. Do not expose descriptor,
-carrier, thunk, slot, or vtable vocabulary as the user's mistake. Accepted
-interface and trait syntax remains a Stage 35 implementation boundary rather
-than being described as invalid Doria.
+carrier, thunk, slot, or vtable vocabulary as the user's mistake. Decision 0134's
+accepted interface and trait syntax remains a staged implementation
+boundary rather than being described as invalid Doria. Diagnostics name the
+precise remaining Stage 35 slice and never reinterpret accepted syntax as a
+permanent language rejection.
 
 ## Suggested fixes
 

@@ -1,5 +1,9 @@
 # Decision 0113: Collection Surface Completion
 
+> **Stage 35 amendment:** Decision 0134 fixes Copy-or-Cloneable preserving
+> construction and set algebra plus public value-only iteration, without
+> replacing optimized built-in iteration or inventing generalized first bindings.
+
 - **Status:** Complete
 - **Accepted:** 2026-08-06 by Andrew Masiye
 - **Date:** 2026-08-05

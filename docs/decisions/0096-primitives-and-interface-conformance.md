@@ -1,5 +1,9 @@
 # Decision 0096: Primitives and interface conformance
 
+> **Stage 35 amendment:** Decision 0134 fixes the public core-interface
+> signatures and dynamic class conformance model while retaining compiler-known
+> unboxed primitive constraints and prohibiting primitive interface-slot boxing.
+
 **Status:** Accepted (settles how primitives satisfy interfaces; largely forced by
 the fat-pointer representation in 0082 and monomorphization in §4.5, and required
 by decision 0092).

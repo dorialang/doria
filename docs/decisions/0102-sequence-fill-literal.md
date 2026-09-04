@@ -1,5 +1,9 @@
 # Decision 0102: Sequence fill literal `[value; count]`
 
+> **Stage 35 amendment:** Decision 0134 permits Move values implementing
+> `Cloneable`; the source is evaluated once and cloned once per destination slot
+> in ascending order. Copy values retain the existing direct path.
+
 **Status:** Accepted (design direction; Copy-scalar and `string` elements in v1.0,
 move-type fills deferred to `Cloneable`). Amends decision 0100's fill deferral and
 plan §4.9's bracket-literal forms. Un-parks the *fill* half of 0100's deferred
@@ -55,7 +59,8 @@ let $flags = [false; n];          // no expected type -> List<bool>
 ### Which element types can be filled (v1.0)
 
 Replicating a value `count` times requires copying it, so the element type must be
-replicable without a `Cloneable` contract (which does not exist until Stage 35):
+replicable without invoking the Decision 0134 `Cloneable` contract, whose
+execution lands in Stage 35 Slice 3:
 
 - **Copy scalars** (`bool`, `int` and the fixed-width integers, `float`/`float32`/
   `float64`) — a bit copy. This covers the motivating buffer workloads.
