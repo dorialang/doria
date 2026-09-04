@@ -83,6 +83,10 @@ impl ForeachIterableFamily {
             Self::Other => "this value",
         }
     }
+
+    const fn has_binding_contract(self) -> bool {
+        !matches!(self, Self::PriorityQueue | Self::Bytes | Self::Other)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -6682,7 +6686,7 @@ impl<'program> Checker<'program> {
                 iterable_type: iterable_ty,
                 first_binding_type: None,
                 value_binding_type: value,
-                order: ForeachIterationOrder::ValueOrder,
+                order: ForeachIterationOrder::Insertion,
             },
             TypeKind::SortedSet(value) => ForeachTypePlan {
                 family: ForeachIterableFamily::SortedSet,
@@ -8371,7 +8375,9 @@ impl<'program> Checker<'program> {
                             annotated_ty
                         })
                 };
-                self.require_foreach_binding_type(&foreach.value_binding, iterable_value_ty);
+                if plan.family.has_binding_contract() {
+                    self.require_foreach_binding_type(&foreach.value_binding, iterable_value_ty);
+                }
                 if dictionary_projection.is_some() && foreach.value_binding.writable {
                     self.diagnostics.push(Diagnostic::new(
                         "E0522",

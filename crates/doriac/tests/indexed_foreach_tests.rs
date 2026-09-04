@@ -4,7 +4,8 @@ use doriac::hir::{Item as HirItem, Stmt as HirStmt};
 use doriac::mir::{self, ControlFlowPlan, ForeachIterationKind, Statement};
 use doriac::names::{PackageIdentity, SourceIdentity};
 use doriac::semantics::{
-    ForeachIterableFamily, ForeachIterationKind as SemanticIterationKind, ForeachValueAccess,
+    ForeachIterableFamily, ForeachIterationKind as SemanticIterationKind, ForeachIterationOrder,
+    ForeachValueAccess,
 };
 use doriac::types::{IntegerType, ResolvedType};
 
@@ -182,6 +183,7 @@ function main(): void
     assert_eq!(facts[3].iterable_family, ForeachIterableFamily::Set);
     assert_eq!(facts[3].iteration_kind, SemanticIterationKind::ValueOnly);
     assert_eq!(facts[3].first_binding_type, None);
+    assert_eq!(facts[3].iteration_order, ForeachIterationOrder::Insertion);
 }
 
 #[test]
@@ -400,17 +402,19 @@ fn sequence_index_diagnostics_are_precise_and_noniterable_sources_do_not_cascade
     assert_eq!(writable[0].title, "Sequence Index Binding Is Readonly");
     assert_eq!(writable[0].fixes[0].edits[0].replacement, "");
 
-    let queue = errors(
-        "function main(): void { PriorityQueue<int> $v = PriorityQueue::from([1]); foreach ($v as int $i => int $value) {} }",
-    );
-    assert_eq!(
-        queue
-            .iter()
-            .filter(|diagnostic| diagnostic.code == "E0529")
-            .count(),
-        1
-    );
-    assert!(!queue.iter().any(|diagnostic| diagnostic.code == "E0745"));
+    for binding in ["int $value", "$value"] {
+        let queue = errors(&format!(
+            "function main(): void {{ PriorityQueue<int> $v = PriorityQueue::from([1]); foreach ($v as {binding}) {{}} }}"
+        ));
+        assert_eq!(
+            queue
+                .iter()
+                .map(|diagnostic| diagnostic.code)
+                .collect::<Vec<_>>(),
+            ["E0529"],
+            "{binding}: {queue:#?}"
+        );
+    }
 
     let bytes = errors(
         "function main(): void { Bytes $v = Bytes::fromArray([1]); foreach ($v as int $i => int $value) {} }",
