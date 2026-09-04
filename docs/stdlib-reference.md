@@ -49,13 +49,19 @@ Every primitive has a companion, and the set is a **complete, symmetric matrix**
 - **`String`** — executable intrinsic properties are `$s->length` (Unicode grapheme clusters), `$s->byteLength` (UTF-8 bytes), `$s->isEmpty`, and `$s->bytes` (copy in v1.0). Executable companion operations are trimming/casing (`trim`, `trimStart`, `trimEnd`, `lower`, `upper`, `lowerFirst`, `upperFirst`); predicates (`contains`, `startsWith`, `endsWith`, `equalsIgnoreCase`, `containsIgnoreCase`, `startsWithIgnoreCase`, `endsWithIgnoreCase`); grapheme-indexed search (`indexOf`, `lastIndexOf`, `indexOfIgnoreCase`, `lastIndexOfIgnoreCase`); `countOccurrences`; `replace`; `split`/`join`; `slice`; `repeat`; `padStart`/`padEnd`; and UTF-8-validating `fromBytes` (decision 0103). The `$s->graphemes` / `$s->codePoints` views await the public traversal protocol, and `compare` / `compareIgnoreCase` await executable `Ordering`. There is no public `str_*` family, `$s->chars`, integer string indexing, or duplicate instance-method spelling.
 
 ### Value interfaces (core contracts)
-Details: decision 0096 (primitive conformance), the interfaces/traits decision (Stage 35), 0079 (`Displayable`).
+Details: decisions 0096 (primitive conformance), 0134 (interfaces, traits, value
+contracts, and public iteration), and 0079 (`Displayable`).
 
 - **`Comparable<T>`** — `compare(T $other): Ordering`, over the core enum **`Ordering { Less, Equal, Greater }`** (decision 0095). There is no `<=>` operator.
-- **`Equatable<T>`** — structural/value equality contract (`==`/`!=`).
-- **`Hashable`** — a canonical hash for `Dictionary`/`Set` keys.
+- **`Equatable<T>`** — readonly `equals(T $other): bool`; explicit value-equality
+  conformance for `==`/`!=`. Nonconforming class equality remains identity.
+- **`Hashable`** — readonly `hash(): uint64` for Dictionary/Set keys. Equal values
+  yield equal hashes; the value is stable while stored but is not a persistent
+  cross-version format. Hash tables add private per-process keyed mixing.
 - **`Displayable`** — `toString(): string`; Doria's answer to `__toString`, drives interpolation / `.` / `echo` (§4.6, 0079).
-- **`Cloneable`** — the explicit-duplication contract (`->clone()`), public from Stage 35.
+- **`Cloneable`** — readonly nonthrowing `clone(): self`; author-provided explicit
+  duplication returning an independently owned value of the same dynamic class.
+  Doria does not synthesize, implicitly invoke, or promise universal deep cloning.
 - **`Error`** — the compiler-known Move interface for checked errors. Conformance
   is explicit through `implements Error` and requires an externally accessible
   readonly stored `string $message`; a promoted constructor property satisfies
@@ -63,8 +69,11 @@ Details: decision 0096 (primitive conformance), the interfaces/traits decision (
   equality. A class extending an Error-conforming class remains conforming: a
   parent `throws` contract, catch, and typed `toThrow` inspector cover
   descendants while preserving the concrete Error identity. General interface
-  execution and `SharedReference<Error>` remain Stage 35 work. Decisions 0119
-  and 0130.
+  execution and `SharedReference<Error>` land in Stage 35 Slice 2. Decisions 0119
+  and 0130. Decision 0134 unifies its erased carrier with general interface
+  values, permits Error subinterfaces, and retains the stored-message rule as a
+  narrow compiler-known exception rather than accepting general interface
+  properties.
 
 Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096).
 
@@ -92,7 +101,15 @@ A standalone `{ ... }` block (decision 0107) is the direct way to end an access
 object's lifetime before the surrounding function continues.
 
 ### Iteration
-- **`Iterable<T>` / `Iterator<T>`** — the public iteration protocol that makes user types work with `foreach`; user conformance lands at Stage 35 (built-in collections use compiler-internal iteration earlier, Phase D).
+- **`Iterable<T>`** — readonly `iterator(): Iterator<T>`.
+- **`Iterator<T>`** — readonly `hasCurrent(): bool`, readonly `current(): T`, and
+  writable `advance(): void`. A borrowed iterator carries a compiler-owned
+  nonescaping readonly source loan; `current()` borrows one element and
+  `hasCurrent()` keeps nullable elements distinct from exhaustion. User-defined
+  Stage 35 iteration is value-only and every binding remains explicitly typed.
+  Built-in collections retain their optimized compiler-internal plans and exact
+  sequence-index/dictionary-key roles; deliberate erasure alone uses the public
+  protocol carrier.
 
 ### Ranges and math basics
 - **Range types** — `a..b` (inclusive) / `a..<b` (exclusive-end); `int` endpoints; used with `foreach` (SPEC control flow).
@@ -123,11 +140,11 @@ Binary I/O uses `read_file_bytes(string): Bytes`, `write_file_bytes(string, Byte
 ## Collections (core-language move types)
 Owned move types with a growable/fixed distinction. The complete family and naming are settled in **decision 0092**; the method surface originates in **decision 0100** and is completed by **decision 0113**. All four Decision 0113 slices are implemented: the renamed/widened membership surface, receiver-aware diagnostics, value search/removal, set endpoints, and writable in-place `clear(): void` execute. Stage 30g adds the accepted higher-order surface to `List<T>` alone. A bare name is the default (hash / insertion-ordered) collection; the `Sorted` prefix is the comparison-ordered variant. Cross-cutting rules (0100): reads are `readonly`, mutators `writable`; ingestion moves values in; `$l[i]`/`$d[k]` reads **assert presence and panic** on absence while the `?T` methods are the safe path; removal hands the owned element back; mutators return `void` (userland fluent APIs stay a decision-0088 capability).
 
-Sequence literals also have the repeat form **`[value; count]`** (decision 0102). It contextually constructs either a runtime-sized `T[]` or a one-shot-filled `List<T>` and defaults to `List<T>` without an expected type. `value` is evaluated once before the runtime-`int` `count`; zero produces an empty sequence, a constant-negative count is rejected, and a runtime-negative count panics with `fill count is negative`. In v1.0, `value` must be a Copy scalar or `string`; move-type and nullable fills await `Cloneable` (Stage 35). The form is sequence-only: it does not construct `Set` or `Dictionary`.
+Sequence literals also have the repeat form **`[value; count]`** (decision 0102). It contextually constructs either a runtime-sized `T[]` or a one-shot-filled `List<T>` and defaults to `List<T>` without an expected type. `value` is evaluated once before the runtime-`int` `count`; zero produces an empty sequence, a constant-negative count is rejected, and a runtime-negative count panics with `fill count is negative`. Copy values use the direct fill path; a Move value must implement Decision 0134's `Cloneable`, is evaluated once, and is cloned once per output slot in ascending order. The form is sequence-only: it does not construct `Set` or `Dictionary`.
 
 - **`T[]`** (typed arrays) — contiguous, fixed-length-after-creation; `length` property, indexing (panics OOB), `foreach`, and `contains`; the engine-grade buffer. Its optional first `foreach` binding is a readonly zero-based canonical-`int` sequence index. `[value; count]` is its only runtime-sized constructor. Slicing is a future addition.
 - **`Bytes`** — owned mutable byte buffer for binary work; `uint8[]`↔`Bytes` interconvert only through explicit `Bytes::fromArray`/`->toArray` (copy in v1.0). Slice 2 provides `length`, indexed `uint8` reads/writes and RMW, and byte-wise `==`/`!=`; growable/slice/search members await a future method-surface record.
-- **`List<T>`** — the everyday growable sequence and default workhorse: `add`, `insertAt`, `removeAt` (returns the owned element), `pop` (`?T`), `contains`, `indexOf(T): ?int` (first equal position, `null` when absent), writable `remove(T): bool` (first equal element only), writable `clear(): void` (in-place emptying), `first`/`last` (`?T` properties), `count`, and `isEmpty` (properties). Stage 30g implements `map<U>(function(T): U $transform): List<U>`, Copy-only preserving `filter(function(T): bool $predicate): List<T>`, and writable-accumulator `reduce<A>(take A $initial, function(writable A, T): void $reducer): A`. Each also accepts the corresponding `writable function writable(...)` callback through an exclusive function-value borrow; readonly callbacks use readonly borrows, callbacks never escape, and once callbacks are rejected. The source is visited in insertion order and remains unchanged. `map` owns its new results and supports Move results; `filter` copies only Copy elements; `reduce` owns its initial accumulator and supports Copy or Move accumulators. Each method throws exactly the checked Errors declared by its callback's structural function type. Checked failure destroys the partial result or accumulator before propagating. No other collection family receives these algorithms in Stage 30.
+- **`List<T>`** — the everyday growable sequence and default workhorse: `add`, `insertAt`, `removeAt` (returns the owned element), `pop` (`?T`), `contains`, `indexOf(T): ?int` (first equal position, `null` when absent), writable `remove(T): bool` (first equal element only), writable `clear(): void` (in-place emptying), `first`/`last` (`?T` properties), `count`, and `isEmpty` (properties). Stage 30g implements `map<U>(function(T): U $transform): List<U>`, preserving `filter(function(T): bool $predicate): List<T>`, and writable-accumulator `reduce<A>(take A $initial, function(writable A, T): void $reducer): A`. Each also accepts the corresponding `writable function writable(...)` callback through an exclusive function-value borrow; readonly callbacks use readonly borrows, callbacks never escape, and once callbacks are rejected. The source is visited in insertion order and remains unchanged. `map` owns its new results and supports Move results; Decision 0134 widens `filter` from Copy to Copy-or-Cloneable elements, invoking author-provided clone for retained Move values; `reduce` owns its initial accumulator and supports Copy or Move accumulators. Each method throws exactly the checked Errors declared by its callback's structural function type. Checked failure destroys the partial result or accumulator before propagating. No other collection family receives these algorithms in Stage 30.
 - **`Dictionary<K, V>` / `SortedDictionary<K, V>`** — `get` returning `?V`, `set`, `remove` returning `?V`, `containsKey` (key membership), executable O(n) `containsValue(V): bool` (value membership), writable `clear(): void` (in-place emptying), `keys`/`values` (`foreach`-only projections, not storable in v1.0), and `count`/`isEmpty` (properties). `Dictionary` iterates in insertion order, `SortedDictionary` by ascending `Comparable` key. The optional first main-loop binding is the actual readonly key, never an ordinal; values may be writable through the main iteration form. Projections remain value-only.
 - **`Set<T>` / `SortedSet<T>`** — `::from`, `add` (`bool`), `remove` (`bool`), `contains`, `union`, `intersect`, `difference`, writable `clear(): void` (in-place emptying), executable readonly `first: ?T` / `last: ?T` properties, and `count`/`isEmpty` (properties). `Set` endpoints follow insertion order; `SortedSet` endpoints are the ascending minimum and maximum. All endpoints are O(1), return `null` when empty, and borrow the retained element. Iteration is readonly: replacement is remove plus add. Existing-source construction and algebra preserve every input and require `Copy` or, once Stage 35 lands, `Cloneable`.
 - **`PriorityQueue<T>`** — `push`, `pop` (`?T`), `peek` (`?T`), `contains`, writable `clear(): void`, and `count`/`isEmpty` (properties), min-first by `Comparable`. Duplicates are allowed, equal elements have no stable tie order, and there is no `foreach` (drain via `pop`). **`Deque<T>`** — `pushFront`/`pushBack`/`popFront`/`popBack`/`peekFront`/`peekBack`/`contains`, writable `clear(): void`, `count`/`isEmpty` (properties), and readonly or writable `foreach` front-to-back. It subsumes FIFO/LIFO, so there are no separate `Queue`/`Stack` types.

@@ -1,5 +1,9 @@
 # Decision 0129: Native Testing Foundation, Behavioral DSL, Fluent Expectations, And Assertion Outcomes
 
+> **Stage 35 amendment:** Decision 0134 supplies the public Equatable,
+> Displayable, Cloneable, Error-subinterface, and interface-erasure contracts
+> consumed by later testing fixtures without changing schemas 1 through 3.
+
 - **Status:** Accepted
 - **Accepted:** 2026-08-29
 - **Date:** 2026-08-29
@@ -38,7 +42,7 @@ Native Testing Foundation Slice 2 - Complete
 Native Testing Foundation Slice 3 - Complete
 Native Testing Foundation - Complete
 Stage 34 Single Class Inheritance - Complete
-Stage 35 Interfaces And Traits - Next
+Stage 35 Interfaces And Traits - Authority Accepted; Slice 1 Next
 Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
@@ -616,7 +620,7 @@ Completed status:
 ```text
 Native Testing Foundation - Complete
 Stage 34 Single Class Inheritance - Complete
-Stage 35 Interfaces And Traits - Next
+Stage 35 Interfaces And Traits - Authority Accepted; Slice 1 Next
 Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
@@ -690,7 +694,7 @@ No test assertion may consume a Move value merely to inspect it.
 - Baton remains the runner and process orchestrator.
 - The compiler remains the semantic authority.
 - The language server remains a presentation client over compiler/Baton facts.
-- Stage 34 is complete and Stage 35 is next because this foundation is closed.
+- Stage 34 is complete and Stage 35 authority is accepted and Slice 1 is next because this foundation is closed.
 
 ## Invalidated Elsewhere
 

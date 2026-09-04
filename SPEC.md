@@ -134,7 +134,7 @@ See Decision 0116 for the current control-flow authority.
 
 ### Source organization and compiler directives
 
-The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0127 fixes the implemented normal path/Git dependency resolver, SemVer validation, one-version graph, strict deterministic lockfile, dependency commands, global Git cache, offline policy, multi-package plans, and receipt identities. Decision 0128 fixes and implements canonical dependency source descriptors, workspaces, development graphs, tests, processors, generated-source ownership, graph inspection, and project inventory. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. All three Stage 33 slices and Phase F are complete. Native Testing Foundation Slices 1 through 3 are complete, the foundation is complete, and Stage 34 single class inheritance is complete and Stage 35 interfaces and traits is next. The Pre-Stage-45 Doria-native Baton transition remains scheduled.
+The accepted namespace, import, include, and directive direction is recorded in `docs/decisions/0028-namespaces-use-include-and-directives.md`. Decision 0117 defines compile-time autoloading, hybrid strict source layout, package compilation graphs, and the Baton-to-compiler build-plan boundary. Decision 0118 defines the package manifest, dependencies, lockfile, workspace, processor, cache, and offline model. Decision 0126 fixes schema-2 local/scoped package identity, binary/library targets, target selection, deterministic source discovery, and target-scoped plans and receipts. Decision 0127 fixes the implemented normal path/Git dependency resolver, SemVer validation, one-version graph, strict deterministic lockfile, dependency commands, global Git cache, offline policy, multi-package plans, and receipt identities. Decision 0128 fixes and implements canonical dependency source descriptors, workspaces, development graphs, tests, processors, generated-source ownership, graph inspection, and project inventory. Decision 0124 fixes implementation ownership without changing those semantics: Stage 33 validates the Baton product contract in the disposable PHP UX bootstrap, and a mandatory Pre-Stage-45 transition parity-ports it to the clean Doria-native `dorialang/baton` repository before the unsuffixed `2026.03.1` release. Stage 31 implements namespace and import syntax, the edition-2026 prelude, canonical package-owned global identities, compiler-facing edition/package/source context, versioned build plans, complete multi-file indexing, compile-time include resolution, package visibility, and strict source layout. All three Stage 33 slices and Phase F are complete. Native Testing Foundation Slices 1 through 3 are complete, the foundation is complete, and Stage 34 single class inheritance is complete and Stage 35 interfaces and traits authority is accepted and Slice 1 is next. The Pre-Stage-45 Doria-native Baton transition remains scheduled.
 
 Namespaces define logical symbol ownership and declaration scope. They are part of semantic name resolution, not source inclusion, package resolution, build orchestration, or runtime loading.
 
@@ -1572,7 +1572,22 @@ interface Renderable
 }
 ```
 
-Interfaces may declare method requirements and may extend one or more interfaces. Interface members do not define instance storage. Default methods, static interface methods, constants, generic interfaces, variance, and interface property requirements remain future design work.
+Decision 0134 defines generic nominal interfaces, multiple interface inheritance,
+exact requirement compatibility, and two-word erased values. Requirements are
+external bodyless instance methods terminated by `;`; they may be generic, may
+use readonly or writable receivers, preserve parameter ownership and names, and
+declare checked Errors. Parameter defaults, `internal`, `open`, `override`,
+static members, constructors, destructors, constants, properties, and method
+bodies are not interface requirements. User interfaces remain method-only;
+`Error` retains its narrow compiler-known readonly stored `string $message`
+exception so Stage 35 does not decide Stage 36 property hooks.
+
+Classes conform only through authored or inherited `implements`. Interface
+values are `(data pointer, interface vtable pointer)` carriers over the original
+headerless class allocation. Conversion and ancestor upcast do not allocate;
+deliberate erasure uses one constant-slot indirect call while monomorphized
+generic constraints remain static. `is` and match perform checked exact
+specialization narrowing, and an open interface domain is never exhaustive.
 
 Doria accepts `trait` declaration grammar for reusable class-body members:
 
@@ -1583,7 +1598,15 @@ trait HasSlug
 }
 ```
 
-Current semantic checking reports trait declarations as unsupported until Stage 35. The accepted grammar preserves member bodies such as `self::MAX_DEPTH` without false parser errors. Traits may eventually be composed into classes or other traits with `uses`. Trait conflict-resolution rules, aliasing, access changes through trait composition, trait property rules, trait static member rules, trait abstract method requirements, and whether PHP-style `insteadof` / `as` are accepted exactly remain future design work.
+Decision 0134 defines generic traits composed into classes or traits with
+`uses`. Traits may provide instance/static properties and methods plus constants;
+bodyless methods are composer requirements. They flatten recursively in authored
+order before class layout and MIR. The same trait origin reached through a
+diamond is included once; unrelated collisions require explicit `insteadof` or
+`as`, and `as internal` may only tighten access. Adaptations apply to methods,
+not properties or constants. Traits cannot declare lifecycle methods, `open`, or
+`override`, and cannot use `parent::`. User trait properties follow one
+deterministic layout, initialization, and reverse-destruction order. There is no runtime trait object or PHP-defined trait precedence.
 
 Doria implements single class inheritance. Classes are closed by default;
 subclassing requires an `open class`, and a class may have at most one direct
@@ -1643,7 +1666,8 @@ layout keeps inherited offsets stable. Decision 0130 defines hierarchy
 resolution, parent calls, construction, destruction, dispatch, narrowing,
 checked Error coverage, and backend obligations in full.
 
-Doria will support `implements` for compiler-checked interface conformance:
+Decision 0134 accepts `implements` for compiler-checked nominal interface
+conformance; Stage 35 Slice 1 implements its declaration graph and diagnostics:
 
 ```doria
 class Post extends Model implements Renderable, JsonSerializable
@@ -1651,7 +1675,10 @@ class Post extends Model implements Renderable, JsonSerializable
 }
 ```
 
-Likely direction: a class may implement one or more interfaces, and Doria's PHP-shaped direction points toward nominal interface conformance. Exact conformance checking details remain future implementation work.
+A class may implement one or more interfaces. Conformance is authored rather
+than structural, inherited through the class hierarchy, and checked against the
+fully specialized interface requirement graph. Method-name coincidence alone
+never establishes conformance.
 
 `use` and `uses` have distinct meanings:
 

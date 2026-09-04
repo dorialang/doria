@@ -1,5 +1,9 @@
 # Decision 0133: Explicit Foreach Binding Types
 
+> **Stage 35 amendment:** Decision 0134 applies this explicit-type requirement
+> unchanged to user-defined Iterable values; compiler inference remains recovery
+> and fix data, never permission to omit the type.
+
 - **Status:** Accepted
 - **Accepted:** 2026-09-04
 - **Implementation Status:** Implemented By The Post-Stage-34 Explicit Foreach Binding Types Corrective Beat
@@ -86,8 +90,8 @@ they must point forward to this decision before being used as current guidance.
 
 This decision does not add destructuring, tuple bindings, a `let` foreach form,
 three-binding iteration, inferred declaration syntax, user-defined iterables,
-or new collection/index roles. Stage 35 remains responsible for public
-`Iterable<T>` and `Iterator<T>` conformance.
+or new collection/index roles. Decision 0134 assigns public `Iterable<T>` and
+`Iterator<T>` conformance to Stage 35 Slice 3.
 
 ## Invalidated Elsewhere
 
@@ -97,5 +101,5 @@ or new collection/index roles. Stage 35 remains responsible for public
   `as writable $value`, or `as $index => $value` as valid Doria are stale.
 - Website and external UAT examples must use `as T $value` and
   `as int $index => T $value` after their compiler/tooling integration updates.
-- Stage 35 remains the next numbered language stage. The next decision-record
-  number remains unallocated.
+- Decision 0134 accepts Stage 35 authority; Slice 1 is the next implementation
+  unit.

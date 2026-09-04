@@ -1,5 +1,9 @@
 # Decision 0132: Indexed Sequence Foreach Bindings And Scalar Display Materialization
 
+> **Stage 35 amendment:** Decision 0134 keeps built-in sequence indexes and
+> Dictionary keys exact while making user-defined Iterable conformance
+> value-only. It does not infer a generalized first-binding role.
+
 - **Status:** Accepted
 - **Accepted:** 2026-09-02
 - **Implementation Status:** Implemented By The Post-Stage-34 Indexed Foreach And Scalar Display Corrective Beat
@@ -160,5 +164,5 @@ Decisions 0130 and 0131 remain unchanged.
   repository does not coordinate that website update.
 - Decision 0133 supersedes the inferred-binding allowance without changing this
   record's iterable-role matrix or execution model.
-- Stage 35 remains the next numbered language stage, and property hooks remain
-  scheduled and unimplemented.
+- Decision 0134 accepts Stage 35 authority and makes Slice 1 the next
+  implementation unit; property hooks remain scheduled and unimplemented.

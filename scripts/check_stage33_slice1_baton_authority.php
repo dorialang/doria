@@ -120,8 +120,6 @@ function check_stage33_slice1_baton_authority(string $root): array
         'Stage 33 — Scheduled, Not Implemented',
         'Stage 33 is scheduled, not implemented',
         'Stage 33 remains scheduled',
-        'Slice 1 is next',
-        'with Slice 1 next',
         'Stage 33 Slice 2 — Next',
         'Stage 33 Slice 2 is next',
         'Stage 33 Slice 2 Next',

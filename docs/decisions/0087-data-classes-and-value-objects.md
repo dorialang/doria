@@ -1,5 +1,9 @@
 # Decision 0087: Data classes, value objects, and the DTO boundary
 
+> **Stage 35 amendment:** Decision 0134 fixes explicit `Equatable`, `Hashable`,
+> `Comparable`, and author-provided `Cloneable` contracts. It does not synthesize
+> value behavior or change this record's data-class boundary.
+
 **Status:** Accepted (design direction; implementation deferred — see Sequencing)
 
 ## Context

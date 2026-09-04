@@ -1,5 +1,9 @@
 # 0030 Trait composition uses keyword
 
+> **Stage 35 amendment:** Decision 0134 fixes generic trait composition,
+> bodyless requirements, deterministic flattening, and the exact Doria
+> `insteadof`/`as internal` rules while preserving `uses` as the composition word.
+
 Status: Accepted
 
 ## Decision

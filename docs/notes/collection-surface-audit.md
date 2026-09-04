@@ -233,7 +233,7 @@ each exposes iteration over the heap (C# `UnorderedItems`, Rust `BinaryHeap::ite
 |--------------------|-------------------------------------------|-----------------------------------------------------------------------------------------|
 | `getOrDefault`     | `$d->get($k) ?? $default`                 | `??` already covers it exactly. Adding a method would be a second spelling for one idea |
 | `isSubsetOf` etc.  | `$a->difference($b)->isEmpty`             | Correct and readable; only costs an allocation                                          |
-| `addAll` / `merge` | `foreach ($src as T $v) { $dst->add($v); }` | Three clear lines, and bulk-move ownership is genuinely unsettled until `Cloneable`   |
+| `addAll` / `merge` | `foreach ($src as T $v) { $dst->add($v); }` | Three clear lines; Decision 0134 settles cloning capability but does not add a bulk member |
 | `sort` / `reverse` | `SortedSet` / `SortedDictionary` exist    | Ordering is what the `Sorted` family is *for*; comparator sorting belongs with closures |
 
 ### Deliberate design, not oversight
@@ -253,8 +253,10 @@ re-proposed:
   `List<T>` and `T[]` a readonly zero-based `int` sequence index and preserves
   actual keys for Dictionary families. Ranges, sets, deques, and Dictionary
   projections remain value-only; stable order alone does not imply an index.
-- **`keys`/`values` are not storable.** Deliberately deferred to the Stage 35
-  iteration protocol so they can be upgraded additively.
+- **`keys`/`values` are not storable.** They remain compiler-known readonly,
+  foreach-only projections. Decision 0134's public iteration protocol does not
+  silently turn them into owned lists or nameable view types; a later additive
+  iterator API would require its own authored surface.
 - **`List`, `Dictionary`, and `T[]` are built by literal, not by `::from`.**
   These types exist to de-conflate PHP's `array`, and the typed bracket literal
   — including the empty `[]` — is that replacement. `::from` is the constructor

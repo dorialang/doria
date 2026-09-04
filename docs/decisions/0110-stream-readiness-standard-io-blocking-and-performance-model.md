@@ -1,5 +1,9 @@
 # Decision 0110: Stream, Readiness, Standard I/O, Blocking Mode, And Performance Model
 
+> **Stage 35 amendment:** Decision 0134 supplies nominal method-only capability
+> interfaces and nonallocating erased dispatch. This record still owns the later
+> stream capability names, members, and performance appendix.
+
 - **Status:** Accepted
 - **Date:** 2026-08-02
 - **Owners:** Doria language and standard-library design

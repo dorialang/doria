@@ -16,7 +16,7 @@ Native Testing Foundation Slice 2 - Complete
 Native Testing Foundation Slice 3 - Complete
 Native Testing Foundation - Complete
 Stage 34 Single Class Inheritance - Complete
-Stage 35 Interfaces And Traits - Next
+Stage 35 Interfaces And Traits - Authority Accepted; Slice 1 Next
 Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 

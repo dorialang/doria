@@ -280,7 +280,18 @@ These are identity, not scope deferral. They do not become available later, and 
 - Direct constructor `$this` is a construction root, not a writable receiver. It may initialize a direct uninitialized property and may traverse a definitely initialized writable property into ordinary writable child access. Every intermediate must be initialized, non-null, and writable; nested readonly properties receive no constructor-only initialization privilege.
 - Independently owned values may initialize owning instance properties and replace initialized writable owning properties. Replacement acquires the new value before destroying the old one. Moving a value out of a property remains a separate object-invariant problem; do not combine move-in and move-out as one unsupported surface.
 - A readonly static with a const-evaluable initializer is itself const-evaluable and may seed another static. Static initialization ordering resolves through the constant-evaluation dependency graph; cycles are rejected with the chain shown.
-- `Displayable` is a compiler-known nominal contract requiring explicit `implements Displayable` and exactly `function toString(): string`. Do not accept structural conformance or general interfaces early. Concrete classes dispatch `toString()` through ordinary method lowering; interface values and general dispatch land with interfaces.
+- Decision 0134 owns interfaces, traits, core value contracts, and public
+  iteration. Conformance is nominal and declaration-site only; concrete objects
+  remain headerless; erased interface values are two words; generic constraints
+  dispatch statically; traits flatten before MIR. User interfaces are method-only
+  until property hooks are separately accepted. `Error` retains its narrow
+  compiler-known readonly stored `string $message` exception. Do not infer
+  structural conformance, box primitives, add runtime trait objects, or let a
+  backend reconstruct conformance or flattening.
+- `Displayable` requires explicit `implements Displayable` and exactly
+  `function toString(): string`. It is one of Decision 0134's compiler-known
+  nominal core contracts, not structural conformance or implicit string
+  conversion.
 - Lifecycle methods are compiler-invoked protocol points, not ordinary methods. Their legal shapes are an allowlist; unspecified modifier combinations on magic names are rejected by default, and they are never callable directly.
 - Everything dies in reverse of construction: owned locals and temporaries drop in reverse initialization order among values still owned, and a class's `__destruct` body runs before its properties drop in reverse declaration order. This deliberately matches C++ rather than Rust, so the language is uniform.
 

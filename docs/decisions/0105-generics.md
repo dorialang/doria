@@ -1,5 +1,9 @@
 # Decision 0105: Generics (monomorphized functions and classes)
 
+> **Stage 35 amendment:** Decision 0134 adds invariant generic interfaces and
+> traits. Concrete constrained calls remain monomorphized and static; only
+> deliberate interface erasure uses dynamic dispatch.
+
 **Status:** Accepted. Formalizes D9 and plan §4.5, which set the direction but
 left "the generics decision" explicitly unauthored. It **ratifies** the generic
 functions/methods already shipped at Stage 24 and **settles the class-specific

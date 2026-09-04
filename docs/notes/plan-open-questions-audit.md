@@ -40,10 +40,11 @@ its compiler implementation is complete and coordinated tooling is pending.
 
 Most of the plan's "(… decision, unauthored)" markers are large features whose
 **design is sketched and stage is assigned**; they need a record authored, not a
-decision made: interfaces/traits (35), FFI/unsafe (40), geometry-math (47), DDO
+decision made: FFI/unsafe (40), geometry-math (47), DDO
 (post-29), and concurrency/async (Phase H). Inheritance is no longer in that
 list: Decision 0130 settles and implements Stage 34. Closures are likewise
-settled by Decisions 0120 and 0121:
+settled by Decisions 0120 and 0121. Interfaces, traits, core value contracts,
+and public iteration are settled by Decision 0134, with Stage 35 Slice 1 next:
 
 - decision 0120 requires explicit `with` capture lists;
 - the pre-Stage-30 grammar slice is complete and owns accepted lexer/parser/AST syntax.
@@ -82,7 +83,8 @@ above; their accepted decisions and scheduled work are the authority.
 - Genuinely blocked / correctly parked (not audited): async/concurrency (Phase H), FFI zero-copy (Stage 40), generics value-parameters (kept-room extension point), `sscanf` (post-1.0), registry server (post-1.0), labeled break/continue, `goto`, `declare` keys.
 
 ## Invalidated elsewhere (if recommendations are adopted)
-- **F2**: the Stage 35 plan entry (line 858) — reword to cite 0082's fat-pointer commitment; no code.
+- **F2**: completed by Decision 0134, which preserves Decision 0082's fat-pointer
+  commitment and fixes the complete Stage 35 interface/trait contract.
 - **F3**: a new named-arguments record + stage; 0086 and 0095 cross-refs; DDO prerequisites.
 - **F4**: lexer + 0016 + SPEC literals; the `fixed-width-integers` example.
 - Nothing in this note edits the plan/SPEC/records — it is findings only. On approval, each item becomes a plan/SPEC amendment and/or a decision record (next free number, subject-cited until authored, `scripts/check_docs_authority.php` green).
@@ -100,7 +102,8 @@ package graphs, include resolution, package visibility, and multi-source
 lowering are implemented. Stage 32 is complete under Decision 0125. Stage 33
 Slices 1 through 3 and Phase F are complete under Decisions 0126 through 0128;
 Native Testing Foundation Slices 1 through 3 are complete, the foundation is
-complete, and Stage 34 is complete and Stage 35 is next. Decision 0124
+complete, and Stage 34 is complete. Decision 0134 accepts Stage 35 authority and
+Slice 1 is next. Decision 0124
 separately binds the Pre-Stage-45 Doria-native port, parity and release cutover,
 and the unsuffixed
 `2026.03.1` blocker. Stage 30 is complete and E0641 remains historical and

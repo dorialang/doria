@@ -1,5 +1,9 @@
 # Decision 0093: Nullable types and narrowing
 
+> **Stage 35 amendment:** Decision 0134 extends exact `is` and match narrowing
+> to nullable, mixed, class, and interface carriers while preserving ownership,
+> provenance, and the rule that open interface domains are not exhaustive.
+
 Status: Accepted
 
 ## Context

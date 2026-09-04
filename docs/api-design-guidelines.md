@@ -88,6 +88,16 @@ Decision 0110 supplies reusable rules for hosted resource APIs:
 
 - Prefer small capability interfaces over universal god objects. A value should
   advertise only the operations it can actually perform.
+- Decision 0134 makes interface conformance nominal. Keep concrete generic paths
+  statically specialized and erase to a two-word interface value only when the API needs
+  heterogeneous dynamic dispatch. Do not require callers to allocate adapters.
+- User interfaces are method-only. Keep property-shaped capability contracts
+  out of public APIs until the property-hook authority defines their ownership,
+  effects, and mutation surface; the compiler-known Error message is the narrow
+  exception.
+- Use `Cloneable` only when an API preserves its input and must duplicate an
+  owned Move value. Sharing remains explicit through `share()` and is not a
+  synonym for cloning.
 - Make ownership visible. Resource handles are move values; ownership transfer
   uses `take`; explicit close/finish consumes the owner; borrowed adapters are
   explicitly distinguished from the default owning form.

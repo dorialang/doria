@@ -15,7 +15,7 @@
   Stage 33 Slice 3 — Complete; Stage 33 — Complete; Phase F — Complete;
   Native Testing Foundation Slices 1 Through 3 — Complete; Foundation — Complete;
   Stage 34 Single Class Inheritance — Complete;
-  Stage 35 Interfaces And Traits — Next;
+  Stage 35 Interfaces And Traits — Authority Accepted; Slice 1 Next;
   E0641, E0671, And E0672 — Historical And Reserved
 - **Scope:** Package source discovery, file layout, compilation inputs, package
   visibility, and the Baton-to-compiler boundary
@@ -387,7 +387,7 @@ package graph, package-wide visibility, strict source layout, include-once,
 multi-source diagnostics and lowering, backend execution, and in-memory
 incremental inputs. Stages 31 and 32 and all three Stage 33 slices are complete.
 Stage 33 and Phase F are complete. Native Testing Foundation Slices 1 through 3
-and the foundation are complete, and Stage 34 is complete and Stage 35 is next. The completed
+and the foundation are complete, and Stage 34 is complete and Stage 35 authority is accepted and Slice 1 is next. The completed
 Baton contract remains frozen in
 `dorialang/baton-php` rather than selecting Baton's permanent implementation
 language. The mandatory native transition remains separately scheduled before

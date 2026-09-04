@@ -34,7 +34,7 @@ The accepted record also fixes the dependency-ordered Stage 30a through Stage
 30h implementation slices. Stages 30a through 30h and Stage 30 are complete.
 E0641 is historical and reserved. Stages 31 through 33 and Phase F are complete;
 Native Testing Foundation Slices 1 through 3 are complete. The foundation is complete,
-and Stage 34 is complete and Stage 35 is next.
+and Stage 34 is complete and Stage 35 authority is accepted and Slice 1 is next.
 
 ## Historical Scope
 
