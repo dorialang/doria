@@ -127,3 +127,14 @@ Guardrails:
 - Use manual constructor assignment only with `parameter` when the stored property has a different name, or when the constructor validates, normalizes, transforms, or accepts ownership into a differently named field.
 - Do not rename a child parameter merely to evade an inherited-property collision; role markers express the semantic intent without hidden storage.
 - Do not use PHP visibility modifiers such as `public`, `private`, or `protected` in Doria examples.
+
+## Foreach And Display Examples
+
+For two-binding `foreach`, teach a zero-based readonly `int` first binding on
+`List<T>` and `T[]`, and an actual readonly key on Dictionary families. Keep
+ranges, sets, deques, and Dictionary projections value-only. Property-rooted
+sequence examples are valid and should not be rewritten into manual counters.
+
+Teach interpolation, string-anchored concatenation, and `%s` as expressions that
+produce ordinary reusable strings. Do not compensate with primitive `toString`,
+`String::from` scalar aliases, casts, or implicit scalar assignment conversion.

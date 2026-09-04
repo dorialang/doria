@@ -346,3 +346,6 @@ grammars, website examples, and authority guards are affected.
 - Stage 29 Slice 2 reuses the same structured finalizer regions.
 - Stage 31 namespace and compile-time autoload authority, Stage 33 Baton work,
   self-hosting, and the performance workstream gain no new semantics here.
+- Decision 0132 uses these same structured loop exits for indexed sequence
+  iteration: same-loop `continue` advances the ordinal exactly once, while
+  `break`, return, and checked exits expose no later index and preserve cleanup.

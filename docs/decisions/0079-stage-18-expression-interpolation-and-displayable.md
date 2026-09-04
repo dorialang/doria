@@ -100,3 +100,8 @@ The parser fuzz target feeds arbitrary byte input through UTF-8 replacement deco
 Stage 18 completes the display architecture established by decision 0045 without changing primitive conversion. AST/HIR retain ordinary expression structure and order, typed MIR remains backend-independent, and all native primitive behavior remains differentially tested.
 
 The strict literal-opening-brace rule deliberately catches ambiguous text rather than silently changing output. General interface work and native class execution remain visibly staged instead of being approximated through PHP behavior or backend convenience.
+
+Decision 0132 clarifies the materialization boundary: every successful
+interpolation is an ordinary reusable `string`, not an implicit conversion rule
+for surrounding assignments or calls. Decision 0104's primitive-companion
+surface remains unchanged.

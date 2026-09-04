@@ -1,0 +1,25 @@
+property 0:alpha
+property 2:gamma
+property count 3
+list 0:one
+list 1:two
+array 0:a
+array 1:b
+number 0:10
+number 1:21
+item 0:left
+item 1:right
+generic 0
+generic 1
+map left:1
+map right:2
+sorted 10:ten
+sorted 20:twenty
+range 0
+range 1
+set 2
+set 1
+sorted-set 1
+sorted-set 2
+deque front
+deque back

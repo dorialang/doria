@@ -26,10 +26,12 @@ fn native_and_debug_share_remaining_mir_coverage_diagnostics() {
     let native = compile_error(source, BackendTarget::Native);
     let debug = compile_error(source, BackendTarget::Debug);
 
-    assert_eq!(native[0].code, "E0425");
+    assert_eq!(native[0].code, "E0745");
     assert_eq!(debug[0].code, native[0].code);
     assert_eq!(debug[0].message, native[0].message);
-    assert!(native[0].message.contains("key bindings"));
+    assert!(native[0]
+        .message
+        .contains("does not provide a first binding"));
 }
 
 fn compile_error(source: &str, target: BackendTarget) -> Vec<Diagnostic> {

@@ -1,5 +1,9 @@
 # 0034 Stage 9 MVP iteration syntax
 
+> **Current syntax amendment:** Decision 0133 requires an explicit type on every
+> foreach binding. The examples below are normalized to that current spelling;
+> the stage-scope statements remain historical.
+
 Status: Accepted
 
 ## Decision
@@ -27,13 +31,13 @@ for (let writable $i = 10; $i > 0; $i--) {
 Doria also supports `foreach` over integer ranges:
 
 ```doria
-foreach (0..10 as $i) {
+foreach (0..10 as int $i) {
     echo $i;
 }
 ```
 
 ```doria
-foreach (0..<10 as $i) {
+foreach (0..<10 as int $i) {
     echo $i;
 }
 ```
@@ -54,7 +58,7 @@ The variable after `as` in a range `foreach` is a loop-local binding. It does no
 Range `foreach` bindings are readonly per iteration by default:
 
 ```doria
-foreach (0..10 as $i) {
+foreach (0..10 as int $i) {
     let $copy = $i;
 }
 ```

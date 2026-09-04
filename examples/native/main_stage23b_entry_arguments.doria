@@ -15,7 +15,7 @@ function main(List<string> $args): int
     echo "\n";
 
     // Insertion-ordered iteration.
-    foreach ($args as $argument) {
+    foreach ($args as string $argument) {
         echo "arg=";
         echo $argument;
         echo "\n";

@@ -649,7 +649,9 @@ fn retry_transient_executable_busy<T>(
     for attempt in 0..MAX_ATTEMPTS {
         match operation() {
             Ok(value) => return Ok(value),
-            Err(error) if is_transient_executable_busy(&error) && attempt + 1 < MAX_ATTEMPTS => {
+            Err(error)
+                if is_transient_executable_launch_error(&error) && attempt + 1 < MAX_ATTEMPTS =>
+            {
                 thread::sleep(Duration::from_millis(25));
             }
             Err(error) => return Err(error),
@@ -869,8 +871,10 @@ fn read_hex_fixture(path: &Path) -> Vec<u8> {
         .collect()
 }
 
-fn is_transient_executable_busy(error: &io::Error) -> bool {
-    cfg!(unix) && error.raw_os_error() == Some(26)
+fn is_transient_executable_launch_error(error: &io::Error) -> bool {
+    cfg!(unix)
+        && (error.raw_os_error() == Some(26)
+            || (cfg!(target_os = "macos") && error.raw_os_error() == Some(88)))
 }
 
 #[cfg(unix)]

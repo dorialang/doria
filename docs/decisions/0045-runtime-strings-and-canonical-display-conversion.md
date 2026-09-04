@@ -66,3 +66,8 @@ Unix hosts use system `malloc`/`free`; Windows uses the process heap (`GetProces
 ## Consequences
 
 Strings are real typed MIR values across locals, parameters, calls, returns, comparisons, panic messages, and output. The interpreter remains the semantic oracle. Cranelift fast and LLVM release profiles consume the same validated MIR and private runtime ABI. PHP compatibility must use explicit Doria display behavior and must report unsupported coverage instead of silently inheriting PHP coercion.
+
+Decision 0132 clarifies that interpolation, string-anchored concatenation, and
+`%s` materialize this ordinary owned `string`. The result may be assigned,
+returned, passed, and stored; this does not add scalar assignment coercion,
+primitive `toString`, `String::from` scalar overloads, or casts.

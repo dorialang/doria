@@ -41,6 +41,95 @@ enum DictionaryProjection {
     Values,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForeachIterationKind {
+    ValueOnly,
+    SequenceIndex,
+    DictionaryKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForeachIterableFamily {
+    IntegerRange,
+    List,
+    TypedArray,
+    Dictionary,
+    SortedDictionary,
+    Set,
+    SortedSet,
+    Deque,
+    DictionaryKeysProjection,
+    DictionaryValuesProjection,
+    PriorityQueue,
+    Bytes,
+    Other,
+}
+
+impl ForeachIterableFamily {
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::IntegerRange => "integer range",
+            Self::List => "List",
+            Self::TypedArray => "typed array",
+            Self::Dictionary => "Dictionary",
+            Self::SortedDictionary => "SortedDictionary",
+            Self::Set => "Set",
+            Self::SortedSet => "SortedSet",
+            Self::Deque => "Deque",
+            Self::DictionaryKeysProjection => "Dictionary keys projection",
+            Self::DictionaryValuesProjection => "Dictionary values projection",
+            Self::PriorityQueue => "PriorityQueue",
+            Self::Bytes => "Bytes",
+            Self::Other => "this value",
+        }
+    }
+
+    const fn has_binding_contract(self) -> bool {
+        !matches!(self, Self::PriorityQueue | Self::Bytes | Self::Other)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForeachIterationOrder {
+    Sequence,
+    Insertion,
+    AscendingKey,
+    ValueOrder,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForeachValueAccess {
+    Readonly,
+    Writable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeachSemanticInfo {
+    pub iterable_type: ResolvedType,
+    pub iterable_family: ForeachIterableFamily,
+    pub iteration_kind: ForeachIterationKind,
+    pub first_binding_type: Option<ResolvedType>,
+    pub value_binding_type: ResolvedType,
+    pub first_binding_type_span: Option<Span>,
+    pub value_binding_type_span: Option<Span>,
+    pub first_binding_span: Option<Span>,
+    pub value_binding_span: Span,
+    pub value_access: ForeachValueAccess,
+    pub iteration_order: ForeachIterationOrder,
+    pub source: crate::names::SourceIdentity,
+    pub package: crate::names::PackageIdentity,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ForeachTypePlan {
+    family: ForeachIterableFamily,
+    iteration_kind: ForeachIterationKind,
+    iterable_type: TypeId,
+    first_binding_type: Option<TypeId>,
+    value_binding_type: TypeId,
+    order: ForeachIterationOrder,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MixedBoxPlan {
     pub source_type: ResolvedType,
@@ -136,6 +225,10 @@ pub struct SemanticInfo {
     /// Tooling and HIR consume this table instead of inferring promotion or
     /// inheritance from parameter spelling.
     pub constructor_parameters: HashMap<Span, ConstructorParameterSemanticInfo>,
+    /// Checked iterable family and first-binding role for every foreach source.
+    /// HIR, backends, and tooling consume this fact instead of reclassifying
+    /// PHP-shaped `first => value` syntax independently.
+    pub foreach_loops: HashMap<Span, ForeachSemanticInfo>,
     /// Compile-time property-family authority. One entry corresponds to one
     /// physical root property; override parameters are related declarations,
     /// never additional fields.
@@ -936,6 +1029,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             call_targets: checker.call_targets,
             method_hierarchy,
             constructor_parameters: checker.constructor_parameters,
+            foreach_loops: checker.foreach_loops,
             property_families,
             method_call_targets: checker.method_call_targets,
             static_member_targets: checker.static_member_targets,
@@ -1844,6 +1938,7 @@ struct Checker<'program> {
     override_roots: HashMap<Span, Span>,
     overridden_declarations: HashMap<Span, Span>,
     constructor_parameters: HashMap<Span, ConstructorParameterSemanticInfo>,
+    foreach_loops: HashMap<Span, ForeachSemanticInfo>,
     flow_facts: crate::narrowing::FactsByUse,
     contextual_expression_types: HashMap<Span, TypeId>,
     when_contexts: Vec<WhenCheckContext>,
@@ -2648,6 +2743,7 @@ impl<'program> Checker<'program> {
             override_roots: HashMap::new(),
             overridden_declarations: HashMap::new(),
             constructor_parameters: HashMap::new(),
+            foreach_loops: HashMap::new(),
             flow_facts: crate::narrowing::analyze_program(program),
             contextual_expression_types: HashMap::new(),
             when_contexts: Vec::new(),
@@ -6381,28 +6477,28 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> Option<TypeId> {
         scopes.push();
-        let (inferred_key, inferred_value) =
+        let (inferred_first, inferred_value) =
             self.infer_foreach_binding_types(foreach, scopes, method_context);
-        if let Some(key) = &foreach.key {
-            let ty = key
+        if let Some(first_binding) = &foreach.first_binding {
+            let ty = first_binding
                 .ty
                 .as_ref()
                 .map(|ty| self.resolve_type_ref_for_return_inference(ty))
-                .unwrap_or(inferred_key);
+                .unwrap_or(inferred_first);
             let _ = scopes.declare(
-                key.name.clone(),
+                first_binding.name.clone(),
                 Binding::unresolved(false, ty, ty, None, None),
             );
         }
 
         let value_ty = foreach
-            .value
+            .value_binding
             .ty
             .as_ref()
             .map(|ty| self.resolve_type_ref_for_return_inference(ty))
             .unwrap_or(inferred_value);
         let _ = scopes.declare(
-            foreach.value.name.clone(),
+            foreach.value_binding.name.clone(),
             Binding::unresolved(false, value_ty, value_ty, None, None),
         );
 
@@ -6490,12 +6586,33 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) -> (TypeId, TypeId) {
+        let plan = self.infer_foreach_type_plan(foreach, scopes, method_context);
+        (
+            plan.first_binding_type
+                .unwrap_or_else(|| self.types.unknown()),
+            plan.value_binding_type,
+        )
+    }
+
+    fn infer_foreach_type_plan(
+        &mut self,
+        foreach: &ForeachStmt,
+        scopes: &ScopeStack,
+        method_context: Option<&MethodContext>,
+    ) -> ForeachTypePlan {
         let unknown = self.types.unknown();
         if Self::is_grouped_range_expr(&foreach.iterable) {
             let integer = self
                 .range_integer_type(&foreach.iterable, scopes, method_context)
                 .unwrap_or(IntegerType::Int64);
-            return (unknown, self.types.intern(TypeKind::Integer(integer)));
+            return ForeachTypePlan {
+                family: ForeachIterableFamily::IntegerRange,
+                iteration_kind: ForeachIterationKind::ValueOnly,
+                iterable_type: unknown,
+                first_binding_type: None,
+                value_binding_type: self.types.intern(TypeKind::Integer(integer)),
+                order: ForeachIterationOrder::ValueOrder,
+            };
         }
 
         if let Some((dictionary, projection)) =
@@ -6505,34 +6622,120 @@ impl<'program> Checker<'program> {
             if let TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) =
                 self.types.kind(dictionary_ty).clone()
             {
-                return (
-                    unknown,
-                    match projection {
+                return ForeachTypePlan {
+                    family: match projection {
+                        DictionaryProjection::Keys => {
+                            ForeachIterableFamily::DictionaryKeysProjection
+                        }
+                        DictionaryProjection::Values => {
+                            ForeachIterableFamily::DictionaryValuesProjection
+                        }
+                    },
+                    iteration_kind: ForeachIterationKind::ValueOnly,
+                    iterable_type: dictionary_ty,
+                    first_binding_type: None,
+                    value_binding_type: match projection {
                         DictionaryProjection::Keys => key,
                         DictionaryProjection::Values => value,
                     },
-                );
+                    order: match self.types.kind(dictionary_ty) {
+                        TypeKind::SortedDictionary(_, _) => ForeachIterationOrder::AscendingKey,
+                        _ => ForeachIterationOrder::Insertion,
+                    },
+                };
             }
         }
 
         let iterable_ty = self.infer_expr_type(&foreach.iterable, scopes, method_context);
         match self.types.kind(iterable_ty).clone() {
-            TypeKind::List(value)
-            | TypeKind::Set(value)
-            | TypeKind::SortedSet(value)
-            | TypeKind::Deque(value) => (
-                self.types.intern(TypeKind::Integer(IntegerType::Int64)),
-                value,
-            ),
-            TypeKind::TypedArray(value) => (
-                self.types.intern(TypeKind::Integer(IntegerType::Int64)),
-                value,
-            ),
-            TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
-                (key, value)
-            }
-            TypeKind::Mixed => (unknown, self.types.intern(TypeKind::Mixed)),
-            _ => (unknown, unknown),
+            TypeKind::List(value) => ForeachTypePlan {
+                family: ForeachIterableFamily::List,
+                iteration_kind: ForeachIterationKind::SequenceIndex,
+                iterable_type: iterable_ty,
+                first_binding_type: Some(self.types.intern(TypeKind::Integer(IntegerType::Int64))),
+                value_binding_type: value,
+                order: ForeachIterationOrder::Sequence,
+            },
+            TypeKind::TypedArray(value) => ForeachTypePlan {
+                family: ForeachIterableFamily::TypedArray,
+                iteration_kind: ForeachIterationKind::SequenceIndex,
+                iterable_type: iterable_ty,
+                first_binding_type: Some(self.types.intern(TypeKind::Integer(IntegerType::Int64))),
+                value_binding_type: value,
+                order: ForeachIterationOrder::Sequence,
+            },
+            TypeKind::Dictionary(key, value) => ForeachTypePlan {
+                family: ForeachIterableFamily::Dictionary,
+                iteration_kind: ForeachIterationKind::DictionaryKey,
+                iterable_type: iterable_ty,
+                first_binding_type: Some(key),
+                value_binding_type: value,
+                order: ForeachIterationOrder::Insertion,
+            },
+            TypeKind::SortedDictionary(key, value) => ForeachTypePlan {
+                family: ForeachIterableFamily::SortedDictionary,
+                iteration_kind: ForeachIterationKind::DictionaryKey,
+                iterable_type: iterable_ty,
+                first_binding_type: Some(key),
+                value_binding_type: value,
+                order: ForeachIterationOrder::AscendingKey,
+            },
+            TypeKind::Set(value) => ForeachTypePlan {
+                family: ForeachIterableFamily::Set,
+                iteration_kind: ForeachIterationKind::ValueOnly,
+                iterable_type: iterable_ty,
+                first_binding_type: None,
+                value_binding_type: value,
+                order: ForeachIterationOrder::Insertion,
+            },
+            TypeKind::SortedSet(value) => ForeachTypePlan {
+                family: ForeachIterableFamily::SortedSet,
+                iteration_kind: ForeachIterationKind::ValueOnly,
+                iterable_type: iterable_ty,
+                first_binding_type: None,
+                value_binding_type: value,
+                order: ForeachIterationOrder::ValueOrder,
+            },
+            TypeKind::Deque(value) => ForeachTypePlan {
+                family: ForeachIterableFamily::Deque,
+                iteration_kind: ForeachIterationKind::ValueOnly,
+                iterable_type: iterable_ty,
+                first_binding_type: None,
+                value_binding_type: value,
+                order: ForeachIterationOrder::Sequence,
+            },
+            TypeKind::PriorityQueue(value) => ForeachTypePlan {
+                family: ForeachIterableFamily::PriorityQueue,
+                iteration_kind: ForeachIterationKind::ValueOnly,
+                iterable_type: iterable_ty,
+                first_binding_type: None,
+                value_binding_type: value,
+                order: ForeachIterationOrder::ValueOrder,
+            },
+            TypeKind::Bytes => ForeachTypePlan {
+                family: ForeachIterableFamily::Bytes,
+                iteration_kind: ForeachIterationKind::ValueOnly,
+                iterable_type: iterable_ty,
+                first_binding_type: None,
+                value_binding_type: unknown,
+                order: ForeachIterationOrder::ValueOrder,
+            },
+            TypeKind::Mixed => ForeachTypePlan {
+                family: ForeachIterableFamily::Other,
+                iteration_kind: ForeachIterationKind::ValueOnly,
+                iterable_type: iterable_ty,
+                first_binding_type: None,
+                value_binding_type: self.types.intern(TypeKind::Mixed),
+                order: ForeachIterationOrder::ValueOrder,
+            },
+            _ => ForeachTypePlan {
+                family: ForeachIterableFamily::Other,
+                iteration_kind: ForeachIterationKind::ValueOnly,
+                iterable_type: iterable_ty,
+                first_binding_type: None,
+                value_binding_type: unknown,
+                order: ForeachIterationOrder::ValueOrder,
+            },
         }
     }
 
@@ -7977,9 +8180,20 @@ impl<'program> Checker<'program> {
                         ),
                     );
                 }
+                if matches!(self.types.kind(iterable_ty), TypeKind::Bytes) {
+                    self.diagnostics.push(
+                        Diagnostic::new(
+                            "E0747",
+                            "Bytes does not support foreach iteration",
+                            foreach.iterable.span(),
+                        )
+                        .with_title("Bytes Does Not Support Foreach")
+                        .with_help("use indexed byte access through the existing Bytes API"),
+                    );
+                }
                 if range_iterable {
                     if let Some(integer) = foreach
-                        .value
+                        .value_binding
                         .ty
                         .as_ref()
                         .and_then(|ty| ty.arguments.is_empty().then_some(ty))
@@ -7988,16 +8202,8 @@ impl<'program> Checker<'program> {
                         self.contextualize_range_literals(&foreach.iterable, integer);
                     }
                 }
-                let unknown_ty = self.types.unknown();
-                let range_integer = self
-                    .range_integer_type(&foreach.iterable, scopes, method_context)
-                    .unwrap_or(IntegerType::Int64);
-                let int_ty = self.types.intern(TypeKind::Integer(range_integer));
-                let (iterable_key_ty, iterable_value_ty) = if range_iterable {
-                    (unknown_ty, int_ty)
-                } else {
-                    self.infer_foreach_binding_types(foreach, scopes, method_context)
-                };
+                let plan = self.infer_foreach_type_plan(foreach, scopes, method_context);
+                let iterable_value_ty = plan.value_binding_type;
 
                 if range_iterable {
                     self.check_expr_with_range_context(
@@ -8032,73 +8238,154 @@ impl<'program> Checker<'program> {
                 }
                 let mut loop_scopes = scopes.clone();
                 loop_scopes.push();
-                if let Some(key) = &foreach.key {
-                    if key.writable {
-                        self.diagnostics.push(Diagnostic::new(
-                            "E0520",
-                            "foreach key bindings are readonly",
-                            foreach.span,
-                        ));
-                    }
-                    let ty = if dictionary_projection.is_some() {
-                        self.diagnostics.push(Diagnostic::new(
-                            "E0522",
-                            "dictionary `keys` and `values` projections yield one readonly element and do not support a key binding",
-                            foreach.span,
-                        ));
+                if let Some(first_binding) = &foreach.first_binding {
+                    let ty = if plan.iteration_kind == ForeachIterationKind::ValueOnly
+                        && matches!(
+                            plan.family,
+                            ForeachIterableFamily::IntegerRange
+                                | ForeachIterableFamily::Set
+                                | ForeachIterableFamily::SortedSet
+                                | ForeachIterableFamily::Deque
+                                | ForeachIterableFamily::DictionaryKeysProjection
+                                | ForeachIterableFamily::DictionaryValuesProjection
+                        ) {
+                        let mut diagnostic = Diagnostic::new(
+                            "E0745",
+                            format!(
+                                "{} foreach is value-only and does not provide a first binding",
+                                plan.family.display_name()
+                            ),
+                            first_binding.span,
+                        )
+                        .with_title("This Foreach Source Does Not Provide A First Binding")
+                        .with_help(
+                            "remove the first binding and `=>` and iterate the value directly",
+                        );
+                        if let Some(removal) = self.safe_foreach_first_binding_removal(foreach) {
+                            diagnostic = diagnostic.with_structured_fix(
+                                "Remove The Unsupported First Binding",
+                                FixApplicability::MachineApplicable,
+                                vec![FixEdit {
+                                    source: DiagnosticSource::Current,
+                                    span: removal,
+                                    replacement: String::new(),
+                                }],
+                            );
+                        }
+                        self.diagnostics.push(diagnostic);
                         self.types.unknown()
-                    } else if range_iterable {
-                        self.diagnostics.push(Diagnostic::new(
-                            "E0425",
-                            "foreach over integer ranges does not support key bindings",
-                            foreach.span,
-                        ));
+                    } else if plan.iteration_kind == ForeachIterationKind::ValueOnly {
                         self.types.unknown()
                     } else {
-                        key.ty.as_ref().map_or(iterable_key_ty, |ty| {
-                            let annotated_ty = self.resolve_type_ref(ty, foreach.span);
-                            self.check_foreach_binding_type(
-                                annotated_ty,
-                                iterable_key_ty,
-                                foreach.span,
+                        if first_binding.writable {
+                            let role = match plan.iteration_kind {
+                                ForeachIterationKind::SequenceIndex => "sequence index",
+                                ForeachIterationKind::DictionaryKey => "dictionary key",
+                                ForeachIterationKind::ValueOnly => unreachable!(),
+                            };
+                            let mut diagnostic = Diagnostic::new(
+                                "E0520",
+                                format!("foreach {role} bindings are readonly"),
+                                first_binding.writable_span.unwrap_or(first_binding.span),
+                            )
+                            .with_title(
+                                if plan.iteration_kind == ForeachIterationKind::SequenceIndex {
+                                    "Sequence Index Binding Is Readonly"
+                                } else {
+                                    "Dictionary Key Binding Is Readonly"
+                                },
+                            )
+                            .with_help(format!("remove `writable` from the {role} binding"));
+                            if let Some(writable_span) = first_binding.writable_span {
+                                diagnostic = diagnostic.with_fix(writable_span, "");
+                            }
+                            self.diagnostics.push(diagnostic);
+                        }
+                        let inferred = plan
+                            .first_binding_type
+                            .expect("non-value-only foreach plan must have a first-binding type");
+                        self.require_foreach_binding_type(first_binding, inferred);
+                        first_binding.ty.as_ref().map_or(inferred, |ty| {
+                            let annotated_ty = self.resolve_type_ref(
+                                ty,
+                                first_binding.type_span.unwrap_or(first_binding.span),
                             );
+                            let type_span = first_binding.type_span.unwrap_or(first_binding.span);
+                            if plan.iteration_kind == ForeachIterationKind::SequenceIndex {
+                                self.check_sequence_index_binding_type(
+                                    annotated_ty,
+                                    inferred,
+                                    type_span,
+                                );
+                            } else {
+                                self.check_foreach_binding_type(annotated_ty, inferred, type_span);
+                            }
                             annotated_ty
                         })
                     };
                     self.declare_binding(
                         &mut loop_scopes,
-                        key.name.clone(),
+                        first_binding.name.clone(),
                         Binding::unresolved(false, ty, ty, None, None),
-                        key.span,
-                        BindingKind::ForeachKey,
+                        first_binding.name_span,
+                        BindingKind::ForeachFirst,
                         BindingOwnership::ReadonlyBorrow,
                     );
                 }
                 let value_ty = if range_iterable {
-                    if let Some(annotation) = &foreach.value.ty {
-                        let annotated_ty = self.resolve_type_ref(annotation, foreach.span);
-                        self.check_foreach_binding_type(annotated_ty, int_ty, foreach.span);
-                    }
-                    int_ty
-                } else {
-                    foreach.value.ty.as_ref().map_or(iterable_value_ty, |ty| {
-                        let annotated_ty = self.resolve_type_ref(ty, foreach.span);
+                    if let Some(annotation) = &foreach.value_binding.ty {
+                        let annotated_ty = self.resolve_type_ref(
+                            annotation,
+                            foreach
+                                .value_binding
+                                .type_span
+                                .unwrap_or(foreach.value_binding.span),
+                        );
                         self.check_foreach_binding_type(
                             annotated_ty,
                             iterable_value_ty,
-                            foreach.span,
+                            foreach
+                                .value_binding
+                                .type_span
+                                .unwrap_or(foreach.value_binding.span),
                         );
-                        annotated_ty
-                    })
+                    }
+                    iterable_value_ty
+                } else {
+                    foreach
+                        .value_binding
+                        .ty
+                        .as_ref()
+                        .map_or(iterable_value_ty, |ty| {
+                            let annotated_ty = self.resolve_type_ref(
+                                ty,
+                                foreach
+                                    .value_binding
+                                    .type_span
+                                    .unwrap_or(foreach.value_binding.span),
+                            );
+                            self.check_foreach_binding_type(
+                                annotated_ty,
+                                iterable_value_ty,
+                                foreach
+                                    .value_binding
+                                    .type_span
+                                    .unwrap_or(foreach.value_binding.span),
+                            );
+                            annotated_ty
+                        })
                 };
-                if dictionary_projection.is_some() && foreach.value.writable {
+                if plan.family.has_binding_contract() {
+                    self.require_foreach_binding_type(&foreach.value_binding, iterable_value_ty);
+                }
+                if dictionary_projection.is_some() && foreach.value_binding.writable {
                     self.diagnostics.push(Diagnostic::new(
                         "E0522",
                         "dictionary `keys` and `values` projections are readonly; use the main dictionary `foreach` form for writable values",
                         foreach.span,
                     ));
                 }
-                if range_iterable && foreach.value.writable {
+                if range_iterable && foreach.value_binding.writable {
                     self.diagnostics.push(Diagnostic::new(
                         "E0425",
                         "foreach over integer ranges produces readonly value bindings",
@@ -8108,7 +8395,7 @@ impl<'program> Checker<'program> {
                 if matches!(
                     self.types.kind(iterable_ty),
                     TypeKind::Set(_) | TypeKind::SortedSet(_)
-                ) && foreach.value.writable
+                ) && foreach.value_binding.writable
                 {
                     self.diagnostics.push(
                         Diagnostic::new(
@@ -8127,9 +8414,9 @@ impl<'program> Checker<'program> {
                 }
                 self.declare_binding(
                     &mut loop_scopes,
-                    foreach.value.name.clone(),
+                    foreach.value_binding.name.clone(),
                     Binding::unresolved(
-                        foreach.value.writable
+                        foreach.value_binding.writable
                             && dictionary_projection.is_none()
                             && !range_iterable
                             && !matches!(
@@ -8141,12 +8428,46 @@ impl<'program> Checker<'program> {
                         None,
                         None,
                     ),
-                    foreach.value.span,
+                    foreach.value_binding.name_span,
                     BindingKind::ForeachValue,
-                    if foreach.value.writable {
+                    if foreach.value_binding.writable {
                         BindingOwnership::WritableBorrow
                     } else {
                         BindingOwnership::ReadonlyBorrow
+                    },
+                );
+                let context = self
+                    .compilation_contexts
+                    .get(&foreach.span.source)
+                    .unwrap_or(&self.compilation_context);
+                self.foreach_loops.insert(
+                    foreach.span,
+                    ForeachSemanticInfo {
+                        iterable_type: self.types.resolved(plan.iterable_type),
+                        iterable_family: plan.family,
+                        iteration_kind: plan.iteration_kind,
+                        first_binding_type: plan
+                            .first_binding_type
+                            .map(|ty| self.types.resolved(ty)),
+                        value_binding_type: self.types.resolved(value_ty),
+                        first_binding_type_span: foreach
+                            .first_binding
+                            .as_ref()
+                            .and_then(|binding| binding.type_span),
+                        value_binding_type_span: foreach.value_binding.type_span,
+                        first_binding_span: foreach
+                            .first_binding
+                            .as_ref()
+                            .map(|binding| binding.span),
+                        value_binding_span: foreach.value_binding.span,
+                        value_access: if foreach.value_binding.writable {
+                            ForeachValueAccess::Writable
+                        } else {
+                            ForeachValueAccess::Readonly
+                        },
+                        iteration_order: plan.order,
+                        source: context.source.clone(),
+                        package: context.package.clone(),
                     },
                 );
                 let mut loop_constructor_init_context = constructor_init_context
@@ -9364,6 +9685,23 @@ impl<'program> Checker<'program> {
             return;
         }
         let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
+            if matches!(
+                self.types.kind(object_ty),
+                TypeKind::Integer(_) | TypeKind::Float(_) | TypeKind::Bool
+            ) {
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0304",
+                        format!(
+                            "type `{}` has no instance method `{method}`",
+                            self.types.display(object_ty)
+                        ),
+                        span,
+                    )
+                    .with_title("Type Has No Instance Method")
+                    .with_help("use an operation defined by the value's semantic type"),
+                );
+            }
             return;
         };
         let method_info = self
@@ -14892,6 +15230,69 @@ impl<'program> Checker<'program> {
         if !self.is_assignable(target, value) {
             self.check_assignable(target, value, span, AssignmentDestination::Type);
         }
+    }
+
+    fn require_foreach_binding_type(&mut self, binding: &ForeachBinding, inferred: TypeId) {
+        if binding.ty.is_some() || self.is_unknown_type(inferred) {
+            return;
+        }
+
+        let inferred_name = self.types.display(inferred);
+        let mut diagnostic = Diagnostic::new(
+            "E0748",
+            format!(
+                "foreach binding `${}` requires an explicit type; this binding has type `{inferred_name}`",
+                binding.name
+            ),
+            binding.name_span,
+        )
+        .with_title("Foreach Binding Type Is Required")
+        .with_explanation(
+            "A foreach binding declares a loop-local variable. Doria requires its type to be visible at the declaration site.",
+        );
+
+        let insertion = Span::in_source(
+            binding.name_span.source,
+            binding.name_span.start,
+            binding.name_span.start,
+        );
+        diagnostic = diagnostic
+            .with_help(format!("write `{inferred_name} ${}`", binding.name))
+            .with_fix(insertion, format!("{inferred_name} "));
+
+        self.diagnostics.push(diagnostic);
+    }
+
+    fn check_sequence_index_binding_type(&mut self, target: TypeId, value: TypeId, span: Span) {
+        if self.is_unknown_type(target) || self.is_unknown_type(value) {
+            return;
+        }
+        if target != value {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0746",
+                    format!(
+                        "sequence index binding must be `int`, got `{}`",
+                        self.types.display(target)
+                    ),
+                    span,
+                )
+                .with_title("Sequence Index Binding Must Be Int")
+                .with_help("replace the sequence index type with `int`")
+                .with_fix(span, "int"),
+            );
+        }
+    }
+
+    fn safe_foreach_first_binding_removal(&self, foreach: &ForeachStmt) -> Option<Span> {
+        let first = foreach.first_binding.as_ref()?;
+        let removal = Span::in_source(
+            first.span.source,
+            first.span.start,
+            foreach.value_binding.span.start,
+        );
+        let text = self.source_slice(removal)?;
+        (!contains_comment(text) && text.contains("=>")).then_some(removal)
     }
 
     fn readonly_int_constant(
@@ -21628,6 +22029,16 @@ impl<'program> Checker<'program> {
                 "keys" | "values",
             )
         ) {
+            let binding_type = match (self.types.kind(ty), property) {
+                (TypeKind::Dictionary(key, _) | TypeKind::SortedDictionary(key, _), "keys") => {
+                    self.types.display(*key)
+                }
+                (
+                    TypeKind::Dictionary(_, value) | TypeKind::SortedDictionary(_, value),
+                    "values",
+                ) => self.types.display(*value),
+                _ => unreachable!("dictionary projection was established above"),
+            };
             self.diagnostics.push(
                 Diagnostic::new(
                     "E0522",
@@ -21637,7 +22048,7 @@ impl<'program> Checker<'program> {
                     span,
                 )
                 .with_help(format!(
-                    "iterate it with `foreach ($dictionary->{property} as $value)` or build an owned copy explicitly"
+                    "iterate it with `foreach ($dictionary->{property} as {binding_type} $value)` or build an owned copy explicitly"
                 )),
             );
             return;

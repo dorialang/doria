@@ -2307,13 +2307,17 @@ impl Resolver {
             Stmt::Foreach(statement) => {
                 self.resolve_expr(&statement.iterable);
                 self.scopes.push(HashMap::new());
-                if let Some(key) = &statement.key {
-                    self.declare(&key.name, statement.span.start, key.ty.clone());
+                if let Some(first_binding) = &statement.first_binding {
+                    self.declare(
+                        &first_binding.name,
+                        statement.span.start,
+                        first_binding.ty.clone(),
+                    );
                 }
                 self.declare(
-                    &statement.value.name,
+                    &statement.value_binding.name,
                     statement.span.start.saturating_add(1),
-                    statement.value.ty.clone(),
+                    statement.value_binding.ty.clone(),
                 );
                 self.resolve_statements(&statement.body.statements);
                 self.scopes.pop();

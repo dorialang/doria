@@ -1774,15 +1774,15 @@ fn emits_php_for_stage_9_range_iteration() {
         r#"
 function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
-    foreach (0..<10 as $i) {
+    foreach (0..<10 as int $i) {
         echo "x";
     }
 
-    foreach (0..10 as $i) {
+    foreach (0..10 as int $i) {
         echo "x";
     }
 
-    foreach ((0..2) as $k) {
+    foreach ((0..2) as int $k) {
         echo "x";
     }
 }
@@ -1805,7 +1805,7 @@ fn guards_inclusive_php_ranges_before_terminal_increment() {
         r#"
 function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 {
-    foreach (9223372036854775807..9223372036854775807 as $i) {
+    foreach (9223372036854775807..9223372036854775807 as int $i) {
         echo "x";
     }
 }

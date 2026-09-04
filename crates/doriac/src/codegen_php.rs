@@ -2585,7 +2585,7 @@ fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<
         }
         Stmt::Break { .. } | Stmt::Continue { .. } => Ok(()),
         Stmt::Foreach(foreach) => {
-            if foreach.value.writable {
+            if foreach.value_binding.writable {
                 let iterable = dictionary_foreach_projection(&foreach.iterable)
                     .map_or(&foreach.iterable, |(dictionary, _)| dictionary);
                 let supported = semantic_info
@@ -2608,13 +2608,13 @@ fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<
             } else {
                 validate_expr(&foreach.iterable, semantic_info)?;
             }
-            if let Some(key) = &foreach.key {
-                if let Some(ty) = &key.ty {
-                    validate_type(ty, foreach.span)?;
+            if let Some(first_binding) = &foreach.first_binding {
+                if let Some(ty) = &first_binding.ty {
+                    validate_type(ty, first_binding.span)?;
                 }
             }
-            if let Some(ty) = &foreach.value.ty {
-                validate_type(ty, foreach.span)?;
+            if let Some(ty) = &foreach.value_binding.ty {
+                validate_type(ty, foreach.value_binding.span)?;
             }
             validate_block(&foreach.body, semantic_info)
         }
@@ -6284,13 +6284,13 @@ fn emit_foreach(
             }
         );
         scopes.push();
-        let value_name = scopes.declare(&foreach.value.name);
+        let value_name = scopes.declare(&foreach.value_binding.name);
 
         write_indent(output, indent);
         output.push_str("foreach (");
         output.push_str(&iterable);
         output.push_str(" as ");
-        if foreach.value.writable {
+        if foreach.value_binding.writable {
             output.push('&');
         }
         output.push('$');
@@ -6307,25 +6307,44 @@ fn emit_foreach(
 
     let iterable = emit_expr(&foreach.iterable, scopes);
     scopes.push();
-    let key_name = foreach.key.as_ref().map(|key| scopes.declare(&key.name));
-    let value_name = scopes.declare(&foreach.value.name);
+    let first_name = foreach
+        .first_binding
+        .as_ref()
+        .map(|binding| scopes.declare(&binding.name));
+    let value_name = scopes.declare(&foreach.value_binding.name);
+    let sequence_index = (foreach.iteration_kind
+        == crate::semantics::ForeachIterationKind::SequenceIndex)
+        .then(|| scopes.fresh_temp("__doria_sequence_index"));
+
+    if let Some(sequence_index) = &sequence_index {
+        writeln(output, indent, &format!("${sequence_index} = 0;"));
+    }
 
     write_indent(output, indent);
     output.push_str("foreach (");
     output.push_str(&iterable);
     output.push_str(" as ");
-    if let Some(key_name) = key_name {
-        output.push('$');
-        output.push_str(&key_name);
-        output.push_str(" => ");
+    if foreach.iteration_kind == crate::semantics::ForeachIterationKind::DictionaryKey {
+        if let Some(first_name) = &first_name {
+            output.push('$');
+            output.push_str(first_name);
+            output.push_str(" => ");
+        }
     }
-    if foreach.value.writable {
+    if foreach.value_binding.writable {
         output.push('&');
     }
     output.push('$');
     output.push_str(&value_name);
     output.push_str(")\n");
     writeln(output, indent, "{");
+    if let (Some(first_name), Some(sequence_index)) = (&first_name, &sequence_index) {
+        writeln(
+            output,
+            indent + 1,
+            &format!("${first_name} = ${sequence_index}++;"),
+        );
+    }
     for statement in &foreach.body.statements {
         emit_statement(statement, output, indent + 1, scopes);
     }
@@ -6387,7 +6406,7 @@ fn emit_range_foreach(
     writeln(output, indent, &format!("${end_temp} = {end_expr};"));
 
     scopes.push();
-    let value_name = scopes.declare(&foreach.value.name);
+    let value_name = scopes.declare(&foreach.value_binding.name);
     let done_temp = inclusive.then(|| scopes.fresh_temp("__doria_range_done"));
     if let Some(done_temp) = &done_temp {
         writeln(output, indent, &format!("${done_temp} = false;"));

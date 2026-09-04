@@ -1433,10 +1433,10 @@ fn statement_return_borrow(
         }
         Stmt::Foreach(statement) => {
             let mut loop_shadowed = shadowed.clone();
-            if let Some(key) = &statement.key {
-                loop_shadowed.insert(key.name.clone());
+            if let Some(first_binding) = &statement.first_binding {
+                loop_shadowed.insert(first_binding.name.clone());
             }
-            loop_shadowed.insert(statement.value.name.clone());
+            loop_shadowed.insert(statement.value_binding.name.clone());
             block_return_borrow(
                 &statement.body,
                 function,
@@ -3208,10 +3208,10 @@ impl Checker<'_> {
         let borrow_depth = self.active_borrows.len();
         self.activate_place_borrow(&statement.iterable, UseMode::Read, scopes);
         scopes.push();
-        if let Some(key) = &statement.key {
-            self.declare_foreach_binding(key, scopes);
+        if let Some(first_binding) = &statement.first_binding {
+            self.declare_foreach_binding(first_binding, scopes);
         }
-        self.declare_foreach_binding(&statement.value, scopes);
+        self.declare_foreach_binding(&statement.value_binding, scopes);
         let mut flow = self.check_block(&statement.body, scopes, return_move_type, false);
         scopes.pop();
         for backedge in &mut flow.backedges {
@@ -6463,8 +6463,11 @@ fn statement_uses_variable(statement: &Stmt, name: &str) -> bool {
         Stmt::Break { .. } | Stmt::Continue { .. } => false,
         Stmt::Foreach(statement) => {
             expr_uses_variable(&statement.iterable, name)
-                || (statement.key.as_ref().is_none_or(|key| key.name != name)
-                    && statement.value.name != name
+                || (statement
+                    .first_binding
+                    .as_ref()
+                    .is_none_or(|first_binding| first_binding.name != name)
+                    && statement.value_binding.name != name
                     && statements_use_variable(&statement.body.statements, name))
         }
         Stmt::Increment(statement) => expr_uses_variable(&statement.target, name),

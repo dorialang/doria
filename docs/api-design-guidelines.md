@@ -233,6 +233,10 @@ Settled:
 - Doria examples should avoid Rust-flavored API vocabulary unless that vocabulary has been intentionally adopted.
 - Set and SortedSet iteration is readonly; replace an element through remove plus add.
 - PriorityQueue is min-first and deliberately has no foreach surface.
+- A two-binding `foreach` exposes a zero-based readonly `int` only for `List<T>`
+  and `T[]`; Dictionary families expose their actual readonly key. Ranges, sets,
+  deques, and Dictionary projections remain value-only until a separate public
+  iteration contract is accepted.
 - Deque owns both FIFO and LIFO vocabulary; do not introduce Queue or Stack aliases.
 - Existing-source collection construction and set algebra preserve their inputs and therefore require Copy or Cloneable values.
 ```

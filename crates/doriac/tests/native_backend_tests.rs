@@ -589,7 +589,7 @@ function countTo42(): int
 {
     let writable $sum = 0;
 
-    foreach (0..<42 as $i) {
+    foreach (0..<42 as int $i) {
         $sum += 1;
     }
 
@@ -710,7 +710,7 @@ function limit(): int throws Doria\Std\Io\IoError
 
 function main(): void throws Doria\Std\Io\IoError
 {
-    foreach (start()..<limit() as $i) {
+    foreach (start()..<limit() as int $i) {
         echo "x";
     }
 }
@@ -2801,7 +2801,7 @@ function main(): int
 {
     let writable $sum = 0;
 
-    foreach (0..100 as $i) {
+    foreach (0..100 as int $i) {
         if ($i == 42) {
             break;
         }
@@ -2819,7 +2819,7 @@ function main(): int
 {
     let writable $sum = 0;
 
-    foreach ((0..2) as $i) {
+    foreach ((0..2) as int $i) {
         $sum += 1;
     }
 
@@ -2869,7 +2869,7 @@ function main(): int
 {
     let writable $sum = 0;
 
-    foreach (0..10 as $i) {
+    foreach (0..10 as int $i) {
         if ($i < 10) {
             continue;
         }
@@ -2887,7 +2887,7 @@ function main(): int
 {
     let writable $i = 5;
 
-    foreach (0..1 as $i) {
+    foreach (0..1 as int $i) {
     }
 
     return $i;
@@ -2900,7 +2900,7 @@ function main(): int
 {
     let writable $sum = 0;
 
-    foreach (9223372036854775807..9223372036854775807 as $i) {
+    foreach (9223372036854775807..9223372036854775807 as int $i) {
         $sum = 42;
     }
 
@@ -2914,7 +2914,7 @@ function main(): int
 {
     let writable $sum = 42;
 
-    foreach (9223372036854775807..9223372036854775807 as $i) {
+    foreach (9223372036854775807..9223372036854775807 as int $i) {
         if ($i == 9223372036854775807) {
             continue;
         }
@@ -3037,7 +3037,7 @@ function main(): int
 {
     let writable $sum = 0;
 
-    foreach (0..10001 as $i) {
+    foreach (0..10001 as int $i) {
         $sum += 0;
     }
 
@@ -4274,7 +4274,9 @@ fn retry_transient_executable_busy<T>(
     for attempt in 0..MAX_ATTEMPTS {
         match operation() {
             Ok(value) => return Ok(value),
-            Err(error) if is_transient_executable_busy(&error) && attempt + 1 < MAX_ATTEMPTS => {
+            Err(error)
+                if is_transient_executable_launch_error(&error) && attempt + 1 < MAX_ATTEMPTS =>
+            {
                 thread::sleep(Duration::from_millis(25));
             }
             Err(error) => return Err(error),
@@ -4284,8 +4286,10 @@ fn retry_transient_executable_busy<T>(
     unreachable!("retry loop returns on final attempt")
 }
 
-fn is_transient_executable_busy(error: &io::Error) -> bool {
-    cfg!(unix) && error.raw_os_error() == Some(26)
+fn is_transient_executable_launch_error(error: &io::Error) -> bool {
+    cfg!(unix)
+        && (error.raw_os_error() == Some(26)
+            || (cfg!(target_os = "macos") && error.raw_os_error() == Some(88)))
 }
 
 fn compile_native_file(input: &Path, output: &Path) {

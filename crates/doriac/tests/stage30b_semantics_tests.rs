@@ -223,7 +223,7 @@ class Inspector
         ("ready", BindingKind::GivenBinding),
         ("index", BindingKind::LoopBinding),
         ("value", BindingKind::ForeachValue),
-        ("key", BindingKind::ForeachKey),
+        ("key", BindingKind::ForeachFirst),
         ("entry", BindingKind::ForeachValue),
     ] {
         let declaration = declarations

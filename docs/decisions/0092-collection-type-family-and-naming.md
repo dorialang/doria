@@ -131,3 +131,8 @@ record.
   insertion order.
 - Any pipeline note that still describes the sorted/priority/deque family as
   unimplemented — Stage 26 completes that family without adding aliases.
+
+Decision 0132 clarifies first-binding roles without changing this record's
+ordering: List and typed arrays expose zero-based sequence indexes, Dictionary
+families expose actual keys, Set/SortedSet/Deque remain value-only, and
+PriorityQueue remains non-iterable.

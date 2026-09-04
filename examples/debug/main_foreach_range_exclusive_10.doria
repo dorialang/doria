@@ -2,7 +2,7 @@ function main(): int
 {
     let writable $count = 0;
 
-    foreach (0..<10 as $i) {
+    foreach (0..<10 as int $i) {
         $count++;
     }
 

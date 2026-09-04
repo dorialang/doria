@@ -5,7 +5,7 @@ function mark(string $value): void throws Doria\Std\Io\IoError
 
 function main(): void
 {
-    foreach (0..<3 as $i) {
+    foreach (0..<3 as int $i) {
         mark(".");
     }
 }

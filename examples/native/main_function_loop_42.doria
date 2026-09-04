@@ -2,7 +2,7 @@ function countTo42(): int
 {
     let writable $sum = 0;
 
-    foreach (0..<42 as $i) {
+    foreach (0..<42 as int $i) {
         $sum += 1;
     }
 

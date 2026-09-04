@@ -1546,13 +1546,24 @@ impl<'a> Resolver<'a> {
             Stmt::Break { .. } | Stmt::Continue { .. } => {}
             Stmt::Foreach(statement) => {
                 self.normalize_expression(&mut statement.iterable);
-                if let Some(key) = &mut statement.key {
-                    if let Some(ty) = &mut key.ty {
-                        self.normalize_type(ty, key.span, GlobalReferenceRole::Type);
+                if let Some(first_binding) = &mut statement.first_binding {
+                    if let Some(ty) = &mut first_binding.ty {
+                        self.normalize_type(
+                            ty,
+                            first_binding.type_span.unwrap_or(first_binding.span),
+                            GlobalReferenceRole::Type,
+                        );
                     }
                 }
-                if let Some(ty) = &mut statement.value.ty {
-                    self.normalize_type(ty, statement.value.span, GlobalReferenceRole::Type);
+                if let Some(ty) = &mut statement.value_binding.ty {
+                    self.normalize_type(
+                        ty,
+                        statement
+                            .value_binding
+                            .type_span
+                            .unwrap_or(statement.value_binding.span),
+                        GlobalReferenceRole::Type,
+                    );
                 }
                 self.normalize_block(&mut statement.body);
             }

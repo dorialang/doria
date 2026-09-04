@@ -253,7 +253,7 @@ impl CollectionKind {
     }
 
     pub const fn supports_foreach(self) -> bool {
-        !matches!(self, Self::PriorityQueue)
+        !matches!(self, Self::Bytes | Self::PriorityQueue)
     }
 
     pub const fn supports_writable_element_iteration(self) -> bool {
@@ -4284,8 +4284,44 @@ pub enum ControlFlowPlan {
     Given(GivenControlFlowPlan),
     When(WhenResultPlan),
     DoWhile(DoWhilePlan),
+    Foreach(ForeachPlan),
     Finalizer(FinalizerRegionPlan),
     ListAlgorithm(Box<ListAlgorithmPlan>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeachIterationKind {
+    ValueOnly,
+    SequenceIndex,
+    DictionaryKey,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForeachProjection {
+    Main,
+    Keys,
+    Values,
+}
+
+/// Validation identity for a source foreach loop. Execution uses the ordinary
+/// CFG and collection operands named here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForeachPlan {
+    pub collection: LocalId,
+    pub collection_type: CollectionTypeId,
+    pub iteration_kind: ForeachIterationKind,
+    pub projection: ForeachProjection,
+    pub first_binding: Option<LocalId>,
+    pub value_binding: LocalId,
+    pub value_writable: bool,
+    pub index: LocalId,
+    pub setup: BlockId,
+    pub header: BlockId,
+    pub body: BlockId,
+    pub update: BlockId,
+    pub exit: BlockId,
+    pub continue_sources: Vec<BlockId>,
+    pub source_span: Span,
 }
 
 /// Validation identity for one compiler-known terminal expectation. Execution
@@ -7376,6 +7412,25 @@ impl fmt::Display for ControlFlowPlan {
                 formatter,
                 "do block{} while block{} -> block{}",
                 plan.body.0, plan.condition.0, plan.exit.0
+            ),
+            Self::Foreach(plan) => write!(
+                formatter,
+                "foreach {} local{} as {} -> local{} (index local{}, body block{}, update block{})",
+                match plan.projection {
+                    ForeachProjection::Main => "values",
+                    ForeachProjection::Keys => "keys projection",
+                    ForeachProjection::Values => "values projection",
+                },
+                plan.collection.0,
+                match plan.iteration_kind {
+                    ForeachIterationKind::ValueOnly => "Value Only",
+                    ForeachIterationKind::SequenceIndex => "Sequence Index",
+                    ForeachIterationKind::DictionaryKey => "Dictionary Key",
+                },
+                plan.value_binding.0,
+                plan.index.0,
+                plan.body.0,
+                plan.update.0,
             ),
             Self::Finalizer(plan) => write!(
                 formatter,

@@ -265,16 +265,35 @@ for (let writable $i = 0; $i < 10; $i++) {
 `foreach` is preferred for collections and ranges. Integer ranges use `..` for inclusive ranges and `..<` for exclusive-end ranges:
 
 ```doria
-foreach (0..10 as $i) {
+foreach (0..10 as int $i) {
     echo $i;
 }
 
-foreach (0..<10 as $i) {
+foreach (0..<10 as int $i) {
     echo $i;
 }
 ```
 
-`0..10` produces `0` through `10`. `0..<10` produces `0` through `9`. Range endpoints must be `int` expressions. The variable after `as` is a readonly loop-local binding for each iteration and does not leak outside the `foreach` body.
+`0..10` produces `0` through `10`. `0..<10` produces `0` through `9`. Range endpoints must be `int` expressions. Every `foreach` binding requires an explicit type. The variable after `as` is a readonly loop-local binding for each iteration and does not leak outside the `foreach` body.
+
+The optional first binding in the PHP-shaped two-binding form has a checked role:
+
+```doria
+foreach ($items as int $index => Item $item) {
+    echo "{$index}: {$item}\n";
+}
+```
+
+For `List<T>` and `T[]`, it is a readonly canonical-`int` sequence index starting
+at zero and advancing once per yielded element. For `Dictionary<K, V>` and
+`SortedDictionary<K, V>`, it is the actual readonly key of type `K`; dictionary
+ordering remains insertion or ascending-key order respectively. Integer ranges,
+sets, sorted sets, deques, and dictionary key/value projections are value-only.
+`PriorityQueue<T>` and `Bytes` are not iterable. A property-rooted sequence is
+evaluated and borrowed once, not moved or copied. Writable value iteration
+retains its existing exclusive-access rules; a first binding is never writable.
+Decisions 0132 and 0133 are authoritative. Decision 0132 defines iterable roles;
+Decision 0133 requires an explicit authored type on every foreach binding.
 
 Standalone `++` and `--` mutation statements require a declared writable `int` target:
 
@@ -1139,7 +1158,7 @@ Interpolated strings are represented in the AST and Doria IR as string parts bef
 
 Literal opening braces in double-quoted strings are written `\{`. A bare `}` is literal outside an open interpolation, and `\}` is accepted but not required. Brace doubling is not an escape. A bare `{` that does not begin a valid expression is an error with a machine-applicable `\{` fix. Single-quoted strings remain non-interpolating and are the simple choice for brace-heavy text.
 
-Interpolated values may be `string`, a fixed-width integer, `float`, `bool`, or an explicitly conforming `Displayable` class. They use the same canonical display conversion as `echo`, `.`, and Stage 17 `%s`. Null, nullable values without a non-null proof, `mixed`, typed arrays, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected.
+Interpolated values may be `string`, a fixed-width integer, `float`, `bool`, or an explicitly conforming `Displayable` class. They use the same canonical display conversion as `echo`, `.`, and Stage 17 `%s`. Interpolation, string-anchored concatenation, and `%s` materialize an ordinary `string` that may be assigned, returned, passed to a `string` parameter, stored in `List<string>` or `string[]`, nested, and echoed later. Direct scalar-to-string assignment or ordinary argument conversion remains invalid. Null, nullable values without a non-null proof, `mixed`, typed arrays, `List<T>`, `Dictionary<K, V>`, and `Set<T>` are rejected.
 
 `Displayable` is a narrow compiler-known nominal interface contract, not general interface support:
 
@@ -1824,7 +1843,7 @@ function main(): void
 function main(List<string> $args): int
 {
     printf("count=%d\n", $args->count);
-    foreach ($args as $argument) {
+    foreach ($args as string $argument) {
         echo $argument;
         echo "\n";
     }
