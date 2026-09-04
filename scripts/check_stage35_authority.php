@@ -71,6 +71,11 @@ $require($paths['decision'], $files['decision'], [
     'writable function advance(): void;',
     'The compiler-known Iterator methods declare',
     'no checked Errors',
+    'concrete implementing type specialization',
+    'built-in array or collection specialization',
+    '| TraitRef "::" Name "as" Name ";"',
+    '| TraitRef "::" Name "as" "internal" Name? ";"',
+    'Type parameters remain excluded from attribute targets under Decision 0125.',
     'User interfaces remain method-only.',
     'Stage 36 remains their sole owner.',
     'all six existing families',
@@ -137,10 +142,17 @@ foreach ($files as $key => $contents) {
 }
 
 $forbid($paths['decision'], $files['decision'], [
+    'TraitRef "::" Name "as" ("internal")? Name? ";"',
     'interface conversion allocates a wrapper',
     'primitives inhabit interface-typed slots',
     'runtime trait object is required',
     'property hooks are part of Stage 35',
+]);
+
+$require($paths['readme'], $files['readme'], [
+    'currently provides `map`, `filter`',
+    '`filter` currently',
+    'preserves Copy elements',
 ]);
 
 foreach ([

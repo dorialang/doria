@@ -194,7 +194,7 @@ An open-class carrier converts without allocation: its data pointer is retained
 and its exact class descriptor supplies the statically indexed conformance
 vtable for the requested interface specialization.
 
-Destroying an owned interface value invokes the exact dynamic class drop glue
+Destroying an owned interface value invokes the exact dynamic type drop glue
 once. Moves and nullable transport treat both carrier words as one value so no
 partial move, duplicate drop, or stale vtable is possible.
 
@@ -203,14 +203,20 @@ partial move, duplicate drop, or stale vtable is possible.
 The compiler emits one immutable private vtable for every reachable pair of:
 
 ```text
-concrete dynamic class specialization
+concrete implementing type specialization
 interface specialization
 ```
 
+An implementing type specialization may be a user class or a compiler-known
+built-in array or collection specialization. Built-ins use the same static
+pair-keyed vtable rule for deliberate interface erasure; they do not require a
+class descriptor or become classes. Their vtable descriptor and drop entries
+use the compiler-known concrete type identity and drop glue.
+
 Its canonical contents are:
 
-1. exact dynamic class descriptor identity;
-2. exact dynamic drop glue;
+1. exact concrete type descriptor identity;
+2. exact concrete drop glue;
 3. constant ancestor-interface conversion entries;
 4. method entries in canonical requirement order;
 5. checked ABI, receiver, or covariant-return thunks where required.
@@ -480,7 +486,8 @@ TraitUse := "uses" TypeRef ("," TypeRef)* (";" | "{" Adaptation* "}")
 MethodRequirement := MethodSignature ";"
 
 Adaptation := TraitRef "::" Name "insteadof" TraitRef ("," TraitRef)* ";"
-            | TraitRef "::" Name "as" ("internal")? Name? ";"
+            | TraitRef "::" Name "as" Name ";"
+            | TraitRef "::" Name "as" "internal" Name? ";"
 ```
 
 Traits may define instance and static properties, methods, static methods, and
@@ -589,8 +596,9 @@ Precedence is deterministic:
 ## Attributes And Metadata
 
 Interface and trait declarations are authored targets. Interface requirements,
-trait members, type parameters, and parameters use their existing authored
-target kinds. Implementations do not inherit requirement attributes.
+trait members, and parameters use their existing authored target kinds.
+Type parameters remain excluded from attribute targets under Decision 0125.
+Implementations do not inherit requirement attributes.
 
 Flattening and generic specialization do not create duplicate public metadata
 targets or duplicate attribute applications. Public metadata retains the
