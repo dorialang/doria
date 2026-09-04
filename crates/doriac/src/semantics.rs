@@ -106,6 +106,8 @@ pub struct ForeachSemanticInfo {
     pub iteration_kind: ForeachIterationKind,
     pub first_binding_type: Option<ResolvedType>,
     pub value_binding_type: ResolvedType,
+    pub first_binding_type_span: Option<Span>,
+    pub value_binding_type_span: Option<Span>,
     pub first_binding_span: Option<Span>,
     pub value_binding_span: Span,
     pub value_access: ForeachValueAccess,
@@ -8442,6 +8444,11 @@ impl<'program> Checker<'program> {
                             .first_binding_type
                             .map(|ty| self.types.resolved(ty)),
                         value_binding_type: self.types.resolved(value_ty),
+                        first_binding_type_span: foreach
+                            .first_binding
+                            .as_ref()
+                            .and_then(|binding| binding.type_span),
+                        value_binding_type_span: foreach.value_binding.type_span,
                         first_binding_span: foreach
                             .first_binding
                             .as_ref()

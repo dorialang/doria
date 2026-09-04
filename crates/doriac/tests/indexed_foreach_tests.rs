@@ -160,6 +160,8 @@ function main(): void
         Some(ResolvedType::Integer(IntegerType::Int64))
     );
     assert_eq!(facts[0].value_binding_type, ResolvedType::String);
+    assert!(facts[0].first_binding_type_span.is_some());
+    assert!(facts[0].value_binding_type_span.is_some());
     assert_eq!(facts[0].value_access, ForeachValueAccess::Readonly);
     assert_eq!(
         facts[0].source,
@@ -194,8 +196,11 @@ function main(): void
     foreach (0..<2 as $number) {}
 }
 "#;
-    let diagnostics = errors(source)
-        .into_iter()
+    let analysis = analyze(source);
+    let diagnostics = analysis
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.severity == DiagnosticSeverity::Error)
         .filter(|diagnostic| diagnostic.code == "E0748")
         .collect::<Vec<_>>();
     assert_eq!(diagnostics.len(), 5, "{diagnostics:#?}");
@@ -212,6 +217,20 @@ function main(): void
     assert!(diagnostics.iter().all(|diagnostic| {
         diagnostic.fixes[0].applicability == FixApplicability::MachineApplicable
     }));
+    assert_eq!(
+        analysis
+            .info
+            .foreach_loops
+            .values()
+            .filter(|loop_info| loop_info.first_binding_type_span.is_some())
+            .count(),
+        1
+    );
+    assert!(analysis
+        .info
+        .foreach_loops
+        .values()
+        .all(|loop_info| loop_info.value_binding_type_span.is_none()));
 
     let lowering = doriac::lower_source_to_mir("indexed-foreach.doria", source)
         .expect_err("missing foreach types must fail before MIR");
