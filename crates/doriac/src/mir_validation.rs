@@ -10803,29 +10803,35 @@ fn validate_foreach_plan_cfg(
                 }) if *collection == plan.collection
             )
     );
+    let is_index_increment = |statement: &mir::Statement| {
+        matches!(
+            statement,
+            mir::Statement::AssignLocal {
+                target,
+                value: mir::Rvalue::Value(mir::ValueExpression::Integer(
+                    mir::IntegerExpression::Binary {
+                        ty: IntegerType::Int64,
+                        op: mir::IntegerBinaryOp::Add,
+                        left,
+                        right,
+                        ..
+                    },
+                )),
+            } if *target == plan.index
+                && integer_expression_reads_local(left, plan.index)
+                && integer_expression_is_constant(right, 1)
+        )
+    };
     let increments = function
         .blocks
         .iter()
         .flat_map(|block| &block.statements)
-        .filter(|statement| {
-            matches!(
-                statement,
-                mir::Statement::AssignLocal {
-                    target,
-                    value: mir::Rvalue::Value(mir::ValueExpression::Integer(
-                        mir::IntegerExpression::Binary {
-                            ty: IntegerType::Int64,
-                            op: mir::IntegerBinaryOp::Add,
-                            left,
-                            right,
-                            ..
-                        },
-                    )),
-                } if *target == plan.index
-                    && integer_expression_reads_local(left, plan.index)
-                    && integer_expression_is_constant(right, 1)
-            )
-        })
+        .filter(|statement| is_index_increment(statement))
+        .count();
+    let update_increments = block_in(function, plan.update)?
+        .statements
+        .iter()
+        .filter(|statement| is_index_increment(statement))
         .count();
     let body = block_in(function, plan.body)?;
     let first_binding_values = plan.first_binding.map_or_else(Vec::new, |first| {
@@ -10853,11 +10859,31 @@ fn validate_foreach_plan_cfg(
         }
         (Some(_), mir::ForeachIterationKind::ValueOnly) => false,
     };
+    let value_binding_value = body
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            mir::Statement::AssignLocal { target, value } if *target == plan.value_binding => {
+                Some(value)
+            }
+            _ => None,
+        });
+    let value_binding_is_established =
+        value_binding_value.is_some_and(|value| match plan.projection {
+            mir::ForeachProjection::Keys => {
+                rvalue_reads_collection_key_at(value, plan.collection, plan.index)
+            }
+            mir::ForeachProjection::Main | mir::ForeachProjection::Values => {
+                rvalue_reads_collection_value_at(value, plan.collection, plan.index)
+            }
+        });
     if anchor != plan.setup
         || zero_initializers != 1
         || increments != 1
+        || update_increments != 1
         || !header_is_positional
         || !first_binding_is_established
+        || !value_binding_is_established
         || !matches!(setup.terminator, mir::Terminator::Jump(target) if target == plan.header)
         || !matches!(
             block_in(function, plan.update)?.terminator,
@@ -10923,6 +10949,194 @@ fn rvalue_reads_collection_key_at(
             offset,
         } if *candidate == collection && rvalue_reads_integer_local(offset, index)
     )
+}
+
+fn rvalue_reads_collection_value_at(
+    value: &mir::Rvalue,
+    collection: mir::LocalId,
+    index: mir::LocalId,
+) -> bool {
+    let matches_index =
+        |candidate: mir::LocalId, offset: &mir::Rvalue, positional: bool, remove: bool| {
+            candidate == collection
+                && positional
+                && !remove
+                && rvalue_reads_integer_local(offset, index)
+        };
+    let matches_nullable =
+        |candidate: mir::LocalId, offset: &mir::Rvalue, access: mir::NullableCollectionAccess| {
+            candidate == collection
+                && access == mir::NullableCollectionAccess::At
+                && rvalue_reads_integer_local(offset, index)
+        };
+
+    match value {
+        mir::Rvalue::Value(expression) => {
+            scalar_value_expression_operand(expression).is_some_and(|operand| {
+                matches!(
+                    operand,
+                    mir::Operand::CollectionIndex {
+                        collection,
+                        index,
+                        positional,
+                        remove,
+                    } if matches_index(*collection, index, *positional, *remove)
+                )
+            })
+        }
+        mir::Rvalue::String(mir::StringExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+        })
+        | mir::Rvalue::Error(mir::ErrorExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+        })
+        | mir::Rvalue::SharedReference(mir::SharedReferenceExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        })
+        | mir::Rvalue::WeakReference(mir::WeakReferenceExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        })
+        | mir::Rvalue::NullableSharedReference(
+            mir::NullableSharedReferenceExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            },
+        )
+        | mir::Rvalue::NullableWeakReference(
+            mir::NullableWeakReferenceExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            },
+        )
+        | mir::Rvalue::WritableSharedReference(
+            mir::WritableSharedReferenceExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            },
+        )
+        | mir::Rvalue::WritableWeakReference(
+            mir::WritableWeakReferenceExpression::CollectionIndex {
+                collection,
+                index,
+                positional,
+                remove,
+                ..
+            },
+        )
+        | mir::Rvalue::Function(mir::FunctionExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        })
+        | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            remove,
+            ..
+        }) => matches_index(*collection, index, *positional, *remove),
+        mir::Rvalue::Class(mir::ClassExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            transfer,
+            ..
+        }) => matches_index(*collection, index, *positional, *transfer),
+        mir::Rvalue::Mixed(mir::MixedExpression::CollectionIndex {
+            collection,
+            index,
+            positional,
+            transfer,
+            remove,
+        }) => matches_index(*collection, index, *positional, *transfer || *remove),
+        mir::Rvalue::Collection(mir::CollectionExpression::Index {
+            source,
+            index,
+            positional,
+            transfer,
+            ..
+        }) => matches_index(*source, index, *positional, *transfer),
+        mir::Rvalue::PayloadEnum(mir::PayloadEnumExpression::Use {
+            place:
+                mir::PayloadEnumPlace::CollectionIndex {
+                    collection,
+                    index,
+                    positional,
+                    remove,
+                },
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        })
+        | mir::Rvalue::NullablePayloadEnum(mir::NullablePayloadEnumExpression::Use {
+            place:
+                mir::PayloadEnumPlace::CollectionIndex {
+                    collection,
+                    index,
+                    positional,
+                    remove,
+                },
+            mode: mir::PayloadEnumUseMode::Borrow,
+            ..
+        }) => matches_index(*collection, index, *positional, *remove),
+        mir::Rvalue::NullableScalar(mir::NullableScalarExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+            ..
+        })
+        | mir::Rvalue::NullableString(mir::NullableStringExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+        })
+        | mir::Rvalue::NullableError(mir::NullableErrorExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+        })
+        | mir::Rvalue::NullableClass(mir::NullableClassExpression::DictionaryGet {
+            collection,
+            key,
+            access,
+            ..
+        }) => matches_nullable(*collection, key, *access),
+        _ => false,
+    }
+}
+
+fn scalar_value_expression_operand(value: &mir::ValueExpression) -> Option<&mir::Operand> {
+    match value {
+        mir::ValueExpression::Integer(mir::IntegerExpression::Use { operand, .. })
+        | mir::ValueExpression::Float(mir::FloatExpression::Use { operand, .. })
+        | mir::ValueExpression::Bool(mir::BoolExpression::Use { operand })
+        | mir::ValueExpression::Enum(mir::EnumExpression::Use { operand, .. }) => Some(operand),
+        _ => None,
+    }
 }
 
 fn validate_list_algorithm_types(

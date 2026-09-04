@@ -15254,7 +15254,7 @@ impl<'program> Checker<'program> {
         if self.is_unknown_type(target) || self.is_unknown_type(value) {
             return;
         }
-        if !self.is_assignable(target, value) {
+        if target != value {
             self.diagnostics.push(
                 Diagnostic::new(
                     "E0746",

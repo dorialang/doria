@@ -364,6 +364,15 @@ fn sequence_index_diagnostics_are_precise_and_noniterable_sources_do_not_cascade
     assert_eq!(wrong[0].title, "Sequence Index Binding Must Be Int");
     assert_eq!(wrong[0].fixes[0].edits[0].replacement, "int");
 
+    for broader in ["?int", "mixed"] {
+        let diagnostics = errors(&format!(
+            "function main(): void {{ List<int> $v = [1]; foreach ($v as {broader} $i => int $value) {{}} }}"
+        ));
+        assert_eq!(diagnostics.len(), 1, "{broader}: {diagnostics:#?}");
+        assert_eq!(diagnostics[0].code, "E0746");
+        assert_eq!(diagnostics[0].fixes[0].edits[0].replacement, "int");
+    }
+
     let writable = errors(
         "function main(): void { int[] $v = [1]; foreach ($v as writable int $i => int $value) {} }",
     );
@@ -486,6 +495,36 @@ function main(): void
         });
     doriac::mir_validation::validate_program(&missing_binding_source)
         .expect_err("the first binding must be established before the body");
+
+    let mut misplaced_increment = valid.clone();
+    let (function, _, _) = first_foreach_plan_location(&misplaced_increment);
+    let plan = first_foreach_plan_mut(&mut misplaced_increment).clone();
+    let increment = misplaced_increment.functions[function].blocks[plan.update.0]
+        .statements
+        .pop()
+        .expect("foreach update increment");
+    misplaced_increment.functions[function].blocks[plan.body.0]
+        .statements
+        .push(increment);
+    doriac::mir_validation::validate_program(&misplaced_increment)
+        .expect_err("the traversal ordinal must advance in the shared update block");
+
+    let mut wrong_value_source = valid.clone();
+    let (function, _, _) = first_foreach_plan_location(&wrong_value_source);
+    let plan = first_foreach_plan_mut(&mut wrong_value_source).clone();
+    let value = wrong_value_source.functions[function].blocks[plan.body.0]
+        .statements
+        .iter_mut()
+        .find_map(|statement| match statement {
+            Statement::AssignLocal { target, value } if *target == plan.value_binding => {
+                Some(value)
+            }
+            _ => None,
+        })
+        .expect("foreach value binding assignment");
+    *value = mir::Rvalue::String(mir::StringExpression::Literal("wrong".into()));
+    doriac::mir_validation::validate_program(&wrong_value_source)
+        .expect_err("the value binding must read the planned collection position");
 }
 
 #[test]
