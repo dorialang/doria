@@ -329,3 +329,8 @@ separate clean status-0 behavior.
 *Readable code. Checked contracts. Native binaries.*
 
 </div>
+
+## License
+
+Apache License 2.0. See [LICENSE](LICENSE).
+Third-party components retain their own licenses and notices.

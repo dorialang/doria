@@ -5,6 +5,10 @@ updates:
     target-branch: develop
     schedule:
       interval: weekly
+    groups:
+      cranelift:
+        patterns:
+          - "cranelift-*"
 
   - package-ecosystem: github-actions
     directory: /
