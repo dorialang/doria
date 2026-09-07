@@ -1200,18 +1200,20 @@ fn execute_native_output(
     let outcome_path = temp_path.with_extension("doria-outcome");
     write_backend_output(&temp_path, output)
         .map_err(|error| format!("failed to write temp native executable: {error}"))?;
-    let status = Command::new(&temp_path)
-        .env("DORIA_RUNTIME_OUTCOME_V2", &outcome_path)
-        .env("DORIA_RUNTIME_OUTCOME_V3", &outcome_path)
-        .env("DORIA_RUNTIME_OUTCOME_V4", &outcome_path)
-        .args(program_args)
-        .status()
-        .map_err(|error| {
-            format!(
-                "failed to run native executable `{}`: {error}",
-                temp_path.display()
-            )
-        });
+    let status = doriac::native_process::spawn(
+        Command::new(&temp_path)
+            .env("DORIA_RUNTIME_OUTCOME_V2", &outcome_path)
+            .env("DORIA_RUNTIME_OUTCOME_V3", &outcome_path)
+            .env("DORIA_RUNTIME_OUTCOME_V4", &outcome_path)
+            .args(program_args),
+    )
+    .and_then(|mut child| child.wait())
+    .map_err(|error| {
+        format!(
+            "failed to run native executable `{}`: {error}",
+            temp_path.display()
+        )
+    });
     let runtime_payload = fs::read(&outcome_path).ok();
     let _ = fs::remove_file(&outcome_path);
     let _ = fs::remove_file(&temp_path);

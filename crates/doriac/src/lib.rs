@@ -37,6 +37,7 @@ pub mod names;
 mod narrowing;
 pub mod native_abi;
 pub mod native_closure_abi;
+pub mod native_process;
 pub mod numeric;
 pub mod ownership;
 pub mod parser;
