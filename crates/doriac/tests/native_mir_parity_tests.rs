@@ -356,14 +356,13 @@ fn assert_closed_output_pipe(
     fs::write(&executable, bytes).expect("broken-pipe executable should be writable");
     make_executable(&executable);
 
-    let mut child = retry_transient_executable_busy(|| {
+    let mut child = doriac::native_process::spawn(
         Command::new(&executable)
             .current_dir(&directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-    })
+            .stderr(Stdio::piped()),
+    )
     .unwrap_or_else(|error| panic!("failed to start {backend} {name} fixture: {error}"));
     match closed_stream {
         ClosedStream::Stdout => drop(child.stdout.take()),
@@ -626,38 +625,18 @@ fn run_native_executable(
     stdin: &[u8],
     args: &[String],
 ) -> io::Result<Output> {
-    let mut child = retry_transient_executable_busy(|| {
+    let mut child = doriac::native_process::spawn(
         Command::new(executable)
             .args(args)
             .current_dir(cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-    })?;
+            .stderr(Stdio::piped()),
+    )?;
     let mut child_stdin = child.stdin.take().expect("piped stdin should be available");
     write_stdin_tolerating_early_close(&mut child_stdin, stdin)?;
     drop(child_stdin);
     child.wait_with_output()
-}
-
-fn retry_transient_executable_busy<T>(
-    mut operation: impl FnMut() -> io::Result<T>,
-) -> io::Result<T> {
-    const MAX_ATTEMPTS: usize = 20;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        match operation() {
-            Ok(value) => return Ok(value),
-            Err(error)
-                if is_transient_executable_launch_error(&error) && attempt + 1 < MAX_ATTEMPTS =>
-            {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("retry loop returns on its final attempt")
 }
 
 fn write_stdin_tolerating_early_close(child_stdin: &mut dyn Write, stdin: &[u8]) -> io::Result<()> {
@@ -871,12 +850,6 @@ fn read_hex_fixture(path: &Path) -> Vec<u8> {
         .collect()
 }
 
-fn is_transient_executable_launch_error(error: &io::Error) -> bool {
-    cfg!(unix)
-        && (error.raw_os_error() == Some(26)
-            || (cfg!(target_os = "macos") && error.raw_os_error() == Some(88)))
-}
-
 #[cfg(unix)]
 fn make_executable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
@@ -940,14 +913,13 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         fs::write(&executable, bytes).expect("prompt-timing executable should be writable");
         make_executable(&executable);
 
-        let mut child = retry_transient_executable_busy(|| {
+        let mut child = doriac::native_process::spawn(
             Command::new(&executable)
                 .current_dir(&directory)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-        })
+                .stderr(Stdio::piped()),
+        )
         .unwrap_or_else(|error| {
             panic!("failed to start the {backend} prompt-timing fixture: {error}")
         });

@@ -1,10 +1,8 @@
 use std::collections::BTreeSet;
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Output, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use doriac::backend::BackendOutput;
 use doriac::build_plan::{BuildNativeProfile, CompilerTarget};
@@ -109,11 +107,14 @@ fn assert_native_output(
         permissions.set_mode(0o755);
         fs::set_permissions(&executable, permissions).expect("make native executable runnable");
     }
-    let output = retry_transient_executable_busy(|| {
+    let output = doriac::native_process::spawn(
         Command::new(&executable)
             .current_dir(working_directory)
-            .output()
-    })
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .and_then(|child| child.wait_with_output())
     .expect("run native executable");
     let _ = fs::remove_file(&executable);
     assert_run(fixture, backend, &output, expected_stdout);
@@ -155,37 +156,6 @@ fn temporary_path(stem: &str, extension: &str) -> PathBuf {
         path.set_extension(extension);
     }
     path
-}
-
-fn retry_transient_executable_busy<T>(
-    mut operation: impl FnMut() -> io::Result<T>,
-) -> io::Result<T> {
-    const MAX_ATTEMPTS: usize = 20;
-    for attempt in 0..MAX_ATTEMPTS {
-        match operation() {
-            Ok(value) => return Ok(value),
-            Err(error)
-                if is_transient_executable_launch_error(&error) && attempt + 1 < MAX_ATTEMPTS =>
-            {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("retry loop returns on its final attempt")
-}
-
-fn is_transient_executable_launch_error(error: &io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        error.raw_os_error() == Some(26)
-            || (cfg!(target_os = "macos") && error.raw_os_error() == Some(88))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = error;
-        false
-    }
 }
 
 fn host_linker_is_available() -> bool {

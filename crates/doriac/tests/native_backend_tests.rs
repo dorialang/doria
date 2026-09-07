@@ -1,10 +1,10 @@
+use doriac::native_process;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::process::{Command, Output};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use doriac::backend::BackendTarget;
 #[cfg(unix)]
@@ -1347,13 +1347,12 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
         &output,
     );
 
-    let mut child = retry_transient_executable_busy(|| {
+    let mut child = native_process::spawn(
         Command::new(&output)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-    })
+            .stderr(Stdio::piped()),
+    )
     .expect("native executable should start");
     drop(child.stderr.take());
     child
@@ -1401,12 +1400,11 @@ function main(): void throws Failure
         &output,
     );
 
-    let mut child = retry_transient_executable_busy(|| {
+    let mut child = native_process::spawn(
         Command::new(&output)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-    })
+            .stderr(Stdio::piped()),
+    )
     .expect("native executable should start");
     drop(child.stderr.take());
     let run = child
@@ -1471,15 +1469,15 @@ function main(): void throws Doria\Std\Io\IoError
         &output,
     );
 
-    let run = retry_transient_executable_busy(|| {
-        let (read_end, write_end) = os_pipe()?;
-        drop(read_end);
+    let (read_end, write_end) = os_pipe().expect("stdin pipe should open");
+    drop(read_end);
+    let run = native_process::spawn(
         Command::new(&output)
             .stdin(Stdio::from(write_end))
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-    })
+            .stderr(Stdio::piped()),
+    )
+    .and_then(|child| child.wait_with_output())
     .expect("native executable should run with a write-only stdin");
 
     assert_eq!(run.status.code(), Some(70));
@@ -4250,46 +4248,26 @@ fn assert_native_run_output(output: &Path, stem: &str, expected_stdout: &[u8]) {
 }
 
 fn run_native_executable(output: &Path) -> io::Result<Output> {
-    retry_transient_executable_busy(|| Command::new(output).output())
+    run_native_executable_in_directory(output, &std::env::current_dir()?)
 }
 
 fn run_native_executable_in_directory(output: &Path, directory: &Path) -> io::Result<Output> {
-    retry_transient_executable_busy(|| Command::new(output).current_dir(directory).output())
+    native_process::spawn(
+        Command::new(output)
+            .current_dir(directory)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )?
+    .wait_with_output()
 }
 
 fn spawn_native_executable_with_piped_output(output: &Path) -> io::Result<std::process::Child> {
-    retry_transient_executable_busy(|| {
+    native_process::spawn(
         Command::new(output)
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-    })
-}
-
-fn retry_transient_executable_busy<T>(
-    mut operation: impl FnMut() -> io::Result<T>,
-) -> io::Result<T> {
-    const MAX_ATTEMPTS: usize = 20;
-
-    for attempt in 0..MAX_ATTEMPTS {
-        match operation() {
-            Ok(value) => return Ok(value),
-            Err(error)
-                if is_transient_executable_launch_error(&error) && attempt + 1 < MAX_ATTEMPTS =>
-            {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-
-    unreachable!("retry loop returns on final attempt")
-}
-
-fn is_transient_executable_launch_error(error: &io::Error) -> bool {
-    cfg!(unix)
-        && (error.raw_os_error() == Some(26)
-            || (cfg!(target_os = "macos") && error.raw_os_error() == Some(88)))
+            .stderr(Stdio::piped()),
+    )
 }
 
 fn compile_native_file(input: &Path, output: &Path) {

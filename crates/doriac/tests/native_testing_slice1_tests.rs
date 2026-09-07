@@ -6,11 +6,9 @@ use doriac::build_plan::{
 use doriac::compilation_graph::{analyze_compilation_graph_for_ide, load_compilation_graph};
 use doriac::source_provider::InMemorySourceProvider;
 use std::fs;
-use std::io;
 use std::path::PathBuf;
-use std::process::Command;
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const PACKAGE: &str = "acme/tests";
 const TEST_SOURCE: &str = "acme/tests:tests.doria";
@@ -224,8 +222,14 @@ fn run_emitted(output: doriac::backend::BackendOutput) -> std::process::Output {
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).expect("executable permissions");
     }
-    let output =
-        retry_transient_executable_busy(|| Command::new(&path).output()).expect("run executable");
+    let output = doriac::native_process::spawn(
+        Command::new(&path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .and_then(|child| child.wait_with_output())
+    .expect("run executable");
     let _ = fs::remove_file(path);
     output
 }
@@ -248,49 +252,21 @@ fn run_emitted_with_assertion_outcome(
         permissions.set_mode(0o755);
         fs::set_permissions(&path, permissions).expect("executable permissions");
     }
-    let output = retry_transient_executable_busy(|| {
+    let output = doriac::native_process::spawn(
         Command::new(&path)
             .env("DORIA_RUNTIME_OUTCOME_V2", &outcome)
             .env("DORIA_RUNTIME_OUTCOME_V3", &outcome)
             .env("DORIA_RUNTIME_OUTCOME_V4", &outcome)
-            .output()
-    })
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+    )
+    .and_then(|child| child.wait_with_output())
     .expect("run executable");
     let payload = fs::read(&outcome).expect("assertion outcome");
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(outcome);
     (output, payload)
-}
-
-fn retry_transient_executable_busy<T>(
-    mut operation: impl FnMut() -> io::Result<T>,
-) -> io::Result<T> {
-    const MAX_ATTEMPTS: usize = 20;
-    for attempt in 0..MAX_ATTEMPTS {
-        match operation() {
-            Ok(value) => return Ok(value),
-            Err(error)
-                if is_transient_executable_launch_error(&error) && attempt + 1 < MAX_ATTEMPTS =>
-            {
-                thread::sleep(Duration::from_millis(25));
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    unreachable!("retry loop returns on its final attempt")
-}
-
-fn is_transient_executable_launch_error(error: &io::Error) -> bool {
-    #[cfg(unix)]
-    {
-        error.raw_os_error() == Some(26)
-            || (cfg!(target_os = "macos") && error.raw_os_error() == Some(88))
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = error;
-        false
-    }
 }
 
 fn first_behavioral_dispatcher(source: &str) -> String {

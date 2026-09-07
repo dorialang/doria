@@ -9,7 +9,7 @@ use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 
 #[test]
-fn development_launcher_builds_the_runtime_from_source() {
+fn development_launcher_keeps_bundled_runtime_enabled() {
     let launcher = include_str!("../../../bin/doriac");
     assert!(
         !launcher.contains("--no-default-features"),
@@ -504,8 +504,8 @@ function main(): int
     let output_path = temp_dir.join(native_output_name("main"));
     assert!(output_path.exists(), "native executable should exist");
 
-    let run = Command::new(&output_path)
-        .status()
+    let run = doriac::native_process::spawn(&mut Command::new(&output_path))
+        .and_then(|mut child| child.wait())
         .expect("native executable should run");
     assert_eq!(run.code(), Some(42));
 
@@ -564,6 +564,7 @@ fn run_compiles_source_to_native_and_returns_program_status() {
         r#"
 function main(): int
 {
+    echo "ran once\n";
     return 42;
 }
 "#,
@@ -577,11 +578,9 @@ function main(): int
         .output()
         .expect("doriac binary should run");
 
-    assert_eq!(
-        run.status.code(),
-        Some(42),
-        "doriac run should return the native program status"
-    );
+    assert_status("native run", &run, 42);
+    assert_eq!(run.stdout, b"ran once\n");
+    assert!(run.stderr.is_empty(), "{run:?}");
 
     let _ = fs::remove_dir_all(temp_dir);
 }
@@ -611,10 +610,10 @@ fn run_forwards_program_arguments_after_the_separator() {
         .arg("--")
         .arg("--looks-like-an-option")
         .arg("two words")
-        .status()
+        .output()
         .expect("doriac binary should launch the generated program");
 
-    assert_eq!(run.code(), Some(2));
+    assert_status("native arguments", &run, 2);
 
     let _ = fs::remove_dir_all(temp_dir);
 }
@@ -647,7 +646,7 @@ fn run_preserves_non_utf8_program_arguments_for_the_runtime() {
             .output()
             .expect("doriac binary should launch the generated program");
 
-        assert_eq!(run.status.code(), Some(101), "source: {source}");
+        assert_status(source, &run, 101);
         assert!(
             String::from_utf8_lossy(&run.stderr)
                 .contains("Panic[P1410]: Program Argument Is Not Valid UTF-8"),
@@ -757,7 +756,7 @@ fn release_compile_and_run_use_the_enabled_llvm_profile() {
         .arg("--release")
         .output()
         .expect("doriac binary should run");
-    assert_eq!(run.status.code(), Some(42));
+    assert_status("LLVM release run", &run, 42);
     let _ = fs::remove_dir_all(temp_dir);
 }
 
@@ -1062,14 +1061,18 @@ fn doriac_bin() -> &'static str {
 }
 
 fn assert_success(label: &str, output: Output) {
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        panic!(
-            "{label} failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
-            output.status, stdout, stderr
-        );
-    }
+    assert_status(label, &output, 0);
+}
+
+fn assert_status(label: &str, output: &Output, expected: i32) {
+    assert_eq!(
+        output.status.code(),
+        Some(expected),
+        "{label} failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn assert_failure_contains(label: &str, output: Output, expected: &str) {
