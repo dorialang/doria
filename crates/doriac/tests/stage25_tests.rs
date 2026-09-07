@@ -235,7 +235,7 @@ function main(): void
 }
 
 #[test]
-fn user_defined_constraints_are_deferred_to_stage_35() {
+fn undeclared_user_constraints_are_rejected() {
     let errors = diagnostics(
         r#"
 class Box<T implements UserConstraint> {}
@@ -243,9 +243,7 @@ function main(): void {}
 "#,
     );
     assert!(errors.iter().any(|diagnostic| {
-        diagnostic.code == "E0533"
-            && diagnostic.message.contains("UserConstraint")
-            && diagnostic.message.contains("Stage 35")
+        diagnostic.code == "E0750" && diagnostic.message.contains("UserConstraint")
     }));
 }
 

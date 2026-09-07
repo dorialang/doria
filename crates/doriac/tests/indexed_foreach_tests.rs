@@ -96,7 +96,7 @@ function main(): void
     let AstItem::Function(function) = &program.items[0] else {
         panic!("expected function");
     };
-    let AstStmt::Foreach(foreach) = &function.body.statements[1] else {
+    let AstStmt::Foreach(foreach) = &function.body.statements()[1] else {
         panic!("expected foreach");
     };
     let first = foreach.first_binding.as_ref().expect("first binding");
@@ -121,7 +121,10 @@ function main(): void
         &source[foreach.value_binding.span.start..foreach.value_binding.span.end],
         "string $item"
     );
-    assert!(matches!(function.body.statements[2], AstStmt::Echo { .. }));
+    assert!(matches!(
+        function.body.statements()[2],
+        AstStmt::Echo { .. }
+    ));
 }
 
 #[test]

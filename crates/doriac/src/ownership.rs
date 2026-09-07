@@ -532,10 +532,11 @@ fn returned_closure_provenance(
     }
 
     let mut sources = HashMap::new();
-    collect_sources(&function.body, binding_resolution, &mut sources);
+    let body = function.body.as_block()?;
+    collect_sources(body, binding_resolution, &mut sources);
     let mut found = None;
     visit_block(
-        &function.body,
+        body,
         function,
         closures,
         binding_resolution,
@@ -1037,7 +1038,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                                 },
                             );
                         }
-                        ClassMember::Constant(_) => {}
+                        ClassMember::Constant(_) | ClassMember::Uses(_) => {}
                         ClassMember::Method(method) => {
                             let mut method_signature = signature(
                                 method,
@@ -1264,7 +1265,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
                         ClassMember::Method(method) => {
                             checker.check_function(method, Some(&class.name))
                         }
-                        ClassMember::Constant(_) => {}
+                        ClassMember::Constant(_) | ClassMember::Uses(_) => {}
                     }
                 }
             }
@@ -1306,7 +1307,7 @@ pub(crate) fn function_return_borrow_with_calls(
 ) -> Option<ReturnBorrow> {
     let mut borrow = None;
     if block_return_borrow(
-        &function.body,
+        function.body.as_block()?,
         function,
         resolve_call,
         &HashSet::new(),
@@ -1979,6 +1980,9 @@ impl Checker<'_> {
     }
 
     fn check_function(&mut self, function: &ast::FunctionDecl, receiver_class: Option<&str>) {
+        let Some(body) = function.body.as_block() else {
+            return;
+        };
         let enclosing_type_params = receiver_class
             .and_then(|class| self.class_type_params.get(class))
             .cloned()
@@ -2083,7 +2087,7 @@ impl Checker<'_> {
                 && self.current_return_borrow.is_none()
         }) || (function.return_type.is_none()
             && self.inferred_move_returns.contains(&function.span));
-        self.check_block(&function.body, &mut scopes, return_move_type, false);
+        self.check_block(body, &mut scopes, return_move_type, false);
         self.current_return_borrow = previous_return_borrow;
         self.current_type_params = previous_type_params;
         self.receiver_writable = previous_receiver_writable;

@@ -1,0 +1,3 @@
+interface Broken<T extends A<,>, { function read(int): ; }
+trait Missing { uses First<>, Second { First::call as; } function next(): void {} }
+class Recovery { function next(): int { return 1; } }

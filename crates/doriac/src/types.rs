@@ -387,12 +387,12 @@ pub enum FunctionBorrowSource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ClassType<T> {
+pub struct NominalType<T> {
     pub name: String,
     pub arguments: Vec<T>,
 }
 
-impl<T> ClassType<T> {
+impl<T> NominalType<T> {
     pub fn new(name: impl Into<String>, arguments: Vec<T>) -> Self {
         Self {
             name: name.into(),
@@ -400,6 +400,9 @@ impl<T> ClassType<T> {
         }
     }
 }
+
+pub type ClassType<T> = NominalType<T>;
+pub type InterfaceType<T> = NominalType<T>;
 
 /// The six compiler-known Stage 25a shared-ownership types (record 0106). Each
 /// takes exactly one type argument and belongs to one of two permanently disjoint
@@ -520,6 +523,10 @@ pub enum TypeKind {
     Function(SemanticFunctionType<TypeId>),
     Enum(EnumType),
     Class(ClassType<TypeId>),
+    Interface(InterfaceType<TypeId>),
+    /// Exact dynamic implementer, only in an interface's owned return contract.
+    InterfaceSelf(String),
+    TraitSelf(String),
     List(TypeId),
     Dictionary(TypeId, TypeId),
     SortedDictionary(TypeId, TypeId),
@@ -546,6 +553,9 @@ pub enum ResolvedType {
     Enum(EnumType),
     Nullable(Box<ResolvedType>),
     Class(ClassType<ResolvedType>),
+    Interface(InterfaceType<ResolvedType>),
+    InterfaceSelf(String),
+    TraitSelf(String),
     TypedArray(Box<ResolvedType>),
     List(Box<ResolvedType>),
     Dictionary(Box<ResolvedType>, Box<ResolvedType>),
@@ -571,7 +581,7 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
         ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
             1 + resolved_type_complexity(key) + resolved_type_complexity(value)
         }
-        ResolvedType::Class(class) => {
+        ResolvedType::Class(class) | ResolvedType::Interface(class) => {
             1 + class
                 .arguments
                 .iter()
@@ -601,6 +611,8 @@ pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
         | ResolvedType::Void
         | ResolvedType::Null
         | ResolvedType::TypeParameter(_)
+        | ResolvedType::InterfaceSelf(_)
+        | ResolvedType::TraitSelf(_)
         | ResolvedType::Enum(_)
         | ResolvedType::Unsupported => 1,
     }
@@ -662,7 +674,7 @@ impl TypeRegistry {
             TypeKind::TypeParameter(name) => name.clone(),
             TypeKind::Function(function) => self.display_function(function),
             TypeKind::Enum(enum_type) => enum_type.name.clone(),
-            TypeKind::Class(class) => {
+            TypeKind::Class(class) | TypeKind::Interface(class) => {
                 if class.arguments.is_empty() {
                     class.name.clone()
                 } else {
@@ -679,6 +691,7 @@ impl TypeRegistry {
                 }
             }
             TypeKind::List(element) => format!("List<{}>", self.display(*element)),
+            TypeKind::InterfaceSelf(_) | TypeKind::TraitSelf(_) => "self".to_string(),
             TypeKind::Dictionary(key, value) => {
                 format!(
                     "Dictionary<{}, {}>",
@@ -775,6 +788,16 @@ impl TypeRegistry {
                 }))
             }
             TypeKind::Enum(enum_type) => ResolvedType::Enum(enum_type.clone()),
+            TypeKind::InterfaceSelf(name) => ResolvedType::InterfaceSelf(name.clone()),
+            TypeKind::TraitSelf(name) => ResolvedType::TraitSelf(name.clone()),
+            TypeKind::Interface(interface) => ResolvedType::Interface(InterfaceType::new(
+                interface.name.clone(),
+                interface
+                    .arguments
+                    .iter()
+                    .map(|argument| self.resolved(*argument))
+                    .collect(),
+            )),
             TypeKind::Nullable(inner) => ResolvedType::Nullable(Box::new(self.resolved(*inner))),
             TypeKind::Class(class) => ResolvedType::Class(ClassType::new(
                 class.name.clone(),
@@ -849,6 +872,16 @@ impl TypeRegistry {
                 })
             }
             ResolvedType::Enum(ty) => TypeKind::Enum(ty.clone()),
+            ResolvedType::InterfaceSelf(name) => TypeKind::InterfaceSelf(name.clone()),
+            ResolvedType::TraitSelf(name) => TypeKind::TraitSelf(name.clone()),
+            ResolvedType::Interface(interface) => TypeKind::Interface(InterfaceType::new(
+                interface.name.clone(),
+                interface
+                    .arguments
+                    .iter()
+                    .map(|argument| self.intern_resolved(argument))
+                    .collect(),
+            )),
             ResolvedType::Nullable(inner) => {
                 let inner = self.intern_resolved(inner);
                 TypeKind::Nullable(inner)

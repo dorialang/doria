@@ -983,8 +983,13 @@ pub fn metadata_type_name(ty: &ResolvedType) -> String {
             }
             display
         }
-        ResolvedType::Class(class) if class.arguments.is_empty() => class.name.clone(),
-        ResolvedType::Class(class) => format!(
+        ResolvedType::InterfaceSelf(_) | ResolvedType::TraitSelf(_) => "self".to_string(),
+        ResolvedType::Class(class) | ResolvedType::Interface(class)
+            if class.arguments.is_empty() =>
+        {
+            class.name.clone()
+        }
+        ResolvedType::Class(class) | ResolvedType::Interface(class) => format!(
             "{}<{}>",
             class.name,
             class

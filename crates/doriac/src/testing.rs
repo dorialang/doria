@@ -508,7 +508,8 @@ impl Elaborator<'_> {
             params: Vec::new(),
             return_type: Some(TypeRef::named("void")),
             throws: None,
-            body,
+            body: ast::FunctionBody::Block(body),
+            syntax: Box::new(ast::FunctionSyntax::synthetic(function_span)),
             modifier_prefix_span: function_span,
             span: function_span,
         }));

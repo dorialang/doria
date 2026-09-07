@@ -306,3 +306,5 @@ examples/native/main_constructor_property_write_order.doria
 examples/native/main_stage31_namespaces.doria
 examples/native/main_stage32_attributes.doria
 examples/native/main_scalar_display_materialization.doria
+examples/native/main_stage35_concrete_conformance.doria
+examples/native/main_stage35_generic_conformance.doria

@@ -390,7 +390,7 @@ function main(): void {
     let Item::Function(main) = &program.items[4] else {
         panic!("expected main function");
     };
-    let ast::Stmt::VarDecl(binding) = &main.body.statements[0] else {
+    let ast::Stmt::VarDecl(binding) = &main.body.statements()[0] else {
         panic!("expected match binding");
     };
     let ast::Expr::Match { arms, .. } = &binding.initializer else {

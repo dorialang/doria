@@ -42,7 +42,7 @@ function choose(?Label $label, mixed $value): string
         panic!("expected function");
     };
     assert!(function.params[0].ty.nullable);
-    let Stmt::VarDecl(declaration) = &function.body.statements[0] else {
+    let Stmt::VarDecl(declaration) = &function.body.statements()[0] else {
         panic!("expected declaration");
     };
     let Expr::Binary {
@@ -60,7 +60,7 @@ function choose(?Label $label, mixed $value): string
             ..
         }
     ));
-    let Stmt::If(if_statement) = &function.body.statements[1] else {
+    let Stmt::If(if_statement) = &function.body.statements()[1] else {
         panic!("expected if statement");
     };
     assert!(matches!(if_statement.condition, Expr::IsType { .. }));
@@ -567,7 +567,7 @@ function inspect(mixed $value): bool { return $value is Base; }
         .any(|diagnostic| diagnostic.code.starts_with('P')));
     let interface = interface_diagnostics
         .into_iter()
-        .find(|diagnostic| diagnostic.code == "E0510")
+        .find(|diagnostic| diagnostic.code == "E0758")
         .expect("expected interface-stage diagnostic");
     assert!(interface.message.contains("Stage 35"));
 }

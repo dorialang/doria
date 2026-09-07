@@ -3,6 +3,33 @@ use doriac::hir;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[test]
+fn php_executes_concrete_nominal_contracts_without_erasure() {
+    let name = "concrete";
+    let source = include_str!("../../../examples/native/main_stage35_concrete_conformance.doria");
+    let expected = "report\n";
+    let php = doriac::compile_source_to_php(name, source).unwrap();
+    assert!(!php.contains("interface Renderable"));
+    let Ok(version) = Command::new("php").arg("--version").output() else {
+        eprintln!("PHP unavailable; execution skipped for {name}");
+        return;
+    };
+    assert!(version.status.success());
+    let script = format!(
+        "{}\n{}();",
+        php.strip_prefix("<?php").unwrap(),
+        php_function_name("main")
+    );
+    let output = Command::new("php").args(["-r", &script]).output().unwrap();
+    assert!(
+        output.status.success(),
+        "{name}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(output.stdout, expected.as_bytes());
+}
+
 fn php_function_name(name: &str) -> String {
     let encoded = name
         .as_bytes()
@@ -3557,10 +3584,9 @@ fn php_backend_executes_checked_errors_with_doria_descriptor_dispatch() {
         if path == "checked-error-catch-all.doria" {
             assert!(!php.contains("->descriptor ==="));
         } else {
-            assert!(php.contains("->descriptor ==="));
+            assert!(php.contains("->error() instanceof "), "{path}");
         }
-        assert!(!php.contains("instanceof Failure"));
-        assert!(!php.contains("instanceof BuildError"));
+        assert!(!php.contains("->descriptor ==="));
 
         let script = format!(
             "{}\n__DoriaFunction_6d61696e();",

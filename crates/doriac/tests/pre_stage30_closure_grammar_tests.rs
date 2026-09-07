@@ -164,7 +164,7 @@ function make(): function(int): int
         "function(int): int"
     );
     assert!(matches!(
-        &make.body.statements[0],
+        &make.body.statements()[0],
         Stmt::Return {
             expr: Some(Expr::Closure(_)),
             ..
@@ -416,7 +416,7 @@ fn stage30a_callable_postfix_ast_is_distinct_and_chains_with_exact_spans() {
                 span,
             },
         ..
-    } = &main.body.statements[0]
+    } = &main.body.statements()[0]
     else {
         panic!("variable invocation must be a callable call");
     };
@@ -428,49 +428,49 @@ fn stage30a_callable_postfix_ast_is_distinct_and_chains_with_exact_spans() {
     assert_eq!(span_text(source, *span), "$callback(1)");
 
     assert!(matches!(
-        &main.body.statements[1],
+        &main.body.statements()[1],
         Stmt::Expr {
             expr: Expr::CallableCall { callee, .. },
             ..
         } if matches!(callee.as_ref(), Expr::FunctionCall { name, .. } if name == "factory")
     ));
     assert!(matches!(
-        &main.body.statements[2],
+        &main.body.statements()[2],
         Stmt::Expr {
             expr: Expr::Index { collection, .. },
             ..
         } if matches!(collection.as_ref(), Expr::CallableCall { .. })
     ));
     assert!(matches!(
-        &main.body.statements[3],
+        &main.body.statements()[3],
         Stmt::Expr {
             expr: Expr::PropertyAccess { object, .. },
             ..
         } if matches!(object.as_ref(), Expr::CallableCall { .. })
     ));
     assert!(matches!(
-        &main.body.statements[4],
+        &main.body.statements()[4],
         Stmt::Expr {
             expr: Expr::CallableCall { callee, .. },
             ..
         } if matches!(callee.as_ref(), Expr::Grouped { expr, .. } if matches!(expr.as_ref(), Expr::Closure(_)))
     ));
     assert!(matches!(
-        &main.body.statements[6],
+        &main.body.statements()[6],
         Stmt::Expr {
             expr: Expr::FunctionCall { name, args, .. },
             ..
         } if name == "named" && args[0].name.as_ref().is_some_and(|name| name.text == "value")
     ));
     assert!(matches!(
-        &main.body.statements[7],
+        &main.body.statements()[7],
         Stmt::Expr {
             expr: Expr::MethodCall { method, args, .. },
             ..
         } if method == "method" && args[0].name.is_some()
     ));
     assert!(matches!(
-        &main.body.statements[8],
+        &main.body.statements()[8],
         Stmt::Expr {
             expr: Expr::StaticCall { method, args, .. },
             ..

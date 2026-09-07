@@ -60,7 +60,7 @@ foreach ($paths as $key => $path) {
 $require($paths['decision'], $files['decision'], [
     '# Decision 0134:',
     '**Status:** Accepted',
-    '**Implementation Status:** Stage 35 Authority Accepted; Slice 1 Next',
+    '**Implementation Status:** Stage 35 Authority Accepted; Slice 1 Complete; Slice 2 Next',
     'interface Equatable<T>',
     'function equals(T $other): bool;',
     'function hash(): uint64;',
@@ -84,9 +84,9 @@ $require($paths['decision'], $files['decision'], [
 ]);
 
 $require($paths['plan'], $files['plan'], [
-    'Stage 35 — Interfaces And Traits — Authority Accepted; Slice 1 Next',
-    'Slice 1 — Next: Grammar, Graphs, And Conformance',
-    'Slice 2 — Scheduled: Interface Runtime And Ownership',
+    'Stage 35 — Interfaces And Traits — In Progress; Slice 1 Complete; Slice 2 Next',
+    'Slice 1 — Complete: Grammar, Graphs, And Conformance',
+    'Slice 2 — Next: Interface Runtime And Ownership',
     'Slice 3 — Scheduled: Core Contracts And Public Iteration',
     'Slice 4 — Scheduled: Trait Composition',
     'Slice 5 — Scheduled: Cross-Repository Closure',
@@ -94,7 +94,14 @@ $require($paths['plan'], $files['plan'], [
 
 $require($paths['pipeline'], $files['pipeline'], [
     'Stage 35 Interfaces And Traits authority is accepted under Decision 0134',
-    'Slice 1 Grammar, Graphs, And Conformance is next',
+    'Slice 1 Grammar, Graphs, And Conformance is complete',
+    'Stage 35 Authority — Accepted',
+    'Stage 35 Slice 1 Grammar, Graphs, And Conformance — Complete',
+    'Stage 35 Slice 2 Interface Runtime And Ownership — Next',
+    'Stage 35 Slice 3 Core Contracts And Public Iteration — Scheduled',
+    'Stage 35 Slice 4 Trait Composition — Scheduled',
+    'Stage 35 Slice 5 Cross-Repository Closure — Scheduled',
+    'Stage 35 — In Progress',
 ]);
 
 $require($paths['spec'], $files['spec'], [
@@ -130,12 +137,26 @@ $require($paths['collectionsAudit'], $files['collectionsAudit'], [
 ]);
 
 $staleStatus = [
+    'Slice 1 is next',
+    'Slice 1 Next',
     'Stage 35 — Interfaces And Traits — Next',
     'Stage 35 Interfaces And Traits — Next',
     'Stage 35 Interfaces And Traits - Next',
     'Stage 35 interfaces and traits is next',
     'Stage 35 is next',
 ];
+
+$require('crates/doriac/src/semantics/contracts.rs', $read('crates/doriac/src/semantics/contracts.rs'), [
+    'ConformanceStatus', 'DeferredComposition', 'ContractMismatch',
+]);
+$require('crates/doriac/src/ast.rs', $read('crates/doriac/src/ast.rs'), [
+    'enum FunctionBody', 'Requirement', 'TraitAdaptation',
+]);
+$require('crates/doriac/tests/stage35_contract_tests.rs', $read('crates/doriac/tests/stage35_contract_tests.rs'), [
+    'every_callable_substitution_axis_is_retained_in_conformance_facts',
+    'interface_value_matrix_resolves_types_then_stops_before_hir',
+    'unused_traits_are_compile_time_declarations_and_composition_defers_conformance',
+]);
 
 foreach ($files as $key => $contents) {
     $forbid($paths[$key], $contents, $staleStatus);

@@ -150,6 +150,8 @@ pub enum GlobalReferenceRole {
     StaticQualifier,
     Extends,
     Implements,
+    Uses,
+    TraitAdaptation,
     Throws,
     Catch,
     TypeTest,
@@ -280,6 +282,22 @@ pub const EDITION_2026_PRELUDE: &[PreludeEntry] = &[
     PreludeEntry {
         name: "Equatable",
         reserved: false,
+    },
+    PreludeEntry {
+        name: "Cloneable",
+        reserved: false,
+    },
+    PreludeEntry {
+        name: "Iterable",
+        reserved: false,
+    },
+    PreludeEntry {
+        name: "Iterator",
+        reserved: false,
+    },
+    PreludeEntry {
+        name: "Ordering",
+        reserved: true,
     },
     PreludeEntry {
         name: "Int",
@@ -555,6 +573,7 @@ struct Resolver<'a> {
     references: Vec<GlobalSymbolReference>,
     unresolved: Vec<UnresolvedGlobalReference>,
     external_causes: HashSet<String>,
+    type_parameter_scopes: Vec<HashSet<String>>,
     environment: Option<&'a NameResolutionEnvironment>,
 }
 
@@ -571,6 +590,7 @@ impl<'a> Resolver<'a> {
             imports: HashMap::new(),
             diagnostics: Vec::new(),
             references: Vec::new(),
+            type_parameter_scopes: Vec::new(),
             unresolved: Vec::new(),
             external_causes: HashSet::new(),
             environment: None,
@@ -1290,13 +1310,41 @@ impl<'a> Resolver<'a> {
             Item::Class(class) => self.normalize_class(class),
             Item::Enum(definition) => self.normalize_enum(definition),
             Item::Interface(declaration) => {
+                self.type_parameter_scopes.push(
+                    declaration
+                        .type_params
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect(),
+                );
                 declaration.name = self.canonical_declaration_name(&declaration.name);
+                self.normalize_type_params(&mut declaration.type_params);
+                for (parent, span) in declaration
+                    .parents
+                    .iter_mut()
+                    .zip(&declaration.syntax.inheritance_type_spans)
+                {
+                    self.normalize_type(parent, *span, GlobalReferenceRole::Extends);
+                }
+                for requirement in &mut declaration.requirements {
+                    self.normalize_function(requirement);
+                }
+                self.type_parameter_scopes.pop();
             }
             Item::Trait(declaration) => {
+                self.type_parameter_scopes.push(
+                    declaration
+                        .type_params
+                        .iter()
+                        .map(|parameter| parameter.name.clone())
+                        .collect(),
+                );
                 declaration.name = self.canonical_declaration_name(&declaration.name);
+                self.normalize_type_params(&mut declaration.type_params);
                 for member in &mut declaration.members {
                     self.normalize_class_member(member);
                 }
+                self.type_parameter_scopes.pop();
             }
             Item::Function(function) => {
                 function.name = self.canonical_declaration_name(&function.name);
@@ -1311,6 +1359,13 @@ impl<'a> Resolver<'a> {
     }
 
     fn normalize_class(&mut self, class: &mut ClassDecl) {
+        self.type_parameter_scopes.push(
+            class
+                .type_params
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect(),
+        );
         class.name = self.canonical_declaration_name(&class.name);
         if let Some(parent) = &mut class.parent {
             self.normalize_type(
@@ -1319,21 +1374,23 @@ impl<'a> Resolver<'a> {
                 GlobalReferenceRole::Extends,
             );
         }
-        for interface in &mut class.implements {
-            let source_span = self.occurrence_span(interface, class.span);
-            if let Some(resolved) = self.resolve_name(
+        for (index, interface) in class.implements.iter_mut().enumerate() {
+            self.normalize_type(
                 interface,
-                source_span,
+                class
+                    .syntax
+                    .inheritance_type_spans
+                    .get(index)
+                    .copied()
+                    .unwrap_or(class.span),
                 GlobalReferenceRole::Implements,
-                false,
-            ) {
-                *interface = resolved;
-            }
+            );
         }
         self.normalize_type_params(&mut class.type_params);
         for member in &mut class.members {
             self.normalize_class_member(member);
         }
+        self.type_parameter_scopes.pop();
     }
 
     fn normalize_enum(&mut self, definition: &mut EnumDecl) {
@@ -1373,6 +1430,28 @@ impl<'a> Resolver<'a> {
             }
             ClassMember::Method(method) => self.normalize_function(method),
             ClassMember::Constant(constant) => self.normalize_const(constant),
+            ClassMember::Uses(composition) => {
+                for (ty, span) in composition.traits.iter_mut().zip(&composition.type_spans) {
+                    self.normalize_type(ty, *span, GlobalReferenceRole::Uses);
+                }
+                for adaptation in &mut composition.adaptations {
+                    self.normalize_type(
+                        &mut adaptation.origin,
+                        adaptation.origin_span,
+                        GlobalReferenceRole::TraitAdaptation,
+                    );
+                    if let TraitAdaptationKind::InsteadOf {
+                        excluded,
+                        type_spans,
+                        ..
+                    } = &mut adaptation.kind
+                    {
+                        for (ty, span) in excluded.iter_mut().zip(type_spans) {
+                            self.normalize_type(ty, *span, GlobalReferenceRole::TraitAdaptation);
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -1384,6 +1463,13 @@ impl<'a> Resolver<'a> {
     }
 
     fn normalize_function(&mut self, function: &mut FunctionDecl) {
+        self.type_parameter_scopes.push(
+            function
+                .type_params
+                .iter()
+                .map(|parameter| parameter.name.clone())
+                .collect(),
+        );
         self.normalize_type_params(&mut function.type_params);
         for param in &mut function.params {
             self.normalize_type(&mut param.ty, param.span, GlobalReferenceRole::Type);
@@ -1399,7 +1485,10 @@ impl<'a> Resolver<'a> {
                 self.normalize_type(&mut entry.ty, entry.span, GlobalReferenceRole::Throws);
             }
         }
-        self.normalize_block(&mut function.body);
+        if let Some(body) = function.body.as_block_mut() {
+            self.normalize_block(body);
+        }
+        self.type_parameter_scopes.pop();
     }
 
     fn normalize_type(&mut self, ty: &mut TypeRef, fallback: Span, role: GlobalReferenceRole) {
@@ -1434,7 +1523,14 @@ impl<'a> Resolver<'a> {
                 self.normalize_type(argument, fallback, GlobalReferenceRole::Type);
             }
         }
-        if ty.function.is_some() || ty.grouped.is_some() || is_language_type_name(&ty.name) {
+        if ty.function.is_some()
+            || ty.grouped.is_some()
+            || is_language_type_name(&ty.name)
+            || self
+                .type_parameter_scopes
+                .iter()
+                .any(|scope| scope.contains(&ty.name))
+        {
             return;
         }
         let span = ty.source_name.as_ref().map_or(fallback, |name| name.span);

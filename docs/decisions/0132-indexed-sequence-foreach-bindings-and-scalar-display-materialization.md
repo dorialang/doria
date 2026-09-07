@@ -164,5 +164,5 @@ Decisions 0130 and 0131 remain unchanged.
   repository does not coordinate that website update.
 - Decision 0133 supersedes the inferred-binding allowance without changing this
   record's iterable-role matrix or execution model.
-- Decision 0134 accepts Stage 35 authority and makes Slice 1 the next
-  implementation unit; property hooks remain scheduled and unimplemented.
+- Decision 0134 accepts Stage 35 authority; Slice 1 is complete and Slice 2
+  is the next implementation unit. Property hooks remain scheduled and unimplemented.

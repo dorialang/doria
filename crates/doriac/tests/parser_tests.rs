@@ -65,7 +65,7 @@ function main(): void throws Error
         panic!("expected load function");
     };
     assert_eq!(load.throws.as_ref().unwrap().entries.len(), 2);
-    let Stmt::Try(try_statement) = &load.body.statements[0] else {
+    let Stmt::Try(try_statement) = &load.body.statements()[0] else {
         panic!("expected try statement");
     };
     assert_eq!(try_statement.catches.len(), 2);
@@ -125,7 +125,7 @@ function main(): void
     let Item::Function(function) = &program.items[0] else {
         panic!("expected function declaration");
     };
-    let Stmt::Block(outer) = &function.body.statements[0] else {
+    let Stmt::Block(outer) = &function.body.statements()[0] else {
         panic!("expected outer standalone block");
     };
     assert!(matches!(outer.statements[1], Stmt::Block(_)));
@@ -163,7 +163,14 @@ class Child extends Vendor\Base implements Vendor\Contracts\Printable
         class.parent.as_ref().map(|parent| parent.name.as_str()),
         Some("Vendor\\Base")
     );
-    assert_eq!(class.implements, ["Vendor\\Contracts\\Printable"]);
+    assert_eq!(
+        class
+            .implements
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["Vendor\\Contracts\\Printable"]
+    );
     let ClassMember::Method(method) = &class.members[0] else {
         panic!("expected method declaration");
     };
@@ -544,19 +551,19 @@ $value ^= 1;
 fn structural_lowering_preserves_stage_13_operator_variants() {
     let ast = doriac::parse_source(
         "test.doria",
-        "$value <<= 1; echo ~-$value | $mask ^ $other & 1;",
+        "let writable $value = 2; let $mask = 1; let $other = 0; $value <<= 1; echo ~-$value | $mask ^ $other & 1;",
     )
     .expect("parse should succeed");
-    let hir = doriac::lowering::lower_program(&ast)
-        .expect("AST without interface declarations should lower structurally");
+    let hir = doriac::lowering::lower_program_with_semantics(&ast, Default::default())
+        .expect("operator AST should lower structurally without semantic facts");
 
     assert!(matches!(
-        &hir.items[0],
+        &hir.items[3],
         doriac::hir::Item::Statement(doriac::hir::Stmt::Assignment(assignment))
             if assignment.op == AssignOp::ShiftLeftAssign
     ));
     assert!(matches!(
-        &hir.items[1],
+        &hir.items[4],
         doriac::hir::Item::Statement(doriac::hir::Stmt::Echo {
             expr: doriac::hir::Expr::Binary {
                 op: BinaryOp::BitwiseOr,
@@ -568,17 +575,13 @@ fn structural_lowering_preserves_stage_13_operator_variants() {
 }
 
 #[test]
-fn direct_lowering_reports_accepted_interface_declarations() {
+fn direct_lowering_preserves_contract_facts_without_runtime_declarations() {
     let ast = doriac::parse_source("test.doria", "interface Printable {}")
         .expect("accepted interface declaration should parse");
-    let diagnostics = doriac::lowering::lower_program(&ast)
-        .expect_err("unsupported interface declaration should not reach Doria IR");
-
-    assert_eq!(diagnostics.len(), 1);
-    assert_eq!(diagnostics[0].code, "E0464");
-    assert!(diagnostics[0]
-        .message
-        .contains("interface declaration `Printable`"));
+    let hir =
+        doriac::lowering::lower_program(&ast).expect("declarations are compile-time material");
+    assert!(hir.items.is_empty());
+    assert_eq!(hir.semantic_info.contracts.interfaces[0].name, "Printable");
 }
 
 #[test]
@@ -1260,7 +1263,7 @@ function main(): void
         panic!("expected main");
     };
     assert!(matches!(
-        &main.body.statements[0],
+        &main.body.statements()[0],
         Stmt::DoWhile(statement) if statement.semicolon_span.is_some()
     ));
 
@@ -1331,7 +1334,7 @@ function main(): void
     };
     let names: Vec<Option<&str>> = main
         .body
-        .statements
+        .statements()
         .iter()
         .map(|statement| {
             let Stmt::Expr { expr, .. } = statement else {

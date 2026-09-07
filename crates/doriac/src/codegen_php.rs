@@ -5486,17 +5486,12 @@ fn emit_assertion_statement(
                 _ => None,
             }
             .expect("checked throw inspector has one parameter");
-            let exact = match &parameter.ty {
-                ResolvedType::Class(class) => Some(php_symbol_name(&class.name)),
-                ResolvedType::Error => None,
-                _ => unreachable!("checked throw inspector parameter implements Error"),
-            };
             let error = format!("${caught_error}");
-            if let Some(exact) = exact {
+            if parameter.ty != ResolvedType::Error {
                 writeln(
                     output,
                     indent + 1,
-                    &format!("if (${caught}->descriptor === {exact}::__doriaErrorType())"),
+                    &format!("if ({})", php_error_matches(&error, &parameter.ty)),
                 );
                 writeln(output, indent + 1, "{");
                 writeln(output, indent + 2, &format!("(${inspector})({error});"));
@@ -5759,6 +5754,16 @@ fn emit_try_statement(
     }
 }
 
+fn php_error_matches(value: &str, error_type: &ResolvedType) -> String {
+    match error_type {
+        ResolvedType::Error => "true".to_string(),
+        ResolvedType::Class(class) => {
+            format!("{value} instanceof {}", php_symbol_name(&class.name))
+        }
+        _ => unreachable!("semantic checking restricts checked errors to Error values"),
+    }
+}
+
 fn emit_try_statement_inner(
     statement: &TryStmt,
     output: &mut String,
@@ -5788,10 +5793,9 @@ fn emit_try_statement_inner(
                     has_catch_all = true;
                     "true".to_string()
                 }
-                ResolvedType::Class(class) => format!(
-                    "${caught}->descriptor === {}::__doriaErrorType()",
-                    php_symbol_name(&class.name)
-                ),
+                ResolvedType::Class(_) => {
+                    php_error_matches(&format!("${caught}->error()"), error_type)
+                }
                 _ => unreachable!("semantic checking restricts catch types to Error values"),
             };
             writeln(
@@ -5991,6 +5995,11 @@ fn resolved_is_function_type(ty: &ResolvedType) -> bool {
 
 fn resolved_type_needs_php_drop(ty: &ResolvedType, scopes: &PhpNameScopes) -> bool {
     match ty {
+        ResolvedType::Interface(_)
+        | ResolvedType::InterfaceSelf(_)
+        | ResolvedType::TraitSelf(_) => {
+            unreachable!("interface execution must be rejected before PHP emission")
+        }
         ResolvedType::Mixed
         | ResolvedType::Error
         | ResolvedType::Function(_)
@@ -7323,6 +7332,11 @@ fn resolved_type_identity(ty: &ResolvedType) -> String {
         ResolvedType::Mixed => "mixed".to_string(),
         ResolvedType::Error => "Error".to_string(),
         ResolvedType::TypeParameter(name) => format!("type:{}:{name}", name.len()),
+        ResolvedType::Interface(_)
+        | ResolvedType::InterfaceSelf(_)
+        | ResolvedType::TraitSelf(_) => {
+            unreachable!("interface execution must be rejected before PHP emission")
+        }
         ResolvedType::Function(function) => {
             let invocation = match function.invocation_mode {
                 crate::types::FunctionInvocationMode::Readonly => "readonly",
@@ -7636,6 +7650,11 @@ fn php_type(ty: &TypeRef) -> String {
 
 fn php_resolved_type(ty: &ResolvedType) -> String {
     match ty {
+        ResolvedType::Interface(_)
+        | ResolvedType::InterfaceSelf(_)
+        | ResolvedType::TraitSelf(_) => {
+            unreachable!("interface execution must be rejected before PHP emission")
+        }
         ResolvedType::Void => "void".to_string(),
         ResolvedType::Integer(_) => "int".to_string(),
         ResolvedType::Float(_) => "float".to_string(),

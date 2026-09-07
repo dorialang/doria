@@ -1,0 +1,19 @@
+interface Source<T> {
+    function read(): T;
+    writable function replace(take T $value): void;
+}
+internal interface Repository<T> extends Source<T> {
+    function convert<U implements Displayable>(U $value): string;
+}
+trait First<T> {
+    function format(T $value): string;
+}
+trait Second<T> {
+    function format(T $value): string;
+}
+class Report implements Repository<int> {
+    uses First<int>, Second<int> {
+        First<int>::format insteadof Second<int>;
+        Second<int>::format as internal secondary;
+    }
+}

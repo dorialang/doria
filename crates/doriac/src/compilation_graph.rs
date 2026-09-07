@@ -558,7 +558,8 @@ fn stable_source_ids<'a>(
         let mut candidate = u32::from_str_radix(&digest[..8], 16)
             .expect("SHA-256 hexadecimal prefix is a u32")
             & 0x7fff_ffff;
-        while candidate == crate::compiler_known_io::SYNTHETIC_SOURCE_ID.0
+        while candidate == crate::compiler_known_contracts::SOURCE_ID.0
+            || candidate == crate::compiler_known_io::SYNTHETIC_SOURCE_ID.0
             || !allocated.insert(candidate)
         {
             candidate = candidate.wrapping_add(1) & 0x7fff_ffff;
@@ -871,8 +872,20 @@ pub fn analyze_compilation_graph_for_ide(graph: &CompilationGraph) -> GraphSeman
             crate::compiler_known_io::SYNTHETIC_SOURCE_ID,
             "",
         )))
+        .chain(std::iter::once((
+            crate::compiler_known_contracts::SOURCE_ID,
+            crate::compiler_known_contracts::SOURCE_TEXT,
+        )))
         .collect::<HashMap<_, _>>();
     let compiler_known_context = selected_context(graph);
+    contexts.insert(
+        crate::compiler_known_contracts::SOURCE_ID,
+        CompilationContext {
+            edition: compiler_known_context.edition,
+            package: PackageIdentity::CompilerKnown,
+            source: SourceIdentity(crate::compiler_known_contracts::SOURCE_NAME.to_string()),
+        },
+    );
     contexts.insert(
         crate::compiler_known_io::SYNTHETIC_SOURCE_ID,
         CompilationContext {

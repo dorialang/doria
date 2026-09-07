@@ -87,14 +87,14 @@ function check_indexed_foreach_and_scalar_display(string $root): array
         'Stage 34 — Single Class Inheritance — Complete',
         'Indexed Foreach And Scalar Display Corrective Beat — Complete',
         'Explicit Foreach Binding Types Corrective Beat — Complete',
-        'Stage 35 — Interfaces And Traits — Authority Accepted; Slice 1 Next',
+        'Stage 35 — Interfaces And Traits — In Progress; Slice 1 Complete; Slice 2 Next',
         'Stage 36 Property Hooks — Scheduled',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
         'Indexed Foreach And Scalar Display Corrective Beat — Complete.',
         'Explicit Foreach Binding Types Corrective Beat — Complete.',
-        'Stage 35 Interfaces And Traits — Authority Accepted; Slice 1 Next.',
+        'Stage 35 Interfaces And Traits — In Progress; Slice 1 Complete; Slice 2 Next.',
         'Stage 36 Property Hooks — Scheduled.',
     ]);
 

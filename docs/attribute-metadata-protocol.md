@@ -84,6 +84,12 @@ does not expose interface slots, vtables, descriptors, trait layout offsets, or
 adaptation tables, and attributes are not accepted on `uses` or adaptation
 statements in Stage 35.
 
+Slice 1 emits interface requirement, trait method, and parameter applications
+once from their authored targets. Schemas 1, 2, and 3 and processor protocol 1
+are unchanged. Immutable compiler contract facts expose requirement origins,
+conformance status, selected declarations, and pending-slice boundaries for
+tooling; they do not constitute a runtime layout or flattened attribute table.
+
 Schema version 2 contains every schema-version-1 field plus `callables`. Each
 callable records one canonical attribute-target-compatible identity, name, kind,
 package, source, access, generic arity, ordered parameters, return type, required

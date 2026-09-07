@@ -816,7 +816,7 @@ fn self_scope_and_type_forms_resolve_before_mir() {
         })
         .expect("next method");
     assert!(matches!(
-        &next.body.statements[0],
+        &next.body.statements()[0],
         doriac::ast::Stmt::Assignment(doriac::ast::Assignment {
             target: doriac::ast::Expr::StaticMember {
                 qualifier: StaticQualifier::SelfType,
@@ -1107,7 +1107,7 @@ fn reserved_and_two_clock_qualifiers_are_structural_not_parser_errors() {
                 &class.members[0],
                 ClassMember::Method(method)
                     if matches!(
-                        &method.body.statements[0],
+                        &method.body.statements()[0],
                         doriac::ast::Stmt::Expr {
                             expr: doriac::ast::Expr::StaticCall {
                                 qualifier: StaticQualifier::Parent,
@@ -1143,7 +1143,7 @@ trait UsesLimit
                 &trait_decl.members[0],
                 ClassMember::Method(method)
                     if matches!(
-                        &method.body.statements[0],
+                        &method.body.statements()[0],
                         doriac::ast::Stmt::Return {
                             expr: Some(doriac::ast::Expr::StaticMember {
                                 qualifier: StaticQualifier::SelfType,
@@ -1154,7 +1154,11 @@ trait UsesLimit
                     )
             )
     ));
-    let trait_diagnostics = diagnostics(trait_source);
+    doriac::check_source("trait.doria", trait_source)
+        .expect("unused trait declarations are supported by Stage 35 Slice 1");
+    let trait_diagnostics = diagnostics(&format!(
+        "{trait_source} class Limited {{ uses UsesLimit; const int MAX_DEPTH = 3; }}"
+    ));
     assert_eq!(
         trait_diagnostics
             .iter()
@@ -1163,6 +1167,6 @@ trait UsesLimit
         0
     );
     assert!(trait_diagnostics.iter().any(|diagnostic| {
-        diagnostic.code == "E0493" && diagnostic.message.contains("Stage 35")
+        diagnostic.code == "E0493" && diagnostic.message.contains("Stage 35 Slice 4")
     }));
 }
