@@ -211,8 +211,11 @@ fn check_class(
         return;
     };
 
+    let Some(body) = constructor.body.as_block() else {
+        return;
+    };
     let graph = build_function_cfg_with_checked_effects(
-        &constructor.body,
+        body,
         constructor.span,
         given_preludes,
         checked_effect_sites,
@@ -245,7 +248,7 @@ fn check_class(
                 class,
                 &properties,
                 state,
-                constructor.body.span,
+                body.span,
                 "constructor fallthrough",
                 &mut analysis.diagnostics,
             ),

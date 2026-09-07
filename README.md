@@ -146,6 +146,11 @@ runtime access-check cost.
   headerless allocation. Traits use `uses` and flatten at compile time, never as
   runtime mixin objects.
 
+Interface requirements preserve receiver mutability, parameter ownership, and
+checked effects. Conformance is nominal: a class declares its contracts rather
+than acquiring them through matching method names. See the
+[implementation plan](docs/doria-end-to-end-plan.md) for compiler coverage.
+
 ## What people build with it
 
 - **Native services and CLI tools** — single-binary deployment, measured cold startup, predictable memory.

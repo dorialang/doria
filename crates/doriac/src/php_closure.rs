@@ -943,6 +943,8 @@ fn collect_call_targets(program: &hir::Program) -> HashMap<Span, Span> {
                     method_name,
                     ..
                 } => methods.get(&(class_type.name.clone(), method_name.clone())),
+                // Generic specialization remains outside PHP compatibility coverage.
+                crate::semantics::CallableTarget::ConstrainedMethod { .. } => None,
             }?;
             Some((*span, *start))
         })

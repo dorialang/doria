@@ -2,6 +2,8 @@ use crate::lexer::StringQuoteKind;
 use crate::source::{QualifiedNameRef, Span};
 use crate::types::TypeRef;
 
+pub mod visit;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program {
     pub namespace: Option<NamespaceDecl>,
@@ -209,6 +211,8 @@ pub struct TraitDecl {
     pub access_span: Option<Span>,
     pub name: String,
     pub name_span: Span,
+    pub type_params: Vec<TypeParamDecl>,
+    pub syntax: TypeDeclarationSyntax,
     pub members: Vec<ClassMember>,
     pub span: Span,
 }
@@ -219,7 +223,43 @@ pub struct InterfaceDecl {
     pub access_span: Option<Span>,
     pub name: String,
     pub name_span: Span,
+    pub type_params: Vec<TypeParamDecl>,
+    pub parents: Vec<TypeRef>,
+    pub requirements: Vec<FunctionDecl>,
+    pub syntax: TypeDeclarationSyntax,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypeDeclarationSyntax {
+    pub keyword_span: Span,
+    pub type_parameters: Option<DelimitedListSpans>,
+    pub inheritance_keyword_span: Option<Span>,
+    pub inheritance_type_spans: Vec<Span>,
+    pub inheritance_comma_spans: Vec<Span>,
+    pub open_brace_span: Span,
+    pub close_brace_span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DelimitedListSpans {
+    pub open_span: Span,
+    pub comma_spans: Vec<Span>,
+    pub close_span: Span,
+}
+
+impl TypeDeclarationSyntax {
+    pub fn synthetic(span: Span) -> Self {
+        Self {
+            keyword_span: span,
+            type_parameters: None,
+            inheritance_keyword_span: None,
+            inheritance_type_spans: Vec::new(),
+            inheritance_comma_spans: Vec::new(),
+            open_brace_span: span,
+            close_brace_span: span,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -235,7 +275,8 @@ pub struct ClassDecl {
     pub extends_span: Option<Span>,
     pub parent_span: Option<Span>,
     pub modifier_prefix_span: Span,
-    pub implements: Vec<String>,
+    pub implements: Vec<TypeRef>,
+    pub syntax: TypeDeclarationSyntax,
     pub members: Vec<ClassMember>,
     pub span: Span,
 }
@@ -245,6 +286,46 @@ pub enum ClassMember {
     Property(PropertyDecl),
     Method(FunctionDecl),
     Constant(ConstDecl),
+    Uses(TraitUse),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitUse {
+    pub keyword_span: Span,
+    pub traits: Vec<TypeRef>,
+    pub type_spans: Vec<Span>,
+    pub comma_spans: Vec<Span>,
+    pub adaptations: Vec<TraitAdaptation>,
+    pub open_brace_span: Option<Span>,
+    pub close_brace_span: Option<Span>,
+    pub semicolon_span: Option<Span>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraitAdaptation {
+    pub origin: TypeRef,
+    pub origin_span: Span,
+    pub separator_span: Span,
+    pub method: NameRef,
+    pub kind: TraitAdaptationKind,
+    pub semicolon_span: Span,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TraitAdaptationKind {
+    InsteadOf {
+        keyword_span: Span,
+        excluded: Vec<TypeRef>,
+        type_spans: Vec<Span>,
+        comma_spans: Vec<Span>,
+    },
+    Alias {
+        keyword_span: Span,
+        internal_span: Option<Span>,
+        alias: Option<NameRef>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,9 +374,68 @@ pub struct FunctionDecl {
     pub params: Vec<Param>,
     pub return_type: Option<TypeRef>,
     pub throws: Option<ThrowsClause>,
-    pub body: Block,
+    pub body: FunctionBody,
+    pub syntax: Box<FunctionSyntax>,
     pub modifier_prefix_span: Span,
     pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FunctionBody {
+    Block(Block),
+    Requirement { semicolon_span: Span },
+}
+
+impl FunctionBody {
+    pub fn as_block(&self) -> Option<&Block> {
+        match self {
+            Self::Block(block) => Some(block),
+            Self::Requirement { .. } => None,
+        }
+    }
+
+    pub fn as_block_mut(&mut self) -> Option<&mut Block> {
+        match self {
+            Self::Block(block) => Some(block),
+            Self::Requirement { .. } => None,
+        }
+    }
+
+    pub fn span(&self) -> Span {
+        match self {
+            Self::Block(block) => block.span,
+            Self::Requirement { semicolon_span } => *semicolon_span,
+        }
+    }
+
+    pub fn statements(&self) -> &[Stmt] {
+        self.as_block().map_or(&[], |block| &block.statements)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct FunctionSyntax {
+    pub keyword_span: Span,
+    pub type_parameters: Option<DelimitedListSpans>,
+    pub parameters: DelimitedListSpans,
+    pub return_colon_span: Option<Span>,
+    pub return_type_span: Option<Span>,
+}
+
+impl FunctionSyntax {
+    pub fn synthetic(span: Span) -> Self {
+        Self {
+            keyword_span: span,
+            type_parameters: None,
+            parameters: DelimitedListSpans {
+                open_span: span,
+                comma_spans: Vec::new(),
+                close_span: span,
+            },
+            return_colon_span: None,
+            return_type_span: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -311,7 +451,7 @@ pub struct ThrowsEntry {
     pub span: Span,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeParamDecl {
     pub name: String,
     pub constraints: Vec<TypeRef>,

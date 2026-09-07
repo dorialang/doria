@@ -532,7 +532,7 @@ function main(): void
         "open class A { open function f(int $x): int { return $x; } } class B extends A { override function f(int $y): int { return $y; } }",
         "open class A { open function f(): A { return new A(); } } class B extends A { override function f(): mixed { return 1; } }",
         "open class A { open function f(): mixed { return 1; } } class B extends A { override function f(): int { return 1; } }",
-        "open class A { open function f(): ?A { return null; } } class B extends A { override function f(): B { return new B(); } }",
+        "open class A { open function f(): A { return new A(); } } class B extends A { override function f(): ?B { return null; } }",
         "open class A { open function f(): void {} } class B extends A { override writable function f(): void {} }",
     ] {
         assert_diagnostic(source, "E0729");

@@ -168,7 +168,7 @@ impl MemberClassCatalog {
                                 .insert((class.name.clone(), property.name.clone()), result);
                         }
                     }
-                    crate::ast::ClassMember::Constant(_) => {}
+                    crate::ast::ClassMember::Constant(_) | crate::ast::ClassMember::Uses(_) => {}
                 }
             }
         }
@@ -229,7 +229,8 @@ impl NullabilityCatalog {
                                     member_is_non_null(&property.ty, &class.type_params),
                                 );
                             }
-                            crate::ast::ClassMember::Constant(_) => {}
+                            crate::ast::ClassMember::Constant(_)
+                            | crate::ast::ClassMember::Uses(_) => {}
                         }
                     }
                 }
@@ -587,8 +588,11 @@ fn analyze_function(
     facts: &mut FactsByUse,
     catalog: &FlowCatalog,
 ) {
+    let Some(body) = function.body.as_block() else {
+        return;
+    };
     analyze_body(
-        &function.body,
+        body,
         &function.params,
         function.span,
         current_class.map(|class| class.name.as_str()),

@@ -32,7 +32,10 @@ adds backend-neutral in-place collection clearing and registers
 `main_collection_clear.doria`; no Decision 0113 member remains behind E0559.
 
 Decision 0134 accepts Stage 35 interface, trait, core-contract, and public-
-iteration authority without claiming executable coverage. Slices 2 through 5
+iteration authority. Slice 1 adds `main_stage35_concrete_conformance.doria`
+(`report\n`) and `main_stage35_generic_conformance.doria` (`42\n2\n`), exercising
+ordinary concrete methods and semantically selected generic calls without
+interface erasure. Slices 2 through 5
 must add explicit matrix rows for two-word erased carriers, exact dynamic drop,
 nullable/mixed/shared transport, direct versus erased dispatch, Cloneable
 widening, user-defined iteration loans, and deterministic trait flattening as

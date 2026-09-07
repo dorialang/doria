@@ -12,15 +12,19 @@ pub struct ReturnAnalysis {
     pub fallthrough_reachable: bool,
 }
 
-pub fn analyze(function: &FunctionDecl) -> ReturnAnalysis {
-    analyze_block(&function.body, function.span)
+pub fn analyze(function: &FunctionDecl) -> Option<ReturnAnalysis> {
+    Some(analyze_block(function.body.as_block()?, function.span))
 }
 
 pub fn analyze_with_given(
     function: &FunctionDecl,
     given_preludes: &GivenSemanticInfoMap,
-) -> ReturnAnalysis {
-    analyze_block_with_given(&function.body, function.span, given_preludes)
+) -> Option<ReturnAnalysis> {
+    Some(analyze_block_with_given(
+        function.body.as_block()?,
+        function.span,
+        given_preludes,
+    ))
 }
 
 pub fn analyze_block(block: &Block, owner_span: crate::source::Span) -> ReturnAnalysis {

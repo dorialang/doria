@@ -60,6 +60,14 @@ function check_stage34_inheritance(string $root): array
         $files[$key] = $read($path);
     }
 
+    $require('AGENTS.md', $read('AGENTS.md'), [
+        'concrete catches cover the named class and descendants',
+    ]);
+    $require($paths['spec'], $files['spec'], [
+        'Concrete catches cover the named Error class and its',
+        'Source order applies: a parent catch makes a later descendant catch unreachable',
+    ]);
+
     $require($paths['decision'], $files['decision'], [
         '# Decision 0130:',
         '**Status:** Accepted',
@@ -72,6 +80,8 @@ function check_stage34_inheritance(string $root): array
         'Metadata schemas 1, 2, and',
         'processor protocol version 1 remain exact',
         'Stage 35 may',
+        'catch cover descendants',
+        'Typed `toThrow` inspectors',
         'reuse private descriptor infrastructure for interface fat pointers',
     ]);
     foreach (['guide', 'plan', 'pipeline', 'spec'] as $key) {
@@ -85,12 +95,12 @@ function check_stage34_inheritance(string $root): array
     }
     $require($paths['plan'], $files['plan'], [
         'Stage 34 — Single Class Inheritance — Complete',
-        'Stage 35 — Interfaces And Traits — Authority Accepted; Slice 1 Next',
+        'Stage 35 — Interfaces And Traits — In Progress; Slice 1 Complete; Slice 2 Next',
         'Decision 0130',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
-        'Stage 35 Interfaces And Traits — Authority Accepted; Slice 1 Next.',
+        'Stage 35 Interfaces And Traits — In Progress; Slice 1 Complete; Slice 2 Next.',
     ]);
     $forbid($paths['spec'], $files['spec'], [
         'parent lookup and dispatch are Stage 34 semantics and are currently diagnosed as unsupported',
@@ -132,7 +142,8 @@ function check_stage34_inheritance(string $root): array
         'if !parent_info.is_open',
         'if !method.is_override',
         'parent::__construct(...)',
-        'interface conformance tests land in Stage 35',
+        'self.method_contract_failures(method, inherited)',
+        'self.check_nominal_conformances()',
     ]);
     $require($paths['mir'], $files['mir'], [
         'pub is_open: bool',

@@ -139,7 +139,8 @@ fn checked_string_results_have_statement_lifetime_cleanup() {
 
 fn unsupported_after_parsing(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     let ast = doriac::parse_source("test.doria", source).expect("source should parse");
-    let hir = doriac::lowering::lower_program(&ast)
+    // Deliberately bypass semantic checking to exercise MIR's defensive checks.
+    let hir = doriac::lowering::lower_program_with_semantics(&ast, Default::default())
         .expect("AST without interface declarations should lower structurally");
     doriac::mir_lowering::lower_program(&hir)
         .expect_err("HIR should be outside native compilation coverage")

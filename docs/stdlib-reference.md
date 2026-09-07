@@ -75,6 +75,14 @@ contracts, and public iteration), and 0079 (`Displayable`).
   narrow compiler-known exception rather than accepting general interface
   properties.
 
+Stage 35 Slice 1 checks these canonical declarations, inherited requirements,
+and trait-free nominal conformance, including generic concrete specialization.
+It does not activate interface values or erased calls (Slice 2), new value
+operations, Cloneable widening, or public iteration (Slice 3), or trait
+composition (Slice 4). Each pending operation receives its owning slice's
+diagnostic before executable lowering. Existing Error and concrete Displayable
+execution retain their current carriers and behavior.
+
 Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096).
 
 ### Shared ownership

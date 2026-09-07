@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Accepted:** 2026-09-04
-- **Implementation Status:** Stage 35 Authority Accepted; Slice 1 Next
+- **Implementation Status:** Stage 35 Authority Accepted; Slice 1 Complete; Slice 2 Next
 - **Amends:** Decisions 0029, 0030, 0079, 0082, 0087, 0089, 0093, 0096, 0100, 0102, 0105, 0106, 0110, 0113, 0119, 0121, 0125, 0129, 0130, 0131, 0132, and 0133
 
 ## Context
@@ -10,9 +10,11 @@
 Doria already commits to nominal interfaces, multiple interface inheritance,
 compile-time trait composition, headerless class objects, two-word erased
 interface values, monomorphized generic constraints, explicit ownership, and
-checked Errors. The compiler currently implements only the compiler-known
-`Displayable` and `Error` contracts and accepts incomplete interface and trait
-syntax behind Stage 35 diagnostics.
+checked Errors. At authority acceptance, the compiler implemented only the compiler-known
+`Displayable` and `Error` contracts and accepted incomplete interface and trait
+syntax behind Stage 35 diagnostics. Slice 1 now implements grammar, declaration
+graphs, and trait-free conformance; the implementation sequence below records
+the remaining runtime boundaries.
 
 This decision completes the source, ownership, ABI, iteration, and composition
 contract before implementation begins. It does not accept property hooks,
@@ -461,7 +463,7 @@ trait HasSlug
 {
     string $slug = "";
 
-    function slug(): string
+    function formatSlug(): string
     {
         return $this->slug;
     }
@@ -719,11 +721,24 @@ redesign it.
 
 ### Slice 1: Grammar, Graphs, And Conformance
 
-Implement complete lexer/parser/AST/source identity, interface and trait
+**Complete.** Implements complete lexer/parser/AST/source identity, interface and trait
 declaration graphs, interface inheritance, method compatibility, nominal
 conformance, incremental facts, diagnostics, and compiler-fact-based tooling.
 Interface value execution and trait composition remain precise pre-HIR
 unsupported boundaries.
+
+Requirements have a distinct non-executable body form. Generic parent/use
+graphs retain source order, canonical specializations, and declaration origins;
+cycles terminate by declaration identity. Stage-34 callable substitution is
+shared by overrides and conformance. Trait-dependent obligations remain deferred,
+never checked by pretending a flattened member exists. Concrete generic calls
+record their selected implementation in semantic facts before MIR lowering.
+
+The durable concrete and generic-conformance fixtures cover existing native
+method execution; PHP uses that same concrete path. Invalid declarations use
+E0749-E0757, interface erasure E0758, core execution E0759, and primitive
+erasure E0760. Trait composition retains E0493. No interface runtime primitive
+or physical slot layout is delivered in this slice.
 
 ### Slice 2: Interface Runtime And Ownership
 

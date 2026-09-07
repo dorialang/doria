@@ -1767,12 +1767,20 @@ it("catch assertion", function (): void {
         "{:#?}",
         analysis.diagnostics
     );
+    let helper_declaration = analysis.authored_sources[TEST_SOURCE]
+        .items
+        .iter()
+        .find_map(|item| match item {
+            doriac::ast::Item::Function(function) if function.name == "helper" => {
+                Some(function.span)
+            }
+            _ => None,
+        })
+        .expect("authored helper declaration");
     let helper = analysis
         .semantic_info
         .callable_effective_checked_effects
-        .iter()
-        .find(|(span, _)| source[span.start..span.end].starts_with("function helper"))
-        .map(|(_, effects)| effects)
+        .get(&helper_declaration)
         .expect("helper effect profile");
     assert_eq!(helper.len(), 1);
     assert_eq!(

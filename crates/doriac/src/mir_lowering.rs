@@ -648,7 +648,11 @@ fn specialize_callable_instance(
     class_ids: &ClassIds,
     semantic_info: &SemanticInfo,
 ) -> DiagnosticResult<CallableInstance> {
-    let Some(target) = semantic_info.call_targets.get(span) else {
+    let Some(target) = semantic_info
+        .call_targets
+        .get(span)
+        .and_then(|target| target.specialize(|ty| substitute_resolved_type(ty, substitutions)))
+    else {
         return Err(vec![Diagnostic::new(
             "I2401",
             "checked generic call has no callable target",
@@ -656,22 +660,16 @@ fn specialize_callable_instance(
         )]);
     };
     let declaration = match target {
-        CallableTarget::Function { name } => functions.get(name).copied(),
+        CallableTarget::Function { name } => functions.get(&name).copied(),
         CallableTarget::Method {
             class_type,
             method_name,
             ..
-        } => {
-            let specialized =
-                substitute_resolved_type(&ResolvedType::Class(class_type.clone()), substitutions);
-            let ResolvedType::Class(class_type) = specialized else {
-                unreachable!("class target substitution must remain a class");
-            };
-            class_ids
-                .get(&class_type)
-                .and_then(|class| methods.get(&(*class, method_name.clone())))
-                .copied()
-        }
+        } => class_ids
+            .get(&class_type)
+            .and_then(|class| methods.get(&(*class, method_name.clone())))
+            .copied(),
+        CallableTarget::ConstrainedMethod { .. } => unreachable!("specialized target is concrete"),
     }
     .ok_or_else(|| {
         vec![Diagnostic::new(
@@ -2281,6 +2279,9 @@ fn intern_resolved_collection_types(
 ) -> Option<mir::Type> {
     use crate::types::ResolvedType;
     let ty = match ty {
+        ResolvedType::Interface(_)
+        | ResolvedType::InterfaceSelf(_)
+        | ResolvedType::TraitSelf(_) => return None,
         ResolvedType::Integer(ty) => mir::Type::Scalar(mir::ScalarType::Integer(*ty)),
         ResolvedType::Float(ty) => mir::Type::Scalar(mir::ScalarType::Float(*ty)),
         ResolvedType::Bool => mir::Type::Scalar(mir::ScalarType::Bool),
@@ -8783,16 +8784,12 @@ impl<'semantic> LoweringContext<'semantic> {
     }
 
     fn call_target_class_id(&self, span: Span) -> Option<ClassId> {
-        let CallableTarget::Method { class_type, .. } =
-            self.semantic_info.call_targets.get(&span)?
+        let CallableTarget::Method { class_type, .. } = self
+            .semantic_info
+            .call_targets
+            .get(&span)?
+            .specialize(|ty| substitute_resolved_type(ty, &self.type_substitutions))?
         else {
-            return None;
-        };
-        let specialized = substitute_resolved_type(
-            &ResolvedType::Class(class_type.clone()),
-            &self.type_substitutions,
-        );
-        let ResolvedType::Class(class_type) = specialized else {
             return None;
         };
         self.class_id_for_type(&class_type)
@@ -9119,6 +9116,9 @@ impl<'semantic> LoweringContext<'semantic> {
     fn mir_resolved_type(&self, ty: &crate::types::ResolvedType) -> Option<mir::Type> {
         use crate::types::ResolvedType;
         match ty {
+            ResolvedType::Interface(_)
+            | ResolvedType::InterfaceSelf(_)
+            | ResolvedType::TraitSelf(_) => None,
             ResolvedType::Integer(ty) => Some(mir::Type::Scalar(mir::ScalarType::Integer(*ty))),
             ResolvedType::Float(ty) => Some(mir::Type::Scalar(mir::ScalarType::Float(*ty))),
             ResolvedType::Bool => Some(mir::Type::Scalar(mir::ScalarType::Bool)),

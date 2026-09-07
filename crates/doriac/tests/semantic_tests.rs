@@ -2311,28 +2311,31 @@ echo $token;
 }
 
 #[test]
-fn reserves_displayable_and_defers_general_interfaces() {
+fn reserves_displayable_and_checks_general_interfaces() {
     assert_diagnostic_code("class Displayable {}", "E0309");
-    assert_diagnostic_code("class Label implements Other {}", "E0464");
+    assert_diagnostic_code("class Label implements Other {}", "E0750");
+    doriac::check_source(
+        "interface.doria",
+        "interface Other {} class Label implements Other {}",
+    )
+    .expect("nominal conformance is implemented in Stage 35 Slice 1");
 
-    for (source, code) in [
-        ("interface Displayable {}", "E0309"),
-        ("interface Other {}", "E0464"),
-    ] {
-        doriac::parse_source("test.doria", source)
-            .expect("accepted interface declarations should parse");
-        let diagnostics = doriac::check_source("test.doria", source)
-            .expect_err("interface semantics are not implemented yet");
-        assert!(diagnostics.iter().any(|diagnostic| diagnostic.code == code));
-        assert!(diagnostics
-            .iter()
-            .all(|diagnostic| !diagnostic.code.starts_with('P')));
-    }
+    let source = "interface Displayable {}";
+    doriac::parse_source("test.doria", source)
+        .expect("accepted interface declarations should parse");
+    let diagnostics = doriac::check_source("test.doria", source)
+        .expect_err("compiler-known interface name is reserved");
+    assert!(diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0309"));
+    assert!(diagnostics
+        .iter()
+        .all(|diagnostic| !diagnostic.code.starts_with('P')));
 }
 
 #[test]
-fn resolves_same_file_inheritance_while_interfaces_remain_deferred() {
-    let diagnostics = doriac::check_source(
+fn resolves_same_file_inheritance_and_nominal_interfaces() {
+    doriac::check_source(
         "test.doria",
         r#"
 namespace Vendor\App;
@@ -2341,14 +2344,7 @@ interface Printable {}
 class Child extends Base implements Printable {}
 "#,
     )
-    .expect_err("interface conformance is not implemented yet");
-
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == "E0464" && diagnostic.message.contains("interface")));
-    assert!(diagnostics
-        .iter()
-        .all(|diagnostic| !diagnostic.code.starts_with('P')));
+    .expect("trait-free nominal conformance is implemented");
 }
 
 #[test]

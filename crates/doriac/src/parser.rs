@@ -38,6 +38,7 @@ struct FunctionModifiers {
     static_span: Option<Span>,
     start_span: Span,
     is_member: bool,
+    allow_requirement: bool,
 }
 
 impl Parser {
@@ -508,6 +509,7 @@ impl Parser {
                 static_span: None,
                 start_span: self.span(declaration_start, self.previous().span.end),
                 is_member: false,
+                allow_requirement: false,
             })
             .map(Item::Function)
         } else if self.match_kind(&TokenKind::Const) {
@@ -766,6 +768,10 @@ impl Parser {
                 value.span,
                 value.name_span,
             ),
+            ClassMember::Uses(_) => {
+                self.reject_attribute_target(&groups, "trait composition");
+                return;
+            }
         };
         self.attach_attributes(
             groups,
@@ -870,6 +876,7 @@ impl Parser {
                 static_span: None,
                 start_span: internal_span.merge(self.previous().span),
                 is_member: false,
+                allow_requirement: false,
             })
             .map(Item::Function)
         } else if self.match_kind(&TokenKind::Const) {
@@ -892,7 +899,7 @@ impl Parser {
     fn parse_enum(&mut self, access: MemberAccess, start: usize) -> Option<EnumDecl> {
         let name = self.expect_type_declaration_name("expected enum name")?;
         let name_span = self.previous().span;
-        let type_params = self.parse_type_params()?;
+        let (type_params, _) = self.parse_type_params()?;
         let backing_type = if self.match_kind(&TokenKind::Colon) {
             Some(self.parse_type_ref()?)
         } else {
@@ -991,9 +998,10 @@ impl Parser {
         open_span: Option<Span>,
         start: usize,
     ) -> Option<ClassDecl> {
+        let keyword_span = self.previous().span;
         let name = self.expect_type_declaration_name("expected class name")?;
         let name_span = self.previous().span;
-        let type_params = self.parse_type_params()?;
+        let (type_params, type_parameters) = self.parse_type_params()?;
         let (parent, extends_span, parent_span) = if self.match_kind(&TokenKind::Extends) {
             let extends_span = self.previous().span;
             let parent = self.parse_type_ref()?;
@@ -1005,32 +1013,21 @@ impl Parser {
         } else {
             (None, None, None)
         };
-        let mut implements = Vec::new();
-        if self.match_kind(&TokenKind::Implements) {
-            loop {
-                implements.push(
-                    self.expect_qualified_name("expected interface name after `implements`")?,
-                );
-                if !self.match_kind(&TokenKind::Comma) {
-                    break;
-                }
-            }
-        }
-        self.expect(TokenKind::LeftBrace, "expected `{` after class name")?;
-
-        let mut members = Vec::new();
-        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
-            if let Some(member) = self.parse_class_member() {
-                members.push(member);
+        let inheritance_keyword_span = self
+            .match_kind(&TokenKind::Implements)
+            .then(|| self.previous().span);
+        let (implements, inheritance_type_spans, inheritance_comma_spans) =
+            if inheritance_keyword_span.is_some() {
+                self.parse_type_list()?
             } else {
-                self.synchronize();
-            }
-        }
-
-        let end = self
-            .expect(TokenKind::RightBrace, "expected `}` after class body")?
-            .span
-            .end;
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+        let open_brace_span = self
+            .expect(TokenKind::LeftBrace, "expected `{` after class name")?
+            .span;
+        let members = self.parse_declaration_members(false);
+        let close_brace_span = self.close_declaration_body();
+        let end = close_brace_span.end;
 
         Some(ClassDecl {
             access,
@@ -1045,42 +1042,75 @@ impl Parser {
             parent_span,
             modifier_prefix_span: self.span(start, name_span.start),
             implements,
+            syntax: TypeDeclarationSyntax {
+                keyword_span,
+                type_parameters,
+                inheritance_keyword_span,
+                inheritance_type_spans,
+                inheritance_comma_spans,
+                open_brace_span,
+                close_brace_span,
+            },
             members,
             span: self.span(start, end),
         })
     }
 
     fn parse_trait(&mut self, access: MemberAccess, start: usize) -> Option<TraitDecl> {
+        let keyword_span = self.previous().span;
         let name = self.expect_type_declaration_name("expected trait name")?;
         let name_span = self.previous().span;
-        self.expect(TokenKind::LeftBrace, "expected `{` after trait name")?;
-
-        let mut members = Vec::new();
-        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
-            if let Some(member) = self.parse_class_member() {
-                members.push(member);
-            } else {
-                self.synchronize();
-            }
-        }
-
-        let end = self
-            .expect(TokenKind::RightBrace, "expected `}` after trait body")?
-            .span
-            .end;
+        let (type_params, type_parameters) = self.parse_type_params()?;
+        let open_brace_span = self
+            .expect(TokenKind::LeftBrace, "expected `{` after trait name")?
+            .span;
+        let members = self.parse_declaration_members(true);
+        let close_brace_span = self.close_declaration_body();
+        let end = close_brace_span.end;
         Some(TraitDecl {
             access,
             access_span: self.access_span(&access, start),
             name,
             name_span,
+            type_params,
+            syntax: TypeDeclarationSyntax {
+                keyword_span,
+                type_parameters,
+                inheritance_keyword_span: None,
+                inheritance_type_spans: Vec::new(),
+                inheritance_comma_spans: Vec::new(),
+                open_brace_span,
+                close_brace_span,
+            },
             members,
             span: self.span(start, end),
         })
     }
 
-    fn parse_class_member(&mut self) -> Option<ClassMember> {
+    fn parse_class_member(&mut self, allow_requirement: bool) -> Option<ClassMember> {
         let attributes = self.parse_attribute_groups()?;
-        if self.check(&TokenKind::Use) || self.check(&TokenKind::Include) {
+        if self.match_kind(&TokenKind::Uses) {
+            self.reject_attribute_target(&attributes, "trait composition");
+            return self.parse_trait_use().map(ClassMember::Uses);
+        }
+        if self.match_kind(&TokenKind::Use) {
+            let keyword = self.previous().span;
+            let composition = self.parse_trait_use();
+            let mut diagnostic = Diagnostic::new(
+                "P0001",
+                "class and trait composition uses `uses`, not the file-scope import keyword `use`",
+                keyword,
+            )
+            .with_title("Trait Composition Requires Uses");
+            if composition.is_some() {
+                diagnostic = diagnostic.with_fix(keyword, "uses");
+            }
+            self.diagnostics.push(diagnostic);
+            self.reject_attribute_target(&attributes, "trait composition");
+            return composition.map(ClassMember::Uses);
+        }
+        let member_start = self.peek().span.start;
+        if self.check(&TokenKind::Include) {
             let token = self.advance().clone();
             let (title, message) = if matches!(token.kind, TokenKind::Use) {
                 (
@@ -1158,15 +1188,9 @@ impl Parser {
                     override_span,
                     writable_span,
                     static_span,
-                    start_span: self.span(
-                        open_span
-                            .or(override_span)
-                            .or(static_span)
-                            .or(writable_span)
-                            .map_or(start, |span| span.start),
-                        start,
-                    ),
+                    start_span: self.span(member_start, start),
                     is_member: true,
+                    allow_requirement,
                 })
                 .map(ClassMember::Method);
             if let Some(member) = &member {
@@ -1175,6 +1199,16 @@ impl Parser {
             return member;
         }
 
+        if let Some(modifier) = open_span.or(override_span) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "P0001",
+                    "`open` and `override` apply only to methods",
+                    modifier,
+                )
+                .with_title("Property Cannot Have A Method Modifier"),
+            );
+        }
         let start = self.peek().span.start;
         let ty = self.parse_type_ref()?;
         let (name, name_span) = self.expect_variable("expected property variable name")?;
@@ -1258,12 +1292,17 @@ impl Parser {
             static_span,
             start_span,
             is_member,
+            allow_requirement,
         } = modifiers;
+        let keyword_span = self.previous().span;
         let start = start_span.start;
         let name = self.expect_callable_name("expected function name")?;
         let name_span = self.previous().span;
-        let type_params = self.parse_type_params()?;
-        self.expect(TokenKind::LeftParen, "expected `(` after function name")?;
+        let (type_params, type_parameters) = self.parse_type_params()?;
+        let parameters_open_span = self
+            .expect(TokenKind::LeftParen, "expected `(` after function name")?
+            .span;
+        let mut comma_spans = Vec::new();
 
         let mut params = Vec::new();
         if !self.check(&TokenKind::RightParen) {
@@ -1272,16 +1311,26 @@ impl Parser {
                 if !self.match_kind(&TokenKind::Comma) {
                     break;
                 }
+                comma_spans.push(self.previous().span);
                 if self.check(&TokenKind::RightParen) {
                     break;
                 }
             }
         }
 
-        self.expect(TokenKind::RightParen, "expected `)` after parameters")?;
+        let close_span = self
+            .expect(TokenKind::RightParen, "expected `)` after parameters")?
+            .span;
 
-        let return_type = if self.match_kind(&TokenKind::Colon) {
-            Some(self.parse_type_ref()?)
+        let return_colon_span = self
+            .match_kind(&TokenKind::Colon)
+            .then(|| self.previous().span);
+        let mut return_type_span = None;
+        let return_type = if return_colon_span.is_some() {
+            let start = self.peek().span.start;
+            let ty = self.parse_type_ref()?;
+            return_type_span = Some(self.span(start, self.previous().span.end));
+            Some(ty)
         } else {
             None
         };
@@ -1292,8 +1341,14 @@ impl Parser {
             None
         };
 
-        let body = self.parse_block()?;
-        let span = self.span(start, body.span.end);
+        let body = if allow_requirement && self.match_kind(&TokenKind::Semicolon) {
+            FunctionBody::Requirement {
+                semicolon_span: self.previous().span,
+            }
+        } else {
+            FunctionBody::Block(self.parse_block()?)
+        };
+        let span = self.span(start, body.span().end);
         Some(FunctionDecl {
             access,
             access_span: self.access_span(&access, start_span.start),
@@ -1312,6 +1367,17 @@ impl Parser {
             return_type,
             throws,
             body,
+            syntax: Box::new(FunctionSyntax {
+                keyword_span,
+                type_parameters,
+                parameters: DelimitedListSpans {
+                    open_span: parameters_open_span,
+                    comma_spans,
+                    close_span,
+                },
+                return_colon_span,
+                return_type_span,
+            }),
             modifier_prefix_span: self.span(start, name_span.start),
             span,
         })
@@ -1337,13 +1403,17 @@ impl Parser {
         })
     }
 
-    fn parse_type_params(&mut self) -> Option<Vec<TypeParamDecl>> {
+    fn parse_type_params(&mut self) -> Option<(Vec<TypeParamDecl>, Option<DelimitedListSpans>)> {
         if !self.match_kind(&TokenKind::Less) {
-            return Some(Vec::new());
+            return Some((Vec::new(), None));
         }
-
+        let open_span = self.previous().span;
+        let mut comma_spans = Vec::new();
+        let close_span;
         let mut params = Vec::new();
         loop {
+            let attributes = self.parse_attribute_groups()?;
+            self.reject_attribute_target(&attributes, "type parameters");
             let start = self.peek().span.start;
             let name = self.expect_identifier("expected type-parameter name")?;
             let mut constraints = Vec::new();
@@ -1382,61 +1452,304 @@ impl Parser {
                 span: self.span(start, end),
             });
 
-            if self.pending_type_argument_close.take().is_some() {
+            if let Some(span) = self.pending_type_argument_close.take() {
+                close_span = span;
                 break;
             }
             if self.check(&TokenKind::Greater) {
                 self.advance();
+                close_span = self.previous().span;
                 break;
             }
-            self.expect(TokenKind::Comma, "expected `,` or `>` after type parameter")?;
+            comma_spans.push(
+                self.expect(TokenKind::Comma, "expected `,` or `>` after type parameter")?
+                    .span,
+            );
         }
 
-        Some(params)
+        Some((
+            params,
+            Some(DelimitedListSpans {
+                open_span,
+                comma_spans,
+                close_span,
+            }),
+        ))
     }
 
     fn parse_interface(&mut self, access: MemberAccess, start: usize) -> Option<InterfaceDecl> {
-        let name = self.expect_identifier("expected interface name")?;
+        let keyword_span = self.previous().span;
+        let name = self.expect_type_declaration_name("expected interface name")?;
         let name_span = self.previous().span;
-        self.expect(TokenKind::LeftBrace, "expected `{` after interface name")?;
-
-        let mut depth = 1_usize;
-        let mut end = self.previous().span.end;
-        while depth > 0 {
-            if self.is_at_end() {
-                self.error("expected `}` after interface body", self.peek().span);
-                return None;
-            }
-            let token = self.advance().clone();
-            end = token.span.end;
-            if matches!(token.kind, TokenKind::Use | TokenKind::Include) {
-                let (title, message) = if matches!(token.kind, TokenKind::Use) {
-                    (
-                        "Import Is Not At File Scope",
-                        "`use` imports are valid only at file scope",
-                    )
-                } else {
-                    (
-                        "Include Is Not At File Scope",
-                        "`include` is valid only at file scope",
-                    )
-                };
-                self.diagnostics
-                    .push(Diagnostic::new("P0001", message, token.span).with_title(title));
-            }
-            match token.kind {
-                TokenKind::LeftBrace => depth += 1,
-                TokenKind::RightBrace => depth -= 1,
-                _ => {}
+        let (type_params, type_parameters) = self.parse_type_params()?;
+        let inheritance_keyword_span = self
+            .match_kind(&TokenKind::Extends)
+            .then(|| self.previous().span);
+        let (parents, inheritance_type_spans, inheritance_comma_spans) =
+            if inheritance_keyword_span.is_some() {
+                self.parse_type_list()?
+            } else {
+                (Vec::new(), Vec::new(), Vec::new())
+            };
+        let open_brace_span = self
+            .expect(TokenKind::LeftBrace, "expected `{` after interface name")?
+            .span;
+        let mut requirements = Vec::new();
+        for member in self.parse_declaration_members(true) {
+            match member {
+                ClassMember::Method(requirement) => requirements.push(requirement),
+                ClassMember::Property(property) => self.invalid_interface_member(property.span),
+                ClassMember::Constant(constant) => self.invalid_interface_member(constant.span),
+                ClassMember::Uses(composition) => self.invalid_interface_member(composition.span),
             }
         }
-
+        let close_brace_span = self.close_declaration_body();
         Some(InterfaceDecl {
             access,
             access_span: self.access_span(&access, start),
             name,
             name_span,
-            span: self.span(start, end),
+            type_params,
+            parents,
+            requirements,
+            syntax: TypeDeclarationSyntax {
+                keyword_span,
+                type_parameters,
+                inheritance_keyword_span,
+                inheritance_type_spans,
+                inheritance_comma_spans,
+                open_brace_span,
+                close_brace_span,
+            },
+            span: self.span(start, close_brace_span.end),
+        })
+    }
+
+    fn invalid_interface_member(&mut self, span: Span) {
+        self.diagnostics.push(Diagnostic::new(
+            "E0749",
+            "interfaces contain only instance method requirements",
+            span,
+        ));
+    }
+
+    fn parse_type_list(&mut self) -> Option<(Vec<TypeRef>, Vec<Span>, Vec<Span>)> {
+        let mut types = Vec::new();
+        let mut spans = Vec::new();
+        let mut commas = Vec::new();
+        loop {
+            let start = self.peek().span.start;
+            types.push(self.parse_type_ref()?);
+            spans.push(self.span(start, self.previous().span.end));
+            if !self.match_kind(&TokenKind::Comma) {
+                break;
+            }
+            commas.push(self.previous().span);
+        }
+        Some((types, spans, commas))
+    }
+
+    fn parse_declaration_members(&mut self, allow_requirement: bool) -> Vec<ClassMember> {
+        let mut members = Vec::new();
+        while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+            if matches!(
+                self.peek().kind,
+                TokenKind::Class
+                    | TokenKind::Interface
+                    | TokenKind::Trait
+                    | TokenKind::Enum
+                    | TokenKind::Namespace
+            ) {
+                break;
+            }
+            let before = self.current;
+            if let Some(member) = self.parse_class_member(allow_requirement) {
+                members.push(member);
+            } else {
+                if self.current == before {
+                    self.advance();
+                }
+                self.synchronize_member();
+            }
+        }
+        members
+    }
+
+    fn close_declaration_body(&mut self) -> Span {
+        if self.match_kind(&TokenKind::RightBrace) {
+            self.previous().span
+        } else {
+            let at = self.peek().span;
+            self.error("expected `}` after declaration body", at);
+            self.span(at.start, at.start)
+        }
+    }
+
+    fn synchronize_member(&mut self) {
+        self.pending_type_argument_close = None;
+        while !self.is_at_end() {
+            match self.peek().kind {
+                TokenKind::RightBrace
+                | TokenKind::Function
+                | TokenKind::Internal
+                | TokenKind::Writable
+                | TokenKind::Static
+                | TokenKind::Open
+                | TokenKind::Override
+                | TokenKind::Uses
+                | TokenKind::Const
+                | TokenKind::Class
+                | TokenKind::Interface
+                | TokenKind::Trait
+                | TokenKind::Enum
+                | TokenKind::Namespace
+                | TokenKind::AttributeOpen => return,
+                TokenKind::Semicolon => {
+                    self.advance();
+                    return;
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+    }
+
+    fn parse_trait_use(&mut self) -> Option<TraitUse> {
+        let keyword_span = self.previous().span;
+        let (traits, type_spans, comma_spans) = self.parse_type_list()?;
+        let mut adaptations = Vec::new();
+        let (open_brace_span, close_brace_span, semicolon_span, end) =
+            if self.match_kind(&TokenKind::LeftBrace) {
+                let open = self.previous().span;
+                while !self.check(&TokenKind::RightBrace) && !self.is_at_end() {
+                    if matches!(
+                        self.peek().kind,
+                        TokenKind::Function
+                            | TokenKind::Uses
+                            | TokenKind::Class
+                            | TokenKind::Interface
+                            | TokenKind::Trait
+                    ) {
+                        break;
+                    }
+                    let before = self.current;
+                    if let Some(adaptation) = self.parse_trait_adaptation() {
+                        adaptations.push(adaptation);
+                    } else {
+                        if self.current == before {
+                            self.advance();
+                        }
+                        while !self.is_at_end()
+                            && !matches!(
+                                self.peek().kind,
+                                TokenKind::Semicolon
+                                    | TokenKind::RightBrace
+                                    | TokenKind::Function
+                                    | TokenKind::Uses
+                            )
+                        {
+                            self.advance();
+                        }
+                        self.match_kind(&TokenKind::Semicolon);
+                    }
+                }
+                let close = self.close_declaration_body();
+                (Some(open), Some(close), None, close.end)
+            } else {
+                let semicolon = self
+                    .expect(
+                        TokenKind::Semicolon,
+                        "expected `;` or adaptations after trait uses",
+                    )?
+                    .span;
+                (None, None, Some(semicolon), semicolon.end)
+            };
+        Some(TraitUse {
+            keyword_span,
+            traits,
+            type_spans,
+            comma_spans,
+            adaptations,
+            open_brace_span,
+            close_brace_span,
+            semicolon_span,
+            span: self.span(keyword_span.start, end),
+        })
+    }
+
+    fn parse_trait_adaptation(&mut self) -> Option<TraitAdaptation> {
+        let attributes = self.parse_attribute_groups()?;
+        self.reject_attribute_target(&attributes, "trait adaptations");
+        let start = self.peek().span.start;
+        let origin = self.parse_type_ref()?;
+        let origin_span = self.span(start, self.previous().span.end);
+        let separator_span = self
+            .expect(TokenKind::DoubleColon, "expected `::` after adapted trait")?
+            .span;
+        let text = self.expect_callable_name("expected trait method name")?;
+        let method = NameRef {
+            text,
+            span: self.previous().span,
+        };
+        let kind = if self.match_kind(&TokenKind::Insteadof) {
+            let keyword_span = self.previous().span;
+            let (excluded, type_spans, comma_spans) = self.parse_type_list()?;
+            TraitAdaptationKind::InsteadOf {
+                keyword_span,
+                excluded,
+                type_spans,
+                comma_spans,
+            }
+        } else {
+            let keyword_span = self
+                .expect(
+                    TokenKind::As,
+                    "expected `as` or `insteadof` in trait adaptation",
+                )?
+                .span;
+            let internal_span = self
+                .match_kind(&TokenKind::Internal)
+                .then(|| self.previous().span);
+            if matches!(&self.peek().kind, TokenKind::Identifier(name) if matches!(name.as_str(), "public" | "private" | "protected"))
+            {
+                let modifier = self.advance().span;
+                self.diagnostics.push(
+                    Diagnostic::new(
+                        "E0757",
+                        "trait adaptations do not accept PHP visibility modifiers",
+                        modifier,
+                    )
+                    .with_title("Unsupported Trait Adaptation Modifier"),
+                );
+                return None;
+            }
+            let alias = if internal_span.is_some() && self.check(&TokenKind::Semicolon) {
+                None
+            } else {
+                let text = self.expect_identifier("expected an alias or `internal` after `as`")?;
+                Some(NameRef {
+                    text,
+                    span: self.previous().span,
+                })
+            };
+            TraitAdaptationKind::Alias {
+                keyword_span,
+                internal_span,
+                alias,
+            }
+        };
+        let semicolon_span = self
+            .expect(TokenKind::Semicolon, "expected `;` after trait adaptation")?
+            .span;
+        Some(TraitAdaptation {
+            origin,
+            origin_span,
+            separator_span,
+            method,
+            kind,
+            semicolon_span,
+            span: self.span(start, semicolon_span.end),
         })
     }
 
@@ -4787,13 +5100,6 @@ impl Parser {
         self.finish_qualified_name_ref(first, first_span)
     }
 
-    fn expect_qualified_name(&mut self, message: &str) -> Option<String> {
-        let name = self.parse_qualified_name_ref(message)?;
-        let canonical = name.canonical();
-        self.qualified_names.push(name);
-        Some(canonical)
-    }
-
     fn finish_qualified_name(&mut self, first: String, message: &str) -> Option<String> {
         let first_span = self.previous().span;
         let name = self.finish_qualified_name_ref(first, first_span)?;
@@ -5053,6 +5359,8 @@ fn token_name(kind: &TokenKind) -> &'static str {
         TokenKind::Case => "case",
         TokenKind::Interface => "interface",
         TokenKind::Trait => "trait",
+        TokenKind::Uses => "uses",
+        TokenKind::Insteadof => "insteadof",
         TokenKind::Implements => "implements",
         TokenKind::Namespace => "namespace",
         TokenKind::Use => "use",

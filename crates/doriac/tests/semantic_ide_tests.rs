@@ -37,7 +37,7 @@ fn method_call_span(program: &doriac::ast::Program, method_name: &str) -> doriac
                 let ClassMember::Method(method) = member else {
                     return None;
                 };
-                method.body.statements.iter().find_map(|statement| {
+                method.body.statements().iter().find_map(|statement| {
                     let Stmt::Expr { expr, .. } = statement else {
                         return None;
                     };

@@ -195,9 +195,9 @@ dependencies = [
 
 [[package]]
 name = "cranelift-object"
-version = "0.134.3"
+version = "0.134.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "de62346d98fa0345ed187e0daf565a1c8b3117d027e76653a1100b0a1e3ba0bf"
+checksum = "bfa81fb9bd399209e79235d490b0edf6d2d4a6408268f1e491487338cb2b6749"
 dependencies = [
  "anyhow",
  "cranelift-codegen",

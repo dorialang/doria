@@ -1,0 +1,18 @@
+interface Renderable
+{
+    function render(): string;
+}
+
+class Report implements Renderable
+{
+    function render(): string
+    {
+        return "report";
+    }
+}
+
+function main(): void
+{
+    let $report = new Report();
+    echo $report->render() . "\n";
+}

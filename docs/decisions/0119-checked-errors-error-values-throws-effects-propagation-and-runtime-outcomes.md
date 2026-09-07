@@ -173,9 +173,11 @@ unavailable in sibling catches and finally. Finally sees the enclosing lexical
 scope. Existing shadowing rules apply.
 
 One centralized `covers(catch_type, thrown_type)` operation defines matching.
-In Stage 29 a concrete catch matches exact concrete identity and `catch (Error)`
-matches every checked error. Stage 34 may add superclass coverage and Stage 35
-may add general interface coverage by extending that operation. Duplicate exact
+Originally, a concrete catch matches exact concrete identity. Decision 0130
+supersedes that Stage 29 restriction: a parent Error catch covers descendants,
+as do parent `throws` contracts and typed `toThrow` inspectors. `catch (Error)`
+matches every checked error. Stage 35 may add general interface coverage by
+extending that operation. A parent catch makes later descendant catches unreachable. Duplicate exact
 catches, every catch after `Error`, and catches proven unable to match any
 protected effect are unreachable. An open `Error` effect keeps concrete catches
 potentially reachable.
@@ -369,7 +371,7 @@ including ambient I/O, through the same propagation and cleanup model. Stages
 30 through 32 and the Decision 0123 corrective beat are complete. All three
 Stage 33 slices and Phase F are complete under Decisions 0126 through 0128;
 Native Testing Foundation Slices 1 through 3 are complete, the Native Testing
-Foundation is complete, and Stage 34 is complete and Stage 35 authority is accepted and Slice 1 is next.
+Foundation is complete, and Stage 34 is complete and Stage 35 Slice 1 is complete and Slice 2 is next.
 
 ## Explicit Exclusions
 

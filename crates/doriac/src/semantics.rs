@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+pub mod contracts;
+
 use crate::ast::*;
 use crate::attributes::{
     AttributeApplication, AttributeAuthoredArgument, AttributeBoundArgument,
@@ -31,8 +33,8 @@ use crate::symbols::{
 use crate::types::{
     resolved_type_complexity, ClassType, FunctionBorrowSource, FunctionInvocationMode,
     FunctionReturnBorrow, FunctionTypeParameterMode, FunctionTypeRef, ResolvedType,
-    SemanticFunctionParameter, SemanticFunctionType, SharedHandleKind, TypeArgumentRef, TypeId,
-    TypeKind, TypeRef, TypeRegistry,
+    SemanticFunctionParameter, SemanticFunctionType, SharedHandleKind, TypeId, TypeKind, TypeRef,
+    TypeRegistry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +64,7 @@ pub enum ForeachIterableFamily {
     DictionaryValuesProjection,
     PriorityQueue,
     Bytes,
+    PublicIterable,
     Other,
 }
 
@@ -80,6 +83,7 @@ impl ForeachIterableFamily {
             Self::DictionaryValuesProjection => "Dictionary values projection",
             Self::PriorityQueue => "PriorityQueue",
             Self::Bytes => "Bytes",
+            Self::PublicIterable => "public Iterable",
             Self::Other => "this value",
         }
     }
@@ -174,6 +178,7 @@ pub struct SemanticInfo {
         HashMap<crate::source::SourceId, crate::testing::SourceSemanticContext>,
     /// Canonical global declaration/reference facts produced before checking.
     pub global_symbols: crate::names::GlobalSymbolFacts,
+    pub contracts: contracts::ContractFacts,
     /// Compiler-owned suites and unified test declarations. Runtime backends
     /// consume only the generated ordinary functions, never this metadata.
     pub test_semantics: crate::testing::TestSemanticFacts,
@@ -481,6 +486,59 @@ pub enum CallableTarget {
         method_name: String,
         direct_parent: bool,
     },
+    ConstrainedMethod {
+        receiver: ResolvedType,
+        method_name: String,
+        requirement: Span,
+        implementations: Vec<ConstrainedMethodImplementation>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConstrainedMethodImplementation {
+    pub receiver: ResolvedType,
+    pub declaring_class: ClassType<ResolvedType>,
+    pub declaration: Span,
+}
+
+impl CallableTarget {
+    pub fn specialize(&self, substitute: impl Fn(&ResolvedType) -> ResolvedType) -> Option<Self> {
+        match self {
+            Self::Function { .. } => Some(self.clone()),
+            Self::Method {
+                class_type,
+                method_name,
+                direct_parent,
+            } => {
+                let ResolvedType::Class(class_type) =
+                    substitute(&ResolvedType::Class(class_type.clone()))
+                else {
+                    return None;
+                };
+                Some(Self::Method {
+                    class_type,
+                    method_name: method_name.clone(),
+                    direct_parent: *direct_parent,
+                })
+            }
+            Self::ConstrainedMethod {
+                receiver,
+                method_name,
+                implementations,
+                ..
+            } => {
+                let receiver = substitute(receiver);
+                implementations
+                    .iter()
+                    .find(|implementation| implementation.receiver == receiver)
+                    .map(|implementation| Self::Method {
+                        class_type: implementation.declaring_class.clone(),
+                        method_name: method_name.clone(),
+                        direct_parent: false,
+                    })
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -980,6 +1038,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
     let class_hierarchy = collect_class_hierarchy_semantics(&checker);
     let method_hierarchy = collect_method_hierarchy_semantics(&checker);
     let classes = collect_ordered_class_semantics(program, &mut checker);
+    checker.specialize_conformance_facts(&classes);
     let enums = collect_ordered_enum_semantics(&checker);
     let property_families = collect_property_family_semantics(&checker);
     let callable_signatures = checker
@@ -1012,6 +1071,7 @@ pub fn analyze_program_for_ide_with_graph_and_test_context<'source>(
             compilation_contexts: checker.compilation_contexts,
             source_semantic_contexts: checker.source_semantic_contexts,
             global_symbols: checker.global_symbols,
+            contracts: checker.contracts,
             test_semantics: checker.test_semantics,
             assertions: checker.assertions,
             assertion_completions: checker.assertion_completions,
@@ -1074,7 +1134,13 @@ fn ambient_effect_maps_equal(
 }
 
 fn collect_ordered_enum_semantics(checker: &Checker<'_>) -> Vec<EnumSemanticInfo> {
-    let mut enums = checker.enums.values().cloned().collect::<Vec<_>>();
+    // Signature-only contract vocabulary is not an executable enum declaration.
+    let mut enums = checker
+        .enums
+        .values()
+        .filter(|definition| definition.span.source != crate::compiler_known_contracts::SOURCE_ID)
+        .cloned()
+        .collect::<Vec<_>>();
     enums.sort_by_key(|definition| definition.id);
     enums
         .into_iter()
@@ -1267,6 +1333,18 @@ fn collect_ordered_class_semantics(
                 .collect::<Vec<_>>(),
         )
     });
+    if !checker.pending_core_operations.is_empty() {
+        for instance in &instances {
+            if let Some(declaration) = checker
+                .classes
+                .get(&instance.name)
+                .map(|class| class.declaration)
+            {
+                let substitutions = checker.class_type_substitutions(instance);
+                checker.check_specialized_core_operations(declaration, &substitutions);
+            }
+        }
+    }
     let concrete_instances = instances.into_iter().collect::<HashSet<_>>();
 
     let declarations = program.items.iter().filter_map(|item| match item {
@@ -1332,7 +1410,8 @@ fn collect_ordered_class_semantics(
                             )),
                             ClassMember::Property(_)
                             | ClassMember::Method(_)
-                            | ClassMember::Constant(_) => None,
+                            | ClassMember::Constant(_)
+                            | ClassMember::Uses(_) => None,
                         });
                 let promoted =
                     hierarchy_declaration
@@ -1557,7 +1636,13 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
         .map(|(span, pending)| (*span, pending.clone()))
         .collect::<Vec<_>>();
     calls.sort_by_key(|(span, _)| *span);
-    for (_, pending) in &calls {
+    for (span, pending) in &calls {
+        if matches!(
+            checker.call_targets.get(span),
+            Some(CallableTarget::ConstrainedMethod { .. })
+        ) {
+            continue;
+        }
         if pending
             .bindings
             .values()
@@ -1583,6 +1668,21 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
             continue;
         };
         let substitutions = instance.substitutions();
+        checker.check_specialized_core_operations(function.span, &substitutions);
+        let constrained_calls = checker
+            .call_targets
+            .iter()
+            .filter_map(|(span, target)| {
+                (span.source == function.span.source
+                    && span.start >= function.span.start
+                    && span.end <= function.span.end
+                    && matches!(target, CallableTarget::ConstrainedMethod { .. }))
+                .then_some(*span)
+            })
+            .collect::<Vec<_>>();
+        for span in constrained_calls {
+            checker.specialize_constrained_method(span, &substitutions);
+        }
 
         if let Some(templates) = checker
             .callable_class_instantiation_templates
@@ -1614,7 +1714,7 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
             {
                 continue;
             }
-            let bindings = pending
+            let mut bindings = pending
                 .bindings
                 .iter()
                 .map(|(name, ty)| {
@@ -1630,7 +1730,35 @@ fn collect_callable_class_instantiations(program: &Program, checker: &mut Checke
             {
                 continue;
             }
-            let target = SemanticCallableInstance::new(pending.declaration, bindings);
+            let declaration = if matches!(
+                checker.call_targets.get(span),
+                Some(CallableTarget::ConstrainedMethod { .. })
+            ) {
+                let Some(method) = checker.specialize_constrained_method(*span, &substitutions)
+                else {
+                    continue;
+                };
+                let arguments = pending
+                    .type_params
+                    .iter()
+                    .map(|parameter| bindings.get(&parameter.name).copied())
+                    .collect::<Option<Vec<_>>>();
+                let Some(arguments) = arguments else {
+                    continue;
+                };
+                bindings = method.enclosing_type_bindings.clone();
+                bindings.extend(
+                    method
+                        .type_params
+                        .iter()
+                        .zip(arguments)
+                        .map(|(parameter, argument)| (parameter.name.clone(), argument)),
+                );
+                method.declaration
+            } else {
+                pending.declaration
+            };
+            let target = SemanticCallableInstance::new(declaration, bindings);
             if ids.contains_key(&target) {
                 continue;
             }
@@ -1851,38 +1979,6 @@ pub fn check_program(program: &Program) -> DiagnosticResult<()> {
     analyze_program(program).map(|_| ())
 }
 
-pub(crate) fn interface_declaration_diagnostic(interface_decl: &InterfaceDecl) -> Diagnostic {
-    let (code, message) = if matches!(interface_decl.name.as_str(), "Displayable" | "Error") {
-        (
-            "E0309",
-            format!(
-                "`{}` is a compiler-known interface and cannot be redeclared",
-                interface_decl.name
-            ),
-        )
-    } else {
-        (
-            "E0464",
-            format!(
-                "interface declaration `{}` is accepted syntax but is not available in this compiler version",
-                interface_decl.name
-            ),
-        )
-    };
-    Diagnostic::new(code, message, interface_decl.span)
-}
-
-pub(crate) fn trait_declaration_diagnostic(trait_decl: &TraitDecl) -> Diagnostic {
-    Diagnostic::unsupported_stage(
-        "E0493",
-        format!(
-            "trait declaration `{}` is accepted syntax; trait composition semantics land in Stage 35",
-            trait_decl.name
-        ),
-        trait_decl.span,
-    )
-}
-
 struct ThrowAssertionCheck<'expression> {
     subject: &'expression Expr,
     actual_type: TypeId,
@@ -1903,6 +1999,10 @@ struct Checker<'program> {
     assertions: HashMap<Span, AssertionSemanticInfo>,
     assertion_completions: HashMap<Span, AssertionCompletionInfo>,
     classes: HashMap<String, ClassInfo>,
+    contracts: contracts::ContractFacts,
+    interface_definitions: HashMap<String, contracts::InterfaceDefinition>,
+    interface_requirements:
+        HashMap<crate::types::InterfaceType<TypeId>, contracts::InterfaceRequirements>,
     enums: HashMap<String, EnumDefinition>,
     functions: HashMap<String, FunctionInfo>,
     function_signatures: HashMap<Span, FunctionInfo>,
@@ -1924,7 +2024,11 @@ struct Checker<'program> {
     generic_call_specializations: HashMap<Span, GenericSpecialization>,
     constrained_display_calls: HashSet<Span>,
     pending_generic_calls: HashMap<Span, PendingGenericCall>,
+    pending_core_operations: Vec<(Span, TypeId, &'static str)>,
+    class_conformance_cache: HashMap<ClassType<TypeId>, contracts::ClassConformances>,
     type_parameter_scopes: Vec<HashMap<String, Vec<TypeRef>>>,
+    contract_type_depth: usize,
+    checking_type_constraints: HashSet<(String, Vec<TypeId>)>,
     class_instantiations: HashSet<ClassType<TypeId>>,
     class_instantiation_templates: HashMap<String, HashSet<ClassType<TypeId>>>,
     callable_class_instantiation_templates: HashMap<Span, HashSet<ClassType<TypeId>>>,
@@ -2241,6 +2345,9 @@ fn semantic_type_capabilities(
             equality: true,
         },
         TypeKind::Void
+        | TypeKind::Interface(_)
+        | TypeKind::InterfaceSelf(_)
+        | TypeKind::TraitSelf(_)
         | TypeKind::Function(_)
         | TypeKind::Mixed
         | TypeKind::TypedArray(_)
@@ -2347,6 +2454,9 @@ fn semantic_layout_shape(
         }
         TypeKind::Null => Some(LayoutShape { size: 0, align: 1 }),
         TypeKind::Void
+        | TypeKind::Interface(_)
+        | TypeKind::InterfaceSelf(_)
+        | TypeKind::TraitSelf(_)
         | TypeKind::Error
         | TypeKind::Unknown
         | TypeKind::Heterogeneous
@@ -2397,93 +2507,6 @@ fn type_parameter_scope(params: &[TypeParamDecl]) -> HashMap<String, Vec<TypeRef
         .iter()
         .map(|param| (param.name.clone(), param.constraints.clone()))
         .collect()
-}
-
-fn type_refs_alpha_equivalent(
-    child: &TypeRef,
-    parent: &TypeRef,
-    child_params: &[TypeParamInfo],
-    parent_params: &[TypeParamInfo],
-) -> bool {
-    let child = child
-        .grouped
-        .as_ref()
-        .map_or(child, |grouped| &grouped.inner);
-    let parent = parent
-        .grouped
-        .as_ref()
-        .map_or(parent, |grouped| &grouped.inner);
-    let child_name = child_params
-        .iter()
-        .position(|parameter| parameter.name == child.name)
-        .and_then(|index| parent_params.get(index))
-        .map_or(child.name.as_str(), |parameter| parameter.name.as_str());
-    if child_name != parent.name
-        || child.nullable != parent.nullable
-        || child.arguments.len() != parent.arguments.len()
-    {
-        return false;
-    }
-    if !child
-        .arguments
-        .iter()
-        .zip(&parent.arguments)
-        .all(|(child, parent)| match (child, parent) {
-            (TypeArgumentRef::Type(child), TypeArgumentRef::Type(parent)) => {
-                type_refs_alpha_equivalent(child, parent, child_params, parent_params)
-            }
-            (TypeArgumentRef::Value(child), TypeArgumentRef::Value(parent)) => child == parent,
-            _ => false,
-        })
-    {
-        return false;
-    }
-    match (&child.function, &parent.function) {
-        (None, None) => true,
-        (Some(child), Some(parent)) => {
-            child.invocation_mode == parent.invocation_mode
-                && child.parameters.len() == parent.parameters.len()
-                && child
-                    .parameters
-                    .iter()
-                    .zip(&parent.parameters)
-                    .all(|(child, parent)| {
-                        child.ownership_mode == parent.ownership_mode
-                            && type_refs_alpha_equivalent(
-                                &child.ty,
-                                &parent.ty,
-                                child_params,
-                                parent_params,
-                            )
-                    })
-                && type_refs_alpha_equivalent(
-                    &child.return_type,
-                    &parent.return_type,
-                    child_params,
-                    parent_params,
-                )
-                && match (&child.throws_clause, &parent.throws_clause) {
-                    (None, None) => true,
-                    (Some(child), Some(parent)) => {
-                        child.entries.len() == parent.entries.len()
-                            && child
-                                .entries
-                                .iter()
-                                .zip(&parent.entries)
-                                .all(|(child, parent)| {
-                                    type_refs_alpha_equivalent(
-                                        &child.ty,
-                                        &parent.ty,
-                                        child_params,
-                                        parent_params,
-                                    )
-                                })
-                    }
-                    _ => false,
-                }
-        }
-        _ => false,
-    }
 }
 
 /// The callee facts a call site needs to resolve a returned borrow back to the
@@ -2709,6 +2732,9 @@ impl<'program> Checker<'program> {
             assertions: HashMap::new(),
             assertion_completions: HashMap::new(),
             classes: HashMap::new(),
+            contracts: contracts::ContractFacts::default(),
+            interface_definitions: HashMap::new(),
+            interface_requirements: HashMap::new(),
             enums: HashMap::new(),
             functions: HashMap::new(),
             function_signatures: HashMap::new(),
@@ -2730,7 +2756,11 @@ impl<'program> Checker<'program> {
             generic_call_specializations: HashMap::new(),
             constrained_display_calls: HashSet::new(),
             pending_generic_calls: HashMap::new(),
+            pending_core_operations: Vec::new(),
+            class_conformance_cache: HashMap::new(),
             type_parameter_scopes: Vec::new(),
+            contract_type_depth: 0,
+            checking_type_constraints: HashSet::new(),
             class_instantiations: HashSet::new(),
             class_instantiation_templates: HashMap::new(),
             callable_class_instantiation_templates: HashMap::new(),
@@ -2784,6 +2814,8 @@ impl<'program> Checker<'program> {
         self.predeclare_classes();
         self.collect_enums();
         self.collect_classes();
+        self.collect_interface_declarations();
+        self.collect_trait_declarations();
         self.validate_class_hierarchies();
         self.finalize_enum_metadata();
         self.collect_functions();
@@ -2827,17 +2859,12 @@ impl<'program> Checker<'program> {
                 }
                 Item::Class(class_decl) => self.check_class(class_decl),
                 Item::Enum(enum_decl) => self.check_enum(enum_decl),
-                Item::Interface(interface_decl) => {
-                    self.diagnostics
-                        .push(interface_declaration_diagnostic(interface_decl));
-                }
-                Item::Trait(trait_decl) => {
-                    self.diagnostics
-                        .push(trait_declaration_diagnostic(trait_decl));
-                }
+                Item::Interface(_) => {}
+                Item::Trait(declaration) => self.check_trait_bodies(declaration),
             }
         }
         self.materialize_override_parameter_defaults();
+        self.check_nominal_conformances();
         self.validate_parent_constructor_protocols();
         self.report_unresolved_generic_calls();
         self.check_pending_integer_literal_ranges();
@@ -3386,6 +3413,9 @@ impl<'program> Checker<'program> {
             }
             TypeKind::Void
             | TypeKind::Bytes
+            | TypeKind::Interface(_)
+            | TypeKind::InterfaceSelf(_)
+            | TypeKind::TraitSelf(_)
             | TypeKind::Null
             | TypeKind::Mixed
             | TypeKind::Error
@@ -3508,6 +3538,7 @@ impl<'program> Checker<'program> {
                     };
                     for member in &trait_decl.members {
                         let (span, name) = match member {
+                            ClassMember::Uses(_) => continue,
                             ClassMember::Property(property) => {
                                 (property.span, property.name.as_str())
                             }
@@ -3587,7 +3618,36 @@ impl<'program> Checker<'program> {
                         }
                     }
                 }
-                Item::Interface(_) | Item::Constant(_) | Item::Statement(_) => {}
+                Item::Interface(interface) => {
+                    let Some(owner) = self.global_id_for_declaration_span(interface.span) else {
+                        continue;
+                    };
+                    for method in &interface.requirements {
+                        if method.span == syntax.target_span {
+                            return Some(AttributeTarget::ClassMember {
+                                class: owner.clone(),
+                                kind: syntax.kind,
+                                name: method.name.clone(),
+                                span: method.span,
+                            });
+                        }
+                        if let Some((index, parameter)) = method
+                            .params
+                            .iter()
+                            .enumerate()
+                            .find(|(_, parameter)| parameter.span == syntax.target_span)
+                        {
+                            return Some(AttributeTarget::CallableParameter {
+                                callable: format!("{}::{}", interface.name, method.name),
+                                parameter_index: index,
+                                parameter_name: parameter.name.clone(),
+                                roles: syntax.roles.clone(),
+                                span: parameter.span,
+                            });
+                        }
+                    }
+                }
+                Item::Constant(_) | Item::Statement(_) => {}
             }
         }
         None
@@ -3829,15 +3889,21 @@ impl<'program> Checker<'program> {
                         constraints: param.constraints.clone(),
                     })
                     .collect(),
-                builtin_interfaces: class_decl
-                    .implements
-                    .iter()
-                    .filter_map(|name| match name.as_str() {
-                        "Displayable" => Some(BuiltinInterface::Displayable),
-                        "Error" => Some(BuiltinInterface::Error),
-                        _ => None,
-                    })
-                    .collect(),
+                builtin_interfaces: [
+                    (BuiltinInterface::Displayable, "Displayable"),
+                    (BuiltinInterface::Error, "Error"),
+                ]
+                .into_iter()
+                .filter_map(|(interface, name)| {
+                    class_decl
+                        .implements
+                        .iter()
+                        .any(|ty| {
+                            self.interface_declares_ancestor(&ty.name, name, &mut HashSet::new())
+                        })
+                        .then_some(interface)
+                })
+                .collect(),
                 properties: HashMap::new(),
                 static_properties: HashMap::new(),
                 constants: HashMap::new(),
@@ -3847,6 +3913,7 @@ impl<'program> Checker<'program> {
 
             for member in &class_decl.members {
                 match member {
+                    ClassMember::Uses(_) => {}
                     ClassMember::Property(property) => {
                         if property.is_static {
                             self.declare_static_property(&mut info, &class_decl.name, property);
@@ -4620,7 +4687,7 @@ impl<'program> Checker<'program> {
             let first_statement_is_parent_call =
                 constructor
                     .body
-                    .statements
+                    .statements()
                     .first()
                     .is_some_and(|statement| {
                         matches!(
@@ -4711,6 +4778,12 @@ impl<'program> Checker<'program> {
             .program
             .items
             .iter()
+            .chain(
+                crate::compiler_known_contracts::declarations()
+                    .items
+                    .iter()
+                    .filter(|item| matches!(item, Item::Enum(_))),
+            )
             .filter_map(|item| match item {
                 Item::Enum(declaration) => Some(declaration),
                 _ => None,
@@ -5187,35 +5260,18 @@ impl<'program> Checker<'program> {
     }
 
     fn check_class_interfaces(&mut self, class_decl: &ClassDecl, info: &ClassInfo) {
-        let mut seen = HashSet::new();
-        for interface in &class_decl.implements {
-            if !seen.insert(interface) {
-                self.diagnostics.push(Diagnostic::new(
-                    "E0464",
-                    format!(
-                        "class `{}` implements `{interface}` more than once",
-                        class_decl.name
-                    ),
-                    class_decl.span,
-                ));
-                continue;
-            }
-            if !matches!(interface.as_str(), "Displayable" | "Error") {
-                self.diagnostics.push(Diagnostic::new(
-                    "E0464",
-                    format!(
-                        "general interface conformance for `{interface}` is accepted syntax but is not available in this compiler version"
-                    ),
-                    class_decl.span,
-                ));
-            }
+        if self.class_requires_trait_composition(&class_decl.name) {
+            return;
         }
-
         if info.implements(BuiltinInterface::Error) {
             self.check_error_interface(class_decl, info);
         }
 
-        if !info.implements(BuiltinInterface::Displayable) {
+        if !class_decl
+            .implements
+            .iter()
+            .any(|ty| ty.name == "Displayable")
+        {
             return;
         }
 
@@ -5716,6 +5772,9 @@ impl<'program> Checker<'program> {
     fn type_implements_error(&self, ty: TypeId) -> bool {
         match self.types.kind(ty) {
             TypeKind::Error => true,
+            TypeKind::Interface(interface) => {
+                self.interface_declares_ancestor(&interface.name, "Error", &mut HashSet::new())
+            }
             TypeKind::Class(class) => {
                 self.class_implements_builtin(&class.name, BuiltinInterface::Error)
             }
@@ -5749,6 +5808,12 @@ impl<'program> Checker<'program> {
         if let Some(class_name) = declaring_class {
             let enclosing_parameters = self.program.items.iter().find_map(|item| match item {
                 Item::Class(class) if class.name == class_name => Some(&class.type_params),
+                Item::Interface(interface) if interface.name == class_name => {
+                    Some(&interface.type_params)
+                }
+                Item::Trait(declaration) if declaration.name == class_name => {
+                    Some(&declaration.type_params)
+                }
                 _ => None,
             });
             if let Some(enclosing_parameters) = enclosing_parameters {
@@ -5818,17 +5883,17 @@ impl<'program> Checker<'program> {
                 ));
             }
             for constraint in &param.constraints {
-                if Self::is_compiler_known_constraint(&constraint.name) {
+                if self
+                    .authored_interface_declaration(&constraint.name)
+                    .is_some()
+                {
+                    self.resolve_interface_edge(constraint, param.span);
+                } else if Self::is_compiler_known_constraint(&constraint.name)
+                    && self.is_core_interface(&constraint.name)
+                {
                     self.check_compiler_known_constraint_declaration(param, constraint);
                 } else {
-                    self.diagnostics.push(Diagnostic::unsupported_stage(
-                        "E0533",
-                        format!(
-                            "constraint `{constraint}` on type parameter `{}` requires Stage 35 user-defined interfaces",
-                            param.name
-                        ),
-                        param.span,
-                    ));
+                    self.resolve_interface_edge(constraint, param.span);
                 }
             }
         }
@@ -5887,7 +5952,9 @@ impl<'program> Checker<'program> {
                         ClassMember::Method(method) => {
                             Some((method.clone(), Some(class.name.clone())))
                         }
-                        ClassMember::Property(_) | ClassMember::Constant(_) => None,
+                        ClassMember::Property(_)
+                        | ClassMember::Constant(_)
+                        | ClassMember::Uses(_) => None,
                     })
                     .collect(),
                 Item::Enum(_)
@@ -6162,7 +6229,9 @@ impl<'program> Checker<'program> {
                             method.return_type.is_none()
                                 && LifecycleMethod::from_method_name(&method.name).is_none()
                         }
-                        ClassMember::Property(_) | ClassMember::Constant(_) => false,
+                        ClassMember::Property(_)
+                        | ClassMember::Constant(_)
+                        | ClassMember::Uses(_) => false,
                     })
                     .count(),
                 _ => 0,
@@ -6254,7 +6323,10 @@ impl<'program> Checker<'program> {
             );
         }
 
-        self.infer_move_return_from_block(&function.body, &mut scopes, method_context)
+        function
+            .body
+            .as_block()
+            .and_then(|body| self.infer_move_return_from_block(body, &mut scopes, method_context))
             .unwrap_or_else(|| self.types.unknown())
     }
 
@@ -6647,6 +6719,16 @@ impl<'program> Checker<'program> {
         }
 
         let iterable_ty = self.infer_expr_type(&foreach.iterable, scopes, method_context);
+        if let Some(element) = self.public_iterable_element(iterable_ty) {
+            return ForeachTypePlan {
+                family: ForeachIterableFamily::PublicIterable,
+                iteration_kind: ForeachIterationKind::ValueOnly,
+                iterable_type: iterable_ty,
+                first_binding_type: None,
+                value_binding_type: element,
+                order: ForeachIterationOrder::ValueOrder,
+            };
+        }
         match self.types.kind(iterable_ty).clone() {
             TypeKind::List(value) => ForeachTypePlan {
                 family: ForeachIterableFamily::List,
@@ -6807,6 +6889,16 @@ impl<'program> Checker<'program> {
                     self.resolve_type_ref_for_return_inference(ty.type_argument(0).unwrap());
                 self.types.intern(TypeKind::Set(element))
             }
+            name if self.interface_declaration(name).is_some() && !ty.has_value_arguments() => {
+                let arguments = ty
+                    .type_arguments()
+                    .map(|argument| self.resolve_type_ref_for_return_inference(argument))
+                    .collect();
+                self.types
+                    .intern(TypeKind::Interface(crate::types::InterfaceType::new(
+                        name, arguments,
+                    )))
+            }
             name if self.classes.contains_key(name) && !ty.has_value_arguments() => {
                 let arguments = ty
                     .type_arguments()
@@ -6844,7 +6936,7 @@ impl<'program> Checker<'program> {
                         "Constant Initializer Cannot Throw",
                     );
                 }
-                ClassMember::Method(_) => {}
+                ClassMember::Method(_) | ClassMember::Uses(_) => {}
             }
         }
         let has_constructor = class_decl.members.iter().any(
@@ -7284,6 +7376,9 @@ impl<'program> Checker<'program> {
     }
 
     fn check_function(&mut self, function: &FunctionDecl, method_context: Option<MethodContext>) {
+        let Some(body) = function.body.as_block() else {
+            return;
+        };
         let previous_callable = self.current_callable.replace(function.span);
         let previous_owner = std::mem::replace(
             &mut self.current_lexical_owner,
@@ -7308,7 +7403,7 @@ impl<'program> Checker<'program> {
                     None,
                     None,
                 ),
-                Span::new(function.span.start, function.span.start),
+                function.span.at(function.span.start, function.span.start),
                 BindingKind::MethodReceiver,
                 if context.receiver_access.is_writable() {
                     BindingOwnership::WritableBorrow
@@ -7426,7 +7521,7 @@ impl<'program> Checker<'program> {
         });
 
         self.check_block(
-            &function.body,
+            body,
             &mut scopes,
             method_context.as_ref(),
             constructor_init_context.as_mut(),
@@ -7600,6 +7695,11 @@ impl<'program> Checker<'program> {
         for candidate in covering {
             if *candidate == effect || matches!(self.types.kind(*candidate), TypeKind::Error) {
                 return true;
+            }
+            if let TypeKind::Interface(interface) = self.types.kind(*candidate).clone() {
+                if self.type_has_declared_interface(effect, &interface, &mut HashSet::new()) {
+                    return true;
+                }
             }
             let (TypeKind::Class(candidate), TypeKind::Class(effect)) = (
                 self.types.kind(*candidate).clone(),
@@ -8236,6 +8336,22 @@ impl<'program> Checker<'program> {
                         method_context,
                     );
                 }
+                if plan.family == ForeachIterableFamily::PublicIterable {
+                    self.report_contract_boundary(
+                        contracts::PendingContractOperation::CoreValueOperation,
+                        foreach.iterable.span(),
+                    );
+                    if foreach.value_binding.writable {
+                        self.diagnostics.push(
+                            Diagnostic::new(
+                                "E0522",
+                                "public Iterable yields readonly element borrows",
+                                foreach.value_binding.span,
+                            )
+                            .with_title("Public Iteration Is Readonly"),
+                        );
+                    }
+                }
                 let mut loop_scopes = scopes.clone();
                 loop_scopes.push();
                 if let Some(first_binding) = &foreach.first_binding {
@@ -8243,6 +8359,7 @@ impl<'program> Checker<'program> {
                         && matches!(
                             plan.family,
                             ForeachIterableFamily::IntegerRange
+                                | ForeachIterableFamily::PublicIterable
                                 | ForeachIterableFamily::Set
                                 | ForeachIterableFamily::SortedSet
                                 | ForeachIterableFamily::Deque
@@ -9498,6 +9615,9 @@ impl<'program> Checker<'program> {
     }
 
     fn check_missing_final_return(&mut self, function: &FunctionDecl, context: &ReturnContext) {
+        let Some(body) = function.body.as_block() else {
+            return;
+        };
         if context.lifecycle.is_some() {
             return;
         }
@@ -9511,7 +9631,7 @@ impl<'program> Checker<'program> {
         }
 
         if crate::return_analysis::analyze_block_with_given_and_terminals(
-            &function.body,
+            body,
             function.span,
             &self.given_preludes,
             &self.terminal_assertion_spans(),
@@ -10438,6 +10558,9 @@ impl<'program> Checker<'program> {
             }
             TypeKind::Void
             | TypeKind::Nullable(_)
+            | TypeKind::Interface(_)
+            | TypeKind::InterfaceSelf(_)
+            | TypeKind::TraitSelf(_)
             | TypeKind::Null
             | TypeKind::Mixed
             | TypeKind::Function(_)
@@ -11066,6 +11189,7 @@ impl<'program> Checker<'program> {
                     self.check_method_call(
                         object,
                         method,
+                        *member_span,
                         args,
                         *null_safe,
                         *span,
@@ -11143,6 +11267,15 @@ impl<'program> Checker<'program> {
                 span,
             } => {
                 let class_name = &class_type.name;
+                if self.interface_declaration(class_name).is_some()
+                    || self.trait_declaration(class_name).is_some()
+                {
+                    for arg in args {
+                        self.check_expr(&arg.value, scopes, method_context);
+                    }
+                    self.diagnostics.push(Diagnostic::new("E0750", format!("`{class_type}` is a contract declaration, not a constructible class"), *span).with_title("Contract Cannot Be Constructed"));
+                    return;
+                }
                 if class_name == crate::compiler_known_test::ASSERTION_ERROR {
                     for arg in args {
                         self.check_expr(&arg.value, scopes, method_context);
@@ -12150,7 +12283,8 @@ impl<'program> Checker<'program> {
                 .as_ref()
                 .map(|return_type| return_type.ty.clone()),
             throws: None,
-            body,
+            body: crate::ast::FunctionBody::Block(body),
+            syntax: Box::new(crate::ast::FunctionSyntax::synthetic(closure.span)),
             modifier_prefix_span: closure.span,
             span: closure.span,
         };
@@ -13547,6 +13681,7 @@ impl<'program> Checker<'program> {
                 | TypeKind::Bool
                 | TypeKind::Enum(_)
                 | TypeKind::Class(_)
+                | TypeKind::Interface(_)
                 | TypeKind::Function(_)
         )
     }
@@ -14121,6 +14256,11 @@ impl<'program> Checker<'program> {
             }
             BinaryOp::Equal | BinaryOp::NotEqual => {
                 self.check_equality_operands(left, right, span, scopes, method_context);
+                let left_ty = self.infer_expr_type(left, scopes, method_context);
+                let right_ty = self.infer_expr_type(right, scopes, method_context);
+                if !matches!(self.types.kind(right_ty), TypeKind::Null) {
+                    self.gate_core_operation(left_ty, "Equatable", span);
+                }
             }
             BinaryOp::Concat => {
                 self.check_concat_operands(left, right, span, scopes, method_context);
@@ -14762,6 +14902,9 @@ impl<'program> Checker<'program> {
                 .find(|definition| definition.id == enum_type.id)
                 .is_some_and(|definition| !definition.capabilities.copy),
             TypeKind::Class(_)
+            | TypeKind::Interface(_)
+            | TypeKind::InterfaceSelf(_)
+            | TypeKind::TraitSelf(_)
             | TypeKind::Function(_)
             | TypeKind::Error
             | TypeKind::SharedHandle(_, _)
@@ -14785,14 +14928,19 @@ impl<'program> Checker<'program> {
     fn type_can_return_borrow(&self, ty: TypeId) -> bool {
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.type_can_return_borrow(*inner),
-            TypeKind::Class(_) | TypeKind::TypeParameter(_) => true,
+            TypeKind::Class(_)
+            | TypeKind::Interface(_)
+            | TypeKind::TraitSelf(_)
+            | TypeKind::TypeParameter(_) => true,
             _ => false,
         }
     }
 
     fn type_is_symbolic(&self, ty: TypeId) -> bool {
         match self.types.kind(ty) {
-            TypeKind::TypeParameter(_) => true,
+            TypeKind::TypeParameter(_) | TypeKind::TraitSelf(_) | TypeKind::InterfaceSelf(_) => {
+                true
+            }
             TypeKind::Nullable(inner)
             | TypeKind::TypedArray(inner)
             | TypeKind::List(inner)
@@ -14804,7 +14952,7 @@ impl<'program> Checker<'program> {
             TypeKind::Dictionary(key, value) | TypeKind::SortedDictionary(key, value) => {
                 self.type_is_symbolic(*key) || self.type_is_symbolic(*value)
             }
-            TypeKind::Class(class) => class
+            TypeKind::Class(class) | TypeKind::Interface(class) => class
                 .arguments
                 .iter()
                 .any(|argument| self.type_is_symbolic(*argument)),
@@ -14887,20 +15035,17 @@ impl<'program> Checker<'program> {
             self.types.kind(target).clone(),
             self.types.kind(value).clone(),
         ) {
+            (TypeKind::InterfaceSelf(_), TypeKind::InterfaceSelf(_)) => true,
+            (TypeKind::Interface(target), _) => {
+                self.type_has_declared_interface(value, &target, &mut HashSet::new())
+            }
             (TypeKind::Class(target), TypeKind::Class(value)) => {
                 self.class_is_subtype(&value, &target)
             }
             (TypeKind::Nullable(target), TypeKind::Nullable(value)) => {
-                match (
-                    self.types.kind(target).clone(),
-                    self.types.kind(value).clone(),
-                ) {
-                    (TypeKind::Class(target), TypeKind::Class(value)) => {
-                        self.class_is_subtype(&value, &target)
-                    }
-                    _ => false,
-                }
+                self.override_return_is_compatible(target, value)
             }
+            (TypeKind::Nullable(target), _) => self.override_return_is_compatible(target, value),
             _ => false,
         }
     }
@@ -14919,7 +15064,7 @@ impl<'program> Checker<'program> {
             if self.program.items.iter().any(|item| {
                 matches!(item, Item::Class(declaration)
                     if declaration.name == name
-                        && declaration.implements.iter().any(|implemented| implemented == interface_name))
+                        && declaration.implements.iter().any(|implemented| self.interface_declares_ancestor(&implemented.name, interface_name, &mut HashSet::new())))
             }) {
                 return true;
             }
@@ -14981,90 +15126,8 @@ impl<'program> Checker<'program> {
         inherited_class: &ClassType<TypeId>,
         inherited: &MethodInfo,
     ) -> bool {
-        let generic_valid = method.type_params.len() == inherited.type_params.len()
-            && method
-                .type_params
-                .iter()
-                .zip(&inherited.type_params)
-                .all(|(child, parent)| {
-                    child.constraints.len() == parent.constraints.len()
-                        && child.constraints.iter().zip(&parent.constraints).all(
-                            |(child_constraint, parent_constraint)| {
-                                type_refs_alpha_equivalent(
-                                    child_constraint,
-                                    parent_constraint,
-                                    &method.type_params,
-                                    &inherited.type_params,
-                                )
-                            },
-                        )
-                });
-        let alpha_substitutions = method
-            .type_params
-            .iter()
-            .zip(&inherited.type_params)
-            .map(|(child, parent)| {
-                (
-                    child.name.clone(),
-                    self.types
-                        .intern(TypeKind::TypeParameter(parent.name.clone())),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let child_parameter_types = method
-            .params
-            .iter()
-            .map(|parameter| self.substitute_type_id(parameter.ty, &alpha_substitutions))
-            .collect::<Vec<_>>();
-        let same_parameters = method.params.len() == inherited.params.len()
-            && method
-                .params
-                .iter()
-                .zip(&inherited.params)
-                .zip(child_parameter_types)
-                .all(|((child, parent), child_ty)| {
-                    child.name == parent.name
-                        && child_ty == parent.ty
-                        && child.take == parent.take
-                        && child.writable == parent.writable
-                });
         let defaults_omitted = method.params.iter().all(|parameter| !parameter.has_default);
-        let receiver_valid = !matches!(
-            (inherited.receiver_mode, method.receiver_mode),
-            (Some(ReceiverMode::Readonly), Some(ReceiverMode::Writable))
-        );
-        let child_return = self.substitute_type_id(method.return_ty, &alpha_substitutions);
-        let return_valid = self.override_return_is_compatible(inherited.return_ty, child_return);
-        let child_effects = method
-            .checked_effects
-            .iter()
-            .map(|effect| self.substitute_type_id(*effect, &alpha_substitutions))
-            .collect::<Vec<_>>();
-        let effects_valid = child_effects.iter().all(|effect| {
-            inherited.checked_effects.iter().any(|allowed| {
-                if effect == allowed {
-                    return true;
-                }
-                match (
-                    self.types.kind(*allowed).clone(),
-                    self.types.kind(*effect).clone(),
-                ) {
-                    (TypeKind::Class(parent), TypeKind::Class(child)) => {
-                        self.class_is_subtype(&child, &parent)
-                    }
-                    _ => false,
-                }
-            })
-        });
-        if same_parameters
-            && defaults_omitted
-            && receiver_valid
-            && return_valid
-            && effects_valid
-            && generic_valid
-            && method.access == MemberAccess::External
-            && !method.is_static
-        {
+        if defaults_omitted && self.method_contract_failures(method, inherited).is_empty() {
             return true;
         }
 
@@ -15090,6 +15153,18 @@ impl<'program> Checker<'program> {
         substitutions: &HashMap<String, TypeId>,
     ) -> TypeId {
         match self.types.kind(ty).clone() {
+            TypeKind::Interface(interface) => {
+                let arguments = interface
+                    .arguments
+                    .iter()
+                    .map(|argument| self.substitute_type_id(*argument, substitutions))
+                    .collect();
+                self.types
+                    .intern(TypeKind::Interface(crate::types::InterfaceType::new(
+                        interface.name,
+                        arguments,
+                    )))
+            }
             TypeKind::TypeParameter(name) => substitutions.get(&name).copied().unwrap_or(ty),
             TypeKind::Nullable(inner) => {
                 let inner = self.substitute_type_id(inner, substitutions);
@@ -15179,20 +15254,7 @@ impl<'program> Checker<'program> {
         class: &ClassType<TypeId>,
     ) -> MethodInfo {
         let substitutions = self.class_type_substitutions(class);
-        let mut specialized = method.clone();
-        specialized
-            .enclosing_type_bindings
-            .extend(substitutions.clone());
-        for param in &mut specialized.params {
-            param.ty = self.substitute_type_id(param.ty, &substitutions);
-        }
-        specialized.return_ty = self.substitute_type_id(method.return_ty, &substitutions);
-        specialized.checked_effects = method
-            .checked_effects
-            .iter()
-            .map(|effect| self.substitute_type_id(*effect, &substitutions))
-            .collect();
-        specialized
+        self.substitute_contract_method(method, &substitutions)
     }
 
     fn specialize_property_for_class(
@@ -16185,6 +16247,7 @@ impl<'program> Checker<'program> {
         &mut self,
         object: &Expr,
         method: &str,
+        member_span: Span,
         args: &[Argument],
         null_safe: bool,
         span: Span,
@@ -16192,6 +16255,21 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) {
         let object_ty = self.infer_expr_type(object, scopes, method_context);
+        if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
+            if let Some(declared) = self.trait_method(&owner, method) {
+                self.record_contract_member_reference(member_span, vec![declared.declaration]);
+                self.check_declared_contract_method(
+                    declared,
+                    object,
+                    method,
+                    args,
+                    span,
+                    scopes,
+                    method_context,
+                );
+            }
+            return;
+        }
         if let Some((kind, payload)) = self.shared_handle_type(object_ty, null_safe) {
             for arg in args {
                 self.check_expr(&arg.value, scopes, method_context);
@@ -16225,6 +16303,19 @@ impl<'program> Checker<'program> {
             }
             // Falls through: the payload class resolves the member transparently.
         }
+        if let Some(interface) = self.interface_receiver(object_ty) {
+            self.check_interface_call(
+                &interface,
+                object,
+                method,
+                member_span,
+                args,
+                span,
+                scopes,
+                method_context,
+            );
+            return;
+        }
         if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty).clone() {
             if method == "toString"
                 && args.is_empty()
@@ -16232,6 +16323,32 @@ impl<'program> Checker<'program> {
             {
                 self.constrained_display_calls.insert(span);
                 return;
+            }
+            match self.constrained_requirement(&parameter, method, span) {
+                Ok(Some(required)) => {
+                    self.check_contract_call(
+                        required,
+                        object,
+                        method,
+                        member_span,
+                        args,
+                        span,
+                        scopes,
+                        method_context,
+                    );
+                    return;
+                }
+                Err(origins) => {
+                    let mut diagnostic = Diagnostic::new("E0753", format!("constraints on `{parameter}` provide conflicting contracts for `{method}`"), member_span)
+                        .with_title("Conflicting Constrained Methods");
+                    for origin in origins {
+                        diagnostic = diagnostic
+                            .with_related(origin, "this constraint declares a different contract");
+                    }
+                    self.diagnostics.push(diagnostic);
+                    return;
+                }
+                Ok(None) => {}
             }
             self.diagnostics.push(
                 Diagnostic::new(
@@ -16259,6 +16376,9 @@ impl<'program> Checker<'program> {
         }
         let Some((declaring_class, method_info)) = self.lookup_instance_method(&class_type, method)
         else {
+            if self.class_requires_trait_composition(&class_name) {
+                return;
+            }
             self.diagnostics.push(Diagnostic::new(
                 "E0304",
                 format!("unknown method `{class_name}::{method}`"),
@@ -16784,6 +16904,45 @@ impl<'program> Checker<'program> {
             return;
         }
 
+        if matches!(access.qualifier, StaticQualifier::SelfType)
+            && self.trait_declaration(class_name).is_some()
+        {
+            if let Some(declared) = self.trait_method(class_name, access.member) {
+                if !declared.is_static {
+                    self.diagnostics.push(Diagnostic::new(
+                        "E0487",
+                        format!(
+                            "instance method `{class_name}::{}` requires an object receiver",
+                            access.member
+                        ),
+                        access.span,
+                    ));
+                    return;
+                }
+                self.record_contract_member_reference(
+                    access.member_span,
+                    vec![declared.declaration],
+                );
+                let method = self.instantiate_generic_method_call(
+                    access.member,
+                    &declared,
+                    args,
+                    access.span,
+                    scopes,
+                    method_context,
+                );
+                self.check_call_arguments(
+                    access.member,
+                    &method.params,
+                    args,
+                    access.span,
+                    scopes,
+                    method_context,
+                );
+                self.record_checked_effects(method.checked_effects, access.span);
+            }
+            return;
+        }
         if !self.classes.contains_key(class_name) {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
@@ -17034,6 +17193,12 @@ impl<'program> Checker<'program> {
             );
             return;
         }
+        if definition.span.source == crate::compiler_known_contracts::SOURCE_ID {
+            self.report_contract_boundary(
+                contracts::PendingContractOperation::CoreValueOperation,
+                access.span,
+            );
+        }
         self.enum_case_values.insert(
             access.span,
             EnumValue {
@@ -17210,6 +17375,10 @@ impl<'program> Checker<'program> {
                     );
                     return None;
                 };
+                if self.trait_declaration(&context.class_name).is_some() {
+                    // The declaration pass diagnoses this without fabricating a class hierarchy.
+                    return None;
+                }
                 let Some(parent) = self
                     .classes
                     .get(&context.class_name)
@@ -17250,6 +17419,12 @@ impl<'program> Checker<'program> {
         class_name: &str,
         method_context: Option<&MethodContext>,
     ) -> Option<(ClassType<TypeId>, StaticMemberInfo)> {
+        if matches!(access.qualifier, StaticQualifier::SelfType)
+            && self.trait_declaration(class_name).is_some()
+        {
+            // The composer owns self-qualified storage and constants. Do not invent a class here.
+            return None;
+        }
         if !self.classes.contains_key(class_name) {
             self.diagnostics.push(Diagnostic::new(
                 "E0305",
@@ -18335,16 +18510,18 @@ impl<'program> Checker<'program> {
                 if parent_access == ObjectPathAccess::Readonly {
                     return ObjectPathAccess::Readonly;
                 }
-                let Some(class_name) = self.expr_class_name(object, scopes, method_context) else {
-                    return ObjectPathAccess::Readonly;
-                };
-                if self
-                    .classes
-                    .get(&class_name)
-                    .and_then(|class_info| class_info.properties.get(property))
-                    .map(|property| property.writable)
-                    .unwrap_or(false)
-                {
+                let object_ty = self.infer_expr_type(object, scopes, method_context);
+                let writable =
+                    if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
+                        self.trait_property(&owner, property)
+                            .is_some_and(|property| property.writable)
+                    } else {
+                        self.expr_class_name(object, scopes, method_context)
+                            .and_then(|class| self.classes.get(&class))
+                            .and_then(|class| class.properties.get(property))
+                            .is_some_and(|property| property.writable)
+                    };
+                if writable {
                     ObjectPathAccess::Writable
                 } else {
                     ObjectPathAccess::Readonly
@@ -18575,6 +18752,25 @@ impl<'program> Checker<'program> {
         method_context: Option<&MethodContext>,
     ) -> Option<(String, PropertyInfo)> {
         let object_ty = self.infer_expr_type(object, scopes, method_context);
+        if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
+            return self
+                .trait_property(&owner, property)
+                .map(|property| (owner, property));
+        }
+        if let Some(interface) = self.interface_receiver(object_ty) {
+            self.diagnostics.push(
+                Diagnostic::new(
+                    "E0303",
+                    format!(
+                        "interface `{}` has no property `{property}`",
+                        interface.name
+                    ),
+                    span,
+                )
+                .with_title("Unknown Interface Property"),
+            );
+            return None;
+        }
         if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty) {
             self.diagnostics.push(
                 Diagnostic::new(
@@ -18601,6 +18797,9 @@ impl<'program> Checker<'program> {
         let Some((declaring_class, property_info)) =
             self.lookup_instance_property(&class_type, property)
         else {
+            if self.class_requires_trait_composition(&class_name) {
+                return None;
+            }
             self.diagnostics.push(Diagnostic::new(
                 "E0303",
                 format!("unknown property `{class_name}::{property}`"),
@@ -18773,6 +18972,9 @@ impl<'program> Checker<'program> {
     }
 
     fn type_parameter_has_constraint(&self, parameter: &str, required: &str) -> bool {
+        if self.authored_interface_declaration(required).is_some() {
+            return false;
+        }
         self.type_parameter_scopes
             .iter()
             .rev()
@@ -18819,6 +19021,12 @@ impl<'program> Checker<'program> {
         constraint_name: &str,
         operand: TypeId,
     ) -> bool {
+        if self
+            .authored_interface_declaration(constraint_name)
+            .is_some()
+        {
+            return false;
+        }
         let constraints = self
             .type_parameter_scopes
             .iter()
@@ -19006,6 +19214,9 @@ impl<'program> Checker<'program> {
                 | TypeKind::TypeParameter(_)
                 | TypeKind::Function(_)
                 | TypeKind::Class(_)
+                | TypeKind::Interface(_)
+                | TypeKind::InterfaceSelf(_)
+                | TypeKind::TraitSelf(_)
                 | TypeKind::SharedHandle(_, _)
                 | TypeKind::Bytes
                 | TypeKind::TypedArray(_)
@@ -19049,6 +19260,8 @@ impl<'program> Checker<'program> {
 
         match ty.name.as_str() {
             "self" if ty.arguments.is_empty() => match declaring_class {
+                Some(interface) if self.interface_declaration(interface).is_some() => self.types.intern(TypeKind::InterfaceSelf(interface.to_string())),
+                Some(owner) if self.program.items.iter().any(|item| matches!(item, Item::Trait(declaration) if declaration.name == owner)) => self.types.intern(TypeKind::TraitSelf(owner.to_string())),
                 Some(class_name) => self.symbolic_class_type(class_name),
                 None => self.reject_type_ref(
                     ty,
@@ -19123,6 +19336,9 @@ impl<'program> Checker<'program> {
                         );
                     }
                     return self.types.unknown();
+                }
+                if name == "Ordering" && span.source != crate::compiler_known_contracts::SOURCE_ID && self.contract_type_depth == 0 {
+                    self.report_contract_boundary(contracts::PendingContractOperation::CoreValueOperation, span);
                 }
                 let definition = self.enums.get(name).expect("enum existence checked");
                 self.types.intern(TypeKind::Enum(EnumType::new(
@@ -19290,6 +19506,20 @@ impl<'program> Checker<'program> {
                 }
                 self.types.unknown()
             }
+            name if self.interface_declaration(name).is_some() => {
+                let declaration = self.interface_declaration(name).cloned().expect("known interface declaration");
+                if !self.expect_type_arg_count(ty, declaration.type_params.len(), span) { return self.types.unknown(); }
+                let arguments = ty.type_arguments().map(|argument| self.resolve_type_ref_in_position(argument, span, TypePosition::Value, declaring_class)).collect::<Vec<_>>();
+                let parameters = declaration.type_params.iter().map(|parameter| TypeParamInfo { name: parameter.name.clone(), constraints: parameter.constraints.clone() }).collect::<Vec<_>>();
+                self.check_class_type_constraints(name, &parameters, &arguments, span);
+                let interface = self.types.intern(TypeKind::Interface(crate::types::InterfaceType::new(name, arguments)));
+                if self.contract_type_depth == 0 && declaring_class.is_none_or(|owner| self.interface_declaration(owner).is_none()
+                    && !self.program.items.iter().any(|item| matches!(item, Item::Trait(declaration) if declaration.name == owner))) {
+                    self.report_contract_boundary(contracts::PendingContractOperation::InterfaceValue, span);
+                }
+                interface
+            }
+            name if self.trait_declaration(name).is_some() => self.reject_type_ref(ty, span, "E0750", "a trait is a composition declaration, not a value type"),
             name if self.classes.contains_key(name) => {
                 let type_params = self
                     .classes
@@ -19352,6 +19582,11 @@ impl<'program> Checker<'program> {
     }
 
     fn symbolic_class_type(&mut self, class_name: &str) -> TypeId {
+        if self.trait_declaration(class_name).is_some() {
+            return self
+                .types
+                .intern(TypeKind::TraitSelf(class_name.to_string()));
+        }
         let parameter_names = self
             .classes
             .get(class_name)
@@ -19372,6 +19607,9 @@ impl<'program> Checker<'program> {
     }
 
     fn check_stage23_hashable_type(&mut self, ty: TypeId, span: Span, role: &str) {
+        if self.gate_core_operation(ty, "Hashable", span) {
+            return;
+        }
         let diagnostic = match self.types.kind(ty) {
             TypeKind::Integer(_)
             | TypeKind::String
@@ -19524,6 +19762,22 @@ impl<'program> Checker<'program> {
         second: Option<TypeId>,
         span: Span,
     ) {
+        let elements = [Some(first), second];
+        if elements
+            .iter()
+            .flatten()
+            .any(|ty| self.type_is_move_type(*ty))
+            && elements
+                .iter()
+                .flatten()
+                .all(|ty| !self.type_is_move_type(*ty) || self.has_core_contract(*ty, "Cloneable"))
+        {
+            self.report_contract_boundary(
+                contracts::PendingContractOperation::CoreValueOperation,
+                span,
+            );
+            return;
+        }
         if self.type_is_move_type(first)
             || second.is_some_and(|value| self.type_is_move_type(value))
         {
@@ -19573,6 +19827,9 @@ impl<'program> Checker<'program> {
     }
 
     fn check_stage26_comparable_type(&mut self, ty: TypeId, span: Span, role: &str) {
+        if self.gate_core_operation(ty, "Comparable", span) {
+            return;
+        }
         let diagnostic = match self.types.kind(ty) {
             TypeKind::Integer(_)
             | TypeKind::String
@@ -19698,6 +19955,10 @@ impl<'program> Checker<'program> {
         arguments: &[TypeId],
         span: Span,
     ) {
+        let identity = (class_name.to_string(), arguments.to_vec());
+        if !self.checking_type_constraints.insert(identity.clone()) {
+            return;
+        }
         let bindings = params
             .iter()
             .zip(arguments)
@@ -19705,9 +19966,7 @@ impl<'program> Checker<'program> {
             .collect::<HashMap<_, _>>();
         for (param, argument) in params.iter().zip(arguments) {
             for constraint in &param.constraints {
-                if !Self::is_compiler_known_constraint(&constraint.name)
-                    || self.type_is_symbolic(*argument)
-                {
+                if self.type_is_symbolic(*argument) {
                     continue;
                 }
                 if self.constraint_accepts_type_argument(constraint, *argument, &bindings, span) {
@@ -19728,6 +19987,7 @@ impl<'program> Checker<'program> {
                 }
             }
         }
+        self.checking_type_constraints.remove(&identity);
     }
 
     fn check_concrete_class_constraints(&mut self, class: &ClassType<TypeId>, span: Span) {
@@ -19751,8 +20011,7 @@ impl<'program> Checker<'program> {
                 continue;
             };
             for constraint in &param.constraints {
-                if !Self::is_compiler_known_constraint(&constraint.name)
-                    || self.type_is_symbolic(argument)
+                if self.type_is_symbolic(argument)
                     || self.constraint_accepts_type_argument(constraint, argument, bindings, span)
                 {
                     continue;
@@ -19780,6 +20039,37 @@ impl<'program> Checker<'program> {
         bindings: &HashMap<String, TypeId>,
         span: Span,
     ) -> bool {
+        if self.interface_declaration(&constraint.name).is_some()
+            && (!self.is_core_interface(&constraint.name)
+                || !self.type_satisfies_compiler_constraint(argument, &constraint.name))
+        {
+            self.type_parameter_scopes.push(
+                bindings
+                    .keys()
+                    .map(|name| (name.clone(), Vec::new()))
+                    .collect(),
+            );
+            let target = if self.is_core_interface(&constraint.name)
+                && matches!(constraint.name.as_str(), "Comparable" | "Equatable")
+                && constraint.arguments.is_empty()
+            {
+                Some(crate::types::InterfaceType::new(
+                    &constraint.name,
+                    vec![argument],
+                ))
+            } else {
+                self.resolve_interface_edge(constraint, span)
+            };
+            self.type_parameter_scopes.pop();
+            return target.is_some_and(|mut target| {
+                target.arguments = target
+                    .arguments
+                    .iter()
+                    .map(|ty| self.substitute_type_id(*ty, bindings))
+                    .collect();
+                self.type_has_declared_interface(argument, &target, &mut HashSet::new())
+            });
+        }
         if !self.type_satisfies_compiler_constraint(argument, &constraint.name) {
             return false;
         }
@@ -19844,6 +20134,9 @@ impl<'program> Checker<'program> {
         span: Span,
         destination: AssignmentDestination,
     ) {
+        if self.reject_primitive_interface_erasure(target, value, span) {
+            return;
+        }
         let expected_function = self.non_null_function_type(target).cloned();
         let actual_function = self.non_null_function_type(value).cloned();
         if let (Some(expected), Some(actual)) = (expected_function, actual_function) {
@@ -20274,6 +20567,9 @@ impl<'program> Checker<'program> {
     }
 
     fn check_repeat_element_eligibility(&mut self, element: TypeId, span: Span) -> bool {
+        if self.gate_core_operation(element, "Cloneable", span) {
+            return false;
+        }
         match self.types.kind(element) {
             TypeKind::Bool
             | TypeKind::Integer(_)
@@ -20430,6 +20726,9 @@ impl<'program> Checker<'program> {
             (TypeKind::Class(target), TypeKind::Class(value)) => {
                 self.class_is_subtype(&value, &target)
             }
+            (TypeKind::Interface(target), _) => {
+                self.type_has_declared_interface(value, &target, &mut HashSet::new())
+            }
             (TypeKind::Function(target), TypeKind::Function(value)) => {
                 self.function_type_compatibility(&target, &value).is_ok()
             }
@@ -20553,6 +20852,11 @@ impl<'program> Checker<'program> {
                 // argument from the single constructor argument (record 0106). This
                 // is compiler-known inference for this type, not a general
                 // user-defined generic-constructor rule.
+                if self.interface_declaration(&class_type.name).is_some()
+                    || self.trait_declaration(&class_type.name).is_some()
+                {
+                    return self.types.unknown();
+                }
                 if let Some(kind) = SharedHandleKind::from_source_name(&class_type.name) {
                     let payload = match class_type.type_argument(0) {
                         Some(argument) => self.resolve_type_ref_with_class(
@@ -20628,6 +20932,12 @@ impl<'program> Checker<'program> {
                     return result;
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
+                    return self
+                        .trait_property(&owner, property)
+                        .map(|property| property.ty)
+                        .unwrap_or_else(|| self.types.unknown());
+                }
                 if let Some((kind, _)) = self.shared_handle_type(object_ty, *null_safe) {
                     if !Self::shared_handle_forwards(kind) {
                         return self.types.unknown();
@@ -20680,6 +20990,13 @@ impl<'program> Checker<'program> {
                     return self.types.intern_resolved(&call.result_type.clone());
                 }
                 let object_ty = self.infer_expr_type(object, scopes, method_context);
+                if let TypeKind::TraitSelf(owner) = self.types.kind(object_ty).clone() {
+                    let result = self
+                        .trait_method(&owner, method)
+                        .map(|method| method.return_ty)
+                        .unwrap_or_else(|| self.types.unknown());
+                    return self.generic_call_result_type(*span, result);
+                }
                 if let Some((kind, payload)) = self.shared_handle_type(object_ty, *null_safe) {
                     if let Some(result) =
                         self.shared_handle_member_return_type(kind, payload, method)
@@ -20699,13 +21016,23 @@ impl<'program> Checker<'program> {
                 ) {
                     return result;
                 }
-                if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty) {
+                if let TypeKind::TypeParameter(parameter) = self.types.kind(object_ty).clone() {
                     if method == "toString"
-                        && self.type_parameter_has_constraint(parameter, "Displayable")
+                        && self.type_parameter_has_constraint(&parameter, "Displayable")
                     {
                         return self.types.intern(TypeKind::String);
                     }
-                    return self.types.unknown();
+                    let result = self.constrained_method_return(&parameter, method, *span);
+                    let result = self.generic_call_result_type(*span, result);
+                    return self.null_safe_result_type(result, *null_safe);
+                }
+                if let Some(interface) = self.interface_receiver(object_ty) {
+                    let result = self
+                        .interface_method(&interface, method)
+                        .map(|method| method.return_ty)
+                        .unwrap_or_else(|| self.types.unknown());
+                    let result = self.generic_call_result_type(*span, result);
+                    return self.null_safe_result_type(result, *null_safe);
                 }
                 let Some(class_type) = self.expr_class_type(object, scopes, method_context) else {
                     return self.types.unknown();
@@ -20866,7 +21193,9 @@ impl<'program> Checker<'program> {
                 }
                 let target = self.call_targets.get(span).and_then(|target| match target {
                     CallableTarget::Method { class_type, .. } => Some(class_type.clone()),
-                    CallableTarget::Function { .. } => None,
+                    CallableTarget::Function { .. } | CallableTarget::ConstrainedMethod { .. } => {
+                        None
+                    }
                 });
                 let result = if let Some(target) = target {
                     let target = ClassType::new(
@@ -21098,6 +21427,15 @@ impl<'program> Checker<'program> {
                 })
             }
             (TypeKind::Error, "message") => Some(self.types.intern(TypeKind::String)),
+            (TypeKind::Interface(interface), "message")
+                if self.interface_declares_ancestor(
+                    &interface.name,
+                    "Error",
+                    &mut HashSet::new(),
+                ) =>
+            {
+                Some(self.types.intern(TypeKind::String))
+            }
             (TypeKind::String, "length" | "byteLength") => Some(int),
             (TypeKind::String, "isEmpty") => Some(bool_ty),
             (TypeKind::String, "bytes") => Some(self.types.intern(TypeKind::Bytes)),
@@ -21472,7 +21810,10 @@ impl<'program> Checker<'program> {
         }
         matches!(
             self.types.kind(payload),
-            TypeKind::Class(_) | TypeKind::TypeParameter(_) | TypeKind::Unknown
+            TypeKind::Class(_)
+                | TypeKind::Interface(_)
+                | TypeKind::TypeParameter(_)
+                | TypeKind::Unknown
         )
     }
 
@@ -22520,6 +22861,11 @@ impl<'program> Checker<'program> {
                     );
                     return;
                 }
+                if self.type_is_move_type(*element)
+                    && self.gate_core_operation(*element, "Cloneable", span)
+                {
+                    return;
+                }
                 if self.type_is_move_type(*element) {
                     self.diagnostics.push(
                         Diagnostic::new(
@@ -22654,6 +23000,9 @@ impl<'program> Checker<'program> {
     }
 
     fn check_stage23_equatable_type(&mut self, ty: TypeId, span: Span, operation: &str) {
+        if self.gate_core_operation(ty, "Equatable", span) {
+            return;
+        }
         match self.types.kind(ty) {
             TypeKind::Nullable(inner) => self.check_stage23_equatable_type(*inner, span, operation),
             TypeKind::Integer(_)
@@ -23048,6 +23397,17 @@ impl<'program> Checker<'program> {
             self.types.kind(tested).clone(),
         ) {
             (TypeKind::Mixed | TypeKind::Unknown, _) => true,
+            (TypeKind::Interface(_), TypeKind::Interface(_)) => true,
+            (TypeKind::Interface(interface), TypeKind::Class(_)) => {
+                self.type_has_declared_interface(tested, &interface, &mut HashSet::new())
+            }
+            (TypeKind::Class(class), TypeKind::Interface(interface)) => {
+                self.type_has_declared_interface(value, &interface, &mut HashSet::new())
+                    || self
+                        .classes
+                        .get(&class.name)
+                        .is_some_and(|class| class.is_open)
+            }
             (TypeKind::Nullable(inner), TypeKind::Class(tested)) => {
                 match self.types.kind(inner).clone() {
                     TypeKind::Class(value) => self.class_is_subtype(&tested, &value),
@@ -23055,9 +23415,7 @@ impl<'program> Checker<'program> {
                     _ => false,
                 }
             }
-            (TypeKind::Nullable(inner), _) => {
-                inner == tested || matches!(self.types.kind(inner), TypeKind::Mixed)
-            }
+            (TypeKind::Nullable(inner), _) => self.exact_type_test_can_match(inner, tested),
             (TypeKind::Class(value), TypeKind::Class(tested)) => {
                 self.class_is_subtype(&tested, &value)
             }
@@ -23213,11 +23571,13 @@ impl<'program> Checker<'program> {
                 }
             }
             Some(crate::narrowing::Fact::Exact(ty)) => {
+                self.contract_type_depth += 1;
                 let tested = self.resolve_type_ref_with_class(
                     &ty,
                     span,
                     method_context.map(|context| context.class_name.as_str()),
                 );
+                self.contract_type_depth -= 1;
                 if self.exact_type_test_can_match(declared_ty, tested) {
                     tested
                 } else {
@@ -23241,7 +23601,7 @@ impl<'program> Checker<'program> {
             TypeKind::Nullable(inner) => {
                 let member_receiver = matches!(
                     self.types.kind(*inner),
-                    TypeKind::Class(_) | TypeKind::SharedHandle(_, _)
+                    TypeKind::Class(_) | TypeKind::Interface(_) | TypeKind::SharedHandle(_, _)
                 ) || (operation == "property access"
                     && matches!(self.types.kind(*inner), TypeKind::Enum(_)));
                 if !member_receiver {
@@ -23282,18 +23642,11 @@ impl<'program> Checker<'program> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
-        if ty.name == "Displayable"
-            || self
-                .program
-                .items
-                .iter()
-                .any(|item| matches!(item, Item::Interface(interface) if interface.name == ty.name))
-        {
-            self.diagnostics.push(Diagnostic::unsupported_stage(
-                "E0510",
-                "interface `is` tests are accepted syntax; interface conformance tests land in Stage 35",
+        if ty.name == "Displayable" {
+            self.report_contract_boundary(
+                contracts::PendingContractOperation::InterfaceValue,
                 span,
-            ));
+            );
             return;
         }
 
@@ -23304,6 +23657,9 @@ impl<'program> Checker<'program> {
         );
         self.type_test_types
             .insert(span, self.types.resolved(tested));
+        if matches!(self.types.kind(tested), TypeKind::Interface(_)) && !ty.nullable {
+            return;
+        }
         if ty.nullable
             || !matches!(
                 self.types.kind(tested),

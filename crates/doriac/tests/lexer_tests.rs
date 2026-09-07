@@ -70,8 +70,8 @@ fn lexes_import_and_include_keywords_without_crossing_identifier_boundaries() {
 
     assert!(matches!(kinds[0], TokenKind::Use));
     assert!(matches!(kinds[1], TokenKind::Include));
+    assert!(matches!(kinds[2], TokenKind::Uses));
     for (index, expected) in [
-        (2, "uses"),
         (3, "useful"),
         (4, "includePath"),
         (5, "use_value"),

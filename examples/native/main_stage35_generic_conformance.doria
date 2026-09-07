@@ -1,0 +1,38 @@
+interface Transform<T>
+{
+    function apply(T $value): int;
+    function measure<U>(U $value, int $scale): int;
+}
+
+open class Base<T> implements Transform<T>
+{
+    open function apply(T $value): int
+    {
+        return 21;
+    }
+
+    function measure<U>(U $value, int $scale = 2): int
+    {
+        return $scale;
+    }
+}
+
+class Report extends Base<int>
+{
+    override function apply(int $value): int
+    {
+        return $value * 2;
+    }
+}
+
+function transform<T implements Transform<int>>(T $item): int
+{
+    return $item->apply($item->measure(21, 21));
+}
+
+function main(): void
+{
+    let $report = new Report();
+    echo transform($report) . "\n";
+    echo $report->measure("default") . "\n";
+}

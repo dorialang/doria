@@ -21,16 +21,27 @@ impl ClassContext<'_> {
 }
 
 pub fn lower_program(program: &ast::Program) -> DiagnosticResult<hir::Program> {
-    lower_program_with_semantics(program, crate::semantics::SemanticInfo::default())
+    lower_program_with_semantics(program, crate::semantics::analyze_program(program)?)
 }
 
 pub fn lower_program_with_semantics(
     program: &ast::Program,
     semantic_info: crate::semantics::SemanticInfo,
 ) -> DiagnosticResult<hir::Program> {
+    if !semantic_info.contracts.boundaries.is_empty() {
+        return Err(semantic_info
+            .contracts
+            .boundaries
+            .iter()
+            .map(|boundary| boundary.operation.diagnostic(boundary.span))
+            .collect());
+    }
     let mut items = Vec::with_capacity(program.items.len());
     let mut diagnostics = Vec::new();
     for item in &program.items {
+        if matches!(item, ast::Item::Interface(_) | ast::Item::Trait(_)) {
+            continue;
+        }
         match lower_item(item) {
             Ok(item) => items.push(item),
             Err(diagnostic) => diagnostics.push(diagnostic),
@@ -42,6 +53,30 @@ pub fn lower_program_with_semantics(
     apply_checked_error_semantics(&mut items, &semantic_info);
     apply_global_identities(&mut items, &semantic_info);
     apply_constructor_parameter_semantics(&mut items, &semantic_info);
+    for item in &mut items {
+        let hir::Item::Class(class) = item else {
+            continue;
+        };
+        if let Some(checked) = semantic_info
+            .classes
+            .iter()
+            .find(|checked| checked.declaration_name == class.name)
+        {
+            for (interface, name) in [
+                (crate::symbols::BuiltinInterface::Displayable, "Displayable"),
+                (crate::symbols::BuiltinInterface::Error, "Error"),
+            ] {
+                if checked.implements(interface)
+                    && !class
+                        .implements
+                        .iter()
+                        .any(|implemented| implemented == name)
+                {
+                    class.implements.push(name.to_string());
+                }
+            }
+        }
+    }
 
     let test_suites = semantic_info.test_semantics.suites.clone();
     let tests = semantic_info.test_semantics.tests.clone();
@@ -573,15 +608,12 @@ fn apply_expr_checked_error_semantics(
 
 fn lower_item(item: &ast::Item) -> Result<hir::Item, Diagnostic> {
     match item {
-        ast::Item::Class(class_decl) => Ok(hir::Item::Class(lower_class(class_decl))),
+        ast::Item::Class(class_decl) => lower_class(class_decl).map(hir::Item::Class),
         ast::Item::Enum(enum_decl) => Ok(hir::Item::Enum(lower_enum(enum_decl))),
-        ast::Item::Interface(interface_decl) => Err(
-            crate::semantics::interface_declaration_diagnostic(interface_decl),
-        ),
-        ast::Item::Trait(trait_decl) => {
-            Err(crate::semantics::trait_declaration_diagnostic(trait_decl))
+        ast::Item::Interface(_) | ast::Item::Trait(_) => {
+            unreachable!("compile-time declarations do not enter HIR")
         }
-        ast::Item::Function(function) => Ok(hir::Item::Function(lower_function(function, None))),
+        ast::Item::Function(function) => lower_function(function, None).map(hir::Item::Function),
         ast::Item::Constant(constant) => Ok(hir::Item::Constant(lower_constant(constant, None))),
         ast::Item::Statement(statement) => Ok(hir::Item::Statement(lower_stmt(statement, None))),
     }
@@ -629,13 +661,13 @@ fn lower_enum(enum_decl: &ast::EnumDecl) -> hir::EnumDecl {
     }
 }
 
-fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
+fn lower_class(class_decl: &ast::ClassDecl) -> Result<hir::ClassDecl, Diagnostic> {
     let class_context = ClassContext {
         name: &class_decl.name,
         type_params: &class_decl.type_params,
         parent: class_decl.parent.as_ref(),
     };
-    hir::ClassDecl {
+    Ok(hir::ClassDecl {
         global_id: None,
         source_identity: crate::names::SourceIdentity("<unknown>".to_string()),
         package: crate::names::PackageIdentity::Standalone,
@@ -656,28 +688,43 @@ fn lower_class(class_decl: &ast::ClassDecl) -> hir::ClassDecl {
         extends_span: class_decl.extends_span,
         parent_span: class_decl.parent_span,
         modifier_prefix_span: class_decl.modifier_prefix_span,
-        implements: class_decl.implements.clone(),
+        implements: class_decl
+            .implements
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         members: class_decl
             .members
             .iter()
             .map(|member| lower_class_member(member, class_context))
-            .collect(),
+            .collect::<Result<_, _>>()?,
         span: class_decl.span,
-    }
+    })
 }
 
-fn lower_class_member(member: &ast::ClassMember, class_name: ClassContext<'_>) -> hir::ClassMember {
-    match member {
+fn lower_class_member(
+    member: &ast::ClassMember,
+    class_name: ClassContext<'_>,
+) -> Result<hir::ClassMember, Diagnostic> {
+    Ok(match member {
         ast::ClassMember::Property(property) => {
             hir::ClassMember::Property(lower_property(property, Some(class_name)))
         }
         ast::ClassMember::Method(method) => {
-            hir::ClassMember::Method(lower_function(method, Some(class_name)))
+            hir::ClassMember::Method(lower_function(method, Some(class_name))?)
         }
         ast::ClassMember::Constant(constant) => {
             hir::ClassMember::Constant(lower_constant(constant, Some(class_name)))
         }
-    }
+        ast::ClassMember::Uses(composition) => {
+            return Err(Diagnostic::new(
+                "E0493",
+                "trait composition is not yet supported; it requires Stage 35 Slice 4",
+                composition.span,
+            )
+            .with_title("Trait Composition Is Not Yet Supported"))
+        }
+    })
 }
 
 fn lower_property(
@@ -721,8 +768,16 @@ fn lower_constant(
 fn lower_function(
     function: &ast::FunctionDecl,
     class_name: Option<ClassContext<'_>>,
-) -> hir::FunctionDecl {
-    hir::FunctionDecl {
+) -> Result<hir::FunctionDecl, Diagnostic> {
+    let body = function.body.as_block().ok_or_else(|| {
+        Diagnostic::new(
+            "E0749",
+            "an executable function must have a body",
+            function.body.span(),
+        )
+        .with_title("Function Body Is Required")
+    })?;
+    Ok(hir::FunctionDecl {
         global_id: None,
         source_identity: crate::names::SourceIdentity("<unknown>".to_string()),
         package: crate::names::PackageIdentity::Standalone,
@@ -766,10 +821,10 @@ fn lower_function(
         required_checked_effects: Vec::new(),
         ambient_checked_effects: Vec::new(),
         test_assertion_checked_effects: Vec::new(),
-        body: lower_block(&function.body, class_name),
+        body: lower_block(body, class_name),
         modifier_prefix_span: function.modifier_prefix_span,
         span: function.span,
-    }
+    })
 }
 
 fn lower_type_param(

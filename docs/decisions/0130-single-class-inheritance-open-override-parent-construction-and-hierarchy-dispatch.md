@@ -320,7 +320,7 @@ compiled class ABI, or Stage 35/35a behavior.
   lifecycle-phase dispatch rather than one isolated class body.
 - Incremental fingerprints, compiler metadata clients, official editor tooling,
   active docs, parity matrices, examples, and mechanical guards must describe
-  Stage 34 as complete and Stage 35 authority as accepted with Slice 1 next.
+  Stage 34 as complete and Stage 35 Slice 1 as complete with Slice 2 next.
 - The separate website later needs its class, override, parent construction,
   narrowing, Error hierarchy, performance, editor, and Stage-34 UAT surfaces
   synchronized; this compiler work does not modify that repository.

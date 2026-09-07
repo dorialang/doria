@@ -451,6 +451,7 @@ fn append_item_signature(surface: &mut String, item: &Item, source_text: &str) {
         Item::Class(class) => {
             surface.push_str("class:");
             append_access(surface, class.access);
+            surface.push(if class.is_open { 'o' } else { '-' });
             surface.push_str(&class.name);
             append_type_params(surface, &class.type_params);
             surface.push_str("extends:");
@@ -459,7 +460,7 @@ fn append_item_signature(surface: &mut String, item: &Item, source_text: &str) {
             }
             surface.push_str("implements:");
             for implemented in &class.implements {
-                surface.push_str(implemented);
+                surface.push_str(&implemented.to_string());
                 surface.push(',');
             }
             for member in &class.members {
@@ -488,11 +489,20 @@ fn append_item_signature(surface: &mut String, item: &Item, source_text: &str) {
             surface.push_str("interface:");
             append_access(surface, value.access);
             surface.push_str(&value.name);
+            append_type_params(surface, &value.type_params);
+            for parent in &value.parents {
+                surface.push_str("extends:");
+                surface.push_str(&parent.to_string());
+            }
+            for requirement in &value.requirements {
+                append_function_signature(surface, "requirement", requirement, source_text);
+            }
         }
         Item::Trait(value) => {
             surface.push_str("trait:");
             append_access(surface, value.access);
             surface.push_str(&value.name);
+            append_type_params(surface, &value.type_params);
             for member in &value.members {
                 append_member_signature(surface, member, source_text);
             }
@@ -522,6 +532,7 @@ fn append_member_signature(surface: &mut String, member: &ClassMember, source_te
             surface.push_str(&property.ty.to_string());
             surface.push(':');
             surface.push_str(&property.name);
+            append_optional_expression(surface, property.initializer.as_ref(), source_text);
         }
         ClassMember::Method(function) => {
             append_function_signature(surface, "method", function, source_text)
@@ -532,6 +543,14 @@ fn append_member_signature(surface: &mut String, member: &ClassMember, source_te
             surface.push_str(&value.name);
             append_optional_type(surface, value.ty.as_ref());
             append_expression(surface, &value.initializer, source_text);
+        }
+        ClassMember::Uses(composition) => {
+            surface.push_str("uses:");
+            surface.push_str(
+                source_text
+                    .get(composition.span.start..composition.span.end)
+                    .unwrap_or(""),
+            );
         }
     }
 }
@@ -545,6 +564,8 @@ fn append_function_signature(
     surface.push_str(kind);
     surface.push(':');
     append_access(surface, function.access);
+    surface.push(if function.is_open { 'o' } else { '-' });
+    surface.push(if function.is_override { 'v' } else { '-' });
     surface.push(if function.is_static { 's' } else { '-' });
     surface.push(if function.writable_this { 'w' } else { 'r' });
     surface.push_str(&function.name);
@@ -580,6 +601,29 @@ fn append_function_signature(
         for entry in &throws.entries {
             surface.push_str(&entry.ty.to_string());
             surface.push(',');
+        }
+    }
+    match &function.body {
+        crate::ast::FunctionBody::Requirement { .. } => surface.push_str("requirement;"),
+        crate::ast::FunctionBody::Block(body) => {
+            surface.push_str("body;");
+            // Return provenance and inferred return types are part of the callable
+            // contract. A body edit may change them without changing its spelling.
+            let fixed_scalar_return = function.return_type.as_ref().is_some_and(|ty| {
+                ty.function.is_none()
+                    && ty.arguments.is_empty()
+                    && ty.grouped.is_none()
+                    && (crate::types::IntegerType::from_source_name(&ty.name).is_some()
+                        || crate::types::FloatType::from_source_name(&ty.name).is_some()
+                        || matches!(ty.name.as_str(), "void" | "bool" | "string"))
+            });
+            if !fixed_scalar_return {
+                surface.push_str(
+                    source_text
+                        .get(body.span.start..body.span.end)
+                        .unwrap_or(""),
+                );
+            }
         }
     }
 }

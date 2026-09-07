@@ -15,6 +15,7 @@ pub mod codegen_native;
 pub mod codegen_php;
 pub mod collection_diagnostics;
 pub mod compilation_graph;
+pub mod compiler_known_contracts;
 pub mod compiler_known_io;
 pub mod compiler_known_test;
 pub mod const_eval;
@@ -638,6 +639,18 @@ fn append_compiler_known_semantic_context(
     source_texts: &mut std::collections::HashMap<source::SourceId, &str>,
     contexts: &mut std::collections::HashMap<source::SourceId, CompilationContext>,
 ) {
+    source_texts.insert(
+        compiler_known_contracts::SOURCE_ID,
+        compiler_known_contracts::SOURCE_TEXT,
+    );
+    contexts.insert(
+        compiler_known_contracts::SOURCE_ID,
+        CompilationContext {
+            edition: context.edition,
+            package: names::PackageIdentity::CompilerKnown,
+            source: names::SourceIdentity(compiler_known_contracts::SOURCE_NAME.to_string()),
+        },
+    );
     if !ast_uses_compiler_known_source(program) {
         return;
     }

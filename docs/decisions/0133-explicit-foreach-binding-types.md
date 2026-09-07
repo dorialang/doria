@@ -101,5 +101,5 @@ or new collection/index roles. Decision 0134 assigns public `Iterable<T>` and
   `as writable $value`, or `as $index => $value` as valid Doria are stale.
 - Website and external UAT examples must use `as T $value` and
   `as int $index => T $value` after their compiler/tooling integration updates.
-- Decision 0134 accepts Stage 35 authority; Slice 1 is the next implementation
-  unit.
+- Decision 0134 accepts Stage 35 authority; Slice 1 is complete and Slice 2
+  is the next implementation unit.

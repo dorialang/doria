@@ -45,7 +45,7 @@ class Box {
 }
 
 #[test]
-fn compiler_known_constraints_are_checked_and_user_constraints_wait_for_stage_35() {
+fn compiler_known_constraints_are_checked_and_unknown_constraints_are_rejected() {
     doriac::check_source(
         "stage24-constraint-ok.doria",
         r#"
@@ -74,9 +74,7 @@ function main(): void {}
 "#,
     );
     assert!(errors.iter().any(|diagnostic| {
-        diagnostic.code == "E0533"
-            && diagnostic.message.contains("UserComparable")
-            && diagnostic.message.contains("Stage 35")
+        diagnostic.code == "E0750" && diagnostic.message.contains("UserComparable")
     }));
 }
 

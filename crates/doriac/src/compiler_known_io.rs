@@ -396,7 +396,8 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
         extends_span: None,
         parent_span: None,
         modifier_prefix_span: span,
-        implements: vec!["Error".to_string()],
+        implements: vec![TypeRef::named("Error")],
+        syntax: crate::ast::TypeDeclarationSyntax::synthetic(span),
         members: vec![ClassMember::Method(FunctionDecl {
             access: MemberAccess::External,
             access_span: None,
@@ -414,10 +415,11 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
             params,
             return_type: None,
             throws: None,
-            body: Block {
+            body: crate::ast::FunctionBody::Block(Block {
                 statements: Vec::new(),
                 span,
-            },
+            }),
+            syntax: Box::new(crate::ast::FunctionSyntax::synthetic(span)),
             modifier_prefix_span: span,
             span,
         })],

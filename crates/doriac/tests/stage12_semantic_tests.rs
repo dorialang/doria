@@ -295,7 +295,7 @@ fn cfg_nodes_retain_source_spans() {
             _ => None,
         })
         .expect("function should exist");
-    let analysis = doriac::return_analysis::analyze(function);
+    let analysis = doriac::return_analysis::analyze(function).expect("executable function");
     let branch = analysis
         .graph
         .nodes

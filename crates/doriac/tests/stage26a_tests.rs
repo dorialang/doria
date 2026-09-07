@@ -19,7 +19,7 @@ fn parser_preserves_one_initializer_and_each_binding_span() {
     let Item::Function(function) = &program.items[0] else {
         panic!("expected function");
     };
-    let Stmt::VarDecl(declaration) = &function.body.statements[0] else {
+    let Stmt::VarDecl(declaration) = &function.body.statements()[0] else {
         panic!("expected local declaration");
     };
     assert!(declaration.writable);
