@@ -1406,9 +1406,10 @@ function renderRecord(string $id): string
 
 A `try` statement requires at least one `catch` or `finally`; catches precede
 the optional finalizer. Catch bindings are optional. A present binding is owned,
-readonly, and catch-scoped. Concrete catches match exact concrete Error identity
-in Stage 29; `catch (Error)` catches every checked error. Duplicate catches,
-catches after `Error`, and catches proven unable to match a protected effect are
+readonly, and catch-scoped. Concrete catches cover the named Error class and its
+descendants (Decision 0130); `catch (Error)` catches every checked error.
+Source order applies: a parent catch makes a later descendant catch unreachable.
+Duplicate catches, catches after `Error`, and catches proven unable to match a protected effect are
 unreachable. Catch bodies are independent: sibling catches do not handle an
 error raised by another catch. A checked Error may escape `finally`; a catch on
 that same `try` does not cover it, while a finalizer-local or outer catch may.

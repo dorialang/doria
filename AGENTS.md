@@ -310,7 +310,8 @@ These are identity, not scope deferral. They do not become available later, and 
   requiring explicit `implements Error` and an external readonly stored
   `string $message`; promoted readonly `message` satisfies it. `throw` is a
   statement that transfers owned Error values, `throws` follows an explicit
-  callable return type, concrete catches are exact, `catch (Error)` is the
+  callable return type, concrete catches cover the named class and descendants
+  (Decision 0130), `catch (Error)` is the
   catch-all, and callers catch or declare every effect. Catch bindings are
   optional, checked cleanup does not roll back side effects, and failed
   construction runs no class destructor. Stage 29 Slice 1 checking and AST/HIR

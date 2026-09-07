@@ -60,6 +60,14 @@ function check_stage34_inheritance(string $root): array
         $files[$key] = $read($path);
     }
 
+    $require('AGENTS.md', $read('AGENTS.md'), [
+        'concrete catches cover the named class and descendants',
+    ]);
+    $require($paths['spec'], $files['spec'], [
+        'Concrete catches cover the named Error class and its',
+        'Source order applies: a parent catch makes a later descendant catch unreachable',
+    ]);
+
     $require($paths['decision'], $files['decision'], [
         '# Decision 0130:',
         '**Status:** Accepted',
@@ -72,6 +80,8 @@ function check_stage34_inheritance(string $root): array
         'Metadata schemas 1, 2, and',
         'processor protocol version 1 remain exact',
         'Stage 35 may',
+        'catch cover descendants',
+        'Typed `toThrow` inspectors',
         'reuse private descriptor infrastructure for interface fat pointers',
     ]);
     foreach (['guide', 'plan', 'pipeline', 'spec'] as $key) {

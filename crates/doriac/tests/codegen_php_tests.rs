@@ -3530,7 +3530,7 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 }
 
 #[test]
-fn php_backend_executes_checked_errors_with_doria_descriptor_dispatch() {
+fn php_backend_executes_checked_errors_with_doria_catch_coverage() {
     let fixtures = [
         (
             "checked-error-catch.doria",
@@ -3541,6 +3541,11 @@ fn php_backend_executes_checked_errors_with_doria_descriptor_dispatch() {
             "checked-error-catch-all.doria",
             include_str!("../../../examples/native/main_checked_error_catch_all.doria"),
             "catch all\n",
+        ),
+        (
+            "checked-error-hierarchy.doria",
+            include_str!("../../../examples/native/main_stage34_inheritance_error_catch.doria"),
+            "catch missing\n",
         ),
         (
             "checked-error-optional-binding.doria",

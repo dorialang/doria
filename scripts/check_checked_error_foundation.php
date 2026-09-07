@@ -98,6 +98,7 @@ $require($decisionPath, $decision, [
     'A binding is optional',
     'owned readonly',
     'concrete catch matches exact concrete identity',
+    'supersedes that Stage 29 restriction: a parent Error catch covers descendants',
     '`catch (Error)`',
     'matches every checked error',
     'unable to match any',
