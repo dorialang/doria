@@ -335,3 +335,4 @@ examples/native/main_stage35_interface_shared_weak.doria
 examples/native/main_stage35_interface_shared_access.doria
 examples/native/main_stage35_interface_shared_storage.doria
 examples/native/main_stage35_interface_shared_closures.doria
+examples/native/main_stage35_interface_argument_cleanup.doria

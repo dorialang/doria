@@ -3808,6 +3808,10 @@ fn validate_indirect_arguments(
             )));
         }
         validate_rvalue(program, caller, argument)?;
+        require_tracked_interface_argument(
+            argument,
+            parameter.mode == mir::FunctionParameterMode::Take,
+        )?;
         if parameter.mode == mir::FunctionParameterMode::Writable {
             require_writable_interface_argument(program, caller, argument)?;
         }
@@ -16704,6 +16708,10 @@ fn validate_call_args_for_params(
                 | mir::Type::NullableInterface(_)
         );
         let promoted_transfer = promoted_transfers.is_some_and(|indices| indices.contains(&index));
+        require_tracked_interface_argument(
+            argument,
+            parameter_definition.owned || promoted_transfer,
+        )?;
         if matches!(
             parameter_type,
             mir::Type::Interface(_) | mir::Type::NullableInterface(_)
@@ -16835,6 +16843,25 @@ fn validate_call_args_for_params(
             }
             borrowed_class_locals.insert(local, mode);
         }
+    }
+    Ok(())
+}
+
+fn require_tracked_interface_argument(
+    argument: &mir::Rvalue,
+    taken: bool,
+) -> Result<(), BackendError> {
+    if !taken
+        && matches!(
+            argument.ty(),
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+        )
+        && !argument.is_null_value()
+        && !argument.borrows_move_value()
+    {
+        return Err(malformed_mir(
+            "borrowed interface argument requires a tracked temporary owner",
+        ));
     }
     Ok(())
 }

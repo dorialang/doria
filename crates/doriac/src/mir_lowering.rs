@@ -11818,7 +11818,7 @@ fn lower_call_argument(
     mode: mir::FunctionParameterMode,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<mir::Rvalue> {
-    match mode {
+    let value = match mode {
         mir::FunctionParameterMode::Take => lower_rvalue_as_expected(argument, expected, context),
         mir::FunctionParameterMode::Readonly => {
             lower_rvalue_as_borrowed(argument, expected, context)
@@ -11837,6 +11837,20 @@ fn lower_call_argument(
             }
             lower_rvalue_as_borrowed(argument, expected, context)
         }
+    }?;
+    // Erasure carries ownership, not just a pointer. Keep a borrowed argument's
+    // temporary owner in the statement scope, including checked failure edges.
+    if mode != mir::FunctionParameterMode::Take
+        && matches!(
+            expected,
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+        )
+        && !value.is_null_value()
+        && !value.borrows_move_value()
+    {
+        Ok(hoist_argument_temporary(value, expected, mode, context))
+    } else {
+        Ok(value)
     }
 }
 
@@ -11923,10 +11937,7 @@ fn lower_call_args_with_ownership(
         // checked from the lowered MIR rather than an expression-shape list:
         // constructing even a syntactically-pure collection affects destruction
         // order. The call vector then reads those locals in parameter order.
-        let owns_temporary = lowered.owned_temporary_class().is_some()
-            || lowered.owned_temporary_collection().is_some()
-            || lowered.owned_temporary_shared().is_some()
-            || lowered.mixed_ownership().has_shell();
+        let owns_temporary = rvalue_has_owned_temporary(&lowered);
         lowered_args[param_index] = Some(
             if mode == mir::FunctionParameterMode::Writable
                 || in_order
@@ -11934,12 +11945,7 @@ fn lower_call_args_with_ownership(
             {
                 lowered
             } else {
-                hoist_argument_temporary(
-                    lowered,
-                    expected,
-                    mode == mir::FunctionParameterMode::Take,
-                    context,
-                )
+                hoist_argument_temporary(lowered, expected, mode, context)
             },
         );
     }
@@ -12013,7 +12019,7 @@ fn argument_evaluation_is_observable(expr: &hir::Expr) -> bool {
 fn hoist_argument_temporary(
     value: mir::Rvalue,
     ty: mir::Type,
-    transfers: bool,
+    mode: mir::FunctionParameterMode,
     context: &mut LoweringContext,
 ) -> mir::Rvalue {
     let borrowed_move_value = value.borrows_move_value();
@@ -12058,11 +12064,12 @@ fn hoist_argument_temporary(
             unreachable!("closure environments are not source arguments")
         }
     };
+    context.locals[local.0].writable = mode == mir::FunctionParameterMode::Writable;
     context.push_statement(mir::Statement::AssignLocal {
         target: local,
         value,
     });
-    read_local_as_rvalue(local, ty, transfers)
+    read_local_as_rvalue(local, ty, mode == mir::FunctionParameterMode::Take)
 }
 
 /// Read a temporary local back as an rvalue of its own type.

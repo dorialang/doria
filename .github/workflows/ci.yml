@@ -61,6 +61,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install PHP for compatibility parity and repository guards
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+
       - name: Install native leak checker
         run: |
           sudo apt-get update
@@ -320,6 +326,12 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      - name: Install PHP for compatibility parity
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
 
       - name: Configure MSVC developer environment
         if: runner.os == 'Windows'

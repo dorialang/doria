@@ -39,7 +39,9 @@ interface erasure. Slice 2 adds the `main_stage35_interface_*` fixture family:
 owned and borrowed dispatch, ancestor/sibling views, nullable/mixed patterns,
 properties, generic storage and closures, shared/weak/access chains, Error
 subinterfaces, Displayable, and exact cleanup. PHP syntax/execution checks reuse
-the same source and output sidecars. Structural tests check headerless payloads,
+the same source and output sidecars and require `php` on PATH. Compiler CI
+installs PHP explicitly in both the default and tier-1 LLVM jobs rather than
+depending on runner-image defaults. Structural tests check headerless payloads,
 two-word carrier/element widths, static vtables, direct constrained calls,
 constant-slot erased calls, allocation-free conversion, and entry-only scratch.
 Malformed-MIR tests independently reject invalid conformance/slot/ABI plans,
@@ -47,7 +49,7 @@ unproved refinements, expired roots, and escaped access leases. Cloneable
 widening, user-defined iteration loans, and trait flattening remain later
 slices with precise pre-HIR diagnostics.
 
-The 27 interface fixtures have exact output/status sidecars in the durable
+The 28 interface fixtures have exact output/status sidecars in the durable
 manifest. Linux CI also runs this entire fixture family under Valgrind for both
 native profiles, checking definite and indirect leaks; that platform evidence
 is separate from local macOS parity.

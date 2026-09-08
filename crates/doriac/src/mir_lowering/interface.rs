@@ -1223,6 +1223,73 @@ function main(): void {
     }
 
     #[test]
+    fn interface_argument_temporaries_drop_on_success_and_checked_failure() {
+        let source = include_str!(
+            "../../../../examples/native/main_stage35_interface_argument_cleanup.doria"
+        );
+        let program = lower_checked_source(source);
+        let expected = include_bytes!("../../tests/fixtures/native_io/main_stage35_interface_argument_cleanup/expected_stdout");
+        let output = crate::mir_interpreter::interpret(&program).unwrap();
+        assert_eq!(output.stdout, expected);
+        assert_eq!(output.exit_status, 0);
+        assert_native_output(&program, expected);
+        assert_php_output(source, expected);
+    }
+
+    #[test]
+    fn interface_arguments_reject_untracked_temporary_owners() {
+        let program = lower_checked_source(
+            r#"
+interface Value { function read(): int; }
+class Item implements Value { function read(): int { return 1; } }
+function read(Value $value): void { echo $value->read(); }
+function main(): void {
+    read(new Item());
+    let $callback = function(Value $value): void { read($value); };
+    $callback(new Item());
+}
+"#,
+        );
+        for indirect in [false, true] {
+            let mut changed = program.clone();
+            let main = changed
+                .functions
+                .iter_mut()
+                .find(|function| function.name == "main")
+                .unwrap();
+            let owner = main
+                .blocks
+                .iter()
+                .flat_map(|block| &block.statements)
+                .find_map(|statement| match statement {
+                    mir::Statement::AssignLocal {
+                        value: value @ mir::Rvalue::Interface(_),
+                        ..
+                    } if !value.borrows_move_value() => Some(value.clone()),
+                    _ => None,
+                })
+                .unwrap();
+            let args = main
+                .blocks
+                .iter_mut()
+                .find_map(|block| match &mut block.terminator {
+                    mir::Terminator::CheckedCall { args, .. } if !indirect => Some(args),
+                    mir::Terminator::CheckedIndirectCall { args, .. } if indirect => Some(args),
+                    _ => None,
+                })
+                .unwrap();
+            args[0] = owner;
+            let error = crate::mir_validation::validate_program(&changed).unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains("borrowed interface argument requires a tracked temporary owner"),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
     fn checked_renderable_source_lowers_to_a_static_interface_entry() {
         let program = lower_checked_source(include_str!(
             "../../../../examples/native/main_stage35_interface_dispatch.doria"
