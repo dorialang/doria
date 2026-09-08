@@ -3540,6 +3540,12 @@ fn lower_statement(
             };
             let old_value = if replaces {
                 match property_definition.ty {
+                    ty if ty.shared_interface().is_some() => Some(builder.ins().load(
+                        pointer_type,
+                        cranelift_codegen::ir::MachMemFlags::trusted(),
+                        address,
+                        0,
+                    )),
                     mir::Type::String
                     | mir::Type::Mixed
                     | mir::Type::NullableMixed

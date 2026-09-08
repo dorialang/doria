@@ -200,6 +200,8 @@ jobs:
         run: |
           for source in examples/native/main_stage35_interface_*.doria; do
             name=$(basename "$source" .doria)
+            # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
+            if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi
             target/debug/doriac compile "$source" --out "build/native/${name}"
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
           done
@@ -546,6 +548,8 @@ jobs:
         run: |
           for source in examples/native/main_stage35_interface_*.doria; do
             name=$(basename "$source" .doria)
+            # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
+            if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi
             target/debug/doriac compile "$source" --release --out "build/native/${name}_release"
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}_release"
           done

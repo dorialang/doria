@@ -97,6 +97,43 @@ fn durable_interface_fixtures_preserve_php_execution_and_cleanup() {
     }
 }
 
+#[test]
+fn php_host_collection_and_shutdown_preserve_strong_cycles() {
+    use std::process::Command;
+    let source =
+        include_str!("../../../examples/native/main_stage35_interface_strong_cycles.doria");
+    let hir = doriac::lower_source("shared-cycles.doria", source).unwrap();
+    let mir = doriac::mir_lowering::lower_program(&hir).unwrap();
+    let expected = doriac::mir_interpreter::interpret(&mir).unwrap().stdout;
+    let php = doriac::codegen_php::generate(&hir, Some(&mir)).unwrap();
+    for enabled in [true, false] {
+        let script = format!(
+            "{}\n{}\n__DoriaFunction_6d61696e(); echo \"before host collection\\n\"; gc_collect_cycles(); echo \"after host collection\\n\";
+            $control = new __DoriaSharedControl(new stdClass());
+            $observed = WeakReference::create($control);
+            $owner = new __DoriaSharedHandle($control, 0);
+            unset($control);
+            __doria_drop_value($owner);
+            gc_collect_cycles();
+            if ($observed->get() !== null) {{ throw new LogicException(\"released control block retained\"); }}",
+            if enabled { "gc_enable();" } else { "gc_disable();" },
+            php.strip_prefix("<?php").unwrap(),
+        );
+        let output = Command::new("php").args(["-r", &script]).output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        assert_eq!(
+            output.stdout,
+            [
+                expected.as_slice(),
+                b"before host collection\nafter host collection\n"
+            ]
+            .concat(),
+            "host GC enabled: {enabled}"
+        );
+    }
+}
+
 fn interface_dispatch_mir() -> mir::Program {
     let mut program = doriac::lower_source_to_mir(
         "interface-entry.doria",

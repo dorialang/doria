@@ -40,6 +40,38 @@ fn php_function_name(name: &str) -> String {
 }
 
 #[test]
+fn unhandled_error_cleanup_does_not_depend_on_php_shutdown() {
+    let php = doriac::compile_source_to_php(
+        "unhandled-cleanup.doria",
+        r#"
+class Failure implements Error {
+    function __construct(string $message) {}
+    function __destruct(): void { try { echo "drop error\n"; } catch (Error) {} }
+}
+function main(): void throws Failure { throw new Failure("expected failure"); }
+"#,
+    )
+    .unwrap();
+    let output = Command::new("php")
+        .args([
+            "-r",
+            &format!(
+                "{}\n{}();",
+                php.strip_prefix("<?php").unwrap(),
+                php_function_name("main")
+            ),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(70), "{output:?}");
+    assert_eq!(output.stdout, b"drop error\n");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("Error[R1000]"),
+        "{output:?}"
+    );
+}
+
+#[test]
 fn stage32_attributes_are_metadata_only_in_php_output() {
     let source = include_str!("../../../examples/native/main_stage32_attributes.doria");
     let php = doriac::compile_source_to_php("main_stage32_attributes.doria", source)

@@ -95,12 +95,17 @@ function __doria_shared_release_count(int &$count): void
 
 final class __DoriaSharedControl
 {
+    // PHP reachability must not replace Doria's explicit strong-count lifetime.
+    private static array $livePayloads = [];
     public int $strong = 1;
     public int $weak = 0;
     public int $readers = 0;
     public bool $writer = false;
 
-    public function __construct(public ?object $payload) {}
+    public function __construct(public ?object $payload)
+    {
+        self::$livePayloads[spl_object_id($this)] = $this;
+    }
 
     public function release(): void
     {
@@ -111,6 +116,7 @@ final class __DoriaSharedControl
         }
         $payload = $this->payload;
         $this->payload = null;
+        unset(self::$livePayloads[spl_object_id($this)]);
         __doria_drop_value($payload);
     }
 }
@@ -194,8 +200,7 @@ final class __DoriaSharedHandle
 
     public function __destruct()
     {
-        global $__doria_panicking;
-        if (!$__doria_panicking) { $this->drop(); }
+        if (__doria_cleanup_enabled()) { $this->drop(); }
     }
 }
 "#;

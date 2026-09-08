@@ -752,8 +752,11 @@ shared/weak/access families retain the interface view beside the existing
 control-block pointer, with access release before owner release.
 
 The interpreter, Cranelift, LLVM, and PHP preserve these ownership and checked
-outcome contracts. MIR validation rejects wrong slots, specializations, effects,
-unproved narrowing, moved owners, and views escaping their owner or lease.
+outcome contracts. PHP roots live shared control blocks until their explicit
+final strong release and suppresses host-shutdown cleanup, preserving intentional
+strong cycles without invoking their Doria destructors. MIR validation rejects
+wrong slots, specializations, effects, unproved narrowing, moved owners, and
+views escaping their owner or lease.
 Durable `main_stage35_interface_*` fixtures cover the runtime cross-product;
 malformed-MIR tests and emitted-IR checks cover independent soundness and
 allocation/layout invariants. E0758 is retired and reserved; E0759 still owns

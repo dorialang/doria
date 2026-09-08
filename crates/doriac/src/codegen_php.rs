@@ -87,7 +87,7 @@ final class __DoriaCheckedError extends Exception
 
     public function __destruct()
     {
-        $this->dropError();
+        if (__doria_cleanup_enabled()) { $this->dropError(); }
     }
 }
 
@@ -442,18 +442,18 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
         $facts = $error->__doriaAssertionFacts();
         $v4 = getenv("DORIA_RUNTIME_OUTCOME_V4");
         if (is_string($v4) && __doria_write_assertion_outcome_v4($caught, $facts, $v4)) {
-            unset($caught);
+            $caught->dropError();
             exit(70);
         }
     }
     $v3 = getenv("DORIA_RUNTIME_OUTCOME_V3");
     if (!$assertion && is_string($v3) && __doria_write_error_outcome_v3($caught, $v3)) {
-        unset($caught);
+        $caught->dropError();
         exit(70);
     }
     if ($assertion && !is_string(getenv("DORIA_RUNTIME_OUTCOME_V4")) &&
         is_string($v3) && __doria_write_error_outcome_v3($caught, $v3)) {
-        unset($caught);
+        $caught->dropError();
         exit(70);
     }
     if ($assertion) {
@@ -469,7 +469,7 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
             "\n\nWhy\n  " . __doria_safe_error_message($error->message) .
             "\n\nProcess Exited With Status 70\n";
         @fwrite(STDERR, $message);
-        unset($caught);
+        $caught->dropError();
         exit(70);
     }
     $message = "Error[R1000]: Unhandled " . $type . "\n\nWhere\n" .
@@ -480,7 +480,7 @@ function __doria_report_unhandled_error(__DoriaCheckedError $caught): void
         __doria_safe_error_message($error->message) .
         "\n\nProcess Exited With Status 70\n";
     @fwrite(STDERR, $message);
-    unset($caught);
+    $caught->dropError();
     exit(70);
 }
 
@@ -897,6 +897,18 @@ function __doria_collection_projection(mixed $collection, bool $keys): array
 
 const PHP_CLOSURE_BASE_RUNTIME: &str = r#"
 $__doria_panicking = false;
+$__doria_shutting_down = false;
+register_shutdown_function(static function (): void {
+    global $__doria_shutting_down;
+    $__doria_shutting_down = true;
+});
+
+function __doria_cleanup_enabled(): bool
+{
+    global $__doria_panicking, $__doria_shutting_down;
+    // Host shutdown may reclaim leaked graphs, but must not execute Doria drops.
+    return !$__doria_panicking && !$__doria_shutting_down;
+}
 
 interface __DoriaFunctionValue
 {
@@ -907,8 +919,7 @@ interface __DoriaOwnedObject {}
 
 function __doria_begin_destroy(object $value, string $class): bool
 {
-    global $__doria_panicking;
-    if ($__doria_panicking) { return false; }
+    if (!__doria_cleanup_enabled()) { return false; }
     static $destroyed;
     $destroyed ??= new WeakMap();
     $completed = $destroyed[$value] ?? [];
@@ -940,6 +951,7 @@ function __doria_take_cell(__DoriaCell $cell): mixed
 
 function __doria_drop_value(mixed &$value): void
 {
+    if (!__doria_cleanup_enabled()) { return; }
     if ($value instanceof __DoriaMixedValue) {
         $payload = $value->value();
         __doria_drop_value($payload);
@@ -1089,8 +1101,7 @@ fn emit_php_closure_environment(
     output.push('\n');
     writeln(output, 1, "public function __destruct()");
     writeln(output, 1, "{");
-    writeln(output, 2, "global $__doria_panicking;");
-    writeln(output, 2, "if ($__doria_panicking) { return; }");
+    writeln(output, 2, "if (!__doria_cleanup_enabled()) { return; }");
     writeln(
         output,
         2,
@@ -1235,8 +1246,7 @@ fn emit_php_closure_carrier(
     output.push('\n');
     writeln(output, 1, "public function __destruct()");
     writeln(output, 1, "{");
-    writeln(output, 2, "global $__doria_panicking;");
-    writeln(output, 2, "if ($__doria_panicking) { return; }");
+    writeln(output, 2, "if (!__doria_cleanup_enabled()) { return; }");
     writeln(
         output,
         2,

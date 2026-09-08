@@ -2,9 +2,27 @@ interface Named { function name(): string; }
 class Name implements Named {
     function __construct(string $text) {}
     function name(): string { return $this->text; }
-    function __destruct(): void { try { echo "drop;"; } catch (Error $error) {} }
+    function __destruct(): void { try { echo "drop;\n"; } catch (Error $error) {} }
 }
 class Holder { function __construct(take SharedReference<Named> $value) {} }
+class ReplaceableHandles {
+    writable ?SharedReference<Named> $strong = null;
+    writable ?WeakReference<Named> $weak = null;
+    writable ?WritableSharedReference<Named> $writableStrong = null;
+    writable ?WritableWeakReference<Named> $writableWeak = null;
+    writable function replace(SharedReference<Named> $owner, WritableSharedReference<Named> $writableOwner): void {
+        $this->strong = $owner->share();
+        $this->weak = $owner->createWeakReference();
+        $this->writableStrong = $writableOwner->share();
+        $this->writableWeak = $writableOwner->createWeakReference();
+    }
+    writable function clear(): void {
+        $this->strong = null;
+        $this->weak = null;
+        $this->writableStrong = null;
+        $this->writableWeak = null;
+    }
+}
 function inspect(SharedReference<Named> $value): void { echo $value->name(); }
 function main(): void {
     SharedReference<Named> $owner = shared new Name("stored");
@@ -16,4 +34,11 @@ function main(): void {
     let $found = $map->get("key");
     if ($found != null) { inspect($found); }
     echo $map->get("missing")?->name() ?? "absent";
+    {
+        let writable $handles = new ReplaceableHandles();
+        let $writableOwner = new WritableSharedReference<Named>(new Name("writable"));
+        $handles->replace($owner, $writableOwner);
+        $handles->replace($owner, $writableOwner);
+        $handles->clear();
+    }
 }

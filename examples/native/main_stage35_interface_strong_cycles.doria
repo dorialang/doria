@@ -1,0 +1,33 @@
+interface ParentView { function name(): string; }
+interface ChildView { writable function attach(take SharedReference<ParentView> $parent): void; }
+
+class CycleParent implements ParentView
+{
+    function __construct(take WritableSharedReference<ChildView> $child) {}
+    function name(): string { return "parent"; }
+    function __destruct(): void { try { echo "drop parent\n"; } catch (Error) {} }
+}
+
+class CycleChild implements ChildView
+{
+    writable ?SharedReference<ParentView> $parentReference = null;
+    writable function attach(take SharedReference<ParentView> $parent): void
+    {
+        $this->parentReference = $parent;
+    }
+    function __destruct(): void { try { echo "drop child\n"; } catch (Error) {} }
+}
+
+function makeCycle(): void
+{
+    let $child = new WritableSharedReference<ChildView>(new CycleChild());
+    SharedReference<ParentView> $parent = shared new CycleParent($child->share());
+    let writable $access = $child->acquireWritableAccess();
+    $access->attach($parent->share());
+}
+
+function main(): void
+{
+    makeCycle();
+    echo "strong cycle retained\n";
+}
