@@ -1182,7 +1182,8 @@ AC: legal/illegal borrow and ctor fixture matrix; borrow-conflict diagnostic sna
     ownership families, and interpreter/Cranelift/LLVM/PHP parity.
   - **Slice 3 — Next: Core Contracts And Public Iteration.** Implement
     Comparable, Equatable, Hashable, Cloneable, Copy-to-Cloneable widening,
-    nonescaping Iterator source loans, user-defined value-only `foreach`, and
+    nonescaping Iterator source loans through promoted `borrow` constructor
+    parameters, `getCurrent()`, user-defined value-only `foreach`, and
     optimized built-in integration. Decision 0133's explicit binding types and
     Decision 0132's built-in first-binding roles remain exact.
   - **Slice 4 — Scheduled: Trait Composition.** Implement recursive generic

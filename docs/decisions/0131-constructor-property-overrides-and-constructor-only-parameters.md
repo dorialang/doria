@@ -2,7 +2,9 @@
 
 > **Stage 35 amendment:** Decision 0134 places flattened trait properties after
 > inherited storage and in exact class-body expansion order, before existing
-> promoted constructor-property ordering. It does not change constructor roles.
+> promoted constructor-property ordering. Its Slice 3 amendment adds the narrow
+> iterator-source `borrow` mode to promoted constructor parameters; ordinary
+> constructor roles and owned promotion remain unchanged.
 
 - **Status:** Accepted
 - **Accepted:** 2026-09-02

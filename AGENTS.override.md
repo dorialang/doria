@@ -46,6 +46,8 @@ accepted authority from current implementation.
 
 When Andrew explicitly asks for a walkthrough or simpler explanation:
 
+- treat simplification as a check of shared meaning, not a knowledge gap;
+- start with a contextual example in plain language and clarify assumptions;
 - explain the exact reasoning neutrally;
 - preserve technical precision;
 - separate accepted authority, current implementation, and future work;

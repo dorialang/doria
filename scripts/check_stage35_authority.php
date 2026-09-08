@@ -67,7 +67,10 @@ $require($paths['decision'], $files['decision'], [
     'function clone(): self;',
     'function iterator(): Iterator<T>;',
     'function hasCurrent(): bool;',
-    'function current(): T;',
+    'function getCurrent(): T;',
+    '`borrow T $source`',
+    'author obligation',
+    'memory safety',
     'writable function advance(): void;',
     'The compiler-known Iterator methods declare',
     'no checked Errors',
@@ -117,7 +120,7 @@ $require($paths['stdlib'], $files['stdlib'], [
     'clone(): self',
     'iterator(): Iterator<T>',
     'hasCurrent(): bool',
-    'current(): T',
+    'getCurrent(): T',
     'advance(): void',
     'Copy-or-Cloneable',
 ]);
@@ -177,12 +180,15 @@ foreach ($files as $key => $contents) {
 }
 
 $forbid($paths['decision'], $files['decision'], [
+    'function current(): T;',
     'TraitRef "::" Name "as" ("internal")? Name? ";"',
     'interface conversion allocates a wrapper',
     'primitives inhabit interface-typed slots',
     'runtime trait object is required',
     'property hooks are part of Stage 35',
 ]);
+
+$forbid($paths['stdlib'], $files['stdlib'], ['`current(): T`']);
 
 $require($paths['readme'], $files['readme'], [
     'currently provides `map`, `filter`',

@@ -9,6 +9,15 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Active
 
+- Stage 35 Slice 3's source-capture ruling is accepted, not implemented:
+  Decision 0134 specifies promoted `borrow` constructor parameters for iterator
+  source retention and renames the accessor to `getCurrent()`. The compiler's
+  Slice 1 declaration fixtures still use the earlier `current()` spelling;
+  migrating those declarations, return-borrow facts, diagnostics, tests, and
+  language-server/editor consumers belongs to Slice 3. Hash-key stability is an
+  author obligation, including shared or external state; contract violations
+  must not compromise memory safety. Neither this authority amendment nor the
+  updated agent guidance completes Slice 3 or changes installed tooling.
 - Stage 18 full expression interpolation and compiler-known `Displayable` is merged.
 - Stage 19 ownership, moves, destruction, and native class layout is complete on the current branch.
 - Stage 20 statically resolved instance/static methods, Copy-type static properties, class/top-level constants, `internal` enforcement, and concrete native `Displayable` execution are complete on the current branch. Static access is sigil-free, `self` resolves to the declaring class, and one class-level index rejects cross-kind member-name collisions.

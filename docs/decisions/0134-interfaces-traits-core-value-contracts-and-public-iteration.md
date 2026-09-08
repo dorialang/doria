@@ -300,12 +300,17 @@ membership. `==` and `!=` delegate to `equals` only for a statically valid
 Equatable contract. Nonconforming class equality remains identity. Nullable
 equality handles absence first and delegates only for two present values.
 
-`Hashable` returns `uint64`. Equal values produce equal hashes, and a key's hash
-is stable while stored. The returned value is not a persistence or wire-format
-guarantee across compiler/runtime versions. Hash collections apply private
-per-process keyed mixing for collision resistance. Keys are consumed and never
-exposed writable, so equality/hash-participating state cannot change while the
-key is stored. Shared-reference wrappers are not automatically Hashable.
+`Hashable` returns `uint64`. Equal values must produce equal hashes. Preserving
+equality/hash-participating state while a key is stored is an author obligation,
+including state reachable through explicit shared references or other external
+state used by these methods. Keys are consumed and never exposed writable, but
+that protects owned paths; it does not prove transitive immutability or prevent
+external aliases from changing shared state. This contract introduces no new
+static deep-immutability restriction, and violating its laws must not compromise
+memory safety. The returned hash is not a persistence or wire-format guarantee
+across compiler/runtime versions. Hash collections apply private per-process
+keyed mixing for collision resistance. Shared-reference wrappers are not
+automatically Hashable.
 
 `Displayable::toString` remains the only class display contract and creates no
 implicit string assignment conversion, `__toString`, primitive method, or cast.
@@ -367,7 +372,7 @@ interface Iterable<T>
 interface Iterator<T>
 {
     function hasCurrent(): bool;
-    function current(): T;
+    function getCurrent(): T;
     writable function advance(): void;
 }
 ```
@@ -376,9 +381,9 @@ These compiler-known interfaces carry one narrow provenance rule required by
 Move values:
 
 - `iterator()` creates an iterator carrier tied to a readonly source loan.
-- The carrier is Move and may own cursor state. A carrier containing a source
-  loan cannot be returned, stored, captured, or otherwise escape that loan.
-- `current()` returns a readonly element borrow tied to the iterator/source
+- The carrier is Move and may own cursor state. Returning, storing, or capturing
+  a carrier must not let it escape or outlive its source loan.
+- `getCurrent()` returns a readonly element borrow tied to the iterator/source
   loan, despite the ordinary `T` spelling. This is not a general hidden-borrow
   return rule.
 - `hasCurrent()` distinguishes exhaustion, so nullable elements remain valid
@@ -390,11 +395,90 @@ heap or per-iteration allocation. The compiler-known Iterator methods declare
 no checked Errors, as fixed by the core signatures above. `foreach` still routes
 checked exits from its body through iterator and source-loan cleanup.
 
-`foreach` acquires one iterator, checks `hasCurrent`, borrows `current`, runs the
-body, then advances. It releases the element, iterator, and source loan exactly
-once on exhaustion, `break`, `continue`, `return`, or checked exit. Nested and
-concurrent readonly iterators are valid; writable access to the source conflicts
-with every active readonly iterator loan.
+`foreach` acquires one iterator, checks `hasCurrent`, borrows `getCurrent`, runs
+the body, then advances. Each iteration releases its element borrow before
+advancing. A same-loop `continue` advances that same cursor without releasing
+its source loan. Exhaustion or an exit crossing the loop releases the element,
+iterator, and source loan exactly once. Nested and concurrent readonly iterators
+are valid; writable access to the source conflicts with every active readonly
+iterator loan.
+
+### Borrowed Source Construction
+
+The approved receiving-mode keyword is `borrow`, paired with `take`: `take`
+receives ownership; `borrow` receives temporary access while ownership stays
+with the source owner. In an iterator carrier, a promoted constructor parameter
+`borrow T $source` creates a retained readonly source relationship, not an owned
+property. Ordinary unmarked constructor promotion remains owning. No separate
+`borrowed`, `loan`, `loanable`, `rent`, or `lease` keyword is introduced.
+
+The carrier's source access remains tied to the original source after its
+constructor returns. Moving or returning the carrier preserves that dependency;
+it cannot escape or outlive the source loan. The compiler prevents conflicting
+source mutation. A writable cursor can advance its owned position but cannot
+mutate its borrowed source. Cleanup releases the loan without destroying the
+source. This adds neither implicit cloning nor mandatory shared ownership,
+runtime locking, or allocation. It does not authorize general borrowed fields
+in arbitrary classes; the retained-source facility is scoped to iterator
+carriers here.
+
+The following accepted example belongs to Stage 35 Slice 3, not the implemented
+Slices 1 and 2. The accessor is `getCurrent()`, replacing the earlier `current()`
+spelling; it remains a method, not a Stage 36 property hook.
+
+```doria
+class Book
+{
+    function __construct(string $title) {}
+}
+
+class BookShelf implements Iterable<Book>
+{
+    function __construct(take List<Book> $books) {}
+
+    function iterator(): Iterator<Book>
+    {
+        return new BookCursor($this->books);
+    }
+}
+
+class BookCursor implements Iterator<Book>
+{
+    writable int $position = 0;
+
+    function __construct(borrow List<Book> $source) {}
+
+    function hasCurrent(): bool
+    {
+        return $this->position < $this->source->count;
+    }
+
+    function getCurrent(): Book
+    {
+        return $this->source[$this->position];
+    }
+
+    writable function advance(): void
+    {
+        $this->position++;
+    }
+}
+
+function main(): void
+{
+    let $shelf = new BookShelf([
+        new Book("Doria"),
+        new Book("Compiler Design"),
+    ]);
+    foreach ($shelf as Book $book) {
+        echo "{$book->title}\n";
+    }
+}
+```
+
+The shelf owns the list and books; the cursor owns its position and borrows the
+same list. After the loop, the shelf still owns every book, and another loop
+creates an independent cursor starting at zero.
 
 User-defined iteration is value-only in Stage 35:
 
@@ -413,7 +497,7 @@ nullable element and would make an ordinary return own a Move element, forcing
 removal or cloning. Callback traversal complicates structured exits and checked
 effects. Universal integer cursors impose unsuitable complexity on linked
 structures. Mandatory owning or heap iterators prevent ordinary borrowed
-container traversal. The accepted current/advance carrier keeps ownership and
+container traversal. The accepted getCurrent/advance carrier keeps ownership and
 control flow explicit in compiler facts.
 
 ## Built-In Collection Integration

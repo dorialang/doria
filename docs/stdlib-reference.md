@@ -56,8 +56,11 @@ contracts, and public iteration), and 0079 (`Displayable`).
 - **`Equatable<T>`** — readonly `equals(T $other): bool`; explicit value-equality
   conformance for `==`/`!=`. Nonconforming class equality remains identity.
 - **`Hashable`** — readonly `hash(): uint64` for Dictionary/Set keys. Equal values
-  yield equal hashes; the value is stable while stored but is not a persistent
-  cross-version format. Hash tables add private per-process keyed mixing.
+  must yield equal hashes. Authors must preserve equality/hash-participating
+  state while a key is stored, including shared or external state; owned-key
+  storage is not a compiler guarantee of transitive immutability. Violations
+  must not compromise memory safety. Hashes are not a persistent cross-version
+  format. Hash tables add private per-process keyed mixing.
 - **`Displayable`** — `toString(): string`; Doria's answer to `__toString`, drives interpolation / `.` / `echo` (§4.6, 0079).
 - **`Cloneable`** — readonly nonthrowing `clone(): self`; author-provided explicit
   duplication returning an independently owned value of the same dynamic class.
@@ -118,14 +121,19 @@ object's lifetime before the surrounding function continues.
 
 ### Iteration
 - **`Iterable<T>`** — readonly `iterator(): Iterator<T>`.
-- **`Iterator<T>`** — readonly `hasCurrent(): bool`, readonly `current(): T`, and
+- **`Iterator<T>`** — readonly `hasCurrent(): bool`, readonly `getCurrent(): T`, and
   writable `advance(): void`. A borrowed iterator carries a compiler-owned
-  nonescaping readonly source loan; `current()` borrows one element and
+  nonescaping readonly source loan; `getCurrent()` borrows one element and
   `hasCurrent()` keeps nullable elements distinct from exhaustion. User-defined
   Stage 35 iteration is value-only and every binding remains explicitly typed.
   Built-in collections retain their optimized compiler-internal plans and exact
   sequence-index/dictionary-key roles; deliberate erasure alone uses the public
   protocol carrier.
+
+Decision 0134's `borrow` receiving mode on an iterator's promoted constructor
+parameter retains readonly source access instead of ownership. Cursor state
+remains independently owned; releasing the cursor does not destroy its source.
+This is an iterator-carrier facility, not general borrowed class fields.
 
 ### Ranges and math basics
 - **Range types** — `a..b` (inclusive) / `a..<b` (exclusive-end); `int` endpoints; used with `foreach` (SPEC control flow).
