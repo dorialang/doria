@@ -1,0 +1,29 @@
+interface Named { function name(): string; }
+interface Counter { writable function set(int $next): void; function count(): int; }
+class Value implements Named, Counter {
+    writable int $number = 0;
+    function name(): string { return "value"; }
+    writable function set(int $next): void { $this->number = $next; }
+    function count(): int { return $this->number; }
+    function __destruct() { try { echo "drop"; } catch (Error) {} }
+}
+class Other implements Named {
+    function name(): string { return "other"; }
+    function __destruct() { try { echo "other-drop"; } catch (Error) {} }
+}
+function set(writable Named $value, int $next): void {
+    if ($value is Counter) { $value->set($next); echo $value->count(); }
+}
+function inspect(Named $value): string {
+    return match ($value) { Counter $counter => "counter {$counter->count()}", default => "no-counter" };
+}
+function consume(take Named $value): string {
+    return match (take $value) { Value $concrete => $concrete->name() . "!", Counter $counter => "counter", default => "other" };
+}
+function main(): void {
+    writable Named $value = new Value();
+    set($value, 1);
+    echo inspect($value);
+    echo consume($value);
+    echo consume(new Other());
+}

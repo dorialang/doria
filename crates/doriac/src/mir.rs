@@ -38,6 +38,26 @@ pub struct FinalizerRegionId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ErrorDescriptorId(pub usize);
 
+/// An invariant, fully substituted interface specialization. Error occupies
+/// the first identity so checked outcomes use the ordinary interface carrier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InterfaceTypeId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct InterfaceVtableId(pub usize);
+
+/// Concrete payload identity is independent of the interface view. Collection
+/// identities are reserved for compiler-known implementers, not fake classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ImplementingType {
+    Class(ClassId),
+    Collection(CollectionTypeId),
+}
+
+impl InterfaceTypeId {
+    pub const ERROR: Self = Self(0);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ErrorOriginId(pub usize);
 
@@ -65,6 +85,8 @@ pub struct Program {
     pub classes: Vec<Class>,
     pub enums: Vec<EnumDefinition>,
     pub collection_types: Vec<CollectionType>,
+    pub interface_types: Vec<InterfaceType>,
+    pub interface_vtables: Vec<InterfaceVtable>,
     pub statics: Vec<StaticProperty>,
     pub error_descriptors: Vec<ErrorDescriptor>,
     pub error_origins: Vec<ErrorOrigin>,
@@ -86,6 +108,8 @@ impl PartialEq for Program {
             && self.namespace == other.namespace
             && self.enums == other.enums
             && self.collection_types == other.collection_types
+            && self.interface_types == other.interface_types
+            && self.interface_vtables == other.interface_vtables
             && self.statics == other.statics
             && self.error_descriptors == other.error_descriptors
             && self.error_origins == other.error_origins
@@ -285,6 +309,63 @@ pub struct CollectionType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceType {
+    pub id: InterfaceTypeId,
+    pub name: String,
+    pub ancestors: Vec<InterfaceTypeId>,
+    pub methods: Vec<InterfaceMethod>,
+}
+
+impl InterfaceType {
+    pub fn error() -> Self {
+        Self {
+            id: InterfaceTypeId::ERROR,
+            name: "Error".into(),
+            ancestors: Vec::new(),
+            methods: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceMethod {
+    pub requirement: Span,
+    pub name: String,
+    pub arguments: Vec<Type>,
+    pub signature: FunctionTypeId,
+    pub writable_receiver: bool,
+    pub exact_dynamic_return: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceVtable {
+    pub id: InterfaceVtableId,
+    pub implementing_type: ImplementingType,
+    pub interface: InterfaceTypeId,
+    pub conformance_origin: Span,
+    /// Same payload and ownership, with the ancestor's checked method view.
+    pub ancestors: Vec<InterfaceVtableId>,
+    pub methods: Vec<FunctionId>,
+    /// Error reporting facts belong to the payload, not to another owner.
+    pub error_descriptor: Option<ErrorDescriptorId>,
+}
+
+impl Program {
+    pub fn interface_vtable(
+        &self,
+        implementing_type: ImplementingType,
+        interface: InterfaceTypeId,
+    ) -> Option<InterfaceVtableId> {
+        self.interface_vtables
+            .iter()
+            .find(|table| {
+                table.implementing_type == implementing_type && table.interface == interface
+            })
+            .map(|table| table.id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StaticProperty {
     pub id: StaticId,
     pub class: ClassId,
@@ -351,6 +432,7 @@ pub struct ErrorOrigin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CheckedEffect {
     Concrete(ErrorDescriptorId),
+    Interface(InterfaceTypeId),
     Any,
 }
 
@@ -478,6 +560,7 @@ impl FunctionType {
 pub struct ClosureDescriptor {
     pub id: ClosureDescriptorId,
     pub source_closure: ClosureId,
+    pub source_instance: ClosureOwner,
     pub function_type: FunctionTypeId,
     pub entry_function: FunctionId,
     pub environment_layout: Option<ClosureEnvironmentLayoutId>,
@@ -485,6 +568,12 @@ pub struct ClosureDescriptor {
     pub invocation_mode: FunctionInvocationMode,
     pub source_span: Span,
     pub debug_identity: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ClosureOwner {
+    Callable(FunctionId),
+    PropertyInitializer(PropertyId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -614,22 +703,22 @@ pub enum Type {
     NullableScalar(ScalarType),
     NullableString,
     NullableMixed,
-    Error,
-    NullableError,
+    Interface(InterfaceTypeId),
+    NullableInterface(InterfaceTypeId),
     Class(ClassId),
     NullableClass(ClassId),
-    SharedReference(ClassId),
-    WeakReference(ClassId),
-    NullableSharedReference(ClassId),
-    NullableWeakReference(ClassId),
-    WritableSharedReference(WritableSharedPayload),
-    WritableWeakReference(WritableSharedPayload),
-    NullableWritableSharedReference(WritableSharedPayload),
-    NullableWritableWeakReference(WritableSharedPayload),
-    ReadonlySharedReferenceAccess(WritableSharedPayload),
-    WritableSharedReferenceAccess(WritableSharedPayload),
-    NullableReadonlySharedReferenceAccess(WritableSharedPayload),
-    NullableWritableSharedReferenceAccess(WritableSharedPayload),
+    SharedReference(SharedPayload),
+    WeakReference(SharedPayload),
+    NullableSharedReference(SharedPayload),
+    NullableWeakReference(SharedPayload),
+    WritableSharedReference(SharedPayload),
+    WritableWeakReference(SharedPayload),
+    NullableWritableSharedReference(SharedPayload),
+    NullableWritableWeakReference(SharedPayload),
+    ReadonlySharedReferenceAccess(SharedPayload),
+    WritableSharedReferenceAccess(SharedPayload),
+    NullableReadonlySharedReferenceAccess(SharedPayload),
+    NullableWritableSharedReferenceAccess(SharedPayload),
     Collection(CollectionTypeId),
     NullableCollection(CollectionTypeId),
     PayloadEnum(PayloadEnumType),
@@ -660,14 +749,34 @@ impl PayloadEnumType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum WritableSharedPayload {
+pub enum SharedPayload {
     Class(ClassId),
     Collection(CollectionTypeId),
+    Interface(InterfaceTypeId),
+}
+
+impl SharedPayload {
+    pub const fn from_type(ty: Type) -> Option<Self> {
+        match ty {
+            Type::Class(class) => Some(Self::Class(class)),
+            Type::Collection(collection) => Some(Self::Collection(collection)),
+            Type::Interface(interface) => Some(Self::Interface(interface)),
+            _ => None,
+        }
+    }
+
+    pub const fn ty(self) -> Type {
+        match self {
+            Self::Class(class) => Type::Class(class),
+            Self::Collection(collection) => Type::Collection(collection),
+            Self::Interface(interface) => Type::Interface(interface),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SharedAccessType {
-    pub payload: WritableSharedPayload,
+    pub payload: SharedPayload,
     pub writable: bool,
     pub nullable: bool,
 }
@@ -684,13 +793,41 @@ impl SharedAccessType {
 }
 
 impl Type {
+    pub const ERROR: Self = Self::Interface(InterfaceTypeId::ERROR);
+    pub const NULLABLE_ERROR: Self = Self::NullableInterface(InterfaceTypeId::ERROR);
+
+    pub const fn shared_payload(self) -> Option<SharedPayload> {
+        match self {
+            Self::SharedReference(payload)
+            | Self::WeakReference(payload)
+            | Self::NullableSharedReference(payload)
+            | Self::NullableWeakReference(payload)
+            | Self::WritableSharedReference(payload)
+            | Self::WritableWeakReference(payload)
+            | Self::NullableWritableSharedReference(payload)
+            | Self::NullableWritableWeakReference(payload)
+            | Self::ReadonlySharedReferenceAccess(payload)
+            | Self::WritableSharedReferenceAccess(payload)
+            | Self::NullableReadonlySharedReferenceAccess(payload)
+            | Self::NullableWritableSharedReferenceAccess(payload) => Some(payload),
+            _ => None,
+        }
+    }
+
+    pub const fn shared_interface(self) -> Option<InterfaceTypeId> {
+        match self.shared_payload() {
+            Some(SharedPayload::Interface(interface)) => Some(interface),
+            _ => None,
+        }
+    }
+
     pub const fn has_move_ownership(self) -> bool {
         matches!(
             self,
             Self::Mixed
                 | Self::NullableMixed
-                | Self::Error
-                | Self::NullableError
+                | Self::Interface(_)
+                | Self::NullableInterface(_)
                 | Self::Class(_)
                 | Self::NullableClass(_)
                 | Self::SharedReference(_)
@@ -990,8 +1127,8 @@ pub enum Rvalue {
     NullableScalar(NullableScalarExpression),
     NullableString(NullableStringExpression),
     NullableMixed(NullableMixedExpression),
-    Error(ErrorExpression),
-    NullableError(NullableErrorExpression),
+    Interface(InterfaceExpression),
+    NullableInterface(NullableInterfaceExpression),
     Class(ClassExpression),
     NullableClass(NullableClassExpression),
     SharedReference(SharedReferenceExpression),
@@ -1023,6 +1160,22 @@ pub enum OwnedSharedTemporary {
 }
 
 impl Rvalue {
+    pub fn error(value: InterfaceValue) -> Self {
+        Self::interface(InterfaceTypeId::ERROR, value)
+    }
+
+    pub fn nullable_error(value: NullableInterfaceValue) -> Self {
+        Self::nullable_interface(InterfaceTypeId::ERROR, value)
+    }
+
+    pub fn interface(interface: InterfaceTypeId, value: InterfaceValue) -> Self {
+        Self::Interface(InterfaceExpression { interface, value })
+    }
+
+    pub fn nullable_interface(interface: InterfaceTypeId, value: NullableInterfaceValue) -> Self {
+        Self::NullableInterface(NullableInterfaceExpression { interface, value })
+    }
+
     pub const fn ty(&self) -> Type {
         match self {
             Self::Value(value) => Type::Scalar(value.ty()),
@@ -1031,14 +1184,14 @@ impl Rvalue {
             Self::NullableScalar(value) => Type::NullableScalar(value.ty()),
             Self::NullableString(_) => Type::NullableString,
             Self::NullableMixed(_) => Type::NullableMixed,
-            Self::Error(_) => Type::Error,
-            Self::NullableError(_) => Type::NullableError,
+            Self::Interface(value) => Type::Interface(value.interface),
+            Self::NullableInterface(value) => Type::NullableInterface(value.interface),
             Self::Class(value) => Type::Class(value.class()),
             Self::NullableClass(value) => Type::NullableClass(value.class()),
-            Self::SharedReference(value) => Type::SharedReference(value.class()),
-            Self::WeakReference(value) => Type::WeakReference(value.class()),
-            Self::NullableSharedReference(value) => Type::NullableSharedReference(value.class()),
-            Self::NullableWeakReference(value) => Type::NullableWeakReference(value.class()),
+            Self::SharedReference(value) => Type::SharedReference(value.payload()),
+            Self::WeakReference(value) => Type::WeakReference(value.payload()),
+            Self::NullableSharedReference(value) => Type::NullableSharedReference(value.payload()),
+            Self::NullableWeakReference(value) => Type::NullableWeakReference(value.payload()),
             Self::WritableSharedReference(value) => Type::WritableSharedReference(value.payload()),
             Self::WritableWeakReference(value) => Type::WritableWeakReference(value.payload()),
             Self::NullableWritableSharedReference(value) => {
@@ -1071,8 +1224,8 @@ impl Rvalue {
             | Self::Mixed(_)
             | Self::NullableScalar(_)
             | Self::NullableMixed(_)
-            | Self::Error(_)
-            | Self::NullableError(_)
+            | Self::Interface(InterfaceExpression { .. })
+            | Self::NullableInterface(NullableInterfaceExpression { .. })
             | Self::NullableString(_)
             | Self::SharedReference(_)
             | Self::WeakReference(_)
@@ -1099,8 +1252,8 @@ impl Rvalue {
             | Self::NullableScalar(_)
             | Self::NullableString(_)
             | Self::NullableMixed(_)
-            | Self::Error(_)
-            | Self::NullableError(_)
+            | Self::Interface(InterfaceExpression { .. })
+            | Self::NullableInterface(NullableInterfaceExpression { .. })
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::SharedReference(_)
@@ -1166,8 +1319,8 @@ impl Rvalue {
             | Self::NullableScalar(_)
             | Self::NullableString(_)
             | Self::NullableMixed(_)
-            | Self::Error(_)
-            | Self::NullableError(_)
+            | Self::Interface(InterfaceExpression { .. })
+            | Self::NullableInterface(NullableInterfaceExpression { .. })
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::Collection(_)
@@ -1197,8 +1350,8 @@ impl Rvalue {
             | Self::NullableScalar(_)
             | Self::NullableString(_)
             | Self::NullableMixed(_)
-            | Self::Error(_)
-            | Self::NullableError(_)
+            | Self::Interface(InterfaceExpression { .. })
+            | Self::NullableInterface(NullableInterfaceExpression { .. })
             | Self::Collection(_)
             | Self::NullableCollection(_)
             | Self::SharedReference(_)
@@ -1239,8 +1392,10 @@ impl Rvalue {
             | Self::NullableSharedReferenceAccess(_) => self.owned_temporary_shared().is_none(),
             Self::Mixed(value) => value.ownership() == MixedOwnership::None,
             Self::NullableMixed(value) => value.ownership() == MixedOwnership::None,
-            Self::Error(value) => value.is_borrowed(),
-            Self::NullableError(value) => value.is_borrowed(),
+            Self::Interface(InterfaceExpression { value, .. }) => value.is_borrowed(),
+            Self::NullableInterface(NullableInterfaceExpression { value, .. }) => {
+                value.is_borrowed()
+            }
             Self::PayloadEnum(value) => !value.owned_temporary(),
             Self::NullablePayloadEnum(value) => !value.owned_temporary(),
             Self::Function(value) => function_expression_is_borrowed(value),
@@ -1269,7 +1424,10 @@ impl Rvalue {
                     NullableSharedReferenceAccessExpression::Null { .. }
                 )
                 | Self::NullableMixed(NullableMixedExpression::Null)
-                | Self::NullableError(NullableErrorExpression::Null)
+                | Self::NullableInterface(NullableInterfaceExpression {
+                    value: NullableInterfaceValue::Null,
+                    ..
+                })
                 | Self::NullablePayloadEnum(NullablePayloadEnumExpression::Null(_))
                 | Self::NullableFunction(NullableFunctionExpression::Null { .. })
         )
@@ -1277,6 +1435,8 @@ impl Rvalue {
 
     pub const fn transferred_owned_local(&self) -> Option<LocalId> {
         match self {
+            Self::Interface(value) => value.value.transferred_owned_local(),
+            Self::NullableInterface(value) => value.value.transferred_owned_local(),
             Self::Mixed(MixedExpression::Local {
                 local,
                 transfer: true,
@@ -1286,6 +1446,11 @@ impl Rvalue {
                 transfer: true,
             })
             | Self::Class(ClassExpression::Local {
+                local,
+                transfer: true,
+                ..
+            })
+            | Self::Class(ClassExpression::InterfacePayload {
                 local,
                 transfer: true,
                 ..
@@ -1304,18 +1469,6 @@ impl Rvalue {
                 local,
                 transfer: true,
                 ..
-            })
-            | Self::Error(ErrorExpression::Local {
-                local,
-                transfer: true,
-            })
-            | Self::Error(ErrorExpression::NullableLocalAssumeNonNull {
-                local,
-                transfer: true,
-            })
-            | Self::NullableError(NullableErrorExpression::Local {
-                local,
-                transfer: true,
             }) => Some(*local),
             Self::SharedReference(SharedReferenceExpression::Local {
                 local,
@@ -1413,8 +1566,6 @@ impl Rvalue {
             | Self::NullableScalar(_)
             | Self::NullableString(_)
             | Self::NullableMixed(_)
-            | Self::Error(_)
-            | Self::NullableError(_)
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::Collection(_)
@@ -1459,11 +1610,16 @@ impl Rvalue {
             | Self::NullableScalar(NullableScalarExpression::Local { local, .. })
             | Self::Mixed(MixedExpression::Local { local, .. })
             | Self::NullableMixed(NullableMixedExpression::Local { local, .. })
-            | Self::Error(
-                ErrorExpression::Local { local, .. }
-                | ErrorExpression::NullableLocalAssumeNonNull { local, .. },
-            )
-            | Self::NullableError(NullableErrorExpression::Local { local, .. })
+            | Self::Interface(InterfaceExpression {
+                value:
+                    InterfaceValue::Local { local, .. }
+                    | InterfaceValue::NullableLocalAssumeNonNull { local, .. },
+                ..
+            })
+            | Self::NullableInterface(NullableInterfaceExpression {
+                value: NullableInterfaceValue::Local { local, .. },
+                ..
+            })
             | Self::Class(
                 ClassExpression::Local { local, .. }
                 | ClassExpression::NullableLocalAssumeNonNull { local, .. },
@@ -1530,8 +1686,8 @@ impl Rvalue {
             | Self::String(_)
             | Self::NullableScalar(_)
             | Self::NullableString(_)
-            | Self::Error(_)
-            | Self::NullableError(_)
+            | Self::Interface(InterfaceExpression { .. })
+            | Self::NullableInterface(NullableInterfaceExpression { .. })
             | Self::Class(_)
             | Self::NullableClass(_)
             | Self::Collection(_)
@@ -1585,7 +1741,31 @@ pub(crate) fn nullable_function_expression_is_borrowed(value: &NullableFunctionE
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ErrorExpression {
+pub struct InterfaceExpression {
+    pub interface: InterfaceTypeId,
+    pub value: InterfaceValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NullableInterfaceExpression {
+    pub interface: InterfaceTypeId,
+    pub value: NullableInterfaceValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InterfaceValue {
+    SharedPayload {
+        local: LocalId,
+    },
+    NarrowedLocal {
+        local: LocalId,
+        interface: InterfaceTypeId,
+        transfer: bool,
+    },
+    Upcast {
+        source: Box<InterfaceExpression>,
+        interface: InterfaceTypeId,
+    },
     Local {
         local: LocalId,
         transfer: bool,
@@ -1596,11 +1776,11 @@ pub enum ErrorExpression {
     },
     FromClass {
         object: Box<ClassExpression>,
-        descriptor: ErrorDescriptorId,
+        vtable: InterfaceVtableId,
     },
     FromNullableClass {
         object: Box<NullableClassExpression>,
-        descriptor: ErrorDescriptorId,
+        vtable: InterfaceVtableId,
     },
     Property {
         object: LocalId,
@@ -1618,16 +1798,19 @@ pub enum ErrorExpression {
         positional: bool,
         remove: bool,
     },
-    MixedPayload {
-        mixed: LocalId,
-        transfer: bool,
-    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NullableErrorExpression {
+pub enum NullableInterfaceValue {
+    SharedPayload {
+        local: LocalId,
+    },
+    Upcast {
+        source: Box<NullableInterfaceExpression>,
+        interface: InterfaceTypeId,
+    },
     Null,
-    Error(ErrorExpression),
+    Present(InterfaceValue),
     Local {
         local: LocalId,
         transfer: bool,
@@ -1655,13 +1838,56 @@ pub enum NullableErrorExpression {
     },
 }
 
-impl ErrorExpression {
+impl InterfaceValue {
+    const fn transferred_owned_local(&self) -> Option<LocalId> {
+        match self {
+            Self::Upcast { source, .. } => source.value.transferred_owned_local(),
+            Self::NarrowedLocal {
+                local,
+                transfer: true,
+                ..
+            } => Some(*local),
+            Self::Local {
+                local,
+                transfer: true,
+            }
+            | Self::NullableLocalAssumeNonNull {
+                local,
+                transfer: true,
+            } => Some(*local),
+            Self::FromClass { object, .. } => match &**object {
+                ClassExpression::Local {
+                    local,
+                    transfer: true,
+                    ..
+                }
+                | ClassExpression::NullableLocalAssumeNonNull {
+                    local,
+                    transfer: true,
+                    ..
+                } => Some(*local),
+                _ => None,
+            },
+            Self::FromNullableClass { object, .. } => match &**object {
+                NullableClassExpression::Local {
+                    local,
+                    transfer: true,
+                    ..
+                } => Some(*local),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     pub fn is_borrowed(&self) -> bool {
         match self {
+            Self::SharedPayload { .. } => true,
+            Self::Upcast { source, .. } => source.value.is_borrowed(),
+            Self::NarrowedLocal { transfer, .. } => !transfer,
             Self::Local { transfer, .. }
             | Self::NullableLocalAssumeNonNull { transfer, .. }
-            | Self::Property { transfer, .. }
-            | Self::MixedPayload { transfer, .. } => !transfer,
+            | Self::Property { transfer, .. } => !transfer,
             Self::CollectionIndex { remove, .. } => !remove,
             Self::Call { return_borrow, .. } => return_borrow.is_some(),
             Self::FromClass { object, .. } => object.borrows_class_value(),
@@ -1670,11 +1896,25 @@ impl ErrorExpression {
     }
 }
 
-impl NullableErrorExpression {
+impl NullableInterfaceValue {
+    const fn transferred_owned_local(&self) -> Option<LocalId> {
+        match self {
+            Self::Upcast { source, .. } => source.value.transferred_owned_local(),
+            Self::Present(value) => value.transferred_owned_local(),
+            Self::Local {
+                local,
+                transfer: true,
+            } => Some(*local),
+            _ => None,
+        }
+    }
+
     pub fn is_borrowed(&self) -> bool {
         match self {
+            Self::SharedPayload { .. } => true,
+            Self::Upcast { source, .. } => source.value.is_borrowed(),
             Self::Null => true,
-            Self::Error(value) => value.is_borrowed(),
+            Self::Present(value) => value.is_borrowed(),
             Self::Local { transfer, .. } | Self::Property { transfer, .. } => !transfer,
             Self::Call { return_borrow, .. } => return_borrow.is_some(),
             Self::DictionaryGet { access, .. } => !matches!(
@@ -1826,42 +2066,42 @@ impl NullablePayloadEnumExpression {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedReferenceExpression {
     New {
-        class: ClassId,
-        value: Box<ClassExpression>,
+        payload: SharedPayload,
+        value: Box<Rvalue>,
     },
     Local {
-        class: ClassId,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     NullableLocalAssumeNonNull {
-        class: ClassId,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     Property {
-        class: ClassId,
+        payload: SharedPayload,
         object: LocalId,
         property: PropertyId,
     },
     Call {
-        class: ClassId,
+        payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
     },
     Share {
-        class: ClassId,
+        payload: SharedPayload,
         value: Box<SharedReferenceExpression>,
     },
     Coalesce {
-        class: ClassId,
+        payload: SharedPayload,
         left: Box<NullableSharedReferenceExpression>,
         right: Box<SharedReferenceExpression>,
         transfer: bool,
     },
     CollectionIndex {
-        class: ClassId,
+        payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -1871,16 +2111,16 @@ pub enum SharedReferenceExpression {
 }
 
 impl SharedReferenceExpression {
-    pub const fn class(&self) -> ClassId {
+    pub const fn payload(&self) -> SharedPayload {
         match self {
-            Self::New { class, .. }
-            | Self::Local { class, .. }
-            | Self::NullableLocalAssumeNonNull { class, .. }
-            | Self::Property { class, .. }
-            | Self::Call { class, .. }
-            | Self::Share { class, .. }
-            | Self::Coalesce { class, .. }
-            | Self::CollectionIndex { class, .. } => *class,
+            Self::New { payload, .. }
+            | Self::Local { payload, .. }
+            | Self::NullableLocalAssumeNonNull { payload, .. }
+            | Self::Property { payload, .. }
+            | Self::Call { payload, .. }
+            | Self::Share { payload, .. }
+            | Self::Coalesce { payload, .. }
+            | Self::CollectionIndex { payload, .. } => *payload,
         }
     }
 
@@ -1923,38 +2163,38 @@ impl SharedReferenceExpression {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WeakReferenceExpression {
     Local {
-        class: ClassId,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     NullableLocalAssumeNonNull {
-        class: ClassId,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     Property {
-        class: ClassId,
+        payload: SharedPayload,
         object: LocalId,
         property: PropertyId,
     },
     Call {
-        class: ClassId,
+        payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
     },
     Create {
-        class: ClassId,
+        payload: SharedPayload,
         value: Box<SharedReferenceExpression>,
     },
     Coalesce {
-        class: ClassId,
+        payload: SharedPayload,
         left: Box<NullableWeakReferenceExpression>,
         right: Box<WeakReferenceExpression>,
         transfer: bool,
     },
     CollectionIndex {
-        class: ClassId,
+        payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -1964,15 +2204,15 @@ pub enum WeakReferenceExpression {
 }
 
 impl WeakReferenceExpression {
-    pub const fn class(&self) -> ClassId {
+    pub const fn payload(&self) -> SharedPayload {
         match self {
-            Self::Local { class, .. }
-            | Self::NullableLocalAssumeNonNull { class, .. }
-            | Self::Property { class, .. }
-            | Self::Call { class, .. }
-            | Self::Create { class, .. }
-            | Self::Coalesce { class, .. }
-            | Self::CollectionIndex { class, .. } => *class,
+            Self::Local { payload, .. }
+            | Self::NullableLocalAssumeNonNull { payload, .. }
+            | Self::Property { payload, .. }
+            | Self::Call { payload, .. }
+            | Self::Create { payload, .. }
+            | Self::Coalesce { payload, .. }
+            | Self::CollectionIndex { payload, .. } => *payload,
         }
     }
 
@@ -2014,51 +2254,51 @@ impl WeakReferenceExpression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NullableSharedReferenceExpression {
-    Null(ClassId),
+    Null(SharedPayload),
     Shared(SharedReferenceExpression),
     Local {
-        class: ClassId,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     Property {
-        class: ClassId,
+        payload: SharedPayload,
         object: LocalId,
         property: PropertyId,
     },
     Call {
-        class: ClassId,
+        payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
     },
     Acquire {
-        class: ClassId,
+        payload: SharedPayload,
         value: Box<WeakReferenceExpression>,
     },
     NullSafeShare {
-        class: ClassId,
+        payload: SharedPayload,
         value: Box<NullableSharedReferenceExpression>,
     },
     NullSafeAcquire {
-        class: ClassId,
+        payload: SharedPayload,
         value: Box<NullableWeakReferenceExpression>,
     },
     Coalesce {
-        class: ClassId,
+        payload: SharedPayload,
         left: Box<NullableSharedReferenceExpression>,
         right: Box<NullableSharedReferenceExpression>,
         transfer: bool,
     },
     DictionaryGet {
-        class: ClassId,
+        payload: SharedPayload,
         collection: LocalId,
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
         stored_nullable: bool,
     },
     CollectionIndex {
-        class: ClassId,
+        payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -2068,19 +2308,19 @@ pub enum NullableSharedReferenceExpression {
 }
 
 impl NullableSharedReferenceExpression {
-    pub const fn class(&self) -> ClassId {
+    pub const fn payload(&self) -> SharedPayload {
         match self {
-            Self::Null(class)
-            | Self::Local { class, .. }
-            | Self::Property { class, .. }
-            | Self::Call { class, .. }
-            | Self::Acquire { class, .. }
-            | Self::NullSafeShare { class, .. }
-            | Self::NullSafeAcquire { class, .. }
-            | Self::Coalesce { class, .. }
-            | Self::DictionaryGet { class, .. }
-            | Self::CollectionIndex { class, .. } => *class,
-            Self::Shared(value) => value.class(),
+            Self::Null(payload)
+            | Self::Local { payload, .. }
+            | Self::Property { payload, .. }
+            | Self::Call { payload, .. }
+            | Self::Acquire { payload, .. }
+            | Self::NullSafeShare { payload, .. }
+            | Self::NullSafeAcquire { payload, .. }
+            | Self::Coalesce { payload, .. }
+            | Self::DictionaryGet { payload, .. }
+            | Self::CollectionIndex { payload, .. } => *payload,
+            Self::Shared(value) => value.payload(),
         }
     }
 
@@ -2139,43 +2379,43 @@ impl NullableSharedReferenceExpression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NullableWeakReferenceExpression {
-    Null(ClassId),
+    Null(SharedPayload),
     Weak(WeakReferenceExpression),
     Local {
-        class: ClassId,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     Property {
-        class: ClassId,
+        payload: SharedPayload,
         object: LocalId,
         property: PropertyId,
     },
     Call {
-        class: ClassId,
+        payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
     },
     NullSafeCreate {
-        class: ClassId,
+        payload: SharedPayload,
         value: Box<NullableSharedReferenceExpression>,
     },
     Coalesce {
-        class: ClassId,
+        payload: SharedPayload,
         left: Box<NullableWeakReferenceExpression>,
         right: Box<NullableWeakReferenceExpression>,
         transfer: bool,
     },
     DictionaryGet {
-        class: ClassId,
+        payload: SharedPayload,
         collection: LocalId,
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
         stored_nullable: bool,
     },
     CollectionIndex {
-        class: ClassId,
+        payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -2185,17 +2425,17 @@ pub enum NullableWeakReferenceExpression {
 }
 
 impl NullableWeakReferenceExpression {
-    pub const fn class(&self) -> ClassId {
+    pub const fn payload(&self) -> SharedPayload {
         match self {
-            Self::Null(class)
-            | Self::Local { class, .. }
-            | Self::Property { class, .. }
-            | Self::Call { class, .. }
-            | Self::NullSafeCreate { class, .. }
-            | Self::Coalesce { class, .. }
-            | Self::DictionaryGet { class, .. }
-            | Self::CollectionIndex { class, .. } => *class,
-            Self::Weak(value) => value.class(),
+            Self::Null(payload)
+            | Self::Local { payload, .. }
+            | Self::Property { payload, .. }
+            | Self::Call { payload, .. }
+            | Self::NullSafeCreate { payload, .. }
+            | Self::Coalesce { payload, .. }
+            | Self::DictionaryGet { payload, .. }
+            | Self::CollectionIndex { payload, .. } => *payload,
+            Self::Weak(value) => value.payload(),
         }
     }
 
@@ -2252,42 +2492,42 @@ impl NullableWeakReferenceExpression {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WritableSharedReferenceExpression {
     New {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         value: Box<Rvalue>,
     },
     Local {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     NullableLocalAssumeNonNull {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     Property {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         object: LocalId,
         property: PropertyId,
     },
     Call {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
     },
     Share {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         value: Box<WritableSharedReferenceExpression>,
     },
     Coalesce {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         left: Box<NullableWritableSharedReferenceExpression>,
         right: Box<WritableSharedReferenceExpression>,
         transfer: bool,
     },
     CollectionIndex {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -2297,7 +2537,7 @@ pub enum WritableSharedReferenceExpression {
 }
 
 impl WritableSharedReferenceExpression {
-    pub const fn payload(&self) -> WritableSharedPayload {
+    pub const fn payload(&self) -> SharedPayload {
         match self {
             Self::New { payload, .. }
             | Self::Local { payload, .. }
@@ -2326,38 +2566,38 @@ impl WritableSharedReferenceExpression {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WritableWeakReferenceExpression {
     Local {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     NullableLocalAssumeNonNull {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     Property {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         object: LocalId,
         property: PropertyId,
     },
     Call {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
     },
     Create {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         value: Box<WritableSharedReferenceExpression>,
     },
     Coalesce {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         left: Box<NullableWritableWeakReferenceExpression>,
         right: Box<WritableWeakReferenceExpression>,
         transfer: bool,
     },
     CollectionIndex {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -2367,7 +2607,7 @@ pub enum WritableWeakReferenceExpression {
 }
 
 impl WritableWeakReferenceExpression {
-    pub const fn payload(&self) -> WritableSharedPayload {
+    pub const fn payload(&self) -> SharedPayload {
         match self {
             Self::Local { payload, .. }
             | Self::NullableLocalAssumeNonNull { payload, .. }
@@ -2394,44 +2634,44 @@ impl WritableWeakReferenceExpression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NullableWritableSharedReferenceExpression {
-    Null(WritableSharedPayload),
+    Null(SharedPayload),
     Strong(WritableSharedReferenceExpression),
     Local {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     Property {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         object: LocalId,
         property: PropertyId,
     },
     Call {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
     },
     Acquire {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         value: Box<WritableWeakReferenceExpression>,
     },
     NullSafeShare {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         value: Box<NullableWritableSharedReferenceExpression>,
     },
     NullSafeAcquire {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         value: Box<NullableWritableWeakReferenceExpression>,
     },
     Coalesce {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         left: Box<NullableWritableSharedReferenceExpression>,
         right: Box<NullableWritableSharedReferenceExpression>,
         transfer: bool,
     },
     DictionaryGet {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         collection: LocalId,
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
@@ -2440,7 +2680,7 @@ pub enum NullableWritableSharedReferenceExpression {
 }
 
 impl NullableWritableSharedReferenceExpression {
-    pub const fn payload(&self) -> WritableSharedPayload {
+    pub const fn payload(&self) -> SharedPayload {
         match self {
             Self::Null(payload)
             | Self::Local { payload, .. }
@@ -2477,36 +2717,36 @@ impl NullableWritableSharedReferenceExpression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NullableWritableWeakReferenceExpression {
-    Null(WritableSharedPayload),
+    Null(SharedPayload),
     Weak(WritableWeakReferenceExpression),
     Local {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         local: LocalId,
         transfer: bool,
     },
     Property {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         object: LocalId,
         property: PropertyId,
     },
     Call {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
     },
     NullSafeCreate {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         value: Box<NullableWritableSharedReferenceExpression>,
     },
     Coalesce {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         left: Box<NullableWritableWeakReferenceExpression>,
         right: Box<NullableWritableWeakReferenceExpression>,
         transfer: bool,
     },
     DictionaryGet {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         collection: LocalId,
         key: Box<Rvalue>,
         access: NullableCollectionAccess,
@@ -2515,7 +2755,7 @@ pub enum NullableWritableWeakReferenceExpression {
 }
 
 impl NullableWritableWeakReferenceExpression {
-    pub const fn payload(&self) -> WritableSharedPayload {
+    pub const fn payload(&self) -> SharedPayload {
         match self {
             Self::Null(payload)
             | Self::Local { payload, .. }
@@ -2549,25 +2789,25 @@ impl NullableWritableWeakReferenceExpression {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SharedReferenceAccessExpression {
     Local {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         local: LocalId,
         writable: bool,
         transfer: bool,
     },
     NullableLocalAssumeNonNull {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         local: LocalId,
         writable: bool,
         transfer: bool,
     },
     Property {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         object: LocalId,
         property: PropertyId,
         writable: bool,
     },
     CollectionIndex {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -2576,14 +2816,14 @@ pub enum SharedReferenceAccessExpression {
         remove: bool,
     },
     Call {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
         writable: bool,
     },
     Acquire {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         value: Box<WritableSharedReferenceExpression>,
         writable: bool,
         span: Span,
@@ -2593,24 +2833,24 @@ pub enum SharedReferenceAccessExpression {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NullableSharedReferenceAccessExpression {
     Null {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         writable: bool,
     },
     Access(Box<SharedReferenceAccessExpression>),
     Local {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         local: LocalId,
         writable: bool,
         transfer: bool,
     },
     Property {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         object: LocalId,
         property: PropertyId,
         writable: bool,
     },
     CollectionIndex {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         collection: LocalId,
         index: Box<Rvalue>,
         /// True when `index` is a position in the collection rather than a key.
@@ -2625,14 +2865,14 @@ pub enum NullableSharedReferenceAccessExpression {
         stored: SharedAccessType,
     },
     Call {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         function: FunctionId,
         args: Vec<Rvalue>,
         return_borrow: Option<ReturnBorrow>,
         writable: bool,
     },
     NullSafeAcquire {
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         value: Box<NullableWritableSharedReferenceExpression>,
         writable: bool,
         span: Span,
@@ -2640,7 +2880,7 @@ pub enum NullableSharedReferenceAccessExpression {
 }
 
 impl NullableSharedReferenceAccessExpression {
-    pub const fn payload(&self) -> WritableSharedPayload {
+    pub const fn payload(&self) -> SharedPayload {
         match self {
             Self::Null { payload, .. }
             | Self::Local { payload, .. }
@@ -2694,7 +2934,7 @@ impl NullableSharedReferenceAccessExpression {
 }
 
 impl SharedReferenceAccessExpression {
-    pub const fn payload(&self) -> WritableSharedPayload {
+    pub const fn payload(&self) -> SharedPayload {
         match self {
             Self::Local { payload, .. }
             | Self::NullableLocalAssumeNonNull { payload, .. }
@@ -2972,13 +3212,15 @@ pub enum MixedTag {
     Float(FloatType),
     String,
     Class(ClassId),
-    Error,
+    Interface(InterfaceTypeId),
     Enum(EnumId),
     PayloadEnum(PayloadEnumType),
     Function(FunctionTypeId),
 }
 
 impl MixedTag {
+    pub const ERROR: Self = Self::Interface(InterfaceTypeId::ERROR);
+
     pub const fn ty(self) -> Type {
         match self {
             Self::Bool => Type::Scalar(ScalarType::Bool),
@@ -2986,7 +3228,7 @@ impl MixedTag {
             Self::Float(ty) => Type::Scalar(ScalarType::Float(ty)),
             Self::String => Type::String,
             Self::Class(class) => Type::Class(class),
-            Self::Error => Type::Error,
+            Self::Interface(interface) => Type::Interface(interface),
             Self::Enum(enum_id) => Type::Scalar(ScalarType::Enum(enum_id)),
             Self::PayloadEnum(ty) => Type::PayloadEnum(ty),
             Self::Function(ty) => Type::Function(ty),
@@ -2996,7 +3238,11 @@ impl MixedTag {
     pub const fn has_structural_type_id(self) -> bool {
         matches!(
             self,
-            Self::Class(_) | Self::Enum(_) | Self::PayloadEnum(_) | Self::Function(_)
+            Self::Class(_)
+                | Self::Interface(_)
+                | Self::Enum(_)
+                | Self::PayloadEnum(_)
+                | Self::Function(_)
         )
     }
 }
@@ -3039,8 +3285,9 @@ pub enum MixedExpression {
         value: ClassExpression,
         payload_owned: bool,
     },
-    BoxError {
-        value: Box<ErrorExpression>,
+    BoxInterface {
+        value: Box<InterfaceExpression>,
+        payload_owned: bool,
     },
     BoxPayloadEnum {
         value: Box<PayloadEnumExpression>,
@@ -3071,9 +3318,10 @@ impl MixedExpression {
                 ..
             } => MixedOwnership::Owned,
             Self::BoxValue(_) => MixedOwnership::ShellOnly,
-            Self::BoxPayloadEnum { .. } | Self::BoxError { .. } => MixedOwnership::Owned,
+            Self::BoxPayloadEnum { .. } => MixedOwnership::Owned,
             Self::BoxString { payload_owned, .. }
             | Self::BoxClass { payload_owned, .. }
+            | Self::BoxInterface { payload_owned, .. }
             | Self::BoxFunction { payload_owned, .. } => {
                 if *payload_owned {
                     MixedOwnership::Owned
@@ -3231,6 +3479,17 @@ impl NullableScalarExpression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClassExpression {
+    InterfacePayload {
+        class: ClassId,
+        local: LocalId,
+        transfer: bool,
+    },
+    /// Borrow the exact implementing payload inside its statically checked entry thunk.
+    InterfaceReceiver {
+        class: ClassId,
+        receiver: LocalId,
+        vtable: InterfaceVtableId,
+    },
     Local {
         class: ClassId,
         local: LocalId,
@@ -3294,7 +3553,9 @@ pub enum ClassExpression {
 impl ClassExpression {
     pub const fn class(&self) -> ClassId {
         match self {
-            Self::Local { class, .. }
+            Self::InterfacePayload { class, .. }
+            | Self::InterfaceReceiver { class, .. }
+            | Self::Local { class, .. }
             | Self::Property { class, .. }
             | Self::Call { class, .. }
             | Self::New { class, .. }
@@ -3319,8 +3580,17 @@ impl ClassExpression {
                 class,
                 transfer: true,
                 ..
+            }
+            | Self::InterfacePayload {
+                class,
+                transfer: true,
+                ..
             } => Some(*class),
-            Self::Local {
+            Self::InterfaceReceiver { .. }
+            | Self::InterfacePayload {
+                transfer: false, ..
+            }
+            | Self::Local {
                 transfer: false, ..
             }
             | Self::Property { .. }
@@ -3339,12 +3609,14 @@ impl ClassExpression {
 
     pub const fn borrows_class_value(&self) -> bool {
         match self {
-            Self::Local { transfer, .. }
+            Self::InterfacePayload { transfer, .. }
+            | Self::Local { transfer, .. }
             | Self::NullableLocalAssumeNonNull { transfer, .. }
             | Self::Coalesce { transfer, .. }
             | Self::CollectionIndex { transfer, .. }
             | Self::MixedPayload { transfer, .. } => !*transfer,
-            Self::Property { .. }
+            Self::InterfaceReceiver { .. }
+            | Self::Property { .. }
             | Self::SharedPayload { .. }
             | Self::SharedAccessPayload { .. }
             | Self::Call {
@@ -3687,7 +3959,7 @@ pub enum StringExpression {
         object: LocalId,
         property: PropertyId,
     },
-    ErrorMessage(Box<ErrorExpression>),
+    ErrorMessage(Box<InterfaceValue>),
     Static(StaticId),
     Concat(Vec<StringExpression>),
     Display(ValueExpression),
@@ -3941,6 +4213,10 @@ pub struct FormatExpression {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoolExpression {
+    NominalIs {
+        local: LocalId,
+        target: Type,
+    },
     Use {
         operand: Operand,
     },
@@ -3980,7 +4256,7 @@ pub enum BoolExpression {
     NullableWritableWeakReferenceIsPresent(Box<NullableWritableWeakReferenceExpression>),
     NullableSharedReferenceAccessIsPresent(Box<NullableSharedReferenceAccessExpression>),
     NullableMixedIsPresent(Box<NullableMixedExpression>),
-    NullableErrorIsPresent(Box<NullableErrorExpression>),
+    NullableErrorIsPresent(Box<NullableInterfaceExpression>),
     NullablePayloadEnumIsPresent(Box<NullablePayloadEnumExpression>),
     NullableFunctionIsPresent(Box<NullableFunctionExpression>),
     PayloadEnumCompare {
@@ -4149,23 +4425,23 @@ pub enum Statement {
     },
     DropSharedReference {
         local: LocalId,
-        class: ClassId,
+        payload: SharedPayload,
     },
     DropWeakReference {
         local: LocalId,
-        class: ClassId,
+        payload: SharedPayload,
     },
     DropWritableSharedReference {
         local: LocalId,
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
     },
     DropWritableWeakReference {
         local: LocalId,
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
     },
     DropSharedReferenceAccess {
         local: LocalId,
-        payload: WritableSharedPayload,
+        payload: SharedPayload,
         writable: bool,
     },
     DropString {
@@ -4513,6 +4789,40 @@ pub enum CollectionMutationOp {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndirectCallee {
+    Closure(FunctionExpression),
+    /// The receiver is also argument zero of the private entry signature.
+    InterfaceMethod {
+        receiver: LocalId,
+        interface: InterfaceTypeId,
+        slot: usize,
+    },
+}
+
+impl From<FunctionExpression> for IndirectCallee {
+    fn from(value: FunctionExpression) -> Self {
+        Self::Closure(value)
+    }
+}
+
+impl fmt::Display for IndirectCallee {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Closure(value) => value.fmt(formatter),
+            Self::InterfaceMethod {
+                receiver,
+                interface,
+                slot,
+            } => write!(
+                formatter,
+                "interface#{} local{} slot{slot}",
+                interface.0, receiver.0
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Terminator {
     Return(Rvalue),
     ReturnVoid,
@@ -4537,7 +4847,7 @@ pub enum Terminator {
         span: Span,
     },
     IndirectCall {
-        callee: FunctionExpression,
+        callee: IndirectCallee,
         function_type: FunctionTypeId,
         invocation_mode: FunctionInvocationMode,
         args: Vec<Rvalue>,
@@ -4546,7 +4856,7 @@ pub enum Terminator {
         span: Span,
     },
     CheckedIndirectCall {
-        callee: FunctionExpression,
+        callee: IndirectCallee,
         function_type: FunctionTypeId,
         invocation_mode: FunctionInvocationMode,
         args: Vec<Rvalue>,
@@ -4666,11 +4976,13 @@ fn terminator_class_temporary_capacity(terminator: &Terminator) -> usize {
         }
         Terminator::IndirectCall { callee, args, .. }
         | Terminator::CheckedIndirectCall { callee, args, .. } => {
-            function_class_temporary_capacity(callee)
-                + args
-                    .iter()
-                    .map(rvalue_class_temporary_capacity)
-                    .sum::<usize>()
+            (match callee {
+                IndirectCallee::Closure(value) => function_class_temporary_capacity(value),
+                IndirectCallee::InterfaceMethod { .. } => 0,
+            }) + args
+                .iter()
+                .map(rvalue_class_temporary_capacity)
+                .sum::<usize>()
         }
         Terminator::CheckedConstruct {
             properties, args, ..
@@ -4727,34 +5039,42 @@ fn rvalue_class_temporary_capacity(value: &Rvalue) -> usize {
             Rvalue::NullableScalar(value) => nullable_scalar_class_temporary_capacity(value),
             Rvalue::NullableString(value) => nullable_string_class_temporary_capacity(value),
             Rvalue::NullableMixed(value) => nullable_mixed_class_temporary_capacity(value),
-            Rvalue::Error(value) => match value {
-                ErrorExpression::FromClass { object, .. } => {
+            Rvalue::Interface(InterfaceExpression { value, .. }) => match value {
+                InterfaceValue::SharedPayload { .. } => 0,
+                InterfaceValue::Upcast { source, .. } => {
+                    rvalue_class_temporary_capacity(&Rvalue::Interface(*source.clone()))
+                }
+                InterfaceValue::FromClass { object, .. } => {
                     class_expression_temporary_capacity(object)
                 }
-                ErrorExpression::FromNullableClass { object, .. } => {
+                InterfaceValue::FromNullableClass { object, .. } => {
                     nullable_class_temporary_capacity(object)
                 }
-                ErrorExpression::Call { args, .. } => {
+                InterfaceValue::Call { args, .. } => {
                     args.iter().map(rvalue_class_temporary_capacity).sum()
                 }
-                ErrorExpression::Local { .. }
-                | ErrorExpression::NullableLocalAssumeNonNull { .. }
-                | ErrorExpression::Property { .. }
-                | ErrorExpression::CollectionIndex { .. }
-                | ErrorExpression::MixedPayload { .. } => 0,
+                InterfaceValue::NarrowedLocal { .. }
+                | InterfaceValue::Local { .. }
+                | InterfaceValue::NullableLocalAssumeNonNull { .. }
+                | InterfaceValue::Property { .. }
+                | InterfaceValue::CollectionIndex { .. } => 0,
             },
-            Rvalue::NullableError(value) => match value {
-                NullableErrorExpression::Error(value) => {
-                    rvalue_class_temporary_capacity(&Rvalue::Error(value.clone()))
+            Rvalue::NullableInterface(NullableInterfaceExpression { value, .. }) => match value {
+                NullableInterfaceValue::SharedPayload { .. } => 0,
+                NullableInterfaceValue::Upcast { source, .. } => {
+                    rvalue_class_temporary_capacity(&Rvalue::NullableInterface(*source.clone()))
                 }
-                NullableErrorExpression::Call { args, .. } => {
+                NullableInterfaceValue::Present(value) => {
+                    rvalue_class_temporary_capacity(&Rvalue::error(value.clone()))
+                }
+                NullableInterfaceValue::Call { args, .. } => {
                     args.iter().map(rvalue_class_temporary_capacity).sum()
                 }
-                NullableErrorExpression::Null
-                | NullableErrorExpression::Local { .. }
-                | NullableErrorExpression::Property { .. }
-                | NullableErrorExpression::DictionaryGet { .. }
-                | NullableErrorExpression::CollectionIndex { .. } => 0,
+                NullableInterfaceValue::Null
+                | NullableInterfaceValue::Local { .. }
+                | NullableInterfaceValue::Property { .. }
+                | NullableInterfaceValue::DictionaryGet { .. }
+                | NullableInterfaceValue::CollectionIndex { .. } => 0,
             },
             Rvalue::Class(value) => class_expression_temporary_capacity(value),
             Rvalue::NullableClass(value) => nullable_class_temporary_capacity(value),
@@ -5079,7 +5399,7 @@ fn nullable_writable_weak_class_temporary_capacity(
 
 fn shared_class_temporary_capacity(value: &SharedReferenceExpression) -> usize {
     match value {
-        SharedReferenceExpression::New { value, .. } => class_expression_temporary_capacity(value),
+        SharedReferenceExpression::New { value, .. } => rvalue_class_temporary_capacity(value),
         SharedReferenceExpression::Call { args, .. } => {
             args.iter().map(rvalue_class_temporary_capacity).sum()
         }
@@ -5176,8 +5496,8 @@ fn mixed_class_temporary_capacity(value: &MixedExpression) -> usize {
         MixedExpression::BoxValue(value) => value_class_temporary_capacity(value),
         MixedExpression::BoxString { value, .. } => string_class_temporary_capacity(value),
         MixedExpression::BoxClass { value, .. } => class_expression_temporary_capacity(value),
-        MixedExpression::BoxError { value } => {
-            rvalue_class_temporary_capacity(&Rvalue::Error((**value).clone()))
+        MixedExpression::BoxInterface { value, .. } => {
+            rvalue_class_temporary_capacity(&Rvalue::Interface((**value).clone()))
         }
         MixedExpression::BoxPayloadEnum { value } => payload_enum_class_temporary_capacity(value),
         MixedExpression::BoxFunction { value, .. } => function_class_temporary_capacity(value),
@@ -5320,7 +5640,7 @@ fn string_class_temporary_capacity(value: &StringExpression) -> usize {
         }
         StringExpression::EnumBacking { value, .. } => enum_class_temporary_capacity(value),
         StringExpression::ErrorMessage(value) => {
-            rvalue_class_temporary_capacity(&Rvalue::Error((**value).clone()))
+            rvalue_class_temporary_capacity(&Rvalue::error((**value).clone()))
         }
         StringExpression::Literal(_)
         | StringExpression::Local(_)
@@ -5370,7 +5690,9 @@ fn nullable_string_class_temporary_capacity(value: &NullableStringExpression) ->
 
 fn class_expression_temporary_capacity(value: &ClassExpression) -> usize {
     match value {
-        ClassExpression::Local { .. }
+        ClassExpression::InterfacePayload { .. }
+        | ClassExpression::InterfaceReceiver { .. }
+        | ClassExpression::Local { .. }
         | ClassExpression::Property { .. }
         | ClassExpression::NullableLocalAssumeNonNull { .. }
         | ClassExpression::MixedPayload { .. }
@@ -5482,6 +5804,7 @@ fn nullable_class_temporary_capacity(value: &NullableClassExpression) -> usize {
 
 pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
     match value {
+        BoolExpression::NominalIs { .. } => 0,
         BoolExpression::Use { .. } => 0,
         BoolExpression::Compare { left, right, .. } => {
             value_class_temporary_capacity(left) + value_class_temporary_capacity(right)
@@ -5495,7 +5818,7 @@ pub(crate) fn bool_class_temporary_capacity(value: &BoolExpression) -> usize {
         }
         BoolExpression::ClassIdentityCompare { .. } => 0,
         BoolExpression::NullableErrorIsPresent(value) => {
-            rvalue_class_temporary_capacity(&Rvalue::NullableError((**value).clone()))
+            rvalue_class_temporary_capacity(&Rvalue::NullableInterface((**value).clone()))
         }
         BoolExpression::NullableScalarIsPresent(value) => {
             nullable_scalar_class_temporary_capacity(value)
@@ -5759,17 +6082,19 @@ impl fmt::Display for Type {
             Type::NullableScalar(ty) => write!(formatter, "?{ty}"),
             Type::NullableString => write!(formatter, "?string"),
             Type::NullableMixed => write!(formatter, "?mixed"),
-            Type::Error => write!(formatter, "Error"),
-            Type::NullableError => write!(formatter, "?Error"),
+            Type::Interface(InterfaceTypeId::ERROR) => write!(formatter, "Error"),
+            Type::NullableInterface(InterfaceTypeId::ERROR) => write!(formatter, "?Error"),
+            Type::Interface(interface) => write!(formatter, "interface#{}", interface.0),
+            Type::NullableInterface(interface) => write!(formatter, "?interface#{}", interface.0),
             Type::Class(class) => write!(formatter, "class#{}", class.0),
             Type::NullableClass(class) => write!(formatter, "?class#{}", class.0),
-            Type::SharedReference(class) => write!(formatter, "shared<class#{}>", class.0),
-            Type::WeakReference(class) => write!(formatter, "weak<class#{}>", class.0),
+            Type::SharedReference(payload) => write!(formatter, "shared<{payload}>"),
+            Type::WeakReference(payload) => write!(formatter, "weak<{payload}>"),
             Type::NullableSharedReference(class) => {
-                write!(formatter, "?shared<class#{}>", class.0)
+                write!(formatter, "?shared<{class}>")
             }
             Type::NullableWeakReference(class) => {
-                write!(formatter, "?weak<class#{}>", class.0)
+                write!(formatter, "?weak<{class}>")
             }
             Type::WritableSharedReference(payload) => {
                 write!(formatter, "writable-shared<{payload}>")
@@ -5817,11 +6142,12 @@ impl fmt::Display for Type {
     }
 }
 
-impl fmt::Display for WritableSharedPayload {
+impl fmt::Display for SharedPayload {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Class(class) => write!(formatter, "class#{}", class.0),
             Self::Collection(collection) => write!(formatter, "collection#{}", collection.0),
+            Self::Interface(interface) => write!(formatter, "interface#{}", interface.0),
         }
     }
 }
@@ -5872,19 +6198,74 @@ impl fmt::Display for Operand {
 impl fmt::Display for Rvalue {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Interface(InterfaceExpression {
+                value: InterfaceValue::SharedPayload { local },
+                ..
+            }) => write!(formatter, "shared_interface_payload local{}", local.0),
+            Self::NullableInterface(NullableInterfaceExpression {
+                value: NullableInterfaceValue::SharedPayload { local },
+                ..
+            }) => write!(
+                formatter,
+                "nullable_shared_interface_payload local{}",
+                local.0
+            ),
+            Self::Interface(InterfaceExpression {
+                value:
+                    InterfaceValue::NarrowedLocal {
+                        local,
+                        interface,
+                        transfer,
+                    },
+                ..
+            }) => write!(
+                formatter,
+                "{}narrow_interface local{} as interface#{}",
+                if *transfer { "move " } else { "" },
+                local.0,
+                interface.0
+            ),
+            Rvalue::Interface(InterfaceExpression {
+                value: InterfaceValue::Upcast { source, interface },
+                ..
+            }) => {
+                write!(
+                    formatter,
+                    "upcast ({}) to interface#{}",
+                    Rvalue::Interface(*source.clone()),
+                    interface.0
+                )
+            }
+            Rvalue::NullableInterface(NullableInterfaceExpression {
+                value: NullableInterfaceValue::Upcast { source, interface },
+                ..
+            }) => {
+                write!(
+                    formatter,
+                    "upcast ({}) to ?interface#{}",
+                    Rvalue::NullableInterface(*source.clone()),
+                    interface.0
+                )
+            }
             Rvalue::Value(expression) => write!(formatter, "{expression}"),
             Rvalue::String(value) => write!(formatter, "{value}"),
             Rvalue::NullableScalar(value) => write!(formatter, "{value}"),
             Rvalue::NullableString(value) => write!(formatter, "{value}"),
             Rvalue::Mixed(value) => write!(formatter, "{value}"),
             Rvalue::NullableMixed(value) => write!(formatter, "{value}"),
-            Rvalue::Error(ErrorExpression::Local { local, transfer }) => write!(
+            Rvalue::Interface(InterfaceExpression {
+                value: InterfaceValue::Local { local, transfer },
+                ..
+            }) => write!(
                 formatter,
                 "{}Error local{}",
                 if *transfer { "move " } else { "borrow " },
                 local.0
             ),
-            Rvalue::Error(ErrorExpression::NullableLocalAssumeNonNull { local, transfer }) => {
+            Rvalue::Interface(InterfaceExpression {
+                value: InterfaceValue::NullableLocalAssumeNonNull { local, transfer },
+                ..
+            }) => {
                 write!(
                     formatter,
                     "{}nonnull ?Error local{}",
@@ -5892,16 +6273,30 @@ impl fmt::Display for Rvalue {
                     local.0
                 )
             }
-            Rvalue::Error(ErrorExpression::FromClass { object, descriptor }) => {
-                write!(formatter, "erase {object} as error#{}", descriptor.0)
+            Rvalue::Interface(InterfaceExpression {
+                value: InterfaceValue::FromClass { object, vtable },
+                ..
+            }) => {
+                write!(formatter, "erase {object} with vtable#{}", vtable.0)
             }
-            Rvalue::Error(ErrorExpression::FromNullableClass { object, descriptor }) => {
-                write!(formatter, "erase {object} as ?error#{}", descriptor.0)
+            Rvalue::Interface(InterfaceExpression {
+                value: InterfaceValue::FromNullableClass { object, vtable },
+                ..
+            }) => {
+                write!(
+                    formatter,
+                    "erase nullable {object} with vtable#{}",
+                    vtable.0
+                )
             }
-            Rvalue::Error(ErrorExpression::Property {
-                object,
-                property,
-                transfer,
+            Rvalue::Interface(InterfaceExpression {
+                value:
+                    InterfaceValue::Property {
+                        object,
+                        property,
+                        transfer,
+                    },
+                ..
             }) => write!(
                 formatter,
                 "{}local{}->property#{}:{} as Error",
@@ -5910,13 +6305,20 @@ impl fmt::Display for Rvalue {
                 property.class.0,
                 property.index
             ),
-            Rvalue::Error(ErrorExpression::Call { function, args, .. }) => {
+            Rvalue::Interface(InterfaceExpression {
+                value: InterfaceValue::Call { function, args, .. },
+                ..
+            }) => {
                 write!(formatter, "call fn{}({args:?}) as Error", function.0)
             }
-            Rvalue::Error(ErrorExpression::CollectionIndex {
-                collection,
-                index,
-                remove,
+            Rvalue::Interface(InterfaceExpression {
+                value:
+                    InterfaceValue::CollectionIndex {
+                        collection,
+                        index,
+                        remove,
+                        ..
+                    },
                 ..
             }) => write!(
                 formatter,
@@ -5924,28 +6326,35 @@ impl fmt::Display for Rvalue {
                 if *remove { "remove " } else { "borrow " },
                 collection.0
             ),
-            Rvalue::Error(ErrorExpression::MixedPayload { mixed, transfer }) => write!(
-                formatter,
-                "{}mixed Error local{}",
-                if *transfer { "move " } else { "borrow " },
-                mixed.0
-            ),
-            Rvalue::NullableError(NullableErrorExpression::Null) => {
+            Rvalue::NullableInterface(NullableInterfaceExpression {
+                value: NullableInterfaceValue::Null,
+                ..
+            }) => {
                 write!(formatter, "null as ?Error")
             }
-            Rvalue::NullableError(NullableErrorExpression::Error(value)) => {
-                write!(formatter, "some({})", Rvalue::Error(value.clone()))
+            Rvalue::NullableInterface(NullableInterfaceExpression {
+                value: NullableInterfaceValue::Present(value),
+                ..
+            }) => {
+                write!(formatter, "some({})", Rvalue::error(value.clone()))
             }
-            Rvalue::NullableError(NullableErrorExpression::Local { local, transfer }) => write!(
+            Rvalue::NullableInterface(NullableInterfaceExpression {
+                value: NullableInterfaceValue::Local { local, transfer },
+                ..
+            }) => write!(
                 formatter,
                 "{}?Error local{}",
                 if *transfer { "move " } else { "borrow " },
                 local.0
             ),
-            Rvalue::NullableError(NullableErrorExpression::Property {
-                object,
-                property,
-                transfer,
+            Rvalue::NullableInterface(NullableInterfaceExpression {
+                value:
+                    NullableInterfaceValue::Property {
+                        object,
+                        property,
+                        transfer,
+                    },
+                ..
             }) => write!(
                 formatter,
                 "{}local{}->property#{}:{} as ?Error",
@@ -5954,18 +6363,27 @@ impl fmt::Display for Rvalue {
                 property.class.0,
                 property.index
             ),
-            Rvalue::NullableError(NullableErrorExpression::Call { function, args, .. }) => {
+            Rvalue::NullableInterface(NullableInterfaceExpression {
+                value: NullableInterfaceValue::Call { function, args, .. },
+                ..
+            }) => {
                 write!(formatter, "call fn{}({args:?}) as ?Error", function.0)
             }
-            Rvalue::NullableError(NullableErrorExpression::DictionaryGet {
-                collection,
-                key,
+            Rvalue::NullableInterface(NullableInterfaceExpression {
+                value:
+                    NullableInterfaceValue::DictionaryGet {
+                        collection, key, ..
+                    },
                 ..
             }) => write!(formatter, "local{}->get({key}) as ?Error", collection.0),
-            Rvalue::NullableError(NullableErrorExpression::CollectionIndex {
-                collection,
-                index,
-                remove,
+            Rvalue::NullableInterface(NullableInterfaceExpression {
+                value:
+                    NullableInterfaceValue::CollectionIndex {
+                        collection,
+                        index,
+                        remove,
+                        ..
+                    },
                 ..
             }) => write!(
                 formatter,
@@ -6222,6 +6640,26 @@ impl fmt::Display for CollectionExpression {
 impl fmt::Display for ClassExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InterfacePayload {
+                class,
+                local,
+                transfer,
+            } => write!(
+                formatter,
+                "{}interface_payload local{} as class#{}",
+                if *transfer { "move " } else { "" },
+                local.0,
+                class.0
+            ),
+            Self::InterfaceReceiver {
+                class,
+                receiver,
+                vtable,
+            } => write!(
+                formatter,
+                "borrow interface local{} as class#{} via vtable#{}",
+                receiver.0, class.0, vtable.0
+            ),
             Self::Local {
                 local,
                 transfer: true,
@@ -6302,7 +6740,7 @@ impl fmt::Display for ClassExpression {
 impl fmt::Display for SharedReferenceExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::New { class, .. } => write!(formatter, "shared new class#{}", class.0),
+            Self::New { payload, .. } => write!(formatter, "shared new {payload}"),
             Self::Local {
                 local, transfer, ..
             } => write!(
@@ -6375,7 +6813,7 @@ impl fmt::Display for WeakReferenceExpression {
 impl fmt::Display for NullableSharedReferenceExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Null(class) => write!(formatter, "null: ?shared<class#{}>", class.0),
+            Self::Null(payload) => write!(formatter, "null: ?shared<{payload}>"),
             Self::Shared(value) => write!(formatter, "some({value})"),
             Self::Local { local, .. } => write!(formatter, "local{}", local.0),
             Self::Property {
@@ -6401,7 +6839,7 @@ impl fmt::Display for NullableSharedReferenceExpression {
 impl fmt::Display for NullableWeakReferenceExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Null(class) => write!(formatter, "null: ?weak<class#{}>", class.0),
+            Self::Null(payload) => write!(formatter, "null: ?weak<{payload}>"),
             Self::Weak(value) => write!(formatter, "some({value})"),
             Self::Local { local, .. } => write!(formatter, "local{}", local.0),
             Self::Property {
@@ -6432,7 +6870,7 @@ impl fmt::Display for MixedTag {
             Self::String => formatter.write_str("string"),
             Self::Function(ty) => write!(formatter, "function-type#{}", ty.0),
             Self::Class(class) => write!(formatter, "class#{}", class.0),
-            Self::Error => formatter.write_str("Error"),
+            Self::Interface(interface) => write!(formatter, "interface#{}", interface.0),
             Self::PayloadEnum(ty) => write!(formatter, "payload-enum#{}", ty.id.0),
         }
     }
@@ -6460,8 +6898,8 @@ impl fmt::Display for MixedExpression {
             Self::BoxString { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxFunction { value, .. } => write!(formatter, "mixed({value})"),
             Self::BoxClass { value, .. } => write!(formatter, "mixed({value})"),
-            Self::BoxError { value } => {
-                write!(formatter, "mixed({})", Rvalue::Error((**value).clone()))
+            Self::BoxInterface { value, .. } => {
+                write!(formatter, "mixed({})", Rvalue::Interface((**value).clone()))
             }
             Self::BoxPayloadEnum { value } => {
                 write!(formatter, "mixed(payload-enum#{})", value.ty().id.0)
@@ -6749,7 +7187,7 @@ impl fmt::Display for StringExpression {
             StringExpression::ErrorMessage(error) => write!(
                 formatter,
                 "error_message({})",
-                Rvalue::Error((**error).clone())
+                Rvalue::error((**error).clone())
             ),
             StringExpression::Static(id) => write!(formatter, "static{}", id.0),
             StringExpression::MixedPayload(local) => {
@@ -6852,6 +7290,7 @@ impl fmt::Display for FormatExpression {
 impl fmt::Display for BoolExpression {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NominalIs { local, target } => write!(formatter, "local{} is {target}", local.0),
             Self::Use { operand } => match operand {
                 Operand::Scalar(ScalarValue::Bool(value)) => write!(formatter, "{value}: bool"),
                 Operand::Local(id) => write!(formatter, "local{}: bool", id.0),
@@ -6902,7 +7341,7 @@ impl fmt::Display for BoolExpression {
             Self::NullableErrorIsPresent(value) => write!(
                 formatter,
                 "present({})",
-                Rvalue::NullableError((**value).clone())
+                Rvalue::NullableInterface((**value).clone())
             ),
             Self::NullableClassIsPresent(value) => write!(formatter, "present({value})"),
             Self::ClassIs { value, target } => {
@@ -7267,11 +7706,17 @@ impl fmt::Display for Statement {
             Statement::DropClass { local, class } => {
                 write!(formatter, "drop class#{} local{}", class.0, local.0)
             }
-            Statement::DropSharedReference { local, class } => {
-                write!(formatter, "drop shared<class#{}> local{}", class.0, local.0)
+            Statement::DropSharedReference {
+                local,
+                payload: class,
+            } => {
+                write!(formatter, "drop shared<{class}> local{}", local.0)
             }
-            Statement::DropWeakReference { local, class } => {
-                write!(formatter, "drop weak<class#{}> local{}", class.0, local.0)
+            Statement::DropWeakReference {
+                local,
+                payload: class,
+            } => {
+                write!(formatter, "drop weak<{class}> local{}", local.0)
             }
             Statement::DropWritableSharedReference { local, payload } => {
                 write!(

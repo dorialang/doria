@@ -1,0 +1,47 @@
+interface Failure extends Error { function code(): int; }
+interface Missing extends Failure {}
+class Gone implements Missing {
+    function __construct(string $message) {}
+    function code(): int { return 404; }
+    function __destruct() { try { echo "drop;"; } catch (Error) {} }
+}
+class Other implements Failure {
+    function __construct(string $message) {}
+    function code(): int { return 500; }
+    function __destruct() { try { echo "other-drop;"; } catch (Error) {} }
+}
+function forward(take Failure $value): void throws Failure {
+    try { throw $value; }
+    catch (Missing $caught) { echo "inner {$caught->code()};"; throw $caught; }
+}
+interface Task { function run(): void throws Failure; }
+class Job implements Task {
+    function run(): void throws Missing { throw new Gone("job"); }
+}
+function invoke(Task $task): void throws Failure { $task->run(); }
+function optionalFailure(): ?Failure { return new Gone("nullable"); }
+function optionalMessage(?Error $error): ?string { return $error?->message; }
+function main(): void {
+    {
+        try { forward(new Gone("gone")); }
+        catch (Missing $caught) { echo "{$caught->message};"; }
+        catch (Failure $caught) { echo "wrong;"; }
+        try { forward(new Other("other")); }
+        catch (Missing $caught) { echo "wrong;"; }
+        catch (Failure $caught) { echo "{$caught->message}:{$caught->code()};"; }
+        try { invoke(new Job()); }
+        catch (Failure $caught) { echo "{$caught->message};"; }
+        SharedReference<Failure> $owner = shared new Gone("shared");
+        echo "{$owner->message}:{$owner->code()};";
+        ?SharedReference<Failure> $maybeOwner = $owner->share();
+        ?SharedReference<Failure> $noOwner = null;
+        echo ($maybeOwner?->message ?? "wrong") . ";" . ($noOwner?->message ?? "absent") . ";";
+        ?Failure $maybeError = optionalFailure();
+        ?Failure $noError = null;
+        ?string $message = $owner->message;
+        echo ($maybeError?->message ?? "wrong") . ";" . ($noError?->message ?? "absent") . ";";
+        echo ($message ?? "wrong") . ";";
+        echo (optionalMessage($maybeError) ?? "wrong") . ";";
+    }
+    echo "\n";
+}

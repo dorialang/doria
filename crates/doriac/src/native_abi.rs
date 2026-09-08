@@ -3,6 +3,9 @@
 use crate::mir;
 
 pub const ASSERTION_ERROR_DESCRIPTOR_MAGIC: u64 = 0xA557_0004;
+pub const INTERFACE_VTABLE_HEADER_WORDS: usize = 10;
+pub const INTERFACE_VTABLE_CLASS_DESCRIPTOR_WORD: u32 = 8;
+pub const CLASS_DESCRIPTOR_INTERFACE_WORD: u32 = 5;
 
 pub const STRING_FROM_UTF8: &str = "dr_v1_string_from_utf8";
 pub const PROCESS_EXIT: &str = "dr_v1_exit_process";
@@ -359,10 +362,13 @@ pub const MIXED_TAG_STRING: u8 = 12;
 pub const MIXED_TAG_CLASS: u8 = 13;
 pub const MIXED_TAG_ENUM: u8 = 14;
 pub const MIXED_TAG_PAYLOAD_ENUM: u8 = 15;
-pub const MIXED_TAG_ERROR: u8 = 16;
+pub const MIXED_TAG_INTERFACE: u8 = 16;
 pub const MIXED_TAG_FUNCTION: u8 = 17;
 
 pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<u8> {
+    if ty.shared_interface().is_some() {
+        return pointer_width.checked_mul(2);
+    }
     match ty {
         mir::Type::Scalar(mir::ScalarType::Bool) => Some(1),
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => Some(ty.storage_bytes() as u8),
@@ -389,7 +395,7 @@ pub const fn collection_value_width(ty: mir::Type, pointer_width: u8) -> Option<
         | mir::Type::NullableWritableSharedReferenceAccess(_)
         | mir::Type::Collection(_)
         | mir::Type::NullableCollection(_) => Some(pointer_width),
-        mir::Type::Error | mir::Type::NullableError => pointer_width.checked_mul(2),
+        mir::Type::Interface(_) | mir::Type::NullableInterface(_) => pointer_width.checked_mul(2),
         mir::Type::Function(_) | mir::Type::NullableFunction(_) => pointer_width.checked_mul(2),
         mir::Type::ClosureEnvironment(_) => Some(pointer_width),
         mir::Type::NullableScalar(_) => Some(16),
@@ -402,7 +408,7 @@ pub const fn nullable_payload_type(ty: mir::Type) -> Option<mir::Type> {
         mir::Type::NullableScalar(value) => Some(mir::Type::Scalar(value)),
         mir::Type::NullableString => Some(mir::Type::String),
         mir::Type::NullableMixed => Some(mir::Type::Mixed),
-        mir::Type::NullableError => Some(mir::Type::Error),
+        mir::Type::NullableInterface(interface) => Some(mir::Type::Interface(interface)),
         mir::Type::NullableClass(value) => Some(mir::Type::Class(value)),
         mir::Type::NullableSharedReference(value) => Some(mir::Type::SharedReference(value)),
         mir::Type::NullableWeakReference(value) => Some(mir::Type::WeakReference(value)),
@@ -441,7 +447,39 @@ pub fn function_symbol(function: &mir::Function) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::collection_header_size;
+    use super::{collection_header_size, collection_value_width, nullable_payload_type};
+    use crate::mir::{InterfaceTypeId, Type};
+
+    #[test]
+    fn every_interface_specialization_uses_a_paired_carrier() {
+        assert_eq!(doria_rt::DR_INTERFACE_CARRIER_SIZE, size_of::<usize>() * 2);
+        assert_eq!(
+            doria_rt::DR_INTERFACE_VTABLE_HEADER_SIZE,
+            size_of::<usize>() * super::INTERFACE_VTABLE_HEADER_WORDS
+        );
+        for interface in [
+            InterfaceTypeId::ERROR,
+            InterfaceTypeId(1),
+            InterfaceTypeId(42),
+        ] {
+            for pointer_width in [4, 8] {
+                for ty in [
+                    Type::Interface(interface),
+                    Type::NullableInterface(interface),
+                ] {
+                    assert_eq!(
+                        collection_value_width(ty, pointer_width),
+                        Some(pointer_width * 2)
+                    );
+                    assert!(ty.has_move_ownership());
+                }
+            }
+            assert_eq!(
+                nullable_payload_type(Type::NullableInterface(interface)),
+                Some(Type::Interface(interface))
+            );
+        }
+    }
 
     #[test]
     fn collection_cleanup_scratch_matches_the_runtime_header() {

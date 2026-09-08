@@ -1,0 +1,22 @@
+interface Labeled extends Displayable { function label(): string; }
+class Text implements Labeled {
+    function __construct(string $text) {}
+    function label(): string { return $this->text; }
+    function toString(): string { echo "convert:"; return $this->text; }
+}
+function display(Displayable $value): void {
+    echo $value;
+    echo "[{$value}]";
+    echo "concat:" . $value;
+    echo sprintf("format:%s", $value);
+}
+function constrained<T implements Displayable>(T $value): void { echo "generic:{$value}"; }
+function main(): void {
+    Labeled $value = new Text("text");
+    display($value);
+    constrained($value);
+    ?Displayable $nullable = new Text("nullable");
+    if ($nullable != null) { echo $nullable; }
+    let $direct = new Text("direct");
+    constrained($direct);
+}

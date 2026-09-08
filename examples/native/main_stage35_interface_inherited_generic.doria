@@ -1,0 +1,15 @@
+interface Identify { function identity<T>(take T $value): T; }
+interface Value { function number(): int; }
+class Item implements Value {
+    function number(): int { return 7; }
+    function __destruct(): void { try { echo "drop;"; } catch (Error $error) {} }
+}
+open class Base { function identity<U>(take U $value): U { return $value; } }
+class Child extends Base implements Identify {}
+function main(): void {
+    Identify $identity = new Child();
+    echo $identity->identity(true);
+    Value $item = new Item();
+    let $result = $identity->identity($item);
+    echo $result->number();
+}

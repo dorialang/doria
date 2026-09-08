@@ -1,0 +1,30 @@
+interface Named { function name(): string; }
+interface Numbered { function number(): int; }
+interface Read<T> { function read(): T; }
+class Value implements Named, Numbered, Read<int> {
+    function name(): string { return "value"; }
+    function number(): int { return 42; }
+    function read(): int { return 7; }
+    function __destruct() { try { echo "drop;"; } catch (Error) {} }
+}
+function inspect(mixed $value): void {
+    if ($value is Named) { echo $value->name(); }
+    if ($value is Numbered) { echo $value->number(); }
+    if ($value is Value) { echo $value->read(); }
+    if ($value is Read<int>) { echo $value->read(); }
+    if ($value is Read<string>) { echo "wrong"; }
+}
+function consume(take mixed $value): string {
+    return match (take $value) { Numbered $number => "number {$number->number()}", default => "other" };
+}
+function main(): void {
+    Named $value = new Value();
+    inspect($value);
+    echo $value->name();
+    inspect(new Value());
+    inspect(5); inspect("text");
+    ?mixed $none = null;
+    if ($none is Named) { echo "wrong-null"; }
+    echo consume($value);
+    echo consume(new Value());
+}

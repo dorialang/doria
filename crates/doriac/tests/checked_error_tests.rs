@@ -738,6 +738,9 @@ function main(): void
                 mir.error_descriptors[id.0].type_name.as_str()
             }
             doriac::mir::CheckedEffect::Any => "Error",
+            doriac::mir::CheckedEffect::Interface(interface) => {
+                &mir.interface_types[interface.0].name
+            }
         })
         .collect::<Vec<_>>();
     assert_eq!(

@@ -1,5 +1,4 @@
 use doriac::ast::{ClassMember, Item};
-use doriac::backend::BackendTarget;
 
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
     doriac::check_source("stage24.doria", source).expect_err("source should be rejected")
@@ -365,22 +364,16 @@ function main(): int
 }
 
 #[test]
-fn php_backend_rejects_generics_with_an_explicit_capability_diagnostic() {
-    let errors = doriac::compile_source(
+fn php_backend_emits_concrete_generic_callable_instances() {
+    let php = doriac::compile_source_to_php(
         "stage24-php.doria",
         r#"
 function identity<T>(T $value): T { return $value; }
-function main(): int { return identity(42); }
+function main(): int { identity(true); return identity(42); }
 "#,
-        BackendTarget::Php,
     )
-    .expect_err("the PHP compatibility backend should reject native-only generics");
-
-    assert!(errors.iter().any(|diagnostic| {
-        diagnostic.code == "B2401"
-            && diagnostic
-                .message
-                .contains("generic function specialization")
-            && diagnostic.message.contains("native target")
-    }));
+    .expect("checked generic instances should lower to PHP");
+    assert!(php.contains("$value): bool"));
+    assert!(php.contains("$value): int"));
+    assert!(!php.contains("(T $value)"));
 }

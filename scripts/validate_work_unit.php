@@ -169,8 +169,9 @@ function llvm_commands(string $target): array
         command(['cargo', 'build', '-p', 'doria-rt', '--locked'], $target),
         command(['cargo', 'build', '-p', 'doriac', '--bin', 'doriac', '--features', 'llvm-backend', '--locked'], $target),
         command(['cargo', 'clippy', '-p', 'doriac', '--all-targets', '--features', 'llvm-backend', '--locked', '--', '-D', 'warnings'], $target),
+        command(['cargo', 'test', '-p', 'doriac', '--lib', '--features', 'llvm-backend', '--locked', 'mir_lowering::interface::tests'], $target),
     ];
-    foreach (['mir_validation_tests', 'llvm_mir_tests', 'cli_tests', 'stage17_io_tests', 'stage18_tests', 'native_mir_parity_tests'] as $suite) {
+    foreach (['mir_validation_tests', 'llvm_mir_tests', 'cli_tests', 'stage17_io_tests', 'stage18_tests', 'stage35_runtime_tests', 'native_mir_parity_tests'] as $suite) {
         $commands[] = command(
             ['cargo', 'test', '-p', 'doriac', '--test', $suite, '--features', 'llvm-backend', '--locked'],
             $target,

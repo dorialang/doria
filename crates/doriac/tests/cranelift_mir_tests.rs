@@ -1,7 +1,7 @@
 use doriac::mir::{
-    BasicBlock, BlockId, FloatBinaryOp, FloatExpression, Function, FunctionId, IntegerExpression,
-    LocalId, Operand, Program, ReturnType, Rvalue, ScalarType, Statement, Terminator, Type,
-    ValueExpression,
+    self, BasicBlock, BlockId, FloatBinaryOp, FloatExpression, Function, FunctionId,
+    IntegerExpression, LocalId, Operand, Program, ReturnType, Rvalue, ScalarType, Statement,
+    Terminator, Type, ValueExpression,
 };
 use doriac::numeric::{FloatType, FloatValue, IntegerType};
 
@@ -478,6 +478,8 @@ fn void_program() -> Program {
         enums: vec![],
         classes: vec![],
         collection_types: vec![],
+        interface_types: vec![mir::InterfaceType::error()],
+        interface_vtables: Vec::new(),
         statics: vec![],
         error_descriptors: Vec::new(),
         error_origins: Vec::new(),

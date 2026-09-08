@@ -1,0 +1,37 @@
+interface Value { function number(): int; }
+interface Read<T> { function read(take T $fallback): T; }
+interface Identify { function identity<T>(take T $value): T; }
+class Item implements Value {
+    function __construct(int $value) {}
+    function number(): int { return $this->value; }
+    function __destruct() { try { echo "drop;"; } catch (Error) {} }
+}
+class Reader<T> implements Read<T> {
+    function read(take T $fallback): T {
+        let $identity = fn(take T $input) => $input;
+        return $identity($fallback);
+    }
+}
+class Identity implements Identify {
+    function identity<U>(take U $value): U { return $value; }
+}
+function forward<T>(Read<T> $reader, take T $value): T { return $reader->read($value); }
+function main(): void {
+    Read<int> $integers = new Reader<int>();
+    Read<Value> $objects = new Reader<Value>();
+    Identify $identity = new Identity();
+    int $original = 42;
+    echo forward($integers, $original);
+    echo $original;
+    Value $item = new Item(7);
+    let $result = forward($objects, $item);
+    echo $identity->identity(3);
+    echo $identity->identity($result)->number();
+    if ($integers is Read<Value>) { echo "wrong-interface"; }
+    if ($integers is Reader<Value>) { echo "wrong-class"; }
+    if ($integers is Reader<int>) { echo "typed;"; }
+    SharedReference<Identify> $shared = shared new Identity();
+    echo $shared->identity(9);
+    Value $last = new Item(6);
+    echo $shared->identity($last)->number();
+}

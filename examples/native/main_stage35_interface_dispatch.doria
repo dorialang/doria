@@ -1,0 +1,10 @@
+interface Renderable { function render(): string; }
+class Report implements Renderable {
+    function __construct(string $title) {}
+    function render(): string { return $this->title; }
+}
+function renderReport(Renderable $report): string { return $report->render(); }
+function main(): void {
+    Renderable $report = new Report("report");
+    echo renderReport($report) . "\n";
+}

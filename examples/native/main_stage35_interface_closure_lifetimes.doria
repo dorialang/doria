@@ -1,0 +1,19 @@
+interface Value { function number(): int; }
+class Item implements Value {
+    function __construct(int $value) {}
+    function number(): int { return $this->value; }
+    function __destruct() { try { echo "drop;"; } catch (Error) {} }
+}
+function main(): void {
+    writable bool $running = true;
+    for (let writable $make = fn() => new Item(1); $running; $make = fn() => new Item(2)) {
+        echo $make()->number();
+        $running = false;
+    }
+    given { let $condition = fn() => true; } if ($condition()) {
+        echo (function (): Value { return new Item(3); })()->number();
+    } finally {
+        let $finish = fn() => new Item(4);
+        echo $finish()->number();
+    }
+}

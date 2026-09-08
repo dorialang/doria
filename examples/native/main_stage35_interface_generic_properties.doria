@@ -1,0 +1,21 @@
+interface Value { function number(): int; }
+class Item implements Value {
+    function __construct(int $value) {}
+    function number(): int { return $this->value; }
+    function __destruct() { try { echo "drop;"; } catch (Error) {} }
+}
+class Holder<T> { function __construct(take T $value) {} }
+class Factory<T> {
+    function(take T): T $identity = fn(take T $input) => $input;
+}
+function inspect(Value $value): void { echo $value->number(); }
+function main(): void {
+    let $holder = new Holder<Value>(new Item(8));
+    inspect($holder->value);
+    let $integers = new Factory<int>();
+    let $objects = new Factory<Value>();
+    echo ($integers->identity)(42);
+    Value $value = new Item(7);
+    let $result = ($objects->identity)($value);
+    inspect($result);
+}

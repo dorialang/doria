@@ -1,0 +1,18 @@
+interface Value { function read(): int; }
+class Number implements Value {
+    function __construct(int $number) {}
+    function read(): int { return $this->number; }
+}
+function concrete(Number $value): int { return $value->read(); }
+function constrained<T implements Value>(T $value): int { return $value->read(); }
+function erased(Value $value): int { return $value->read(); }
+function repeat(Number $number): int {
+    let writable $result = 0;
+    foreach (0..3 as int $i) {
+        $result = concrete($number);
+        $result = constrained($number);
+        $result = erased($number);
+    }
+    return $result;
+}
+function main(): void { echo "{repeat(new Number(7))}\n"; }

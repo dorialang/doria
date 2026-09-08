@@ -123,12 +123,12 @@ fn indirect_callee_and_mode_mut(
 ) -> (&mut FunctionExpression, &mut FunctionInvocationMode) {
     match terminator {
         Terminator::IndirectCall {
-            callee,
+            callee: mir::IndirectCallee::Closure(callee),
             invocation_mode,
             ..
         }
         | Terminator::CheckedIndirectCall {
-            callee,
+            callee: mir::IndirectCallee::Closure(callee),
             invocation_mode,
             ..
         } => (callee, invocation_mode),

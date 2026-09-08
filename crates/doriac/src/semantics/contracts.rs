@@ -6,6 +6,7 @@ use crate::types::InterfaceType;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContractFacts {
     pub interfaces: Vec<InterfaceFacts>,
+    pub interface_specializations: Vec<InterfaceSpecializationFacts>,
     pub traits: Vec<TraitFacts>,
     pub conformances: Vec<ConformanceFacts>,
     pub boundaries: Vec<SupportBoundary>,
@@ -42,6 +43,16 @@ pub struct InterfaceFacts {
     pub name_span: Span,
     pub type_parameters: Vec<TypeParamDecl>,
     pub parents: Vec<ContractEdge>,
+    pub requirements: Vec<RequirementFacts>,
+    pub valid: bool,
+}
+
+/// The checked, substituted requirement graph used by runtime lowering. Keeping
+/// this separate from declaration syntax prevents backend conformance lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterfaceSpecializationFacts {
+    pub specialization: InterfaceType<ResolvedType>,
+    pub ancestors: Vec<InterfaceType<ResolvedType>>,
     pub requirements: Vec<RequirementFacts>,
     pub valid: bool,
 }
@@ -85,6 +96,7 @@ pub struct RequirementImplementation {
     pub requirement_origins: Vec<RequirementOrigin>,
     pub implementation: Option<Span>,
     pub failures: Vec<ContractMismatch>,
+    pub exact_dynamic_return: Option<ResolvedType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,7 +110,6 @@ pub struct ConformanceFacts {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingContractOperation {
-    InterfaceValue,
     CoreValueOperation,
     TraitComposition,
 }
@@ -106,7 +117,6 @@ pub enum PendingContractOperation {
 impl PendingContractOperation {
     pub fn slice(self) -> u8 {
         match self {
-            Self::InterfaceValue => 2,
             Self::CoreValueOperation => 3,
             Self::TraitComposition => 4,
         }
@@ -114,7 +124,6 @@ impl PendingContractOperation {
 
     pub fn diagnostic(self, span: Span) -> Diagnostic {
         let (code, description) = match self {
-            Self::InterfaceValue => ("E0758", "interface value execution"),
             Self::CoreValueOperation => ("E0759", "core value-contract execution"),
             Self::TraitComposition => ("E0493", "trait composition"),
         };
@@ -127,7 +136,6 @@ impl PendingContractOperation {
             span,
         )
         .with_title(match self {
-            Self::InterfaceValue => "Interface Execution Is Not Yet Supported",
             Self::CoreValueOperation => "Core Contract Execution Is Not Yet Supported",
             Self::TraitComposition => "Trait Composition Is Not Yet Supported",
         })
@@ -194,6 +202,7 @@ pub enum ContractMismatch {
     Receiver,
     ReturnType,
     ReturnProvenance,
+    ExactDynamicReturn,
     CheckedEffects,
     Accessibility,
     StaticMethod,
@@ -210,6 +219,7 @@ impl ContractMismatch {
             Self::Receiver => "receiver access",
             Self::ReturnType => "return type",
             Self::ReturnProvenance => "return ownership or provenance",
+            Self::ExactDynamicReturn => "owned exact dynamic implementing-class result",
             Self::CheckedEffects => "checked effects",
             Self::Accessibility => "external accessibility",
             Self::StaticMethod => "instance method identity",
@@ -218,6 +228,63 @@ impl ContractMismatch {
 }
 
 impl Checker<'_> {
+    pub(super) fn publish_interface_specializations(&mut self) {
+        let conformances = self
+            .contracts
+            .conformances
+            .iter()
+            .map(|fact| fact.interface.clone())
+            .collect::<Vec<_>>();
+        for interface in conformances {
+            let interface = InterfaceType::new(
+                interface.name,
+                interface
+                    .arguments
+                    .iter()
+                    .map(|argument| self.types.intern_resolved(argument))
+                    .collect(),
+            );
+            self.types.intern(TypeKind::Interface(interface));
+        }
+        // A type used only in a test or storage declaration still needs its
+        // canonical graph. Building a graph can intern further referenced types.
+        let mut next = 0;
+        while let Some(kind) = self.types.kinds().get(next).cloned() {
+            next += 1;
+            if let TypeKind::Interface(interface) = kind {
+                self.canonical_interface_requirements(&interface, &mut Vec::new());
+            }
+        }
+        let mut specializations = self.interface_requirements.iter().collect::<Vec<_>>();
+        specializations.sort_by_key(|(interface, _)| {
+            (
+                &interface.name,
+                interface
+                    .arguments
+                    .iter()
+                    .map(|ty| self.types.display(*ty))
+                    .collect::<Vec<_>>(),
+            )
+        });
+        self.contracts.interface_specializations = specializations
+            .into_iter()
+            .map(|(interface, graph)| InterfaceSpecializationFacts {
+                specialization: self.resolved_interface(interface),
+                ancestors: graph
+                    .ancestors
+                    .iter()
+                    .map(|ancestor| self.resolved_interface(ancestor))
+                    .collect(),
+                requirements: graph
+                    .requirements
+                    .iter()
+                    .map(|requirement| self.requirement_facts(requirement))
+                    .collect(),
+                valid: graph.valid,
+            })
+            .collect();
+    }
+
     pub(super) fn interface_receiver(&self, ty: TypeId) -> Option<InterfaceType<TypeId>> {
         match self.types.kind(ty) {
             TypeKind::Interface(interface) => Some(interface.clone()),
@@ -234,11 +301,27 @@ impl Checker<'_> {
         interface: &InterfaceType<TypeId>,
         name: &str,
     ) -> Option<MethodInfo> {
-        self.canonical_interface_requirements(interface, &mut Vec::new())
+        let mut method = self
+            .canonical_interface_requirements(interface, &mut Vec::new())
             .requirements
             .into_iter()
             .find(|requirement| requirement.name == name)
-            .map(|requirement| requirement.method)
+            .map(|requirement| requirement.method)?;
+        self.resolve_interface_self_result(&mut method, interface);
+        Some(method)
+    }
+
+    fn resolve_interface_self_result(
+        &mut self,
+        method: &mut MethodInfo,
+        interface: &InterfaceType<TypeId>,
+    ) {
+        if matches!(
+            self.types.kind(method.return_ty),
+            TypeKind::InterfaceSelf(_)
+        ) {
+            method.return_ty = self.types.intern(TypeKind::Interface(interface.clone()));
+        }
     }
 
     pub(super) fn constrained_requirement(
@@ -343,7 +426,7 @@ impl Checker<'_> {
         scopes: &ScopeStack,
         method_context: Option<&MethodContext>,
     ) {
-        let Some(required) = self
+        let Some(mut required) = self
             .canonical_interface_requirements(interface, &mut Vec::new())
             .requirements
             .into_iter()
@@ -362,6 +445,7 @@ impl Checker<'_> {
             );
             return;
         };
+        self.resolve_interface_self_result(&mut required.method, interface);
         self.check_contract_call(
             required,
             object,
@@ -395,6 +479,15 @@ impl Checker<'_> {
                     method_name: method.to_string(),
                     requirement: required.method.declaration,
                     implementations: Vec::new(),
+                });
+        } else if let Some(interface) = self.interface_receiver(receiver) {
+            let interface = self.resolved_interface(&interface);
+            self.call_targets
+                .entry(span)
+                .or_insert_with(|| CallableTarget::InterfaceMethod {
+                    interface,
+                    method_name: method.to_string(),
+                    requirement: required.method.declaration,
                 });
         }
         if self.contract_type_depth == 0
@@ -467,7 +560,15 @@ impl Checker<'_> {
             scopes,
             method_context,
         );
-        self.record_checked_effects(method.checked_effects, span);
+        let effects = if matches!(
+            self.call_targets.get(&span),
+            Some(CallableTarget::InterfaceMethod { .. })
+        ) {
+            self.complete_function_value_effects(&method.checked_effects, span)
+        } else {
+            method.checked_effects
+        };
+        self.record_checked_effects(effects, span);
     }
 
     pub(super) fn specialize_constrained_method(
@@ -767,16 +868,8 @@ impl Checker<'_> {
                 .boundaries
                 .push(SupportBoundary { operation, span });
         }
-        // Provisional effect inference retains facts but discards diagnostics.
-        // A retained boundary must not suppress the final source diagnostic.
-        let diagnostic = operation.diagnostic(span);
-        if !self
-            .diagnostics
-            .iter()
-            .any(|existing| existing.code == diagnostic.code && existing.span == span)
-        {
-            self.diagnostics.push(diagnostic);
-        }
+        // Pending execution is not a semantic error. Publish its diagnostic only
+        // after checking, so it cannot suppress effect or ownership facts.
     }
 
     pub(super) fn collect_interface_declarations(&mut self) {
@@ -1506,10 +1599,11 @@ impl Checker<'_> {
                 for mut requirement in requirements.requirements {
                     // Dependent interface `self` is instantiated by the concrete implementer,
                     // never by the lexical interface or the method's declaring ancestor.
-                    if matches!(
+                    let requires_exact_return = matches!(
                         self.types.kind(requirement.method.return_ty),
                         TypeKind::InterfaceSelf(_)
-                    ) {
+                    );
+                    if requires_exact_return {
                         requirement.method.return_ty = implementing_type;
                     }
                     let method = self.find_concrete_contract_method(&class, &requirement.name);
@@ -1517,12 +1611,30 @@ impl Checker<'_> {
                         requirement_origins: self.requirement_origins(&requirement),
                         implementation: None,
                         failures: Vec::new(),
+                        exact_dynamic_return: None,
                     };
                     if !deferred && requirements.valid {
                         if let Some(method) = method {
                             implementation.implementation = Some(method.declaration);
                             implementation.failures =
                                 self.method_contract_failures(&method, &requirement.method);
+                            if requires_exact_return {
+                                let expected = self.types.resolved(implementing_type);
+                                if method.return_borrow.is_none()
+                                    && self.prove_exact_return(
+                                        method.declaration,
+                                        &expected,
+                                        &method.enclosing_type_bindings,
+                                        &mut HashSet::new(),
+                                    )
+                                {
+                                    implementation.exact_dynamic_return = Some(expected);
+                                } else {
+                                    implementation
+                                        .failures
+                                        .push(ContractMismatch::ExactDynamicReturn);
+                                }
+                            }
                             if !implementation.failures.is_empty() {
                                 fact.status = ConformanceStatus::Invalid;
                                 if !legacy_diagnostic {
@@ -1589,6 +1701,13 @@ impl Checker<'_> {
                 let ty = self.types.intern_resolved(&fact.implementing_type);
                 let ty = self.substitute_type_id(ty, &substitutions);
                 fact.implementing_type = self.types.resolved(ty);
+                for implementation in &mut fact.implementations {
+                    if let Some(exact) = &mut implementation.exact_dynamic_return {
+                        let ty = self.types.intern_resolved(exact);
+                        let ty = self.substitute_type_id(ty, &substitutions);
+                        *exact = self.types.resolved(ty);
+                    }
+                }
                 for interface in std::iter::once(&mut fact.interface).chain(
                     fact.implementations.iter_mut().flat_map(|implementation| {
                         implementation
@@ -1607,6 +1726,143 @@ impl Checker<'_> {
                     self.contracts.conformances.push(fact);
                 }
             }
+        }
+    }
+
+    fn prove_exact_return(
+        &mut self,
+        declaration: Span,
+        expected: &ResolvedType,
+        bindings: &HashMap<String, TypeId>,
+        visiting: &mut HashSet<Span>,
+    ) -> bool {
+        if !visiting.insert(declaration) {
+            return false;
+        }
+        let function = self.program.items.iter().find_map(|item| match item {
+            Item::Function(function) if function.span == declaration => Some(function),
+            Item::Class(class) => class.members.iter().find_map(|member| match member {
+                ClassMember::Method(method) if method.span == declaration => Some(method),
+                _ => None,
+            }),
+            _ => None,
+        });
+        let analysis = function.and_then(|function| {
+            crate::return_analysis::analyze_with_given(function, &self.given_preludes)
+        });
+        let proven = analysis.is_some_and(|analysis| {
+            !analysis.fallthrough_reachable
+                && analysis
+                    .value_returns()
+                    .all(|value| self.prove_exact_result(value, expected, bindings, visiting))
+        });
+        visiting.remove(&declaration);
+        proven
+    }
+
+    fn exact_result_type(
+        &mut self,
+        span: Span,
+        bindings: &HashMap<String, TypeId>,
+    ) -> Option<ResolvedType> {
+        let ty = self.expression_types.get(&span)?.clone();
+        let ty = self.types.intern_resolved(&ty);
+        let ty = self.substitute_type_id(ty, bindings);
+        Some(self.types.resolved(ty))
+    }
+
+    fn prove_exact_result(
+        &mut self,
+        expr: &Expr,
+        expected: &ResolvedType,
+        bindings: &HashMap<String, TypeId>,
+        visiting: &mut HashSet<Span>,
+    ) -> bool {
+        // A closed result type is exact regardless of how the value was produced.
+        if self.exact_result_type(expr.span(), bindings).as_ref() == Some(expected)
+            && matches!(expected, ResolvedType::Class(class) if self.classes.get(&class.name).is_some_and(|class| !class.is_open))
+        {
+            return true;
+        }
+        match expr {
+            Expr::Grouped { expr, .. } => {
+                self.prove_exact_result(expr, expected, bindings, visiting)
+            }
+            Expr::New { span, .. } => {
+                self.exact_result_type(*span, bindings).as_ref() == Some(expected)
+            }
+            Expr::Variable { span, .. } => match self.flow_facts.get(span).cloned() {
+                Some(crate::narrowing::Fact::Constructed { origins, .. }) => {
+                    !origins.is_empty()
+                        && origins.iter().all(|origin| {
+                            self.exact_result_type(*origin, bindings).as_ref() == Some(expected)
+                        })
+                }
+                _ => false,
+            },
+            Expr::Match { arms, .. } => {
+                !arms.is_empty()
+                    && arms.iter().all(|arm| {
+                        self.prove_exact_result(&arm.value, expected, bindings, visiting)
+                    })
+            }
+            Expr::When(expression) => expression.branches.iter().all(|branch| {
+                let analysis = crate::return_analysis::analyze_block_with_given(
+                    &branch.block,
+                    branch.span,
+                    &self.given_preludes,
+                );
+                !analysis.fallthrough_reachable
+                    && analysis
+                        .value_returns()
+                        .all(|value| self.prove_exact_result(value, expected, bindings, visiting))
+            }),
+            Expr::FunctionCall { span, .. }
+            | Expr::StaticCall { span, .. }
+            | Expr::MethodCall { span, .. } => match self.call_targets.get(span).cloned() {
+                Some(CallableTarget::Function { name }) => {
+                    let Some(function) = self.functions.get(&name) else {
+                        return false;
+                    };
+                    let declaration = function.declaration;
+                    function.return_borrow.is_none()
+                        && self.prove_exact_return(declaration, expected, bindings, visiting)
+                }
+                Some(CallableTarget::Method {
+                    class_type,
+                    method_name,
+                    direct_parent,
+                }) => {
+                    let class = ClassType {
+                        name: class_type.name,
+                        arguments: class_type
+                            .arguments
+                            .iter()
+                            .map(|ty| self.types.intern_resolved(ty))
+                            .collect(),
+                    };
+                    let Some(method) = self.find_concrete_contract_method(&class, &method_name)
+                    else {
+                        return false;
+                    };
+                    let exact_dispatch = direct_parent
+                        || method.virtual_root.is_none()
+                        || self
+                            .classes
+                            .get(&class.name)
+                            .is_some_and(|class| !class.is_open);
+                    exact_dispatch
+                        && method.return_borrow.is_none()
+                        && self.prove_exact_return(
+                            method.declaration,
+                            expected,
+                            &method.enclosing_type_bindings,
+                            visiting,
+                        )
+                }
+                _ => false,
+            },
+            _ => false,
         }
     }
 
@@ -2472,4 +2728,31 @@ fn check_trait_cycles(
         visiting.pop();
     }
     !cyclic.contains(name)
+}
+
+#[cfg(test)]
+mod runtime_effect_tests {
+    #[test]
+    fn erased_requirement_call_keeps_automatic_io_transport() {
+        let (_, analysis) = crate::analyze_source_for_ide(
+            "effects.doria",
+            r#"
+interface Reader { function read(): int; }
+function read(Reader $reader): int { return $reader->read(); }
+"#,
+        )
+        .unwrap();
+        let effects = analysis
+            .info
+            .checked_effect_sites
+            .values()
+            .flatten()
+            .collect::<Vec<_>>();
+        for name in [
+            crate::compiler_known_io::IO_ERROR,
+            crate::compiler_known_io::INVALID_UTF8_ERROR,
+        ] {
+            assert!(effects.iter().any(|effect| matches!(effect, crate::types::ResolvedType::Class(class) if class.name == name)), "{effects:?}");
+        }
+    }
 }

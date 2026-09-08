@@ -1,0 +1,19 @@
+interface Named { function name(): string; }
+class Name implements Named {
+    function __construct(string $text) {}
+    function name(): string { return $this->text; }
+    function __destruct(): void { try { echo "drop;"; } catch (Error $error) {} }
+}
+class Holder { function __construct(take SharedReference<Named> $value) {} }
+function inspect(SharedReference<Named> $value): void { echo $value->name(); }
+function main(): void {
+    SharedReference<Named> $owner = shared new Name("stored");
+    let $holder = new Holder($owner->share());
+    inspect($holder->value);
+    List<SharedReference<Named>> $list = [$owner->share()];
+    inspect($list[0]);
+    Dictionary<string, SharedReference<Named>> $map = ["key" => $owner->share()];
+    let $found = $map->get("key");
+    if ($found != null) { inspect($found); }
+    echo $map->get("missing")?->name() ?? "absent";
+}

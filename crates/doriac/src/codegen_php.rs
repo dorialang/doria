@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
@@ -17,14 +18,16 @@ use crate::source::Span;
 use crate::symbols::{BindingId, BuiltinInterface};
 use crate::types::{ResolvedType, TypeRef};
 
+mod interface;
+mod shared;
+mod specialization;
+
 const PHP_INTEGER_UNSUPPORTED_CODE: &str = "B1301";
-const PHP_OWNERSHIP_UNSUPPORTED_CODE: &str = "B1901";
 const PHP_CONSTANT_UNSUPPORTED_CODE: &str = "B2001";
 const PHP_COLLECTION_UNSUPPORTED_CODE: &str = "B2301";
-const PHP_GENERICS_UNSUPPORTED_CODE: &str = "B2401";
 const PHP_STRING_RUNTIME_UNSUPPORTED_CODE: &str = "B2501";
 
-const PHP_CHECKED_ERROR_HELPERS: &str = r#"
+const PHP_ERROR_CONTRACT: &str = r#"
 interface __DoriaErrorValue
 {
     public static function __doriaErrorType(): __DoriaErrorDescriptor;
@@ -33,7 +36,9 @@ interface __DoriaErrorValue
     public function __doriaErrorOrigin(): int;
     public function __doriaErrorCallable(): string;
 }
+"#;
 
+const PHP_CHECKED_ERROR_HELPERS: &str = r#"
 final class __DoriaErrorDescriptor
 {
     public function __construct(public string $typeName) {}
@@ -898,6 +903,21 @@ interface __DoriaFunctionValue
     public function __doriaDrop(): void;
 }
 
+interface __DoriaOwnedObject {}
+
+function __doria_begin_destroy(object $value, string $class): bool
+{
+    global $__doria_panicking;
+    if ($__doria_panicking) { return false; }
+    static $destroyed;
+    $destroyed ??= new WeakMap();
+    $completed = $destroyed[$value] ?? [];
+    if (isset($completed[$class])) { return false; }
+    $completed[$class] = true;
+    $destroyed[$value] = $completed;
+    return true;
+}
+
 final class __DoriaCell
 {
     public bool $live = true;
@@ -925,6 +945,10 @@ function __doria_drop_value(mixed &$value): void
         __doria_drop_value($payload);
     } elseif ($value instanceof __DoriaFunctionValue) {
         $value->__doriaDrop();
+    } elseif ($value instanceof __DoriaSharedHandle) {
+        $value->drop();
+    } elseif ($value instanceof __DoriaOwnedObject) {
+        $value->__destruct();
     } elseif (is_array($value)) {
         foreach (array_reverse(array_keys($value)) as $key) {
             __doria_drop_value($value[$key]);
@@ -943,17 +967,41 @@ function __doria_drop_cell(__DoriaCell $cell): void
 
 function __doria_replace_cell(__DoriaCell $cell, mixed $replacement): void
 {
-    if ($cell->live) {
-        __doria_drop_value($cell->value);
-    }
+    $previous = $cell->live ? $cell->value : null;
     $cell->value = $replacement;
     $cell->live = true;
+    __doria_drop_value($previous);
+}
+
+function __doria_collection_index(array $values, int|string $key, bool $dictionary, int $start, int $end, string $callable): mixed
+{
+    if (!array_key_exists($key, $values)) {
+        __doria_panic($dictionary ? "P1312" : "P1310", $start, $end, null, $callable,
+            $dictionary ? [] : ["index" => $key, "length" => count($values)]);
+    }
+    return $values[$key];
+}
+
+function __doria_dictionary_get(?array $values, int|string $key): mixed
+{
+    return $values[$key] ?? null;
+}
+
+function __doria_collection_set(array &$values, int|string $key, mixed $replacement, bool $dictionary, int $start, int $end, string $callable): void
+{
+    if (!$dictionary && !array_key_exists($key, $values)) {
+        __doria_panic("P1310", $start, $end, null, $callable, ["index" => $key, "length" => count($values)]);
+    }
+    $previous = $values[$key] ?? null;
+    $values[$key] = $replacement;
+    __doria_drop_value($previous);
 }
 
 "#;
 
 fn emit_php_closure_runtime(
     plan: &PhpClosurePlan,
+    specialization: &specialization::Plan,
     program: Option<&mir::Program>,
     output: &mut String,
 ) {
@@ -975,6 +1023,7 @@ fn emit_php_closure_runtime(
             descriptor,
             plan.function_type(descriptor.function_type),
             program,
+            specialization,
             output,
         );
     }
@@ -1056,6 +1105,7 @@ fn emit_php_closure_carrier(
     descriptor: &PhpClosureDescriptor,
     function_type: &mir::FunctionType,
     program: &mir::Program,
+    specialization: &specialization::Plan,
     output: &mut String,
 ) {
     writeln(
@@ -1099,7 +1149,7 @@ fn emit_php_closure_carrier(
                 let ty = if parameter.mode == mir::FunctionParameterMode::Writable {
                     "__DoriaCell".to_string()
                 } else {
-                    php_mir_type(parameter.ty, program)
+                    php_mir_type(parameter.ty, program, specialization)
                 };
                 format!("{ty} $argument{index}")
             })
@@ -1109,7 +1159,7 @@ fn emit_php_closure_carrier(
     output.push(')');
     if let mir::ReturnType::Value(ty) = function_type.return_type {
         output.push_str(": ");
-        output.push_str(&php_mir_type(ty, program));
+        output.push_str(&php_mir_type(ty, program, specialization));
     } else {
         output.push_str(": void");
     }
@@ -1197,7 +1247,11 @@ fn emit_php_closure_carrier(
     output.push('\n');
 }
 
-fn php_mir_type(ty: mir::Type, program: &mir::Program) -> String {
+fn php_mir_type(
+    ty: mir::Type,
+    program: &mir::Program,
+    specialization: &specialization::Plan,
+) -> String {
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(_)) => "int".to_string(),
         mir::Type::Scalar(mir::ScalarType::Float(_)) => "float".to_string(),
@@ -1213,11 +1267,13 @@ fn php_mir_type(ty: mir::Type, program: &mir::Program) -> String {
         }
         mir::Type::NullableString => "?string".to_string(),
         mir::Type::NullableMixed => "mixed".to_string(),
-        mir::Type::Error => "__DoriaErrorValue".to_string(),
-        mir::Type::NullableError => "?__DoriaErrorValue".to_string(),
-        mir::Type::Class(id) => php_symbol_name(&program.classes[id.0].name),
+        // The closure descriptor validates the exact Doria contract. This PHP
+        // invocation shim accepts its nominal object carrier, not only Error.
+        mir::Type::Interface(_) => "object".to_string(),
+        mir::Type::NullableInterface(_) => "?object".to_string(),
+        mir::Type::Class(id) => specialization.class_symbol(id).to_string(),
         mir::Type::NullableClass(id) => {
-            format!("?{}", php_symbol_name(&program.classes[id.0].name))
+            format!("?{}", specialization.class_symbol(id))
         }
         mir::Type::PayloadEnum(ty) => php_symbol_name(&program.enums[ty.id.0].name),
         mir::Type::NullablePayloadEnum(ty) => {
@@ -1242,24 +1298,32 @@ fn php_mir_type(ty: mir::Type, program: &mir::Program) -> String {
         }
         mir::Type::SharedReference(_)
         | mir::Type::WeakReference(_)
-        | mir::Type::NullableSharedReference(_)
-        | mir::Type::NullableWeakReference(_)
         | mir::Type::WritableSharedReference(_)
         | mir::Type::WritableWeakReference(_)
+        | mir::Type::ReadonlySharedReferenceAccess(_)
+        | mir::Type::WritableSharedReferenceAccess(_) => "__DoriaSharedHandle".to_string(),
+        mir::Type::NullableSharedReference(_)
+        | mir::Type::NullableWeakReference(_)
         | mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_)
-        | mir::Type::ReadonlySharedReferenceAccess(_)
-        | mir::Type::WritableSharedReferenceAccess(_)
         | mir::Type::NullableReadonlySharedReferenceAccess(_)
-        | mir::Type::NullableWritableSharedReferenceAccess(_)
-        | mir::Type::ClosureEnvironment(_) => "mixed".to_string(),
+        | mir::Type::NullableWritableSharedReferenceAccess(_) => "?__DoriaSharedHandle".to_string(),
+        mir::Type::ClosureEnvironment(_) => "mixed".to_string(),
     }
 }
 
 pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String, BackendError> {
-    validate_program(program)?;
-
-    let closure_plan = Rc::new(PhpClosurePlan::build(program, mir));
+    let mut closure_plan = PhpClosurePlan::build(program, mir);
+    let specialization = Rc::new(specialization::Plan::build(program, &closure_plan)?);
+    validate_program(program, &specialization)?;
+    for descriptor in closure_plan.descriptors.values_mut() {
+        let class = match descriptor.source_instance {
+            mir::ClosureOwner::Callable(id) => specialization.callable(id).class,
+            mir::ClosureOwner::PropertyInitializer(property) => Some(property.class),
+        };
+        descriptor.owner_class = class.map(|class| specialization.class_symbol(class).to_string());
+    }
+    let closure_plan = Rc::new(closure_plan);
 
     let mut output = String::from(
         "<?php\n\ninterface __DoriaDisplayable\n{\n    public function toString(): string;\n}\n\ninterface __DoriaValueEquatable\n{\n    public function __doriaEquals(mixed $other): bool;\n}\n\nfinal class __DoriaMixedValue\n{\n    public function __construct(\n        private readonly string $typeTag,\n        private mixed $value,\n    ) {\n    }\n\n    public function is(string $typeTag): bool { return $this->typeTag === $typeTag; }\n    public function value(): mixed { return $this->value; }\n}\n\nfunction __doria_box_mixed(string $typeTag, mixed $value): __DoriaMixedValue\n{\n    if ($typeTag === 'float32') { $value = unpack('G', pack('G', $value))[1]; }\n    return new __DoriaMixedValue($value === null ? 'null' : $typeTag, $value);\n}\n\nfunction __doria_mixed_is(mixed $value, string $typeTag): bool\n{\n    return $value instanceof __DoriaMixedValue && $value->is($typeTag);\n}\n\nfunction __doria_mixed_value(mixed $value): mixed\n{\n    return $value instanceof __DoriaMixedValue ? $value->value() : $value;\n}\n\nfunction __doria_equal(mixed $left, mixed $right): bool\n{\n    if ($left instanceof __DoriaValueEquatable) { return $left->__doriaEquals($right); }\n    if ($right instanceof __DoriaValueEquatable) { return $right->__doriaEquals($left); }\n    return $left === $right;\n}\n\nfunction __doria_display(string|int|float|bool|__DoriaDisplayable $value): string\n{\n    if ($value instanceof __DoriaDisplayable) { return $value->toString(); }\n    if (is_bool($value)) { return $value ? 'true' : 'false'; }\n    return (string) $value;\n}\n\nfunction __doria_less(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) < 0; }\n    return $left < $right;\n}\n\nfunction __doria_less_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) <= 0; }\n    return $left <= $right;\n}\n\nfunction __doria_greater(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) > 0; }\n    return $left > $right;\n}\n\nfunction __doria_greater_equal(string|int|float|bool $left, string|int|float|bool $right): bool\n{\n    if (is_string($left) && is_string($right)) { return strcmp($left, $right) >= 0; }\n    return $left >= $right;\n}\n\n",
@@ -1267,6 +1331,7 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
     output.push_str(
         "function __doria_box_nullable_mixed(string $typeTag, mixed $value): mixed\n{\n    return $value === null ? null : __doria_box_mixed($typeTag, $value);\n}\n\n",
     );
+    output.push_str(PHP_ERROR_CONTRACT);
     if program
         .semantic_info
         .classes
@@ -1275,8 +1340,10 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
     {
         output.push_str(PHP_CHECKED_ERROR_HELPERS);
     }
+    interface::emit_declarations(&program.semantic_info, &mut output);
     output.push_str(PHP_STAGE26_COLLECTION_HELPERS);
-    emit_php_closure_runtime(&closure_plan, mir, &mut output);
+    emit_php_closure_runtime(&closure_plan, &specialization, mir, &mut output);
+    output.push_str(shared::RUNTIME);
     output.push_str("$__doria_sources = [\n");
     if program.sources.is_empty() {
         output.push_str(&format!(
@@ -1306,6 +1373,8 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
                 "P1000"
                     | "P1001"
                     | "P1311"
+                    | "P1310"
+                    | "P1312"
                     | "P1401"
                     | "P1402"
                     | "P1403"
@@ -1313,6 +1382,11 @@ pub fn generate(program: &Program, mir: Option<&mir::Program>) -> Result<String,
                     | "P1405"
                     | "P1406"
                     | "P1407"
+                    | "P1501"
+                    | "P1502"
+                    | "P1503"
+                    | "P1504"
+                    | "P1505"
             )
         })
     {
@@ -1413,11 +1487,13 @@ function __doria_panic(
     int $end,
     ?string $message = null,
     ?string $callable = null,
+    array $facts = [],
 )
 {
     global $__doria_catalogue, $__doria_function_spans, $__doria_function_names, $__doria_generated_closure_frames, $__doria_panicking;
     if (!isset($__doria_catalogue[$code])) { $code = "P1001"; }
     [$title, $label, $why] = $__doria_catalogue[$code];
+    if ($code === "P1501" && isset($facts["conflictReason"])) { $why = $facts["conflictReason"]; }
     [$sourcePath, $sourceText, $sourceStart] = __doria_source_location($start);
     [, , $sourceEnd] = __doria_source_location($end);
     $line = __doria_source_line($start);
@@ -1436,10 +1512,19 @@ function __doria_panic(
         "__doria_write_stderr",
         "__doria_sprintf",
         "__doria_printf",
+        "__doria_collection_index",
+        "__doria_collection_set",
+        "__doria_replace_cell",
+        "__doria_drop_cell",
+        "__doria_drop_value",
+        "__doria_shared_retain",
+        "__doria_shared_release_count",
     ];
     $frames = [];
     foreach (debug_backtrace(DEBUG_BACKTRACE_IGNORE_ARGS) as $frame) {
         if (!isset($frame["function"])) { continue; }
+        if (in_array($frame["class"] ?? null, ["__DoriaSharedControl", "__DoriaSharedHandle"], true)
+            || $frame["function"] === "{closure}" || str_starts_with($frame["function"], "{closure:")) { continue; }
         $frameName = isset($frame["class"])
             ? $frame["class"] . "::" . $frame["function"]
             : $frame["function"];
@@ -1476,6 +1561,10 @@ function __doria_panic(
     @fwrite(STDERR, $gutter . $label . "\n\nWhy\n" . $why);
     if ($code === "P1000" && $message !== null) {
         @fwrite(STDERR, "\n\nNote\n" . $message);
+    }
+    if ($facts !== [] && $code !== "P1501") {
+        @fwrite(STDERR, "\n\nFacts");
+        foreach ($facts as $name => $value) { @fwrite(STDERR, "\n" . $name . ": " . $value); }
     }
     @fwrite(STDERR, "\n\nCall Path");
     foreach ($frames as $index => $frame) {
@@ -2098,6 +2187,13 @@ function __doria_printf(
     }
     let mut scopes = PhpNameScopes::new(
         PhpScopeSymbols {
+            interface_names: program
+                .semantic_info
+                .contracts
+                .interfaces
+                .iter()
+                .map(|interface| interface.name.clone())
+                .collect(),
             static_properties,
             payload_unit_cases,
             payload_top_constants,
@@ -2110,6 +2206,7 @@ function __doria_printf(
         closure_plan,
     );
     scopes.matches = program.semantic_info.matches.clone();
+    scopes.specialization = specialization;
     scopes.whens = program.semantic_info.whens.clone();
     scopes.given_preludes = program.semantic_info.given_preludes.clone();
     scopes.expression_types = program.semantic_info.expression_types.clone();
@@ -2181,58 +2278,160 @@ function __doria_printf(
     Ok(output)
 }
 
-fn validate_program(program: &Program) -> Result<(), BackendError> {
+struct PhpValidation<'a> {
+    semantic: &'a SemanticInfo,
+    plan: &'a specialization::Plan,
+    substitutions: &'a HashMap<String, ResolvedType>,
+    expression_types: HashMap<Span, ResolvedType>,
+    shared_construction_types: HashMap<Span, ResolvedType>,
+}
+
+impl std::ops::Deref for PhpValidation<'_> {
+    type Target = SemanticInfo;
+    fn deref(&self) -> &Self::Target {
+        self.semantic
+    }
+}
+
+impl<'a> PhpValidation<'a> {
+    fn new(
+        semantic: &'a SemanticInfo,
+        plan: &'a specialization::Plan,
+        substitutions: &'a HashMap<String, ResolvedType>,
+    ) -> Self {
+        let specialize = |types: &HashMap<Span, ResolvedType>| {
+            types
+                .iter()
+                .map(|(span, ty)| {
+                    (
+                        *span,
+                        crate::types::substitute_resolved_type(ty, substitutions),
+                    )
+                })
+                .collect()
+        };
+        Self {
+            semantic,
+            plan,
+            substitutions,
+            expression_types: specialize(&semantic.expression_types),
+            shared_construction_types: specialize(&semantic.shared_construction_types),
+        }
+    }
+
+    fn expression_type(&self, span: Span) -> Option<&ResolvedType> {
+        self.expression_types.get(&span)
+    }
+
+    fn float_type(&self, span: Span) -> Option<FloatType> {
+        match self.expression_type(span) {
+            Some(ResolvedType::Float(ty)) => Some(*ty),
+            _ => self.semantic.float_type(span),
+        }
+    }
+}
+
+fn validate_program(program: &Program, plan: &specialization::Plan) -> Result<(), BackendError> {
+    let empty = HashMap::new();
+    let context = PhpValidation::new(&program.semantic_info, plan, &empty);
     for item in &program.items {
-        validate_item(item, &program.semantic_info)?;
+        match item {
+            Item::Function(function) => {
+                for callable in plan.callables.iter().filter(|callable| {
+                    callable.class.is_none() && callable.declaration == function.span
+                }) {
+                    let context =
+                        PhpValidation::new(&program.semantic_info, plan, &callable.substitutions);
+                    validate_function(function, &context, false)?;
+                }
+            }
+            Item::Class(declaration) => {
+                for class in program
+                    .semantic_info
+                    .classes
+                    .iter()
+                    .filter(|class| class.declaration_name == declaration.name)
+                {
+                    let substitutions = declaration
+                        .type_params
+                        .iter()
+                        .zip(&class.arguments)
+                        .map(|(parameter, ty)| (parameter.name.clone(), ty.clone()))
+                        .collect();
+                    let context = PhpValidation::new(&program.semantic_info, plan, &substitutions);
+                    validate_class(declaration, &context)?;
+                    for method in declaration
+                        .members
+                        .iter()
+                        .filter_map(|member| match member {
+                            ClassMember::Method(method) => Some(method),
+                            _ => None,
+                        })
+                    {
+                        for callable in plan.callables.iter().filter(|callable| {
+                            callable.class == Some(class.id) && callable.declaration == method.span
+                        }) {
+                            let context = PhpValidation::new(
+                                &program.semantic_info,
+                                plan,
+                                &callable.substitutions,
+                            );
+                            validate_function(method, &context, true)?;
+                        }
+                    }
+                }
+            }
+            _ => validate_item(item, &context)?,
+        }
     }
     Ok(())
 }
 
-fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
-    match item {
-        Item::Class(class_decl) => {
-            if !class_decl.type_params.is_empty() {
-                return Err(BackendError::from_diagnostics(vec![Diagnostic::new(
-                    PHP_GENERICS_UNSUPPORTED_CODE,
-                    "PHP compatibility output does not support generic class specialization; compile this program for a native target",
-                    class_decl.span,
-                )]));
-            }
-            for member in &class_decl.members {
-                match member {
-                    ClassMember::Property(property) => {
-                        validate_type(&property.ty, property.span)?;
-                        if property.is_static {
-                            validate_evaluated_value(
-                                semantic_info,
-                                &ConstKey::Static {
-                                    class_name: class_decl.name.clone(),
-                                    name: property.name.clone(),
-                                },
-                                property.span,
-                            )?;
-                        } else if let Some(initializer) = &property.initializer {
-                            validate_expr(initializer, semantic_info)?;
-                        }
-                    }
-                    ClassMember::Method(method) => validate_function(method, semantic_info, true)?,
-                    ClassMember::Constant(constant) => {
-                        validate_php_class_constant_name(constant)?;
-                        if let Some(ty) = &constant.ty {
-                            validate_type(ty, constant.span)?;
-                        }
-                        validate_evaluated_value(
-                            semantic_info,
-                            &ConstKey::Class {
-                                class_name: class_decl.name.clone(),
-                                name: constant.name.clone(),
-                            },
-                            constant.span,
-                        )?;
-                    }
+fn validate_class(
+    class_decl: &ClassDecl,
+    semantic_info: &PhpValidation<'_>,
+) -> Result<(), BackendError> {
+    for member in &class_decl.members {
+        match member {
+            ClassMember::Property(property) => {
+                validate_type(&property.ty, property.span, semantic_info)?;
+                if property.is_static {
+                    validate_evaluated_value(
+                        semantic_info,
+                        &ConstKey::Static {
+                            class_name: class_decl.name.clone(),
+                            name: property.name.clone(),
+                        },
+                        property.span,
+                    )?;
+                } else if let Some(initializer) = &property.initializer {
+                    validate_expr(initializer, semantic_info)?;
                 }
             }
-            Ok(())
+            ClassMember::Method(_) => {}
+            ClassMember::Constant(constant) => {
+                validate_php_class_constant_name(constant)?;
+                if let Some(ty) = &constant.ty {
+                    validate_type(ty, constant.span, semantic_info)?;
+                }
+                validate_evaluated_value(
+                    semantic_info,
+                    &ConstKey::Class {
+                        class_name: class_decl.name.clone(),
+                        name: constant.name.clone(),
+                    },
+                    constant.span,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_item(item: &Item, semantic_info: &PhpValidation<'_>) -> Result<(), BackendError> {
+    match item {
+        Item::Class(_) | Item::Function(_) => {
+            unreachable!("callables are validated per concrete instance")
         }
         Item::Enum(enum_decl) => {
             if !enum_decl.type_params.is_empty() {
@@ -2244,7 +2443,7 @@ fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), Backen
             }
             for case in &enum_decl.cases {
                 for field in &case.payload {
-                    validate_type(&field.ty, field.span)?;
+                    validate_type(&field.ty, field.span, semantic_info)?;
                 }
                 if let Some(value) = &case.backing_value {
                     validate_expr(value, semantic_info)?;
@@ -2252,10 +2451,9 @@ fn validate_item(item: &Item, semantic_info: &SemanticInfo) -> Result<(), Backen
             }
             Ok(())
         }
-        Item::Function(function) => validate_function(function, semantic_info, false),
         Item::Constant(constant) => {
             if let Some(ty) = &constant.ty {
-                validate_type(ty, constant.span)?;
+                validate_type(ty, constant.span, semantic_info)?;
             }
             validate_evaluated_value(
                 semantic_info,
@@ -2313,16 +2511,9 @@ fn validate_const_value(value: &ConstValue, span: Span) -> Result<(), BackendErr
 
 fn validate_function(
     function: &FunctionDecl,
-    semantic_info: &SemanticInfo,
+    semantic_info: &PhpValidation<'_>,
     is_method: bool,
 ) -> Result<(), BackendError> {
-    if !function.type_params.is_empty() {
-        return Err(BackendError::from_diagnostics(vec![Diagnostic::new(
-            PHP_GENERICS_UNSUPPORTED_CODE,
-            "PHP compatibility output does not support generic function specialization; compile this program for a native target",
-            function.span,
-        )]));
-    }
     if is_method
         && matches!(function.name.as_str(), "__construct" | "__destruct")
         && (function.is_static || function.writable_this)
@@ -2333,13 +2524,7 @@ fn validate_function(
         )));
     }
     for (parameter_index, param) in function.params.iter().enumerate() {
-        if param.take && is_move_type(&param.ty, semantic_info) {
-            return Err(unsupported_ownership_shape(
-                param.span,
-                format!("ownership transfer through `take ${}`", param.name),
-            ));
-        }
-        validate_type(&param.ty, param.span)?;
+        validate_type(&param.ty, param.span, semantic_info)?;
         if param.default.is_some() {
             let default = semantic_info
                 .parameter_defaults
@@ -2357,27 +2542,9 @@ fn validate_function(
         }
     }
     if let Some(return_type) = &function.return_type {
-        validate_type(return_type, function.span)?;
+        validate_type(return_type, function.span, semantic_info)?;
     }
     validate_block(&function.body, semantic_info)
-}
-
-fn is_move_type(ty: &TypeRef, semantic_info: &SemanticInfo) -> bool {
-    ty.name == "mixed"
-        || matches!(
-            ty.name.as_str(),
-            "[]" | "List"
-                | "Dictionary"
-                | "Set"
-                | "SortedDictionary"
-                | "SortedSet"
-                | "PriorityQueue"
-                | "Deque"
-        )
-        || semantic_info
-            .classes
-            .iter()
-            .any(|class| class.name == ty.name)
 }
 
 fn php_type_ref_needs_explicit_drop(
@@ -2385,18 +2552,35 @@ fn php_type_ref_needs_explicit_drop(
     classes: &HashSet<String>,
     payload_enums: &HashSet<String>,
     type_parameters: &HashSet<String>,
+    interfaces: &HashSet<String>,
 ) -> bool {
     ty.function.is_some()
         || ty.name == "mixed"
+        || ty.name == "Error"
+        || interfaces.contains(&ty.name)
+        || crate::types::SharedHandleKind::from_source_name(&ty.name).is_some()
         || classes.contains(&ty.name)
         || payload_enums.contains(&ty.name)
         || type_parameters.contains(&ty.name)
         || ty.type_arguments().any(|argument| {
-            php_type_ref_needs_explicit_drop(argument, classes, payload_enums, type_parameters)
+            php_type_ref_needs_explicit_drop(
+                argument,
+                classes,
+                payload_enums,
+                type_parameters,
+                interfaces,
+            )
         })
 }
 
 fn php_explicit_drop_types(program: &Program) -> (HashSet<String>, HashSet<String>) {
+    let interfaces = program
+        .semantic_info
+        .contracts
+        .interfaces
+        .iter()
+        .map(|interface| interface.name.clone())
+        .collect::<HashSet<_>>();
     let classes = program
         .items
         .iter()
@@ -2439,6 +2623,7 @@ fn php_explicit_drop_types(program: &Program) -> (HashSet<String>, HashSet<Strin
                         &drop_classes,
                         &drop_enums,
                         &type_parameters,
+                        &interfaces,
                     )
                 })
             }) {
@@ -2458,6 +2643,7 @@ fn php_explicit_drop_types(program: &Program) -> (HashSet<String>, HashSet<Strin
                         &drop_classes,
                         &drop_enums,
                         &type_parameters,
+                        &interfaces,
                     )
                 }
                 ClassMember::Method(method) if method.name == "__construct" => {
@@ -2468,6 +2654,7 @@ fn php_explicit_drop_types(program: &Program) -> (HashSet<String>, HashSet<Strin
                                 &drop_classes,
                                 &drop_enums,
                                 &type_parameters,
+                                &interfaces,
                             )
                     })
                 }
@@ -2492,14 +2679,53 @@ fn php_explicit_drop_types(program: &Program) -> (HashSet<String>, HashSet<Strin
     }
 }
 
-fn validate_type(ty: &TypeRef, span: Span) -> Result<(), BackendError> {
-    if crate::types::SharedHandleKind::from_source_name(&ty.name).is_some() {
-        return Err(unsupported_shared_ownership(span));
-    }
-    for argument in ty.type_arguments() {
-        validate_type(argument, span)?;
+fn validate_type(
+    ty: &TypeRef,
+    span: Span,
+    context: &PhpValidation<'_>,
+) -> Result<(), BackendError> {
+    if let Some(ty) = context.plan.resolve_type(ty, context.substitutions) {
+        validate_resolved_type(&ty, span)?;
     }
     Ok(())
+}
+
+fn validate_resolved_type(ty: &ResolvedType, span: Span) -> Result<(), BackendError> {
+    match ty {
+        ResolvedType::SharedHandle(_, payload) => {
+            if !matches!(
+                payload.as_ref(),
+                ResolvedType::Interface(_) | ResolvedType::Error
+            ) {
+                return Err(unsupported_shared_ownership(span));
+            }
+            validate_resolved_type(payload, span)
+        }
+        ResolvedType::Nullable(inner)
+        | ResolvedType::TypedArray(inner)
+        | ResolvedType::List(inner)
+        | ResolvedType::Set(inner)
+        | ResolvedType::SortedSet(inner)
+        | ResolvedType::PriorityQueue(inner)
+        | ResolvedType::Deque(inner) => validate_resolved_type(inner, span),
+        ResolvedType::Class(class) | ResolvedType::Interface(class) => {
+            for ty in &class.arguments {
+                validate_resolved_type(ty, span)?;
+            }
+            Ok(())
+        }
+        ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
+            validate_resolved_type(key, span)?;
+            validate_resolved_type(value, span)
+        }
+        ResolvedType::Function(function) => {
+            for parameter in &function.parameters {
+                validate_resolved_type(&parameter.ty, span)?;
+            }
+            validate_resolved_type(&function.return_type, span)
+        }
+        _ => Ok(()),
+    }
 }
 
 fn unsupported_shared_ownership(span: Span) -> BackendError {
@@ -2510,19 +2736,22 @@ fn unsupported_shared_ownership(span: Span) -> BackendError {
     )])
 }
 
-fn validate_block(block: &Block, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
+fn validate_block(block: &Block, semantic_info: &PhpValidation<'_>) -> Result<(), BackendError> {
     for statement in &block.statements {
         validate_statement(statement, semantic_info)?;
     }
     Ok(())
 }
 
-fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
+fn validate_statement(
+    statement: &Stmt,
+    semantic_info: &PhpValidation<'_>,
+) -> Result<(), BackendError> {
     match statement {
         Stmt::Block(block) => validate_block(block, semantic_info),
         Stmt::VarDecl(decl) => {
             if let Some(ty) = &decl.ty {
-                validate_type(ty, decl.span)?;
+                validate_type(ty, decl.span, semantic_info)?;
             }
             validate_expr(&decl.initializer, semantic_info)
         }
@@ -2559,7 +2788,7 @@ fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<
                 match initializer {
                     ForInitializer::VarDecl(decl) => {
                         if let Some(ty) = &decl.ty {
-                            validate_type(ty, decl.span)?;
+                            validate_type(ty, decl.span, semantic_info)?;
                         }
                         validate_expr(&decl.initializer, semantic_info)?;
                     }
@@ -2610,11 +2839,11 @@ fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<
             }
             if let Some(first_binding) = &foreach.first_binding {
                 if let Some(ty) = &first_binding.ty {
-                    validate_type(ty, first_binding.span)?;
+                    validate_type(ty, first_binding.span, semantic_info)?;
                 }
             }
             if let Some(ty) = &foreach.value_binding.ty {
-                validate_type(ty, foreach.value_binding.span)?;
+                validate_type(ty, foreach.value_binding.span, semantic_info)?;
             }
             validate_block(&foreach.body, semantic_info)
         }
@@ -2634,7 +2863,7 @@ fn validate_statement(statement: &Stmt, semantic_info: &SemanticInfo) -> Result<
     }
 }
 
-fn validate_if(if_stmt: &IfStmt, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
+fn validate_if(if_stmt: &IfStmt, semantic_info: &PhpValidation<'_>) -> Result<(), BackendError> {
     if let Some(given) = &if_stmt.given {
         validate_given(given, semantic_info)?;
     }
@@ -2652,7 +2881,10 @@ fn validate_if(if_stmt: &IfStmt, semantic_info: &SemanticInfo) -> Result<(), Bac
     Ok(())
 }
 
-fn validate_given(given: &GivenPrelude, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
+fn validate_given(
+    given: &GivenPrelude,
+    semantic_info: &PhpValidation<'_>,
+) -> Result<(), BackendError> {
     for statement in &given.block.statements {
         validate_statement(statement, semantic_info)?;
     }
@@ -2661,7 +2893,7 @@ fn validate_given(given: &GivenPrelude, semantic_info: &SemanticInfo) -> Result<
 
 fn validate_assignment(
     assignment: &Assignment,
-    semantic_info: &SemanticInfo,
+    semantic_info: &PhpValidation<'_>,
 ) -> Result<(), BackendError> {
     validate_expr(&assignment.target, semantic_info)?;
     validate_expr(&assignment.value, semantic_info)?;
@@ -2704,7 +2936,7 @@ fn unsupported_increment(increment: &IncrementStmt) -> BackendError {
     )
 }
 
-fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
+fn validate_expr(expr: &Expr, semantic_info: &PhpValidation<'_>) -> Result<(), BackendError> {
     match expr {
         Expr::Assertion(assertion) => {
             for operand in [
@@ -2721,10 +2953,10 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
         }
         Expr::Closure(closure) => {
             for parameter in &closure.parameters {
-                validate_type(&parameter.ty, parameter.span)?;
+                validate_type(&parameter.ty, parameter.span, semantic_info)?;
             }
             if let Some(return_type) = &closure.return_type {
-                validate_type(return_type, closure.span)?;
+                validate_type(return_type, closure.span, semantic_info)?;
             }
             match &closure.body {
                 ClosureBody::Expression(body) => validate_expr(body, semantic_info),
@@ -2785,10 +3017,10 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
         } => {
             validate_expr(collection, semantic_info)?;
             validate_expr(index, semantic_info)?;
-            if semantic_info
-                .expression_type(collection.span())
-                .is_some_and(is_stage23_runtime_type)
-            {
+            if matches!(
+                semantic_info.expression_type(collection.span()),
+                Some(ResolvedType::Bytes | ResolvedType::Set(_))
+            ) {
                 return Err(unsupported_collection_shape(
                     *span,
                     "assertive collection indexed access",
@@ -2841,6 +3073,7 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             let receiver_type = semantic_info.expression_type(object.span());
             if receiver_type.is_some_and(is_stage23_runtime_type)
                 && !matches!(receiver_type, Some(ResolvedType::List(_)) if method == "add")
+                && !matches!(receiver_type, Some(ResolvedType::Dictionary(_, _)) if method == "get")
             {
                 return Err(unsupported_collection_shape(
                     *span,
@@ -2870,11 +3103,13 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             shared,
             span,
         } => {
-            // The PHP compatibility backend cannot express Doria's shared-ownership
-            // families: PHP object references are not `SharedReference<T>`, and PHP's
-            // refcounting does not implement the writable family's access rules.
-            if *shared
-                || crate::types::SharedHandleKind::from_source_name(&class_type.name).is_some()
+            if (*shared
+                || crate::types::SharedHandleKind::from_source_name(&class_type.name).is_some())
+                && !semantic_info
+                    .shared_construction_types
+                    .get(span)
+                    .or_else(|| semantic_info.expression_type(*span))
+                    .is_some_and(shared::interface_payload)
             {
                 return Err(unsupported_shared_ownership(*span));
             }
@@ -2934,7 +3169,7 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
             ) {
                 Ok(())
             } else {
-                validate_type(ty, *span)
+                validate_type(ty, *span, semantic_info)
             }
         }
         Expr::Unary { op, expr, span } => {
@@ -3076,7 +3311,10 @@ fn validate_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), Backen
     }
 }
 
-fn validate_display_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<(), BackendError> {
+fn validate_display_expr(
+    expr: &Expr,
+    semantic_info: &PhpValidation<'_>,
+) -> Result<(), BackendError> {
     if semantic_info.float_type(expr.span()).is_some() {
         return Err(unsupported_numeric_shape(
             expr.span(),
@@ -3088,7 +3326,7 @@ fn validate_display_expr(expr: &Expr, semantic_info: &SemanticInfo) -> Result<()
 
 fn validate_php_format_call(
     args: &[Argument],
-    semantic_info: &SemanticInfo,
+    semantic_info: &PhpValidation<'_>,
 ) -> Result<(), BackendError> {
     let Some(format) = args.first().map(|argument| &argument.value) else {
         return Ok(());
@@ -3122,7 +3360,7 @@ fn validate_php_format_call(
 
 fn validate_arguments(
     arguments: &[Argument],
-    semantic_info: &SemanticInfo,
+    semantic_info: &PhpValidation<'_>,
 ) -> Result<(), BackendError> {
     for argument in arguments {
         validate_expr(&argument.value, semantic_info)?;
@@ -3159,15 +3397,14 @@ fn emit_call_argument_values(
                 assignment_target_cell(&argument.value, scopes).unwrap_or_else(|| {
                     format!(
                         "new __DoriaCell({})",
-                        emit_owned_expr(&argument.value, scopes)
+                        if parameter.is_some_and(|parameter| parameter.take) {
+                            emit_owned_expr(&argument.value, scopes)
+                        } else {
+                            emit_expr(&argument.value, scopes)
+                        }
                     )
                 })
-            } else if parameter.is_some_and(|parameter| parameter.take)
-                && scopes
-                    .expression_types
-                    .get(&argument.value.span())
-                    .is_some_and(resolved_is_function_type)
-            {
+            } else if parameter.is_some_and(|parameter| parameter.take) {
                 emit_owned_expr(&argument.value, scopes)
             } else {
                 emit_expr(&argument.value, scopes)
@@ -3326,17 +3563,6 @@ fn unsupported_numeric_shape(span: Span, feature: impl Into<String>) -> BackendE
     )])
 }
 
-fn unsupported_ownership_shape(span: Span, feature: impl Into<String>) -> BackendError {
-    BackendError::from_diagnostics(vec![Diagnostic::new(
-        PHP_OWNERSHIP_UNSUPPORTED_CODE,
-        format!(
-            "PHP compatibility backend cannot preserve {} exactly; use the `native` or `debug` target for this valid Doria program",
-            feature.into()
-        ),
-        span,
-    )])
-}
-
 fn unsupported_constant_shape(span: Span, feature: impl Into<String>) -> BackendError {
     BackendError::from_diagnostics(vec![Diagnostic::new(
         PHP_CONSTANT_UNSUPPORTED_CODE,
@@ -3384,6 +3610,7 @@ fn is_stage23_runtime_type(ty: &ResolvedType) -> bool {
 
 #[derive(Debug, Clone)]
 struct PhpScopeSymbols {
+    interface_names: HashSet<String>,
     static_properties: HashSet<(String, String)>,
     payload_unit_cases: HashSet<(String, String)>,
     payload_top_constants: HashSet<String>,
@@ -3416,6 +3643,15 @@ struct PhpNameScopes {
     binding_places: Vec<HashMap<BindingId, PhpBindingPlace>>,
     owned_cells: Vec<Vec<String>>,
     current_callable: Option<String>,
+    current_class: Option<String>,
+    closure_owner: Option<mir::ClosureOwner>,
+    current_class_id: Option<crate::class_layout::ClassId>,
+    specialization: Rc<specialization::Plan>,
+    substitutions: HashMap<String, ResolvedType>,
+    returns_borrow: bool,
+    expression_temporaries: Option<Rc<RefCell<Vec<String>>>>,
+    yield_temporaries: Option<Rc<RefCell<Vec<String>>>>,
+    pending_returns: Vec<Rc<RefCell<Vec<String>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -3463,6 +3699,15 @@ impl PhpNameScopes {
             binding_places: vec![HashMap::new()],
             owned_cells: vec![Vec::new()],
             current_callable: None,
+            current_class: None,
+            closure_owner: None,
+            current_class_id: None,
+            specialization: Rc::default(),
+            substitutions: HashMap::new(),
+            returns_borrow: false,
+            expression_temporaries: None,
+            yield_temporaries: None,
+            pending_returns: Vec::new(),
         }
     }
 
@@ -3480,6 +3725,12 @@ impl PhpNameScopes {
         scopes.direct_parent_calls = self.direct_parent_calls.clone();
         scopes.const_evaluation = self.const_evaluation.clone();
         scopes.current_callable = self.current_callable.clone();
+        scopes.current_class = self.current_class.clone();
+        scopes.closure_owner = self.closure_owner;
+        scopes.current_class_id = self.current_class_id;
+        scopes.specialization = Rc::clone(&self.specialization);
+        scopes.substitutions = self.substitutions.clone();
+        scopes.returns_borrow = self.returns_borrow;
         scopes
     }
 
@@ -3600,6 +3851,16 @@ impl PhpNameScopes {
         self.closure_plan.cell_bindings.contains(&binding)
     }
 
+    fn owns_binding(&self, binding: BindingId) -> bool {
+        self.closure_plan
+            .binding_resolution
+            .declarations_by_id
+            .get(&binding)
+            .is_some_and(|declaration| {
+                declaration.ownership == crate::symbols::BindingOwnership::Owned
+            })
+    }
+
     fn own_cell(&mut self, php_name: String) {
         self.owned_cells
             .last_mut()
@@ -3611,10 +3872,6 @@ impl PhpNameScopes {
         self.owned_cells
             .last()
             .expect("PHP emitter always has an ownership scope")
-    }
-
-    fn all_owned_cells(&self) -> impl DoubleEndedIterator<Item = &String> {
-        self.owned_cells.iter().flat_map(|scope| scope.iter())
     }
 
     fn has_owned_cells(&self) -> bool {
@@ -3738,7 +3995,7 @@ fn emit_item(
 
 fn emit_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize, scopes: &PhpNameScopes) {
     if enum_decl.cases.iter().any(|case| !case.payload.is_empty()) {
-        emit_payload_enum(enum_decl, output, indent);
+        emit_payload_enum(enum_decl, output, indent, scopes);
         return;
     }
     write_indent(output, indent);
@@ -3763,12 +4020,26 @@ fn emit_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize, scopes: &
     writeln(output, indent, "}");
 }
 
-fn emit_payload_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize) {
+fn emit_payload_enum(
+    enum_decl: &EnumDecl,
+    output: &mut String,
+    indent: usize,
+    scopes: &PhpNameScopes,
+) {
+    let owned_marker = if scopes
+        .symbols
+        .payload_enums_with_php_destructors
+        .contains(&enum_decl.name)
+    {
+        ", __DoriaOwnedObject"
+    } else {
+        ""
+    };
     writeln(
         output,
         indent,
         &format!(
-            "final class {} implements __DoriaValueEquatable",
+            "final class {} implements __DoriaValueEquatable{owned_marker}",
             php_symbol_name(&enum_decl.name)
         ),
     );
@@ -3804,6 +4075,20 @@ fn emit_payload_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize) {
     writeln(output, indent + 1, "{");
     writeln(output, indent + 2, "return $this->__doriaPayload[$index];");
     writeln(output, indent + 1, "}");
+    writeln(
+        output,
+        indent + 1,
+        "public function __doriaTakePayload(int $index): mixed",
+    );
+    writeln(output, indent + 1, "{");
+    writeln(
+        output,
+        indent + 2,
+        "$value = $this->__doriaPayload[$index];",
+    );
+    writeln(output, indent + 2, "$this->__doriaPayload[$index] = null;");
+    writeln(output, indent + 2, "return $value;");
+    writeln(output, indent + 1, "}");
 
     for (tag, case) in enum_decl.cases.iter().enumerate() {
         output.push('\n');
@@ -3816,7 +4101,7 @@ fn emit_payload_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize) {
             &case
                 .payload
                 .iter()
-                .map(|field| format!("{} ${}", php_type(&field.ty), field.name))
+                .map(|field| format!("{} ${}", php_type(&field.ty, scopes), field.name))
                 .collect::<Vec<_>>()
                 .join(", "),
         );
@@ -3868,6 +4153,11 @@ fn emit_payload_enum(enum_decl: &EnumDecl, output: &mut String, indent: usize) {
     writeln(
         output,
         indent + 2,
+        "if (!__doria_begin_destroy($this, self::class)) { return; }",
+    );
+    writeln(
+        output,
+        indent + 2,
         "for ($index = count($this->__doriaPayload) - 1; $index >= 0; --$index) { if (function_exists('__doria_drop_value')) { __doria_drop_value($this->__doriaPayload[$index]); } unset($this->__doriaPayload[$index]); }",
     );
     writeln(output, indent + 1, "}");
@@ -3881,6 +4171,33 @@ fn emit_class(
     indent: usize,
     scopes: &PhpNameScopes,
 ) {
+    for class in semantic_info
+        .classes
+        .iter()
+        .filter(|class| class.declaration_name == class_decl.name)
+    {
+        let constructor = scopes
+            .specialization
+            .callables
+            .iter()
+            .find(|callable| callable.class == Some(class.id) && callable.symbol == "__construct")
+            .expect("each concrete class has a checked constructor instance");
+        let mut scopes = scopes.specialization.scope(scopes, constructor);
+        scopes.current_class_id = Some(class.id);
+        emit_class_instance(class_decl, semantic_info, output, indent, &scopes);
+    }
+}
+
+fn emit_class_instance(
+    class_decl: &ClassDecl,
+    semantic_info: &SemanticInfo,
+    output: &mut String,
+    indent: usize,
+    scopes: &PhpNameScopes,
+) {
+    let mut class_scopes = scopes.clone();
+    class_scopes.current_class = Some(class_decl.name.clone());
+    let scopes = &class_scopes;
     let type_parameters = class_decl
         .type_params
         .iter()
@@ -3897,6 +4214,7 @@ fn emit_class(
                         &scopes.symbols.classes_with_php_destructors,
                         &scopes.symbols.payload_enums_with_php_destructors,
                         &type_parameters,
+                        &scopes.symbols.interface_names,
                     ) =>
             {
                 Some(property.name.clone())
@@ -3916,6 +4234,7 @@ fn emit_class(
                             &scopes.symbols.classes_with_php_destructors,
                             &scopes.symbols.payload_enums_with_php_destructors,
                             &type_parameters,
+                            &scopes.symbols.interface_names,
                         )
                 })
                 .map(|parameter| parameter.name.clone())
@@ -3957,38 +4276,60 @@ fn emit_class(
             .classes_with_php_destructors
             .contains(&parent.name)
     });
-    let is_error = class_decl
-        .implements
+    let checked_class = semantic_info
+        .classes
         .iter()
-        .any(|interface| interface == "Error");
-    let mut interfaces = Vec::new();
-    if class_decl
-        .implements
-        .iter()
-        .any(|interface| interface == "Displayable")
+        .find(|class| Some(class.id) == scopes.current_class_id);
+    let is_error = checked_class.is_some_and(|class| class.implements(BuiltinInterface::Error));
+    let class_type = crate::types::ClassType::new(
+        class_decl.name.clone(),
+        checked_class.unwrap().arguments.clone(),
+    );
+    let mut interfaces = interface::class_views(semantic_info, &class_type);
+    if scopes
+        .symbols
+        .classes_with_php_destructors
+        .contains(&class_decl.name)
     {
-        interfaces.push("__DoriaDisplayable");
+        interfaces.push("__DoriaOwnedObject".to_string());
+    }
+    if checked_class.is_some_and(|class| class.implements(BuiltinInterface::Displayable)) {
+        interfaces.push("__DoriaDisplayable".to_string());
     }
     if is_error {
-        interfaces.push("__DoriaErrorValue");
+        interfaces.push("__DoriaErrorValue".to_string());
     }
+    interfaces.sort();
+    interfaces.dedup();
     let implements = if interfaces.is_empty() {
         String::new()
     } else {
         format!(" implements {}", interfaces.join(", "))
     };
-    let extends = class_decl
+    let extends = checked_class
+        .unwrap()
         .parent
         .as_ref()
         .map_or_else(String::new, |parent| {
-            format!(" extends {}", php_symbol_name(&parent.name))
+            format!(
+                " extends {}",
+                scopes
+                    .specialization
+                    .class_symbols
+                    .get(parent)
+                    .expect("checked parent instance")
+            )
         });
     writeln(
         output,
         indent,
         &format!(
             "class {}{extends}{implements}",
-            php_symbol_name(&class_decl.name)
+            scopes
+                .specialization
+                .class_symbols
+                .get(&class_type)
+                .expect("checked class instance")
         ),
     );
     writeln(output, indent, "{");
@@ -4086,7 +4427,7 @@ fn emit_class(
                 &format!(
                     "{} {} ${};",
                     emit_member_access(&access),
-                    php_type(&parameter.ty),
+                    php_type(&parameter.ty, scopes),
                     parameter.name
                 ),
             );
@@ -4140,6 +4481,13 @@ fn emit_class(
                         } else {
                             &[]
                         },
+                        construction_properties: if emitted_method.name == "__construct" {
+                            owned_properties.as_slice()
+                        } else {
+                            &[]
+                        },
+                        parent_drop_on_construction_failure: parent_has_destructor
+                            && emitted_method.name == "__construct",
                     },
                 )
             }
@@ -4154,29 +4502,66 @@ fn emit_class(
         output.push('\n');
     }
     if !has_constructor && (!instance_initializers.is_empty() || parent_has_constructor) {
+        let mut constructor_scopes = scopes.expression_scope();
+        constructor_scopes.current_callable = Some(format!("{}::__construct", class_decl.name));
+        let parent_completed = parent_has_destructor
+            .then(|| constructor_scopes.fresh_temp("__doria_parent_completed"));
+        let cleanup = !owned_properties.is_empty() || parent_has_destructor;
         writeln(output, indent + 1, "public function __construct()");
         writeln(output, indent + 1, "{");
+        if let Some(parent_completed) = &parent_completed {
+            writeln(output, indent + 2, &format!("${parent_completed} = false;"));
+        }
+        if cleanup {
+            writeln(output, indent + 2, "try {");
+        }
+        let body_indent = indent + 2 + usize::from(cleanup);
         if parent_has_constructor {
-            writeln(output, indent + 2, "parent::__construct();");
+            writeln(output, body_indent, "parent::__construct();");
+            if let Some(parent_completed) = &parent_completed {
+                writeln(output, body_indent, &format!("${parent_completed} = true;"));
+            }
         }
         for (name, initializer) in &instance_initializers {
             writeln(
                 output,
-                indent + 2,
+                body_indent,
                 &format!(
                     "$this->{name} = {};",
-                    emit_expr(initializer, &scopes.expression_scope())
+                    emit_owned_expr(
+                        initializer,
+                        &scopes
+                            .specialization
+                            .property_scope(&constructor_scopes, name)
+                    )
                 ),
+            );
+        }
+        if cleanup {
+            emit_constructor_catch(
+                &owned_properties,
+                parent_completed.as_deref(),
+                output,
+                indent + 2,
+                &mut constructor_scopes,
             );
         }
         writeln(output, indent + 1, "}");
         output.push('\n');
     }
-    if !has_destructor && (!owned_properties.is_empty() || parent_has_destructor) {
+    if !has_destructor
+        && scopes
+            .symbols
+            .classes_with_php_destructors
+            .contains(&class_decl.name)
+    {
         writeln(output, indent + 1, "public function __destruct()");
         writeln(output, indent + 1, "{");
-        writeln(output, indent + 2, "global $__doria_panicking;");
-        writeln(output, indent + 2, "if ($__doria_panicking) { return; }");
+        writeln(
+            output,
+            indent + 2,
+            "if (!__doria_begin_destroy($this, __CLASS__)) { return; }",
+        );
         for property in owned_properties.iter().rev() {
             writeln(
                 output,
@@ -4192,7 +4577,16 @@ fn emit_class(
         writeln(output, indent + 1, "}");
         output.push('\n');
     }
-    emit_closure_entries(Some(&class_decl.name), output, indent + 1, scopes);
+    emit_closure_entries(
+        Some(
+            scopes
+                .specialization
+                .class_symbol(checked_class.unwrap().id),
+        ),
+        output,
+        indent + 1,
+        scopes,
+    );
     writeln(output, indent, "}");
     let static_payload_initializers = class_decl.members.iter().filter_map(|member| match member {
         ClassMember::Property(property)
@@ -4310,6 +4704,16 @@ fn emit_closure_entry(
     indent: usize,
     shared_scopes: &PhpNameScopes,
 ) {
+    let specialized_scopes;
+    let shared_scopes = if let mir::ClosureOwner::Callable(instance) = descriptor.source_instance {
+        specialized_scopes = shared_scopes.specialization.scope(
+            shared_scopes,
+            shared_scopes.specialization.callable(instance),
+        );
+        &specialized_scopes
+    } else {
+        shared_scopes
+    };
     let semantic = shared_scopes
         .closure_plan
         .semantic_closures
@@ -4317,6 +4721,8 @@ fn emit_closure_entry(
         .expect("checked closure must have semantic facts");
     let mut scopes = shared_scopes.expression_scope();
     scopes.current_callable = Some(descriptor.debug_identity.clone());
+    scopes.closure_owner = Some(descriptor.source_instance);
+    scopes.returns_borrow = matches!(&semantic.function_type, ResolvedType::Function(function) if function.return_borrow.is_some());
     scopes.push();
 
     write_indent(output, indent);
@@ -4335,7 +4741,7 @@ fn emit_closure_entry(
         let parameter_type = if parameter.writable {
             "__DoriaCell".to_string()
         } else {
-            php_type(&parameter.ty)
+            php_type(&parameter.ty, &scopes)
         };
         parameters.push(format!("{parameter_type} ${}", parameter.name));
         scopes.declare_unmangled(&parameter.name);
@@ -4350,10 +4756,9 @@ fn emit_closure_entry(
     }
     output.push_str(&parameters.join(", "));
     output.push_str("): ");
-    output.push_str(&php_resolved_type(&semantic.inferred_return_type));
+    output.push_str(&php_resolved_type(&semantic.inferred_return_type, &scopes));
     output.push('\n');
     writeln(output, indent, "{");
-
     if let Some(layout_id) = descriptor.environment_layout {
         let fields = scopes.closure_plan.layout(layout_id).fields.clone();
         for field in fields {
@@ -4374,37 +4779,41 @@ fn emit_closure_entry(
                 &format!("${0} = new __DoriaCell(${0});", parameter.name),
             );
         }
-        if parameter.take && resolved_type_ref_is_function(&parameter.ty) {
+        if parameter.take && scopes.needs_cell(binding) {
             scopes.own_cell(parameter.name.clone());
         }
     }
 
-    match &closure.body {
-        ClosureBody::Expression(expr) => {
-            let result = scopes.fresh_temp("__doria_closure_result");
-            let owns_result = resolved_type_needs_php_drop(&semantic.inferred_return_type, &scopes);
-            writeln(
-                output,
-                indent + 1,
-                &format!(
-                    "${result} = {};",
-                    if owns_result {
-                        emit_owned_expr(expr, &scopes)
-                    } else {
-                        emit_expr(expr, &scopes)
-                    }
-                ),
-            );
-            emit_all_function_cell_cleanup(output, indent + 1, &scopes);
-            writeln(output, indent + 1, &format!("return ${result};"));
-        }
-        ClosureBody::Block(block) => {
-            for statement in &block.statements {
-                emit_statement(statement, output, indent + 1, &mut scopes);
+    emit_owned_scope(
+        output,
+        indent + 1,
+        &mut scopes,
+        |output, indent, scopes| match &closure.body {
+            ClosureBody::Expression(expr) => {
+                let result = scopes.fresh_temp("__doria_closure_result");
+                let owns_result = !scopes.returns_borrow
+                    && resolved_type_needs_php_drop(&semantic.inferred_return_type, scopes);
+                writeln(
+                    output,
+                    indent,
+                    &format!(
+                        "${result} = {};",
+                        if owns_result {
+                            emit_owned_expr(expr, scopes)
+                        } else {
+                            emit_expr(expr, scopes)
+                        }
+                    ),
+                );
+                writeln(output, indent, &format!("return ${result};"));
             }
-            emit_current_function_cell_cleanup(output, indent + 1, &scopes);
-        }
-    }
+            ClosureBody::Block(block) => {
+                for statement in &block.statements {
+                    emit_statement(statement, output, indent, scopes);
+                }
+            }
+        },
+    );
     scopes.pop();
     writeln(output, indent, "}");
 }
@@ -4419,7 +4828,7 @@ fn emit_property(
     shared_scopes: &PhpNameScopes,
 ) {
     let visibility = emit_member_access(&property.access);
-    let ty = php_type(&property.ty);
+    let ty = php_type(&property.ty, shared_scopes);
     write_indent(output, indent);
     output.push_str(visibility);
     output.push(' ');
@@ -4598,9 +5007,33 @@ struct PhpFunctionEmission<'a> {
     invoke_parent_destructor: bool,
     manual_promotions: bool,
     drop_properties: &'a [String],
+    construction_properties: &'a [String],
+    parent_drop_on_construction_failure: bool,
 }
 
 fn emit_function(
+    function: &FunctionDecl,
+    semantic_info: &SemanticInfo,
+    output: &mut String,
+    indent: usize,
+    shared_scopes: &PhpNameScopes,
+    emission: PhpFunctionEmission<'_>,
+) {
+    for callable in shared_scopes
+        .specialization
+        .callables
+        .iter()
+        .filter(|callable| {
+            callable.declaration == function.span
+                && callable.class == shared_scopes.current_class_id
+        })
+    {
+        let scopes = shared_scopes.specialization.scope(shared_scopes, callable);
+        emit_function_instance(function, semantic_info, output, indent, &scopes, emission);
+    }
+}
+
+fn emit_function_instance(
     function: &FunctionDecl,
     semantic_info: &SemanticInfo,
     output: &mut String,
@@ -4615,8 +5048,20 @@ fn emit_function(
         invoke_parent_destructor,
         manual_promotions,
         drop_properties,
+        construction_properties,
+        parent_drop_on_construction_failure,
     } = emission;
     let mut scopes = shared_scopes.expression_scope();
+    scopes.returns_borrow = semantic_info.return_borrows.contains_key(&function.span);
+    scopes.current_callable = Some(if is_method {
+        format!(
+            "{}::{}",
+            scopes.current_class.as_deref().expect("method has a class"),
+            function.name
+        )
+    } else {
+        function.name.clone()
+    });
     let callable_plan = scopes
         .closure_plan
         .callable_definition(function.span)
@@ -4648,11 +5093,10 @@ fn emit_function(
         }
     }
     output.push_str("function ");
-    if is_method {
-        output.push_str(&function.name);
-    } else {
-        output.push_str(&php_function_name(&function.name));
-    }
+    let Some(mir::ClosureOwner::Callable(instance)) = scopes.closure_owner else {
+        unreachable!("authored callable emission has a checked concrete instance");
+    };
+    output.push_str(&scopes.specialization.callable(instance).symbol);
     output.push('(');
     output.push_str(
         &function
@@ -4686,11 +5130,18 @@ fn emit_function(
         .filter(|_| !is_lifecycle_method)
     {
         output.push_str(": ");
-        output.push_str(&php_type(return_type));
+        output.push_str(&php_type(return_type, &scopes));
     }
     output.push('\n');
     writeln(output, indent, "{");
     let is_entry = !is_method && crate::names::source_name_is(&function.name, "main");
+    if is_method && function.name == "__destruct" {
+        writeln(
+            output,
+            indent + 1,
+            "if (!__doria_begin_destroy($this, __CLASS__)) { return; }",
+        );
+    }
     let checked_entry = is_entry && !function.checked_effects.is_empty();
     let body_indent = if checked_entry {
         indent + 2
@@ -4702,163 +5153,211 @@ fn emit_function(
         writeln(output, indent + 1, "{");
     }
     scopes.push();
-    for (parameter_index, param) in function.params.iter().enumerate() {
-        let Some(default @ ConstValue::PayloadEnum(_)) =
-            semantic_info.parameter_defaults.get(&ParameterDefaultKey {
-                function_start: function.span.start,
-                parameter_index,
-            })
-        else {
-            continue;
-        };
-        let name = scopes.php_name(&param.name);
-        writeln(output, body_indent, &format!("if (${name} === []) {{"));
-        writeln(
-            output,
-            body_indent + 1,
-            &format!(
-                "${name} = {};",
-                emit_const_value(default, &semantic_info.const_evaluation)
-            ),
-        );
-        if param.constructor_role.is_promoted() && !manual_promotions {
-            writeln(
-                output,
-                body_indent + 1,
-                &format!("$this->{name} = ${name};"),
-            );
-        }
-        writeln(output, body_indent, "}");
-    }
-    for (index, param) in function.params.iter().enumerate() {
-        if scopes
-            .binding_for_declaration(&param.name, param.span)
-            .is_none()
-        {
-            continue;
-        }
-        let uses_cell = callable_parameter_uses_cell(callable_plan.as_ref(), index);
-        if uses_cell && param.default.is_some() {
-            writeln(
-                output,
-                body_indent,
-                &format!(
-                    "if (!(${0} instanceof __DoriaCell)) {{ ${0} = new __DoriaCell(${0}); }}",
-                    param.name
-                ),
-            );
-        }
-        if param.constructor_role.is_promoted() && uses_cell && !manual_promotions {
-            let value = if uses_cell && param.take && resolved_type_ref_is_function(&param.ty) {
-                format!("__doria_take_cell(${})", param.name)
-            } else if uses_cell {
-                format!("${}->value", param.name)
-            } else {
-                format!("${}", param.name)
-            };
-            writeln(
-                output,
-                body_indent,
-                &format!("$this->{} = {value};", param.name),
-            );
-        }
-        if resolved_type_ref_is_function(&param.ty) && param.take {
-            scopes.own_cell(param.name.clone());
-        }
-    }
-    let explicit_parent_constructor =
-        invoke_parent_constructor && constructor_starts_with_parent_call(function, semantic_info);
-    if invoke_parent_constructor {
-        if explicit_parent_constructor {
-            emit_statement(
-                function
-                    .body
-                    .statements
-                    .first()
-                    .expect("explicit parent constructor call is present"),
-                output,
-                body_indent,
-                &mut scopes,
-            );
-        } else {
-            writeln(output, body_indent, "parent::__construct();");
-        }
-    }
-    if manual_promotions {
-        for (index, param) in function.params.iter().enumerate() {
-            if !param.constructor_role.is_promoted() {
-                continue;
-            }
-            let uses_cell = callable_parameter_uses_cell(callable_plan.as_ref(), index);
-            let value = if uses_cell && param.take && resolved_type_ref_is_function(&param.ty) {
-                format!("__doria_take_cell(${})", param.name)
-            } else if uses_cell {
-                format!("${}->value", param.name)
-            } else {
-                format!("${}", param.name)
-            };
-            writeln(
-                output,
-                body_indent,
-                &format!("$this->{} = {value};", param.name),
-            );
-        }
-    }
-    for (name, initializer) in property_initializers {
+    let parent_completed =
+        parent_drop_on_construction_failure.then(|| scopes.fresh_temp("__doria_parent_completed"));
+    if let Some(parent_completed) = &parent_completed {
         writeln(
             output,
             body_indent,
-            &format!("$this->{name} = {};", emit_expr(initializer, &scopes)),
+            &format!("${parent_completed} = false;"),
         );
     }
-    let routes_destructor_cleanup = invoke_parent_destructor || !drop_properties.is_empty();
-    let statement_indent = if routes_destructor_cleanup {
-        writeln(output, body_indent, "try");
-        writeln(output, body_indent, "{");
-        body_indent + 1
-    } else {
-        body_indent
-    };
-    for statement in function
-        .body
-        .statements
-        .iter()
-        .skip(usize::from(explicit_parent_constructor))
-    {
-        emit_statement(statement, output, statement_indent, &mut scopes);
+    let construction_cleanup =
+        !construction_properties.is_empty() || parent_drop_on_construction_failure;
+    if construction_cleanup {
+        writeln(output, body_indent, "try {");
     }
-    emit_current_function_cell_cleanup(output, statement_indent, &scopes);
-    if routes_destructor_cleanup {
-        writeln(output, body_indent, "}");
-        writeln(output, body_indent, "finally");
-        writeln(output, body_indent, "{");
-        let cleanup_indent = if invoke_parent_destructor && !drop_properties.is_empty() {
-            writeln(output, body_indent + 1, "try");
-            writeln(output, body_indent + 1, "{");
-            body_indent + 2
-        } else {
-            body_indent + 1
-        };
-        for property in drop_properties.iter().rev() {
-            let temporary = scopes.fresh_temp("__doria_property_value");
-            writeln(
+    emit_owned_scope(
+        output,
+        body_indent + usize::from(construction_cleanup),
+        &mut scopes,
+        |output, body_indent, scopes| {
+            for (parameter_index, param) in function.params.iter().enumerate() {
+                let Some(default @ ConstValue::PayloadEnum(_)) =
+                    semantic_info.parameter_defaults.get(&ParameterDefaultKey {
+                        function_start: function.span.start,
+                        parameter_index,
+                    })
+                else {
+                    continue;
+                };
+                let name = scopes.php_name(&param.name);
+                writeln(output, body_indent, &format!("if (${name} === []) {{"));
+                writeln(
+                    output,
+                    body_indent + 1,
+                    &format!(
+                        "${name} = {};",
+                        emit_const_value(default, &semantic_info.const_evaluation)
+                    ),
+                );
+                if param.constructor_role.is_promoted() && !manual_promotions {
+                    writeln(
+                        output,
+                        body_indent + 1,
+                        &format!("$this->{name} = ${name};"),
+                    );
+                }
+                writeln(output, body_indent, "}");
+            }
+            for (index, param) in function.params.iter().enumerate() {
+                if scopes
+                    .binding_for_declaration(&param.name, param.span)
+                    .is_none()
+                {
+                    continue;
+                }
+                let uses_cell = callable_parameter_uses_cell(callable_plan.as_ref(), index);
+                if uses_cell && param.default.is_some() {
+                    writeln(
+                        output,
+                        body_indent,
+                        &format!(
+                    "if (!(${0} instanceof __DoriaCell)) {{ ${0} = new __DoriaCell(${0}); }}",
+                    param.name
+                ),
+                    );
+                }
+                if param.constructor_role.is_promoted() && uses_cell && !manual_promotions {
+                    let value = if uses_cell && param.take {
+                        format!("__doria_take_cell(${})", param.name)
+                    } else if uses_cell {
+                        format!("${}->value", param.name)
+                    } else {
+                        format!("${}", param.name)
+                    };
+                    writeln(
+                        output,
+                        body_indent,
+                        &format!("$this->{} = {value};", param.name),
+                    );
+                }
+                if uses_cell && param.take {
+                    scopes.own_cell(param.name.clone());
+                }
+            }
+            let explicit_parent_constructor = invoke_parent_constructor
+                && constructor_starts_with_parent_call(function, semantic_info);
+            if invoke_parent_constructor {
+                if explicit_parent_constructor {
+                    emit_statement(
+                        function
+                            .body
+                            .statements
+                            .first()
+                            .expect("explicit parent constructor call is present"),
+                        output,
+                        body_indent,
+                        scopes,
+                    );
+                } else {
+                    writeln(output, body_indent, "parent::__construct();");
+                }
+                if let Some(parent_completed) = &parent_completed {
+                    writeln(output, body_indent, &format!("${parent_completed} = true;"));
+                }
+            }
+            if manual_promotions {
+                for (index, param) in function.params.iter().enumerate() {
+                    if !param.constructor_role.is_promoted() {
+                        continue;
+                    }
+                    let uses_cell = callable_parameter_uses_cell(callable_plan.as_ref(), index);
+                    let value = if uses_cell && param.take {
+                        format!("__doria_take_cell(${})", param.name)
+                    } else if uses_cell {
+                        format!("${}->value", param.name)
+                    } else {
+                        format!("${}", param.name)
+                    };
+                    writeln(
+                        output,
+                        body_indent,
+                        &format!("$this->{} = {value};", param.name),
+                    );
+                }
+            }
+            for (name, initializer) in property_initializers {
+                writeln(
+                    output,
+                    body_indent,
+                    &format!(
+                        "$this->{name} = {};",
+                        emit_owned_expr(
+                            initializer,
+                            &scopes.specialization.property_scope(scopes, name)
+                        )
+                    ),
+                );
+            }
+            let routes_destructor_cleanup = invoke_parent_destructor || !drop_properties.is_empty();
+            let statement_indent = if routes_destructor_cleanup {
+                writeln(output, body_indent, "try");
+                writeln(output, body_indent, "{");
+                body_indent + 1
+            } else {
+                body_indent
+            };
+            let emit_statements =
+                |output: &mut String, indent: usize, scopes: &mut PhpNameScopes| {
+                    for statement in function
+                        .body
+                        .statements
+                        .iter()
+                        .skip(usize::from(explicit_parent_constructor))
+                    {
+                        emit_statement(statement, output, indent, scopes);
+                    }
+                };
+            if routes_destructor_cleanup {
+                scopes.push();
+                emit_owned_scope(output, statement_indent, scopes, emit_statements);
+                scopes.pop();
+            } else {
+                emit_statements(output, statement_indent, scopes);
+            }
+            if routes_destructor_cleanup {
+                writeln(output, body_indent, "}");
+                writeln(output, body_indent, "finally");
+                writeln(output, body_indent, "{");
+                let cleanup_indent = if invoke_parent_destructor && !drop_properties.is_empty() {
+                    writeln(output, body_indent + 1, "try");
+                    writeln(output, body_indent + 1, "{");
+                    body_indent + 2
+                } else {
+                    body_indent + 1
+                };
+                for property in drop_properties.iter().rev() {
+                    let temporary = scopes.fresh_temp("__doria_property_value");
+                    writeln(
                 output,
                 cleanup_indent,
                 &format!(
                     "if (isset($this->{property})) {{ ${temporary} = $this->{property}; unset($this->{property}); __doria_drop_value(${temporary}); }}"
                 ),
             );
-        }
-        if invoke_parent_destructor && !drop_properties.is_empty() {
-            writeln(output, body_indent + 1, "}");
-            writeln(output, body_indent + 1, "finally");
-            writeln(output, body_indent + 1, "{");
-            writeln(output, body_indent + 2, "parent::__destruct();");
-            writeln(output, body_indent + 1, "}");
-        } else if invoke_parent_destructor {
-            writeln(output, body_indent + 1, "parent::__destruct();");
-        }
-        writeln(output, body_indent, "}");
+                }
+                if invoke_parent_destructor && !drop_properties.is_empty() {
+                    writeln(output, body_indent + 1, "}");
+                    writeln(output, body_indent + 1, "finally");
+                    writeln(output, body_indent + 1, "{");
+                    writeln(output, body_indent + 2, "parent::__destruct();");
+                    writeln(output, body_indent + 1, "}");
+                } else if invoke_parent_destructor {
+                    writeln(output, body_indent + 1, "parent::__destruct();");
+                }
+                writeln(output, body_indent, "}");
+            }
+        },
+    );
+    if construction_cleanup {
+        emit_constructor_catch(
+            construction_properties,
+            parent_completed.as_deref(),
+            output,
+            body_indent,
+            &mut scopes,
+        );
     }
     scopes.pop();
     if checked_entry {
@@ -4872,6 +5371,45 @@ fn emit_function(
         );
         writeln(output, indent + 1, "}");
     }
+    writeln(output, indent, "}");
+}
+
+fn emit_property_drops(
+    properties: &[String],
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    for property in properties.iter().rev() {
+        let temporary = scopes.fresh_temp("__doria_property_value");
+        writeln(output, indent, &format!(
+            "if (isset($this->{property})) {{ ${temporary} = $this->{property}; unset($this->{property}); __doria_drop_value(${temporary}); }}"
+        ));
+    }
+}
+
+fn emit_constructor_catch(
+    properties: &[String],
+    parent_completed: Option<&str>,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
+    let error = scopes.fresh_temp("__doria_construction_failure");
+    writeln(
+        output,
+        indent,
+        &format!("}} catch (__DoriaCheckedError ${error}) {{"),
+    );
+    emit_property_drops(properties, output, indent + 1, scopes);
+    if let Some(parent_completed) = parent_completed {
+        writeln(
+            output,
+            indent + 1,
+            &format!("if (${parent_completed}) {{ parent::__destruct(); }}"),
+        );
+    }
+    writeln(output, indent + 1, &format!("throw ${error};"));
     writeln(output, indent, "}");
 }
 
@@ -4896,7 +5434,7 @@ fn emit_param(
     if uses_cell && param.default.is_none() {
         output.push_str("__DoriaCell");
     } else if uses_cell {
-        let value_type = php_parameter_value_type(&param.ty, payload_default);
+        let value_type = php_parameter_value_type(&param.ty, payload_default, scopes);
         if value_type == "mixed" {
             output.push_str("mixed");
         } else {
@@ -4904,9 +5442,9 @@ fn emit_param(
             output.push_str(&value_type);
         }
     } else if payload_default {
-        output.push_str(&php_parameter_value_type(&param.ty, true));
+        output.push_str(&php_parameter_value_type(&param.ty, true, scopes));
     } else {
-        output.push_str(&php_type(&param.ty));
+        output.push_str(&php_type(&param.ty, scopes));
     }
     output.push_str(" $");
     output.push_str(&scopes.php_name(&param.name));
@@ -4932,8 +5470,8 @@ fn callable_parameter_uses_cell(
         .is_some_and(|parameter| parameter.cell)
 }
 
-fn php_parameter_value_type(ty: &TypeRef, payload_default: bool) -> String {
-    let php_type = php_type(ty);
+fn php_parameter_value_type(ty: &TypeRef, payload_default: bool, scopes: &PhpNameScopes) -> String {
+    let php_type = php_type(ty, scopes);
     let mut members = vec![php_type.trim_start_matches('?').to_string()];
     if payload_default {
         members.push("array".to_string());
@@ -4959,11 +5497,45 @@ fn php_payload_case_method(case_name: &str, has_payload: bool) -> String {
 fn emit_block(block: &Block, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {
     writeln(output, indent, "{");
     scopes.push();
-    for statement in &block.statements {
-        emit_statement(statement, output, indent + 1, scopes);
-    }
-    emit_current_function_cell_cleanup(output, indent + 1, scopes);
+    emit_owned_scope(output, indent + 1, scopes, |output, indent, scopes| {
+        for statement in &block.statements {
+            emit_statement(statement, output, indent, scopes);
+        }
+    });
     scopes.pop();
+    writeln(output, indent, "}");
+}
+
+fn emit_owned_scope(
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+    emit: impl FnOnce(&mut String, usize, &mut PhpNameScopes),
+) {
+    let mut body = String::new();
+    emit(&mut body, indent, scopes);
+    if scopes.current_owned_cells().is_empty() {
+        output.push_str(&body);
+        return;
+    }
+    writeln(output, indent, "try");
+    writeln(output, indent, "{");
+    for line in body.lines() {
+        output.push_str("    ");
+        output.push_str(line);
+        output.push('\n');
+    }
+    writeln(output, indent, "}");
+    writeln(output, indent, "finally");
+    writeln(output, indent, "{");
+    for cell in scopes.current_owned_cells().iter().rev() {
+        // An exception may precede a declaration, including during its initializer.
+        writeln(
+            output,
+            indent + 1,
+            &format!("if (isset(${cell})) {{ __doria_drop_cell(${cell}); }}"),
+        );
+    }
     writeln(output, indent, "}");
 }
 
@@ -4978,7 +5550,10 @@ fn emit_finalizer_error_boundary(
     writeln(output, indent, &format!("${forwarded} = null;"));
     writeln(output, indent, "try");
     writeln(output, indent, "{");
+    let pending = Rc::new(RefCell::new(Vec::new()));
+    scopes.pending_returns.push(Rc::clone(&pending));
     emit_body(output, indent + 1, scopes);
+    scopes.pending_returns.pop();
     writeln(output, indent, "}");
     writeln(
         output,
@@ -4986,6 +5561,13 @@ fn emit_finalizer_error_boundary(
         &format!("catch (__DoriaCheckedError ${caught})"),
     );
     writeln(output, indent, "{");
+    for result in pending.borrow().iter().rev() {
+        writeln(
+            output,
+            indent + 1,
+            &format!("if (isset(${result})) {{ __doria_drop_value(${result}); }}"),
+        );
+    }
     writeln(
         output,
         indent + 1,
@@ -5010,12 +5592,10 @@ fn emit_with_finally(
     emit_finalizer_error_boundary(output, indent, scopes, |output, indent, scopes| {
         writeln(output, indent, "try");
         writeln(output, indent, "{");
-        scopes.push();
         emit_body(output, indent + 1, scopes);
         writeln(output, indent, "}");
         writeln(output, indent, "finally");
         emit_block(&finally.block, output, indent, scopes);
-        scopes.pop();
     });
 }
 
@@ -5034,15 +5614,12 @@ fn emit_statement(
                 .map(|binding| {
                     scopes
                         .binding_for_declaration(&binding.name, binding.span)
+                        .filter(|binding| scopes.owns_binding(*binding))
                         .and_then(|binding| scopes.source_type(binding))
                         .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes))
                 })
                 .collect::<Vec<_>>();
-            let owns_value = binding_ownership.iter().copied().any(|owns| owns)
-                || scopes
-                    .expression_types
-                    .get(&decl.initializer.span())
-                    .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes));
+            let owns_value = binding_ownership.iter().copied().any(|owns| owns);
             let initializer = if owns_value {
                 emit_owned_expr(&decl.initializer, scopes)
             } else {
@@ -5082,140 +5659,97 @@ fn emit_statement(
             }
         }
         Stmt::Assignment(assignment) => {
-            if assignment.op == AssignOp::Assign
-                && assignment_target_needs_php_drop(&assignment.target, scopes)
-            {
-                let replacement = emit_owned_expr(&assignment.value, scopes);
-                if let Some(cell) = assignment_target_cell(&assignment.target, scopes) {
-                    writeln(
-                        output,
-                        indent,
-                        &format!("__doria_replace_cell({cell}, {replacement});"),
-                    );
-                } else {
-                    let target = emit_assignment_target(&assignment.target, scopes);
-                    let temporary = scopes.fresh_temp("__doria_replacement");
-                    let old = scopes.fresh_temp("__doria_replaced");
-                    writeln(output, indent, &format!("${temporary} = {replacement};"));
-                    writeln(output, indent, &format!("if (isset({target}))"));
-                    writeln(output, indent, "{");
-                    writeln(output, indent + 1, &format!("${old} = {target};"));
-                    writeln(output, indent + 1, &format!("{target} = ${temporary};"));
-                    writeln(output, indent + 1, &format!("__doria_drop_value(${old});"));
-                    writeln(output, indent, "}");
-                    writeln(output, indent, "else");
-                    writeln(output, indent, "{");
-                    writeln(output, indent + 1, &format!("{target} = ${temporary};"));
-                    writeln(output, indent, "}");
-                }
-                return;
-            }
-            if assignment.op == AssignOp::DivAssign {
-                let target = emit_assignment_target(&assignment.target, scopes);
-                writeln(
-                    output,
-                    indent,
-                    &format!(
-                        "{target} = fdiv({target}, {});",
-                        emit_expr(&assignment.value, scopes)
-                    ),
-                );
-                return;
-            }
-            let op = match assignment.op {
-                AssignOp::Assign => "=",
-                AssignOp::AddAssign => "+=",
-                AssignOp::SubAssign => "-=",
-                AssignOp::MulAssign => "*=",
-                AssignOp::DivAssign => "/=",
-                AssignOp::ModAssign => "%=",
-                AssignOp::ShiftLeftAssign => "<<=",
-                AssignOp::ShiftRightAssign => ">>=",
-                AssignOp::BitwiseAndAssign => "&=",
-                AssignOp::BitwiseOrAssign => "|=",
-                AssignOp::BitwiseXorAssign => "^=",
-            };
             writeln(
                 output,
                 indent,
-                &format!(
-                    "{} {} {};",
-                    emit_assignment_target(&assignment.target, scopes),
-                    op,
-                    emit_expr(&assignment.value, scopes)
-                ),
+                &format!("{};", emit_assignment(assignment, scopes)),
             );
         }
         Stmt::Echo { expr, span } => {
-            writeln(
-                output,
-                indent,
-                &format!(
-                    "__doria_write_stdout(__doria_display({}), {}, {}, {});",
+            let expression = with_expression_temporaries(scopes, |scopes| {
+                format!(
+                    "__doria_write_stdout(__doria_display({}), {}, {}, {})",
                     emit_expr(expr, scopes),
                     php_source_location(*span, span.start),
                     php_source_location(*span, span.end),
                     scopes.callable_identity(),
-                ),
-            );
+                )
+            });
+            writeln(output, indent, &format!("{expression};"));
         }
         Stmt::Return { expr, .. } => {
             if let Some(expr) = expr {
-                let owns_result = scopes
-                    .expression_types
-                    .get(&expr.span())
-                    .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes));
+                let mut result_scopes = scopes.clone();
+                if scopes.returns_borrow && scopes.yield_temporaries.is_some() {
+                    result_scopes.expression_temporaries = scopes.yield_temporaries.clone();
+                }
+                let owns_result = !scopes.returns_borrow
+                    && scopes
+                        .expression_types
+                        .get(&expr.span())
+                        .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes));
                 if owns_result || scopes.has_owned_cells() {
                     let result = scopes.fresh_temp("__doria_return");
+                    if owns_result {
+                        for pending in &scopes.pending_returns {
+                            pending.borrow_mut().push(result.clone());
+                        }
+                    }
                     writeln(
                         output,
                         indent,
                         &format!(
                             "${result} = {};",
                             if owns_result {
-                                emit_owned_expr(expr, scopes)
+                                emit_owned_expr(expr, &result_scopes)
                             } else {
-                                emit_expr(expr, scopes)
+                                emit_expr(expr, &result_scopes)
                             }
                         ),
                     );
-                    emit_all_function_cell_cleanup(output, indent, scopes);
                     writeln(output, indent, &format!("return ${result};"));
                 } else {
                     writeln(
                         output,
                         indent,
-                        &format!("return {};", emit_expr(expr, scopes)),
+                        &format!("return {};", emit_expr(expr, &result_scopes)),
                     );
                 }
             } else {
-                emit_all_function_cell_cleanup(output, indent, scopes);
                 writeln(output, indent, "return;");
             }
         }
         Stmt::If(if_stmt) => {
-            if let Some(finally) = &if_stmt.finally {
-                emit_with_finally(finally, output, indent, scopes, |output, indent, scopes| {
-                    if if_stmt.given.is_some() {
-                        emit_given_if(if_stmt, output, indent, scopes);
-                    } else {
-                        emit_if(if_stmt, output, indent, "if", None, scopes);
-                    }
-                });
-            } else if if_stmt.given.is_some() {
-                emit_given_if(if_stmt, output, indent, scopes);
-            } else {
-                emit_if(if_stmt, output, indent, "if", None, scopes);
-            }
+            scopes.push();
+            emit_owned_scope(output, indent, scopes, |output, indent, scopes| {
+                if let Some(finally) = &if_stmt.finally {
+                    emit_with_finally(finally, output, indent, scopes, |output, indent, scopes| {
+                        if if_stmt.given.is_some() {
+                            emit_given_if(if_stmt, output, indent, scopes);
+                        } else {
+                            emit_if(if_stmt, output, indent, "if", None, scopes);
+                        }
+                    });
+                } else if if_stmt.given.is_some() {
+                    emit_given_if(if_stmt, output, indent, scopes);
+                } else {
+                    emit_if(if_stmt, output, indent, "if", None, scopes);
+                }
+            });
+            scopes.pop();
         }
         Stmt::While(while_stmt) => {
-            if let Some(finally) = &while_stmt.finally {
-                emit_with_finally(finally, output, indent, scopes, |output, indent, scopes| {
-                    emit_while(while_stmt, output, indent, scopes);
-                });
-                return;
-            }
-            emit_while(while_stmt, output, indent, scopes);
+            scopes.push();
+            emit_owned_scope(output, indent, scopes, |output, indent, scopes| {
+                if let Some(finally) = &while_stmt.finally {
+                    emit_with_finally(finally, output, indent, scopes, |output, indent, scopes| {
+                        emit_while(while_stmt, output, indent, scopes);
+                    });
+                    return;
+                }
+                emit_while(while_stmt, output, indent, scopes);
+            });
+            scopes.pop();
         }
         Stmt::DoWhile(do_while) => {
             if let Some(finally) = &do_while.finally {
@@ -5252,7 +5786,8 @@ fn emit_statement(
                     return;
                 }
             }
-            writeln(output, indent, &format!("{};", emit_expr(expr, scopes)));
+            let expression = with_expression_temporaries(scopes, |scopes| emit_expr(expr, scopes));
+            writeln(output, indent, &format!("{expression};"));
         }
         Stmt::Throw(statement) => emit_throw_statement(statement, output, indent, scopes),
         Stmt::Try(statement) => emit_try_statement(statement, output, indent, scopes),
@@ -5315,6 +5850,14 @@ fn emit_assertion_statement(
     indent: usize,
     scopes: &mut PhpNameScopes,
 ) {
+    let resolved_actual_type = assertion
+        .actual_type
+        .as_ref()
+        .map(|ty| crate::types::substitute_resolved_type(ty, &scopes.substitutions));
+    let resolved_expected_type = assertion
+        .expected_type
+        .as_ref()
+        .map(|ty| crate::types::substitute_resolved_type(ty, &scopes.substitutions));
     let error_class = php_symbol_name(crate::compiler_known_test::ASSERTION_ERROR);
     let matcher = assertion.matcher.fact_name();
     let origin = php_source_location(assertion.span, assertion.span.start.saturating_add(1));
@@ -5367,7 +5910,7 @@ fn emit_assertion_statement(
         let expected_presentation =
             scopes.fresh_temp("__doria_assertion_throw_expected_presentation");
         let difference = scopes.fresh_temp("__doria_assertion_throw_difference");
-        let expected_error_type = match assertion.expected_type.as_ref() {
+        let expected_error_type = match resolved_expected_type.as_ref() {
             Some(ResolvedType::Function(function)) => match &function
                 .parameters
                 .first()
@@ -5375,6 +5918,7 @@ fn emit_assertion_statement(
                 .ty
             {
                 ResolvedType::Class(class) => class.name.as_str(),
+                ResolvedType::Interface(interface_type) => interface_type.name.as_str(),
                 ResolvedType::Error => "Error",
                 _ => unreachable!("checked throw inspector parameter implements Error"),
             },
@@ -5481,7 +6025,7 @@ fn emit_assertion_statement(
             ),
         );
         if let Some(inspector) = expected.as_ref() {
-            let parameter = match assertion.expected_type.as_ref() {
+            let parameter = match resolved_expected_type.as_ref() {
                 Some(ResolvedType::Function(function)) => function.parameters.first(),
                 _ => None,
             }
@@ -5491,7 +6035,7 @@ fn emit_assertion_statement(
                 writeln(
                     output,
                     indent + 1,
-                    &format!("if ({})", php_error_matches(&error, &parameter.ty)),
+                    &format!("if ({})", php_error_matches(&error, &parameter.ty, scopes)),
                 );
                 writeln(output, indent + 1, "{");
                 writeln(output, indent + 2, &format!("(${inspector})({error});"));
@@ -5584,8 +6128,7 @@ fn emit_assertion_statement(
                 throw_actual_presentation.clone(),
             )
         } else {
-            let ty = assertion
-                .actual_type
+            let ty = resolved_actual_type
                 .as_ref()
                 .map(assertion_type_name)
                 .unwrap_or_default();
@@ -5610,8 +6153,7 @@ fn emit_assertion_statement(
                 format!("${throw_expected_presentation}"),
             )
         } else if let Some(ref expected) = expected {
-            let ty = assertion
-                .expected_type
+            let ty = resolved_expected_type
                 .as_ref()
                 .map(assertion_type_name)
                 .unwrap_or_default();
@@ -5662,8 +6204,8 @@ fn emit_assertion_statement(
         crate::assertions::stable_difference(assertion.matcher, assertion.negated);
     let dynamic_difference = match assertion.matcher {
         crate::assertions::AssertionMatcher::Equal
-            if matches!(assertion.actual_type, Some(ResolvedType::String))
-                && matches!(assertion.expected_type, Some(ResolvedType::String)) =>
+            if matches!(resolved_actual_type, Some(ResolvedType::String))
+                && matches!(resolved_expected_type, Some(ResolvedType::String)) =>
         {
             expected.as_ref().map(|expected| {
                 format!("__doria_assertion_string_difference(${actual}, ${expected}, 0)")
@@ -5678,8 +6220,8 @@ fn emit_assertion_statement(
             format!("__doria_assertion_string_difference(${actual}, ${expected}, 2)")
         }),
         crate::assertions::AssertionMatcher::Equal
-            if matches!(assertion.actual_type, Some(ResolvedType::Bytes))
-                && matches!(assertion.expected_type, Some(ResolvedType::Bytes)) =>
+            if matches!(resolved_actual_type, Some(ResolvedType::Bytes))
+                && matches!(resolved_expected_type, Some(ResolvedType::Bytes)) =>
         {
             expected.as_ref().map(|expected| {
                 format!("__doria_assertion_bytes_difference(${actual}, ${expected})")
@@ -5732,7 +6274,7 @@ fn emit_throw_statement(
         indent,
         &format!(
             "__doria_throw({}, {}, {});",
-            emit_expr(&statement.expr, scopes),
+            emit_owned_expr(&statement.expr, scopes),
             php_source_location(statement.span, statement.span.start.saturating_add(1),),
             scopes.callable_identity(),
         ),
@@ -5754,12 +6296,22 @@ fn emit_try_statement(
     }
 }
 
-fn php_error_matches(value: &str, error_type: &ResolvedType) -> String {
+fn php_error_matches(value: &str, error_type: &ResolvedType, scopes: &PhpNameScopes) -> String {
     match error_type {
         ResolvedType::Error => "true".to_string(),
         ResolvedType::Class(class) => {
-            format!("{value} instanceof {}", php_symbol_name(&class.name))
+            let symbol = scopes
+                .specialization
+                .class_symbols
+                .get(class)
+                .cloned()
+                .unwrap_or_else(|| php_symbol_name(&class.name));
+            format!("{value} instanceof {symbol}")
         }
+        ResolvedType::Interface(interface_type) => format!(
+            "{value} instanceof {}",
+            interface::specialization_name(interface_type)
+        ),
         _ => unreachable!("semantic checking restricts checked errors to Error values"),
     }
 }
@@ -5793,8 +6345,8 @@ fn emit_try_statement_inner(
                     has_catch_all = true;
                     "true".to_string()
                 }
-                ResolvedType::Class(_) => {
-                    php_error_matches(&format!("${caught}->error()"), error_type)
+                ResolvedType::Class(_) | ResolvedType::Interface(_) => {
+                    php_error_matches(&format!("${caught}->error()"), error_type, scopes)
                 }
                 _ => unreachable!("semantic checking restricts catch types to Error values"),
             };
@@ -5812,11 +6364,20 @@ fn emit_try_statement_inner(
             writeln(
                 output,
                 indent + 2,
-                &format!("${binding} = ${caught}->takeError();"),
+                &format!("${binding} = new __DoriaCell(${caught}->takeError());"),
             );
-            for body_statement in &clause.body.statements {
-                emit_statement(body_statement, output, indent + 2, scopes);
+            if let Some(source) = &clause.binding {
+                let id = scopes
+                    .binding_for_declaration(&source.name, source.span)
+                    .expect("checked catch binding exists");
+                scopes.bind_place(id, PhpBindingPlace::Cell(binding.clone()));
             }
+            scopes.own_cell(binding);
+            emit_owned_scope(output, indent + 2, scopes, |output, indent, scopes| {
+                for body_statement in &clause.body.statements {
+                    emit_statement(body_statement, output, indent, scopes);
+                }
+            });
             scopes.pop();
             writeln(output, indent + 1, "}");
         }
@@ -5843,7 +6404,6 @@ fn emit_while(
     scopes: &mut PhpNameScopes,
 ) {
     if let Some(given) = &while_stmt.given {
-        scopes.push();
         let mut predicates = emit_given_setup(given, output, indent, scopes);
         predicates.push(emit_expr(&while_stmt.condition, scopes));
         write_indent(output, indent);
@@ -5851,7 +6411,6 @@ fn emit_while(
         output.push_str(&emit_bool_chain(predicates.iter().map(String::as_str)));
         output.push_str(")\n");
         emit_block(&while_stmt.body, output, indent, scopes);
-        scopes.pop();
         return;
     }
     write_indent(output, indent);
@@ -5899,70 +6458,34 @@ fn emit_panic(
 
 fn emit_for(for_stmt: &ForStmt, output: &mut String, indent: usize, scopes: &mut PhpNameScopes) {
     scopes.push();
-    let initializer = for_stmt
-        .initializer
-        .as_ref()
-        .map(|initializer| emit_for_initializer(initializer, scopes))
-        .unwrap_or_default();
-    let condition = for_stmt
-        .condition
-        .as_ref()
-        .map(|condition| emit_expr(condition, scopes))
-        .unwrap_or_default();
-    let increment = for_stmt
-        .increment
-        .as_ref()
-        .map(|increment| emit_for_increment(increment, scopes))
-        .unwrap_or_default();
-
-    write_indent(output, indent);
-    output.push_str("for (");
-    output.push_str(&initializer);
-    output.push_str("; ");
-    output.push_str(&condition);
-    output.push_str("; ");
-    output.push_str(&increment);
-    output.push_str(")\n");
-    emit_block(&for_stmt.body, output, indent, scopes);
-    scopes.pop();
-}
-
-fn emit_for_initializer(initializer: &ForInitializer, scopes: &mut PhpNameScopes) -> String {
-    match initializer {
-        ForInitializer::VarDecl(decl) => {
-            let initializer = emit_expr(&decl.initializer, scopes);
-            let binding_is_mixed = decl.ty.as_ref().is_some_and(|ty| ty.name == "mixed")
-                || (decl.ty.is_none()
-                    && matches!(
-                        scopes.expression_types.get(&decl.initializer.span()),
-                        Some(ResolvedType::Mixed)
-                    ));
-            if decl.bindings.len() == 1 {
-                let php_name = scopes.declare(&decl.bindings[0].name);
-                if binding_is_mixed {
-                    scopes.mark_mixed(&decl.bindings[0].name);
-                }
-                format!("${php_name} = {initializer}")
-            } else {
-                let temporary = scopes.fresh_temp("__doria_grouped_value");
-                let mut expressions = vec![format!("${temporary} = {initializer}")];
-                expressions.extend(decl.bindings.iter().map(|binding| {
-                    let php_name = scopes.declare(&binding.name);
-                    if binding_is_mixed {
-                        scopes.mark_mixed(&binding.name);
-                    }
-                    format!("${php_name} = ${temporary}")
-                }));
-                // PHP's for-initializer accepts a comma-separated expression
-                // list. Clearing the collision-safe temporary releases its
-                // string handle after the ordered copies, matching Doria's
-                // statement-end temporary lifetime without a chained assign.
-                expressions.push(format!("${temporary} = null"));
-                expressions.join(", ")
-            }
+    emit_owned_scope(output, indent, scopes, |output, indent, scopes| {
+        if let Some(initializer) = &for_stmt.initializer {
+            let statement = match initializer {
+                ForInitializer::VarDecl(decl) => Stmt::VarDecl(decl.clone()),
+                ForInitializer::Assignment(assignment) => Stmt::Assignment(assignment.clone()),
+            };
+            emit_statement(&statement, output, indent, scopes);
         }
-        ForInitializer::Assignment(assignment) => emit_assignment(assignment, scopes),
-    }
+        let condition = for_stmt
+            .condition
+            .as_ref()
+            .map(|condition| emit_expr(condition, scopes))
+            .unwrap_or_default();
+        let increment = for_stmt
+            .increment
+            .as_ref()
+            .map(|increment| emit_for_increment(increment, scopes))
+            .unwrap_or_default();
+
+        write_indent(output, indent);
+        output.push_str("for (; ");
+        output.push_str(&condition);
+        output.push_str("; ");
+        output.push_str(&increment);
+        output.push_str(")\n");
+        emit_block(&for_stmt.body, output, indent, scopes);
+    });
+    scopes.pop();
 }
 
 fn emit_for_increment(increment: &ForIncrement, scopes: &PhpNameScopes) -> String {
@@ -5972,34 +6495,12 @@ fn emit_for_increment(increment: &ForIncrement, scopes: &PhpNameScopes) -> Strin
     }
 }
 
-fn resolved_type_ref_is_function(ty: &TypeRef) -> bool {
-    ty.function.is_some() || ty.type_arguments().any(resolved_type_ref_is_function)
-}
-
-fn resolved_is_function_type(ty: &ResolvedType) -> bool {
-    match ty {
-        ResolvedType::Function(_) => true,
-        ResolvedType::Nullable(inner)
-        | ResolvedType::TypedArray(inner)
-        | ResolvedType::List(inner)
-        | ResolvedType::Set(inner)
-        | ResolvedType::SortedSet(inner)
-        | ResolvedType::PriorityQueue(inner)
-        | ResolvedType::Deque(inner) => resolved_is_function_type(inner),
-        ResolvedType::Dictionary(_, value) | ResolvedType::SortedDictionary(_, value) => {
-            resolved_is_function_type(value)
-        }
-        _ => false,
-    }
-}
-
 fn resolved_type_needs_php_drop(ty: &ResolvedType, scopes: &PhpNameScopes) -> bool {
     match ty {
         ResolvedType::Interface(_)
         | ResolvedType::InterfaceSelf(_)
-        | ResolvedType::TraitSelf(_) => {
-            unreachable!("interface execution must be rejected before PHP emission")
-        }
+        | ResolvedType::SharedHandle(_, _) => true,
+        ResolvedType::TraitSelf(_) => unreachable!("trait execution is pending Stage 35 Slice 4"),
         ResolvedType::Mixed
         | ResolvedType::Error
         | ResolvedType::Function(_)
@@ -6008,10 +6509,7 @@ fn resolved_type_needs_php_drop(ty: &ResolvedType, scopes: &PhpNameScopes) -> bo
             .symbols
             .payload_enums_with_php_destructors
             .contains(&enum_type.name),
-        ResolvedType::Class(class_type) => scopes
-            .symbols
-            .classes_with_php_destructors
-            .contains(&class_type.name),
+        ResolvedType::Class(_) => true,
         ResolvedType::TypedArray(element)
         | ResolvedType::List(element)
         | ResolvedType::Set(element)
@@ -6029,7 +6527,6 @@ fn resolved_type_needs_php_drop(ty: &ResolvedType, scopes: &PhpNameScopes) -> bo
         | ResolvedType::String
         | ResolvedType::Bool
         | ResolvedType::Null
-        | ResolvedType::SharedHandle(_, _)
         | ResolvedType::Unsupported => false,
     }
 }
@@ -6097,39 +6594,141 @@ fn assignment_target_cell(target: &Expr, scopes: &PhpNameScopes) -> Option<Strin
 }
 
 fn emit_owned_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
+    if scopes.expression_temporaries.is_none() {
+        return with_expression_temporaries(scopes, |scopes| emit_owned_expr(expr, scopes));
+    }
     match expr {
         Expr::Grouped { expr: inner, .. } => emit_mixed_box_plan(
             expr,
             format!("({})", emit_owned_expr(inner, scopes)),
             scopes,
         ),
-        Expr::Variable { span, .. } => {
+        Expr::Variable { name, span } => {
             let emitted = scopes
                 .place_for_use(*span)
+                .filter(|_| {
+                    scopes
+                        .binding_for_use(*span)
+                        .and_then(|binding| scopes.source_type(binding))
+                        .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes))
+                })
                 .and_then(PhpBindingPlace::cell)
                 .map_or_else(
                     || emit_expr_unboxed(expr, scopes),
                     |cell| format!("__doria_take_cell({cell})"),
                 );
+            let emitted = if scopes.is_mixed_binding(name)
+                && scopes
+                    .expression_types
+                    .get(span)
+                    .is_some_and(|ty| !is_mixed_storage_type(ty))
+            {
+                format!("__doria_mixed_value({emitted})")
+            } else {
+                emitted
+            };
             emit_mixed_box_plan(expr, emitted, scopes)
         }
-        _ => emit_expr(expr, scopes),
+        Expr::Binary {
+            left,
+            op: BinaryOp::Coalesce,
+            right,
+            ..
+        } => emit_mixed_box_plan(
+            expr,
+            format!(
+                "({} ?? {})",
+                emit_owned_expr(left, scopes),
+                emit_owned_expr(right, scopes)
+            ),
+            scopes,
+        ),
+        Expr::Match {
+            scrutinee,
+            arms,
+            span,
+            ..
+        } => emit_mixed_box_plan(
+            expr,
+            emit_match_expression(scrutinee, arms, *span, true, scopes),
+            scopes,
+        ),
+        Expr::When(when) => emit_mixed_box_plan(
+            expr,
+            emit_when_expression(
+                when.given.as_ref(),
+                &when.branches,
+                when.finally.as_ref(),
+                when.span,
+                true,
+                scopes,
+            ),
+            scopes,
+        ),
+        _ => emit_mixed_box_plan(expr, emit_expr_unboxed(expr, scopes), scopes),
     }
 }
 
-fn emit_current_function_cell_cleanup(output: &mut String, indent: usize, scopes: &PhpNameScopes) {
-    for cell in scopes.current_owned_cells().iter().rev() {
-        writeln(output, indent, &format!("__doria_drop_cell(${cell});"));
+fn emit_index_assignment(assignment: &Assignment, scopes: &PhpNameScopes) -> Option<String> {
+    if assignment.op != AssignOp::Assign {
+        return None;
     }
-}
-
-fn emit_all_function_cell_cleanup(output: &mut String, indent: usize, scopes: &PhpNameScopes) {
-    for cell in scopes.all_owned_cells().rev() {
-        writeln(output, indent, &format!("__doria_drop_cell(${cell});"));
+    let mut target = &assignment.target;
+    while let Expr::Grouped { expr, .. } = target {
+        target = expr;
     }
+    let Expr::Index {
+        collection,
+        index,
+        span,
+    } = target
+    else {
+        return None;
+    };
+    Some(with_expression_temporaries(scopes, |scopes| {
+        format!(
+            "__doria_collection_set({}, {}, {}, {}, {}, {}, {})",
+            emit_assignment_target(collection, scopes),
+            emit_expr(index, scopes),
+            emit_owned_expr(&assignment.value, scopes),
+            matches!(
+                scopes.expression_types.get(&collection.span()),
+                Some(ResolvedType::Dictionary(_, _))
+            ),
+            php_source_location(*span, span.start),
+            php_source_location(*span, span.end),
+            scopes.callable_identity(),
+        )
+    }))
 }
 
 fn emit_assignment(assignment: &Assignment, scopes: &PhpNameScopes) -> String {
+    if scopes.expression_temporaries.is_none() {
+        return with_expression_temporaries(scopes, |scopes| emit_assignment(assignment, scopes));
+    }
+    if let Some(expression) = emit_index_assignment(assignment, scopes) {
+        return expression;
+    }
+    if assignment.op == AssignOp::Assign
+        && assignment_target_needs_php_drop(&assignment.target, scopes)
+    {
+        let replacement = emit_owned_expr(&assignment.value, scopes);
+        if let Some(cell) = assignment_target_cell(&assignment.target, scopes) {
+            return format!("__doria_replace_cell({cell}, {replacement})");
+        }
+        let mut target = &assignment.target;
+        while let Expr::Grouped { expr, .. } = target {
+            target = expr;
+        }
+        if let Expr::PropertyAccess {
+            object, property, ..
+        } = target
+        {
+            // Keep internal-property access in the authored lexical scope.
+            return format!("(function(object $receiver, mixed $replacement): void {{ $previous = $receiver->{property} ?? null; $receiver->{property} = $replacement; __doria_drop_value($previous); }})({}, {replacement})", emit_member_receiver(object, scopes));
+        }
+        return format!("{} = {replacement}", emit_assignment_target(target, scopes));
+    }
     if assignment.op == AssignOp::DivAssign {
         let target = emit_assignment_target(&assignment.target, scopes);
         return format!(
@@ -6173,6 +6772,13 @@ fn emit_increment(increment: &IncrementStmt, scopes: &PhpNameScopes) -> String {
 fn emit_assignment_target(expr: &Expr, scopes: &PhpNameScopes) -> String {
     match expr {
         Expr::Grouped { expr, .. } => emit_assignment_target(expr, scopes),
+        Expr::Index {
+            collection, index, ..
+        } => format!(
+            "{}[{}]",
+            emit_assignment_target(collection, scopes),
+            emit_expr(index, scopes)
+        ),
         _ => emit_expr(expr, scopes),
     }
 }
@@ -6213,7 +6819,6 @@ fn emit_given_if(if_stmt: &IfStmt, output: &mut String, indent: usize, scopes: &
         .given
         .as_ref()
         .expect("given-if emission requires a prelude");
-    scopes.push();
     let predicates = emit_given_setup(given, output, indent, scopes);
     let gate = if predicates.is_empty() {
         None
@@ -6230,7 +6835,6 @@ fn emit_given_if(if_stmt: &IfStmt, output: &mut String, indent: usize, scopes: &
         Some(format!("${gate}"))
     };
     emit_if(if_stmt, output, indent, "if", gate.as_deref(), scopes);
-    scopes.pop();
 }
 
 fn emit_given_setup(
@@ -6282,39 +6886,51 @@ fn emit_foreach(
         return;
     }
 
-    if let Some((dictionary, projection)) = dictionary_foreach_projection(&foreach.iterable) {
-        let iterable = format!(
-            "__doria_collection_projection({}, {})",
-            emit_expr(dictionary, scopes),
-            if projection == DictionaryForeachProjection::Keys {
-                "true"
-            } else {
-                "false"
-            }
-        );
-        scopes.push();
-        let value_name = scopes.declare(&foreach.value_binding.name);
-
-        write_indent(output, indent);
-        output.push_str("foreach (");
-        output.push_str(&iterable);
-        output.push_str(" as ");
-        if foreach.value_binding.writable {
-            output.push('&');
-        }
-        output.push('$');
-        output.push_str(&value_name);
-        output.push_str(")\n");
+    let mut iterable_scopes = scopes.clone();
+    let temporaries = Rc::new(RefCell::new(Vec::new()));
+    iterable_scopes.expression_temporaries = Some(Rc::clone(&temporaries));
+    let iterable =
+        if let Some((dictionary, projection)) = dictionary_foreach_projection(&foreach.iterable) {
+            format!(
+                "__doria_collection_projection({}, {})",
+                emit_expr(dictionary, &iterable_scopes),
+                if projection == DictionaryForeachProjection::Keys {
+                    "true"
+                } else {
+                    "false"
+                }
+            )
+        } else {
+            emit_expr(&foreach.iterable, &iterable_scopes)
+        };
+    let temporaries = temporaries.borrow();
+    if temporaries.is_empty() {
+        emit_foreach_body(foreach, &iterable, output, indent, scopes);
+    } else {
+        writeln(output, indent, "try");
         writeln(output, indent, "{");
-        for statement in &foreach.body.statements {
-            emit_statement(statement, output, indent + 1, scopes);
-        }
-        scopes.pop();
+        emit_foreach_body(foreach, &iterable, output, indent + 1, scopes);
         writeln(output, indent, "}");
-        return;
+        writeln(output, indent, "finally");
+        writeln(output, indent, "{");
+        for temporary in temporaries.iter().rev() {
+            writeln(
+                output,
+                indent + 1,
+                &format!("if (isset(${temporary})) {{ __doria_drop_value(${temporary}); }}"),
+            );
+        }
+        writeln(output, indent, "}");
     }
+}
 
-    let iterable = emit_expr(&foreach.iterable, scopes);
+fn emit_foreach_body(
+    foreach: &ForeachStmt,
+    iterable: &str,
+    output: &mut String,
+    indent: usize,
+    scopes: &mut PhpNameScopes,
+) {
     scopes.push();
     let first_name = foreach
         .first_binding
@@ -6331,7 +6947,7 @@ fn emit_foreach(
 
     write_indent(output, indent);
     output.push_str("foreach (");
-    output.push_str(&iterable);
+    output.push_str(iterable);
     output.push_str(" as ");
     if foreach.iteration_kind == crate::semantics::ForeachIterationKind::DictionaryKey {
         if let Some(first_name) = &first_name {
@@ -6354,9 +6970,11 @@ fn emit_foreach(
             &format!("${first_name} = ${sequence_index}++;"),
         );
     }
-    for statement in &foreach.body.statements {
-        emit_statement(statement, output, indent + 1, scopes);
-    }
+    emit_owned_scope(output, indent + 1, scopes, |output, indent, scopes| {
+        for statement in &foreach.body.statements {
+            emit_statement(statement, output, indent, scopes);
+        }
+    });
     scopes.pop();
     writeln(output, indent, "}");
 }
@@ -6456,16 +7074,85 @@ fn emit_range_foreach(
     }
     output.push_str(")\n");
     writeln(output, indent, "{");
-    for statement in &foreach.body.statements {
-        emit_statement(statement, output, indent + 1, scopes);
-    }
+    emit_owned_scope(output, indent + 1, scopes, |output, indent, scopes| {
+        for statement in &foreach.body.statements {
+            emit_statement(statement, output, indent, scopes);
+        }
+    });
     scopes.pop();
     writeln(output, indent, "}");
 }
 
 fn emit_expr(expr: &Expr, scopes: &PhpNameScopes) -> String {
+    if scopes.expression_temporaries.is_none() {
+        return with_expression_temporaries(scopes, |scopes| {
+            emit_mixed_box_plan(expr, emit_expr_unboxed(expr, scopes), scopes)
+        });
+    }
     let emitted = emit_expr_unboxed(expr, scopes);
-    emit_mixed_box_plan(expr, emitted, scopes)
+    let emitted = emit_mixed_box_plan(expr, emitted, scopes);
+    if expression_creates_owner(expr, scopes) {
+        let temporary = scopes.expression_temp("__doria_owned_expression_", expr.span());
+        let mut temporaries = scopes.expression_temporaries.as_ref().unwrap().borrow_mut();
+        if !temporaries.contains(&temporary) {
+            temporaries.push(temporary.clone());
+        }
+        format!("(${temporary} = {emitted})")
+    } else {
+        emitted
+    }
+}
+
+fn expression_creates_owner(expr: &Expr, scopes: &PhpNameScopes) -> bool {
+    if !scopes
+        .expression_types
+        .get(&expr.span())
+        .is_some_and(|ty| resolved_type_needs_php_drop(ty, scopes))
+    {
+        return false;
+    }
+    match expr {
+        Expr::New { .. } | Expr::Closure(_) | Expr::Array { .. } => true,
+        Expr::FunctionCall { span, .. } | Expr::MethodCall { span, .. } | Expr::StaticCall { span, .. } => {
+            !scopes.closure_plan.callable_at(*span).is_some_and(|plan| plan.returns_borrow)
+                && !matches!(expr, Expr::MethodCall { object, method, .. } if matches!(scopes.expression_types.get(&object.span()), Some(ResolvedType::Dictionary(_, _))) && method == "get")
+        }
+        Expr::CallableCall(call) => scopes.closure_plan.callable_value_calls.get(&call.span)
+            .is_some_and(|call| matches!(&call.function_type, ResolvedType::Function(function) if function.return_borrow.is_none())),
+        _ => false,
+    }
+}
+
+fn with_expression_temporaries(
+    scopes: &PhpNameScopes,
+    emit: impl FnOnce(&PhpNameScopes) -> String,
+) -> String {
+    let mut nested = scopes.clone();
+    let temporaries = Rc::new(RefCell::new(Vec::new()));
+    nested.expression_temporaries = Some(Rc::clone(&temporaries));
+    let expression = emit(&nested);
+    let temporaries = temporaries.borrow();
+    if temporaries.is_empty() {
+        return expression;
+    }
+    let captures = scopes
+        .captured_php_names()
+        .into_iter()
+        .filter(|name| name != "this")
+        .map(|name| format!("&${name}"))
+        .collect::<Vec<_>>();
+    let captures = if captures.is_empty() {
+        String::new()
+    } else {
+        format!(" use ({})", captures.join(", "))
+    };
+    let cleanup = temporaries
+        .iter()
+        .rev()
+        .map(|name| format!("if (isset(${name})) {{ __doria_drop_value(${name}); }}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("(function(){captures} {{ try {{ return {expression}; }} finally {{ {cleanup} }} }})()")
 }
 
 fn emit_mixed_box_plan(expr: &Expr, emitted: String, scopes: &PhpNameScopes) -> String {
@@ -6484,7 +7171,9 @@ fn emit_mixed_box_plan(expr: &Expr, emitted: String, scopes: &PhpNameScopes) -> 
 }
 
 fn emit_closure_expression(closure: &ClosureExpression, scopes: &PhpNameScopes) -> String {
-    let descriptor = scopes.closure_plan.descriptor(closure.closure_id);
+    let descriptor = scopes
+        .closure_plan
+        .descriptor(closure.closure_id, scopes.closure_owner);
     let Some(environment_name) = &descriptor.environment_name else {
         return format!("new {}()", descriptor.carrier_name);
     };
@@ -6570,12 +7259,7 @@ fn emit_callable_call(call: &CallableCall, scopes: &PhpNameScopes) -> String {
                 assignment_target_cell(&argument.value, scopes)
                     .unwrap_or_else(|| emit_expr(&argument.value, scopes))
             }
-            crate::types::FunctionTypeParameterMode::Take
-                if scopes
-                    .expression_types
-                    .get(&argument.value.span())
-                    .is_some_and(resolved_is_function_type) =>
-            {
+            crate::types::FunctionTypeParameterMode::Take => {
                 emit_owned_expr(&argument.value, scopes)
             }
             _ => emit_expr(&argument.value, scopes),
@@ -6678,10 +7362,10 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
                         format!(
                             "{} => {}",
                             emit_expr(key, scopes),
-                            emit_expr(&element.value, scopes)
+                            emit_owned_expr(&element.value, scopes)
                         )
                     } else {
-                        emit_expr(&element.value, scopes)
+                        emit_owned_expr(&element.value, scopes)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -6692,11 +7376,20 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             unreachable!("PHP validation rejects native sequence fill literals")
         }
         Expr::Index {
-            collection, index, ..
+            collection,
+            index,
+            span,
         } => format!(
-            "{}[{}]",
+            "__doria_collection_index({}, {}, {}, {}, {}, {})",
             emit_expr(collection, scopes),
-            emit_expr(index, scopes)
+            emit_expr(index, scopes),
+            matches!(
+                scopes.expression_types.get(&collection.span()),
+                Some(ResolvedType::Dictionary(_, _))
+            ),
+            php_source_location(*span, span.start),
+            php_source_location(*span, span.end),
+            scopes.callable_identity()
         ),
         Expr::PropertyAccess {
             object,
@@ -6720,11 +7413,30 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             property,
             null_safe,
             ..
-        } => format!(
-            "{}{}{property}",
-            emit_member_receiver(object, scopes),
-            if *null_safe { "?->" } else { "->" }
-        ),
+        } => {
+            let receiver = emit_member_receiver(object, scopes);
+            let operator = if *null_safe { "?->" } else { "->" };
+            if scopes
+                .expression_types
+                .get(&object.span())
+                .and_then(shared::kind)
+                .is_some()
+            {
+                if property == "referencedValue"
+                    && scopes
+                        .expression_types
+                        .get(&object.span())
+                        .and_then(shared::kind)
+                        == Some(crate::types::SharedHandleKind::SharedReference)
+                {
+                    format!("{receiver}{operator}payload()")
+                } else {
+                    format!("{receiver}{operator}payload()->{property}")
+                }
+            } else {
+                format!("{receiver}{operator}{property}")
+            }
+        }
         Expr::MethodCall {
             object,
             method,
@@ -6746,14 +7458,39 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             object,
             method,
             args,
+            null_safe: false,
+            ..
+        } if matches!(
+            scopes.expression_types.get(&object.span()),
+            Some(ResolvedType::Dictionary(_, _))
+        ) && method == "get" =>
+        {
+            format!(
+                "__doria_dictionary_get({}, {})",
+                emit_expr(object, scopes),
+                emit_expr(&args[0].value, scopes)
+            )
+        }
+        Expr::MethodCall {
+            object,
+            method,
+            args,
             null_safe,
             span,
             ..
-        } => format!(
-            "{}{}{method}({})",
-            emit_member_receiver(object, scopes),
-            if *null_safe { "?->" } else { "->" },
-            emit_arguments_for_call(args, *span, scopes)
+        } => shared::emit_method(object, method, args, *null_safe, *span, scopes).unwrap_or_else(
+            || {
+                format!(
+                    "{}{}{}({})",
+                    emit_member_receiver(object, scopes),
+                    if *null_safe { "?->" } else { "->" },
+                    scopes
+                        .specialization
+                        .call_symbol(*span, &scopes.substitutions)
+                        .unwrap_or(method),
+                    emit_arguments_for_call(args, *span, scopes)
+                )
+            },
         ),
         Expr::FunctionCall { name, args, span } => emit_function_call(name, args, *span, scopes),
         Expr::StaticCall {
@@ -6793,12 +7530,33 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             let qualifier = if scopes.direct_parent_calls.contains(span) {
                 "parent".to_string()
             } else {
-                php_symbol_name(class_name)
+                scopes
+                    .specialization
+                    .class_symbol_for_call(*span, &scopes.substitutions)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| php_symbol_name(class_name))
             };
+            let method = scopes
+                .specialization
+                .call_symbol(*span, &scopes.substitutions)
+                .unwrap_or(method);
             format!(
                 "{}::{method}({})",
                 qualifier,
-                emit_arguments_for_call(args, *span, scopes)
+                if scopes.is_payload_enum_expression(expr) {
+                    args.iter()
+                        .map(|argument| {
+                            let value = emit_owned_expr(&argument.value, scopes);
+                            match &argument.name {
+                                Some(name) => format!("{}: {value}", name.text),
+                                None => value,
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    emit_arguments_for_call(args, *span, scopes)
+                }
             )
         }
         Expr::StaticMember {
@@ -6827,12 +7585,39 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             class_type,
             args,
             span,
-            ..
-        } => format!(
-            "new {}({})",
-            php_symbol_name(&class_type.name),
-            emit_arguments_for_call(args, *span, scopes)
-        ),
+            shared,
+        } => {
+            let class_symbol = scopes
+                .specialization
+                .class_symbol_for_call(*span, &scopes.substitutions)
+                .or_else(|| {
+                    scopes
+                        .specialization
+                        .class_symbol_for_type(class_type, &scopes.substitutions)
+                })
+                .map(str::to_string)
+                .unwrap_or_else(|| php_symbol_name(&class_type.name));
+            if *shared {
+                format!(
+                    "new __DoriaSharedHandle(new __DoriaSharedControl(new {}({})), 0)",
+                    class_symbol,
+                    emit_arguments_for_call(args, *span, scopes)
+                )
+            } else if crate::types::SharedHandleKind::from_source_name(&class_type.name)
+                == Some(crate::types::SharedHandleKind::WritableSharedReference)
+            {
+                format!(
+                    "new __DoriaSharedHandle(new __DoriaSharedControl({}), 2)",
+                    emit_owned_expr(&args[0].value, scopes)
+                )
+            } else {
+                format!(
+                    "new {}({})",
+                    class_symbol,
+                    emit_arguments_for_call(args, *span, scopes)
+                )
+            }
+        }
         Expr::Grouped { expr, .. } => format!("({})", emit_expr(expr, scopes)),
         Expr::IsType { expr, ty: _, span } => {
             let value = emit_expr(expr, scopes);
@@ -6844,7 +7629,7 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
                 .type_test_types
                 .get(span)
                 .expect("checked type test must preserve its resolved exact type");
-            let test = php_exact_type_test_for_source(&value, source_type, exact_type);
+            let test = php_exact_type_test_for_source(&value, source_type, exact_type, scopes);
             format!("({test})")
         }
         Expr::Unary { op, expr, .. } => match op {
@@ -6942,12 +7727,13 @@ fn emit_expr_unboxed(expr: &Expr, scopes: &PhpNameScopes) -> String {
             arms,
             span,
             ..
-        } => emit_match_expression(scrutinee, arms, *span, scopes),
+        } => emit_match_expression(scrutinee, arms, *span, false, scopes),
         Expr::When(when) => emit_when_expression(
             when.given.as_ref(),
             &when.branches,
             when.finally.as_ref(),
             when.span,
+            false,
             scopes,
         ),
     }
@@ -6958,14 +7744,64 @@ fn emit_when_expression(
     branches: &[WhenBranch],
     finally: Option<&ControlFlowFinally>,
     span: Span,
+    owned_result: bool,
     scopes: &PhpNameScopes,
 ) -> String {
     scopes
         .whens
         .get(&span)
         .expect("checked when expression must have a semantic plan");
-    let captures = scopes.captured_php_names();
-    let capture_list = if captures.is_empty() {
+    let mut when_scopes = scopes.clone();
+    when_scopes.pending_returns.clear();
+    when_scopes.expression_temporaries = None;
+    when_scopes.yield_temporaries = if owned_result {
+        None
+    } else {
+        scopes.expression_temporaries.clone()
+    };
+    when_scopes.returns_borrow = !owned_result;
+    when_scopes.push();
+    let mut body = String::new();
+    emit_owned_scope(
+        &mut body,
+        1,
+        &mut when_scopes,
+        |body, indent, when_scopes| {
+            if let Some(finally) = finally {
+                emit_finalizer_error_boundary(
+                    body,
+                    indent,
+                    when_scopes,
+                    |body, indent, when_scopes| {
+                        writeln(body, indent, "try");
+                        writeln(body, indent, "{");
+                        emit_when_branches(given, branches, body, indent + 1, when_scopes);
+                        writeln(body, indent, "}");
+                        writeln(body, indent, "finally");
+                        emit_block(&finally.block, body, indent, when_scopes);
+                    },
+                );
+            } else {
+                emit_when_branches(given, branches, body, indent, when_scopes);
+            }
+        },
+    );
+    when_scopes.pop();
+    let capture_list = expression_capture_list(scopes);
+    format!("(function(){capture_list} {{\n{body}}})()")
+}
+
+fn expression_capture_list(scopes: &PhpNameScopes) -> String {
+    let mut captures = scopes.captured_php_names();
+    if let Some(temporaries) = &scopes.expression_temporaries {
+        for temporary in temporaries.borrow().iter() {
+            if !captures.contains(temporary) {
+                captures.push(temporary.clone());
+            }
+        }
+    }
+    captures.retain(|name| name != "this");
+    if captures.is_empty() {
         String::new()
     } else {
         format!(
@@ -6976,29 +7812,7 @@ fn emit_when_expression(
                 .collect::<Vec<_>>()
                 .join(", ")
         )
-    };
-    let mut when_scopes = scopes.clone();
-    when_scopes.push();
-    let mut body = String::new();
-    if let Some(finally) = finally {
-        emit_finalizer_error_boundary(
-            &mut body,
-            1,
-            &mut when_scopes,
-            |body, indent, when_scopes| {
-                writeln(body, indent, "try");
-                writeln(body, indent, "{");
-                emit_when_branches(given, branches, body, indent + 1, when_scopes);
-                writeln(body, indent, "}");
-                writeln(body, indent, "finally");
-                emit_block(&finally.block, body, indent, when_scopes);
-            },
-        );
-    } else {
-        emit_when_branches(given, branches, &mut body, 1, &mut when_scopes);
     }
-    when_scopes.pop();
-    format!("(function(){capture_list} {{\n{body}}})()")
 }
 
 fn emit_when_branches(
@@ -7047,6 +7861,7 @@ fn emit_match_expression(
     scrutinee: &Expr,
     arms: &[MatchArm],
     span: Span,
+    owned_result: bool,
     scopes: &PhpNameScopes,
 ) -> String {
     let info = scopes
@@ -7054,23 +7869,16 @@ fn emit_match_expression(
         .get(&span)
         .expect("checked match must have a semantic plan");
     let temporary = scopes.expression_temp("__doriaMatch", span);
-    let captures = scopes.captured_php_names();
-    let capture_list = if captures.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " use ({})",
-            captures
-                .iter()
-                .map(|name| format!("&${name}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-    let mut output = format!("(function(${temporary}){capture_list} {{ ");
+    let consumed = matches!(info.mode, crate::ast::MatchMode::Consumed { .. });
+    let drop_scrutinee = consumed && resolved_type_needs_php_drop(&info.scrutinee_type, scopes);
+    let mut output = String::new();
+    if drop_scrutinee {
+        output.push_str("try { ");
+    }
 
     for (index, (arm, arm_info)) in arms.iter().zip(&info.arms).enumerate() {
         let mut arm_scopes = scopes.clone();
+        arm_scopes.pending_returns.clear();
         arm_scopes.push();
         // Semantic analysis proves every checked match exhaustive. Once all
         // earlier arms fail, the final arm is therefore the remaining case;
@@ -7096,9 +7904,10 @@ fn emit_match_expression(
                 &mut output,
                 &temporary,
                 &arm.pattern,
-                &arm_info.pattern,
+                arm_info,
                 &info.scrutinee_type,
                 &mut arm_scopes,
+                false,
                 false,
             );
             output.push_str("if ((");
@@ -7109,14 +7918,20 @@ fn emit_match_expression(
             &mut output,
             &temporary,
             &arm.pattern,
-            &arm_info.pattern,
+            arm_info,
             &info.scrutinee_type,
             &mut arm_scopes,
             arm.guard.is_some(),
+            consumed,
         );
-        output.push_str("return ");
-        output.push_str(&emit_expr(&arm.value, &arm_scopes));
-        output.push_str("; ");
+        emit_owned_scope(&mut output, 0, &mut arm_scopes, |output, indent, scopes| {
+            let value = if owned_result {
+                emit_owned_expr(&arm.value, scopes)
+            } else {
+                emit_expr(&arm.value, scopes)
+            };
+            writeln(output, indent, &format!("return {value};"));
+        });
         if arm.guard.is_some() {
             output.push_str("} ");
         }
@@ -7124,8 +7939,19 @@ fn emit_match_expression(
             output.push_str("} ");
         }
     }
+    if drop_scrutinee {
+        output.push_str(&format!(
+            "}} finally {{ __doria_drop_value(${temporary}); }} "
+        ));
+    }
+    let capture_list = expression_capture_list(scopes);
+    output.insert_str(0, &format!("(function(${temporary}){capture_list} {{ "));
     output.push_str("})(");
-    output.push_str(&emit_expr(scrutinee, scopes));
+    output.push_str(&if consumed {
+        emit_owned_expr(scrutinee, scopes)
+    } else {
+        emit_expr(scrutinee, scopes)
+    });
     output.push(')');
     output
 }
@@ -7171,26 +7997,42 @@ fn emit_php_match_condition(
                 Some(format!("{value} === {qualifier}::{case}"))
             }
         }
-        ResolvedMatchPattern::ExactType(ty) if is_mixed_storage_type(scrutinee_type) => {
-            Some(format!(
-                "{value} !== null && __doria_mixed_is({value}, {})",
-                emit_php_string_literal(&php_mixed_type_tag(ty))
-            ))
-        }
-        ResolvedMatchPattern::ExactType(ty) => Some(php_exact_type_test(&value, ty)),
+        ResolvedMatchPattern::ExactType(ty) => Some(php_exact_type_test_for_source(
+            &value,
+            scrutinee_type,
+            ty,
+            scopes,
+        )),
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_php_match_bindings(
     output: &mut String,
     temporary: &str,
     pattern: &MatchPattern,
-    resolved: &ResolvedMatchPattern,
+    info: &crate::semantics::MatchArmSemanticInfo,
     scrutinee_type: &ResolvedType,
     arm_scopes: &mut PhpNameScopes,
     reuse: bool,
+    consumed: bool,
 ) {
-    match (pattern, resolved) {
+    let owns = |name: &str| {
+        consumed
+            && info
+                .bindings
+                .iter()
+                .find(|binding| binding.name == name)
+                .is_some_and(|binding| {
+                    !binding.borrowed && resolved_type_needs_php_drop(&binding.ty, arm_scopes)
+                })
+    };
+    let ownership = info
+        .bindings
+        .iter()
+        .map(|binding| (binding.name.clone(), owns(&binding.name)))
+        .collect::<HashMap<_, _>>();
+    match (pattern, &info.pattern) {
         (
             MatchPattern::EnumCase {
                 bindings: Some(bindings),
@@ -7204,9 +8046,20 @@ fn emit_php_match_bindings(
                 } else {
                     arm_scopes.declare(&binding.name)
                 };
-                output.push_str(&format!(
-                    "${name} = ${temporary}->__doriaPayloadAt({index}); "
-                ));
+                let owned = ownership.get(&binding.name).copied().unwrap_or(false);
+                let method = if owned {
+                    "__doriaTakePayload"
+                } else {
+                    "__doriaPayloadAt"
+                };
+                emit_php_match_binding(
+                    output,
+                    &name,
+                    binding,
+                    format!("${temporary}->{method}({index})"),
+                    owned,
+                    arm_scopes,
+                );
             }
         }
         (MatchPattern::TypeBinding { binding, .. }, ResolvedMatchPattern::ExactType(_)) => {
@@ -7220,36 +8073,50 @@ fn emit_php_match_bindings(
             } else {
                 format!("${temporary}")
             };
-            output.push_str(&format!("${name} = {value}; "));
+            let owned = ownership.get(&binding.name).copied().unwrap_or(false);
+            emit_php_match_binding(output, &name, binding, value, owned, arm_scopes);
+            if owned {
+                output.push_str(&format!("${temporary} = null; "));
+            }
         }
         _ => {}
     }
 }
 
-fn php_exact_type_test(value: &str, ty: &ResolvedType) -> String {
-    php_host_exact_type_test(value, &php_mixed_type_tag(ty))
+fn emit_php_match_binding(
+    output: &mut String,
+    name: &str,
+    binding: &crate::hir::MatchBinding,
+    value: String,
+    owned: bool,
+    scopes: &mut PhpNameScopes,
+) {
+    let place = if owned {
+        output.push_str(&format!("${name} = new __DoriaCell({value}); "));
+        scopes.own_cell(name.to_string());
+        PhpBindingPlace::Cell(name.to_string())
+    } else {
+        output.push_str(&format!("${name} = {value}; "));
+        PhpBindingPlace::Direct(name.to_string())
+    };
+    if let Some(id) = scopes.binding_for_declaration(&binding.name, binding.span) {
+        scopes.bind_place(id, place);
+    }
 }
 
 fn php_exact_type_test_for_source(
     value: &str,
     source: &ResolvedType,
     exact: &ResolvedType,
+    scopes: &PhpNameScopes,
 ) -> String {
-    if let ResolvedType::Class(class) = exact {
-        let target = php_symbol_name(&class.name);
-        return match source {
-            ResolvedType::Mixed => {
-                format!("__doria_mixed_value({value}) instanceof {target}")
-            }
-            ResolvedType::Nullable(inner) if matches!(inner.as_ref(), ResolvedType::Mixed) => {
-                format!("{value} !== null && __doria_mixed_value({value}) instanceof {target}")
-            }
-            ResolvedType::Class(_) => format!("{value} instanceof {target}"),
-            ResolvedType::Nullable(inner) if matches!(inner.as_ref(), ResolvedType::Class(_)) => {
-                format!("{value} !== null && {value} instanceof {target}")
-            }
-            _ => "false".to_string(),
+    if let Some(target) = interface::nominal_type_name(exact, scopes) {
+        let value = if is_mixed_storage_type(source) {
+            format!("__doria_mixed_value({value})")
+        } else {
+            value.to_string()
         };
+        return format!("{value} instanceof {target}");
     }
     match source {
         ResolvedType::Mixed => format!(
@@ -7277,25 +8144,6 @@ fn is_mixed_storage_type(ty: &ResolvedType) -> bool {
         || matches!(ty, ResolvedType::Nullable(inner) if matches!(inner.as_ref(), ResolvedType::Mixed))
 }
 
-fn php_host_exact_type_test(value: &str, type_tag: &str) -> String {
-    match type_tag {
-        "int" | "int8" | "int16" | "int32" | "uint8" | "uint16" | "uint32" | "uint64" => {
-            format!("is_int({value})")
-        }
-        "float" | "float32" => format!("is_float({value})"),
-        "string" => format!("is_string({value})"),
-        "bool" => format!("is_bool({value})"),
-        "null" => format!("{value} === null"),
-        tag if tag.starts_with("enum:") => {
-            format!("{value} instanceof {}", php_symbol_name(&tag[5..]))
-        }
-        tag if tag.starts_with("class:") => {
-            format!("{value} instanceof {}", php_symbol_name(&tag[6..]))
-        }
-        _ => unreachable!("semantic checking rejects non-narrowable exact PHP type tests"),
-    }
-}
-
 fn php_mixed_type_tag(ty: &ResolvedType) -> String {
     match ty {
         ResolvedType::Integer(integer) => integer.source_name().to_string(),
@@ -7307,6 +8155,7 @@ fn php_mixed_type_tag(ty: &ResolvedType) -> String {
         ResolvedType::Function(_) => resolved_type_identity(ty),
         ResolvedType::Enum(ty) => format!("enum:{}", ty.name),
         ResolvedType::Class(ty) => format!("class:{}", ty.name),
+        ResolvedType::Interface(ty) => format!("interface:{}", interface::specialization_name(ty)),
         ResolvedType::Nullable(inner) => php_mixed_type_tag(inner),
         _ => unreachable!("only exact Doria runtime values cross a PHP mixed boundary"),
     }
@@ -7332,11 +8181,14 @@ fn resolved_type_identity(ty: &ResolvedType) -> String {
         ResolvedType::Mixed => "mixed".to_string(),
         ResolvedType::Error => "Error".to_string(),
         ResolvedType::TypeParameter(name) => format!("type:{}:{name}", name.len()),
-        ResolvedType::Interface(_)
-        | ResolvedType::InterfaceSelf(_)
-        | ResolvedType::TraitSelf(_) => {
-            unreachable!("interface execution must be rejected before PHP emission")
-        }
+        ResolvedType::Interface(ty) => format!(
+            "interface:{}:{}[{}]",
+            ty.name.len(),
+            ty.name,
+            list(ty.arguments.iter().map(resolved_type_identity))
+        ),
+        ResolvedType::InterfaceSelf(name) => format!("self:{}:{name}", name.len()),
+        ResolvedType::TraitSelf(_) => unreachable!("trait execution is pending Stage 35 Slice 4"),
         ResolvedType::Function(function) => {
             let invocation = match function.invocation_mode {
                 crate::types::FunctionInvocationMode::Readonly => "readonly",
@@ -7533,7 +8385,11 @@ fn emit_function_call(name: &str, args: &[Argument], span: Span, scopes: &PhpNam
         "write_stderr" => "__doria_write_stderr".to_string(),
         "sprintf" => "__doria_sprintf".to_string(),
         "printf" => "__doria_printf".to_string(),
-        _ => php_function_name(name),
+        _ => scopes
+            .specialization
+            .call_symbol(span, &scopes.substitutions)
+            .map(str::to_string)
+            .unwrap_or_else(|| php_function_name(name)),
     };
     let mut emitted = emit_call_argument_values(args, span, scopes);
     if matches!(name, "sprintf" | "printf") {
@@ -7627,13 +8483,29 @@ fn emit_member_access(access: &MemberAccess) -> &'static str {
     }
 }
 
-fn php_type(ty: &TypeRef) -> String {
+fn php_type(ty: &TypeRef, scopes: &PhpNameScopes) -> String {
+    if scopes.substitutions.contains_key(&ty.name) {
+        let resolved =
+            crate::types::resolved_type_ref_with_substitutions(ty, &scopes.substitutions)
+                .expect("checked specialization has a concrete type");
+        return php_resolved_type(&resolved, scopes);
+    }
+    if let Some(symbol) = scopes
+        .specialization
+        .class_symbol_for_type(ty, &scopes.substitutions)
+    {
+        return format!("{}{symbol}", if ty.nullable { "?" } else { "" });
+    }
     let name = if ty.function.is_some() {
         "__DoriaFunctionValue".to_string()
     } else if IntegerType::from_source_name(&ty.name).is_some() {
         "int".to_string()
     } else if FloatType::from_source_name(&ty.name).is_some() {
         "float".to_string()
+    } else if crate::types::SharedHandleKind::from_source_name(&ty.name).is_some() {
+        "__DoriaSharedHandle".to_string()
+    } else if scopes.symbols.interface_names.contains(&ty.name) {
+        interface::declaration_name(&ty.name)
     } else {
         match ty.name.as_str() {
             "List" | "Dictionary" | "Set" | "[]" => "array".to_string(),
@@ -7648,13 +8520,11 @@ fn php_type(ty: &TypeRef) -> String {
     }
 }
 
-fn php_resolved_type(ty: &ResolvedType) -> String {
+fn php_resolved_type(ty: &ResolvedType, scopes: &PhpNameScopes) -> String {
     match ty {
-        ResolvedType::Interface(_)
-        | ResolvedType::InterfaceSelf(_)
-        | ResolvedType::TraitSelf(_) => {
-            unreachable!("interface execution must be rejected before PHP emission")
-        }
+        ResolvedType::Interface(ty) => interface::declaration_name(&ty.name),
+        ResolvedType::InterfaceSelf(name) => interface::declaration_name(name),
+        ResolvedType::TraitSelf(_) => unreachable!("trait execution is pending Stage 35 Slice 4"),
         ResolvedType::Void => "void".to_string(),
         ResolvedType::Integer(_) => "int".to_string(),
         ResolvedType::Float(_) => "float".to_string(),
@@ -7667,9 +8537,14 @@ fn php_resolved_type(ty: &ResolvedType) -> String {
         ResolvedType::Error => "__DoriaErrorValue".to_string(),
         ResolvedType::Function(_) => "__DoriaFunctionValue".to_string(),
         ResolvedType::Enum(ty) => php_symbol_name(&ty.name),
-        ResolvedType::Class(ty) => php_symbol_name(&ty.name),
+        ResolvedType::Class(ty) => scopes
+            .specialization
+            .class_symbols
+            .get(ty)
+            .cloned()
+            .unwrap_or_else(|| php_symbol_name(&ty.name)),
         ResolvedType::Nullable(inner) => {
-            let inner = php_resolved_type(inner);
+            let inner = php_resolved_type(inner, scopes);
             if inner == "mixed" || inner == "null" {
                 "mixed".to_string()
             } else {
@@ -7685,7 +8560,7 @@ fn php_resolved_type(ty: &ResolvedType) -> String {
         ResolvedType::SortedSet(_) => "__DoriaSortedSet".to_string(),
         ResolvedType::PriorityQueue(_) => "__DoriaPriorityQueue".to_string(),
         ResolvedType::Deque(_) => "__DoriaDeque".to_string(),
-        ResolvedType::SharedHandle(_, _) => "mixed".to_string(),
+        ResolvedType::SharedHandle(_, _) => "__DoriaSharedHandle".to_string(),
     }
 }
 

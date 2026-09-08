@@ -3,6 +3,10 @@
 > **Stage 35 amendment:** Decision 0134 requires interface payload support for
 > all six shared/weak/access families using the same control block, retained
 > interface vtable, invariant family, and existing access-lease rules.
+> Slice 2 implements this support, including PHP compatibility. A readonly
+> interface owner is contextually constructed as
+> `SharedReference<I> $owner = shared new Concrete();`; existing wrappers remain
+> invariant and no wrapper-to-wrapper covariance is introduced.
 
 Status: Accepted
 
@@ -222,9 +226,10 @@ preserving the rule that the whole write path permits writing.
 The two families accept different payloads, because they expose payload access
 differently.
 
-**The readonly family accepts class payloads only in v1.0.** `SharedReference<T>`
-and `WeakReference<T>` require `T` to resolve to a class, so `shared new T(...)`
-requires `T` to be a class. Concrete `SharedReference<int>`,
+**The readonly family owns class allocations.** Decision 0134 Slice 2 adds
+interface views of those allocations to `SharedReference<T>` and
+`WeakReference<T>`; `shared new T(...)` still constructs a concrete class.
+Concrete `SharedReference<int>`,
 `SharedReference<string>`, `SharedReference<List<int>>` and the corresponding
 `WeakReference` forms are rejected, as is `shared new List<int>()`.
 
@@ -237,7 +242,7 @@ when `new List<T>()` is not part of Doria's collection vocabulary at all.
 
 A symbolic generic declaration may carry an unresolved type-parameter payload
 (`SharedReference<T>` inside a generic class); each concrete specialization must
-satisfy the class-payload requirement where it is written.
+satisfy the class-allocation or interface-view requirement where it is written.
 
 This is a **v1.0 domain restriction, not a permanent language rule.** A later
 readonly-sharing construction design may widen it — for example by giving the

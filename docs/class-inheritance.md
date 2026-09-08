@@ -180,5 +180,9 @@ Doria does not add runtime reflection to implement inheritance.
 Stage 34 completes single class inheritance. Decision 0134 now fixes the Stage 35
 contract for nominal generic interfaces, two-word interface carriers,
 compile-time trait flattening, core value interfaces, and public iteration. Its
-five implementation slices remain separate from this completed class-hierarchy
-surface.
+first two slices execute checked nominal conformance and interface runtime
+views. An open-parent-to-interface conversion selects the exact dynamic class's
+checked vtable without changing the payload or acquiring another owner.
+Ancestor and sibling interface narrowing preserve that identity, destruction,
+and borrow provenance. Core operations/public iteration and trait composition
+remain separate later slices; they are not activated by runtime erasure.

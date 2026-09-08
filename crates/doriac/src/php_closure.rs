@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::ClosureCaptureMode;
-use crate::hir::{self, ClassMember, Expr, Item, Stmt};
+use crate::hir::{self, ClassMember, Expr, Item};
 use crate::mir;
 use crate::ownership::CaptureAcquisitionKind;
 use crate::source::Span;
@@ -11,6 +11,7 @@ use crate::types::{FunctionTypeParameterMode, ResolvedType};
 #[derive(Debug, Clone)]
 pub(crate) struct PhpClosureDescriptor {
     pub(crate) closure_id: ClosureId,
+    pub(crate) source_instance: mir::ClosureOwner,
     pub(crate) descriptor: mir::ClosureDescriptorId,
     pub(crate) function_type: mir::FunctionTypeId,
     pub(crate) environment_layout: Option<mir::ClosureEnvironmentLayoutId>,
@@ -24,10 +25,11 @@ pub(crate) struct PhpClosureDescriptor {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PhpClosurePlan {
-    pub(crate) descriptors: HashMap<ClosureId, PhpClosureDescriptor>,
+    pub(crate) descriptors: HashMap<mir::ClosureDescriptorId, PhpClosureDescriptor>,
     pub(crate) layouts: HashMap<mir::ClosureEnvironmentLayoutId, mir::ClosureEnvironmentLayout>,
     pub(crate) function_types: HashMap<mir::FunctionTypeId, mir::FunctionType>,
     pub(crate) cell_bindings: HashSet<BindingId>,
+    pub(crate) binding_homes: HashSet<BindingId>,
     pub(crate) binding_resolution: crate::symbols::BindingResolution,
     pub(crate) closures: HashMap<ClosureId, hir::ClosureExpression>,
     pub(crate) semantic_closures: HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
@@ -35,7 +37,9 @@ pub(crate) struct PhpClosurePlan {
     pub(crate) callable_value_calls: HashMap<Span, crate::semantics::CallableValueCallInfo>,
     pub(crate) property_write_types: HashMap<Span, ResolvedType>,
     pub(crate) callables: HashMap<Span, PhpCallablePlan>,
+    pub(crate) source_callables: HashMap<Span, PhpCallablePlan>,
     pub(crate) call_targets: HashMap<Span, Span>,
+    pub(crate) call_site_plans: HashMap<Span, PhpCallablePlan>,
 }
 
 #[derive(Debug, Clone)]
@@ -48,6 +52,7 @@ pub(crate) struct PhpCallableParameter {
 #[derive(Debug, Clone)]
 pub(crate) struct PhpCallablePlan {
     pub(crate) parameters: Vec<PhpCallableParameter>,
+    pub(crate) returns_borrow: bool,
 }
 
 impl PhpClosurePlan {
@@ -89,9 +94,10 @@ impl PhpClosurePlan {
                 &mut used_helpers,
             );
             descriptors.insert(
-                descriptor.source_closure,
+                descriptor.id,
                 PhpClosureDescriptor {
                     closure_id: descriptor.source_closure,
+                    source_instance: descriptor.source_instance,
                     descriptor: descriptor.id,
                     function_type: descriptor.function_type,
                     environment_layout: descriptor.environment_layout,
@@ -114,7 +120,7 @@ impl PhpClosurePlan {
                 declaration
                     .source_type
                     .as_ref()
-                    .is_some_and(is_function_type)
+                    .is_some_and(requires_owned_cell)
                     && (declaration.ownership == crate::symbols::BindingOwnership::Owned
                         || declaration.writable)
             })
@@ -149,7 +155,8 @@ impl PhpClosurePlan {
         }
 
         mark_parameter_home_bindings(program, &mut cell_bindings);
-        let callables = collect_callable_plans(program, &cell_bindings);
+        let binding_homes = cell_bindings.clone();
+        let (source_callables, callables) = collect_callable_plans(program, &cell_bindings);
         let call_targets = collect_call_targets(program);
         mark_call_argument_places(program, &callables, &call_targets, &mut cell_bindings);
 
@@ -188,6 +195,7 @@ impl PhpClosurePlan {
                 .map(|function_type| (function_type.id, function_type))
                 .collect(),
             cell_bindings,
+            binding_homes,
             binding_resolution: program.semantic_info.binding_resolution.clone(),
             closures: collect_closures(program),
             semantic_closures: program.semantic_info.closures.clone(),
@@ -195,17 +203,35 @@ impl PhpClosurePlan {
             callable_value_calls: program.semantic_info.callable_value_calls.clone(),
             property_write_types,
             callables,
+            source_callables,
             call_targets,
+            call_site_plans: HashMap::new(),
         }
     }
 
-    pub(crate) fn descriptor(&self, closure: ClosureId) -> &PhpClosureDescriptor {
-        self.descriptors
-            .get(&closure)
-            .expect("validated MIR must describe every checked closure")
+    pub(crate) fn descriptor(
+        &self,
+        closure: ClosureId,
+        owner: Option<mir::ClosureOwner>,
+    ) -> &PhpClosureDescriptor {
+        let mut matches = self.descriptors.values().filter(|descriptor| {
+            descriptor.closure_id == closure
+                && owner.is_none_or(|owner| descriptor.source_instance == owner)
+        });
+        let descriptor = matches
+            .next()
+            .expect("validated MIR must describe every checked closure instance");
+        assert!(
+            matches.next().is_none(),
+            "closure selection requires its concrete owner instance"
+        );
+        descriptor
     }
 
     pub(crate) fn callable_at(&self, span: crate::source::Span) -> Option<&PhpCallablePlan> {
+        if let Some(plan) = self.call_site_plans.get(&span) {
+            return Some(plan);
+        }
         self.call_targets
             .get(&span)
             .and_then(|target| self.callables.get(target))
@@ -233,202 +259,12 @@ impl PhpClosurePlan {
 
 fn collect_closures(program: &hir::Program) -> HashMap<ClosureId, hir::ClosureExpression> {
     let mut closures = HashMap::new();
-    for item in &program.items {
-        match item {
-            Item::Function(function) => collect_block_closures(&function.body, &mut closures),
-            Item::Class(class) => {
-                for member in &class.members {
-                    match member {
-                        ClassMember::Property(property) => {
-                            if let Some(initializer) = &property.initializer {
-                                collect_expr_closures(initializer, &mut closures);
-                            }
-                        }
-                        ClassMember::Method(method) => {
-                            collect_block_closures(&method.body, &mut closures)
-                        }
-                        ClassMember::Constant(_) => {}
-                    }
-                }
-            }
-            Item::Statement(statement) => collect_statement_closures(statement, &mut closures),
-            Item::Enum(_) | Item::Constant(_) => {}
-        }
-    }
-    closures
-}
-
-fn collect_block_closures(
-    block: &hir::Block,
-    closures: &mut HashMap<ClosureId, hir::ClosureExpression>,
-) {
-    for statement in &block.statements {
-        collect_statement_closures(statement, closures);
-    }
-}
-
-fn collect_statement_closures(
-    statement: &Stmt,
-    closures: &mut HashMap<ClosureId, hir::ClosureExpression>,
-) {
-    match statement {
-        Stmt::Block(block) => collect_block_closures(block, closures),
-        Stmt::VarDecl(decl) => collect_expr_closures(&decl.initializer, closures),
-        Stmt::Assignment(assignment) => {
-            collect_expr_closures(&assignment.target, closures);
-            collect_expr_closures(&assignment.value, closures);
-        }
-        Stmt::Echo { expr, .. }
-        | Stmt::Return {
-            expr: Some(expr), ..
-        }
-        | Stmt::Expr { expr, .. } => collect_expr_closures(expr, closures),
-        Stmt::Return { expr: None, .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
-        Stmt::Throw(statement) => collect_expr_closures(&statement.expr, closures),
-        Stmt::Try(statement) => {
-            collect_block_closures(&statement.body, closures);
-            for catch in &statement.catches {
-                collect_block_closures(&catch.body, closures);
-            }
-            if let Some(finally) = &statement.finally {
-                collect_block_closures(&finally.body, closures);
-            }
-        }
-        Stmt::If(statement) => {
-            collect_expr_closures(&statement.condition, closures);
-            collect_block_closures(&statement.then_block, closures);
-            if let Some(branch) = &statement.else_branch {
-                match branch {
-                    hir::ElseBranch::If(statement) => {
-                        collect_statement_closures(&Stmt::If((**statement).clone()), closures)
-                    }
-                    hir::ElseBranch::Block(block) => collect_block_closures(block, closures),
-                }
-            }
-        }
-        Stmt::While(statement) => {
-            collect_expr_closures(&statement.condition, closures);
-            collect_block_closures(&statement.body, closures);
-        }
-        Stmt::DoWhile(statement) => {
-            collect_block_closures(&statement.body, closures);
-            collect_expr_closures(&statement.condition, closures);
-        }
-        Stmt::For(statement) => {
-            if let Some(condition) = &statement.condition {
-                collect_expr_closures(condition, closures);
-            }
-            collect_block_closures(&statement.body, closures);
-        }
-        Stmt::Foreach(statement) => {
-            collect_expr_closures(&statement.iterable, closures);
-            collect_block_closures(&statement.body, closures);
-        }
-        Stmt::Increment(statement) => collect_expr_closures(&statement.target, closures),
-    }
-}
-
-fn collect_expr_closures(expr: &Expr, closures: &mut HashMap<ClosureId, hir::ClosureExpression>) {
-    match expr {
-        Expr::Assertion(assertion) => {
-            for operand in [
-                assertion.actual.as_deref(),
-                assertion.expected.as_deref(),
-                assertion.user_message.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                collect_expr_closures(operand, closures);
-            }
-        }
-        Expr::Closure(closure) => {
+    hir::visit::expressions(program, &mut |expr| {
+        if let Expr::Closure(closure) = expr {
             closures.insert(closure.closure_id, (**closure).clone());
-            match &closure.body {
-                hir::ClosureBody::Expression(body) => collect_expr_closures(body, closures),
-                hir::ClosureBody::Block(body) => collect_block_closures(body, closures),
-            }
         }
-        Expr::CallableCall(call) => {
-            collect_expr_closures(&call.callee, closures);
-            for argument in &call.args {
-                collect_expr_closures(&argument.value, closures);
-            }
-        }
-        Expr::ListAlgorithmCall(call) => {
-            collect_expr_closures(&call.receiver, closures);
-            for argument in &call.arguments {
-                collect_expr_closures(&argument.value, closures);
-            }
-        }
-        Expr::FunctionCall { args, .. }
-        | Expr::MethodCall { args, .. }
-        | Expr::StaticCall { args, .. }
-        | Expr::New { args, .. } => {
-            for argument in args {
-                collect_expr_closures(&argument.value, closures);
-            }
-        }
-        Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } | Expr::IsType { expr, .. } => {
-            collect_expr_closures(expr, closures)
-        }
-        Expr::Binary { left, right, .. } => {
-            collect_expr_closures(left, closures);
-            collect_expr_closures(right, closures);
-        }
-        Expr::PropertyAccess { object, .. } => collect_expr_closures(object, closures),
-        Expr::Index {
-            collection, index, ..
-        } => {
-            collect_expr_closures(collection, closures);
-            collect_expr_closures(index, closures);
-        }
-        Expr::Array { elements, .. } => {
-            for element in elements {
-                if let Some(key) = &element.key {
-                    collect_expr_closures(key, closures);
-                }
-                collect_expr_closures(&element.value, closures);
-            }
-        }
-        Expr::InterpolatedString { parts, .. } => {
-            for part in parts {
-                if let hir::InterpolatedStringPart::Expr(expr) = part {
-                    collect_expr_closures(expr, closures);
-                }
-            }
-        }
-        Expr::Match {
-            scrutinee, arms, ..
-        } => {
-            collect_expr_closures(scrutinee, closures);
-            for arm in arms {
-                if let Some(guard) = &arm.guard {
-                    collect_expr_closures(&guard.condition, closures);
-                }
-                collect_expr_closures(&arm.value, closures);
-            }
-        }
-        Expr::When(when) => {
-            for branch in &when.branches {
-                if let Some(condition) = &branch.condition {
-                    collect_expr_closures(condition, closures);
-                }
-                collect_block_closures(&branch.block, closures);
-            }
-        }
-        Expr::Variable { .. }
-        | Expr::This { .. }
-        | Expr::Identifier { .. }
-        | Expr::String { .. }
-        | Expr::Float { .. }
-        | Expr::Bool { .. }
-        | Expr::Null { .. }
-        | Expr::Int { .. }
-        | Expr::StaticMember { .. }
-        | Expr::ArrayRepeat { .. }
-        | Expr::Range { .. } => {}
-    }
+    });
+    closures
 }
 
 fn allocate_class_name(base: String, used: &mut HashSet<String>) -> String {
@@ -587,174 +423,7 @@ fn mark_call_argument_places(
     call_targets: &HashMap<Span, Span>,
     cells: &mut HashSet<BindingId>,
 ) {
-    for item in &program.items {
-        match item {
-            Item::Function(function) => {
-                visit_block_calls(&function.body, program, callables, call_targets, cells)
-            }
-            Item::Class(class) => {
-                for member in &class.members {
-                    match member {
-                        ClassMember::Method(method) => {
-                            visit_block_calls(&method.body, program, callables, call_targets, cells)
-                        }
-                        ClassMember::Property(property) => {
-                            if let Some(initializer) = &property.initializer {
-                                visit_expr_calls(
-                                    initializer,
-                                    program,
-                                    callables,
-                                    call_targets,
-                                    cells,
-                                );
-                            }
-                        }
-                        ClassMember::Constant(_) => {}
-                    }
-                }
-            }
-            Item::Statement(statement) => {
-                visit_statement_calls(statement, program, callables, call_targets, cells)
-            }
-            Item::Enum(_) | Item::Constant(_) => {}
-        }
-    }
-}
-
-fn visit_block_calls(
-    block: &hir::Block,
-    program: &hir::Program,
-    callables: &HashMap<Span, PhpCallablePlan>,
-    call_targets: &HashMap<Span, Span>,
-    cells: &mut HashSet<BindingId>,
-) {
-    for statement in &block.statements {
-        visit_statement_calls(statement, program, callables, call_targets, cells);
-    }
-}
-
-fn visit_statement_calls(
-    statement: &Stmt,
-    program: &hir::Program,
-    callables: &HashMap<Span, PhpCallablePlan>,
-    call_targets: &HashMap<Span, Span>,
-    cells: &mut HashSet<BindingId>,
-) {
-    match statement {
-        Stmt::Block(block) => visit_block_calls(block, program, callables, call_targets, cells),
-        Stmt::VarDecl(decl) => {
-            visit_expr_calls(&decl.initializer, program, callables, call_targets, cells)
-        }
-        Stmt::Assignment(assignment) => {
-            visit_expr_calls(&assignment.target, program, callables, call_targets, cells);
-            visit_expr_calls(&assignment.value, program, callables, call_targets, cells);
-        }
-        Stmt::Echo { expr, .. }
-        | Stmt::Return {
-            expr: Some(expr), ..
-        }
-        | Stmt::Expr { expr, .. } => {
-            visit_expr_calls(expr, program, callables, call_targets, cells)
-        }
-        Stmt::Return { expr: None, .. } | Stmt::Break { .. } | Stmt::Continue { .. } => {}
-        Stmt::Throw(statement) => {
-            visit_expr_calls(&statement.expr, program, callables, call_targets, cells)
-        }
-        Stmt::Try(statement) => {
-            visit_block_calls(&statement.body, program, callables, call_targets, cells);
-            for catch in &statement.catches {
-                visit_block_calls(&catch.body, program, callables, call_targets, cells);
-            }
-            if let Some(finally) = &statement.finally {
-                visit_block_calls(&finally.body, program, callables, call_targets, cells);
-            }
-        }
-        Stmt::If(statement) => {
-            visit_expr_calls(
-                &statement.condition,
-                program,
-                callables,
-                call_targets,
-                cells,
-            );
-            visit_block_calls(
-                &statement.then_block,
-                program,
-                callables,
-                call_targets,
-                cells,
-            );
-            if let Some(branch) = &statement.else_branch {
-                match branch {
-                    hir::ElseBranch::If(statement) => visit_statement_calls(
-                        &Stmt::If((**statement).clone()),
-                        program,
-                        callables,
-                        call_targets,
-                        cells,
-                    ),
-                    hir::ElseBranch::Block(block) => {
-                        visit_block_calls(block, program, callables, call_targets, cells)
-                    }
-                }
-            }
-        }
-        Stmt::While(statement) => {
-            visit_expr_calls(
-                &statement.condition,
-                program,
-                callables,
-                call_targets,
-                cells,
-            );
-            visit_block_calls(&statement.body, program, callables, call_targets, cells);
-        }
-        Stmt::DoWhile(statement) => {
-            visit_block_calls(&statement.body, program, callables, call_targets, cells);
-            visit_expr_calls(
-                &statement.condition,
-                program,
-                callables,
-                call_targets,
-                cells,
-            );
-        }
-        Stmt::For(statement) => {
-            if let Some(condition) = &statement.condition {
-                visit_expr_calls(condition, program, callables, call_targets, cells);
-            }
-            visit_block_calls(&statement.body, program, callables, call_targets, cells);
-        }
-        Stmt::Foreach(statement) => {
-            visit_expr_calls(&statement.iterable, program, callables, call_targets, cells);
-            visit_block_calls(&statement.body, program, callables, call_targets, cells);
-        }
-        Stmt::Increment(statement) => {
-            visit_expr_calls(&statement.target, program, callables, call_targets, cells)
-        }
-    }
-}
-
-fn visit_expr_calls(
-    expr: &Expr,
-    program: &hir::Program,
-    callables: &HashMap<Span, PhpCallablePlan>,
-    call_targets: &HashMap<Span, Span>,
-    cells: &mut HashSet<BindingId>,
-) {
-    match expr {
-        Expr::Assertion(assertion) => {
-            for operand in [
-                assertion.actual.as_deref(),
-                assertion.expected.as_deref(),
-                assertion.user_message.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                visit_expr_calls(operand, program, callables, call_targets, cells);
-            }
-        }
+    hir::visit::expressions(program, &mut |expr| match expr {
         Expr::CallableCall(call) => {
             if let Some(ResolvedType::Function(function_type)) = program
                 .semantic_info
@@ -764,25 +433,7 @@ fn visit_expr_calls(
             {
                 mark_mode_arguments(&call.args, &function_type.parameters, program, cells);
             }
-            visit_expr_calls(&call.callee, program, callables, call_targets, cells);
-            for argument in &call.args {
-                visit_expr_calls(&argument.value, program, callables, call_targets, cells);
-            }
         }
-        Expr::ListAlgorithmCall(call) => {
-            visit_expr_calls(&call.receiver, program, callables, call_targets, cells);
-            for argument in &call.arguments {
-                visit_expr_calls(&argument.value, program, callables, call_targets, cells);
-            }
-        }
-        Expr::Closure(closure) => match &closure.body {
-            hir::ClosureBody::Expression(body) => {
-                visit_expr_calls(body, program, callables, call_targets, cells)
-            }
-            hir::ClosureBody::Block(body) => {
-                visit_block_calls(body, program, callables, call_targets, cells)
-            }
-        },
         Expr::FunctionCall { args, span, .. }
         | Expr::MethodCall { args, span, .. }
         | Expr::StaticCall { args, span, .. }
@@ -793,78 +444,18 @@ fn visit_expr_calls(
             {
                 mark_callable_arguments(args, callable, program, cells);
             }
-            for argument in args {
-                visit_expr_calls(&argument.value, program, callables, call_targets, cells);
-            }
         }
-        Expr::Grouped { expr, .. } | Expr::Unary { expr, .. } | Expr::IsType { expr, .. } => {
-            visit_expr_calls(expr, program, callables, call_targets, cells)
-        }
-        Expr::Binary { left, right, .. } => {
-            visit_expr_calls(left, program, callables, call_targets, cells);
-            visit_expr_calls(right, program, callables, call_targets, cells);
-        }
-        Expr::PropertyAccess { object, .. } => {
-            visit_expr_calls(object, program, callables, call_targets, cells)
-        }
-        Expr::Index {
-            collection, index, ..
-        } => {
-            visit_expr_calls(collection, program, callables, call_targets, cells);
-            visit_expr_calls(index, program, callables, call_targets, cells);
-        }
-        Expr::Array { elements, .. } => {
-            for element in elements {
-                if let Some(key) = &element.key {
-                    visit_expr_calls(key, program, callables, call_targets, cells);
-                }
-                visit_expr_calls(&element.value, program, callables, call_targets, cells);
-            }
-        }
-        Expr::InterpolatedString { parts, .. } => {
-            for part in parts {
-                if let hir::InterpolatedStringPart::Expr(expr) = part {
-                    visit_expr_calls(expr, program, callables, call_targets, cells);
-                }
-            }
-        }
-        Expr::Match {
-            scrutinee, arms, ..
-        } => {
-            visit_expr_calls(scrutinee, program, callables, call_targets, cells);
-            for arm in arms {
-                if let Some(guard) = &arm.guard {
-                    visit_expr_calls(&guard.condition, program, callables, call_targets, cells);
-                }
-                visit_expr_calls(&arm.value, program, callables, call_targets, cells);
-            }
-        }
-        Expr::When(when) => {
-            for branch in &when.branches {
-                if let Some(condition) = &branch.condition {
-                    visit_expr_calls(condition, program, callables, call_targets, cells);
-                }
-                visit_block_calls(&branch.block, program, callables, call_targets, cells);
-            }
-        }
-        Expr::Variable { .. }
-        | Expr::This { .. }
-        | Expr::Identifier { .. }
-        | Expr::String { .. }
-        | Expr::Float { .. }
-        | Expr::Bool { .. }
-        | Expr::Null { .. }
-        | Expr::Int { .. }
-        | Expr::StaticMember { .. }
-        | Expr::ArrayRepeat { .. }
-        | Expr::Range { .. } => {}
-    }
+        _ => {}
+    });
 }
 
 fn collect_callable_plans(
     program: &hir::Program,
     cells: &HashSet<BindingId>,
-) -> HashMap<Span, PhpCallablePlan> {
+) -> (
+    HashMap<Span, PhpCallablePlan>,
+    HashMap<Span, PhpCallablePlan>,
+) {
     let mut callables = HashMap::new();
     for item in &program.items {
         match item {
@@ -881,7 +472,81 @@ fn collect_callable_plans(
             Item::Enum(_) | Item::Constant(_) | Item::Statement(_) => {}
         }
     }
-    callables
+    let source_callables = callables.clone();
+    // An erased requirement and every checked implementation must agree on
+    // the parameter home ABI, including homes needed for returned borrows.
+    for interface in &program.semantic_info.contracts.interface_specializations {
+        for requirement in &interface.requirements {
+            let plan = PhpCallablePlan {
+                returns_borrow: requirement.return_borrow.is_some(),
+                parameters: requirement
+                    .signature
+                    .parameters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, parameter)| PhpCallableParameter {
+                        name: parameter.name.clone(),
+                        cell: (requires_owned_cell(&parameter.r#type)
+                            && (parameter.take || parameter.writable))
+                            || requirement.return_borrow.is_some_and(|borrow| {
+                                borrow.source == BorrowSource::Parameter(index)
+                            }),
+                        take: parameter.take,
+                    })
+                    .collect(),
+            };
+            for origin in &requirement.origins {
+                callables.insert(origin.declaration, plan.clone());
+            }
+        }
+    }
+    // A concrete body may require a parameter home even when the contract
+    // doesn't. Propagate that representation throughout the conformance family.
+    loop {
+        let mut changed = false;
+        for conformance in program
+            .semantic_info
+            .contracts
+            .conformances
+            .iter()
+            .filter(|fact| fact.status == crate::semantics::contracts::ConformanceStatus::Checked)
+        {
+            for implementation in &conformance.implementations {
+                let Some(body) = implementation.implementation else {
+                    continue;
+                };
+                for origin in &implementation.requirement_origins {
+                    let (Some(body_plan), Some(requirement_plan)) =
+                        (callables.get(&body), callables.get(&origin.declaration))
+                    else {
+                        continue;
+                    };
+                    let cells = body_plan
+                        .parameters
+                        .iter()
+                        .zip(&requirement_plan.parameters)
+                        .map(|(body, requirement)| body.cell || requirement.cell)
+                        .collect::<Vec<_>>();
+                    for target in [body, origin.declaration] {
+                        for (parameter, cell) in callables
+                            .get_mut(&target)
+                            .unwrap()
+                            .parameters
+                            .iter_mut()
+                            .zip(&cells)
+                        {
+                            changed |= parameter.cell != *cell;
+                            parameter.cell = *cell;
+                        }
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    (source_callables, callables)
 }
 
 fn callable_plan(
@@ -890,6 +555,10 @@ fn callable_plan(
     cells: &HashSet<BindingId>,
 ) -> PhpCallablePlan {
     PhpCallablePlan {
+        returns_borrow: program
+            .semantic_info
+            .return_borrows
+            .contains_key(&function.span),
         parameters: function
             .params
             .iter()
@@ -945,6 +614,9 @@ fn collect_call_targets(program: &hir::Program) -> HashMap<Span, Span> {
                 } => methods.get(&(class_type.name.clone(), method_name.clone())),
                 // Generic specialization remains outside PHP compatibility coverage.
                 crate::semantics::CallableTarget::ConstrainedMethod { .. } => None,
+                crate::semantics::CallableTarget::InterfaceMethod { requirement, .. } => {
+                    Some(requirement)
+                }
             }?;
             Some((*span, *start))
         })
@@ -1031,18 +703,25 @@ pub(crate) fn binding_declared_in_span(
         .map(|declaration| declaration.id)
 }
 
-pub(crate) fn is_function_type(ty: &ResolvedType) -> bool {
+pub(crate) fn requires_owned_cell(ty: &ResolvedType) -> bool {
     match ty {
-        ResolvedType::Function(_) => true,
+        ResolvedType::Interface(_)
+        | ResolvedType::InterfaceSelf(_)
+        | ResolvedType::Error
+        | ResolvedType::Class(_)
+        | ResolvedType::Enum(_)
+        | ResolvedType::Mixed
+        | ResolvedType::SharedHandle(_, _)
+        | ResolvedType::Function(_) => true,
         ResolvedType::Nullable(inner)
         | ResolvedType::TypedArray(inner)
         | ResolvedType::List(inner)
         | ResolvedType::Set(inner)
         | ResolvedType::SortedSet(inner)
         | ResolvedType::PriorityQueue(inner)
-        | ResolvedType::Deque(inner) => is_function_type(inner),
-        ResolvedType::Dictionary(_, value) | ResolvedType::SortedDictionary(_, value) => {
-            is_function_type(value)
+        | ResolvedType::Deque(inner) => requires_owned_cell(inner),
+        ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
+            requires_owned_cell(key) || requires_owned_cell(value)
         }
         _ => false,
     }

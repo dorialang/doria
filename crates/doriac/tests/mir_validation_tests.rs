@@ -274,12 +274,30 @@ fn shared_validator_rejects_malformed_checked_calls_catches_and_carrier_ownershi
         .iter_mut()
         .flat_map(|function| &mut function.blocks)
         .map(|block| &mut block.terminator)
-        .find(|terminator| matches!(terminator, Terminator::ErrorSwitch { .. }))
+        .find(|terminator| {
+            matches!(
+                terminator,
+                Terminator::Branch {
+                    condition: BoolExpression::NominalIs { .. },
+                    ..
+                }
+            )
+        })
         .expect("fixture should contain catch dispatch");
-    let Terminator::ErrorSwitch { cases, .. } = switch else {
+    let Terminator::Branch {
+        condition: BoolExpression::NominalIs { local, .. },
+        then_block,
+        else_block,
+    } = switch
+    else {
         unreachable!()
     };
-    cases[0].0 = mir::ErrorDescriptorId(99);
+    *switch = Terminator::ErrorSwitch {
+        error: *local,
+        cases: vec![(mir::ErrorDescriptorId(99), *then_block)],
+        catch_all: None,
+        fallback: *else_block,
+    };
     assert_malformed(
         &unknown_catch_descriptor,
         "Error descriptor#99 does not exist",
@@ -291,10 +309,18 @@ fn shared_validator_rejects_malformed_checked_calls_catches_and_carrier_ownershi
         .iter_mut()
         .flat_map(|function| &mut function.blocks)
         .flat_map(|block| &mut block.statements)
-        .find(|statement| matches!(statement, Statement::ExtractErrorObject { .. }))
-        .expect("exact catch should extract the concrete object");
+        .find(|statement| {
+            matches!(
+                statement,
+                Statement::AssignLocal {
+                    value: Rvalue::Class(mir::ClassExpression::InterfacePayload { .. }),
+                    ..
+                }
+            )
+        })
+        .expect("class catch should extract the proven concrete object");
     let target = match extraction {
-        Statement::ExtractErrorObject { target, .. } => *target,
+        Statement::AssignLocal { target, .. } => *target,
         _ => unreachable!(),
     };
     let main = wrong_concrete_binding
@@ -302,11 +328,8 @@ fn shared_validator_rejects_malformed_checked_calls_catches_and_carrier_ownershi
         .iter_mut()
         .find(|function| function.name == "main")
         .expect("main should exist");
-    main.locals[target.0].ty = Type::Error;
-    assert_malformed(
-        &wrong_concrete_binding,
-        "exact catch target does not own the descriptor's concrete class",
-    );
+    main.locals[target.0].ty = Type::ERROR;
+    assert_malformed(&wrong_concrete_binding, "receives a mismatched rvalue");
 
     let mut ordinary_call = valid.clone();
     let main = ordinary_call
@@ -479,7 +502,8 @@ function main(): void throws Doria\Std\Io\IoError
 
     let malformed = |program: &Program, expected: &str| {
         let error = doriac::mir_validation::validate_program(program)
-            .expect_err("malformed match MIR must stop before backend emission");
+            .err()
+            .unwrap_or_else(|| panic!("malformed match MIR must be rejected: {expected}"));
         assert!(
             error.message.contains(expected),
             "expected {expected:?}, got {:?}",
@@ -2469,10 +2493,10 @@ function main(): void
         .expect("strong local should exist")
         .id;
     let class = match main.locals[strong.0].ty {
-        Type::WritableSharedReference(doriac::mir::WritableSharedPayload::Class(class)) => class,
+        Type::WritableSharedReference(doriac::mir::SharedPayload::Class(class)) => class,
         other => panic!("expected writable class handle, got {other}"),
     };
-    main.locals[strong.0].ty = Type::SharedReference(class);
+    main.locals[strong.0].ty = Type::SharedReference(doriac::mir::SharedPayload::Class(class));
 
     let error = doriac::mir_validation::validate_program(&program)
         .expect_err("writable retain must reject a readonly-family local");
@@ -5968,7 +5992,9 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
-        return_type: ReturnType::Value(Type::SharedReference(ClassId(1))),
+        return_type: ReturnType::Value(Type::SharedReference(doriac::mir::SharedPayload::Class(
+            ClassId(1),
+        ))),
         return_borrow: None,
         required_checked_effects: Vec::new(),
         ambient_checked_effects: Vec::new(),
@@ -5977,7 +6003,7 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
         locals: vec![Local {
             id: LocalId(0),
             name: "value".to_string(),
-            ty: Type::SharedReference(ClassId(0)),
+            ty: Type::SharedReference(doriac::mir::SharedPayload::Class(ClassId(0))),
             writable: false,
             synthetic: false,
             owned: false,
@@ -5987,9 +6013,9 @@ fn shared_validator_rejects_mismatched_shared_reference_operations() {
             statements: vec![],
             terminator: Terminator::Return(Rvalue::SharedReference(
                 SharedReferenceExpression::Share {
-                    class: ClassId(1),
+                    payload: doriac::mir::SharedPayload::Class(ClassId(1)),
                     value: Box::new(SharedReferenceExpression::Local {
-                        class: ClassId(0),
+                        payload: doriac::mir::SharedPayload::Class(ClassId(0)),
                         local: LocalId(0),
                         transfer: false,
                     }),
@@ -6011,7 +6037,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
     program.functions[0].locals.push(Local {
         id: LocalId(0),
         name: "weak".to_string(),
-        ty: Type::WeakReference(ClassId(0)),
+        ty: Type::WeakReference(doriac::mir::SharedPayload::Class(ClassId(0))),
         writable: false,
         synthetic: false,
         owned: true,
@@ -6021,16 +6047,16 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         .push(Statement::AssignLocal {
             target: LocalId(0),
             value: Rvalue::WeakReference(WeakReferenceExpression::Create {
-                class: ClassId(0),
+                payload: doriac::mir::SharedPayload::Class(ClassId(0)),
                 value: Box::new(SharedReferenceExpression::New {
-                    class: ClassId(0),
-                    value: Box::new(ClassExpression::New {
+                    payload: doriac::mir::SharedPayload::Class(ClassId(0)),
+                    value: Box::new(Rvalue::Class(ClassExpression::New {
                         class: ClassId(0),
                         concrete_class: ClassId(0),
                         properties: vec![],
                         constructor: None,
                         args: vec![],
-                    }),
+                    })),
                 }),
             }),
         });
@@ -6038,7 +6064,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         .statements
         .push(Statement::DropWeakReference {
             local: LocalId(0),
-            class: ClassId(1),
+            payload: doriac::mir::SharedPayload::Class(ClassId(1)),
         });
 
     let error = doriac::mir_validation::validate_program(&program)
@@ -6055,7 +6081,9 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         receiver_mode: None,
         params: vec![LocalId(0)],
         parameter_modes: vec![FunctionParameterMode::Readonly],
-        return_type: ReturnType::Value(Type::NullableSharedReference(ClassId(1))),
+        return_type: ReturnType::Value(Type::NullableSharedReference(
+            doriac::mir::SharedPayload::Class(ClassId(1)),
+        )),
         return_borrow: None,
         required_checked_effects: Vec::new(),
         ambient_checked_effects: Vec::new(),
@@ -6064,7 +6092,7 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
         locals: vec![Local {
             id: LocalId(0),
             name: "weak".to_string(),
-            ty: Type::WeakReference(ClassId(0)),
+            ty: Type::WeakReference(doriac::mir::SharedPayload::Class(ClassId(0))),
             writable: false,
             synthetic: false,
             owned: false,
@@ -6074,9 +6102,9 @@ fn shared_validator_rejects_mismatched_weak_acquisition_and_drop() {
             statements: vec![],
             terminator: Terminator::Return(Rvalue::NullableSharedReference(
                 NullableSharedReferenceExpression::Acquire {
-                    class: ClassId(1),
+                    payload: doriac::mir::SharedPayload::Class(ClassId(1)),
                     value: Box::new(WeakReferenceExpression::Local {
-                        class: ClassId(0),
+                        payload: doriac::mir::SharedPayload::Class(ClassId(0)),
                         local: LocalId(0),
                         transfer: false,
                     }),
@@ -6174,6 +6202,8 @@ fn valid_void_program() -> Program {
         global_symbols: doriac::names::GlobalSymbolFacts::default(),
         classes: vec![],
         collection_types: vec![],
+        interface_types: vec![mir::InterfaceType::error()],
+        interface_vtables: Vec::new(),
         statics: vec![],
         error_descriptors: Vec::new(),
         error_origins: Vec::new(),

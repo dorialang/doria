@@ -1,0 +1,22 @@
+interface Named { function name(): string; }
+class Name implements Named {
+    function __construct(string $text) {}
+    function name(): string { return $this->text; }
+    function __destruct() { try { echo "drop {$this->text};"; } catch (Error $error) {} }
+}
+function consume(take ?Named $source): Named {
+    return match (take $source) {
+        Named $name if $name->name() == "never" => $name,
+        Named $name => $name,
+        null => new Name("fallback"),
+    };
+}
+function main(): void {
+    Named $first = consume(new Name("first"));
+    Named $second = consume(null);
+    let $factory = function (): Named { return new Name("closure"); };
+    Named $third = $factory();
+    echo $first->name() . ";";
+    echo $second->name() . ";";
+    echo $third->name() . ";";
+}

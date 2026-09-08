@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{Block, ElseBranch, Expr, ForIncrement, ForInitializer, ForStmt, Stmt};
-use crate::checked_effects::{CatchTypeMap, EffectSiteMap};
+use crate::checked_effects::{CatchCoverage, CatchCoverageMap, CatchTypeMap, EffectSiteMap};
 use crate::source::Span;
 use crate::types::ResolvedType;
 
@@ -144,7 +144,7 @@ struct LoopContext {
 }
 
 struct ExceptionHandler {
-    catches: Vec<(ResolvedType, NodeId)>,
+    catches: Vec<(Span, NodeId)>,
     catch_finalizer_depth: usize,
 }
 
@@ -155,6 +155,7 @@ struct Builder<'a> {
     given_preludes: GivenSemanticInfoMap,
     checked_effect_sites: &'a EffectSiteMap,
     catch_error_types: &'a CatchTypeMap,
+    catch_coverage: &'a CatchCoverageMap,
     terminal_expression_spans: &'a HashSet<Span>,
     exception_handlers: Vec<ExceptionHandler>,
 }
@@ -177,6 +178,7 @@ pub fn build_function_cfg_with_given(
         given_preludes,
         &checked_effect_sites,
         &catch_error_types,
+        &CatchCoverageMap::new(),
         &terminal_expression_spans,
     )
 }
@@ -195,6 +197,7 @@ pub fn build_function_cfg_with_given_and_terminals(
         given_preludes,
         &checked_effect_sites,
         &catch_error_types,
+        &CatchCoverageMap::new(),
         terminal_expression_spans,
     )
 }
@@ -205,6 +208,7 @@ pub(crate) fn build_function_cfg_with_checked_effects(
     given_preludes: &GivenSemanticInfoMap,
     checked_effect_sites: &EffectSiteMap,
     catch_error_types: &CatchTypeMap,
+    catch_coverage: &CatchCoverageMap,
     terminal_expression_spans: &HashSet<Span>,
 ) -> ControlFlowGraph {
     let graph = ControlFlowGraph::new(function_span);
@@ -216,6 +220,7 @@ pub(crate) fn build_function_cfg_with_checked_effects(
         given_preludes: given_preludes.clone(),
         checked_effect_sites,
         catch_error_types,
+        catch_coverage,
         terminal_expression_spans,
         exception_handlers: Vec::new(),
     };
@@ -321,9 +326,7 @@ impl Builder<'_> {
                             .catches
                             .iter()
                             .zip(&catch_entries)
-                            .map(|(catch, entry)| {
-                                (self.catch_error_types[&catch.span].clone(), *entry)
-                            })
+                            .map(|(catch, entry)| (catch.span, *entry))
                             .collect(),
                         catch_finalizer_depth: self.finalizers.len(),
                     });
@@ -787,22 +790,28 @@ impl Builder<'_> {
     }
 
     fn connect_checked_effect(&mut self, effect: &ResolvedType, span: Span, sources: &[NodeId]) {
-        let handler = self.exception_handlers.iter().rev().find_map(|handler| {
-            handler
-                .catches
-                .iter()
-                .find(|(catch, _)| crate::checked_effects::effect_is_caught(effect, catch))
-                .map(|(_, target)| (*target, handler.catch_finalizer_depth))
-        });
-        match handler {
-            Some((target, finalizer_depth)) => {
-                let routed = self.route_finalizers(sources.to_vec(), finalizer_depth);
-                self.graph.connect_all(&routed, target);
+        let mut handlers = Vec::new();
+        let mut fully_caught = false;
+        'handlers: for handler in self.exception_handlers.iter().rev() {
+            for (catch, target) in &handler.catches {
+                let coverage =
+                    crate::checked_effects::catch_coverage(self.catch_coverage, *catch, effect);
+                if coverage != CatchCoverage::None {
+                    handlers.push((*target, handler.catch_finalizer_depth));
+                }
+                if coverage == CatchCoverage::Complete {
+                    fully_caught = true;
+                    break 'handlers;
+                }
             }
-            None => {
-                let routed = self.route_finalizers(sources.to_vec(), 0);
-                self.terminal(NodeKind::DivergeExit, span, NodeAction::None, routed);
-            }
+        }
+        for (target, finalizer_depth) in handlers {
+            let routed = self.route_finalizers(sources.to_vec(), finalizer_depth);
+            self.graph.connect_all(&routed, target);
+        }
+        if !fully_caught {
+            let routed = self.route_finalizers(sources.to_vec(), 0);
+            self.terminal(NodeKind::DivergeExit, span, NodeAction::None, routed);
         }
     }
 

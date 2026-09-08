@@ -1,0 +1,16 @@
+interface Value { function number(): int; }
+class Item implements Value {
+    function number(): int { return 7; }
+    function __destruct(): void { try { echo "drop;"; } catch (Error $error) {} }
+}
+function wrap<T>(take T $value): WritableSharedReference<T> {
+    return new WritableSharedReference<T>($value);
+}
+function forward<T>(WritableSharedReference<T> $value): WritableSharedReference<T> { return $value->share(); }
+function main(): void {
+    Value $value = new Item();
+    let $owner = wrap($value);
+    let $other = forward($owner);
+    let $read = $other->acquireReadonlyAccess();
+    echo $read->number();
+}

@@ -55,29 +55,26 @@ use crate::native_abi::{
     FORMAT_F32, FORMAT_F64, FORMAT_I64, FORMAT_STRING, FORMAT_U64, INT_PARSE, MIXED_CLONE_OWNED,
     MIXED_FREE, MIXED_NEW, MIXED_NEW_AGGREGATE, MIXED_NEW_AGGREGATE_BORROWED, MIXED_NEW_BORROWED,
     MIXED_PAYLOAD, MIXED_RELEASE_OWNED, MIXED_TAG, MIXED_TAG_BOOL, MIXED_TAG_CLASS, MIXED_TAG_ENUM,
-    MIXED_TAG_ERROR, MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_FUNCTION, MIXED_TAG_INT16,
-    MIXED_TAG_INT32, MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_PAYLOAD_ENUM, MIXED_TAG_STRING,
+    MIXED_TAG_FLOAT32, MIXED_TAG_FLOAT64, MIXED_TAG_FUNCTION, MIXED_TAG_INT16, MIXED_TAG_INT32,
+    MIXED_TAG_INT64, MIXED_TAG_INT8, MIXED_TAG_INTERFACE, MIXED_TAG_PAYLOAD_ENUM, MIXED_TAG_STRING,
     MIXED_TAG_UINT16, MIXED_TAG_UINT32, MIXED_TAG_UINT64, MIXED_TAG_UINT8, MIXED_TYPE_ID,
     NULLABLE_STRING_EQUAL, PROCESS_EXIT, READ_FILE, READ_FILE_BYTES, READ_STDIN_BYTES,
-    READ_STDIN_LINE_PROMPTED, SHARED_ACQUIRE, SHARED_CREATE, SHARED_CREATE_WEAK, SHARED_PAYLOAD,
-    SHARED_PAYLOAD_DESCRIPTOR, SHARED_RELEASE, SHARED_RELEASE_WEAK, SHARED_RETAIN,
-    STRING_ASSERTION_DIFFERENCE, STRING_ASSERTION_QUOTE, STRING_BYTE_LENGTH, STRING_COMPARE,
-    STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE, STRING_COUNT_OCCURRENCES,
-    STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE, STRING_EQUALS_IGNORE_CASE,
-    STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32, STRING_FROM_F64, STRING_FROM_I64,
-    STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH, STRING_INDEX_OF,
-    STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN, STRING_LAST_INDEX_OF,
-    STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST, STRING_PAD_END,
-    STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN, STRING_SLICE,
-    STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE, STRING_TO_BYTES, STRING_TRIM,
-    STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER, STRING_UPPER_FIRST, STRING_WRITE_STDERR,
-    STRING_WRITE_STDOUT, WRITABLE_SHARED_ACQUIRE, WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS,
-    WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS, WRITABLE_SHARED_CREATE, WRITABLE_SHARED_CREATE_WEAK,
+    READ_STDIN_LINE_PROMPTED, SHARED_PAYLOAD, SHARED_PAYLOAD_DESCRIPTOR, SHARED_RELEASE,
+    SHARED_RELEASE_WEAK, STRING_ASSERTION_DIFFERENCE, STRING_ASSERTION_QUOTE, STRING_BYTE_LENGTH,
+    STRING_COMPARE, STRING_CONCAT, STRING_CONTAINS, STRING_CONTAINS_IGNORE_CASE,
+    STRING_COUNT_OCCURRENCES, STRING_DATA, STRING_ENDS_WITH, STRING_ENDS_WITH_IGNORE_CASE,
+    STRING_EQUALS_IGNORE_CASE, STRING_FROM_BOOL, STRING_FROM_BYTES, STRING_FROM_F32,
+    STRING_FROM_F64, STRING_FROM_I64, STRING_FROM_U64, STRING_FROM_UTF8, STRING_GRAPHEME_LENGTH,
+    STRING_INDEX_OF, STRING_INDEX_OF_IGNORE_CASE, STRING_IS_EMPTY, STRING_JOIN,
+    STRING_LAST_INDEX_OF, STRING_LAST_INDEX_OF_IGNORE_CASE, STRING_LOWER, STRING_LOWER_FIRST,
+    STRING_PAD_END, STRING_PAD_START, STRING_RELEASE, STRING_REPEAT, STRING_REPLACE, STRING_RETAIN,
+    STRING_SLICE, STRING_SPLIT, STRING_STARTS_WITH, STRING_STARTS_WITH_IGNORE_CASE,
+    STRING_TO_BYTES, STRING_TRIM, STRING_TRIM_END, STRING_TRIM_START, STRING_UPPER,
+    STRING_UPPER_FIRST, STRING_WRITE_STDERR, STRING_WRITE_STDOUT,
     WRITABLE_SHARED_PAYLOAD_DESCRIPTOR, WRITABLE_SHARED_READONLY_PAYLOAD, WRITABLE_SHARED_RELEASE,
     WRITABLE_SHARED_RELEASE_READONLY_ACCESS, WRITABLE_SHARED_RELEASE_WEAK,
-    WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_RETAIN,
-    WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE, WRITE_FILE_BYTES, WRITE_STDERR_BYTES,
-    WRITE_STDOUT_BYTES,
+    WRITABLE_SHARED_RELEASE_WRITABLE_ACCESS, WRITABLE_SHARED_WRITABLE_PAYLOAD, WRITE_FILE,
+    WRITE_FILE_BYTES, WRITE_STDERR_BYTES, WRITE_STDOUT_BYTES,
 };
 use crate::native_closure_abi;
 use crate::numeric::{FloatType, FloatValue, IntegerPanic, IntegerType, IntegerValue};
@@ -162,6 +159,7 @@ fn build_module<'ctx>(
         &functions,
         &closure_drop_functions,
     )?;
+    let interface_vtables = declare_interface_vtables(context, &module, &target_data, program);
     let class_descriptors = declare_class_descriptors(
         context,
         &module,
@@ -169,15 +167,18 @@ fn build_module<'ctx>(
         program,
         &functions,
         &class_drop_functions,
+        &interface_vtables,
     )?;
     let statics = declare_statics(context, &module, &target_data, program)?;
-    let (error_descriptors, error_origins) = declare_error_metadata(
+    let error_origins = define_interface_metadata(
         context,
         &module,
         &target_data,
         program,
         &class_drop_functions,
         &class_descriptors,
+        &functions,
+        &interface_vtables,
     )?;
     let declarations = DeclaredProgram {
         functions,
@@ -187,7 +188,7 @@ fn build_module<'ctx>(
         closure_descriptors,
         class_descriptors,
         statics,
-        error_descriptors,
+        interface_vtables,
         error_origins,
     };
     for function in &program.functions {
@@ -228,7 +229,7 @@ struct DeclaredProgram<'ctx> {
     closure_descriptors: Vec<GlobalValue<'ctx>>,
     class_descriptors: Vec<GlobalValue<'ctx>>,
     statics: Vec<GlobalValue<'ctx>>,
-    error_descriptors: Vec<GlobalValue<'ctx>>,
+    interface_vtables: Vec<GlobalValue<'ctx>>,
     error_origins: Vec<GlobalValue<'ctx>>,
 }
 
@@ -297,6 +298,7 @@ fn declare_class_descriptors<'ctx>(
     program: &mir::Program,
     functions: &[FunctionValue<'ctx>],
     class_drop_functions: &[FunctionValue<'ctx>],
+    interface_vtables: &[GlobalValue<'ctx>],
 ) -> Result<Vec<GlobalValue<'ctx>>, BackendError> {
     let pointer = context.ptr_type(AddressSpace::default());
     let word = context.ptr_sized_int_type(target_data, None);
@@ -389,12 +391,30 @@ fn declare_class_descriptors<'ctx>(
             })?
             .as_global_value()
             .as_pointer_value();
+        let mut views = vec![pointer.const_null(); program.interface_types.len()];
+        for table in program
+            .interface_vtables
+            .iter()
+            .filter(|table| table.implementing_type == mir::ImplementingType::Class(class.id))
+        {
+            views[table.interface.0] = interface_vtables[table.id.0].as_pointer_value();
+        }
+        let views = pointer.const_array(&views);
+        let views_global = module.add_global(
+            views.get_type(),
+            None,
+            &format!("__doria_class_interfaces_{}", class.id.0),
+        );
+        views_global.set_initializer(&views);
+        views_global.set_constant(true);
+        views_global.set_linkage(Linkage::Private);
         let initializer = descriptor_type.const_named_struct(&[
             parent.into(),
             word.const_int(class.id.0 as u64, false).into(),
             drop.into(),
             vtable.into(),
             ancestry_global.as_pointer_value().into(),
+            views_global.as_pointer_value().into(),
         ]);
         descriptors[class.id.0].set_initializer(&initializer);
     }
@@ -554,40 +574,91 @@ fn declare_statics<'ctx>(
     Ok(globals)
 }
 
-fn declare_error_metadata<'ctx>(
+fn interface_vtable_type<'ctx>(
+    context: &'ctx Context,
+    target_data: &TargetData,
+    methods: usize,
+) -> StructType<'ctx> {
+    let mut fields = interface_vtable_header_type(context, target_data).get_field_types();
+    fields.push(
+        context
+            .ptr_type(AddressSpace::default())
+            .array_type(methods as u32)
+            .into(),
+    );
+    context.struct_type(&fields, false)
+}
+
+fn declare_interface_vtables<'ctx>(
+    context: &'ctx Context,
+    module: &Module<'ctx>,
+    target_data: &TargetData,
+    program: &mir::Program,
+) -> Vec<GlobalValue<'ctx>> {
+    program
+        .interface_vtables
+        .iter()
+        .map(|table| {
+            let global = module.add_global(
+                interface_vtable_type(context, target_data, table.methods.len()),
+                None,
+                &format!("__doria_interface_vtable_{}", table.id.0),
+            );
+            global.set_constant(true);
+            global.set_linkage(Linkage::Internal);
+            global
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn define_interface_metadata<'ctx>(
     context: &'ctx Context,
     module: &Module<'ctx>,
     target_data: &TargetData,
     program: &mir::Program,
     class_drop_functions: &[FunctionValue<'ctx>],
     class_descriptors: &[GlobalValue<'ctx>],
-) -> Result<(Vec<GlobalValue<'ctx>>, Vec<GlobalValue<'ctx>>), BackendError> {
+    functions: &[FunctionValue<'ctx>],
+    interface_vtables: &[GlobalValue<'ctx>],
+) -> Result<Vec<GlobalValue<'ctx>>, BackendError> {
     let pointer = context.ptr_type(AddressSpace::default());
     let word = context.ptr_sized_int_type(target_data, None);
-    let descriptor_type = error_descriptor_type(context, target_data);
-    let mut descriptors = Vec::with_capacity(program.error_descriptors.len());
-    for descriptor in &program.error_descriptors {
-        let class = class_definition(program, descriptor.class)?;
-        let message = class
-            .layout
-            .properties
-            .iter()
-            .find(|property| property.id == descriptor.message_property)
-            .ok_or_else(|| malformed_mir("Error message property has no class layout"))?;
+    for table in &program.interface_vtables {
+        let mir::ImplementingType::Class(class_id) = table.implementing_type else {
+            return Err(malformed_mir(
+                "collection interface vtable requires Stage 35 Slice 3",
+            ));
+        };
+        let class = class_definition(program, class_id)?;
+        let descriptor = table
+            .error_descriptor
+            .map(|id| &program.error_descriptors[id.0]);
+        let message_offset = descriptor
+            .map(|descriptor| {
+                class
+                    .layout
+                    .properties
+                    .iter()
+                    .find(|property| property.id == descriptor.message_property)
+                    .map(|property| property.offset)
+                    .ok_or_else(|| malformed_mir("Error message property has no class layout"))
+            })
+            .transpose()?
+            .unwrap_or(0);
         let drop = class_drop_functions
-            .get(descriptor.class.0)
+            .get(class_id.0)
             .ok_or_else(|| malformed_mir("Error class drop glue was not declared"))?
             .as_global_value()
             .as_pointer_value();
         let type_name = define_bytes(
             context,
             module,
-            descriptor.type_name.as_bytes(),
-            &format!("__doria_error_descriptor_{}_type_name", descriptor.id.0),
+            class.name.as_bytes(),
+            &format!("__doria_interface_vtable_{}_type_name", table.id.0),
         );
         let assertion_offsets = descriptor
-            .assertion
-            .as_ref()
+            .and_then(|descriptor| descriptor.assertion.as_ref())
             .map(|assertion| {
                 let values = assertion
                     .fact_properties
@@ -608,10 +679,7 @@ fn declare_error_metadata<'ctx>(
                 let global = module.add_global(
                     array.get_type(),
                     None,
-                    &format!(
-                        "__doria_error_descriptor_{}_assertion_offsets",
-                        descriptor.id.0
-                    ),
+                    &format!("__doria_interface_vtable_{}_assertion_offsets", table.id.0),
                 );
                 global.set_initializer(&array);
                 global.set_constant(true);
@@ -620,44 +688,45 @@ fn declare_error_metadata<'ctx>(
             })
             .transpose()?
             .unwrap_or_else(|| word.const_zero());
-        let initializer = descriptor_type.const_named_struct(&[
-            type_name.into(),
-            word.const_int(descriptor.type_name.len() as u64, false)
+        let methods = table
+            .methods
+            .iter()
+            .map(|function| {
+                functions
+                    .get(function.0)
+                    .map(|function| function.as_global_value().as_pointer_value())
+                    .ok_or_else(|| malformed_mir("interface method entry was not declared"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let initializer = interface_vtable_type(context, target_data, table.methods.len())
+            .const_named_struct(&[
+                type_name.into(),
+                word.const_int(class.name.len() as u64, false).into(),
+                word.const_int(u64::from(message_offset), false).into(),
+                drop.into(),
+                word.const_int(u64::from(class.layout.size), false).into(),
+                word.const_int(u64::from(class.error_origin_offset.unwrap_or(0)), false)
+                    .into(),
+                assertion_offsets.into(),
+                word.const_int(
+                    descriptor
+                        .and_then(|descriptor| descriptor.assertion.as_ref())
+                        .map_or(0, |_| crate::native_abi::ASSERTION_ERROR_DESCRIPTOR_MAGIC),
+                    false,
+                )
                 .into(),
-            word.const_int(u64::from(message.offset), false).into(),
-            drop.into(),
-            word.const_int(u64::from(class.layout.size), false).into(),
-            word.const_int(
-                u64::from(class.error_origin_offset.ok_or_else(|| {
-                    malformed_mir("Error descriptor class has no hidden origin slot")
-                })?),
-                false,
-            )
-            .into(),
-            assertion_offsets.into(),
-            word.const_int(
-                descriptor
-                    .assertion
-                    .as_ref()
-                    .map_or(0, |_| crate::native_abi::ASSERTION_ERROR_DESCRIPTOR_MAGIC),
-                false,
-            )
-            .into(),
-            class_descriptors
-                .get(descriptor.class.0)
-                .ok_or_else(|| malformed_mir("Error class descriptor was not declared"))?
-                .as_pointer_value()
-                .into(),
-        ]);
-        let global = module.add_global(
-            descriptor_type,
-            None,
-            &format!("__doria_error_descriptor_{}", descriptor.id.0),
-        );
+                class_descriptors
+                    .get(class_id.0)
+                    .ok_or_else(|| malformed_mir("Error class descriptor was not declared"))?
+                    .as_pointer_value()
+                    .into(),
+                word.const_int(table.interface.0 as u64, false).into(),
+                pointer.const_array(&methods).into(),
+            ]);
+        let global = interface_vtables[table.id.0];
         global.set_initializer(&initializer);
         global.set_constant(true);
         global.set_linkage(Linkage::Internal);
-        descriptors.push(global);
     }
 
     let origin_type = context.struct_type(
@@ -713,7 +782,7 @@ fn declare_error_metadata<'ctx>(
         global.set_linkage(Linkage::Internal);
         origins.push(global);
     }
-    Ok((descriptors, origins))
+    Ok(origins)
 }
 
 fn function_type<'ctx>(
@@ -768,9 +837,14 @@ fn indirect_function_type<'ctx>(
     target_data: &TargetData,
     program: &mir::Program,
     function: &mir::FunctionType,
+    environment: bool,
 ) -> Result<inkwell::types::FunctionType<'ctx>, BackendError> {
     let pointer = context.ptr_type(AddressSpace::default());
-    let signature_plan = native_closure_abi::NativeCallableSignaturePlan::indirect(function);
+    let signature_plan = if environment {
+        native_closure_abi::NativeCallableSignaturePlan::indirect(function)
+    } else {
+        native_closure_abi::NativeCallableSignaturePlan::interface_entry(function)
+    };
     let mut parameters = signature_plan
         .hidden_inputs
         .iter()
@@ -778,7 +852,8 @@ fn indirect_function_type<'ctx>(
         .collect::<Vec<BasicMetadataTypeEnum<'ctx>>>();
     let checked = signature_plan.checked;
     for parameter in &function.parameters {
-        let passed_by_pointer = parameter.mode == mir::FunctionParameterMode::Writable
+        let passed_by_pointer = (environment
+            && parameter.mode == mir::FunctionParameterMode::Writable)
             || matches!(
                 parameter.ty,
                 mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_)
@@ -1111,7 +1186,7 @@ fn define_function<'ctx>(
         closure_descriptors: &declarations.closure_descriptors,
         class_descriptors: &declarations.class_descriptors,
         statics: &declarations.statics,
-        error_descriptors: &declarations.error_descriptors,
+        interface_vtables: &declarations.interface_vtables,
         error_origins: &declarations.error_origins,
         local_slots,
         closure_environment_slots,
@@ -1183,7 +1258,7 @@ fn define_class_drop_functions<'ctx>(
             closure_descriptors: &declarations.closure_descriptors,
             class_descriptors: &declarations.class_descriptors,
             statics: &declarations.statics,
-            error_descriptors: &declarations.error_descriptors,
+            interface_vtables: &declarations.interface_vtables,
             error_origins: &declarations.error_origins,
             local_slots: Vec::new(),
             closure_environment_slots: Vec::new(),
@@ -1240,7 +1315,7 @@ fn define_collection_drop_functions<'ctx>(
             closure_descriptors: &declarations.closure_descriptors,
             class_descriptors: &declarations.class_descriptors,
             statics: &declarations.statics,
-            error_descriptors: &declarations.error_descriptors,
+            interface_vtables: &declarations.interface_vtables,
             error_origins: &declarations.error_origins,
             local_slots: Vec::new(),
             closure_environment_slots: Vec::new(),
@@ -1301,7 +1376,7 @@ fn define_closure_drop_functions<'ctx>(
             closure_descriptors: &declarations.closure_descriptors,
             class_descriptors: &declarations.class_descriptors,
             statics: &declarations.statics,
-            error_descriptors: &declarations.error_descriptors,
+            interface_vtables: &declarations.interface_vtables,
             error_origins: &declarations.error_origins,
             local_slots: Vec::new(),
             closure_environment_slots: Vec::new(),
@@ -1796,7 +1871,7 @@ struct FunctionLowerer<'ctx, 'program> {
     closure_descriptors: &'program [GlobalValue<'ctx>],
     class_descriptors: &'program [GlobalValue<'ctx>],
     statics: &'program [GlobalValue<'ctx>],
-    error_descriptors: &'program [GlobalValue<'ctx>],
+    interface_vtables: &'program [GlobalValue<'ctx>],
     error_origins: &'program [GlobalValue<'ctx>],
     local_slots: Vec<Option<PointerValue<'ctx>>>,
     closure_environment_slots: Vec<Option<PointerValue<'ctx>>>,
@@ -2086,16 +2161,79 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         &self,
         id: mir::ErrorDescriptorId,
     ) -> Result<PointerValue<'ctx>, BackendError> {
-        self.error_descriptors
+        let descriptor = self
+            .program
+            .error_descriptors
             .get(id.0)
-            .filter(|_| {
-                self.program
-                    .error_descriptors
-                    .get(id.0)
-                    .is_some_and(|d| d.id == id)
-            })
+            .ok_or_else(|| malformed_mir("Error reporting metadata does not exist"))?;
+        let vtable = self
+            .program
+            .interface_vtable(
+                mir::ImplementingType::Class(descriptor.class),
+                mir::InterfaceTypeId::ERROR,
+            )
+            .ok_or_else(|| malformed_mir("Error reporting type has no interface implementation"))?;
+        self.interface_vtable_address(vtable)
+    }
+
+    fn interface_vtable_address(
+        &self,
+        id: mir::InterfaceVtableId,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        self.interface_vtables
+            .get(id.0)
             .map(|global| (*global).as_pointer_value())
-            .ok_or_else(|| malformed_mir(format!("Error descriptor{} was not declared", id.0)))
+            .ok_or_else(|| malformed_mir(format!("interface vtable{} was not declared", id.0)))
+    }
+
+    fn class_interface_vtable(
+        &self,
+        dynamic: Option<PointerValue<'ctx>>,
+        id: mir::InterfaceVtableId,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let Some(dynamic) = dynamic else {
+            return self.interface_vtable_address(id);
+        };
+        let table = self
+            .program
+            .interface_vtables
+            .get(id.0)
+            .ok_or_else(|| malformed_mir("interface conversion has no vtable"))?;
+        let mir::ImplementingType::Class(class) = table.implementing_type else {
+            return Err(malformed_mir("class conversion uses a non-class vtable"));
+        };
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let present = build(
+            self.builder
+                .build_is_not_null(dynamic, "class.descriptor.present"),
+        )?;
+        let dynamic = build(self.builder.build_select(
+            present,
+            dynamic,
+            self.class_descriptor_address(class)?,
+            "class.descriptor.or-static",
+        ))?
+        .into_pointer_value();
+        let views = build(self.builder.build_struct_gep(
+            class_descriptor_type(self.context, self.target_data),
+            dynamic,
+            crate::native_abi::CLASS_DESCRIPTOR_INTERFACE_WORD,
+            "class.interfaces",
+        ))?;
+        let views = build(
+            self.builder
+                .build_load(pointer, views, "class.interface-table"),
+        )?
+        .into_pointer_value();
+        let offset = self
+            .context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(table.interface.0 as u64, false);
+        let slot = build(unsafe {
+            self.builder
+                .build_in_bounds_gep(pointer, views, &[offset], "interface.slot")
+        })?;
+        Ok(build(self.builder.build_load(pointer, slot, "interface.vtable"))?.into_pointer_value())
     }
 
     fn error_origin_address(
@@ -2125,7 +2263,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .build_conditional_branch(present, drop_block, done),
         )?;
         self.builder.position_at_end(drop_block);
-        let descriptor_type = error_descriptor_type(self.context, self.target_data);
+        let descriptor_type = interface_vtable_header_type(self.context, self.target_data);
         let drop_field = build(self.builder.build_struct_gep(
             descriptor_type,
             descriptor,
@@ -2638,9 +2776,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             })
             | mir::Rvalue::Collection(mir::CollectionExpression::Local { local, .. })
             | mir::Rvalue::Mixed(mir::MixedExpression::Local { local, .. })
-            | mir::Rvalue::Error(mir::ErrorExpression::Local { local, .. })
-            | mir::Rvalue::Error(mir::ErrorExpression::NullableLocalAssumeNonNull {
-                local, ..
+            | mir::Rvalue::Interface(mir::InterfaceExpression {
+                value: mir::InterfaceValue::Local { local, .. },
+                ..
+            })
+            | mir::Rvalue::Interface(mir::InterfaceExpression {
+                value: mir::InterfaceValue::NullableLocalAssumeNonNull { local, .. },
+                ..
             })
             | mir::Rvalue::Function(mir::FunctionExpression::Local { local, .. })
             | mir::Rvalue::NullableFunction(mir::NullableFunctionExpression::Local {
@@ -2654,9 +2796,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ..
             })
             | mir::Rvalue::NullableMixed(mir::NullableMixedExpression::Local { local, .. })
-            | mir::Rvalue::NullableError(mir::NullableErrorExpression::Local { local, .. }) => {
-                Some((*local, None))
-            }
+            | mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression {
+                value: mir::NullableInterfaceValue::Local { local, .. },
+                ..
+            }) => Some((*local, None)),
             mir::Rvalue::String(mir::StringExpression::Property {
                 object, property, ..
             })
@@ -2671,8 +2814,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             | mir::Rvalue::Mixed(mir::MixedExpression::Property {
                 object, property, ..
             })
-            | mir::Rvalue::Error(mir::ErrorExpression::Property {
-                object, property, ..
+            | mir::Rvalue::Interface(mir::InterfaceExpression {
+                value:
+                    mir::InterfaceValue::Property {
+                        object, property, ..
+                    },
+                ..
             })
             | mir::Rvalue::Function(mir::FunctionExpression::Property {
                 object, property, ..
@@ -2737,6 +2884,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         for (local, field) in bindings {
             let slot = local_slot(&self.local_slots, local)?;
             match field.ty {
+                ty if ty.shared_interface().is_some() => {
+                    let ty = llvm_type(self.context, self.target_data, self.program, ty);
+                    let value = build(self.builder.build_load(ty, slot, "shared.capture.new"))?;
+                    build(self.builder.build_store(field.address, value))?;
+                    build(self.builder.build_store(slot, ty.const_zero()))?;
+                }
                 mir::Type::Scalar(_) | mir::Type::NullableScalar(_) => {
                     let value = build(self.builder.build_load(
                         llvm_type(self.context, self.target_data, self.program, field.ty),
@@ -2789,7 +2942,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     build(self.builder.build_store(field.address, new))?;
                     self.clear_function_slot(slot)?;
                 }
-                mir::Type::Error | mir::Type::NullableError => {
+                mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
                     let ty = error_carrier_type(self.context);
                     let new = build(self.builder.build_load(ty, slot, "closure.capture.new"))?;
                     build(self.builder.build_store(field.address, new))?;
@@ -2847,7 +3000,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     #[allow(clippy::too_many_arguments)]
     fn lower_indirect_call(
         &mut self,
-        callee: &mir::FunctionExpression,
+        callee: &mir::IndirectCallee,
         function_type_id: mir::FunctionTypeId,
         invocation_mode: mir::FunctionInvocationMode,
         args: &[mir::Rvalue],
@@ -2862,9 +3015,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 "throwing function type reached nonthrowing indirect call",
             ));
         }
-        let carrier = self.lower_function_expression(callee)?;
-        let (descriptor, environment) = self.closure_parts(carrier)?;
-        let lowered = self.lower_call_arguments_with_parameters(args, &function_type.parameters)?;
+        let (entry, environment, carrier) = self.lower_indirect_callee(callee)?;
+        let lowered = self.lower_call_arguments_with_optional_parameters(
+            args,
+            environment.map(|_| function_type.parameters.as_slice()),
+        )?;
         let mut values = vec![self.current_frame.into()];
         let aggregate_return = matches!(
             function_type.return_type,
@@ -2878,11 +3033,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         if let Some(home) = self.indirect_call_borrow_home(&function_type, args)? {
             values.push(home.into());
         }
-        values.push(environment.into());
+        if let Some(environment) = environment {
+            values.push(environment.into());
+        }
         values.extend(lowered.values.iter().copied());
-        let entry = self.load_closure_entry(descriptor)?;
         let call = build(self.builder.build_indirect_call(
-            indirect_function_type(self.context, self.target_data, self.program, &function_type)?,
+            indirect_function_type(
+                self.context,
+                self.target_data,
+                self.program,
+                &function_type,
+                environment.is_some(),
+            )?,
             entry,
             &values,
             "closure.call",
@@ -2900,7 +3062,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
         self.cleanup_indirect_call_arguments(&function_type, args, &lowered)?;
         if invocation_mode == mir::FunctionInvocationMode::Once {
-            self.drop_function_carrier(carrier)?;
+            self.drop_function_carrier(
+                carrier.ok_or_else(|| {
+                    malformed_mir("interface receiver cannot use once invocation")
+                })?,
+            )?;
         }
         build(
             self.builder
@@ -2912,7 +3078,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     #[allow(clippy::too_many_arguments)]
     fn lower_checked_indirect_call(
         &mut self,
-        callee: &mir::FunctionExpression,
+        callee: &mir::IndirectCallee,
         function_type_id: mir::FunctionTypeId,
         invocation_mode: mir::FunctionInvocationMode,
         args: &[mir::Rvalue],
@@ -2929,9 +3095,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 "nonthrowing function type reached checked indirect call",
             ));
         }
-        let carrier = self.lower_function_expression(callee)?;
-        let (descriptor, environment) = self.closure_parts(carrier)?;
-        let lowered = self.lower_call_arguments_with_parameters(args, &function_type.parameters)?;
+        let (entry, environment, carrier) = self.lower_indirect_callee(callee)?;
+        let lowered = self.lower_call_arguments_with_optional_parameters(
+            args,
+            environment.map(|_| function_type.parameters.as_slice()),
+        )?;
         let mut values = vec![self.current_frame.into()];
         if let Some(result) = result {
             values.push(local_slot(&self.local_slots, result)?.into());
@@ -2940,11 +3108,18 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         if let Some(home) = self.indirect_call_borrow_home(&function_type, args)? {
             values.push(home.into());
         }
-        values.push(environment.into());
+        if let Some(environment) = environment {
+            values.push(environment.into());
+        }
         values.extend(lowered.values.iter().copied());
-        let entry = self.load_closure_entry(descriptor)?;
         let call = build(self.builder.build_indirect_call(
-            indirect_function_type(self.context, self.target_data, self.program, &function_type)?,
+            indirect_function_type(
+                self.context,
+                self.target_data,
+                self.program,
+                &function_type,
+                environment.is_some(),
+            )?,
             entry,
             &values,
             "closure.checked.call",
@@ -2956,7 +3131,11 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             .into_int_value();
         self.cleanup_indirect_call_arguments(&function_type, args, &lowered)?;
         if invocation_mode == mir::FunctionInvocationMode::Once {
-            self.drop_function_carrier(carrier)?;
+            self.drop_function_carrier(
+                carrier.ok_or_else(|| {
+                    malformed_mir("interface receiver cannot use once invocation")
+                })?,
+            )?;
         }
         let current = current_function(&self.builder)?;
         let failed_status = self
@@ -2991,6 +3170,58 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         self.builder.position_at_end(invalid_status);
         build(self.builder.build_unreachable())?;
         Ok(())
+    }
+
+    fn lower_indirect_callee(
+        &mut self,
+        callee: &mir::IndirectCallee,
+    ) -> Result<
+        (
+            PointerValue<'ctx>,
+            Option<PointerValue<'ctx>>,
+            Option<StructValue<'ctx>>,
+        ),
+        BackendError,
+    > {
+        match callee {
+            mir::IndirectCallee::Closure(value) => {
+                let carrier = self.lower_function_expression(value)?;
+                let (descriptor, environment) = self.closure_parts(carrier)?;
+                Ok((
+                    self.load_closure_entry(descriptor)?,
+                    Some(environment),
+                    Some(carrier),
+                ))
+            }
+            mir::IndirectCallee::InterfaceMethod { receiver, slot, .. } => {
+                let carrier = self.lower_error_expression(&mir::InterfaceValue::Local {
+                    local: *receiver,
+                    transfer: false,
+                })?;
+                let (_, vtable) = self.error_parts(carrier)?;
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let offset = crate::native_abi::INTERFACE_VTABLE_HEADER_WORDS
+                    .checked_add(*slot)
+                    .ok_or_else(|| {
+                        malformed_mir("interface method slot exceeds native address range")
+                    })?;
+                let field = unsafe {
+                    build(self.builder.build_gep(
+                        pointer,
+                        vtable,
+                        &[self.context.i64_type().const_int(offset as u64, false)],
+                        "interface.method.field",
+                    ))?
+                };
+                let entry = build(self.builder.build_load(
+                    pointer,
+                    field,
+                    "interface.method.entry",
+                ))?
+                .into_pointer_value();
+                Ok((entry, None, None))
+            }
+        }
     }
 
     fn load_closure_entry(
@@ -3031,7 +3262,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         collection,
                     )?;
                 } else if let Some(shared) = args[index].owned_temporary_shared() {
-                    self.defer_or_drop_owned_shared_temporary(value.into_pointer_value(), shared)?;
+                    self.defer_or_drop_owned_shared_temporary(value, shared)?;
                 } else if let Some((payload, nullable)) = args[index].owned_temporary_payload_enum()
                 {
                     self.drop_payload_enum_at(value.into_pointer_value(), payload, nullable)?;
@@ -3250,7 +3481,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     _ => None,
                 };
                 let old_error = (owns_replaced_value
-                    && matches!(local.ty, mir::Type::Error | mir::Type::NullableError))
+                    && matches!(
+                        local.ty,
+                        mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+                    ))
                 .then(|| {
                     build(self.builder.build_load(
                         error_carrier_type(self.context),
@@ -3561,7 +3795,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     _ => None,
                 };
                 let old_error = (replaces
-                    && matches!(property_ty, mir::Type::Error | mir::Type::NullableError))
+                    && matches!(
+                        property_ty,
+                        mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+                    ))
                 .then(|| {
                     build(self.builder.build_load(
                         error_carrier_type(self.context),
@@ -3639,8 +3876,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         }
                         mir::Type::Scalar(_)
                         | mir::Type::NullableScalar(_)
-                        | mir::Type::Error
-                        | mir::Type::NullableError => None,
+                        | mir::Type::Interface(_)
+                        | mir::Type::NullableInterface(_) => None,
                         mir::Type::Function(_) | mir::Type::NullableFunction(_) => None,
                         mir::Type::ClosureEnvironment(_) => {
                             return Err(malformed_mir(
@@ -3712,16 +3949,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let property = static_definition(self.program, *target)?;
                 let value = self.lower_rvalue(value)?;
                 let address = self.static_address(*target)?;
-                let old_error = matches!(property.ty, mir::Type::Error | mir::Type::NullableError)
-                    .then(|| {
-                        build(self.builder.build_load(
-                            error_carrier_type(self.context),
-                            address,
-                            "static.old.error",
-                        ))
-                        .map(BasicValueEnum::into_struct_value)
-                    })
-                    .transpose()?;
+                let old_error = matches!(
+                    property.ty,
+                    mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+                )
+                .then(|| {
+                    build(self.builder.build_load(
+                        error_carrier_type(self.context),
+                        address,
+                        "static.old.error",
+                    ))
+                    .map(BasicValueEnum::into_struct_value)
+                })
+                .transpose()?;
                 let old_function = matches!(
                     property.ty,
                     mir::Type::Function(_) | mir::Type::NullableFunction(_)
@@ -3861,7 +4101,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 ))?
                 .into_struct_value();
                 let (object, descriptor) = self.error_parts(value)?;
-                let descriptor_type = error_descriptor_type(self.context, self.target_data);
+                let descriptor_type = interface_vtable_header_type(self.context, self.target_data);
                 let offset_field = build(self.builder.build_struct_gep(
                     descriptor_type,
                     descriptor,
@@ -3921,7 +4161,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 };
                 let value: BasicValueEnum<'ctx> =
                     if class_uses_open_carrier(self.program, target_class) {
-                        let descriptor_type = error_descriptor_type(self.context, self.target_data);
+                        let descriptor_type =
+                            interface_vtable_header_type(self.context, self.target_data);
                         let field = build(self.builder.build_struct_gep(
                             descriptor_type,
                             error_descriptor,
@@ -5975,7 +6216,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Type::ClosureEnvironment(_) => Err(malformed_mir(
                 "closure environment pointer reached ordinary value cleanup",
             )),
-            mir::Type::Error | mir::Type::NullableError => {
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
                 let value = build(self.builder.build_load(
                     error_carrier_type(self.context),
                     address,
@@ -6358,7 +6599,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "payload.nullable.equal",
                 ))
             }
-            mir::Type::Error | mir::Type::NullableError => {
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
                 let carrier = error_carrier_type(self.context);
                 let left = build(self.builder.build_load(carrier, left, "payload.left.error"))?
                     .into_struct_value();
@@ -6751,40 +6992,38 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Rvalue::NullableMixed(value) => {
                 Ok(self.lower_nullable_mixed_expression(value)?.into())
             }
-            mir::Rvalue::Error(value) => Ok(self.lower_error_expression(value)?.into()),
-            mir::Rvalue::NullableError(value) => {
+            mir::Rvalue::Interface(mir::InterfaceExpression { value, .. }) => {
+                Ok(self.lower_error_expression(value)?.into())
+            }
+            mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression { value, .. }) => {
                 Ok(self.lower_nullable_error_expression(value)?.into())
             }
-            mir::Rvalue::SharedReference(value) => {
-                Ok(self.lower_shared_reference_expression(value)?.into())
+            mir::Rvalue::SharedReference(value) => self.lower_shared_reference_expression(value),
+            mir::Rvalue::WeakReference(value) => self.lower_weak_reference_expression(value),
+            mir::Rvalue::NullableSharedReference(value) => {
+                self.lower_nullable_shared_reference_expression(value)
             }
-            mir::Rvalue::WeakReference(value) => {
-                Ok(self.lower_weak_reference_expression(value)?.into())
-            }
-            mir::Rvalue::NullableSharedReference(value) => Ok(self
-                .lower_nullable_shared_reference_expression(value)?
-                .into()),
             mir::Rvalue::NullableWeakReference(value) => {
-                Ok(self.lower_nullable_weak_reference_expression(value)?.into())
+                self.lower_nullable_weak_reference_expression(value)
             }
-            mir::Rvalue::WritableSharedReference(value) => Ok(self
-                .lower_writable_shared_reference_expression(value)?
-                .into()),
+            mir::Rvalue::WritableSharedReference(value) => {
+                self.lower_writable_shared_reference_expression(value)
+            }
             mir::Rvalue::WritableWeakReference(value) => {
-                Ok(self.lower_writable_weak_reference_expression(value)?.into())
+                self.lower_writable_weak_reference_expression(value)
             }
-            mir::Rvalue::NullableWritableSharedReference(value) => Ok(self
-                .lower_nullable_writable_shared_reference_expression(value)?
-                .into()),
-            mir::Rvalue::NullableWritableWeakReference(value) => Ok(self
-                .lower_nullable_writable_weak_reference_expression(value)?
-                .into()),
+            mir::Rvalue::NullableWritableSharedReference(value) => {
+                self.lower_nullable_writable_shared_reference_expression(value)
+            }
+            mir::Rvalue::NullableWritableWeakReference(value) => {
+                self.lower_nullable_writable_weak_reference_expression(value)
+            }
             mir::Rvalue::SharedReferenceAccess(value) => {
-                Ok(self.lower_shared_reference_access_expression(value)?.into())
+                self.lower_shared_reference_access_expression(value)
             }
-            mir::Rvalue::NullableSharedReferenceAccess(value) => Ok(self
-                .lower_nullable_shared_reference_access_expression(value)?
-                .into()),
+            mir::Rvalue::NullableSharedReferenceAccess(value) => {
+                self.lower_nullable_shared_reference_access_expression(value)
+            }
             mir::Rvalue::PayloadEnum(value) => {
                 Ok(self.lower_payload_enum_expression(value)?.into())
             }
@@ -6794,12 +7033,215 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
     }
 
+    fn lower_interface_upcast(
+        &mut self,
+        value: StructValue<'ctx>,
+        interface: mir::InterfaceTypeId,
+        nullable: bool,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let object = build(
+            self.builder
+                .build_extract_value(value, 0, "interface.object"),
+        )?
+        .into_pointer_value();
+        let vtable = build(
+            self.builder
+                .build_extract_value(value, 1, "interface.old-view"),
+        )?
+        .into_pointer_value();
+        let entry = self
+            .builder
+            .get_insert_block()
+            .ok_or_else(|| malformed_mir("interface conversion has no block"))?;
+        let done = if nullable {
+            let function = current_function(&self.builder)?;
+            let some = self
+                .context
+                .append_basic_block(function, "interface.upcast.some");
+            let done = self
+                .context
+                .append_basic_block(function, "interface.upcast.done");
+            let present = build(self.builder.build_is_not_null(object, "interface.present"))?;
+            build(self.builder.build_conditional_branch(present, some, done))?;
+            self.builder.position_at_end(some);
+            Some(done)
+        } else {
+            None
+        };
+        let dynamic = build(self.builder.build_struct_gep(
+            interface_vtable_header_type(self.context, self.target_data),
+            vtable,
+            crate::native_abi::INTERFACE_VTABLE_CLASS_DESCRIPTOR_WORD,
+            "interface.dynamic",
+        ))?;
+        let dynamic = build(self.builder.build_load(pointer, dynamic, "interface.class"))?
+            .into_pointer_value();
+        let mut view = self.lower_interface_view(dynamic, interface)?;
+        if let Some(done) = done {
+            let some = self
+                .builder
+                .get_insert_block()
+                .expect("interface non-null conversion block");
+            build(self.builder.build_unconditional_branch(done))?;
+            self.builder.position_at_end(done);
+            let phi = build(self.builder.build_phi(pointer, "interface.optional-view"))?;
+            phi.add_incoming(&[(&pointer.const_null(), entry), (&view, some)]);
+            view = phi.as_basic_value().into_pointer_value();
+        }
+        self.error_value(object, view)
+    }
+
+    fn lower_interface_view(
+        &self,
+        descriptor: PointerValue<'ctx>,
+        interface: mir::InterfaceTypeId,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let views = build(self.builder.build_struct_gep(
+            class_descriptor_type(self.context, self.target_data),
+            descriptor,
+            crate::native_abi::CLASS_DESCRIPTOR_INTERFACE_WORD,
+            "interface.views",
+        ))?;
+        let views = build(
+            self.builder
+                .build_load(pointer, views, "interface.view-table"),
+        )?
+        .into_pointer_value();
+        let offset = self
+            .context
+            .ptr_sized_int_type(self.target_data, None)
+            .const_int(interface.0 as u64, false);
+        let slot = build(unsafe {
+            self.builder
+                .build_in_bounds_gep(pointer, views, &[offset], "interface.slot")
+        })?;
+        Ok(
+            build(self.builder.build_load(pointer, slot, "interface.new-view"))?
+                .into_pointer_value(),
+        )
+    }
+
+    fn lower_nominal_local_parts(
+        &mut self,
+        local: mir::LocalId,
+        transfer: bool,
+    ) -> Result<(PointerValue<'ctx>, PointerValue<'ctx>), BackendError> {
+        let ty = local_in(self.function, local)?.ty;
+        if matches!(ty, mir::Type::Mixed | mir::Type::NullableMixed) {
+            return self.lower_mixed_nominal_parts(local, transfer);
+        }
+        let slot = local_slot(&self.local_slots, local)?;
+        let storage = llvm_type(self.context, self.target_data, self.program, ty);
+        let value = build(self.builder.build_load(storage, slot, "nominal.local"))?;
+        let parts = match ty {
+            mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+                let (object, descriptor) = self.class_parts(value, class)?;
+                (
+                    object,
+                    match descriptor {
+                        Some(descriptor) => descriptor,
+                        None => self.class_descriptor_address(class)?,
+                    },
+                )
+            }
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
+                let (object, vtable) = self.error_parts(value.into_struct_value())?;
+                let field = build(self.builder.build_struct_gep(
+                    interface_vtable_header_type(self.context, self.target_data),
+                    vtable,
+                    crate::native_abi::INTERFACE_VTABLE_CLASS_DESCRIPTOR_WORD,
+                    "nominal.class.field",
+                ))?;
+                let descriptor = build(self.builder.build_load(
+                    self.context.ptr_type(AddressSpace::default()),
+                    field,
+                    "nominal.class",
+                ))?
+                .into_pointer_value();
+                (object, descriptor)
+            }
+            _ => {
+                return Err(malformed_mir(
+                    "nominal projection requires a class or interface",
+                ))
+            }
+        };
+        if transfer {
+            build(self.builder.build_store(slot, storage.const_zero()))?;
+        }
+        Ok(parts)
+    }
+
+    fn lower_class_ancestry_test(
+        &self,
+        descriptor: PointerValue<'ctx>,
+        target: crate::class_layout::ClassId,
+    ) -> Result<IntValue<'ctx>, BackendError> {
+        let field = build(self.builder.build_struct_gep(
+            class_descriptor_type(self.context, self.target_data),
+            descriptor,
+            4,
+            "class.ancestry.field",
+        ))?;
+        let ancestry = build(self.builder.build_load(
+            self.context.ptr_type(AddressSpace::default()),
+            field,
+            "class.ancestry",
+        ))?
+        .into_pointer_value();
+        let byte_address = build(unsafe {
+            self.builder.build_in_bounds_gep(
+                self.context.i8_type(),
+                ancestry,
+                &[self
+                    .context
+                    .i32_type()
+                    .const_int((target.0 / 8) as u64, false)],
+                "class.ancestry.byte.address",
+            )
+        })?;
+        let byte = build(self.builder.build_load(
+            self.context.i8_type(),
+            byte_address,
+            "class.ancestry.byte",
+        ))?
+        .into_int_value();
+        let masked = build(self.builder.build_and(
+            byte,
+            self.context.i8_type().const_int(1 << (target.0 % 8), false),
+            "class.ancestry.masked",
+        ))?;
+        build(self.builder.build_int_compare(
+            IntPredicate::NE,
+            masked,
+            self.context.i8_type().const_zero(),
+            "class.is.matches",
+        ))
+    }
+
     fn lower_error_expression(
         &mut self,
-        expression: &mir::ErrorExpression,
+        expression: &mir::InterfaceValue,
     ) -> Result<StructValue<'ctx>, BackendError> {
         match expression {
-            mir::ErrorExpression::Local { local, transfer } => {
+            mir::InterfaceValue::SharedPayload { local } => {
+                self.lower_shared_interface_payload(*local, false)
+            }
+            mir::InterfaceValue::NarrowedLocal {
+                local,
+                interface,
+                transfer,
+            } => {
+                let (object, descriptor) = self.lower_nominal_local_parts(*local, *transfer)?;
+                self.error_value(object, self.lower_interface_view(descriptor, *interface)?)
+            }
+            mir::InterfaceValue::Upcast { source, interface } => {
+                let value = self.lower_error_expression(&source.value)?;
+                self.lower_interface_upcast(value, *interface, false)
+            }
+            mir::InterfaceValue::Local { local, transfer } => {
                 let slot = local_slot(&self.local_slots, *local)?;
                 let value = build(self.builder.build_load(
                     error_carrier_type(self.context),
@@ -6815,7 +7257,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 Ok(value)
             }
-            mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer } => {
+            mir::InterfaceValue::NullableLocalAssumeNonNull { local, transfer } => {
                 let slot = local_slot(&self.local_slots, *local)?;
                 let value = build(self.builder.build_load(
                     error_carrier_type(self.context),
@@ -6831,28 +7273,28 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 Ok(value)
             }
-            mir::ErrorExpression::FromClass { object, descriptor } => {
+            mir::InterfaceValue::FromClass { object, vtable } => {
                 let class = object.class();
                 let value = self.lower_class_expression(object)?;
-                let object = self.class_object(value, class)?;
-                self.error_value(object, self.error_descriptor_address(*descriptor)?)
+                let (object, dynamic) = self.class_parts(value, class)?;
+                self.error_value(object, self.class_interface_vtable(dynamic, *vtable)?)
             }
-            mir::ErrorExpression::FromNullableClass { object, descriptor } => {
+            mir::InterfaceValue::FromNullableClass { object, vtable } => {
                 let class = object.class();
                 let value = self.lower_nullable_class_expression(object)?;
-                let object = self.class_object(value, class)?;
+                let (object, dynamic) = self.class_parts(value, class)?;
                 let present = build(self.builder.build_is_not_null(object, "error.present"))?;
                 let pointer = self.context.ptr_type(AddressSpace::default());
                 let descriptor = build(self.builder.build_select(
                     present,
-                    self.error_descriptor_address(*descriptor)?,
+                    self.class_interface_vtable(dynamic, *vtable)?,
                     pointer.const_null(),
                     "error.nullable.descriptor",
                 ))?
                 .into_pointer_value();
                 self.error_value(object, descriptor)
             }
-            mir::ErrorExpression::Property {
+            mir::InterfaceValue::Property {
                 object,
                 property,
                 transfer,
@@ -6872,102 +7314,59 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 Ok(value)
             }
-            mir::ErrorExpression::Call { function, args, .. } => Ok(self
+            mir::InterfaceValue::Call { function, args, .. } => Ok(self
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("Error call returned void"))?
                 .into_struct_value()),
-            mir::ErrorExpression::CollectionIndex {
+            mir::InterfaceValue::CollectionIndex {
                 collection,
                 index,
                 positional,
                 remove,
             } => self.lower_error_collection_index(*collection, index, *positional, *remove),
-            mir::ErrorExpression::MixedPayload { mixed, transfer } => {
-                let pointer = self.context.ptr_type(AddressSpace::default());
-                let slot = local_slot(&self.local_slots, *mixed)?;
-                let mixed = build(self.builder.build_load(pointer, slot, "mixed.error.local"))?
-                    .into_pointer_value();
-                let payload = self
-                    .call_runtime(
-                        MIXED_PAYLOAD,
-                        &[pointer.into()],
-                        Some(self.context.i64_type().into()),
-                        &[mixed.into()],
-                    )?
-                    .ok_or_else(|| backend_failure("mixed Error payload read produced no result"))?
-                    .into_int_value();
-                let address = build(self.builder.build_int_to_ptr(
-                    payload,
-                    pointer,
-                    "mixed.error.payload",
-                ))?;
-                let value = build(self.builder.build_load(
-                    error_carrier_type(self.context),
-                    address,
-                    "mixed.error.value",
-                ))?
-                .into_struct_value();
-                if *transfer {
-                    build(self.builder.build_store(slot, pointer.const_null()))?;
-                    let final_claim = self
-                        .call_runtime(
-                            MIXED_RELEASE_OWNED,
-                            &[pointer.into()],
-                            Some(self.context.i8_type().into()),
-                            &[mixed.into()],
-                        )?
-                        .ok_or_else(|| {
-                            backend_failure("mixed Error move released no ownership claim")
-                        })?
-                        .into_int_value();
-                    let shared = build(self.builder.build_int_compare(
-                        IntPredicate::EQ,
-                        final_claim,
-                        self.context.i8_type().const_zero(),
-                        "mixed.error.move.shared",
-                    ))?;
-                    self.lower_panic_if_code_at_active_site(shared, "P1321")?;
-                    let _ =
-                        self.call_runtime(MIXED_FREE, &[pointer.into()], None, &[mixed.into()])?;
-                }
-                Ok(value)
-            }
         }
     }
 
     fn lower_nullable_error_expression(
         &mut self,
-        expression: &mir::NullableErrorExpression,
+        expression: &mir::NullableInterfaceValue,
     ) -> Result<StructValue<'ctx>, BackendError> {
         match expression {
-            mir::NullableErrorExpression::Null => Ok(error_carrier_type(self.context).const_zero()),
-            mir::NullableErrorExpression::Error(value) => self.lower_error_expression(value),
-            mir::NullableErrorExpression::Local { local, transfer } => {
-                self.lower_error_expression(&mir::ErrorExpression::Local {
+            mir::NullableInterfaceValue::SharedPayload { local } => {
+                self.lower_shared_interface_payload(*local, true)
+            }
+            mir::NullableInterfaceValue::Upcast { source, interface } => {
+                let value = self.lower_nullable_error_expression(&source.value)?;
+                self.lower_interface_upcast(value, *interface, true)
+            }
+            mir::NullableInterfaceValue::Null => Ok(error_carrier_type(self.context).const_zero()),
+            mir::NullableInterfaceValue::Present(value) => self.lower_error_expression(value),
+            mir::NullableInterfaceValue::Local { local, transfer } => {
+                self.lower_error_expression(&mir::InterfaceValue::Local {
                     local: *local,
                     transfer: *transfer,
                 })
             }
-            mir::NullableErrorExpression::Property {
+            mir::NullableInterfaceValue::Property {
                 object,
                 property,
                 transfer,
-            } => self.lower_error_expression(&mir::ErrorExpression::Property {
+            } => self.lower_error_expression(&mir::InterfaceValue::Property {
                 object: *object,
                 property: *property,
                 transfer: *transfer,
             }),
-            mir::NullableErrorExpression::Call { function, args, .. } => Ok(self
+            mir::NullableInterfaceValue::Call { function, args, .. } => Ok(self
                 .lower_call(*function, args, true)?
                 .ok_or_else(|| malformed_mir("nullable Error call returned void"))?
                 .into_struct_value()),
-            mir::NullableErrorExpression::CollectionIndex {
+            mir::NullableInterfaceValue::CollectionIndex {
                 collection,
                 index,
                 positional,
                 remove,
             } => self.lower_error_collection_index(*collection, index, *positional, *remove),
-            mir::NullableErrorExpression::DictionaryGet {
+            mir::NullableInterfaceValue::DictionaryGet {
                 collection,
                 key,
                 access,
@@ -7189,7 +7588,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let found = self.entry_alloca(self.context.i8_type(), "error.collection.found")?;
         let removed_key =
             self.entry_alloca(self.context.i64_type(), "error.collection.removed-key")?;
-        let stored_nullable = definition.value == mir::Type::NullableError;
+        let stored_nullable = definition.value == mir::Type::NULLABLE_ERROR;
         let _ = self.call_runtime(
             COLLECTION_AGGREGATE_NULLABLE_ACCESS_INTO,
             &[
@@ -7432,7 +7831,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         "payload enum collection values require aggregate comparison",
                     ))
                 }
-                mir::Type::Error | mir::Type::NullableError => {
+                mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
                     return Err(malformed_mir(
                         "Error collection values require aggregate identity comparison",
                     ))
@@ -7515,7 +7914,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::Type::PayloadEnum(_) | mir::Type::NullablePayloadEnum(_) => Err(malformed_mir(
                 "payload enum collection values require aggregate transport",
             )),
-            mir::Type::Error | mir::Type::NullableError => Err(malformed_mir(
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_) => Err(malformed_mir(
                 "Error collection values require aggregate transport",
             )),
             mir::Type::Function(_)
@@ -7610,7 +8009,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     "payload enum collection values require aggregate transport",
                 ))
             }
-            mir::Type::Error | mir::Type::NullableError => {
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
                 return Err(malformed_mir(
                     "Error collection values require aggregate transport",
                 ))
@@ -8010,117 +8409,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         Ok(result)
     }
 
-    fn lower_function_collection_literal(
-        &mut self,
-        definition: &mir::CollectionType,
-        entries: &[mir::CollectionEntry],
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
-        let byte = self.context.i8_type();
-        let fixed = definition.kind == mir::CollectionKind::TypedArray;
-        let carrier = closure_carrier_type(self.context);
-        let result = self
-            .call_runtime(
-                COLLECTION_AGGREGATE_NEW,
-                &[
-                    pointer.into(),
-                    usize_type.into(),
-                    byte.into(),
-                    byte.into(),
-                    usize_type.into(),
-                    usize_type.into(),
-                    byte.into(),
-                    byte.into(),
-                ],
-                Some(pointer.into()),
-                &[
-                    self.current_frame.into(),
-                    usize_type.const_int(entries.len() as u64, false).into(),
-                    byte.const_int(u64::from(definition.key.is_some()), false)
-                        .into(),
-                    byte.const_int(u64::from(fixed), false).into(),
-                    usize_type
-                        .const_int(self.target_data.get_store_size(&carrier), false)
-                        .into(),
-                    usize_type
-                        .const_int(
-                            u64::from(self.target_data.get_abi_alignment(&carrier)),
-                            false,
-                        )
-                        .into(),
-                    byte.const_int(
-                        u64::from(stage26_collection_kind(definition.kind).unwrap_or(0)),
-                        false,
-                    )
-                    .into(),
-                    byte.const_int(
-                        u64::from(
-                            definition
-                                .comparator
-                                .map(collection_comparator_code)
-                                .unwrap_or(COLLECTION_COMPARE_WORD),
-                        ),
-                        false,
-                    )
-                    .into(),
-                ],
-            )?
-            .ok_or_else(|| backend_failure("function collection allocation produced no result"))?
-            .into_pointer_value();
-        for (index, entry) in entries.iter().enumerate() {
-            let value = self.lower_rvalue(&entry.value)?;
-            let destination = if let (Some(key_type), Some(key)) = (definition.key, &entry.key) {
-                let key = self.lower_rvalue(key)?;
-                self.lower_two_word_dictionary_write_slot(result, key, key_type, definition.value)?
-            } else if fixed {
-                self.call_runtime(
-                    COLLECTION_AGGREGATE_VALUE_AT,
-                    &[
-                        pointer.into(),
-                        pointer.into(),
-                        self.context.i64_type().into(),
-                        byte.into(),
-                        byte.into(),
-                    ],
-                    Some(pointer.into()),
-                    &[
-                        self.current_frame.into(),
-                        result.into(),
-                        self.context
-                            .i64_type()
-                            .const_int(index as u64, false)
-                            .into(),
-                        byte.const_int(1, false).into(),
-                        byte.const_int(u64::from(COLLECTION_COMPARE_WORD), false)
-                            .into(),
-                    ],
-                )?
-                .ok_or_else(|| backend_failure("function array initialization produced no slot"))?
-                .into_pointer_value()
-            } else {
-                self.call_runtime(
-                    COLLECTION_AGGREGATE_PUSH_SLOT,
-                    &[pointer.into()],
-                    Some(pointer.into()),
-                    &[result.into()],
-                )?
-                .ok_or_else(|| backend_failure("function collection insertion produced no slot"))?
-                .into_pointer_value()
-            };
-            self.store_value_at_address(destination, value, definition.value)?;
-        }
-        if stage26_collection_kind(definition.kind).is_some() {
-            let _ = self.call_runtime(
-                COLLECTION_STAGE26_FINALIZE,
-                &[pointer.into()],
-                None,
-                &[result.into()],
-            )?;
-        }
-        Ok(result)
-    }
-
     fn lower_two_word_dictionary_write_slot(
         &mut self,
         collection: PointerValue<'ctx>,
@@ -8369,21 +8657,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         nullable,
                     );
                 }
-                if matches!(
-                    definition.value,
-                    mir::Type::Error | mir::Type::NullableError
-                ) || matches!(
-                    definition.value,
-                    mir::Type::Class(class) | mir::Type::NullableClass(class)
-                        if class_uses_open_carrier(self.program, class)
-                ) {
+                if type_uses_two_word_collection_storage(self.program, definition.value) {
                     return self.lower_two_word_collection_literal(&definition, entries);
-                }
-                if matches!(
-                    definition.value,
-                    mir::Type::Function(_) | mir::Type::NullableFunction(_)
-                ) {
-                    return self.lower_function_collection_literal(&definition, entries);
                 }
                 let fixed = definition.kind == mir::CollectionKind::TypedArray;
                 let value_width = collection_value_width(
@@ -9097,7 +9372,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
     fn lower_nullable_two_word_collection_get(
         &mut self,
-        class: crate::class_layout::ClassId,
+        result_ty: mir::Type,
         collection: mir::LocalId,
         key: &mir::Rvalue,
         access: mir::NullableCollectionAccess,
@@ -9121,12 +9396,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let collection_value = self.collection_pointer(collection)?;
         let key_value = self.lower_rvalue(key)?;
         let key_word = self.value_to_collection_word(key_value, key_type)?;
-        let result_type = llvm_type(
-            self.context,
-            self.target_data,
-            self.program,
-            mir::Type::NullableClass(class),
-        );
+        let result_type = llvm_type(self.context, self.target_data, self.program, result_ty);
         let result = self.entry_alloca(result_type, "class.collection.optional")?;
         build(self.builder.build_store(result, result_type.const_zero()))?;
         let found = self.entry_alloca(self.context.i8_type(), "class.collection.found")?;
@@ -9158,7 +9428,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 self.context
                     .i8_type()
                     .const_int(
-                        u64::from(matches!(definition.value, mir::Type::NullableClass(_))),
+                        u64::from(nullable_payload_type(definition.value).is_some()),
                         false,
                     )
                     .into(),
@@ -10582,8 +10852,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<(), BackendError> {
         if !matches!(
             ty,
-            mir::Type::Error
-                | mir::Type::NullableError
+            mir::Type::Interface(_)
+                | mir::Type::NullableInterface(_)
                 | mir::Type::String
                 | mir::Type::NullableString
                 | mir::Type::Class(_)
@@ -10660,7 +10930,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ty: mir::Type,
     ) -> Result<(), BackendError> {
         match ty {
-            mir::Type::Error | mir::Type::NullableError => {
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
                 self.drop_error_value(value.into_struct_value())
             }
             mir::Type::String => self.release_string(value.into_pointer_value()),
@@ -10836,7 +11106,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         ))?;
         if matches!(
             definition.value,
-            mir::Type::Error | mir::Type::NullableError
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_)
         ) {
             let index = if usize_type.get_bit_width() == 64 {
                 current
@@ -11060,6 +11330,36 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         match expression {
+            mir::ClassExpression::InterfacePayload {
+                class,
+                local,
+                transfer,
+            } => {
+                let (object, descriptor) = self.lower_nominal_local_parts(*local, *transfer)?;
+                self.class_value_for_static_type(object, Some(descriptor), *class, *class)
+            }
+            mir::ClassExpression::InterfaceReceiver {
+                class, receiver, ..
+            } => {
+                let carrier = self.lower_error_expression(&mir::InterfaceValue::Local {
+                    local: *receiver,
+                    transfer: false,
+                })?;
+                let (object, vtable) = self.error_parts(carrier)?;
+                let field = build(self.builder.build_struct_gep(
+                    interface_vtable_header_type(self.context, self.target_data),
+                    vtable,
+                    crate::native_abi::INTERFACE_VTABLE_CLASS_DESCRIPTOR_WORD,
+                    "interface.receiver.class.field",
+                ))?;
+                let descriptor = build(self.builder.build_load(
+                    pointer,
+                    field,
+                    "interface.receiver.class",
+                ))?
+                .into_pointer_value();
+                self.class_value_for_static_type(object, Some(descriptor), *class, *class)
+            }
             mir::ClassExpression::Local {
                 class,
                 local,
@@ -11138,7 +11438,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 class, reference, ..
             } => {
                 let owned = reference.owned_temporary().is_some();
-                let control = self.lower_shared_reference_expression(reference)?;
+                let lowered = self.lower_shared_reference_expression(reference)?;
+                let (control, _) = self.shared_parts(lowered)?;
                 let payload = self
                     .call_runtime(
                         SHARED_PAYLOAD,
@@ -11340,39 +11641,172 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         }
     }
 
-    fn lower_shared_reference_expression(
+    fn lower_shared_interface_payload(
         &mut self,
-        expression: &mir::SharedReferenceExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
+        local: mir::LocalId,
+        nullable: bool,
+    ) -> Result<StructValue<'ctx>, BackendError> {
+        let ty = local_in(self.function, local)?.ty;
         let pointer = self.context.ptr_type(AddressSpace::default());
-        match expression {
-            mir::SharedReferenceExpression::New { class, value } => {
-                let value = self.lower_class_expression(value)?;
-                let (payload, descriptor) = self.class_parts(value, *class)?;
-                let drop_function = if let Some(descriptor) = descriptor {
-                    let descriptor_type = class_descriptor_type(self.context, self.target_data);
-                    let drop_field = build(self.builder.build_struct_gep(
-                        descriptor_type,
-                        descriptor,
-                        2,
-                        "shared.dynamic-drop.field",
-                    ))?;
-                    build(self.builder.build_load(
-                        pointer,
-                        drop_field,
-                        "shared.dynamic-drop.function",
-                    ))?
-                    .into_pointer_value()
-                } else {
-                    self.class_drop_functions
-                        .get(class.0)
-                        .ok_or_else(|| malformed_mir("shared payload drop glue does not exist"))?
-                        .as_global_value()
-                        .as_pointer_value()
+        let slot = local_slot(&self.local_slots, local)?;
+        let value = build(self.builder.build_load(
+            open_class_carrier_type(self.context),
+            slot,
+            "shared.interface",
+        ))?;
+        let (control, view) = self.open_class_parts(value)?;
+        let symbol = match ty {
+            mir::Type::SharedReference(_) | mir::Type::NullableSharedReference(_) => SHARED_PAYLOAD,
+            mir::Type::ReadonlySharedReferenceAccess(_)
+            | mir::Type::NullableReadonlySharedReferenceAccess(_) => {
+                WRITABLE_SHARED_READONLY_PAYLOAD
+            }
+            mir::Type::WritableSharedReferenceAccess(_)
+            | mir::Type::NullableWritableSharedReferenceAccess(_) => {
+                WRITABLE_SHARED_WRITABLE_PAYLOAD
+            }
+            _ => {
+                return Err(malformed_mir(
+                    "interface payload projection has no live shared access",
+                ))
+            }
+        };
+        let object = if nullable {
+            self.lower_null_safe_shared_call(control, symbol, "shared interface payload", false)?
+        } else {
+            self.call_runtime(
+                symbol,
+                &[pointer.into()],
+                Some(pointer.into()),
+                &[control.into()],
+            )?
+            .ok_or_else(|| backend_failure("shared interface projection produced no result"))?
+            .into_pointer_value()
+        };
+        self.open_class_value(object, view)
+    }
+
+    fn shared_parts(
+        &self,
+        value: BasicValueEnum<'ctx>,
+    ) -> Result<(PointerValue<'ctx>, Option<PointerValue<'ctx>>), BackendError> {
+        if value.is_struct_value() {
+            let (control, view) = self.open_class_parts(value)?;
+            Ok((control, Some(view)))
+        } else {
+            Ok((value.into_pointer_value(), None))
+        }
+    }
+
+    fn shared_value(
+        &self,
+        control: PointerValue<'ctx>,
+        view: Option<PointerValue<'ctx>>,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        match view {
+            Some(view) => Ok(self.open_class_value(control, view)?.into()),
+            None => Ok(control.into()),
+        }
+    }
+
+    fn defer_shared_expression(
+        &mut self,
+        control: PointerValue<'ctx>,
+        expression: crate::native_shared::Expression<'_>,
+    ) -> Result<(), BackendError> {
+        match expression.release() {
+            SHARED_RELEASE => self.defer_or_drop_shared_temporary(control, false),
+            SHARED_RELEASE_WEAK => self.defer_or_drop_shared_temporary(control, true),
+            symbol => self.defer_or_drop_writable_shared_temporary(control, symbol),
+        }
+    }
+
+    fn lower_shared_expression(
+        &mut self,
+        expression: crate::native_shared::Expression<'_>,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        use crate::native_shared::Operation as O;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let paired = expression.ty().shared_interface().is_some();
+        let result_type = llvm_type(
+            self.context,
+            self.target_data,
+            self.program,
+            expression.ty(),
+        );
+        match expression.operation() {
+            O::New { value, symbol } => {
+                let lowered = self.lower_rvalue(value)?;
+                let (object, descriptor, drop_fn, view) = match expression.payload() {
+                    mir::SharedPayload::Interface(_) => {
+                        let (object, view) = self.open_class_parts(lowered)?;
+                        let table_type =
+                            interface_vtable_header_type(self.context, self.target_data);
+                        let descriptor_field = build(self.builder.build_struct_gep(
+                            table_type,
+                            view,
+                            8,
+                            "shared.class.field",
+                        ))?;
+                        let descriptor = build(self.builder.build_load(
+                            pointer,
+                            descriptor_field,
+                            "shared.class",
+                        ))?
+                        .into_pointer_value();
+                        let drop_field = build(self.builder.build_struct_gep(
+                            table_type,
+                            view,
+                            3,
+                            "shared.drop.field",
+                        ))?;
+                        let drop_fn =
+                            build(self.builder.build_load(pointer, drop_field, "shared.drop"))?
+                                .into_pointer_value();
+                        (object, Some(descriptor), drop_fn, Some(view))
+                    }
+                    payload => {
+                        let (object, descriptor, drop_fn) = match payload {
+                            mir::SharedPayload::Class(class) => {
+                                let (object, descriptor) = self.class_parts(lowered, class)?;
+                                (
+                                    object,
+                                    descriptor,
+                                    *self.class_drop_functions.get(class.0).ok_or_else(|| {
+                                        malformed_mir("shared class drop glue does not exist")
+                                    })?,
+                                )
+                            }
+                            mir::SharedPayload::Collection(collection) => (
+                                lowered.into_pointer_value(),
+                                None,
+                                *self
+                                    .collection_drop_functions
+                                    .get(collection.0)
+                                    .ok_or_else(|| {
+                                        malformed_mir("shared collection drop glue does not exist")
+                                    })?,
+                            ),
+                            mir::SharedPayload::Interface(_) => unreachable!(),
+                        };
+                        let drop_fn = if let Some(descriptor) = descriptor {
+                            let field = build(self.builder.build_struct_gep(
+                                class_descriptor_type(self.context, self.target_data),
+                                descriptor,
+                                2,
+                                "shared.drop.field",
+                            ))?;
+                            build(self.builder.build_load(pointer, field, "shared.drop"))?
+                                .into_pointer_value()
+                        } else {
+                            drop_fn.as_global_value().as_pointer_value()
+                        };
+                        (object, descriptor, drop_fn, None)
+                    }
                 };
-                Ok(self
+                let control = self
                     .call_runtime(
-                        SHARED_CREATE,
+                        symbol,
                         &[
                             pointer.into(),
                             pointer.into(),
@@ -11382,406 +11816,178 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         Some(pointer.into()),
                         &[
                             self.current_frame.into(),
-                            payload.into(),
+                            object.into(),
                             descriptor.unwrap_or_else(|| pointer.const_null()).into(),
-                            drop_function.into(),
+                            drop_fn.into(),
                         ],
                     )?
                     .ok_or_else(|| backend_failure("shared construction produced no result"))?
-                    .into_pointer_value())
-            }
-            mir::SharedReferenceExpression::Local {
-                local, transfer, ..
-            }
-            | mir::SharedReferenceExpression::NullableLocalAssumeNonNull {
-                local, transfer, ..
-            } => {
-                let slot = local_slot(&self.local_slots, *local)?;
-                let value = build(self.builder.build_load(pointer, slot, "shared.local"))?
                     .into_pointer_value();
-                if *transfer {
-                    build(self.builder.build_store(slot, pointer.const_null()))?;
+                self.shared_value(control, view)
+            }
+            O::Null => Ok(result_type.const_zero()),
+            O::Present(value) => self.lower_shared_expression(value),
+            O::Local { local, transfer } => {
+                let slot = local_slot(&self.local_slots, local)?;
+                let value = build(self.builder.build_load(result_type, slot, "shared.local"))?;
+                if transfer {
+                    build(self.builder.build_store(slot, result_type.const_zero()))?;
                 }
                 Ok(value)
             }
-            mir::SharedReferenceExpression::Property {
-                object, property, ..
-            } => Ok(build(self.builder.build_load(
-                pointer,
-                self.lower_property_address(*object, *property)?,
-                "shared.property",
-            ))?
-            .into_pointer_value()),
-            mir::SharedReferenceExpression::Call { function, args, .. } => Ok(self
-                .lower_call(*function, args, true)?
-                .ok_or_else(|| malformed_mir("shared-reference call produced no result"))?
-                .into_pointer_value()),
-            mir::SharedReferenceExpression::Share { value, .. } => {
-                let owned = value.owned_temporary().is_some();
-                let value = self.lower_shared_reference_expression(value)?;
-                let shared = self
-                    .call_runtime(
-                        SHARED_RETAIN,
+            O::Property { object, property } => {
+                let address = self.lower_property_address(object, property)?;
+                build(
+                    self.builder
+                        .build_load(result_type, address, "shared.property"),
+                )
+            }
+            O::Call { function, args } => self
+                .lower_call(function, args, true)?
+                .ok_or_else(|| malformed_mir("shared call produced no result")),
+            O::Runtime {
+                value,
+                symbol,
+                null_safe,
+                span,
+            } => {
+                let lowered = self.lower_shared_expression(value)?;
+                let (control, view) = self.shared_parts(lowered)?;
+                if let Some(span) = span {
+                    self.set_active_panic_site(span)?;
+                }
+                let result = if null_safe {
+                    self.lower_null_safe_shared_call(control, symbol, "shared operation", true)?
+                } else {
+                    self.call_runtime(
+                        symbol,
                         &[pointer.into(), pointer.into()],
                         Some(pointer.into()),
-                        &[self.current_frame.into(), value.into()],
+                        &[self.current_frame.into(), control.into()],
                     )?
-                    .ok_or_else(|| backend_failure("shared retain produced no result"))?
-                    .into_pointer_value();
-                if owned {
-                    self.defer_or_drop_shared_temporary(value, false)?;
+                    .ok_or_else(|| backend_failure("shared operation produced no result"))?
+                    .into_pointer_value()
+                };
+                if value.owned() {
+                    self.defer_shared_expression(control, value)?;
                 }
-                Ok(shared)
+                let view = if let Some(view) = view {
+                    let present = build(self.builder.build_is_not_null(result, "shared.present"))?;
+                    Some(
+                        build(self.builder.build_select(
+                            present,
+                            view,
+                            pointer.const_null(),
+                            "shared.view",
+                        ))?
+                        .into_pointer_value(),
+                    )
+                } else {
+                    None
+                };
+                self.shared_value(result, view)
             }
-            mir::SharedReferenceExpression::Coalesce {
+            O::Coalesce {
                 left,
                 right,
                 transfer,
-                ..
             } => {
-                let left_owned = left.owned_temporary().is_some();
-                let right_owned = right.owned_temporary().is_some();
-                let left = self.lower_nullable_shared_reference_expression(left)?;
+                let left_value = self.lower_shared_expression(left)?;
+                let (left_control, _) = self.shared_parts(left_value)?;
                 let function = current_function(&self.builder)?;
-                let some = self
-                    .context
-                    .append_basic_block(function, "shared.coalesce.some");
-                let none = self
-                    .context
-                    .append_basic_block(function, "shared.coalesce.none");
-                let done = self
-                    .context
-                    .append_basic_block(function, "shared.coalesce.done");
+                let some = self.context.append_basic_block(function, "shared.some");
+                let none = self.context.append_basic_block(function, "shared.none");
+                let done = self.context.append_basic_block(function, "shared.done");
                 let present = build(
                     self.builder
-                        .build_is_not_null(left, "shared.coalesce.present"),
+                        .build_is_not_null(left_control, "shared.present"),
                 )?;
                 build(self.builder.build_conditional_branch(present, some, none))?;
                 self.builder.position_at_end(some);
                 build(self.builder.build_unconditional_branch(done))?;
-                let some_end = self
-                    .builder
-                    .get_insert_block()
-                    .expect("shared coalesce some block");
                 self.builder.position_at_end(none);
-                let right = self.lower_shared_reference_expression(right)?;
-                build(self.builder.build_unconditional_branch(done))?;
-                let none_end = self
+                let right_value = self.lower_shared_expression(right)?;
+                let (right_control, _) = self.shared_parts(right_value)?;
+                let right_end = self
                     .builder
                     .get_insert_block()
-                    .expect("shared coalesce none block");
+                    .ok_or_else(|| malformed_mir("shared right block missing"))?;
+                build(self.builder.build_unconditional_branch(done))?;
                 self.builder.position_at_end(done);
-                let phi = build(self.builder.build_phi(pointer, "shared.coalesce"))?;
-                phi.add_incoming(&[(&left, some_end), (&right, none_end)]);
-                let result = phi.as_basic_value().into_pointer_value();
-                if !transfer && (left_owned || right_owned) {
-                    let temporary =
-                        build(self.builder.build_phi(pointer, "shared.coalesce.temporary"))?;
-                    let null = pointer.const_null();
-                    let left_temporary = if left_owned { left } else { null };
-                    let right_temporary = if right_owned { right } else { null };
-                    temporary
-                        .add_incoming(&[(&left_temporary, some_end), (&right_temporary, none_end)]);
-                    self.defer_or_drop_shared_temporary(
-                        temporary.as_basic_value().into_pointer_value(),
-                        false,
+                let phi = build(self.builder.build_phi(result_type, "shared.coalesce"))?;
+                phi.add_incoming(&[(&left_value, some), (&right_value, right_end)]);
+                if !transfer && (left.owned() || right.owned()) {
+                    let cleanup = build(self.builder.build_phi(pointer, "shared.temporary"))?;
+                    let left_drop = if left.owned() {
+                        left_control
+                    } else {
+                        pointer.const_null()
+                    };
+                    let right_drop = if right.owned() {
+                        right_control
+                    } else {
+                        pointer.const_null()
+                    };
+                    cleanup.add_incoming(&[(&left_drop, some), (&right_drop, right_end)]);
+                    self.defer_shared_expression(
+                        cleanup.as_basic_value().into_pointer_value(),
+                        expression,
                     )?;
                 }
-                Ok(result)
+                Ok(phi.as_basic_value())
             }
-            mir::SharedReferenceExpression::CollectionIndex {
+            O::Index {
                 collection,
                 index,
                 remove,
                 positional,
-                ..
-            } => Ok(self
-                .lower_collection_index(*collection, index, *remove, *positional)?
-                .into_pointer_value()),
+            } => {
+                if paired {
+                    self.lower_two_word_collection_index(collection, index, remove, positional)
+                } else {
+                    self.lower_collection_index(collection, index, remove, positional)
+                }
+            }
+            O::Get {
+                collection,
+                key,
+                access,
+                stored,
+            } => {
+                if paired {
+                    self.lower_nullable_two_word_collection_get(
+                        expression.ty(),
+                        collection,
+                        key,
+                        access,
+                    )
+                } else {
+                    self.lower_dictionary_get(collection, key, stored, access)
+                        .map(|(_, value)| value)
+                }
+            }
         }
+    }
+
+    fn lower_shared_reference_expression(
+        &mut self,
+        expression: &mir::SharedReferenceExpression,
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_shared_expression(crate::native_shared::Expression::Strong(expression))
     }
 
     fn lower_weak_reference_expression(
         &mut self,
         expression: &mir::WeakReferenceExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        match expression {
-            mir::WeakReferenceExpression::Local {
-                local, transfer, ..
-            }
-            | mir::WeakReferenceExpression::NullableLocalAssumeNonNull {
-                local, transfer, ..
-            } => {
-                let slot = local_slot(&self.local_slots, *local)?;
-                let value = build(self.builder.build_load(pointer, slot, "weak.local"))?
-                    .into_pointer_value();
-                if *transfer {
-                    build(self.builder.build_store(slot, pointer.const_null()))?;
-                }
-                Ok(value)
-            }
-            mir::WeakReferenceExpression::Property {
-                object, property, ..
-            } => Ok(build(self.builder.build_load(
-                pointer,
-                self.lower_property_address(*object, *property)?,
-                "weak.property",
-            ))?
-            .into_pointer_value()),
-            mir::WeakReferenceExpression::Call { function, args, .. } => Ok(self
-                .lower_call(*function, args, true)?
-                .ok_or_else(|| malformed_mir("weak-reference call produced no result"))?
-                .into_pointer_value()),
-            mir::WeakReferenceExpression::Create { value, .. } => {
-                let owned = value.owned_temporary().is_some();
-                let value = self.lower_shared_reference_expression(value)?;
-                let weak = self
-                    .call_runtime(
-                        SHARED_CREATE_WEAK,
-                        &[pointer.into(), pointer.into()],
-                        Some(pointer.into()),
-                        &[self.current_frame.into(), value.into()],
-                    )?
-                    .ok_or_else(|| backend_failure("weak-reference creation produced no result"))?
-                    .into_pointer_value();
-                if owned {
-                    self.defer_or_drop_shared_temporary(value, false)?;
-                }
-                Ok(weak)
-            }
-            mir::WeakReferenceExpression::Coalesce {
-                left,
-                right,
-                transfer,
-                ..
-            } => {
-                let left_owned = left.owned_temporary().is_some();
-                let right_owned = right.owned_temporary().is_some();
-                let left = self.lower_nullable_weak_reference_expression(left)?;
-                let function = current_function(&self.builder)?;
-                let some = self
-                    .context
-                    .append_basic_block(function, "weak.coalesce.some");
-                let none = self
-                    .context
-                    .append_basic_block(function, "weak.coalesce.none");
-                let done = self
-                    .context
-                    .append_basic_block(function, "weak.coalesce.done");
-                let present = build(
-                    self.builder
-                        .build_is_not_null(left, "weak.coalesce.present"),
-                )?;
-                build(self.builder.build_conditional_branch(present, some, none))?;
-                self.builder.position_at_end(some);
-                build(self.builder.build_unconditional_branch(done))?;
-                let some_end = self
-                    .builder
-                    .get_insert_block()
-                    .expect("weak coalesce some block");
-                self.builder.position_at_end(none);
-                let right = self.lower_weak_reference_expression(right)?;
-                build(self.builder.build_unconditional_branch(done))?;
-                let none_end = self
-                    .builder
-                    .get_insert_block()
-                    .expect("weak coalesce none block");
-                self.builder.position_at_end(done);
-                let phi = build(self.builder.build_phi(pointer, "weak.coalesce"))?;
-                phi.add_incoming(&[(&left, some_end), (&right, none_end)]);
-                let result = phi.as_basic_value().into_pointer_value();
-                if !transfer && (left_owned || right_owned) {
-                    let temporary =
-                        build(self.builder.build_phi(pointer, "weak.coalesce.temporary"))?;
-                    let null = pointer.const_null();
-                    let left_temporary = if left_owned { left } else { null };
-                    let right_temporary = if right_owned { right } else { null };
-                    temporary
-                        .add_incoming(&[(&left_temporary, some_end), (&right_temporary, none_end)]);
-                    self.defer_or_drop_shared_temporary(
-                        temporary.as_basic_value().into_pointer_value(),
-                        true,
-                    )?;
-                }
-                Ok(result)
-            }
-            mir::WeakReferenceExpression::CollectionIndex {
-                collection,
-                index,
-                remove,
-                positional,
-                ..
-            } => Ok(self
-                .lower_collection_index(*collection, index, *remove, *positional)?
-                .into_pointer_value()),
-        }
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_shared_expression(crate::native_shared::Expression::Weak(expression))
     }
 
     fn lower_nullable_shared_reference_expression(
         &mut self,
         expression: &mir::NullableSharedReferenceExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        match expression {
-            mir::NullableSharedReferenceExpression::Null(_) => Ok(pointer.const_null()),
-            mir::NullableSharedReferenceExpression::Shared(value) => {
-                self.lower_shared_reference_expression(value)
-            }
-            mir::NullableSharedReferenceExpression::Local {
-                local, transfer, ..
-            } => {
-                let slot = local_slot(&self.local_slots, *local)?;
-                let value = build(
-                    self.builder
-                        .build_load(pointer, slot, "nullable-shared.local"),
-                )?
-                .into_pointer_value();
-                if *transfer {
-                    build(self.builder.build_store(slot, pointer.const_null()))?;
-                }
-                Ok(value)
-            }
-            mir::NullableSharedReferenceExpression::Property {
-                object, property, ..
-            } => Ok(build(self.builder.build_load(
-                pointer,
-                self.lower_property_address(*object, *property)?,
-                "nullable-shared.property",
-            ))?
-            .into_pointer_value()),
-            mir::NullableSharedReferenceExpression::Call { function, args, .. } => Ok(self
-                .lower_call(*function, args, true)?
-                .ok_or_else(|| malformed_mir("nullable shared call produced no result"))?
-                .into_pointer_value()),
-            mir::NullableSharedReferenceExpression::Acquire { value, .. } => {
-                let owned = value.owned_temporary().is_some();
-                let value = self.lower_weak_reference_expression(value)?;
-                let acquired = self
-                    .call_runtime(
-                        SHARED_ACQUIRE,
-                        &[pointer.into(), pointer.into()],
-                        Some(pointer.into()),
-                        &[self.current_frame.into(), value.into()],
-                    )?
-                    .ok_or_else(|| backend_failure("weak acquisition produced no result"))?
-                    .into_pointer_value();
-                if owned {
-                    self.defer_or_drop_shared_temporary(value, true)?;
-                }
-                Ok(acquired)
-            }
-            mir::NullableSharedReferenceExpression::NullSafeShare { value, .. } => {
-                let owned = value.owned_temporary().is_some();
-                let value = self.lower_nullable_shared_reference_expression(value)?;
-                let result =
-                    self.lower_null_safe_shared_call(value, SHARED_RETAIN, "shared retain", true)?;
-                if owned {
-                    self.defer_or_drop_shared_temporary(value, false)?;
-                }
-                Ok(result)
-            }
-            mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
-                let owned = value.owned_temporary().is_some();
-                let value = self.lower_nullable_weak_reference_expression(value)?;
-                let result = self.lower_null_safe_shared_call(
-                    value,
-                    SHARED_ACQUIRE,
-                    "weak acquisition",
-                    true,
-                )?;
-                if owned {
-                    self.defer_or_drop_shared_temporary(value, true)?;
-                }
-                Ok(result)
-            }
-            mir::NullableSharedReferenceExpression::Coalesce {
-                left,
-                right,
-                transfer,
-                ..
-            } => {
-                let left_owned = left.owned_temporary().is_some();
-                let right_owned = right.owned_temporary().is_some();
-                let left = self.lower_nullable_shared_reference_expression(left)?;
-                let function = current_function(&self.builder)?;
-                let some = self
-                    .context
-                    .append_basic_block(function, "nullable.shared.coalesce.some");
-                let none = self
-                    .context
-                    .append_basic_block(function, "nullable.shared.coalesce.none");
-                let done = self
-                    .context
-                    .append_basic_block(function, "nullable.shared.coalesce.done");
-                let present = build(
-                    self.builder
-                        .build_is_not_null(left, "nullable.shared.coalesce.present"),
-                )?;
-                build(self.builder.build_conditional_branch(present, some, none))?;
-                self.builder.position_at_end(some);
-                build(self.builder.build_unconditional_branch(done))?;
-                let some_end = self
-                    .builder
-                    .get_insert_block()
-                    .expect("nullable shared coalesce some block");
-                self.builder.position_at_end(none);
-                let right = self.lower_nullable_shared_reference_expression(right)?;
-                build(self.builder.build_unconditional_branch(done))?;
-                let none_end = self
-                    .builder
-                    .get_insert_block()
-                    .expect("nullable shared coalesce none block");
-                self.builder.position_at_end(done);
-                let phi = build(self.builder.build_phi(pointer, "nullable.shared.coalesce"))?;
-                phi.add_incoming(&[(&left, some_end), (&right, none_end)]);
-                let result = phi.as_basic_value().into_pointer_value();
-                if !transfer && (left_owned || right_owned) {
-                    let temporary = build(
-                        self.builder
-                            .build_phi(pointer, "nullable.shared.coalesce.temporary"),
-                    )?;
-                    let null = pointer.const_null();
-                    let left_temporary = if left_owned { left } else { null };
-                    let right_temporary = if right_owned { right } else { null };
-                    temporary
-                        .add_incoming(&[(&left_temporary, some_end), (&right_temporary, none_end)]);
-                    self.defer_or_drop_shared_temporary(
-                        temporary.as_basic_value().into_pointer_value(),
-                        false,
-                    )?;
-                }
-                Ok(result)
-            }
-            mir::NullableSharedReferenceExpression::DictionaryGet {
-                class,
-                collection,
-                key,
-                access,
-                stored_nullable,
-            } => Ok(self
-                .lower_dictionary_get(
-                    *collection,
-                    key,
-                    if *stored_nullable {
-                        mir::Type::NullableSharedReference(*class)
-                    } else {
-                        mir::Type::SharedReference(*class)
-                    },
-                    *access,
-                )?
-                .1
-                .into_pointer_value()),
-            mir::NullableSharedReferenceExpression::CollectionIndex {
-                collection,
-                index,
-                remove,
-                positional,
-                ..
-            } => Ok(self
-                .lower_collection_index(*collection, index, *remove, *positional)?
-                .into_pointer_value()),
-        }
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_shared_expression(crate::native_shared::Expression::NullableStrong(expression))
     }
 
     fn lower_null_safe_shared_call(
@@ -11841,140 +12047,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     fn lower_nullable_weak_reference_expression(
         &mut self,
         expression: &mir::NullableWeakReferenceExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        match expression {
-            mir::NullableWeakReferenceExpression::Null(_) => Ok(pointer.const_null()),
-            mir::NullableWeakReferenceExpression::Weak(value) => {
-                self.lower_weak_reference_expression(value)
-            }
-            mir::NullableWeakReferenceExpression::Local {
-                local, transfer, ..
-            } => {
-                let slot = local_slot(&self.local_slots, *local)?;
-                let value = build(
-                    self.builder
-                        .build_load(pointer, slot, "nullable-weak.local"),
-                )?
-                .into_pointer_value();
-                if *transfer {
-                    build(self.builder.build_store(slot, pointer.const_null()))?;
-                }
-                Ok(value)
-            }
-            mir::NullableWeakReferenceExpression::Property {
-                object, property, ..
-            } => Ok(build(self.builder.build_load(
-                pointer,
-                self.lower_property_address(*object, *property)?,
-                "nullable-weak.property",
-            ))?
-            .into_pointer_value()),
-            mir::NullableWeakReferenceExpression::Call { function, args, .. } => Ok(self
-                .lower_call(*function, args, true)?
-                .ok_or_else(|| malformed_mir("nullable weak call produced no result"))?
-                .into_pointer_value()),
-            mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
-                let owned = value.owned_temporary().is_some();
-                let value = self.lower_nullable_shared_reference_expression(value)?;
-                let result = self.lower_null_safe_shared_call(
-                    value,
-                    SHARED_CREATE_WEAK,
-                    "weak creation",
-                    true,
-                )?;
-                if owned {
-                    self.defer_or_drop_shared_temporary(value, false)?;
-                }
-                Ok(result)
-            }
-            mir::NullableWeakReferenceExpression::Coalesce {
-                left,
-                right,
-                transfer,
-                ..
-            } => {
-                let left_owned = left.owned_temporary().is_some();
-                let right_owned = right.owned_temporary().is_some();
-                let left = self.lower_nullable_weak_reference_expression(left)?;
-                let function = current_function(&self.builder)?;
-                let some = self
-                    .context
-                    .append_basic_block(function, "nullable.weak.coalesce.some");
-                let none = self
-                    .context
-                    .append_basic_block(function, "nullable.weak.coalesce.none");
-                let done = self
-                    .context
-                    .append_basic_block(function, "nullable.weak.coalesce.done");
-                let present = build(
-                    self.builder
-                        .build_is_not_null(left, "nullable.weak.coalesce.present"),
-                )?;
-                build(self.builder.build_conditional_branch(present, some, none))?;
-                self.builder.position_at_end(some);
-                build(self.builder.build_unconditional_branch(done))?;
-                let some_end = self
-                    .builder
-                    .get_insert_block()
-                    .expect("nullable weak coalesce some block");
-                self.builder.position_at_end(none);
-                let right = self.lower_nullable_weak_reference_expression(right)?;
-                build(self.builder.build_unconditional_branch(done))?;
-                let none_end = self
-                    .builder
-                    .get_insert_block()
-                    .expect("nullable weak coalesce none block");
-                self.builder.position_at_end(done);
-                let phi = build(self.builder.build_phi(pointer, "nullable.weak.coalesce"))?;
-                phi.add_incoming(&[(&left, some_end), (&right, none_end)]);
-                let result = phi.as_basic_value().into_pointer_value();
-                if !transfer && (left_owned || right_owned) {
-                    let temporary = build(
-                        self.builder
-                            .build_phi(pointer, "nullable.weak.coalesce.temporary"),
-                    )?;
-                    let null = pointer.const_null();
-                    let left_temporary = if left_owned { left } else { null };
-                    let right_temporary = if right_owned { right } else { null };
-                    temporary
-                        .add_incoming(&[(&left_temporary, some_end), (&right_temporary, none_end)]);
-                    self.defer_or_drop_shared_temporary(
-                        temporary.as_basic_value().into_pointer_value(),
-                        true,
-                    )?;
-                }
-                Ok(result)
-            }
-            mir::NullableWeakReferenceExpression::DictionaryGet {
-                class,
-                collection,
-                key,
-                access,
-                stored_nullable,
-            } => Ok(self
-                .lower_dictionary_get(
-                    *collection,
-                    key,
-                    if *stored_nullable {
-                        mir::Type::NullableWeakReference(*class)
-                    } else {
-                        mir::Type::WeakReference(*class)
-                    },
-                    *access,
-                )?
-                .1
-                .into_pointer_value()),
-            mir::NullableWeakReferenceExpression::CollectionIndex {
-                collection,
-                index,
-                remove,
-                positional,
-                ..
-            } => Ok(self
-                .lower_collection_index(*collection, index, *remove, *positional)?
-                .into_pointer_value()),
-        }
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_shared_expression(crate::native_shared::Expression::NullableWeak(expression))
     }
 
     fn lower_pointer_local(
@@ -11990,21 +12064,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             build(self.builder.build_store(slot, pointer.const_null()))?;
         }
         Ok(value)
-    }
-
-    fn lower_pointer_property(
-        &mut self,
-        object: mir::LocalId,
-        property: crate::class_layout::PropertyId,
-        name: &str,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        Ok(build(self.builder.build_load(
-            pointer,
-            self.lower_property_address(object, property)?,
-            name,
-        ))?
-        .into_pointer_value())
     }
 
     fn lower_shared_access_payload(
@@ -12032,620 +12091,47 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
     fn lower_writable_shared_reference_expression(
         &mut self,
         expression: &mir::WritableSharedReferenceExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        match expression {
-            mir::WritableSharedReferenceExpression::New { payload, value } => {
-                let lowered = self.lower_rvalue(value)?;
-                let (value, descriptor) = match payload {
-                    mir::WritableSharedPayload::Class(class) => {
-                        self.class_parts(lowered, *class)?
-                    }
-                    mir::WritableSharedPayload::Collection(_) => {
-                        (lowered.into_pointer_value(), None)
-                    }
-                };
-                let static_drop_function = match payload {
-                    mir::WritableSharedPayload::Class(class) => *self
-                        .class_drop_functions
-                        .get(class.0)
-                        .ok_or_else(|| malformed_mir("writable shared drop glue does not exist"))?,
-                    mir::WritableSharedPayload::Collection(collection) => *self
-                        .collection_drop_functions
-                        .get(collection.0)
-                        .ok_or_else(|| {
-                            malformed_mir("writable shared collection drop glue does not exist")
-                        })?,
-                }
-                .as_global_value()
-                .as_pointer_value();
-                let drop_function = if let Some(descriptor) = descriptor {
-                    let descriptor_type = class_descriptor_type(self.context, self.target_data);
-                    let drop_field = build(self.builder.build_struct_gep(
-                        descriptor_type,
-                        descriptor,
-                        2,
-                        "writable.shared.dynamic-drop.field",
-                    ))?;
-                    build(self.builder.build_load(
-                        pointer,
-                        drop_field,
-                        "writable.shared.dynamic-drop.function",
-                    ))?
-                    .into_pointer_value()
-                } else {
-                    static_drop_function
-                };
-                Ok(self
-                    .call_runtime(
-                        WRITABLE_SHARED_CREATE,
-                        &[
-                            pointer.into(),
-                            pointer.into(),
-                            pointer.into(),
-                            pointer.into(),
-                        ],
-                        Some(pointer.into()),
-                        &[
-                            self.current_frame.into(),
-                            value.into(),
-                            descriptor.unwrap_or_else(|| pointer.const_null()).into(),
-                            drop_function.into(),
-                        ],
-                    )?
-                    .ok_or_else(|| {
-                        backend_failure("writable shared construction produced no result")
-                    })?
-                    .into_pointer_value())
-            }
-            mir::WritableSharedReferenceExpression::Local {
-                local, transfer, ..
-            }
-            | mir::WritableSharedReferenceExpression::NullableLocalAssumeNonNull {
-                local,
-                transfer,
-                ..
-            } => self.lower_pointer_local(*local, *transfer, "writable.shared.local"),
-            mir::WritableSharedReferenceExpression::Property {
-                object, property, ..
-            } => self.lower_pointer_property(*object, *property, "writable.shared.property"),
-            mir::WritableSharedReferenceExpression::Call { function, args, .. } => Ok(self
-                .lower_call(*function, args, true)?
-                .ok_or_else(|| malformed_mir("writable shared call produced no result"))?
-                .into_pointer_value()),
-            mir::WritableSharedReferenceExpression::Share { value, .. } => {
-                let owned = value.owned_temporary();
-                let control = self.lower_writable_shared_reference_expression(value)?;
-                let result = self
-                    .call_runtime(
-                        WRITABLE_SHARED_RETAIN,
-                        &[pointer.into(), pointer.into()],
-                        Some(pointer.into()),
-                        &[self.current_frame.into(), control.into()],
-                    )?
-                    .ok_or_else(|| backend_failure("writable shared retain produced no result"))?
-                    .into_pointer_value();
-                if owned {
-                    self.defer_or_drop_writable_shared_temporary(control, WRITABLE_SHARED_RELEASE)?;
-                }
-                Ok(result)
-            }
-            mir::WritableSharedReferenceExpression::Coalesce {
-                left,
-                right,
-                transfer,
-                ..
-            } => {
-                self.lower_writable_shared_coalesce(left, right, *transfer, WRITABLE_SHARED_RELEASE)
-            }
-            mir::WritableSharedReferenceExpression::CollectionIndex {
-                collection,
-                index,
-                remove,
-                positional,
-                ..
-            } => Ok(self
-                .lower_collection_index(*collection, index, *remove, *positional)?
-                .into_pointer_value()),
-        }
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_shared_expression(crate::native_shared::Expression::WritableStrong(expression))
     }
 
     fn lower_writable_weak_reference_expression(
         &mut self,
         expression: &mir::WritableWeakReferenceExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        match expression {
-            mir::WritableWeakReferenceExpression::Local {
-                local, transfer, ..
-            }
-            | mir::WritableWeakReferenceExpression::NullableLocalAssumeNonNull {
-                local,
-                transfer,
-                ..
-            } => self.lower_pointer_local(*local, *transfer, "writable.weak.local"),
-            mir::WritableWeakReferenceExpression::Property {
-                object, property, ..
-            } => self.lower_pointer_property(*object, *property, "writable.weak.property"),
-            mir::WritableWeakReferenceExpression::Call { function, args, .. } => Ok(self
-                .lower_call(*function, args, true)?
-                .ok_or_else(|| malformed_mir("writable weak call produced no result"))?
-                .into_pointer_value()),
-            mir::WritableWeakReferenceExpression::Create { value, .. } => {
-                let owned = value.owned_temporary();
-                let control = self.lower_writable_shared_reference_expression(value)?;
-                let result = self
-                    .call_runtime(
-                        WRITABLE_SHARED_CREATE_WEAK,
-                        &[pointer.into(), pointer.into()],
-                        Some(pointer.into()),
-                        &[self.current_frame.into(), control.into()],
-                    )?
-                    .ok_or_else(|| backend_failure("writable weak creation produced no result"))?
-                    .into_pointer_value();
-                if owned {
-                    self.defer_or_drop_writable_shared_temporary(control, WRITABLE_SHARED_RELEASE)?;
-                }
-                Ok(result)
-            }
-            mir::WritableWeakReferenceExpression::Coalesce {
-                left,
-                right,
-                transfer,
-                ..
-            } => self.lower_writable_weak_coalesce(
-                left,
-                right,
-                *transfer,
-                WRITABLE_SHARED_RELEASE_WEAK,
-            ),
-            mir::WritableWeakReferenceExpression::CollectionIndex {
-                collection,
-                index,
-                remove,
-                positional,
-                ..
-            } => Ok(self
-                .lower_collection_index(*collection, index, *remove, *positional)?
-                .into_pointer_value()),
-        }
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_shared_expression(crate::native_shared::Expression::WritableWeak(expression))
     }
 
     fn lower_nullable_writable_shared_reference_expression(
         &mut self,
         expression: &mir::NullableWritableSharedReferenceExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        match expression {
-            mir::NullableWritableSharedReferenceExpression::Null(_) => Ok(pointer.const_null()),
-            mir::NullableWritableSharedReferenceExpression::Strong(value) => {
-                self.lower_writable_shared_reference_expression(value)
-            }
-            mir::NullableWritableSharedReferenceExpression::Local {
-                local, transfer, ..
-            } => self.lower_pointer_local(*local, *transfer, "nullable.writable.shared.local"),
-            mir::NullableWritableSharedReferenceExpression::Property {
-                object, property, ..
-            } => {
-                self.lower_pointer_property(*object, *property, "nullable.writable.shared.property")
-            }
-            mir::NullableWritableSharedReferenceExpression::Call { function, args, .. } => Ok(self
-                .lower_call(*function, args, true)?
-                .ok_or_else(|| malformed_mir("nullable writable shared call produced no result"))?
-                .into_pointer_value()),
-            mir::NullableWritableSharedReferenceExpression::Acquire { value, .. } => {
-                let owned = value.owned_temporary();
-                let control = self.lower_writable_weak_reference_expression(value)?;
-                let result = self
-                    .call_runtime(
-                        WRITABLE_SHARED_ACQUIRE,
-                        &[pointer.into(), pointer.into()],
-                        Some(pointer.into()),
-                        &[self.current_frame.into(), control.into()],
-                    )?
-                    .ok_or_else(|| backend_failure("writable weak acquisition produced no result"))?
-                    .into_pointer_value();
-                if owned {
-                    self.defer_or_drop_writable_shared_temporary(
-                        control,
-                        WRITABLE_SHARED_RELEASE_WEAK,
-                    )?;
-                }
-                Ok(result)
-            }
-            mir::NullableWritableSharedReferenceExpression::NullSafeShare { value, .. } => {
-                let owned = value.owned_temporary();
-                let control = self.lower_nullable_writable_shared_reference_expression(value)?;
-                let result = self.lower_null_safe_shared_call(
-                    control,
-                    WRITABLE_SHARED_RETAIN,
-                    "writable shared retain",
-                    true,
-                )?;
-                if owned {
-                    self.defer_or_drop_writable_shared_temporary(control, WRITABLE_SHARED_RELEASE)?;
-                }
-                Ok(result)
-            }
-            mir::NullableWritableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
-                let owned = value.owned_temporary();
-                let control = self.lower_nullable_writable_weak_reference_expression(value)?;
-                let result = self.lower_null_safe_shared_call(
-                    control,
-                    WRITABLE_SHARED_ACQUIRE,
-                    "writable weak acquisition",
-                    true,
-                )?;
-                if owned {
-                    self.defer_or_drop_writable_shared_temporary(
-                        control,
-                        WRITABLE_SHARED_RELEASE_WEAK,
-                    )?;
-                }
-                Ok(result)
-            }
-            mir::NullableWritableSharedReferenceExpression::Coalesce {
-                left,
-                right,
-                transfer,
-                ..
-            } => self.lower_nullable_writable_shared_coalesce(
-                left,
-                right,
-                *transfer,
-                WRITABLE_SHARED_RELEASE,
-            ),
-            mir::NullableWritableSharedReferenceExpression::DictionaryGet {
-                payload,
-                collection,
-                key,
-                access,
-                stored_nullable,
-            } => Ok(self
-                .lower_dictionary_get(
-                    *collection,
-                    key,
-                    if *stored_nullable {
-                        mir::Type::NullableWritableSharedReference(*payload)
-                    } else {
-                        mir::Type::WritableSharedReference(*payload)
-                    },
-                    *access,
-                )?
-                .1
-                .into_pointer_value()),
-        }
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_shared_expression(crate::native_shared::Expression::NullableWritableStrong(
+            expression,
+        ))
     }
 
     fn lower_nullable_writable_weak_reference_expression(
         &mut self,
         expression: &mir::NullableWritableWeakReferenceExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        match expression {
-            mir::NullableWritableWeakReferenceExpression::Null(_) => Ok(pointer.const_null()),
-            mir::NullableWritableWeakReferenceExpression::Weak(value) => {
-                self.lower_writable_weak_reference_expression(value)
-            }
-            mir::NullableWritableWeakReferenceExpression::Local {
-                local, transfer, ..
-            } => self.lower_pointer_local(*local, *transfer, "nullable.writable.weak.local"),
-            mir::NullableWritableWeakReferenceExpression::Property {
-                object, property, ..
-            } => self.lower_pointer_property(*object, *property, "nullable.writable.weak.property"),
-            mir::NullableWritableWeakReferenceExpression::Call { function, args, .. } => Ok(self
-                .lower_call(*function, args, true)?
-                .ok_or_else(|| malformed_mir("nullable writable weak call produced no result"))?
-                .into_pointer_value()),
-            mir::NullableWritableWeakReferenceExpression::NullSafeCreate { value, .. } => {
-                let owned = value.owned_temporary();
-                let control = self.lower_nullable_writable_shared_reference_expression(value)?;
-                let result = self.lower_null_safe_shared_call(
-                    control,
-                    WRITABLE_SHARED_CREATE_WEAK,
-                    "writable weak creation",
-                    true,
-                )?;
-                if owned {
-                    self.defer_or_drop_writable_shared_temporary(control, WRITABLE_SHARED_RELEASE)?;
-                }
-                Ok(result)
-            }
-            mir::NullableWritableWeakReferenceExpression::Coalesce {
-                left,
-                right,
-                transfer,
-                ..
-            } => self.lower_nullable_writable_weak_coalesce(
-                left,
-                right,
-                *transfer,
-                WRITABLE_SHARED_RELEASE_WEAK,
-            ),
-            mir::NullableWritableWeakReferenceExpression::DictionaryGet {
-                payload,
-                collection,
-                key,
-                access,
-                stored_nullable,
-            } => Ok(self
-                .lower_dictionary_get(
-                    *collection,
-                    key,
-                    if *stored_nullable {
-                        mir::Type::NullableWritableWeakReference(*payload)
-                    } else {
-                        mir::Type::WritableWeakReference(*payload)
-                    },
-                    *access,
-                )?
-                .1
-                .into_pointer_value()),
-        }
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_shared_expression(crate::native_shared::Expression::NullableWritableWeak(
+            expression,
+        ))
     }
 
     fn lower_shared_reference_access_expression(
         &mut self,
         expression: &mir::SharedReferenceAccessExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        match expression {
-            mir::SharedReferenceAccessExpression::Local {
-                local, transfer, ..
-            }
-            | mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
-                local,
-                transfer,
-                ..
-            } => self.lower_pointer_local(*local, *transfer, "shared.access.local"),
-            mir::SharedReferenceAccessExpression::Property {
-                object, property, ..
-            } => self.lower_pointer_property(*object, *property, "shared.access.property"),
-            mir::SharedReferenceAccessExpression::CollectionIndex {
-                collection,
-                index,
-                remove,
-                positional,
-                ..
-            } => Ok(self
-                .lower_collection_index(*collection, index, *remove, *positional)?
-                .into_pointer_value()),
-            mir::SharedReferenceAccessExpression::Call { function, args, .. } => Ok(self
-                .lower_call(*function, args, true)?
-                .ok_or_else(|| malformed_mir("shared access call produced no result"))?
-                .into_pointer_value()),
-            mir::SharedReferenceAccessExpression::Acquire {
-                value,
-                writable,
-                span,
-                ..
-            } => {
-                let owned = value.owned_temporary();
-                let control = self.lower_writable_shared_reference_expression(value)?;
-                self.set_active_panic_site(*span)?;
-                let result = self
-                    .call_runtime(
-                        if *writable {
-                            WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS
-                        } else {
-                            WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS
-                        },
-                        &[pointer.into(), pointer.into()],
-                        Some(pointer.into()),
-                        &[self.current_frame.into(), control.into()],
-                    )?
-                    .ok_or_else(|| backend_failure("shared access acquisition produced no result"))?
-                    .into_pointer_value();
-                if owned {
-                    self.defer_or_drop_writable_shared_temporary(control, WRITABLE_SHARED_RELEASE)?;
-                }
-                Ok(result)
-            }
-        }
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_shared_expression(crate::native_shared::Expression::Access(expression))
     }
 
     fn lower_nullable_shared_reference_access_expression(
         &mut self,
         expression: &mir::NullableSharedReferenceAccessExpression,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        match expression {
-            mir::NullableSharedReferenceAccessExpression::Null { .. } => Ok(pointer.const_null()),
-            mir::NullableSharedReferenceAccessExpression::Access(value) => {
-                self.lower_shared_reference_access_expression(value)
-            }
-            mir::NullableSharedReferenceAccessExpression::Local {
-                local, transfer, ..
-            } => self.lower_pointer_local(*local, *transfer, "nullable.shared.access.local"),
-            mir::NullableSharedReferenceAccessExpression::Property {
-                object, property, ..
-            } => self.lower_pointer_property(*object, *property, "nullable.shared.access.property"),
-            mir::NullableSharedReferenceAccessExpression::CollectionIndex {
-                collection,
-                index,
-                remove,
-                positional,
-                ..
-            } => Ok(self
-                .lower_collection_index(*collection, index, *remove, *positional)?
-                .into_pointer_value()),
-            mir::NullableSharedReferenceAccessExpression::CollectionGet {
-                collection,
-                key,
-                access,
-                stored,
-            } => Ok(self
-                .lower_dictionary_get(*collection, key, stored.into_type(), *access)?
-                .1
-                .into_pointer_value()),
-            mir::NullableSharedReferenceAccessExpression::Call { function, args, .. } => Ok(self
-                .lower_call(*function, args, true)?
-                .ok_or_else(|| malformed_mir("nullable shared access call produced no result"))?
-                .into_pointer_value()),
-            mir::NullableSharedReferenceAccessExpression::NullSafeAcquire {
-                value,
-                writable,
-                span,
-                ..
-            } => {
-                let owned = value.owned_temporary();
-                let control = self.lower_nullable_writable_shared_reference_expression(value)?;
-                self.set_active_panic_site(*span)?;
-                let result = self.lower_null_safe_shared_call(
-                    control,
-                    if *writable {
-                        WRITABLE_SHARED_ACQUIRE_WRITABLE_ACCESS
-                    } else {
-                        WRITABLE_SHARED_ACQUIRE_READONLY_ACCESS
-                    },
-                    "shared access acquisition",
-                    true,
-                )?;
-                if owned {
-                    self.defer_or_drop_writable_shared_temporary(control, WRITABLE_SHARED_RELEASE)?;
-                }
-                Ok(result)
-            }
-        }
-    }
-
-    fn lower_writable_pointer_coalesce(
-        &mut self,
-        left: PointerValue<'ctx>,
-        left_owned: bool,
-        right_owned: bool,
-        transfer: bool,
-        release: &'static str,
-        lower_right: impl FnOnce(&mut Self) -> Result<PointerValue<'ctx>, BackendError>,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        let function = current_function(&self.builder)?;
-        let some = self
-            .context
-            .append_basic_block(function, "writable.coalesce.some");
-        let none = self
-            .context
-            .append_basic_block(function, "writable.coalesce.none");
-        let done = self
-            .context
-            .append_basic_block(function, "writable.coalesce.done");
-        let present = build(
-            self.builder
-                .build_is_not_null(left, "writable.coalesce.present"),
-        )?;
-        build(self.builder.build_conditional_branch(present, some, none))?;
-        self.builder.position_at_end(some);
-        build(self.builder.build_unconditional_branch(done))?;
-        let some_end = self
-            .builder
-            .get_insert_block()
-            .expect("writable coalesce some block");
-        self.builder.position_at_end(none);
-        let right = lower_right(self)?;
-        build(self.builder.build_unconditional_branch(done))?;
-        let none_end = self
-            .builder
-            .get_insert_block()
-            .expect("writable coalesce none block");
-        self.builder.position_at_end(done);
-        let result = build(self.builder.build_phi(pointer, "writable.coalesce"))?;
-        result.add_incoming(&[(&left, some_end), (&right, none_end)]);
-        if !transfer && (left_owned || right_owned) {
-            let temporary = build(
-                self.builder
-                    .build_phi(pointer, "writable.coalesce.temporary"),
-            )?;
-            let null = pointer.const_null();
-            temporary.add_incoming(&[
-                (&if left_owned { left } else { null }, some_end),
-                (&if right_owned { right } else { null }, none_end),
-            ]);
-            self.defer_or_drop_writable_shared_temporary(
-                temporary.as_basic_value().into_pointer_value(),
-                release,
-            )?;
-        }
-        Ok(result.as_basic_value().into_pointer_value())
-    }
-
-    fn lower_writable_shared_coalesce(
-        &mut self,
-        left: &mir::NullableWritableSharedReferenceExpression,
-        right: &mir::WritableSharedReferenceExpression,
-        transfer: bool,
-        release: &'static str,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let left_owned = left.owned_temporary();
-        let right_owned = right.owned_temporary();
-        let left = self.lower_nullable_writable_shared_reference_expression(left)?;
-        self.lower_writable_pointer_coalesce(
-            left,
-            left_owned,
-            right_owned,
-            transfer,
-            release,
-            |lowerer| lowerer.lower_writable_shared_reference_expression(right),
-        )
-    }
-
-    fn lower_nullable_writable_shared_coalesce(
-        &mut self,
-        left: &mir::NullableWritableSharedReferenceExpression,
-        right: &mir::NullableWritableSharedReferenceExpression,
-        transfer: bool,
-        release: &'static str,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let left_owned = left.owned_temporary();
-        let right_owned = right.owned_temporary();
-        let left = self.lower_nullable_writable_shared_reference_expression(left)?;
-        self.lower_writable_pointer_coalesce(
-            left,
-            left_owned,
-            right_owned,
-            transfer,
-            release,
-            |lowerer| lowerer.lower_nullable_writable_shared_reference_expression(right),
-        )
-    }
-
-    fn lower_writable_weak_coalesce(
-        &mut self,
-        left: &mir::NullableWritableWeakReferenceExpression,
-        right: &mir::WritableWeakReferenceExpression,
-        transfer: bool,
-        release: &'static str,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let left_owned = left.owned_temporary();
-        let right_owned = right.owned_temporary();
-        let left = self.lower_nullable_writable_weak_reference_expression(left)?;
-        self.lower_writable_pointer_coalesce(
-            left,
-            left_owned,
-            right_owned,
-            transfer,
-            release,
-            |lowerer| lowerer.lower_writable_weak_reference_expression(right),
-        )
-    }
-
-    fn lower_nullable_writable_weak_coalesce(
-        &mut self,
-        left: &mir::NullableWritableWeakReferenceExpression,
-        right: &mir::NullableWritableWeakReferenceExpression,
-        transfer: bool,
-        release: &'static str,
-    ) -> Result<PointerValue<'ctx>, BackendError> {
-        let left_owned = left.owned_temporary();
-        let right_owned = right.owned_temporary();
-        let left = self.lower_nullable_writable_weak_reference_expression(left)?;
-        self.lower_writable_pointer_coalesce(
-            left,
-            left_owned,
-            right_owned,
-            transfer,
-            release,
-            |lowerer| lowerer.lower_nullable_writable_weak_reference_expression(right),
-        )
+    ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        self.lower_shared_expression(crate::native_shared::Expression::NullableAccess(expression))
     }
 
     fn lower_nullable_class_expression(
@@ -12659,7 +12145,8 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 class, reference, ..
             } => {
                 let owned = reference.owned_temporary().is_some();
-                let control = self.lower_nullable_shared_reference_expression(reference)?;
+                let lowered = self.lower_nullable_shared_reference_expression(reference)?;
+                let (control, _) = self.shared_parts(lowered)?;
                 let payload = self.lower_null_safe_shared_call(
                     control,
                     SHARED_PAYLOAD,
@@ -12876,7 +12363,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 access,
             } => {
                 if class_uses_open_carrier(self.program, *class) {
-                    self.lower_nullable_two_word_collection_get(*class, *collection, key, *access)
+                    self.lower_nullable_two_word_collection_get(
+                        mir::Type::NullableClass(*class),
+                        *collection,
+                        key,
+                        *access,
+                    )
                 } else {
                     Ok(self
                         .lower_dictionary_get(*collection, key, mir::Type::Class(*class), *access)?
@@ -14299,7 +13791,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::MixedTag::Float(FloatType::Float64) => (MIXED_TAG_FLOAT64, 0),
             mir::MixedTag::String => (MIXED_TAG_STRING, 0),
             mir::MixedTag::Class(class) => (MIXED_TAG_CLASS, class.0 as u32),
-            mir::MixedTag::Error => (MIXED_TAG_ERROR, 0),
+            mir::MixedTag::Interface(interface) => (MIXED_TAG_INTERFACE, interface.0 as u32),
             mir::MixedTag::Enum(enum_id) => (MIXED_TAG_ENUM, enum_id.0 as u32),
             mir::MixedTag::PayloadEnum(ty) => (MIXED_TAG_PAYLOAD_ENUM, ty.id.0 as u32),
             mir::MixedTag::Function(ty) => (MIXED_TAG_FUNCTION, ty.0 as u32),
@@ -14457,15 +13949,24 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     .ok_or_else(|| backend_failure("mixed class allocation produced no result"))?
                     .into_pointer_value())
             }
-            mir::MixedExpression::BoxError { value } => {
-                let value = self.lower_error_expression(value)?;
-                let source = self.entry_alloca(error_carrier_type(self.context), "mixed.error")?;
+            mir::MixedExpression::BoxInterface {
+                value,
+                payload_owned,
+            } => {
+                let interface = value.interface;
+                let value = self.lower_error_expression(&value.value)?;
+                let source =
+                    self.entry_alloca(error_carrier_type(self.context), "mixed.interface")?;
                 build(self.builder.build_store(source, value))?;
-                let (tag, type_id) = self.mixed_tag_value(mir::MixedTag::Error);
+                let (tag, type_id) = self.mixed_tag_value(mir::MixedTag::Interface(interface));
                 let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
                 Ok(self
                     .call_runtime(
-                        MIXED_NEW_AGGREGATE,
+                        if *payload_owned {
+                            MIXED_NEW_AGGREGATE
+                        } else {
+                            MIXED_NEW_AGGREGATE_BORROWED
+                        },
                         &[
                             self.context.i8_type().into(),
                             self.context.i32_type().into(),
@@ -14502,7 +14003,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                                 .into(),
                         ],
                     )?
-                    .ok_or_else(|| backend_failure("mixed Error allocation produced no result"))?
+                    .ok_or_else(|| {
+                        backend_failure("mixed interface allocation produced no result")
+                    })?
                     .into_pointer_value())
             }
             mir::MixedExpression::BoxFunction {
@@ -14822,33 +14325,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         local: mir::LocalId,
         class: crate::class_layout::ClassId,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
-        let pointer = self.context.ptr_type(AddressSpace::default());
-        let mixed = build(self.builder.build_load(
-            pointer,
-            local_slot(&self.local_slots, local)?,
-            "mixed.class.local",
-        ))?
-        .into_pointer_value();
-        let payload = self
-            .call_runtime(
-                MIXED_PAYLOAD,
-                &[pointer.into()],
-                Some(self.context.i64_type().into()),
-                &[mixed.into()],
-            )?
-            .ok_or_else(|| backend_failure("mixed class payload read produced no result"))?
-            .into_int_value();
-        let address = build(self.builder.build_int_to_ptr(
-            payload,
-            pointer,
-            "mixed.class.payload",
-        ))?;
-        let carrier = build(self.builder.build_load(
-            open_class_carrier_type(self.context),
-            address,
-            "mixed.class.carrier",
-        ))?;
-        let (object, descriptor) = self.open_class_parts(carrier)?;
+        let (object, descriptor) = self.lower_mixed_nominal_parts(local, false)?;
         self.class_value_for_static_type(object, Some(descriptor), class, class)
     }
 
@@ -14857,6 +14334,15 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         local: mir::LocalId,
         class: crate::class_layout::ClassId,
     ) -> Result<BasicValueEnum<'ctx>, BackendError> {
+        let (object, descriptor) = self.lower_mixed_nominal_parts(local, true)?;
+        self.class_value_for_static_type(object, Some(descriptor), class, class)
+    }
+
+    fn lower_mixed_nominal_parts(
+        &mut self,
+        local: mir::LocalId,
+        transfer: bool,
+    ) -> Result<(PointerValue<'ctx>, PointerValue<'ctx>), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let slot = local_slot(&self.local_slots, local)?;
         let mixed = build(
@@ -14883,26 +14369,83 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             address,
             "mixed.take.class.carrier",
         ))?;
-        build(self.builder.build_store(slot, pointer.const_null()))?;
-        let owns_final = self
+        let (object, descriptor) = self.open_class_parts(carrier)?;
+        let tag = self
             .call_runtime(
-                MIXED_RELEASE_OWNED,
+                MIXED_TAG,
                 &[pointer.into()],
                 Some(self.context.i8_type().into()),
                 &[mixed.into()],
             )?
-            .ok_or_else(|| backend_failure("mixed class payload take released no ownership claim"))?
+            .ok_or_else(|| backend_failure("mixed nominal tag read produced no result"))?
             .into_int_value();
-        let not_final = build(self.builder.build_int_compare(
-            IntPredicate::EQ,
-            owns_final,
-            self.context.i8_type().const_zero(),
-            "mixed.class.take.shared",
+        let is_interface = build(
+            self.builder.build_int_compare(
+                IntPredicate::EQ,
+                tag,
+                self.context
+                    .i8_type()
+                    .const_int(u64::from(MIXED_TAG_INTERFACE), false),
+                "mixed.nominal.interface",
+            ),
+        )?;
+        let function = current_function(&self.builder)?;
+        let view_block = self
+            .context
+            .append_basic_block(function, "mixed.nominal.view");
+        let class_block = self
+            .context
+            .append_basic_block(function, "mixed.nominal.class");
+        let done = self
+            .context
+            .append_basic_block(function, "mixed.nominal.done");
+        build(
+            self.builder
+                .build_conditional_branch(is_interface, view_block, class_block),
+        )?;
+        self.builder.position_at_end(view_block);
+        let field = build(self.builder.build_struct_gep(
+            interface_vtable_header_type(self.context, self.target_data),
+            descriptor,
+            crate::native_abi::INTERFACE_VTABLE_CLASS_DESCRIPTOR_WORD,
+            "mixed.nominal.class.field",
         ))?;
-        self.lower_panic_if_code_at_active_site(not_final, "P1321")?;
-        let _ = self.call_runtime(MIXED_FREE, &[pointer.into()], None, &[mixed.into()])?;
-        let (object, descriptor) = self.open_class_parts(carrier)?;
-        self.class_value_for_static_type(object, Some(descriptor), class, class)
+        let from_view = build(self.builder.build_load(
+            pointer,
+            field,
+            "mixed.nominal.class.descriptor",
+        ))?
+        .into_pointer_value();
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(class_block);
+        build(self.builder.build_unconditional_branch(done))?;
+        self.builder.position_at_end(done);
+        let phi = build(self.builder.build_phi(pointer, "mixed.nominal.descriptor"))?;
+        phi.add_incoming(&[(&from_view, view_block), (&descriptor, class_block)]);
+        let descriptor = phi.as_basic_value().into_pointer_value();
+        if transfer {
+            build(self.builder.build_store(slot, pointer.const_null()))?;
+            let owns_final = self
+                .call_runtime(
+                    MIXED_RELEASE_OWNED,
+                    &[pointer.into()],
+                    Some(self.context.i8_type().into()),
+                    &[mixed.into()],
+                )?
+                .ok_or_else(|| {
+                    backend_failure("mixed class payload take released no ownership claim")
+                })?
+                .into_int_value();
+            let not_final = build(self.builder.build_int_compare(
+                IntPredicate::EQ,
+                owns_final,
+                self.context.i8_type().const_zero(),
+                "mixed.class.take.shared",
+            ))?;
+            self.lower_panic_if_code_at_active_site(not_final, "P1321")?;
+            let _ = self.call_runtime(MIXED_FREE, &[pointer.into()], None, &[mixed.into()])?;
+        }
+        Ok((object, descriptor))
     }
 
     fn lower_mixed_function_payload(
@@ -15218,7 +14761,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let is_error = build(self.builder.build_int_compare(
             IntPredicate::EQ,
             tag,
-            i8_type.const_int(u64::from(MIXED_TAG_ERROR), false),
+            i8_type.const_int(u64::from(MIXED_TAG_INTERFACE), false),
             "mixed.drop.is_error",
         ))?;
         build(
@@ -15671,9 +15214,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
 
     fn defer_or_drop_owned_shared_temporary(
         &mut self,
-        value: PointerValue<'ctx>,
+        value: BasicValueEnum<'ctx>,
         ownership: mir::OwnedSharedTemporary,
     ) -> Result<(), BackendError> {
+        let (value, _) = self.shared_parts(value)?;
         match ownership {
             mir::OwnedSharedTemporary::Strong => self.defer_or_drop_shared_temporary(value, false),
             mir::OwnedSharedTemporary::Weak => self.defer_or_drop_shared_temporary(value, true),
@@ -15878,7 +15422,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             for property in phase_definition.properties[first_property..].iter().rev() {
                 let address = self.lower_property_address_from_value(object, property.id)?;
                 match property.ty {
-                    mir::Type::Error | mir::Type::NullableError => {
+                    mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
                         let value = build(self.builder.build_load(
                             error_carrier_type(self.context),
                             address,
@@ -16100,7 +15644,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::StringExpression::ErrorMessage(error) => {
                 let carrier = self.lower_error_expression(error)?;
                 let (object, descriptor) = self.error_parts(carrier)?;
-                let descriptor_type = error_descriptor_type(self.context, self.target_data);
+                let descriptor_type = interface_vtable_header_type(self.context, self.target_data);
                 let offset_field = build(self.builder.build_struct_gep(
                     descriptor_type,
                     descriptor,
@@ -17436,14 +16980,6 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         self.lower_call_arguments_with_optional_parameters(args, None)
     }
 
-    fn lower_call_arguments_with_parameters(
-        &mut self,
-        args: &[mir::Rvalue],
-        parameters: &[mir::FunctionParameter],
-    ) -> Result<LoweredCallArguments<'ctx>, BackendError> {
-        self.lower_call_arguments_with_optional_parameters(args, Some(parameters))
-    }
-
     fn lower_call_arguments_with_optional_parameters(
         &mut self,
         args: &[mir::Rvalue],
@@ -17548,7 +17084,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         collection,
                     )?;
                 } else if let Some(shared) = argument.owned_temporary_shared() {
-                    self.defer_or_drop_owned_shared_temporary(value.into_pointer_value(), shared)?;
+                    self.defer_or_drop_owned_shared_temporary(value, shared)?;
                 } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
                     self.drop_payload_enum_at(value.into_pointer_value(), payload, nullable)?;
                 } else if argument.mixed_ownership().has_shell() {
@@ -17614,7 +17150,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         collection,
                     )?;
                 } else if let Some(shared) = argument.owned_temporary_shared() {
-                    self.defer_or_drop_owned_shared_temporary(value.into_pointer_value(), shared)?;
+                    self.defer_or_drop_owned_shared_temporary(value, shared)?;
                 } else if let Some((payload, nullable)) = argument.owned_temporary_payload_enum() {
                     self.drop_payload_enum_at(value.into_pointer_value(), payload, nullable)?;
                 } else if argument.mixed_ownership().has_shell() {
@@ -18320,6 +17856,72 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .build_conditional_branch(condition, then_block, else_block),
                 )?;
             }
+            mir::BoolExpression::NominalIs { local, target } => {
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let slot = local_slot(&self.local_slots, *local)?;
+                let object = build(self.builder.build_load(pointer, slot, "nominal.object"))?
+                    .into_pointer_value();
+                let ty = local_in(self.function, *local)?.ty;
+                let present = if matches!(ty, mir::Type::Mixed | mir::Type::NullableMixed) {
+                    let tag = self
+                        .call_runtime(
+                            MIXED_TAG,
+                            &[pointer.into()],
+                            Some(self.context.i8_type().into()),
+                            &[object.into()],
+                        )?
+                        .ok_or_else(|| {
+                            backend_failure("mixed nominal tag read produced no result")
+                        })?
+                        .into_int_value();
+                    let class = build(
+                        self.builder.build_int_compare(
+                            IntPredicate::EQ,
+                            tag,
+                            self.context
+                                .i8_type()
+                                .const_int(u64::from(MIXED_TAG_CLASS), false),
+                            "mixed.is.class",
+                        ),
+                    )?;
+                    let interface = build(
+                        self.builder.build_int_compare(
+                            IntPredicate::EQ,
+                            tag,
+                            self.context
+                                .i8_type()
+                                .const_int(u64::from(MIXED_TAG_INTERFACE), false),
+                            "mixed.is.interface",
+                        ),
+                    )?;
+                    build(self.builder.build_or(class, interface, "mixed.is.nominal"))?
+                } else {
+                    build(self.builder.build_is_not_null(object, "nominal.present"))?
+                };
+                let inspect = self
+                    .context
+                    .append_basic_block(current_function(&self.builder)?, "nominal.inspect");
+                build(
+                    self.builder
+                        .build_conditional_branch(present, inspect, else_block),
+                )?;
+                self.builder.position_at_end(inspect);
+                let (_, descriptor) = self.lower_nominal_local_parts(*local, false)?;
+                let matches = match target {
+                    mir::Type::Class(class) => {
+                        self.lower_class_ancestry_test(descriptor, *class)?
+                    }
+                    mir::Type::Interface(interface) => build(self.builder.build_is_not_null(
+                        self.lower_interface_view(descriptor, *interface)?,
+                        "nominal.conforms",
+                    ))?,
+                    _ => return Err(malformed_mir("nominal type test has a non-nominal target")),
+                };
+                build(
+                    self.builder
+                        .build_conditional_branch(matches, then_block, else_block),
+                )?;
+            }
             mir::BoolExpression::ClassIs { value, target } => {
                 let owned = value.owned_temporary_class();
                 let class = value.class();
@@ -18349,53 +17951,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                         .build_conditional_branch(present, inspect, else_block),
                 )?;
                 self.builder.position_at_end(inspect);
-                let ancestry_field = build(self.builder.build_struct_gep(
-                    class_descriptor_type(self.context, self.target_data),
-                    descriptor,
-                    4,
-                    "class.ancestry.field",
-                ))?;
-                let pointer = self.context.ptr_type(AddressSpace::default());
-                let ancestry = build(self.builder.build_load(
-                    pointer,
-                    ancestry_field,
-                    "class.ancestry",
-                ))?
-                .into_pointer_value();
-                let byte_address = unsafe {
-                    build(
-                        self.builder.build_in_bounds_gep(
-                            self.context.i8_type(),
-                            ancestry,
-                            &[self
-                                .context
-                                .i32_type()
-                                .const_int(target.0.div_euclid(8) as u64, false)],
-                            "class.ancestry.byte.address",
-                        ),
-                    )?
-                };
-                let byte = build(self.builder.build_load(
-                    self.context.i8_type(),
-                    byte_address,
-                    "class.ancestry.byte",
-                ))?
-                .into_int_value();
-                let masked = build(
-                    self.builder.build_and(
-                        byte,
-                        self.context
-                            .i8_type()
-                            .const_int(1_u64 << (target.0 % 8), false),
-                        "class.ancestry.masked",
-                    ),
-                )?;
-                let matches = build(self.builder.build_int_compare(
-                    IntPredicate::NE,
-                    masked,
-                    self.context.i8_type().const_zero(),
-                    "class.is.matches",
-                ))?;
+                let matches = self.lower_class_ancestry_test(descriptor, *target)?;
                 build(
                     self.builder
                         .build_conditional_branch(matches, then_block, else_block),
@@ -18419,6 +17975,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::BoolExpression::NullableSharedReferenceIsPresent(value) => {
                 let owned = value.owned_temporary().is_some();
                 let value = self.lower_nullable_shared_reference_expression(value)?;
+                let (value, _) = self.shared_parts(value)?;
                 if owned {
                     self.defer_or_drop_shared_temporary(value, false)?;
                 }
@@ -18434,6 +17991,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::BoolExpression::NullableWeakReferenceIsPresent(value) => {
                 let owned = value.owned_temporary().is_some();
                 let value = self.lower_nullable_weak_reference_expression(value)?;
+                let (value, _) = self.shared_parts(value)?;
                 if owned {
                     self.defer_or_drop_shared_temporary(value, true)?;
                 }
@@ -18449,6 +18007,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::BoolExpression::NullableWritableSharedReferenceIsPresent(value) => {
                 let owned = value.owned_temporary();
                 let value = self.lower_nullable_writable_shared_reference_expression(value)?;
+                let (value, _) = self.shared_parts(value)?;
                 if owned {
                     self.defer_or_drop_writable_shared_temporary(value, WRITABLE_SHARED_RELEASE)?;
                 }
@@ -18464,6 +18023,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::BoolExpression::NullableWritableWeakReferenceIsPresent(value) => {
                 let owned = value.owned_temporary();
                 let value = self.lower_nullable_writable_weak_reference_expression(value)?;
+                let (value, _) = self.shared_parts(value)?;
                 if owned {
                     self.defer_or_drop_writable_shared_temporary(
                         value,
@@ -18482,6 +18042,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             mir::BoolExpression::NullableSharedReferenceAccessIsPresent(value) => {
                 let owned = value.owned_temporary();
                 let lowered = self.lower_nullable_shared_reference_access_expression(value)?;
+                let (lowered, _) = self.shared_parts(lowered)?;
                 if owned {
                     self.defer_or_drop_writable_shared_temporary(
                         lowered,
@@ -18515,7 +18076,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 )?;
             }
             mir::BoolExpression::NullableErrorIsPresent(value) => {
-                let value = self.lower_nullable_error_expression(value)?;
+                let value = self.lower_nullable_error_expression(&value.value)?;
                 let (object, _) = self.error_parts(value)?;
                 let condition = build(
                     self.builder
@@ -19439,9 +19000,14 @@ fn collection_storage_type<'ctx>(
     program: &mir::Program,
     ty: mir::Type,
 ) -> Result<BasicTypeEnum<'ctx>, BackendError> {
+    if ty.shared_interface().is_some() {
+        return Ok(llvm_type(context, target_data, program, ty));
+    }
     Ok(match ty {
         mir::Type::Scalar(ty) => scalar_type(context, ty),
-        mir::Type::Error | mir::Type::NullableError => llvm_type(context, target_data, program, ty),
+        mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
+            llvm_type(context, target_data, program, ty)
+        }
         mir::Type::Class(class) | mir::Type::NullableClass(class)
             if class_uses_open_carrier(program, class) =>
         {
@@ -19525,7 +19091,7 @@ fn closure_descriptor_type(context: &Context) -> StructType<'_> {
     context.struct_type(&[pointer.into(), pointer.into()], false)
 }
 
-fn error_descriptor_type<'ctx>(
+fn interface_vtable_header_type<'ctx>(
     context: &'ctx Context,
     target_data: &TargetData,
 ) -> StructType<'ctx> {
@@ -19533,15 +19099,16 @@ fn error_descriptor_type<'ctx>(
     let word = context.ptr_sized_int_type(target_data, None);
     context.struct_type(
         &[
-            pointer.into(),
-            word.into(),
-            word.into(),
-            pointer.into(),
-            word.into(),
-            word.into(),
-            word.into(),
-            word.into(),
-            pointer.into(),
+            pointer.into(), // implementing type name
+            word.into(),    // name byte length
+            word.into(),    // Error message offset, or zero
+            pointer.into(), // exact dynamic drop
+            word.into(),    // payload size
+            word.into(),    // Error origin offset, or zero
+            word.into(),    // assertion offsets, or zero
+            word.into(),    // assertion discriminator
+            pointer.into(), // concrete class descriptor
+            word.into(),    // invariant interface specialization
         ],
         false,
     )
@@ -19591,6 +19158,9 @@ fn llvm_type<'ctx>(
     program: &mir::Program,
     ty: mir::Type,
 ) -> BasicTypeEnum<'ctx> {
+    if ty.shared_interface().is_some() {
+        return open_class_carrier_type(context).into();
+    }
     match ty {
         mir::Type::Scalar(ty) => scalar_type(context, ty),
         mir::Type::NullableScalar(ty) => {
@@ -19602,7 +19172,9 @@ fn llvm_type<'ctx>(
             context.ptr_type(AddressSpace::default()).into(),
         )
         .into(),
-        mir::Type::Error | mir::Type::NullableError => error_carrier_type(context).into(),
+        mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
+            error_carrier_type(context).into()
+        }
         mir::Type::Function(_) | mir::Type::NullableFunction(_) => {
             closure_carrier_type(context).into()
         }
@@ -19648,18 +19220,20 @@ fn class_uses_open_carrier(program: &mir::Program, class: crate::class_layout::C
 }
 
 fn type_uses_two_word_collection_storage(program: &mir::Program, ty: mir::Type) -> bool {
-    matches!(
-        ty,
-        mir::Type::Error
-            | mir::Type::NullableError
-            | mir::Type::Function(_)
-            | mir::Type::NullableFunction(_)
-    ) || match ty {
-        mir::Type::Class(class) | mir::Type::NullableClass(class) => {
-            class_uses_open_carrier(program, class)
+    ty.shared_interface().is_some()
+        || matches!(
+            ty,
+            mir::Type::Interface(_)
+                | mir::Type::NullableInterface(_)
+                | mir::Type::Function(_)
+                | mir::Type::NullableFunction(_)
+        )
+        || match ty {
+            mir::Type::Class(class) | mir::Type::NullableClass(class) => {
+                class_uses_open_carrier(program, class)
+            }
+            _ => false,
         }
-        _ => false,
-    }
 }
 
 fn mir_class_is_subtype(
@@ -19692,6 +19266,7 @@ fn class_descriptor_type<'ctx>(
             pointer.into(), // dynamic drop glue
             pointer.into(), // virtual table
             pointer.into(), // dense ancestry bits
+            pointer.into(), // invariant interface specialization views
         ],
         false,
     )

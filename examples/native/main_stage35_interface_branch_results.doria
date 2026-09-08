@@ -1,0 +1,21 @@
+interface Named { function name(): string; }
+class Name implements Named {
+    function __construct(string $text) {}
+    function name(): string { return $this->text; }
+    function __destruct() { try { echo "drop {$this->text};"; } catch (Error $error) {} }
+}
+function choose(bool $first): Named {
+    return match ($first) { true => new Name("match"), false => new Name("wrong") };
+}
+function chooseWhen(bool $first): Named {
+    return when ($first): Named { return new Name("when"); } else { return new Name("wrong"); };
+}
+function main(): void {
+    ?Named $empty = null;
+    Named $fallback = $empty ?? new Name("fallback");
+    Named $matched = choose(true);
+    Named $branched = chooseWhen(true);
+    echo $fallback->name() . ";";
+    echo $matched->name() . ";";
+    echo $branched->name() . ";";
+}

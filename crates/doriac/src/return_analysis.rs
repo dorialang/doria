@@ -1,7 +1,7 @@
-use crate::ast::{Block, ElseBranch, FunctionDecl, Stmt};
+use crate::ast::{Block, ElseBranch, Expr, FunctionDecl, Stmt};
 use crate::control_flow::{
     build_function_cfg, build_function_cfg_with_given, build_function_cfg_with_given_and_terminals,
-    ControlFlowGraph, GivenSemanticInfoMap, Node,
+    ControlFlowGraph, GivenSemanticInfoMap, Node, NodeAction,
 };
 use crate::dataflow::{solve_forward, ForwardAnalysis};
 use std::collections::HashSet;
@@ -10,6 +10,21 @@ use std::collections::HashSet;
 pub struct ReturnAnalysis {
     pub graph: ControlFlowGraph,
     pub fallthrough_reachable: bool,
+    reachable: Vec<bool>,
+}
+
+impl ReturnAnalysis {
+    pub fn value_returns(&self) -> impl Iterator<Item = &Expr> {
+        self.graph
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.action {
+                NodeAction::Statement(Stmt::Return {
+                    expr: Some(value), ..
+                }) if self.reachable[node.id.0] => Some(value),
+                _ => None,
+            })
+    }
 }
 
 pub fn analyze(function: &FunctionDecl) -> Option<ReturnAnalysis> {
@@ -61,6 +76,7 @@ fn analyze_graph(graph: ControlFlowGraph) -> ReturnAnalysis {
     ReturnAnalysis {
         graph,
         fallthrough_reachable,
+        reachable: result.inputs,
     }
 }
 

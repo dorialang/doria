@@ -141,7 +141,7 @@ function check_stage30_closure_authority(string $root): array
         'Native Testing Foundation Slices 1 through 3 are complete',
         'foundation is complete',
         'Stage 34 is complete',
-        'Stage 35 Slice 1 is complete and Slice 2 is next',
+        'Stage 35 Slices 1 and 2 are complete and Slice 3 is next',
     ]);
     $forbid($proposalPath, $proposal, [
         '**In Review.**',
@@ -199,7 +199,7 @@ function check_stage30_closure_authority(string $root): array
         'Native Testing Foundation Slice 2 — Complete',
         'Native Testing Foundation Slice 3 — Complete',
         'Stage 34 Single Class Inheritance — Complete',
-        'Stage 35 Interfaces And Traits — In Progress; Slice 1 Complete; Slice 2 Next',
+        'Stage 35 Interfaces And Traits — In Progress; Slices 1 And 2 Complete; Slice 3 Next',
     ]);
     $forbid($pipelinePath, $pipeline, [
         'Stage 30 Closure Authority Proposal — In Review',

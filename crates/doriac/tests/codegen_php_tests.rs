@@ -1400,7 +1400,7 @@ let writable $person = new Person("Ada");
     .expect("compilation should succeed");
 
     assert!(php.contains("$count = 1;"));
-    assert!(php.contains("$person->name = \"Lucy\";"));
+    assert!(php.contains("$person->value->name = \"Lucy\";"));
     assert!(!php.contains("($count) = 1;"));
     assert!(!php.contains("($person->name) = \"Lucy\";"));
 }
@@ -2201,7 +2201,8 @@ class Person
 
     assert!(php.contains("public string $name;"));
     assert!(php.contains("public function rename(string $name): void"));
-    assert!(!php.contains("writable"));
+    assert!(!php.contains("writable string $name"));
+    assert!(!php.contains("writable function rename"));
 }
 
 #[test]
@@ -2329,16 +2330,53 @@ fn allows_take_on_copy_parameters_in_php() {
 }
 
 #[test]
-fn rejects_take_on_move_parameters_in_php() {
-    let diagnostics = doriac::compile_source_to_php(
+fn take_on_move_parameters_preserves_explicit_cleanup_in_php() {
+    let php = doriac::compile_source_to_php(
         "test.doria",
-        "class Guard {} function consume(take Guard $guard): void {}",
+        r#"
+class Guard
+{
+    function __construct(string $name) {}
+    function __destruct(): void {
+        try { echo "drop {$this->name};"; } catch (Error $error) {}
+    }
+}
+function consume(take Guard $guard): void { echo "consume;"; }
+function consumeList(take List<Guard> $guards): void { echo "list;"; }
+function consumeMixed(take mixed $guard): void { echo "mixed;"; }
+function main(): void
+{
+    let $guard = new Guard("argument");
+    consume($guard);
+    let $guards = [new Guard("first"), new Guard("second")];
+    consumeList($guards);
+    mixed $erased = new Guard("erased");
+    consumeMixed($erased);
+    echo "done;";
+}
+"#,
     )
-    .expect_err("PHP cannot preserve class ownership transfer");
+    .expect("checked Move arguments transfer their cleanup responsibility");
 
-    assert!(diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code == "B1901"));
+    let run = Command::new("php")
+        .arg("-r")
+        .arg(format!(
+            "{}\n{}();",
+            php.strip_prefix("<?php").unwrap(),
+            php_function_name("main")
+        ))
+        .output()
+        .expect("PHP should execute the ownership regression");
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stderr, b"");
+    assert_eq!(
+        run.stdout,
+        b"consume;drop argument;list;drop second;drop first;mixed;drop erased;done;"
+    );
 }
 
 #[test]
@@ -3330,16 +3368,6 @@ function read(?Label $left, ?Label $right): ?string
 #[test]
 fn php_backend_rejects_unimplemented_stage23_runtime_surfaces_consistently() {
     for (name, source) in [
-        (
-            "indexed read",
-            r#"
-function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
-{
-    List<int> $items = [1];
-    echo $items[0];
-}
-"#,
-        ),
         (
             "list indexOf",
             r#"

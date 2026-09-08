@@ -88,7 +88,7 @@ impl SharedAccessConflict {
 struct SharedControlValue {
     strong: usize,
     weak: usize,
-    payload: Option<(usize, crate::class_layout::ClassId)>,
+    payload: Option<LocalValue>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -174,18 +174,18 @@ impl std::error::Error for InterpreterError {}
 enum FunctionOutcome {
     Value(LocalValue),
     Void,
-    CheckedError(ErrorValue),
+    CheckedError(InterfaceCarrier),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ErrorValue {
+struct InterfaceCarrier {
     object: usize,
-    descriptor: mir::ErrorDescriptorId,
+    vtable: mir::InterfaceVtableId,
 }
 
 enum CheckedIoResult {
     Success(Option<LocalValue>),
-    Error(ErrorValue),
+    Error(InterfaceCarrier),
     RuntimePanic(RuntimePanicEvent),
 }
 
@@ -200,8 +200,11 @@ enum LocalValue {
     },
     NullableString(Option<SharedString>),
     NullableMixed(Option<MixedValue>),
-    Error(ErrorValue),
-    NullableError(Option<ErrorValue>),
+    Error(InterfaceCarrier),
+    NullableError {
+        interface: mir::InterfaceTypeId,
+        value: Option<InterfaceCarrier>,
+    },
     Class {
         object: usize,
         class: crate::class_layout::ClassId,
@@ -212,44 +215,44 @@ enum LocalValue {
     },
     SharedReference {
         control: SharedControl,
-        class: crate::class_layout::ClassId,
+        class: mir::SharedPayload,
     },
     WeakReference {
         control: SharedControl,
-        class: crate::class_layout::ClassId,
+        class: mir::SharedPayload,
     },
     NullableSharedReference {
         control: Option<SharedControl>,
-        class: crate::class_layout::ClassId,
+        class: mir::SharedPayload,
     },
     NullableWeakReference {
         control: Option<SharedControl>,
-        class: crate::class_layout::ClassId,
+        class: mir::SharedPayload,
     },
     WritableSharedReference {
         control: WritableSharedControl,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
     },
     WritableWeakReference {
         control: WritableSharedControl,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
     },
     NullableWritableSharedReference {
         control: Option<WritableSharedControl>,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
     },
     NullableWritableWeakReference {
         control: Option<WritableSharedControl>,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
     },
     SharedReferenceAccess {
         control: WritableSharedControl,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
         writable: bool,
     },
     NullableSharedReferenceAccess {
         control: Option<WritableSharedControl>,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
         writable: bool,
     },
     Collection(CollectionValue),
@@ -288,7 +291,7 @@ enum OwnedDrop {
         control: WritableSharedControl,
         writable: bool,
     },
-    Error(ErrorValue),
+    Error(InterfaceCarrier),
     Function(FunctionValue),
 }
 
@@ -310,8 +313,11 @@ enum EvaluationValue {
     },
     NullableString(Option<SharedString>),
     NullableMixed(Option<MixedValue>),
-    Error(ErrorValue),
-    NullableError(Option<ErrorValue>),
+    Error(InterfaceCarrier),
+    NullableError {
+        interface: mir::InterfaceTypeId,
+        value: Option<InterfaceCarrier>,
+    },
     Class {
         object: usize,
         class: crate::class_layout::ClassId,
@@ -322,44 +328,44 @@ enum EvaluationValue {
     },
     SharedReference {
         control: SharedControl,
-        class: crate::class_layout::ClassId,
+        class: mir::SharedPayload,
     },
     WeakReference {
         control: SharedControl,
-        class: crate::class_layout::ClassId,
+        class: mir::SharedPayload,
     },
     NullableSharedReference {
         control: Option<SharedControl>,
-        class: crate::class_layout::ClassId,
+        class: mir::SharedPayload,
     },
     NullableWeakReference {
         control: Option<SharedControl>,
-        class: crate::class_layout::ClassId,
+        class: mir::SharedPayload,
     },
     WritableSharedReference {
         control: WritableSharedControl,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
     },
     WritableWeakReference {
         control: WritableSharedControl,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
     },
     NullableWritableSharedReference {
         control: Option<WritableSharedControl>,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
     },
     NullableWritableWeakReference {
         control: Option<WritableSharedControl>,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
     },
     SharedReferenceAccess {
         control: WritableSharedControl,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
         writable: bool,
     },
     NullableSharedReferenceAccess {
         control: Option<WritableSharedControl>,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
         writable: bool,
     },
     Collection(CollectionValue),
@@ -392,8 +398,9 @@ enum MixedValue {
         owner: Rc<Cell<usize>>,
         payload_owned: bool,
     },
-    Error {
-        value: ErrorValue,
+    Interface {
+        value: InterfaceCarrier,
+        interface: mir::InterfaceTypeId,
         owner: Rc<Cell<usize>>,
         payload_owned: bool,
     },
@@ -417,7 +424,7 @@ impl MixedValue {
             Self::String(_) => Some(mir::MixedTag::String),
             Self::Class { class, .. } => Some(mir::MixedTag::Class(*class)),
             Self::PayloadEnum { value, .. } => Some(mir::MixedTag::PayloadEnum(value.ty)),
-            Self::Error { .. } => Some(mir::MixedTag::Error),
+            Self::Interface { interface, .. } => Some(mir::MixedTag::Interface(*interface)),
             Self::Function { value, .. } => Some(mir::MixedTag::Function(value.function_type)),
         }
     }
@@ -537,8 +544,8 @@ enum EvaluationTask {
     NullableScalar(mir::NullableScalarExpression),
     NullableString(mir::NullableStringExpression),
     NullableMixed(mir::NullableMixedExpression),
-    Error(mir::ErrorExpression),
-    NullableError(mir::NullableErrorExpression),
+    Error(mir::InterfaceExpression),
+    NullableError(mir::NullableInterfaceExpression),
     Class(mir::ClassExpression),
     NullableClass(mir::NullableClassExpression),
     SharedReference(mir::SharedReferenceExpression),
@@ -552,34 +559,34 @@ enum EvaluationTask {
     SharedReferenceAccess(mir::SharedReferenceAccessExpression),
     NullableSharedReferenceAccess(mir::NullableSharedReferenceAccessExpression),
     AssignGroup(Vec<mir::LocalId>),
-    BuildSharedReference(crate::class_layout::ClassId),
-    BuildNullableSharedSome(crate::class_layout::ClassId),
-    BuildNullableWeakSome(crate::class_layout::ClassId),
-    FinishSharedShare(crate::class_layout::ClassId, bool),
-    FinishWeakCreation(crate::class_layout::ClassId, bool),
-    FinishWeakAcquire(crate::class_layout::ClassId, bool),
-    FinishNullSafeShare(crate::class_layout::ClassId, bool),
-    FinishNullSafeWeakCreation(crate::class_layout::ClassId, bool),
-    FinishNullSafeWeakAcquire(crate::class_layout::ClassId, bool),
+    BuildSharedReference(mir::SharedPayload),
+    BuildNullableSharedSome(mir::SharedPayload),
+    BuildNullableWeakSome(mir::SharedPayload),
+    FinishSharedShare(mir::SharedPayload, bool),
+    FinishWeakCreation(mir::SharedPayload, bool),
+    FinishWeakAcquire(mir::SharedPayload, bool),
+    FinishNullSafeShare(mir::SharedPayload, bool),
+    FinishNullSafeWeakCreation(mir::SharedPayload, bool),
+    FinishNullSafeWeakAcquire(mir::SharedPayload, bool),
     FinishSharedPayload(crate::class_layout::ClassId, bool),
     FinishNullableSharedPayload(crate::class_layout::ClassId, bool),
-    BuildWritableSharedReference(mir::WritableSharedPayload),
-    BuildNullableWritableSharedSome(mir::WritableSharedPayload),
-    BuildNullableWritableWeakSome(mir::WritableSharedPayload),
-    FinishWritableSharedShare(mir::WritableSharedPayload, bool),
-    FinishWritableWeakCreation(mir::WritableSharedPayload, bool),
-    FinishWritableWeakAcquire(mir::WritableSharedPayload, bool),
-    FinishWritableNullSafeShare(mir::WritableSharedPayload, bool),
-    FinishWritableNullSafeWeakCreation(mir::WritableSharedPayload, bool),
-    FinishWritableNullSafeWeakAcquire(mir::WritableSharedPayload, bool),
+    BuildWritableSharedReference(mir::SharedPayload),
+    BuildNullableWritableSharedSome(mir::SharedPayload),
+    BuildNullableWritableWeakSome(mir::SharedPayload),
+    FinishWritableSharedShare(mir::SharedPayload, bool),
+    FinishWritableWeakCreation(mir::SharedPayload, bool),
+    FinishWritableWeakAcquire(mir::SharedPayload, bool),
+    FinishWritableNullSafeShare(mir::SharedPayload, bool),
+    FinishWritableNullSafeWeakCreation(mir::SharedPayload, bool),
+    FinishWritableNullSafeWeakAcquire(mir::SharedPayload, bool),
     FinishSharedAccessAcquire {
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
         writable: bool,
         drop_receiver: bool,
         span: Span,
     },
     FinishNullableSharedAccessAcquire {
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
         writable: bool,
         drop_receiver: bool,
         span: Span,
@@ -663,7 +670,7 @@ enum EvaluationTask {
     },
     CollectionIndexShared {
         collection: mir::LocalId,
-        class: crate::class_layout::ClassId,
+        class: mir::SharedPayload,
         weak: bool,
         nullable: bool,
         transfer: bool,
@@ -671,7 +678,7 @@ enum EvaluationTask {
     },
     CollectionIndexWritableShared {
         collection: mir::LocalId,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
         weak: bool,
         nullable: bool,
         transfer: bool,
@@ -679,7 +686,7 @@ enum EvaluationTask {
     },
     CollectionIndexSharedAccess {
         collection: mir::LocalId,
-        payload: mir::WritableSharedPayload,
+        payload: mir::SharedPayload,
         writable: bool,
         nullable: bool,
         remove: bool,
@@ -702,14 +709,21 @@ enum EvaluationTask {
     BuildNullableSome,
     BuildNullableScalarSome(mir::ScalarType),
     BuildNullableClassSome(crate::class_layout::ClassId),
-    BuildError(mir::ErrorDescriptorId),
+    BuildInterface(mir::InterfaceVtableId),
     ErrorMessage,
-    BuildNullableErrorSome,
+    BuildNullableErrorSome(mir::InterfaceTypeId),
+    ConvertInterfaceView {
+        interface: mir::InterfaceTypeId,
+        nullable: bool,
+    },
     BuildMixedValue,
     BuildMixedString,
     BuildMixedClass(bool),
     BuildMixedPayloadEnum,
-    BuildMixedError,
+    BuildMixedInterface {
+        interface: mir::InterfaceTypeId,
+        payload_owned: bool,
+    },
     BuildMixedFunction(bool),
     BuildNullableMixedPayloadEnum,
     OwnMixed,
@@ -908,6 +922,7 @@ enum EvaluationTask {
         call_site: Span,
     },
     InvokeIndirect {
+        interface_entry: Option<mir::FunctionId>,
         function_type: mir::FunctionTypeId,
         invocation_mode: mir::FunctionInvocationMode,
         argument_count: usize,
@@ -917,6 +932,7 @@ enum EvaluationTask {
         call_site: Span,
     },
     InvokeCheckedIndirect {
+        interface_entry: Option<mir::FunctionId>,
         function_type: mir::FunctionTypeId,
         invocation_mode: mir::FunctionInvocationMode,
         argument_count: usize,
@@ -1561,23 +1577,26 @@ impl Interpreter<'_> {
                             target.0
                         )));
                     }
-                    (mir::Type::Error, mir::Rvalue::Error(expression)) => {
+                    (mir::Type::Interface(_), mir::Rvalue::Interface(expression)) => {
                         let frame = self.current_frame_mut()?;
                         frame.tasks.push(EvaluationTask::Assign(target));
                         frame.tasks.push(EvaluationTask::Error(expression));
                     }
-                    (mir::Type::Error, _) => {
+                    (mir::Type::Interface(_), _) => {
                         return Err(InterpreterError::new(format!(
                             "MIR Error local local{} received another value type",
                             target.0
                         )));
                     }
-                    (mir::Type::NullableError, mir::Rvalue::NullableError(expression)) => {
+                    (
+                        mir::Type::NullableInterface(_),
+                        mir::Rvalue::NullableInterface(expression),
+                    ) => {
                         let frame = self.current_frame_mut()?;
                         frame.tasks.push(EvaluationTask::Assign(target));
                         frame.tasks.push(EvaluationTask::NullableError(expression));
                     }
-                    (mir::Type::NullableError, _) => {
+                    (mir::Type::NullableInterface(_), _) => {
                         return Err(InterpreterError::new(format!(
                             "MIR nullable Error local local{} received another value type",
                             target.0
@@ -1642,7 +1661,7 @@ impl Interpreter<'_> {
                     (
                         mir::Type::SharedReference(expected),
                         mir::Rvalue::SharedReference(expression),
-                    ) if expression.class() == expected => {
+                    ) if expression.payload() == expected => {
                         let frame = self.current_frame_mut()?;
                         frame.tasks.push(EvaluationTask::Assign(target));
                         frame
@@ -1652,7 +1671,7 @@ impl Interpreter<'_> {
                     (
                         mir::Type::WeakReference(expected),
                         mir::Rvalue::WeakReference(expression),
-                    ) if expression.class() == expected => {
+                    ) if expression.payload() == expected => {
                         let frame = self.current_frame_mut()?;
                         frame.tasks.push(EvaluationTask::Assign(target));
                         frame.tasks.push(EvaluationTask::WeakReference(expression));
@@ -1660,7 +1679,7 @@ impl Interpreter<'_> {
                     (
                         mir::Type::NullableSharedReference(expected),
                         mir::Rvalue::NullableSharedReference(expression),
-                    ) if expression.class() == expected => {
+                    ) if expression.payload() == expected => {
                         let frame = self.current_frame_mut()?;
                         frame.tasks.push(EvaluationTask::Assign(target));
                         frame
@@ -1670,7 +1689,7 @@ impl Interpreter<'_> {
                     (
                         mir::Type::NullableWeakReference(expected),
                         mir::Rvalue::NullableWeakReference(expression),
-                    ) if expression.class() == expected => {
+                    ) if expression.payload() == expected => {
                         let frame = self.current_frame_mut()?;
                         frame.tasks.push(EvaluationTask::Assign(target));
                         frame
@@ -2028,7 +2047,7 @@ impl Interpreter<'_> {
                 descriptor,
             } => {
                 let value = self.take_error_local(error)?;
-                let actual_class = self.error_descriptor(value.descriptor)?.class;
+                let actual_class = self.interface_class(value)?;
                 let target_class = self.error_descriptor(descriptor)?.class;
                 if !class_is_subtype(self.program, actual_class, target_class) {
                     return Err(InterpreterError::new(
@@ -2233,9 +2252,11 @@ impl Interpreter<'_> {
             } => {
                 self.set_active_panic_site(span)?;
                 let argument_places = self.indirect_call_argument_places(function_type, &args)?;
+                let interface_entry = self.interface_call_entry(&callee)?;
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::FinishStatement);
                 frame.tasks.push(EvaluationTask::InvokeIndirect {
+                    interface_entry,
                     function_type,
                     invocation_mode,
                     argument_count: args.len(),
@@ -2247,7 +2268,9 @@ impl Interpreter<'_> {
                 for argument in args.into_iter().rev() {
                     frame.tasks.push(EvaluationTask::Rvalue(argument));
                 }
-                frame.tasks.push(EvaluationTask::Function(callee));
+                if let mir::IndirectCallee::Closure(callee) = callee {
+                    frame.tasks.push(EvaluationTask::Function(callee));
+                }
                 Ok(StepOutcome::Continue)
             }
             mir::Terminator::CheckedIndirectCall {
@@ -2263,6 +2286,7 @@ impl Interpreter<'_> {
             } => {
                 self.set_active_panic_site(span)?;
                 let argument_places = self.indirect_call_argument_places(function_type, &args)?;
+                let interface_entry = self.interface_call_entry(&callee)?;
                 let continuation = CheckedContinuation::Indirect {
                     result,
                     error,
@@ -2272,6 +2296,7 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::FinishStatement);
                 frame.tasks.push(EvaluationTask::InvokeCheckedIndirect {
+                    interface_entry,
                     function_type,
                     invocation_mode,
                     argument_count: args.len(),
@@ -2282,7 +2307,9 @@ impl Interpreter<'_> {
                 for argument in args.into_iter().rev() {
                     frame.tasks.push(EvaluationTask::Rvalue(argument));
                 }
-                frame.tasks.push(EvaluationTask::Function(callee));
+                if let mir::IndirectCallee::Closure(callee) = callee {
+                    frame.tasks.push(EvaluationTask::Function(callee));
+                }
                 Ok(StepOutcome::Continue)
             }
             mir::Terminator::CheckedConstruct {
@@ -2401,7 +2428,7 @@ impl Interpreter<'_> {
                 catch_all,
                 fallback,
             } => {
-                let descriptor = self.error_local(error)?.descriptor;
+                let descriptor = self.interface_error_metadata(self.error_local(error)?)?.id;
                 let target = cases
                     .into_iter()
                     .find_map(|(candidate, target)| (candidate == descriptor).then_some(target))
@@ -2444,11 +2471,11 @@ impl Interpreter<'_> {
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableMixed(value)),
-                mir::Rvalue::Error(value) => self
+                mir::Rvalue::Interface(value) => self
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::Error(value)),
-                mir::Rvalue::NullableError(value) => self
+                mir::Rvalue::NullableInterface(value) => self
                     .current_frame_mut()?
                     .tasks
                     .push(EvaluationTask::NullableError(value)),
@@ -2645,24 +2672,15 @@ impl Interpreter<'_> {
             }
             EvaluationTask::BuildSharedReference(class) => {
                 let value = self.pop_local_value()?;
-                let LocalValue::Class {
-                    object,
-                    class: actual,
-                } = value
-                else {
+                if !local_value_matches_type(self.program, class.ty(), &value) {
                     return Err(InterpreterError::new(
-                        "shared construction did not produce a class payload",
-                    ));
-                };
-                if !class_is_subtype(self.program, actual, class) {
-                    return Err(InterpreterError::new(
-                        "shared construction produced another payload class",
+                        "shared construction produced another payload type",
                     ));
                 }
                 let control = Rc::new(RefCell::new(SharedControlValue {
                     strong: 1,
                     weak: 0,
-                    payload: Some((object, actual)),
+                    payload: Some(value),
                 }));
                 self.current_frame_mut()?
                     .values
@@ -2927,26 +2945,21 @@ impl Interpreter<'_> {
                         "payload projection received a non-strong handle",
                     ));
                 };
-                if actual != class {
+                if actual != mir::SharedPayload::Class(class) {
                     return Err(InterpreterError::new(
                         "payload projection changed payload class",
                     ));
                 }
-                let (object, actual) = control
-                    .borrow()
-                    .payload
-                    .ok_or_else(|| InterpreterError::new("strong handle has no live payload"))?;
+                let payload =
+                    control.borrow().payload.clone().ok_or_else(|| {
+                        InterpreterError::new("strong handle has no live payload")
+                    })?;
                 if drop_receiver {
                     self.current_frame_mut()?
                         .statement_temporary_drops
                         .push(OwnedDrop::Shared(control));
                 }
-                self.current_frame_mut()?
-                    .values
-                    .push(EvaluationValue::Class {
-                        object,
-                        class: actual,
-                    });
+                self.push_local_value(payload)?;
             }
             EvaluationTask::FinishNullableSharedPayload(class, drop_receiver) => {
                 let value = self.pop_local_value()?;
@@ -2959,17 +2972,16 @@ impl Interpreter<'_> {
                         "nullable payload projection received another type",
                     ));
                 };
-                if actual != class {
+                if actual != mir::SharedPayload::Class(class) {
                     return Err(InterpreterError::new(
                         "nullable payload projection changed payload class",
                     ));
                 }
                 let object = control
                     .as_ref()
-                    .map(|control| {
-                        control.borrow().payload.ok_or_else(|| {
-                            InterpreterError::new("strong handle has no live payload")
-                        })
+                    .map(|control| match control.borrow().payload.as_ref() {
+                        Some(LocalValue::Class { object, .. }) => Ok(*object),
+                        _ => Err(InterpreterError::new("strong handle has no class payload")),
                     })
                     .transpose()?;
                 if drop_receiver {
@@ -2979,7 +2991,7 @@ impl Interpreter<'_> {
                             .push(OwnedDrop::Shared(control));
                     }
                 }
-                self.push_nullable_class(class, object.map(|(object, _)| object))?;
+                self.push_nullable_class(class, object)?;
             }
             EvaluationTask::BuildWritableSharedReference(payload) => {
                 let value = self.pop_local_value()?;
@@ -4070,12 +4082,17 @@ impl Interpreter<'_> {
                         .current_frame_mut()?
                         .values
                         .push(EvaluationValue::NullablePayloadEnum { ty, value }),
-                    (mir::Type::Error, Some(LocalValue::Error(value))) => {
-                        self.push_nullable_error(Some(value))?;
+                    (mir::Type::Interface(interface), Some(LocalValue::Error(value))) => {
+                        self.push_nullable_error(interface, Some(value))?;
                     }
-                    (mir::Type::Error, None) => self.push_nullable_error(None)?,
-                    (mir::Type::Error, Some(LocalValue::NullableError(value))) => {
-                        self.push_nullable_error(value)?;
+                    (mir::Type::Interface(interface), None) => {
+                        self.push_nullable_error(interface, None)?
+                    }
+                    (
+                        mir::Type::Interface(_),
+                        Some(LocalValue::NullableError { interface, value }),
+                    ) => {
+                        self.push_nullable_error(interface, value)?;
                     }
                     (
                         mir::Type::Function(function_type),
@@ -4556,7 +4573,13 @@ impl Interpreter<'_> {
                 }
                 self.push_nullable_class(actual, Some(object))?;
             }
-            EvaluationTask::BuildError(descriptor) => {
+            EvaluationTask::BuildInterface(vtable) => {
+                let interface = self
+                    .program
+                    .interface_vtables
+                    .get(vtable.0)
+                    .ok_or_else(|| InterpreterError::new("MIR interface conversion has no vtable"))?
+                    .interface;
                 let value = self.pop_local_value()?;
                 let (object, class) = match value {
                     LocalValue::Class { object, class }
@@ -4565,9 +4588,8 @@ impl Interpreter<'_> {
                         class,
                     } => (object, class),
                     LocalValue::NullableClass { object: None, .. } => {
-                        return Err(InterpreterError::new(
-                            "MIR erased an absent nullable Error object",
-                        ));
+                        self.push_nullable_error(interface, None)?;
+                        return Ok(StepOutcome::Continue);
                     }
                     _ => {
                         return Err(InterpreterError::new(
@@ -4575,16 +4597,50 @@ impl Interpreter<'_> {
                         ));
                     }
                 };
-                if self.error_descriptor(descriptor)?.class != class {
-                    return Err(InterpreterError::new(
-                        "MIR Error descriptor does not match its concrete object",
-                    ));
+                let vtable = self
+                    .program
+                    .interface_vtable(mir::ImplementingType::Class(class), interface)
+                    .ok_or_else(|| {
+                        InterpreterError::new("dynamic class has no checked interface conformance")
+                    })?;
+                self.push_error(InterfaceCarrier { object, vtable })?;
+            }
+            EvaluationTask::ConvertInterfaceView {
+                interface,
+                nullable,
+            } => {
+                let value = if nullable {
+                    self.pop_nullable_error()?
+                } else {
+                    Some(self.pop_error()?)
+                };
+                let value = value
+                    .map(|value| {
+                        let implementing_type =
+                            self.program.interface_vtables[value.vtable.0].implementing_type;
+                        let vtable = self
+                            .program
+                            .interface_vtable(implementing_type, interface)
+                            .ok_or_else(|| {
+                                InterpreterError::new("interface ancestor view is missing")
+                            })?;
+                        Ok(InterfaceCarrier {
+                            object: value.object,
+                            vtable,
+                        })
+                    })
+                    .transpose()?;
+                if nullable {
+                    self.push_nullable_error(interface, value)?;
+                } else {
+                    self.push_error(value.ok_or_else(|| {
+                        InterpreterError::new("non-null interface conversion lost its payload")
+                    })?)?;
                 }
-                self.push_error(ErrorValue { object, descriptor })?;
             }
             EvaluationTask::ErrorMessage => {
                 let error = self.pop_error()?;
-                let property = self.error_descriptor(error.descriptor)?.message_property;
+                let property = self.interface_error_metadata(error)?.message_property;
                 let value = self
                     .heap
                     .get(&error.object)
@@ -4601,9 +4657,17 @@ impl Interpreter<'_> {
                     })?;
                 self.push_string(value)?;
             }
-            EvaluationTask::BuildNullableErrorSome => {
-                let value = self.pop_error()?;
-                self.push_nullable_error(Some(value))?;
+            EvaluationTask::BuildNullableErrorSome(interface) => {
+                let value = match self.pop_local_value()? {
+                    LocalValue::Error(value) => Some(value),
+                    LocalValue::NullableError { value: None, .. } => None,
+                    _ => {
+                        return Err(InterpreterError::new(
+                            "nullable interface conversion produced an incompatible value",
+                        ))
+                    }
+                };
+                self.push_nullable_error(interface, value)?;
             }
             EvaluationTask::BuildMixedValue => {
                 let value = self.pop_scalar()?;
@@ -4637,12 +4701,16 @@ impl Interpreter<'_> {
                     payload_owned: true,
                 })?;
             }
-            EvaluationTask::BuildMixedError => {
+            EvaluationTask::BuildMixedInterface {
+                interface,
+                payload_owned,
+            } => {
                 let value = self.pop_error()?;
-                self.push_mixed(MixedValue::Error {
+                self.push_mixed(MixedValue::Interface {
                     value,
+                    interface,
                     owner: Rc::new(Cell::new(1)),
-                    payload_owned: true,
+                    payload_owned,
                 })?;
             }
             EvaluationTask::BuildMixedFunction(payload_owned) => {
@@ -5915,6 +5983,7 @@ impl Interpreter<'_> {
                 )?;
             }
             EvaluationTask::InvokeIndirect {
+                interface_entry,
                 function_type,
                 invocation_mode,
                 argument_count,
@@ -5923,6 +5992,19 @@ impl Interpreter<'_> {
                 continuation,
                 call_site,
             } => {
+                if let Some(entry) = interface_entry {
+                    let values = self.take_call_arguments(argument_count)?;
+                    self.push_frame(
+                        entry,
+                        &values,
+                        &argument_places,
+                        None,
+                        Some(call_site),
+                        false,
+                    )?;
+                    self.current_frame_mut()?.indirect_continuation = Some((result, continuation));
+                    return Ok(StepOutcome::Continue);
+                }
                 let mut values = self.take_call_arguments(argument_count + 1)?;
                 let callee = values.remove(0);
                 self.push_indirect_frame(
@@ -5937,6 +6019,7 @@ impl Interpreter<'_> {
                 )?;
             }
             EvaluationTask::InvokeCheckedIndirect {
+                interface_entry,
                 function_type,
                 invocation_mode,
                 argument_count,
@@ -5944,6 +6027,17 @@ impl Interpreter<'_> {
                 continuation,
                 call_site,
             } => {
+                if let Some(entry) = interface_entry {
+                    let values = self.take_call_arguments(argument_count)?;
+                    self.push_checked_frame(
+                        entry,
+                        &values,
+                        &argument_places,
+                        continuation,
+                        call_site,
+                    )?;
+                    return Ok(StepOutcome::Continue);
+                }
                 let mut values = self.take_call_arguments(argument_count + 1)?;
                 let callee = values.remove(0);
                 self.push_indirect_frame(
@@ -6077,10 +6171,8 @@ impl Interpreter<'_> {
                     state.strong -= 1;
                     (state.strong == 0).then(|| state.payload.take()).flatten()
                 };
-                if let Some((object, class)) = payload {
-                    self.current_frame_mut()?
-                        .tasks
-                        .push(EvaluationTask::DropObject { object, class });
+                if let Some(payload) = payload {
+                    self.queue_value_drops(payload)?;
                 }
             }
             EvaluationTask::ReleaseWeak(control) => {
@@ -6205,7 +6297,7 @@ impl Interpreter<'_> {
                 if !local_value_matches_type(self.program, expected, &value) {
                     return Err(InterpreterError::new(format!(
                         "MIR return evaluation produced {}, expected {expected}",
-                        local_value_type(&value)
+                        local_value_type(self.program, &value)
                     )));
                 }
                 return self.complete_frame(FunctionOutcome::Value(value));
@@ -6453,6 +6545,18 @@ impl Interpreter<'_> {
         condition: mir::BoolExpression,
     ) -> Result<(), InterpreterError> {
         match condition {
+            mir::BoolExpression::NominalIs { local, target } => {
+                let parts = self.nominal_local_parts(local, false)?;
+                let matches = parts.is_some_and(|(_, class)| match target {
+                    mir::Type::Class(target) => class_is_subtype(self.program, class, target),
+                    mir::Type::Interface(target) => self
+                        .program
+                        .interface_vtable(mir::ImplementingType::Class(class), target)
+                        .is_some(),
+                    _ => false,
+                });
+                self.push_scalar(mir::ScalarValue::Bool(matches))?;
+            }
             mir::BoolExpression::PayloadEnumIsCase {
                 local,
                 ty,
@@ -6773,7 +6877,7 @@ impl Interpreter<'_> {
                             id.0
                         )))
                     }
-                    LocalValue::Error(_) | LocalValue::NullableError(_) => {
+                    LocalValue::Error(_) | LocalValue::NullableError { .. } => {
                         return Err(InterpreterError::new(format!(
                             "MIR Error local local{} was used as a string value",
                             id.0
@@ -6885,7 +6989,12 @@ impl Interpreter<'_> {
             mir::StringExpression::ErrorMessage(error) => {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::ErrorMessage);
-                frame.tasks.push(EvaluationTask::Error(*error));
+                frame
+                    .tasks
+                    .push(EvaluationTask::Error(mir::InterfaceExpression {
+                        interface: mir::InterfaceTypeId::ERROR,
+                        value: *error,
+                    }));
             }
             mir::StringExpression::Concat(parts) => {
                 let count = parts.len();
@@ -7148,9 +7257,15 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::BuildMixedPayloadEnum);
                 frame.tasks.push(EvaluationTask::PayloadEnum(*value));
             }
-            mir::MixedExpression::BoxError { value } => {
+            mir::MixedExpression::BoxInterface {
+                value,
+                payload_owned,
+            } => {
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::BuildMixedError);
+                frame.tasks.push(EvaluationTask::BuildMixedInterface {
+                    interface: value.interface,
+                    payload_owned,
+                });
                 frame.tasks.push(EvaluationTask::Error(*value));
             }
             mir::MixedExpression::BoxFunction {
@@ -7191,10 +7306,46 @@ impl Interpreter<'_> {
 
     fn expand_error_expression(
         &mut self,
-        expression: mir::ErrorExpression,
+        mir::InterfaceExpression {
+            interface,
+            value: expression,
+        }: mir::InterfaceExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
-            mir::ErrorExpression::Local { local, transfer } => {
+            mir::InterfaceValue::SharedPayload { local } => {
+                let value = self.shared_interface_payload(local)?.ok_or_else(|| {
+                    InterpreterError::new("non-null shared interface projection is absent")
+                })?;
+                self.push_local_value(LocalValue::Error(value))?;
+            }
+            mir::InterfaceValue::NarrowedLocal {
+                local,
+                interface,
+                transfer,
+            } => {
+                let parts = self.nominal_local_parts(local, transfer)?;
+                if self.pending_panic.is_some() {
+                    return Ok(());
+                }
+                let (object, class) =
+                    parts.ok_or_else(|| InterpreterError::new("narrowed interface is null"))?;
+                let vtable = self
+                    .program
+                    .interface_vtable(mir::ImplementingType::Class(class), interface)
+                    .ok_or_else(|| {
+                        InterpreterError::new("narrowed interface has no matching view")
+                    })?;
+                self.push_error(InterfaceCarrier { object, vtable })?;
+            }
+            mir::InterfaceValue::Upcast { source, interface } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ConvertInterfaceView {
+                    interface,
+                    nullable: false,
+                });
+                frame.tasks.push(EvaluationTask::Error(*source));
+            }
+            mir::InterfaceValue::Local { local, transfer } => {
                 let value = if transfer {
                     self.current_frame_mut()?
                         .locals
@@ -7216,7 +7367,7 @@ impl Interpreter<'_> {
                 };
                 self.push_error(value)?;
             }
-            mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer } => {
+            mir::InterfaceValue::NullableLocalAssumeNonNull { local, transfer } => {
                 let value = if transfer {
                     self.current_frame_mut()?
                         .locals
@@ -7231,24 +7382,27 @@ impl Interpreter<'_> {
                 } else {
                     read_local(&self.current_frame()?.locals, local)?.clone()
                 };
-                let LocalValue::NullableError(Some(value)) = value else {
+                let LocalValue::NullableError {
+                    value: Some(value), ..
+                } = value
+                else {
                     return Err(InterpreterError::new(
                         "MIR nonnull Error expression used an absent or incompatible local",
                     ));
                 };
                 self.push_error(value)?;
             }
-            mir::ErrorExpression::FromClass { object, descriptor } => {
+            mir::InterfaceValue::FromClass { object, vtable } => {
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::BuildError(descriptor));
+                frame.tasks.push(EvaluationTask::BuildInterface(vtable));
                 frame.tasks.push(EvaluationTask::Class(*object));
             }
-            mir::ErrorExpression::FromNullableClass { object, descriptor } => {
+            mir::InterfaceValue::FromNullableClass { object, vtable } => {
                 let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::BuildError(descriptor));
+                frame.tasks.push(EvaluationTask::BuildInterface(vtable));
                 frame.tasks.push(EvaluationTask::NullableClass(*object));
             }
-            mir::ErrorExpression::Property {
+            mir::InterfaceValue::Property {
                 object,
                 property,
                 transfer,
@@ -7265,10 +7419,14 @@ impl Interpreter<'_> {
                 };
                 self.push_error(value)?;
             }
-            mir::ErrorExpression::Call { function, args, .. } => {
-                self.queue_call(function, args, ReturnExpectation::Value(mir::Type::Error))?;
+            mir::InterfaceValue::Call { function, args, .. } => {
+                self.queue_call(
+                    function,
+                    args,
+                    ReturnExpectation::Value(mir::Type::Interface(interface)),
+                )?;
             }
-            mir::ErrorExpression::CollectionIndex {
+            mir::InterfaceValue::CollectionIndex {
                 collection,
                 index,
                 positional,
@@ -7283,62 +7441,44 @@ impl Interpreter<'_> {
                 });
                 frame.tasks.push(EvaluationTask::Rvalue(*index));
             }
-            mir::ErrorExpression::MixedPayload { mixed, transfer } => {
-                let value = if transfer {
-                    self.current_frame_mut()?
-                        .locals
-                        .get_mut(mixed.0)
-                        .and_then(Option::take)
-                        .ok_or_else(|| {
-                            InterpreterError::new("mixed error local was moved before use")
-                        })?
-                } else {
-                    read_local(&self.current_frame()?.locals, mixed)?.clone()
-                };
-                let mixed = match value {
-                    LocalValue::Mixed(value) | LocalValue::NullableMixed(Some(value)) => value,
-                    _ => {
-                        return Err(InterpreterError::new(
-                            "MIR mixed error payload references another local type",
-                        ));
-                    }
-                };
-                let MixedValue::Error {
-                    value,
-                    owner,
-                    payload_owned,
-                } = mixed
-                else {
-                    return Err(InterpreterError::new(
-                        "MIR mixed error payload observed another tag",
-                    ));
-                };
-                if transfer {
-                    if owner.get() != 1 || !payload_owned {
-                        return Err(InterpreterError::new(
-                            "mixed error payload cannot transfer a shared ownership claim",
-                        ));
-                    }
-                    owner.set(0);
-                }
-                self.push_error(value)?;
-            }
         }
         Ok(())
     }
 
     fn expand_nullable_error_expression(
         &mut self,
-        expression: mir::NullableErrorExpression,
+        mir::NullableInterfaceExpression {
+            interface,
+            value: expression,
+        }: mir::NullableInterfaceExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
-            mir::NullableErrorExpression::Null => self.push_nullable_error(None)?,
-            mir::NullableErrorExpression::Error(value) => {
-                let frame = self.current_frame_mut()?;
-                frame.tasks.push(EvaluationTask::BuildNullableErrorSome);
-                frame.tasks.push(EvaluationTask::Error(value));
+            mir::NullableInterfaceValue::SharedPayload { local } => {
+                let value = self.shared_interface_payload(local)?;
+                self.push_nullable_error(interface, value)?;
             }
-            mir::NullableErrorExpression::Local { local, transfer } => {
+            mir::NullableInterfaceValue::Upcast { source, interface } => {
+                let frame = self.current_frame_mut()?;
+                frame.tasks.push(EvaluationTask::ConvertInterfaceView {
+                    interface,
+                    nullable: true,
+                });
+                frame.tasks.push(EvaluationTask::NullableError(*source));
+            }
+            mir::NullableInterfaceValue::Null => self.push_nullable_error(interface, None)?,
+            mir::NullableInterfaceValue::Present(value) => {
+                let frame = self.current_frame_mut()?;
+                frame
+                    .tasks
+                    .push(EvaluationTask::BuildNullableErrorSome(interface));
+                frame
+                    .tasks
+                    .push(EvaluationTask::Error(mir::InterfaceExpression {
+                        interface,
+                        value,
+                    }));
+            }
+            mir::NullableInterfaceValue::Local { local, transfer } => {
                 let value = if transfer {
                     self.current_frame_mut()?
                         .locals
@@ -7353,14 +7493,14 @@ impl Interpreter<'_> {
                 } else {
                     read_local(&self.current_frame()?.locals, local)?.clone()
                 };
-                let LocalValue::NullableError(value) = value else {
+                let LocalValue::NullableError { value, .. } = value else {
                     return Err(InterpreterError::new(
                         "MIR nullable error expression used another local type",
                     ));
                 };
-                self.push_nullable_error(value)?;
+                self.push_nullable_error(interface, value)?;
             }
-            mir::NullableErrorExpression::Property {
+            mir::NullableInterfaceValue::Property {
                 object,
                 property,
                 transfer,
@@ -7370,21 +7510,21 @@ impl Interpreter<'_> {
                 } else {
                     self.read_property(object, property)?
                 };
-                let LocalValue::NullableError(value) = value else {
+                let LocalValue::NullableError { value, .. } = value else {
                     return Err(InterpreterError::new(
                         "MIR nullable error property contains another value type",
                     ));
                 };
-                self.push_nullable_error(value)?;
+                self.push_nullable_error(interface, value)?;
             }
-            mir::NullableErrorExpression::Call { function, args, .. } => {
+            mir::NullableInterfaceValue::Call { function, args, .. } => {
                 self.queue_call(
                     function,
                     args,
-                    ReturnExpectation::Value(mir::Type::NullableError),
+                    ReturnExpectation::Value(mir::Type::NullableInterface(interface)),
                 )?;
             }
-            mir::NullableErrorExpression::DictionaryGet {
+            mir::NullableInterfaceValue::DictionaryGet {
                 collection,
                 key,
                 access,
@@ -7392,12 +7532,12 @@ impl Interpreter<'_> {
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::DictionaryGet {
                     collection,
-                    expected: mir::Type::Error,
+                    expected: mir::Type::Interface(interface),
                     access,
                 });
                 frame.tasks.push(EvaluationTask::Rvalue(*key));
             }
-            mir::NullableErrorExpression::CollectionIndex {
+            mir::NullableInterfaceValue::CollectionIndex {
                 collection,
                 index,
                 positional,
@@ -7951,6 +8091,44 @@ impl Interpreter<'_> {
         expression: mir::ClassExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
+            mir::ClassExpression::InterfacePayload {
+                class,
+                local,
+                transfer,
+            } => {
+                let (object, actual) = self
+                    .nominal_local_parts(local, transfer)?
+                    .ok_or_else(|| InterpreterError::new("narrowed class is null"))?;
+                if !class_is_subtype(self.program, actual, class) {
+                    return Err(InterpreterError::new(
+                        "narrowed interface payload has another class",
+                    ));
+                }
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class { object, class });
+            }
+            mir::ClassExpression::InterfaceReceiver {
+                class,
+                receiver,
+                vtable,
+            } => {
+                let LocalValue::Error(value) = read_local(&self.current_frame()?.locals, receiver)?
+                else {
+                    return Err(InterpreterError::new(
+                        "interface entry receiver is not a carrier",
+                    ));
+                };
+                if value.vtable != vtable || self.interface_class(*value)? != class {
+                    return Err(InterpreterError::new(
+                        "interface entry received an incompatible dynamic payload",
+                    ));
+                }
+                let object = value.object;
+                self.current_frame_mut()?
+                    .values
+                    .push(EvaluationValue::Class { object, class });
+            }
             mir::ClassExpression::Local {
                 class,
                 local,
@@ -7984,7 +8162,7 @@ impl Interpreter<'_> {
                     return Err(InterpreterError::new(format!(
                         "MIR class expression expected class#{}, got {}",
                         class.0,
-                        local_value_type(&value)
+                        local_value_type(self.program, &value)
                     )));
                 };
                 if !class_is_subtype(self.program, actual, class) {
@@ -8170,90 +8348,16 @@ impl Interpreter<'_> {
                 mixed,
                 transfer,
             } => {
-                let value = if transfer {
-                    match mixed_value_from_local(read_local(&self.current_frame()?.locals, mixed)?)
-                    {
-                        Some(MixedValue::Class { class: actual, .. })
-                            if class_is_subtype(self.program, *actual, class) => {}
-                        Some(MixedValue::Class { .. }) => {
-                            return Err(InterpreterError::new(
-                                "MIR mixed class payload observed another class",
-                            ));
-                        }
-                        Some(_) => {
-                            return Err(InterpreterError::new(
-                                "MIR mixed class payload observed another tag",
-                            ));
-                        }
-                        None => {
-                            return Err(InterpreterError::new(
-                                "MIR mixed class payload references another local type",
-                            ));
-                        }
-                    }
-                    let slot = self
-                        .current_frame_mut()?
-                        .locals
-                        .get_mut(mixed.0)
-                        .ok_or_else(|| InterpreterError::new("MIR mixed local does not exist"))?;
-                    match slot.take() {
-                        Some(LocalValue::Mixed(value)) => value,
-                        Some(LocalValue::NullableMixed(Some(value))) => value,
-                        Some(value) => {
-                            *slot = Some(value);
-                            return Err(InterpreterError::new(
-                                "MIR mixed class payload references another local type",
-                            ));
-                        }
-                        None => {
-                            return Err(InterpreterError::new(
-                                "MIR mixed class payload was read before assignment",
-                            ));
-                        }
-                    }
-                } else {
-                    mixed_value_from_local(read_local(&self.current_frame()?.locals, mixed)?)
-                        .ok_or_else(|| {
-                            InterpreterError::new(
-                                "MIR mixed class payload references another local type",
-                            )
-                        })?
-                        .clone()
-                };
-                let MixedValue::Class {
-                    object,
-                    class: actual,
-                    owner,
-                    payload_owned,
-                } = value
-                else {
-                    return Err(InterpreterError::new(
-                        "MIR mixed class payload observed another tag",
-                    ));
-                };
+                let parts = self.nominal_local_parts(mixed, transfer)?;
+                if self.pending_panic.is_some() {
+                    return Ok(());
+                }
+                let (object, actual) =
+                    parts.ok_or_else(|| InterpreterError::new("mixed payload is not nominal"))?;
                 if !class_is_subtype(self.program, actual, class) {
                     return Err(InterpreterError::new(
                         "MIR mixed class payload observed another class",
                     ));
-                }
-                if transfer {
-                    // Moving the class payload out is only sound when this box holds the
-                    // final owning claim. If another box still shares the owner (e.g. read
-                    // from a collection with `mixed $x = $items[0]`) or the box only borrows
-                    // its payload, transferring the object would double-drop it once the
-                    // other holder releases the final claim. Refuse it, matching the native
-                    // backends' runtime panic.
-                    let claims = owner.get();
-                    let owns_final = if claims == 0 {
-                        false
-                    } else {
-                        owner.set(claims - 1);
-                        claims == 1 && payload_owned
-                    };
-                    if !owns_final {
-                        self.pending_panic = Some("P1321");
-                        return Ok(());
-                    }
                 }
                 self.current_frame_mut()?
                     .values
@@ -8304,15 +8408,18 @@ impl Interpreter<'_> {
         expression: mir::SharedReferenceExpression,
     ) -> Result<(), InterpreterError> {
         match expression {
-            mir::SharedReferenceExpression::New { class, value } => {
+            mir::SharedReferenceExpression::New {
+                payload: class,
+                value,
+            } => {
                 let frame = self.current_frame_mut()?;
                 frame
                     .tasks
                     .push(EvaluationTask::BuildSharedReference(class));
-                frame.tasks.push(EvaluationTask::Class(*value));
+                frame.tasks.push(EvaluationTask::Rvalue(*value));
             }
             mir::SharedReferenceExpression::Local {
-                class,
+                payload: class,
                 local,
                 transfer,
             } => {
@@ -8336,7 +8443,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::SharedReference { control, class });
             }
             mir::SharedReferenceExpression::NullableLocalAssumeNonNull {
-                class,
+                payload: class,
                 local,
                 transfer,
             } => {
@@ -8363,7 +8470,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::SharedReference { control, class });
             }
             mir::SharedReferenceExpression::Property {
-                class,
+                payload: class,
                 object,
                 property,
             } => {
@@ -8387,7 +8494,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::SharedReference { control, class });
             }
             mir::SharedReferenceExpression::Call {
-                class,
+                payload: class,
                 function,
                 args,
                 ..
@@ -8396,7 +8503,10 @@ impl Interpreter<'_> {
                 args,
                 ReturnExpectation::Value(mir::Type::SharedReference(class)),
             )?,
-            mir::SharedReferenceExpression::Share { class, value } => {
+            mir::SharedReferenceExpression::Share {
+                payload: class,
+                value,
+            } => {
                 let drop_receiver = value.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
                 frame
@@ -8423,7 +8533,7 @@ impl Interpreter<'_> {
             }
             mir::SharedReferenceExpression::CollectionIndex {
                 positional,
-                class,
+                payload: class,
                 collection,
                 index,
                 remove,
@@ -8449,7 +8559,7 @@ impl Interpreter<'_> {
     ) -> Result<(), InterpreterError> {
         match expression {
             mir::WeakReferenceExpression::Local {
-                class,
+                payload: class,
                 local,
                 transfer,
             } => {
@@ -8473,7 +8583,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::WeakReference { control, class });
             }
             mir::WeakReferenceExpression::NullableLocalAssumeNonNull {
-                class,
+                payload: class,
                 local,
                 transfer,
             } => {
@@ -8500,7 +8610,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::WeakReference { control, class });
             }
             mir::WeakReferenceExpression::Property {
-                class,
+                payload: class,
                 object,
                 property,
             } => {
@@ -8522,7 +8632,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::WeakReference { control, class });
             }
             mir::WeakReferenceExpression::Call {
-                class,
+                payload: class,
                 function,
                 args,
                 ..
@@ -8531,7 +8641,10 @@ impl Interpreter<'_> {
                 args,
                 ReturnExpectation::Value(mir::Type::WeakReference(class)),
             )?,
-            mir::WeakReferenceExpression::Create { class, value } => {
+            mir::WeakReferenceExpression::Create {
+                payload: class,
+                value,
+            } => {
                 let drop_receiver = value.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
                 frame
@@ -8558,7 +8671,7 @@ impl Interpreter<'_> {
             }
             mir::WeakReferenceExpression::CollectionIndex {
                 positional,
-                class,
+                payload: class,
                 collection,
                 index,
                 remove,
@@ -8591,7 +8704,7 @@ impl Interpreter<'_> {
                     class,
                 }),
             mir::NullableSharedReferenceExpression::Shared(value) => {
-                let class = value.class();
+                let class = value.payload();
                 let frame = self.current_frame_mut()?;
                 frame
                     .tasks
@@ -8599,7 +8712,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::SharedReference(value));
             }
             mir::NullableSharedReferenceExpression::Local {
-                class,
+                payload: class,
                 local,
                 transfer,
             } => {
@@ -8623,7 +8736,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::NullableSharedReference { control, class });
             }
             mir::NullableSharedReferenceExpression::Property {
-                class,
+                payload: class,
                 object,
                 property,
             } => {
@@ -8647,7 +8760,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::NullableSharedReference { control, class });
             }
             mir::NullableSharedReferenceExpression::Call {
-                class,
+                payload: class,
                 function,
                 args,
                 ..
@@ -8656,7 +8769,10 @@ impl Interpreter<'_> {
                 args,
                 ReturnExpectation::Value(mir::Type::NullableSharedReference(class)),
             )?,
-            mir::NullableSharedReferenceExpression::Acquire { class, value } => {
+            mir::NullableSharedReferenceExpression::Acquire {
+                payload: class,
+                value,
+            } => {
                 let drop_receiver = value.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
                 frame
@@ -8664,7 +8780,10 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::FinishWeakAcquire(class, drop_receiver));
                 frame.tasks.push(EvaluationTask::WeakReference(*value));
             }
-            mir::NullableSharedReferenceExpression::NullSafeShare { class, value } => {
+            mir::NullableSharedReferenceExpression::NullSafeShare {
+                payload: class,
+                value,
+            } => {
                 let drop_receiver = value.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
                 frame
@@ -8674,7 +8793,10 @@ impl Interpreter<'_> {
                     .tasks
                     .push(EvaluationTask::NullableSharedReference(*value));
             }
-            mir::NullableSharedReferenceExpression::NullSafeAcquire { class, value } => {
+            mir::NullableSharedReferenceExpression::NullSafeAcquire {
+                payload: class,
+                value,
+            } => {
                 let drop_receiver = value.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::FinishNullSafeWeakAcquire(
@@ -8705,7 +8827,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableSharedReference(*left));
             }
             mir::NullableSharedReferenceExpression::DictionaryGet {
-                class,
+                payload: class,
                 collection,
                 key,
                 access,
@@ -8725,7 +8847,7 @@ impl Interpreter<'_> {
             }
             mir::NullableSharedReferenceExpression::CollectionIndex {
                 positional,
-                class,
+                payload: class,
                 collection,
                 index,
                 remove,
@@ -8758,7 +8880,7 @@ impl Interpreter<'_> {
                     class,
                 }),
             mir::NullableWeakReferenceExpression::Weak(value) => {
-                let class = value.class();
+                let class = value.payload();
                 let frame = self.current_frame_mut()?;
                 frame
                     .tasks
@@ -8766,7 +8888,7 @@ impl Interpreter<'_> {
                 frame.tasks.push(EvaluationTask::WeakReference(value));
             }
             mir::NullableWeakReferenceExpression::Local {
-                class,
+                payload: class,
                 local,
                 transfer,
             } => {
@@ -8790,7 +8912,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::NullableWeakReference { control, class });
             }
             mir::NullableWeakReferenceExpression::Property {
-                class,
+                payload: class,
                 object,
                 property,
             } => {
@@ -8814,7 +8936,7 @@ impl Interpreter<'_> {
                     .push(EvaluationValue::NullableWeakReference { control, class });
             }
             mir::NullableWeakReferenceExpression::Call {
-                class,
+                payload: class,
                 function,
                 args,
                 ..
@@ -8823,7 +8945,10 @@ impl Interpreter<'_> {
                 args,
                 ReturnExpectation::Value(mir::Type::NullableWeakReference(class)),
             )?,
-            mir::NullableWeakReferenceExpression::NullSafeCreate { class, value } => {
+            mir::NullableWeakReferenceExpression::NullSafeCreate {
+                payload: class,
+                value,
+            } => {
                 let drop_receiver = value.owned_temporary().is_some();
                 let frame = self.current_frame_mut()?;
                 frame.tasks.push(EvaluationTask::FinishNullSafeWeakCreation(
@@ -8852,7 +8977,7 @@ impl Interpreter<'_> {
                     .push(EvaluationTask::NullableWeakReference(*left));
             }
             mir::NullableWeakReferenceExpression::DictionaryGet {
-                class,
+                payload: class,
                 collection,
                 key,
                 access,
@@ -8872,7 +8997,7 @@ impl Interpreter<'_> {
             }
             mir::NullableWeakReferenceExpression::CollectionIndex {
                 positional,
-                class,
+                payload: class,
                 collection,
                 index,
                 remove,
@@ -10848,6 +10973,40 @@ impl Interpreter<'_> {
         Ok(())
     }
 
+    fn interface_call_entry(
+        &self,
+        callee: &mir::IndirectCallee,
+    ) -> Result<Option<mir::FunctionId>, InterpreterError> {
+        let mir::IndirectCallee::InterfaceMethod {
+            receiver,
+            interface,
+            slot,
+        } = callee
+        else {
+            return Ok(None);
+        };
+        let frame = self.current_frame()?;
+        let LocalValue::Error(value) = read_local(&frame.locals, *receiver)? else {
+            return Err(InterpreterError::new(
+                "interface call receiver is not an interface carrier",
+            ));
+        };
+        let vtable = self
+            .program
+            .interface_vtables
+            .get(value.vtable.0)
+            .filter(|vtable| vtable.interface == *interface)
+            .ok_or_else(|| {
+                InterpreterError::new("interface call receiver has an incompatible vtable")
+            })?;
+        vtable
+            .methods
+            .get(*slot)
+            .copied()
+            .map(Some)
+            .ok_or_else(|| InterpreterError::new("interface call requirement slot does not exist"))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn push_indirect_frame(
         &mut self,
@@ -11649,7 +11808,7 @@ impl Interpreter<'_> {
                 if !local_value_matches_type(self.program, expected, &value) {
                     return Err(InterpreterError::new(format!(
                         "MIR scalar call expected {expected}, returned {}",
-                        local_value_type(&value)
+                        local_value_type(self.program, &value)
                     )));
                 }
                 self.push_local_value(value)?;
@@ -11658,7 +11817,7 @@ impl Interpreter<'_> {
                 if !local_value_matches_type(self.program, expected, &value) {
                     return Err(InterpreterError::new(format!(
                         "MIR discarded call expected {expected}, returned {}",
-                        local_value_type(&value)
+                        local_value_type(self.program, &value)
                     )));
                 }
             }
@@ -12001,7 +12160,7 @@ impl Interpreter<'_> {
         target: crate::compiler_known_io::IoTarget,
         reason: crate::compiler_known_io::IoErrorReason,
         system_code: Option<i64>,
-    ) -> Result<ErrorValue, InterpreterError> {
+    ) -> Result<InterfaceCarrier, InterpreterError> {
         let message = crate::compiler_known_io::io_error_message(operation, &target, reason);
         let operation = self.unit_enum_value(
             crate::compiler_known_io::IO_OPERATION,
@@ -12049,7 +12208,7 @@ impl Interpreter<'_> {
         source: crate::compiler_known_io::Utf8InputSource,
         valid_byte_count: usize,
         invalid_byte_count: Option<usize>,
-    ) -> Result<ErrorValue, InterpreterError> {
+    ) -> Result<InterfaceCarrier, InterpreterError> {
         let message = crate::compiler_known_io::invalid_utf8_message(
             &source,
             valid_byte_count,
@@ -12164,7 +12323,7 @@ impl Interpreter<'_> {
         &mut self,
         type_name: &str,
         properties: Vec<(&str, LocalValue)>,
-    ) -> Result<ErrorValue, InterpreterError> {
+    ) -> Result<InterfaceCarrier, InterpreterError> {
         let descriptor = self
             .program
             .error_descriptors
@@ -12190,11 +12349,11 @@ impl Interpreter<'_> {
                         "MIR Error `{type_name}` has no `{name}` property"
                     ))
                 })?;
-            if local_value_type(&value) != property.ty {
+            if local_value_type(self.program, &value) != property.ty {
                 return Err(InterpreterError::new(format!(
                     "MIR Error `{type_name}` property `{name}` expects {}, got {}",
                     property.ty,
-                    local_value_type(&value)
+                    local_value_type(self.program, &value)
                 )));
             }
             slots[property.id.index] = Some(value);
@@ -12214,9 +12373,17 @@ impl Interpreter<'_> {
                 error_origin: None,
             },
         );
-        Ok(ErrorValue {
+        Ok(InterfaceCarrier {
             object,
-            descriptor: descriptor.id,
+            vtable: self
+                .program
+                .interface_vtable(
+                    mir::ImplementingType::Class(descriptor.class),
+                    mir::InterfaceTypeId::ERROR,
+                )
+                .ok_or_else(|| {
+                    InterpreterError::new("compiler-known Error has no interface vtable")
+                })?,
         })
     }
 
@@ -12241,7 +12408,9 @@ impl Interpreter<'_> {
                 EvaluationValue::NullableString(value) => Ok(LocalValue::NullableString(value)),
                 EvaluationValue::NullableMixed(value) => Ok(LocalValue::NullableMixed(value)),
                 EvaluationValue::Error(value) => Ok(LocalValue::Error(value)),
-                EvaluationValue::NullableError(value) => Ok(LocalValue::NullableError(value)),
+                EvaluationValue::NullableError { interface, value } => {
+                    Ok(LocalValue::NullableError { interface, value })
+                }
                 EvaluationValue::Class { object, class } => Ok(LocalValue::Class { object, class }),
                 EvaluationValue::NullableClass { object, class } => {
                     Ok(LocalValue::NullableClass { object, class })
@@ -12324,7 +12493,7 @@ impl Interpreter<'_> {
             Some(EvaluationValue::Mixed(_)) | Some(EvaluationValue::NullableMixed(_)) => Err(
                 InterpreterError::new("MIR scalar evaluation produced a mixed value"),
             ),
-            Some(EvaluationValue::Error(_)) | Some(EvaluationValue::NullableError(_)) => Err(
+            Some(EvaluationValue::Error(_)) | Some(EvaluationValue::NullableError { .. }) => Err(
                 InterpreterError::new("MIR scalar evaluation produced an Error value"),
             ),
             Some(EvaluationValue::NullableString(_)) => Err(InterpreterError::new(
@@ -12385,7 +12554,7 @@ impl Interpreter<'_> {
             Some(EvaluationValue::Mixed(_)) | Some(EvaluationValue::NullableMixed(_)) => Err(
                 InterpreterError::new("MIR string evaluation produced a mixed value"),
             ),
-            Some(EvaluationValue::Error(_)) | Some(EvaluationValue::NullableError(_)) => Err(
+            Some(EvaluationValue::Error(_)) | Some(EvaluationValue::NullableError { .. }) => Err(
                 InterpreterError::new("MIR string evaluation produced an Error value"),
             ),
             Some(EvaluationValue::NullableString(_)) => Err(InterpreterError::new(
@@ -12440,14 +12609,14 @@ impl Interpreter<'_> {
         Ok(())
     }
 
-    fn push_error(&mut self, value: ErrorValue) -> Result<(), InterpreterError> {
+    fn push_error(&mut self, value: InterfaceCarrier) -> Result<(), InterpreterError> {
         self.current_frame_mut()?
             .values
             .push(EvaluationValue::Error(value));
         Ok(())
     }
 
-    fn pop_error(&mut self) -> Result<ErrorValue, InterpreterError> {
+    fn pop_error(&mut self) -> Result<InterfaceCarrier, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::Error(value)) => Ok(value),
             Some(_) => Err(InterpreterError::new(
@@ -12459,16 +12628,20 @@ impl Interpreter<'_> {
         }
     }
 
-    fn push_nullable_error(&mut self, value: Option<ErrorValue>) -> Result<(), InterpreterError> {
+    fn push_nullable_error(
+        &mut self,
+        interface: mir::InterfaceTypeId,
+        value: Option<InterfaceCarrier>,
+    ) -> Result<(), InterpreterError> {
         self.current_frame_mut()?
             .values
-            .push(EvaluationValue::NullableError(value));
+            .push(EvaluationValue::NullableError { interface, value });
         Ok(())
     }
 
-    fn pop_nullable_error(&mut self) -> Result<Option<ErrorValue>, InterpreterError> {
+    fn pop_nullable_error(&mut self) -> Result<Option<InterfaceCarrier>, InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
-            Some(EvaluationValue::NullableError(value)) => Ok(value),
+            Some(EvaluationValue::NullableError { value, .. }) => Ok(value),
             Some(_) => Err(InterpreterError::new(
                 "MIR nullable Error evaluation produced another value type",
             )),
@@ -12569,7 +12742,7 @@ impl Interpreter<'_> {
 
     fn pop_nullable_shared_reference(
         &mut self,
-    ) -> Result<(crate::class_layout::ClassId, Option<SharedControl>), InterpreterError> {
+    ) -> Result<(mir::SharedPayload, Option<SharedControl>), InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::NullableSharedReference { control, class }) => {
                 Ok((class, control))
@@ -12585,7 +12758,7 @@ impl Interpreter<'_> {
 
     fn pop_nullable_weak_reference(
         &mut self,
-    ) -> Result<(crate::class_layout::ClassId, Option<SharedControl>), InterpreterError> {
+    ) -> Result<(mir::SharedPayload, Option<SharedControl>), InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::NullableWeakReference { control, class }) => Ok((class, control)),
             Some(_) => Err(InterpreterError::new(
@@ -12599,7 +12772,7 @@ impl Interpreter<'_> {
 
     fn pop_writable_shared_reference(
         &mut self,
-    ) -> Result<(WritableSharedControl, mir::WritableSharedPayload), InterpreterError> {
+    ) -> Result<(WritableSharedControl, mir::SharedPayload), InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::WritableSharedReference { control, payload }) => {
                 Ok((control, payload))
@@ -12615,7 +12788,7 @@ impl Interpreter<'_> {
 
     fn pop_writable_weak_reference(
         &mut self,
-    ) -> Result<(WritableSharedControl, mir::WritableSharedPayload), InterpreterError> {
+    ) -> Result<(WritableSharedControl, mir::SharedPayload), InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::WritableWeakReference { control, payload }) => {
                 Ok((control, payload))
@@ -12631,7 +12804,7 @@ impl Interpreter<'_> {
 
     fn pop_nullable_writable_shared_reference(
         &mut self,
-    ) -> Result<(Option<WritableSharedControl>, mir::WritableSharedPayload), InterpreterError> {
+    ) -> Result<(Option<WritableSharedControl>, mir::SharedPayload), InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::NullableWritableSharedReference { control, payload }) => {
                 Ok((control, payload))
@@ -12647,7 +12820,7 @@ impl Interpreter<'_> {
 
     fn pop_nullable_writable_weak_reference(
         &mut self,
-    ) -> Result<(Option<WritableSharedControl>, mir::WritableSharedPayload), InterpreterError> {
+    ) -> Result<(Option<WritableSharedControl>, mir::SharedPayload), InterpreterError> {
         match self.current_frame_mut()?.values.pop() {
             Some(EvaluationValue::NullableWritableWeakReference { control, payload }) => {
                 Ok((control, payload))
@@ -12666,7 +12839,7 @@ impl Interpreter<'_> {
             mir::Type::NullableScalar(ty) => self.push_nullable_scalar(ty, None),
             mir::Type::NullableString => self.push_nullable_string(None),
             mir::Type::NullableMixed => self.push_nullable_mixed(None),
-            mir::Type::NullableError => self.push_nullable_error(None),
+            mir::Type::NullableInterface(interface) => self.push_nullable_error(interface, None),
             mir::Type::NullableClass(class) => self.push_nullable_class(class, None),
             mir::Type::NullableSharedReference(class) => {
                 self.current_frame_mut()?
@@ -12747,11 +12920,11 @@ impl Interpreter<'_> {
             (mir::Type::NullableMixed, LocalValue::NullableMixed(value)) => {
                 self.push_nullable_mixed(value)
             }
-            (mir::Type::NullableError, LocalValue::Error(value)) => {
-                self.push_nullable_error(Some(value))
+            (mir::Type::NullableInterface(interface), LocalValue::Error(value)) => {
+                self.push_nullable_error(interface, Some(value))
             }
-            (mir::Type::NullableError, LocalValue::NullableError(value)) => {
-                self.push_nullable_error(value)
+            (mir::Type::NullableInterface(_), LocalValue::NullableError { interface, value }) => {
+                self.push_nullable_error(interface, value)
             }
             (mir::Type::NullableClass(expected), LocalValue::Class { object, class })
                 if expected == class =>
@@ -12869,7 +13042,9 @@ impl Interpreter<'_> {
             Some(EvaluationValue::NullableString(value)) => Ok(LocalValue::NullableString(value)),
             Some(EvaluationValue::NullableMixed(value)) => Ok(LocalValue::NullableMixed(value)),
             Some(EvaluationValue::Error(value)) => Ok(LocalValue::Error(value)),
-            Some(EvaluationValue::NullableError(value)) => Ok(LocalValue::NullableError(value)),
+            Some(EvaluationValue::NullableError { interface, value }) => {
+                Ok(LocalValue::NullableError { interface, value })
+            }
             Some(EvaluationValue::Class { object, class }) => {
                 Ok(LocalValue::Class { object, class })
             }
@@ -12987,7 +13162,9 @@ impl Interpreter<'_> {
             LocalValue::NullableString(value) => EvaluationValue::NullableString(value),
             LocalValue::NullableMixed(value) => EvaluationValue::NullableMixed(value),
             LocalValue::Error(value) => EvaluationValue::Error(value),
-            LocalValue::NullableError(value) => EvaluationValue::NullableError(value),
+            LocalValue::NullableError { interface, value } => {
+                EvaluationValue::NullableError { interface, value }
+            }
             LocalValue::Class { object, class } => EvaluationValue::Class { object, class },
             LocalValue::NullableClass { object, class } => {
                 EvaluationValue::NullableClass { object, class }
@@ -13575,9 +13752,12 @@ impl Interpreter<'_> {
                 LocalValue::Mixed(_) | LocalValue::NullableMixed(_) => Err(InterpreterError::new(
                     format!("MIR mixed local local{} was used as a scalar value", id.0),
                 )),
-                LocalValue::Error(_) | LocalValue::NullableError(_) => Err(InterpreterError::new(
-                    format!("MIR Error local local{} was used as a scalar value", id.0),
-                )),
+                LocalValue::Error(_) | LocalValue::NullableError { .. } => {
+                    Err(InterpreterError::new(format!(
+                        "MIR Error local local{} was used as a scalar value",
+                        id.0
+                    )))
+                }
                 LocalValue::NullableString(_) => Err(InterpreterError::new(format!(
                     "MIR nullable-string local local{} was used as a scalar value",
                     id.0
@@ -14215,6 +14395,34 @@ impl Interpreter<'_> {
         }
     }
 
+    fn shared_interface_payload(
+        &self,
+        local: mir::LocalId,
+    ) -> Result<Option<InterfaceCarrier>, InterpreterError> {
+        let payload = match read_local(&self.current_frame()?.locals, local)? {
+            LocalValue::SharedReference { control, .. } => control.borrow().payload.clone(),
+            LocalValue::NullableSharedReference { control, .. } => control
+                .as_ref()
+                .and_then(|control| control.borrow().payload.clone()),
+            LocalValue::SharedReferenceAccess { control, .. } => control.borrow().payload.clone(),
+            LocalValue::NullableSharedReferenceAccess { control, .. } => control
+                .as_ref()
+                .and_then(|control| control.borrow().payload.clone()),
+            _ => {
+                return Err(InterpreterError::new(
+                    "interface projection used another handle family",
+                ))
+            }
+        };
+        match payload {
+            Some(LocalValue::Error(value)) => Ok(Some(value)),
+            None => Ok(None),
+            _ => Err(InterpreterError::new(
+                "shared payload is not an interface carrier",
+            )),
+        }
+    }
+
     fn shared_access_payload(&self, local: mir::LocalId) -> Result<LocalValue, InterpreterError> {
         let LocalValue::SharedReferenceAccess { control, .. } =
             read_local(&self.current_frame()?.locals, local)?
@@ -14426,7 +14634,7 @@ impl Interpreter<'_> {
             .ok_or_else(|| InterpreterError::new("MIR Error descriptor does not exist"))
     }
 
-    fn error_local(&self, local: mir::LocalId) -> Result<ErrorValue, InterpreterError> {
+    fn error_local(&self, local: mir::LocalId) -> Result<InterfaceCarrier, InterpreterError> {
         match read_local(&self.current_frame()?.locals, local)? {
             LocalValue::Error(value) => Ok(*value),
             _ => Err(InterpreterError::new(
@@ -14435,7 +14643,106 @@ impl Interpreter<'_> {
         }
     }
 
-    fn take_error_local(&mut self, local: mir::LocalId) -> Result<ErrorValue, InterpreterError> {
+    fn nominal_local_parts(
+        &mut self,
+        local: mir::LocalId,
+        transfer: bool,
+    ) -> Result<Option<(usize, crate::class_layout::ClassId)>, InterpreterError> {
+        let value = read_local(&self.current_frame()?.locals, local)?;
+        let mut mixed_owner = None;
+        let object = match value {
+            LocalValue::Class { object, .. } => Some(*object),
+            LocalValue::NullableClass { object, .. } => *object,
+            LocalValue::Error(value) => Some(value.object),
+            LocalValue::NullableError { value, .. } => value.map(|value| value.object),
+            LocalValue::Mixed(value) | LocalValue::NullableMixed(Some(value)) => match value {
+                MixedValue::Class {
+                    object,
+                    owner,
+                    payload_owned,
+                    ..
+                } => {
+                    mixed_owner = Some((Rc::clone(owner), *payload_owned));
+                    Some(*object)
+                }
+                MixedValue::Interface {
+                    value,
+                    owner,
+                    payload_owned,
+                    ..
+                } => {
+                    mixed_owner = Some((Rc::clone(owner), *payload_owned));
+                    Some(value.object)
+                }
+                _ => None,
+            },
+            LocalValue::NullableMixed(None) => None,
+            _ => {
+                return Err(InterpreterError::new(
+                    "nominal projection has a non-nominal source",
+                ))
+            }
+        };
+        let parts = object
+            .map(|object| {
+                self.heap
+                    .get(&object)
+                    .map(|value| (object, value.class))
+                    .ok_or_else(|| {
+                        InterpreterError::new("nominal projection uses a destroyed object")
+                    })
+            })
+            .transpose()?;
+        if transfer {
+            self.current_frame_mut()?.locals[local.0] = None;
+            if let Some((owner, payload_owned)) = mixed_owner {
+                let claims = owner.get();
+                owner.set(claims.saturating_sub(1));
+                if claims != 1 || !payload_owned {
+                    self.pending_panic = Some("P1321");
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(parts)
+    }
+
+    fn interface_class(
+        &self,
+        value: InterfaceCarrier,
+    ) -> Result<crate::class_layout::ClassId, InterpreterError> {
+        let table = self
+            .program
+            .interface_vtables
+            .get(value.vtable.0)
+            .ok_or_else(|| InterpreterError::new("MIR interface vtable does not exist"))?;
+        match table.implementing_type {
+            mir::ImplementingType::Class(class) => Ok(class),
+            mir::ImplementingType::Collection(_) => Err(InterpreterError::new(
+                "MIR interface payload is not a class",
+            )),
+        }
+    }
+
+    fn interface_error_metadata(
+        &self,
+        value: InterfaceCarrier,
+    ) -> Result<&mir::ErrorDescriptor, InterpreterError> {
+        let descriptor = self
+            .program
+            .interface_vtables
+            .get(value.vtable.0)
+            .and_then(|table| table.error_descriptor)
+            .ok_or_else(|| {
+                InterpreterError::new("MIR interface has no Error reporting metadata")
+            })?;
+        self.error_descriptor(descriptor)
+    }
+
+    fn take_error_local(
+        &mut self,
+        local: mir::LocalId,
+    ) -> Result<InterfaceCarrier, InterpreterError> {
         let slot = self
             .current_frame_mut()?
             .locals
@@ -14463,10 +14770,11 @@ impl Interpreter<'_> {
             .ok_or_else(|| InterpreterError::new("MIR Error local does not exist"))?
             .take();
         match value {
-            Some(LocalValue::Error(value)) | Some(LocalValue::NullableError(Some(value))) => {
-                self.push_owned_drop_task(OwnedDrop::Error(value))
-            }
-            Some(LocalValue::NullableError(None)) | None => Ok(()),
+            Some(LocalValue::Error(value))
+            | Some(LocalValue::NullableError {
+                value: Some(value), ..
+            }) => self.push_owned_drop_task(OwnedDrop::Error(value)),
+            Some(LocalValue::NullableError { value: None, .. }) | None => Ok(()),
             Some(value) => {
                 self.current_frame_mut()?.locals[local.0] = Some(value);
                 Err(InterpreterError::new(
@@ -14497,7 +14805,7 @@ impl Interpreter<'_> {
             }
             OwnedDrop::Error(value) => EvaluationTask::DropObject {
                 object: value.object,
-                class: self.error_descriptor(value.descriptor)?.class,
+                class: self.interface_class(value)?,
             },
             OwnedDrop::Function(value) => EvaluationTask::DropFunctionValue(value),
         };
@@ -14556,7 +14864,7 @@ impl Interpreter<'_> {
             (mir::ReturnType::Value(ty), FunctionOutcome::Value(value)) => {
                 Err(InterpreterError::new(format!(
                     "MIR entry must return int, but signature/value were {ty}/{}",
-                    local_value_type(&value)
+                    local_value_type(self.program, &value)
                 )))
             }
             (_, FunctionOutcome::CheckedError(error)) => self.runtime_error_output(error, entry),
@@ -14565,10 +14873,10 @@ impl Interpreter<'_> {
 
     fn runtime_error_output(
         &self,
-        error: ErrorValue,
+        error: InterfaceCarrier,
         entry: &mir::Function,
     ) -> Result<InterpreterOutput, InterpreterError> {
-        let descriptor = self.error_descriptor(error.descriptor)?;
+        let descriptor = self.interface_error_metadata(error)?;
         let object = self.heap.get(&error.object).ok_or_else(|| {
             InterpreterError::new("escaping Error object was destroyed before reporting")
         })?;
@@ -15289,7 +15597,7 @@ fn assertion_local_value_presentation(
         LocalValue::NullableScalar { value: None, .. }
         | LocalValue::NullableString(None)
         | LocalValue::NullableMixed(None)
-        | LocalValue::NullableError(None)
+        | LocalValue::NullableError { value: None, .. }
         | LocalValue::NullableClass { object: None, .. }
         | LocalValue::NullableSharedReference { control: None, .. }
         | LocalValue::NullableWeakReference { control: None, .. }
@@ -15379,7 +15687,7 @@ fn collection_bytes(collection: &CollectionValue) -> Result<Vec<u8>, Interpreter
         .collect()
 }
 
-fn local_value_type(value: &LocalValue) -> mir::Type {
+fn local_value_type(program: &mir::Program, value: &LocalValue) -> mir::Type {
     match value {
         LocalValue::Scalar(value) => mir::Type::Scalar(value.ty()),
         LocalValue::String(_) => mir::Type::String,
@@ -15387,8 +15695,10 @@ fn local_value_type(value: &LocalValue) -> mir::Type {
         LocalValue::NullableScalar { ty, .. } => mir::Type::NullableScalar(*ty),
         LocalValue::NullableString(_) => mir::Type::NullableString,
         LocalValue::NullableMixed(_) => mir::Type::NullableMixed,
-        LocalValue::Error(_) => mir::Type::Error,
-        LocalValue::NullableError(_) => mir::Type::NullableError,
+        LocalValue::Error(value) => {
+            mir::Type::Interface(program.interface_vtables[value.vtable.0].interface)
+        }
+        LocalValue::NullableError { interface, .. } => mir::Type::NullableInterface(*interface),
         LocalValue::Class { class, .. } => mir::Type::Class(*class),
         LocalValue::NullableClass { class, .. } => mir::Type::NullableClass(*class),
         LocalValue::SharedReference { class, .. } => mir::Type::SharedReference(*class),
@@ -15456,15 +15766,12 @@ fn local_value_matches_type(
         | (mir::Type::NullableClass(expected), LocalValue::NullableClass { class, .. }) => {
             class_is_subtype(program, *class, expected)
         }
-        _ => local_value_type(value) == expected,
+        _ => local_value_type(program, value) == expected,
     }
 }
 
-fn writable_payload_type(payload: mir::WritableSharedPayload) -> mir::Type {
-    match payload {
-        mir::WritableSharedPayload::Class(class) => mir::Type::Class(class),
-        mir::WritableSharedPayload::Collection(collection) => mir::Type::Collection(collection),
-    }
+fn writable_payload_type(payload: mir::SharedPayload) -> mir::Type {
+    payload.ty()
 }
 
 fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
@@ -15472,7 +15779,7 @@ fn non_nullable_type(ty: mir::Type) -> Option<mir::Type> {
         mir::Type::NullableScalar(ty) => Some(mir::Type::Scalar(ty)),
         mir::Type::NullableString => Some(mir::Type::String),
         mir::Type::NullableMixed => Some(mir::Type::Mixed),
-        mir::Type::NullableError => Some(mir::Type::Error),
+        mir::Type::NullableInterface(interface) => Some(mir::Type::Interface(interface)),
         mir::Type::NullableClass(class) => Some(mir::Type::Class(class)),
         mir::Type::NullableSharedReference(class) => Some(mir::Type::SharedReference(class)),
         mir::Type::NullableWeakReference(class) => Some(mir::Type::WeakReference(class)),
@@ -15528,7 +15835,7 @@ fn retain_mixed_claim(value: &mut MixedValue, ownership: mir::MixedOwnership) {
     match value {
         MixedValue::Class { owner, .. }
         | MixedValue::PayloadEnum { owner, .. }
-        | MixedValue::Error { owner, .. }
+        | MixedValue::Interface { owner, .. }
         | MixedValue::Function { owner, .. } => {
             owner.set(owner.get().saturating_add(1));
         }
@@ -15554,10 +15861,11 @@ fn collect_owned_objects_from_entries(
 
 fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop>) {
     match value {
-        LocalValue::Error(value) | LocalValue::NullableError(Some(value)) => {
-            drops.push(OwnedDrop::Error(value))
-        }
-        LocalValue::NullableError(None) => {}
+        LocalValue::Error(value)
+        | LocalValue::NullableError {
+            value: Some(value), ..
+        } => drops.push(OwnedDrop::Error(value)),
+        LocalValue::NullableError { value: None, .. } => {}
         LocalValue::SharedReference { control, .. } => drops.push(OwnedDrop::Shared(control)),
         LocalValue::WeakReference { control, .. } => drops.push(OwnedDrop::Weak(control)),
         LocalValue::NullableSharedReference {
@@ -15654,15 +15962,17 @@ fn collect_owned_objects_from_value(value: LocalValue, drops: &mut Vec<OwnedDrop
                 }
             }
         }
-        LocalValue::Mixed(MixedValue::Error {
+        LocalValue::Mixed(MixedValue::Interface {
             value,
             owner,
             payload_owned,
+            ..
         })
-        | LocalValue::NullableMixed(Some(MixedValue::Error {
+        | LocalValue::NullableMixed(Some(MixedValue::Interface {
             value,
             owner,
             payload_owned,
+            ..
         })) => {
             let claims = owner.get();
             if claims != 0 {
@@ -15735,14 +16045,18 @@ fn collection_values_equal(ty: mir::Type, left: &LocalValue, right: &LocalValue)
             LocalValue::NullableMixed(Some(left)),
         ) => left == right,
         (
-            mir::Type::NullableError,
-            LocalValue::NullableError(Some(left)),
+            mir::Type::NullableInterface(_),
+            LocalValue::NullableError {
+                value: Some(left), ..
+            },
             LocalValue::Error(right),
         )
         | (
-            mir::Type::NullableError,
+            mir::Type::NullableInterface(_),
             LocalValue::Error(right),
-            LocalValue::NullableError(Some(left)),
+            LocalValue::NullableError {
+                value: Some(left), ..
+            },
         ) => left == right,
         (
             mir::Type::NullableClass(class),
@@ -16323,8 +16637,10 @@ fn assign_local(
             if expected == *ty
     ) || matches!(
         (definition.ty, &value),
-        (mir::Type::Error, LocalValue::Error(_))
-            | (mir::Type::NullableError, LocalValue::NullableError(_))
+        (mir::Type::Interface(expected), LocalValue::Error(value)) if program.interface_vtables[value.vtable.0].interface == expected
+    ) || matches!(
+        (definition.ty, &value),
+        (mir::Type::NullableInterface(expected), LocalValue::NullableError { interface, .. }) if expected == *interface
     );
     if !compatible {
         let actual = match &value {
@@ -16340,7 +16656,7 @@ fn assign_local(
             LocalValue::NullableString(_) => "?string",
             LocalValue::NullableMixed(_) => "?mixed",
             LocalValue::Error(_) => "Error",
-            LocalValue::NullableError(_) => "?Error",
+            LocalValue::NullableError { .. } => "?Error",
             LocalValue::Class { .. } => "class",
             LocalValue::NullableClass { .. } => "nullable class",
             LocalValue::SharedReference { .. } => "shared reference",

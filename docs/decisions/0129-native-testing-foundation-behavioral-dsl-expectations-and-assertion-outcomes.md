@@ -42,7 +42,7 @@ Native Testing Foundation Slice 2 - Complete
 Native Testing Foundation Slice 3 - Complete
 Native Testing Foundation - Complete
 Stage 34 Single Class Inheritance - Complete
-Stage 35 Interfaces And Traits - In Progress; Slice 1 Complete; Slice 2 Next
+Stage 35 Interfaces And Traits - In Progress; Slices 1 And 2 Complete; Slice 3 Next
 Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
@@ -620,7 +620,7 @@ Completed status:
 ```text
 Native Testing Foundation - Complete
 Stage 34 Single Class Inheritance - Complete
-Stage 35 Interfaces And Traits - In Progress; Slice 1 Complete; Slice 2 Next
+Stage 35 Interfaces And Traits - In Progress; Slices 1 And 2 Complete; Slice 3 Next
 Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
@@ -694,7 +694,7 @@ No test assertion may consume a Move value merely to inspect it.
 - Baton remains the runner and process orchestrator.
 - The compiler remains the semantic authority.
 - The language server remains a presentation client over compiler/Baton facts.
-- Stage 34 is complete and Stage 35 Slice 1 is complete and Slice 2 is next because this foundation is closed.
+- Stage 34 is complete and Stage 35 Slices 1 and 2 are complete and Slice 3 is next because this foundation is closed.
 
 ## Invalidated Elsewhere
 
