@@ -97,6 +97,25 @@ function main(): int
 }
 
 #[test]
+fn null_safe_generic_calls_infer_the_method_result_before_lifting() {
+    let source =
+        include_str!("../../../examples/native/main_stage35_interface_null_safe_generics.doria");
+    let program = doriac::lower_source_to_mir("null-safe-generics.doria", source).unwrap();
+    let output = doriac::mir_interpreter::interpret(&program).unwrap();
+    assert_eq!(
+        output.stdout,
+        include_bytes!(
+            "fixtures/native_io/main_stage35_interface_null_safe_generics/expected_stdout"
+        )
+    );
+    assert_eq!(output.exit_status, 0);
+    let errors = diagnostics(
+        "class Choice { function choose<T>(T $one, T $two): T { return $one; } } function bad(?Choice $choice): ?int { return $choice?->choose(1, \"wrong\"); }",
+    );
+    assert!(errors.iter().any(|diagnostic| diagnostic.code == "E0532"));
+}
+
+#[test]
 fn unresolved_inference_points_to_a_typed_declaration() {
     let errors = diagnostics(
         r#"

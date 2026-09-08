@@ -49,8 +49,8 @@ unproved refinements, expired roots, and escaped access leases. Cloneable
 widening, user-defined iteration loans, and trait flattening remain later
 slices with precise pre-HIR diagnostics.
 
-The 29 interface fixtures have exact output/status sidecars in the durable
-manifest. Linux CI runs the 28 leak-free fixtures under Valgrind for both native
+The 30 interface fixtures have exact output/status sidecars in the durable
+manifest. Linux CI runs the 29 leak-free fixtures under Valgrind for both native
 profiles, checking definite and indirect leaks; that platform evidence is
 separate from local macOS parity. `main_stage35_interface_strong_cycles` instead
 proves intentional cycle retention and is excluded only from leak-free checks.
@@ -58,6 +58,8 @@ Its PHP regression forces host collection and checks process shutdown: neither
 may invoke Doria payload destruction while the manual strong count is positive.
 The shared-storage fixture also replaces and clears nullable strong/weak property
 handles for both readonly and writable shared ownership families.
+Null-safe generic calls preserve result-context inference through concrete,
+erased, and shared receivers, including already-nullable and context-only types.
 
 | Interface fixture group                         | Interpreter | Cranelift | LLVM    | PHP     |
 |-------------------------------------------------|-------------|-----------|---------|---------|

@@ -18363,9 +18363,22 @@ impl<'program> Checker<'program> {
             return;
         };
         let mut bindings = pending.bindings;
+        let return_ty = if matches!(
+            expr,
+            Expr::MethodCall {
+                null_safe: true,
+                ..
+            }
+        ) {
+            // Context describes the lifted call, not the method's unlifted result.
+            let result = self.substitute_type(pending.return_ty, &bindings);
+            self.null_safe_result_type(result, true)
+        } else {
+            pending.return_ty
+        };
         self.infer_type_parameter_bindings(
             &pending.callee,
-            pending.return_ty,
+            return_ty,
             expected,
             expr.span(),
             &mut bindings,

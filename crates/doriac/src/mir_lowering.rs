@@ -23689,7 +23689,11 @@ fn lower_nullable_shared_reference_expression(
                 remove: false,
             })
         }
-        _ if context.expression_type(expr)? == mir::Type::SharedReference(expected) => {
+        _ if matches!(
+            unparenthesized_place(expr),
+            hir::Expr::New { shared: true, .. }
+        ) || context.expression_type(expr)? == mir::Type::SharedReference(expected) =>
+        {
             Ok(mir::NullableSharedReferenceExpression::Shared(
                 lower_shared_reference_expression(expr, expected, transfer, context)?,
             ))
