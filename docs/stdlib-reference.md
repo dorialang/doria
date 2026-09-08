@@ -68,20 +68,22 @@ contracts, and public iteration), and 0079 (`Displayable`).
   the contract. The erased value exposes readonly `message` and uses identity
   equality. A class extending an Error-conforming class remains conforming: a
   parent `throws` contract, catch, and typed `toThrow` inspector cover
-  descendants while preserving the concrete Error identity. General interface
-  execution and `SharedReference<Error>` land in Stage 35 Slice 2. Decisions 0119
-  and 0130. Decision 0134 unifies its erased carrier with general interface
+  descendants while preserving the concrete Error identity. Stage 35 Slice 2
+  executes Error subinterfaces and all six shared/weak/access families with
+  interface payloads. Decisions 0119 and 0130. Decision 0134 unifies its erased carrier with general interface
   values, permits Error subinterfaces, and retains the stored-message rule as a
   narrow compiler-known exception rather than accepting general interface
   properties.
 
 Stage 35 Slice 1 checks these canonical declarations, inherited requirements,
 and trait-free nominal conformance, including generic concrete specialization.
-It does not activate interface values or erased calls (Slice 2), new value
-operations, Cloneable widening, or public iteration (Slice 3), or trait
-composition (Slice 4). Each pending operation receives its owning slice's
-diagnostic before executable lowering. Existing Error and concrete Displayable
-execution retain their current carriers and behavior.
+Slice 2 executes interface values and erased calls, preserving readonly,
+writable, and take contracts through nullable, mixed, stored, and shared values.
+Error uses the general interface carrier; Displayable invokes the selected
+requirement once in every display context. New value operations, Cloneable
+widening, and public iteration remain Slice 3; trait composition remains
+Slice 4. Each pending operation receives its owning slice's diagnostic before
+executable lowering, including operations through a user subinterface.
 
 Primitives conform to `Equatable`/`Comparable`/`Hashable` by compiler-known conformance and satisfy generic constraints with no boxing (0096).
 
@@ -99,7 +101,13 @@ failed transition through a structured `conflictReason`: readonly-to-writable,
 writable-to-readonly, or writable-to-writable. Access objects release that access
 registration before releasing their owning claim.
 
-In v1.0 the readonly family accepts **class payloads only** — `SharedReference<int>` and `shared new List<int>()` are rejected, since it forwards readonly access directly with no access object for indexed operations. The writable family accepts supported owned collection move types, because its access objects forward member and indexed operations (`$access[0] = 10`). This is a v1.0 domain rule that a later readonly-sharing design may widen.
+The readonly family accepts class allocations, including an interface view of
+the concrete class: `SharedReference<I> $value = shared new Implementation();`.
+All six families retain the same allocation and invariant interface view.
+`SharedReference<int>` and `shared new List<int>()` remain rejected. The writable
+family also accepts supported owned collection move types, because its access
+objects forward member and indexed operations (`$access[0] = 10`). Interface
+support adds no container or wrapper covariance and no cross-family conversion.
 
 The readonly and writable families are disjoint: no conversion exists either way between `SharedReference<T>` and `WritableSharedReference<T>`, the weak forms preserve their family, and no readonly-family and writable-family handle ever refer to the same allocation. All `WritableSharedReference<T>` handles to one allocation share a single runtime access state.
 

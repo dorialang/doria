@@ -7,6 +7,22 @@ fn analyze(source: &str) -> doriac::semantics::SemanticAnalysis {
 }
 
 #[test]
+fn interface_self_requires_exact_dynamic_owned_results() {
+    let prefix = "interface Duplicate { function duplicate(): self; }";
+    for source in [
+        "open class Base implements Duplicate { function duplicate(): self { return new Child(); } } class Child extends Base {}",
+        "open class Base implements Duplicate { function duplicate(): self { return new Base(); } } class Child extends Base {}",
+        "open class Base implements Duplicate { open function duplicate(): self { let writable $result = new Base(); if (choose()) { $result = new Child(); } return $result; } } class Child extends Base { override function duplicate(): self { return new Child(); } } function choose(): bool { return true; }",
+        "class Base implements Duplicate { function duplicate(): self { return $this; } }",
+    ] {
+        let analysis = analyze(&format!("{prefix} {source}"));
+        assert!(analysis.info.contracts.conformances.iter().any(|fact| fact.status == ConformanceStatus::Invalid
+            && fact.implementations.iter().any(|implementation| implementation.failures.contains(
+                &doriac::semantics::contracts::ContractMismatch::ExactDynamicReturn))), "{source}\n{:?}", analysis.diagnostics);
+    }
+}
+
+#[test]
 fn concrete_generic_instances_publish_substituted_conformance_facts() {
     let source = "interface I<T> { function identity(take T $value): T; } class Box<T> implements I<T> { function identity(take T $value): T { return $value; } } function main(): void { let $box = new Box<int>(); echo $box->identity(42); }";
     let analysis = analyze(source);
@@ -164,7 +180,7 @@ fn nested_trait_property_paths_preserve_each_writable_edge() {
 }
 
 #[test]
-fn every_shared_family_and_nested_contract_position_has_a_pre_hir_boundary() {
+fn every_shared_family_and_nested_contract_position_is_accepted() {
     for ty in [
         "SharedReference<I>",
         "WeakReference<I>",
@@ -180,16 +196,12 @@ fn every_shared_family_and_nested_contract_position_has_a_pre_hir_boundary() {
             "interface I {{ function run(): void; }} function hold({ty} $value): void {{}}"
         );
         let analysis = analyze(&source);
-        assert!(!analysis.diagnostics.is_empty(), "{ty}");
         assert!(
-            analysis
-                .diagnostics
-                .iter()
-                .all(|diagnostic| diagnostic.code == "E0758"),
+            analysis.diagnostics.is_empty(),
             "{ty}: {:?}",
             analysis.diagnostics
         );
-        assert!(doriac::lower_source("pending.doria", &source).is_err());
+        doriac::lower_source("interfaces.doria", &source).unwrap();
     }
 }
 
@@ -269,7 +281,7 @@ function main(): void { let $values = new Values(); foreach ($values as int $val
         analysis
             .diagnostics
             .iter()
-            .all(|diagnostic| matches!(diagnostic.code, "E0758" | "E0759")),
+            .all(|diagnostic| diagnostic.code == "E0759"),
         "{:?}",
         analysis.diagnostics
     );
@@ -285,7 +297,11 @@ fn invalid_graphs_never_publish_checked_or_deferred_conformance() {
     ] {
         let analysis = analyze(source);
         assert!(!analysis.diagnostics.is_empty());
-        assert!(analysis.info.contracts.conformances.iter().all(|fact| fact.status == ConformanceStatus::Invalid), "{:?}", analysis.info.contracts);
+        let authored = analysis.info.contracts.conformances.iter()
+            .filter(|fact| fact.origin.source == doriac::source::SourceId(0))
+            .collect::<Vec<_>>();
+        assert!(!authored.is_empty());
+        assert!(authored.iter().all(|fact| fact.status == ConformanceStatus::Invalid), "{:?}", analysis.info.contracts);
     }
     let body = analyze("trait Broken { function answer(): int { return \"wrong\"; } }");
     assert!(
@@ -436,13 +452,15 @@ fn recursive_generic_parents_terminate_before_specialization_expands() {
 }
 
 #[test]
-fn interface_parameters_receive_the_slice_two_boundary() {
+fn interface_parameters_reach_hir_with_checked_calls() {
     let source = "interface Renderable { function render(): string; } function renderReport(Renderable $report): string { return $report->render(); }";
     let analysis = analyze(source);
-    assert_eq!(analysis.diagnostics.len(), 1, "{:?}", analysis.diagnostics);
-    assert_eq!(analysis.diagnostics[0].code, "E0758");
-    assert!(analysis.diagnostics[0].message.contains("Stage 35 Slice 2"));
-    assert!(doriac::lower_source("contracts.doria", source).is_err());
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    doriac::lower_source("contracts.doria", source).unwrap();
 }
 
 #[test]
@@ -596,7 +614,7 @@ fn nominal_generic_constraints_reject_structural_coincidence_and_primitives() {
 }
 
 #[test]
-fn interface_value_matrix_resolves_types_then_stops_before_hir() {
+fn interface_value_matrix_checks_and_lowers_through_public_entrypoints() {
     let declarations = "interface Renderable { function render(): string; } class Report implements Renderable { function render(): string { return \"report\"; } }";
     for body in [
         "Renderable $value = new Report(); echo $value->render();",
@@ -608,9 +626,11 @@ fn interface_value_matrix_resolves_types_then_stops_before_hir() {
     ] {
         let source = format!("{declarations} function main(): void {{ {body} }}");
         let analysis = analyze(&source);
-        assert_eq!(analysis.diagnostics.iter().map(|diagnostic| diagnostic.code).collect::<Vec<_>>(), ["E0758"], "{body}: {:?}", analysis.diagnostics);
-        assert!(doriac::lower_source("boundaries.doria", &source).is_err());
-        assert!(doriac::compile_source_to_php("boundaries.doria", &source).is_err());
+        assert!(analysis.diagnostics.is_empty(), "{body}: {:?}", analysis.diagnostics);
+        let mir = doriac::lower_source_to_mir("interfaces.doria", &source).unwrap();
+        doriac::mir_validation::validate_program(&mir).unwrap();
+        doriac::mir_interpreter::interpret(&mir).unwrap();
+        doriac::compile_source_to_php("interfaces.doria", &source).unwrap();
     }
     let invalid =
         analyze("interface Renderable {} function main(): void { Renderable $value = 1; }");
@@ -711,14 +731,10 @@ function main(): void { let $name = new Name(); echo $name; }
     );
     let analysis = analyze("interface StorageError extends Error {} function propagate(take StorageError $error): void throws StorageError { throw $error; }");
     assert!(
-        analysis
-            .diagnostics
-            .iter()
-            .all(|diagnostic| diagnostic.code == "E0758"),
+        analysis.diagnostics.is_empty(),
         "{:?}",
         analysis.diagnostics
     );
-    assert!(!analysis.diagnostics.is_empty());
 }
 
 #[test]

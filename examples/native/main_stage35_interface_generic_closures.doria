@@ -1,0 +1,13 @@
+interface Value { function number(): int; }
+class Item implements Value { function number(): int { return 7; } }
+function invoke<T>(take T $value): T {
+    let $identity = fn(take T $input) => $input;
+    return $identity($value);
+}
+function main(): void {
+    echo invoke(42);
+    echo invoke(true);
+    Value $value = new Item();
+    let $result = invoke($value);
+    echo $result->number();
+}

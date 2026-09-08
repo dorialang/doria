@@ -1,0 +1,45 @@
+interface Value { function name(): string; writable function update(): void; }
+class Item implements Value {
+    function __construct(string $label) {}
+    function name(): string { return $this->label; }
+    writable function update(): void { echo "{$this->label};"; }
+    function __destruct(): void { try { echo "drop {$this->label};"; } catch (Error) {} }
+}
+class Stop implements Error { string $message = "stop"; }
+function read(Value $value): void { echo "{$value->name()};"; }
+function readNullable(?Value $value): void { if ($value != null) { read($value); } }
+function change(writable Value $value): void { $value->update(); }
+function changeNullable(writable ?Value $value): void { if ($value != null) { $value->update(); } }
+function consume(take Value $value): void { read($value); }
+function failValue(Value $value): void throws Stop { read($value); throw new Stop(); }
+function failInteger(): int throws Stop { throw new Stop(); }
+function pair(Value $value, int $flag): void { read($value); }
+function make(): Value { return new Item("factory"); }
+interface Consumer { function call(Value $value): void; }
+class Sink implements Consumer {
+    function __construct(parameter ?Value $value) { readNullable($value); }
+    function call(Value $value): void { read($value); }
+    static function accept(Value $value): void { read($value); }
+}
+function main(): void {
+    read(new Item("free"));
+    readNullable(new Item("nullable"));
+    readNullable(null);
+    change(new Item("writable"));
+    changeNullable(new Item("writable-nullable"));
+    consume(new Item("take"));
+    read(make());
+    let $sink = new Sink(new Item("constructor"));
+    $sink->call(new Item("instance"));
+    Sink::accept(new Item("static"));
+    let $callback = function (Value $value): void { read($value); };
+    $callback(new Item("closure"));
+    Consumer $consumer = new Sink(null);
+    $consumer->call(new Item("erased"));
+    pair(flag: 0, value: new Item("named"));
+    try { failValue(new Item("failure")); }
+    catch (Stop) { echo "caught;"; }
+    try { pair(new Item("later"), failInteger()); }
+    catch (Stop) { echo "later-caught;"; }
+    echo "done\n";
+}

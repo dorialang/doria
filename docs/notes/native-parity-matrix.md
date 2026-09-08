@@ -35,13 +35,43 @@ Decision 0134 accepts Stage 35 interface, trait, core-contract, and public-
 iteration authority. Slice 1 adds `main_stage35_concrete_conformance.doria`
 (`report\n`) and `main_stage35_generic_conformance.doria` (`42\n2\n`), exercising
 ordinary concrete methods and semantically selected generic calls without
-interface erasure. Slices 2 through 5
-must add explicit matrix rows for two-word erased carriers, exact dynamic drop,
-nullable/mixed/shared transport, direct versus erased dispatch, Cloneable
-widening, user-defined iteration loans, and deterministic trait flattening as
-those paths become executable. Until then, each accepted but unimplemented path
-must stop before HIR with its precise slice diagnostic; `Covered` is not implied
-by the accepted decision.
+interface erasure. Slice 2 adds the `main_stage35_interface_*` fixture family:
+owned and borrowed dispatch, ancestor/sibling views, nullable/mixed patterns,
+properties, generic storage and closures, shared/weak/access chains, Error
+subinterfaces, Displayable, and exact cleanup. PHP syntax/execution checks reuse
+the same source and output sidecars and require `php` on PATH. Compiler CI
+installs PHP explicitly in both the default and tier-1 LLVM jobs rather than
+depending on runner-image defaults. Structural tests check headerless payloads,
+two-word carrier/element widths, static vtables, direct constrained calls,
+constant-slot erased calls, allocation-free conversion, and entry-only scratch.
+Malformed-MIR tests independently reject invalid conformance/slot/ABI plans,
+unproved refinements, expired roots, and escaped access leases. Cloneable
+widening, user-defined iteration loans, and trait flattening remain later
+slices with precise pre-HIR diagnostics.
+
+The 30 interface fixtures have exact output/status sidecars in the durable
+manifest. Linux CI runs the 29 leak-free fixtures under Valgrind for both native
+profiles, checking definite and indirect leaks; that platform evidence is
+separate from local macOS parity. `main_stage35_interface_strong_cycles` instead
+proves intentional cycle retention and is excluded only from leak-free checks.
+Its PHP regression forces host collection and checks process shutdown: neither
+may invoke Doria payload destruction while the manual strong count is positive.
+The shared-storage fixture also replaces and clears nullable strong/weak property
+handles for both readonly and writable shared ownership families.
+Null-safe generic calls preserve result-context inference through concrete,
+erased, and shared receivers, including already-nullable and context-only types.
+
+| Interface fixture group                         | Interpreter | Cranelift | LLVM    | PHP     |
+|-------------------------------------------------|-------------|-----------|---------|---------|
+| Dispatch, ancestors, generics, exact self         | Covered     | Covered   | Covered | Covered |
+| Nullable/mixed views and consuming patterns      | Covered     | Covered   | Covered | Covered |
+| Properties, collections, closures, branch owners | Covered     | Covered   | Covered | Covered |
+| Shared owners, weak handles, access leases       | Covered     | Covered   | Covered | Covered |
+| Errors, Displayable, finalizers, dynamic cleanup | Covered     | Covered   | Covered | Covered |
+
+`main_stage35_interface_structure.doria` supplies the direct/constrained/erased
+comparison without a timing threshold. MIR and LLVM object tests separately
+assert the carrier layout, vtable shape, and allocation/stack-placement rules.
 
 Stage 27 Slice 1 adds nominal unit and backed enum MIR and registers
 `main_unit_enums.doria`, `main_backed_enums.doria`, `main_nullable_enums.doria`,

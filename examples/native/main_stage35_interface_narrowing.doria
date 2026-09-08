@@ -1,0 +1,30 @@
+interface Named { function name(): string; }
+interface Numbered { function number(): int; }
+interface Read<T> { function read(): T; }
+open class Base {}
+class Both extends Base implements Named, Numbered, Read<int> {
+    function name(): string { return "both"; }
+    function number(): int { return 42; }
+    function read(): int { return 7; }
+}
+class Other implements Named { function name(): string { return "other"; } }
+function inspect(Named $value): void {
+    if ($value is Numbered) { echo $value->number(); } else { echo "no-number"; }
+    if ($value is Both) { echo $value->name(); }
+    if ($value is Read<int>) { echo $value->read(); }
+    if ($value is Read<string>) { echo "wrong-generic"; }
+}
+function optional(?Named $value): void {
+    if ($value is Numbered) { echo $value->number(); } else { echo "absent-or-other"; }
+    if ($value is Both) { echo $value->name(); }
+}
+function fromParent(Base $value): void {
+    if ($value is Named) { echo $value->name(); }
+}
+function main(): void {
+    let $both = new Both();
+    inspect($both); fromParent($both); optional($both);
+    inspect(new Other()); optional(null); optional(new Other());
+    let $direct = new Both();
+    if ($direct is Numbered) { echo $direct->number(); }
+}

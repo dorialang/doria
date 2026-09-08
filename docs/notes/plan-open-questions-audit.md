@@ -44,7 +44,7 @@ decision made: FFI/unsafe (40), geometry-math (47), DDO
 (post-29), and concurrency/async (Phase H). Inheritance is no longer in that
 list: Decision 0130 settles and implements Stage 34. Closures are likewise
 settled by Decisions 0120 and 0121. Interfaces, traits, core value contracts,
-and public iteration are settled by Decision 0134, with Stage 35 Slice 1 complete and Slice 2 next:
+and public iteration are settled by Decision 0134, with Stage 35 Slices 1 and 2 complete and Slice 3 next:
 
 - decision 0120 requires explicit `with` capture lists;
 - the pre-Stage-30 grammar slice is complete and owns accepted lexer/parser/AST syntax.
@@ -103,7 +103,7 @@ lowering are implemented. Stage 32 is complete under Decision 0125. Stage 33
 Slices 1 through 3 and Phase F are complete under Decisions 0126 through 0128;
 Native Testing Foundation Slices 1 through 3 are complete, the foundation is
 complete, and Stage 34 is complete. Decision 0134 accepts Stage 35 authority and
-Slice 1 is complete and Slice 2 is next. Decision 0124
+Slices 1 and 2 are complete and Slice 3 is next. Decision 0124
 separately binds the Pre-Stage-45 Doria-native port, parity and release cutover,
 and the unsuffixed
 `2026.03.1` blocker. Stage 30 is complete and E0641 remains historical and

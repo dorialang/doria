@@ -245,11 +245,16 @@ fn starts_structural_function_type(tokens: &[crate::lexer::Token], index: usize)
 }
 
 pub fn resolved_facts_use_canonical_io(facts: &GlobalSymbolFacts) -> bool {
-    facts.references.iter().any(|reference| {
+    // Interface slots share the automatic-effect transport of structural calls,
+    // even when no implementation in this program performs I/O.
+    facts.declarations.iter().any(|declaration| declaration.kind == crate::names::GlobalSymbolKind::Interface)
+    || facts.references.iter().any(|reference| {
         matches!(
-            reference.symbol_id.owner,
+            &reference.symbol_id.owner,
             GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(_))
         )
+        || matches!(&reference.symbol_id.owner,
+            GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::Prelude(name)) if name == "Displayable")
     })
 }
 

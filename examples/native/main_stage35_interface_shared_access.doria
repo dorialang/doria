@@ -1,0 +1,27 @@
+interface Counter { function count(): int; writable function set(int $next): void; }
+class Count implements Counter {
+    function __construct(writable int $value) {}
+    function count(): int { return $this->value; }
+    writable function set(int $next): void { $this->value = $next; }
+    function __destruct(): void { try { echo "drop;"; } catch (Error $error) {} }
+}
+function inspect(ReadonlySharedReferenceAccess<Counter> $value): void { echo "{$value->count()}"; }
+function change(writable WritableSharedReferenceAccess<Counter> $value): void { $value->set(5); }
+function expired(): WritableWeakReference<Counter> {
+    let $owner = new WritableSharedReference<Counter>(new Count(0));
+    return $owner->createWeakReference();
+}
+function main(): void {
+    let $owner = new WritableSharedReference<Counter>(new Count(4));
+    let $other = $owner->share();
+    { let writable $write = $other->acquireWritableAccess(); change($write); }
+    { let $read = $owner->acquireReadonlyAccess(); inspect($read); }
+    let $weak = $owner->createWeakReference();
+    let $acquired = $weak->acquire();
+    if ($acquired != null) {
+        { let writable $write = $acquired->acquireWritableAccess(); $write->set(6); }
+        { let $read = $acquired->acquireReadonlyAccess(); echo "{$read->count()}"; }
+    }
+    let $dead = expired();
+    if ($dead->acquire() == null) { echo "expired;"; }
+}

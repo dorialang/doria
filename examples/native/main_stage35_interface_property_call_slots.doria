@@ -1,0 +1,7 @@
+interface Identity { function identity<T>(take T $value): T; }
+class IdentityImpl implements Identity {
+    function identity<U>(take U $value): U { return $value; }
+}
+function identity(): Identity { return new IdentityImpl(); }
+class Holder { int $value = identity()->identity(42); }
+function main(): void { let $holder = new Holder(); echo "{$holder->value}"; }

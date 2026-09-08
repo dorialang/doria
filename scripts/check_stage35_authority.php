@@ -60,7 +60,7 @@ foreach ($paths as $key => $path) {
 $require($paths['decision'], $files['decision'], [
     '# Decision 0134:',
     '**Status:** Accepted',
-    '**Implementation Status:** Stage 35 Authority Accepted; Slice 1 Complete; Slice 2 Next',
+    '**Implementation Status:** Stage 35 Authority Accepted; Slices 1 And 2 Complete; Slice 3 Next',
     'interface Equatable<T>',
     'function equals(T $other): bool;',
     'function hash(): uint64;',
@@ -84,10 +84,10 @@ $require($paths['decision'], $files['decision'], [
 ]);
 
 $require($paths['plan'], $files['plan'], [
-    'Stage 35 — Interfaces And Traits — In Progress; Slice 1 Complete; Slice 2 Next',
+    'Stage 35 — Interfaces And Traits — In Progress; Slices 1 And 2 Complete; Slice 3 Next',
     'Slice 1 — Complete: Grammar, Graphs, And Conformance',
-    'Slice 2 — Next: Interface Runtime And Ownership',
-    'Slice 3 — Scheduled: Core Contracts And Public Iteration',
+    'Slice 2 — Complete: Interface Runtime And Ownership',
+    'Slice 3 — Next: Core Contracts And Public Iteration',
     'Slice 4 — Scheduled: Trait Composition',
     'Slice 5 — Scheduled: Cross-Repository Closure',
 ]);
@@ -97,8 +97,8 @@ $require($paths['pipeline'], $files['pipeline'], [
     'Slice 1 Grammar, Graphs, And Conformance is complete',
     'Stage 35 Authority — Accepted',
     'Stage 35 Slice 1 Grammar, Graphs, And Conformance — Complete',
-    'Stage 35 Slice 2 Interface Runtime And Ownership — Next',
-    'Stage 35 Slice 3 Core Contracts And Public Iteration — Scheduled',
+    'Stage 35 Slice 2 Interface Runtime And Ownership — Complete',
+    'Stage 35 Slice 3 Core Contracts And Public Iteration — Next',
     'Stage 35 Slice 4 Trait Composition — Scheduled',
     'Stage 35 Slice 5 Cross-Repository Closure — Scheduled',
     'Stage 35 — In Progress',
@@ -137,6 +137,12 @@ $require($paths['collectionsAudit'], $files['collectionsAudit'], [
 ]);
 
 $staleStatus = [
+    'Slice 1 Complete; Slice 2 Next',
+    'Stage 35 Slice 1 is complete and Slice 2 is next',
+    'interface-typed values and general interface dispatch remain deferred',
+    'Interface values, erased calls, conversions/tests, and shared-interface execution until Stage 35 Slice 2',
+    'Collection/interface `is`',
+    'The PHP backend still refuses shared ownership',
     'Slice 1 is next',
     'Slice 1 Next',
     'Stage 35 — Interfaces And Traits — Next',
@@ -154,8 +160,16 @@ $require('crates/doriac/src/ast.rs', $read('crates/doriac/src/ast.rs'), [
 ]);
 $require('crates/doriac/tests/stage35_contract_tests.rs', $read('crates/doriac/tests/stage35_contract_tests.rs'), [
     'every_callable_substitution_axis_is_retained_in_conformance_facts',
-    'interface_value_matrix_resolves_types_then_stops_before_hir',
+    'interface_value_matrix_checks_and_lowers_through_public_entrypoints',
     'unused_traits_are_compile_time_declarations_and_composition_defers_conformance',
+]);
+
+$forbid('crates/doriac/src/semantics/contracts.rs', $read('crates/doriac/src/semantics/contracts.rs'), ['InterfaceValue', 'E0758']);
+$require('crates/doriac/tests/stage35_runtime_tests.rs', $read('crates/doriac/tests/stage35_runtime_tests.rs'), [
+    'interface_erasure_keeps_headerless_layout_and_constrained_calls_direct',
+    'durable_interface_fixtures_preserve_php_execution_and_cleanup',
+    'interface_dispatch_rejects_slot_receiver_and_entry_abi_mismatches',
+    'interface_carrier_validation_rejects_unknown_and_mismatched_views',
 ]);
 
 foreach ($files as $key => $contents) {

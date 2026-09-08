@@ -1,5 +1,4 @@
 use doriac::ast::Item;
-use doriac::backend::BackendTarget;
 use doriac::const_eval::{ConstKey, ConstValue};
 
 fn diagnostics(source: &str) -> Vec<doriac::diagnostics::Diagnostic> {
@@ -571,21 +570,19 @@ function main(): void
 }
 
 #[test]
-fn php_backend_rejects_generic_classes_explicitly() {
-    let errors = doriac::compile_source(
+fn php_backend_emits_concrete_generic_class_instances() {
+    let php = doriac::compile_source_to_php(
         "stage25-php.doria",
         r#"
 class Box<T> { function __construct(take T $value) {} }
-function main(): void { let $box = new Box<int>(42); }
+function main(): void { let $integer = new Box<int>(42); let $boolean = new Box<bool>(true); }
 "#,
-        BackendTarget::Php,
     )
-    .expect_err("the PHP compatibility backend should reject generic classes");
-    assert!(errors.iter().any(|diagnostic| {
-        diagnostic.code == "B2401"
-            && diagnostic.message.contains("generic class specialization")
-            && diagnostic.message.contains("native target")
-    }));
+    .expect("checked generic classes should lower to PHP");
+    assert_eq!(php.matches("class __DoriaClassSpecialization").count(), 2);
+    assert!(php.contains("(public int $value)"));
+    assert!(php.contains("(public bool $value)"));
+    assert!(!php.contains("(public T $value)"));
 }
 
 #[test]

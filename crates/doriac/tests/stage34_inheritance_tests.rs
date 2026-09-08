@@ -706,10 +706,11 @@ function main(): void
     let output = interpret(source);
     assert_eq!(output.stdout, b"missing\n");
 
-    assert_diagnostic(
+    doriac::check_source(
+        "partial-error-catch.doria",
         r#"open class Failure implements Error { function __construct(string $message) {} } class Missing extends Failure { function __construct() { parent::__construct("missing"); } } function fail(): void throws Failure { throw new Failure("base"); } function main(): void { try { fail(); } catch (Missing) {} }"#,
-        "E0629",
-    );
+    )
+    .expect("the declared open Error effect permits descendants; the base Error still escapes");
     let unreachable = diagnostics(
         r#"open class Failure implements Error { function __construct(string $message) {} } class Missing extends Failure { function __construct() { parent::__construct("missing"); } } function fail(): void throws Missing { throw new Missing(); } function main(): void { try { fail(); } catch (Failure) {} catch (Missing) {} }"#,
     );

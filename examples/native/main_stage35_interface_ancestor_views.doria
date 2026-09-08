@@ -1,0 +1,33 @@
+interface Named { function name(): string; }
+interface Detailed extends Named { function detail(): int; }
+open class Name implements Detailed {
+    function __construct(string $text) {}
+    open function name(): string { return $this->text; }
+    function detail(): int { return 42; }
+    function __destruct(): void { try { echo "drop"; } catch (Doria\Std\Io\IoError) {} }
+}
+class Child extends Name {
+    function __construct() { parent::__construct("ignored"); }
+    override function name(): string { return "child"; }
+}
+function display(Named $value): void { echo $value->name(); }
+function borrow(Detailed $value): Named { return $value; }
+function maybe(?Named $value): void {
+    if ($value != null) { display($value); } else { echo "null"; }
+}
+function owned(take Detailed $value): Named { return $value; }
+function nullable(take ?Detailed $value): ?Named { return $value; }
+function main(): void {
+    Detailed $value = new Child();
+    display($value);
+    display(borrow($value));
+    echo "{$value->detail()}";
+    Named $moved = owned($value);
+    display($moved);
+    ?Detailed $none = null;
+    maybe($none);
+    ?Detailed $some = new Name("present");
+    maybe($some);
+    ?Named $nullable = nullable($some);
+    maybe($nullable);
+}

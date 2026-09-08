@@ -41,6 +41,15 @@ impl NativeCallableSignaturePlan {
         )
     }
 
+    pub fn interface_entry(function: &mir::FunctionType) -> Self {
+        Self::new(
+            function.return_type,
+            function.has_checked_transport(),
+            function.return_borrow,
+            false,
+        )
+    }
+
     fn new(
         return_type: mir::ReturnType,
         checked: bool,
@@ -253,6 +262,12 @@ pub fn environment_layout(
 }
 
 pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
+    if ty.shared_interface().is_some() {
+        return NativeLayout {
+            size: pointer_size * 2,
+            align: pointer_size,
+        };
+    }
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(ty)) => NativeLayout {
             size: ty.storage_bytes(),
@@ -266,8 +281,8 @@ pub const fn type_layout(ty: mir::Type, pointer_size: u32) -> NativeLayout {
         mir::Type::Scalar(mir::ScalarType::Enum(_)) => NativeLayout { size: 4, align: 4 },
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
-        | mir::Type::Error
-        | mir::Type::NullableError
+        | mir::Type::Interface(_)
+        | mir::Type::NullableInterface(_)
         | mir::Type::Function(_)
         | mir::Type::NullableFunction(_) => NativeLayout {
             size: pointer_size * 2,
@@ -335,8 +350,8 @@ pub const fn needs_drop(ty: mir::Type) -> bool {
             | mir::Type::NullableString
             | mir::Type::Mixed
             | mir::Type::NullableMixed
-            | mir::Type::Error
-            | mir::Type::NullableError
+            | mir::Type::Interface(_)
+            | mir::Type::NullableInterface(_)
             | mir::Type::Class(_)
             | mir::Type::NullableClass(_)
             | mir::Type::SharedReference(_)

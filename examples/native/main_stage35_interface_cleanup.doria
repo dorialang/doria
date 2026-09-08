@@ -1,0 +1,28 @@
+interface Named { function name(): string; }
+class Name implements Named {
+    function __construct(string $text) {}
+    function name(): string { return $this->text; }
+    function __destruct() { try { echo "drop {$this->text};"; } catch (Error $error) {} }
+}
+function setup(): Named { return new Name("setup"); }
+function main(): void {
+    writable Named $current = new Name("old");
+    writable bool $running = true;
+    for (let $setup = setup(); $running; $current = new Name("new")) {
+        Named $body = new Name("body");
+        echo $setup->name() . ";";
+        $running = false;
+    }
+
+    List<int> $numbers = [1, 2];
+    foreach ($numbers as int $number) {
+        Named $iteration = new Name("iteration {$number}");
+        echo $iteration->name() . ";";
+    }
+    given { Named $prepared = new Name("given"); } if (true) {
+        echo $prepared->name() . ";";
+    } finally {
+        echo "finally " . $prepared->name() . ";";
+    }
+    echo "done;";
+}

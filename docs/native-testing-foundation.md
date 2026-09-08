@@ -16,7 +16,7 @@ Native Testing Foundation Slice 2 - Complete
 Native Testing Foundation Slice 3 - Complete
 Native Testing Foundation - Complete
 Stage 34 Single Class Inheritance - Complete
-Stage 35 Interfaces And Traits - In Progress; Slice 1 Complete; Slice 2 Next
+Stage 35 Interfaces And Traits - In Progress; Slices 1 And 2 Complete; Slice 3 Next
 Pre-Stage-45 Doria-Native Baton Transition - Scheduled
 ```
 
@@ -208,6 +208,12 @@ expect(fn() => parseConfiguration("invalid"))
 
 The inspector parameter supplies the expected Error type. No general runtime
 type token or reflection API is introduced.
+
+Decision 0134 Slice 2 extends this same matching relation to Error subinterfaces,
+including generic inspectors. Inspectors borrow the original concrete Error;
+required effects, ambient I/O, and automatic TestAssertion effects remain
+distinct through erased calls. R1000 and DORIAO2/DORIAO3/DORIAO4 retain their
+existing status, origin, cleanup, and reporting contracts.
 
 ## Expectation Ownership
 

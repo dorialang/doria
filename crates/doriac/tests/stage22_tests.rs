@@ -551,7 +551,7 @@ function main(): void throws Doria\Std\Io\IoError
 }
 
 #[test]
-fn hierarchy_is_is_implemented_while_interface_is_remains_deferred() {
+fn hierarchy_and_interface_is_are_implemented() {
     let hierarchy_source = r#"
 open class Base {}
 class Child extends Base {}
@@ -561,15 +561,8 @@ function inspect(mixed $value): bool { return $value is Base; }
         .expect("Stage 34 implements hierarchy-aware type tests");
 
     let interface_source = "function inspect(mixed $value): bool { return $value is Displayable; }";
-    let interface_diagnostics = diagnostics(interface_source);
-    assert!(!interface_diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.code.starts_with('P')));
-    let interface = interface_diagnostics
-        .into_iter()
-        .find(|diagnostic| diagnostic.code == "E0758")
-        .expect("expected interface-stage diagnostic");
-    assert!(interface.message.contains("Stage 35"));
+    doriac::check_source("interface-is.doria", interface_source)
+        .expect("Stage 35 Slice 2 implements interface type tests");
 }
 
 #[test]

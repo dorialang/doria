@@ -32,9 +32,10 @@ pub enum FieldType {
     NullableClass(ClassId),
     OpenClass(ClassId),
     NullableOpenClass(ClassId),
-    SharedReference(ClassId),
-    WeakReference(ClassId),
-    NullableSharedReference(ClassId),
+    SharedReference,
+    WeakReference,
+    NullableSharedReference,
+    SharedInterface,
     WritableSharedReference,
     WritableWeakReference,
     NullableWritableSharedReference,
@@ -136,6 +137,7 @@ pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
         | FieldType::NullableError
         | FieldType::Function
         | FieldType::NullableFunction
+        | FieldType::SharedInterface
         | FieldType::OpenClass(_)
         | FieldType::NullableOpenClass(_) => (pointer_size * 2, pointer_size),
         FieldType::String
@@ -143,9 +145,9 @@ pub const fn field_size_align(ty: FieldType, pointer_size: u32) -> (u32, u32) {
         | FieldType::NullableMixed
         | FieldType::Class(_)
         | FieldType::NullableClass(_)
-        | FieldType::SharedReference(_)
-        | FieldType::WeakReference(_)
-        | FieldType::NullableSharedReference(_)
+        | FieldType::SharedReference
+        | FieldType::WeakReference
+        | FieldType::NullableSharedReference
         | FieldType::WritableSharedReference
         | FieldType::WritableWeakReference
         | FieldType::NullableWritableSharedReference

@@ -3,6 +3,9 @@
 > **Stage 35 amendment:** Decision 0134 allows owned interface carriers in
 > closure environments and borrowed interface captures under these existing
 > capture/provenance rules. Borrowed iterator carriers remain nonescaping.
+> Slice 2 implements interface captures and callable inputs/results, including
+> generic specializations and shared-interface handles, without changing capture
+> modes, escape rules, or checked-effect transport.
 
 - **Status:** Accepted
 - **Accepted:** 2026-08-19
@@ -71,7 +74,7 @@ Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Complete; Stage 33 Slice 3 �
 Stage 33 — Complete; Phase F — Complete
 Native Testing Foundation Slices 1 Through 3 — Complete; Foundation — Complete
 Stage 34 — Complete
-Stage 35 — In Progress; Slice 1 Complete; Slice 2 Next
+Stage 35 — In Progress; Slices 1 And 2 Complete; Slice 3 Next
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping

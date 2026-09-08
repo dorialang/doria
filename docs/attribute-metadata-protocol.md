@@ -90,6 +90,12 @@ are unchanged. Immutable compiler contract facts expose requirement origins,
 conformance status, selected declarations, and pending-slice boundaries for
 tooling; they do not constitute a runtime layout or flattened attribute table.
 
+Slice 2 adds private executable interface vtables, entry thunks, and exact
+specializations. These never become authored metadata targets or public
+reflection tables. Requirement definitions and implementation navigation retain
+the original package/source identities; schemas 1-3 and processor protocol 1
+are unchanged.
+
 Schema version 2 contains every schema-version-1 field plus `callables`. Each
 callable records one canonical attribute-target-compatible identity, name, kind,
 package, source, access, generic arity, ordered parameters, return type, required

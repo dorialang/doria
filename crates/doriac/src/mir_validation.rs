@@ -7,9 +7,13 @@ use crate::class_layout::{append_hidden_pointer, compute_class_layout, ClassId, 
 use crate::mir;
 use crate::numeric::{FloatType, IntegerType};
 
+mod borrowed_views;
+mod exact_return;
+
 pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
     validate_graph_metadata(program)?;
     validate_error_metadata(program)?;
+    validate_interface_metadata(program)?;
     validate_closure_metadata(program)?;
     for (index, definition) in program.enums.iter().enumerate() {
         if definition.id != crate::enums::EnumId(index) {
@@ -174,6 +178,7 @@ pub fn validate_program(program: &mir::Program) -> Result<(), BackendError> {
         validate_method_identity(program, function)?;
         validate_function(program, function)?;
     }
+    exact_return::validate(program)?;
     Ok(())
 }
 
@@ -595,12 +600,30 @@ fn validate_closure_metadata(program: &mir::Program) -> Result<(), BackendError>
         }
     }
 
+    let mut closure_instances = HashSet::new();
     for (index, descriptor) in program.closure_descriptors.iter().enumerate() {
         if descriptor.id != mir::ClosureDescriptorId(index) {
             return Err(malformed_mir(format!(
                 "closure descriptor table slot {index} contains descriptor#{}",
                 descriptor.id.0
             )));
+        }
+        if !closure_instances.insert((descriptor.source_instance, descriptor.source_closure)) {
+            return Err(malformed_mir(
+                "duplicate source closure in one callable or property instance",
+            ));
+        }
+        match descriptor.source_instance {
+            mir::ClosureOwner::Callable(owner) => {
+                if function_in(program, owner)?.closure.is_some() {
+                    return Err(malformed_mir(
+                        "source closure instance must identify its root callable",
+                    ));
+                }
+            }
+            mir::ClosureOwner::PropertyInitializer(property) => {
+                property_in(program, property.class, property)?;
+            }
         }
         let function_type = function_type_in(program, descriptor.function_type)?;
         if descriptor.invocation_mode != function_type.invocation_mode {
@@ -653,6 +676,186 @@ fn validate_type_reference(program: &mir::Program, ty: mir::Type) -> Result<(), 
     Ok(())
 }
 
+fn interface_in(
+    program: &mir::Program,
+    id: mir::InterfaceTypeId,
+) -> Result<&mir::InterfaceType, BackendError> {
+    program
+        .interface_types
+        .get(id.0)
+        .filter(|definition| definition.id == id)
+        .ok_or_else(|| malformed_mir(format!("interface#{} has no matching specialization", id.0)))
+}
+
+fn validate_interface_metadata(program: &mir::Program) -> Result<(), BackendError> {
+    if interface_in(program, mir::InterfaceTypeId::ERROR)? != &mir::InterfaceType::error() {
+        return Err(malformed_mir(
+            "interface#0 must be the canonical Error contract",
+        ));
+    }
+    for (index, interface) in program.interface_types.iter().enumerate() {
+        if interface.id != mir::InterfaceTypeId(index) {
+            return Err(malformed_mir(
+                "interface specialization table has an invalid identity",
+            ));
+        }
+        let mut ancestors = HashSet::new();
+        for ancestor in &interface.ancestors {
+            if *ancestor == interface.id || !ancestors.insert(*ancestor) {
+                return Err(malformed_mir("interface ancestry is cyclic or duplicated"));
+            }
+            let parent = interface_in(program, *ancestor)?;
+            if parent.ancestors.contains(&interface.id)
+                || parent
+                    .ancestors
+                    .iter()
+                    .any(|transitive| !interface.ancestors.contains(transitive))
+            {
+                return Err(malformed_mir(
+                    "interface ancestry is not a closed acyclic graph",
+                ));
+            }
+        }
+        let mut methods = HashSet::new();
+        for method in &interface.methods {
+            if !methods.insert((method.requirement, &method.arguments)) {
+                return Err(malformed_mir(
+                    "interface method specialization has duplicate slots",
+                ));
+            }
+            let signature = function_type_in(program, method.signature)?;
+            if method.exact_dynamic_return
+                && (signature.return_type
+                    != mir::ReturnType::Value(mir::Type::Interface(interface.id))
+                    || signature.return_borrow.is_some())
+            {
+                return Err(malformed_mir(
+                    "interface self requirement must return an owned matching interface",
+                ));
+            }
+            let mode = if method.writable_receiver {
+                mir::FunctionParameterMode::Writable
+            } else {
+                mir::FunctionParameterMode::Readonly
+            };
+            let invocation = if method.writable_receiver {
+                mir::FunctionInvocationMode::Writable
+            } else {
+                mir::FunctionInvocationMode::Readonly
+            };
+            if signature.parameters.first()
+                != Some(&mir::FunctionParameter {
+                    mode,
+                    ty: mir::Type::Interface(interface.id),
+                })
+                || signature.invocation_mode != invocation
+            {
+                return Err(malformed_mir(
+                    "interface requirement signature has an incompatible receiver",
+                ));
+            }
+            for argument in &method.arguments {
+                validate_type(program, *argument)?;
+            }
+        }
+    }
+    let mut implementations = HashSet::new();
+    for (index, table) in program.interface_vtables.iter().enumerate() {
+        if table.id != mir::InterfaceVtableId(index)
+            || !implementations.insert((table.implementing_type, table.interface))
+        {
+            return Err(malformed_mir(
+                "interface vtable identity is invalid or duplicated",
+            ));
+        }
+        let interface = interface_in(program, table.interface)?;
+        match table.implementing_type {
+            mir::ImplementingType::Class(class) => {
+                let class = class_in(program, class)?;
+                if table.error_descriptor != class.error_descriptor {
+                    return Err(malformed_mir(
+                        "interface vtable Error metadata does not belong to its implementing type",
+                    ));
+                }
+            }
+            mir::ImplementingType::Collection(_) => {
+                return Err(malformed_mir(
+                    "collection interface implementation requires Stage 35 Slice 3",
+                ));
+            }
+        }
+        if (table.interface == mir::InterfaceTypeId::ERROR
+            || interface.ancestors.contains(&mir::InterfaceTypeId::ERROR))
+            && table.error_descriptor.is_none()
+        {
+            return Err(malformed_mir(
+                "Error interface implementation has no reporting metadata",
+            ));
+        }
+        if table.ancestors.len() != interface.ancestors.len()
+            || table.methods.len() != interface.methods.len()
+        {
+            return Err(malformed_mir(
+                "interface vtable does not match its contract shape",
+            ));
+        }
+        for (target, expected) in table.ancestors.iter().zip(&interface.ancestors) {
+            let target = interface_vtable_in(program, *target)?;
+            if target.implementing_type != table.implementing_type || target.interface != *expected
+            {
+                return Err(malformed_mir(
+                    "interface ancestor conversion changes the payload or names the wrong view",
+                ));
+            }
+        }
+        for (method, requirement) in table.methods.iter().zip(&interface.methods) {
+            let entry = function_in(program, *method)?;
+            let signature = function_type_in(program, requirement.signature)?;
+            if entry.id == program.entry
+                || entry.closure.is_some()
+                || entry.receiver_mode.is_some()
+                || entry.virtual_slot.is_some()
+                || entry.return_type != signature.return_type
+                || entry.return_borrow != signature.return_borrow
+                || entry.required_checked_effects != signature.checked_effects
+                || entry.ambient_checked_effects != signature.ambient_checked_effects
+                || entry.test_assertion_checked_effects != signature.test_assertion_checked_effects
+                || entry.checked_effects != signature.complete_checked_effects()
+                || entry.params.len() != signature.parameters.len()
+                || entry.parameter_modes.len() != signature.parameters.len()
+            {
+                return Err(malformed_mir(
+                    "interface vtable entry disagrees with its complete requirement ABI",
+                ));
+            }
+            for ((local, mode), expected) in entry
+                .params
+                .iter()
+                .zip(&entry.parameter_modes)
+                .zip(&signature.parameters)
+            {
+                if local_in(entry, *local)?.ty != expected.ty || *mode != expected.mode {
+                    return Err(malformed_mir(
+                        "interface vtable entry has an incompatible parameter",
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn interface_vtable_in(
+    program: &mir::Program,
+    id: mir::InterfaceVtableId,
+) -> Result<&mir::InterfaceVtable, BackendError> {
+    program
+        .interface_vtables
+        .get(id.0)
+        .filter(|table| table.id == id)
+        .ok_or_else(|| malformed_mir(format!("interface vtable#{} does not exist", id.0)))
+}
+
 fn validate_checked_effects(
     program: &mir::Program,
     effects: &[mir::CheckedEffect],
@@ -662,8 +865,21 @@ fn validate_checked_effects(
         if !seen.insert(*effect) {
             return Err(malformed_mir("checked effect set contains a duplicate"));
         }
-        if let mir::CheckedEffect::Concrete(descriptor) = effect {
-            error_descriptor_in(program, *descriptor)?;
+        match effect {
+            mir::CheckedEffect::Concrete(descriptor) => {
+                error_descriptor_in(program, *descriptor)?;
+            }
+            mir::CheckedEffect::Interface(interface) => {
+                let definition = interface_in(program, *interface)?;
+                if *interface == mir::InterfaceTypeId::ERROR
+                    || !definition.ancestors.contains(&mir::InterfaceTypeId::ERROR)
+                {
+                    return Err(malformed_mir(
+                        "interface checked effect must name an Error subinterface",
+                    ));
+                }
+            }
+            mir::CheckedEffect::Any => {}
         }
     }
     Ok(())
@@ -1016,6 +1232,9 @@ fn validate_lifecycle(
 }
 
 fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
+    if ty.shared_interface().is_some() {
+        return FieldType::SharedInterface;
+    }
     match ty {
         mir::Type::Scalar(mir::ScalarType::Integer(integer)) => FieldType::Integer(integer),
         mir::Type::Scalar(mir::ScalarType::Float(float)) => FieldType::Float(float),
@@ -1033,8 +1252,8 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
         }
         mir::Type::NullableString => FieldType::NullableString,
         mir::Type::NullableMixed => FieldType::NullableMixed,
-        mir::Type::Error => FieldType::Error,
-        mir::Type::NullableError => FieldType::NullableError,
+        mir::Type::Interface(_) => FieldType::Error,
+        mir::Type::NullableInterface(_) => FieldType::NullableError,
         mir::Type::Class(class) => {
             if program
                 .classes
@@ -1057,10 +1276,10 @@ fn field_type(program: &mir::Program, ty: mir::Type) -> FieldType {
                 FieldType::NullableClass(class)
             }
         }
-        mir::Type::SharedReference(class) => FieldType::SharedReference(class),
-        mir::Type::WeakReference(class) => FieldType::WeakReference(class),
-        mir::Type::NullableSharedReference(class) => FieldType::NullableSharedReference(class),
-        mir::Type::NullableWeakReference(class) => FieldType::WeakReference(class),
+        mir::Type::SharedReference(_) => FieldType::SharedReference,
+        mir::Type::WeakReference(_) => FieldType::WeakReference,
+        mir::Type::NullableSharedReference(_) => FieldType::NullableSharedReference,
+        mir::Type::NullableWeakReference(_) => FieldType::WeakReference,
         mir::Type::WritableSharedReference(_) => FieldType::WritableSharedReference,
         mir::Type::WritableWeakReference(_) => FieldType::WritableWeakReference,
         mir::Type::NullableWritableSharedReference(_) => FieldType::NullableWritableSharedReference,
@@ -1309,7 +1528,8 @@ fn validate_function(program: &mir::Program, function: &mir::Function) -> Result
     validate_match_result_plans(function)?;
     validate_match_binding_plans(function)?;
     validate_control_flow_plans(program, function)?;
-    validate_class_local_lifetimes(function)
+    validate_class_local_lifetimes(function)?;
+    borrowed_views::validate(program, function)
 }
 
 fn validate_borrowed_user_locals(
@@ -1321,7 +1541,13 @@ fn validate_borrowed_user_locals(
             && !local.synthetic
             && !local.writable
             && !function.params.contains(&local.id)
-            && matches!(local.ty, mir::Type::Class(_) | mir::Type::NullableClass(_))
+            && matches!(
+                local.ty,
+                mir::Type::Class(_)
+                    | mir::Type::NullableClass(_)
+                    | mir::Type::Interface(_)
+                    | mir::Type::NullableInterface(_)
+            )
     }) {
         let assignments = function
             .blocks
@@ -1346,6 +1572,9 @@ fn validate_borrowed_user_locals(
 }
 
 fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendError> {
+    if let mir::Type::Interface(interface) | mir::Type::NullableInterface(interface) = ty {
+        interface_in(program, interface)?;
+    }
     if let mir::Type::Scalar(mir::ScalarType::Enum(enum_id))
     | mir::Type::NullableScalar(mir::ScalarType::Enum(enum_id)) = ty
     {
@@ -1362,13 +1591,22 @@ fn validate_type(program: &mir::Program, ty: mir::Type) -> Result<(), BackendErr
         validate_payload_enum_type(program, payload)?;
         return Ok(());
     }
-    if let mir::Type::Class(class)
-    | mir::Type::NullableClass(class)
-    | mir::Type::SharedReference(class)
-    | mir::Type::WeakReference(class)
-    | mir::Type::NullableSharedReference(class)
-    | mir::Type::NullableWeakReference(class) = ty
-    {
+    if let Some(payload) = ty.shared_payload() {
+        if matches!(
+            ty,
+            mir::Type::SharedReference(_)
+                | mir::Type::WeakReference(_)
+                | mir::Type::NullableSharedReference(_)
+                | mir::Type::NullableWeakReference(_)
+        ) && matches!(payload, mir::SharedPayload::Collection(_))
+        {
+            return Err(malformed_mir(
+                "readonly shared collection payloads are not supported",
+            ));
+        }
+        return validate_writable_shared_payload(program, payload);
+    }
+    if let mir::Type::Class(class) | mir::Type::NullableClass(class) = ty {
         class_in(program, class)?;
     } else {
         match ty {
@@ -1449,14 +1687,17 @@ fn validate_payload_enum_type(
 
 fn validate_writable_shared_payload(
     program: &mir::Program,
-    payload: mir::WritableSharedPayload,
+    payload: mir::SharedPayload,
 ) -> Result<(), BackendError> {
     match payload {
-        mir::WritableSharedPayload::Class(class) => {
+        mir::SharedPayload::Class(class) => {
             class_in(program, class)?;
         }
-        mir::WritableSharedPayload::Collection(collection) => {
+        mir::SharedPayload::Collection(collection) => {
             collection_in(program, collection)?;
+        }
+        mir::SharedPayload::Interface(interface) => {
+            interface_in(program, interface)?;
         }
     }
     Ok(())
@@ -1726,33 +1967,56 @@ fn validate_statement(
                     "nullable-string local local{} receives another rvalue type",
                     target.0
                 ))),
-                (mir::Type::Error, mir::Rvalue::Error(expression)) => {
-                    validate_error_expression(program, function, expression)?;
+                (
+                    mir::Type::Interface(expected),
+                    mir::Rvalue::Interface(mir::InterfaceExpression {
+                        interface,
+                        value: expression,
+                    }),
+                ) if expected == *interface => {
+                    validate_interface_value(program, function, expected, expression)?;
+                    if local.writable && !local.owned {
+                        require_writable_interface_value(program, function, expression)?;
+                    }
                     validate_error_assignment_ownership(
                         local,
                         error_expression_is_borrowed(expression),
                     )
                 }
-                (mir::Type::Error, _) => Err(malformed_mir(format!(
+                (mir::Type::Interface(_), _) => Err(malformed_mir(format!(
                     "Error local local{} receives a mismatched rvalue",
                     target.0
                 ))),
-                (mir::Type::NullableError, mir::Rvalue::NullableError(expression)) => {
-                    validate_nullable_error_expression(program, function, expression)?;
+                (
+                    mir::Type::NullableInterface(expected),
+                    mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression {
+                        interface,
+                        value: expression,
+                    }),
+                ) if expected == *interface => {
+                    validate_nullable_interface_value(program, function, expected, expression)?;
                     let borrowed = nullable_error_expression_is_borrowed(expression);
-                    if matches!(expression, mir::NullableErrorExpression::Null) {
+                    if local.writable && !local.owned {
+                        require_writable_nullable_interface_value(program, function, expression)?;
+                    }
+                    if matches!(expression, mir::NullableInterfaceValue::Null) {
                         Ok(())
                     } else {
                         validate_error_assignment_ownership(local, borrowed)
                     }
                 }
-                (mir::Type::NullableError, _) => Err(malformed_mir(format!(
+                (mir::Type::NullableInterface(_), _) => Err(malformed_mir(format!(
                     "nullable Error local local{} receives a mismatched rvalue",
                     target.0
                 ))),
-                (_, mir::Rvalue::Error(_) | mir::Rvalue::NullableError(_)) => Err(malformed_mir(
-                    format!("non-Error local local{} receives an Error rvalue", target.0),
-                )),
+                (
+                    _,
+                    mir::Rvalue::Interface(mir::InterfaceExpression { .. })
+                    | mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression { .. }),
+                ) => Err(malformed_mir(format!(
+                    "non-Error local local{} receives an Error rvalue",
+                    target.0
+                ))),
                 (mir::Type::Mixed, mir::Rvalue::Mixed(expression)) => {
                     validate_mixed_expression(program, function, expression)?;
                     let borrowed = is_borrowed_mixed_expression(expression);
@@ -1935,24 +2199,24 @@ fn validate_statement(
                 (
                     mir::Type::SharedReference(expected),
                     mir::Rvalue::SharedReference(expression),
-                ) if expression.class() == expected => {
+                ) if expression.payload() == expected => {
                     validate_shared_reference_expression(program, function, expression)
                 }
                 (mir::Type::WeakReference(expected), mir::Rvalue::WeakReference(expression))
-                    if expression.class() == expected =>
+                    if expression.payload() == expected =>
                 {
                     validate_weak_reference_expression(program, function, expression)
                 }
                 (
                     mir::Type::NullableSharedReference(expected),
                     mir::Rvalue::NullableSharedReference(expression),
-                ) if expression.class() == expected => {
+                ) if expression.payload() == expected => {
                     validate_nullable_shared_reference_expression(program, function, expression)
                 }
                 (
                     mir::Type::NullableWeakReference(expected),
                     mir::Rvalue::NullableWeakReference(expression),
-                ) if expression.class() == expected => {
+                ) if expression.payload() == expected => {
                     validate_nullable_weak_reference_expression(program, function, expression)
                 }
                 (
@@ -2351,7 +2615,10 @@ fn validate_statement(
             }
             class_in(program, *class).map(|_| ())
         }
-        mir::Statement::DropSharedReference { local, class } => {
+        mir::Statement::DropSharedReference {
+            local,
+            payload: class,
+        } => {
             let definition = local_in(function, *local)?;
             if !matches!(
                 definition.ty,
@@ -2364,9 +2631,12 @@ fn validate_statement(
                     local.0, definition.ty
                 )));
             }
-            class_in(program, *class).map(|_| ())
+            validate_writable_shared_payload(program, *class)
         }
-        mir::Statement::DropWeakReference { local, class } => {
+        mir::Statement::DropWeakReference {
+            local,
+            payload: class,
+        } => {
             let definition = local_in(function, *local)?;
             if !matches!(
                 definition.ty,
@@ -2379,7 +2649,7 @@ fn validate_statement(
                     local.0, definition.ty
                 )));
             }
-            class_in(program, *class).map(|_| ())
+            validate_writable_shared_payload(program, *class)
         }
         mir::Statement::DropWritableSharedReference { local, payload } => {
             let definition = local_in(function, *local)?;
@@ -2459,7 +2729,7 @@ fn validate_statement(
         }
         mir::Statement::EnsureErrorOrigin { error, origin } => {
             let error = local_in(function, *error)?;
-            if error.ty != mir::Type::Error || !error.owned {
+            if error.ty != mir::Type::ERROR || !error.owned {
                 return Err(malformed_mir(
                     "Error origin assignment requires an owned Error carrier",
                 ));
@@ -2486,7 +2756,7 @@ fn validate_statement(
                     "exact catch target does not own the descriptor's concrete class",
                 ));
             }
-            if error.ty != mir::Type::Error || !error.owned {
+            if error.ty != mir::Type::ERROR || !error.owned {
                 return Err(malformed_mir(
                     "exact catch extraction requires an owned Error carrier",
                 ));
@@ -2495,7 +2765,11 @@ fn validate_statement(
         }
         mir::Statement::DropError { local } => {
             let local = local_in(function, *local)?;
-            if !matches!(local.ty, mir::Type::Error | mir::Type::NullableError) || !local.owned {
+            if !matches!(
+                local.ty,
+                mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+            ) || !local.owned
+            {
                 return Err(malformed_mir(
                     "Error drop must reference an owned Error carrier",
                 ));
@@ -2761,7 +3035,7 @@ fn validate_statement(
                     validate_operand(message, mir::Type::String)?;
                 }
                 let error = local_in(function, plan.error)?;
-                if error.ty != mir::Type::Error || !error.owned || !error.synthetic {
+                if error.ty != mir::Type::ERROR || !error.owned || !error.synthetic {
                     return Err(malformed_mir(
                         "assertion failure must use an owned synthetic Error local",
                     ));
@@ -2870,7 +3144,7 @@ fn validate_statement(
                         }
                         mir::StructuredExitKind::CheckedError { error } => {
                             let error = local_in(function, error)?;
-                            if error.ty != mir::Type::Error || !error.owned {
+                            if error.ty != mir::Type::ERROR || !error.owned {
                                 return Err(malformed_mir(
                                     "checked-error finalizer exit does not own an Error carrier",
                                 ));
@@ -2894,8 +3168,11 @@ fn validate_statement(
 fn grouped_move_rvalue_is_null(ty: mir::Type, value: &mir::Rvalue) -> bool {
     match (ty, value) {
         (
-            mir::Type::NullableError,
-            mir::Rvalue::NullableError(mir::NullableErrorExpression::Null),
+            mir::Type::NULLABLE_ERROR,
+            mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression {
+                value: mir::NullableInterfaceValue::Null,
+                ..
+            }),
         ) => true,
         (mir::Type::NullableMixed, mir::Rvalue::NullableMixed(value)) => {
             matches!(value, mir::NullableMixedExpression::Null)
@@ -2974,6 +3251,22 @@ fn validate_terminator(
             }
             validate_rvalue(program, function, expression)?;
             if validate_return_ownership {
+                if matches!(
+                    return_type,
+                    mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+                ) {
+                    let inferred = infer_function_return_borrow(program, function)?;
+                    if inferred != function.return_borrow {
+                        return Err(malformed_mir(
+                            "interface return loses its declared borrow provenance",
+                        ));
+                    }
+                    if inferred.is_none() && expression.borrows_move_value() {
+                        return Err(malformed_mir(
+                            "owning interface return receives a borrowed view",
+                        ));
+                    }
+                }
                 if let (mir::Type::Class(_), mir::Rvalue::Class(class)) = (return_type, expression)
                 {
                     let expected = infer_function_return_borrow(program, function)?;
@@ -3117,7 +3410,7 @@ fn validate_terminator(
                 }
             }
             let error = local_in(function, *error)?;
-            if error.ty != mir::Type::Error || !error.owned || !error.synthetic {
+            if error.ty != mir::Type::ERROR || !error.owned || !error.synthetic {
                 return Err(malformed_mir("checked call has an incompatible Error slot"));
             }
             block_in(function, *success)?;
@@ -3218,7 +3511,7 @@ fn validate_terminator(
                 ));
             }
             let error_definition = local_in(function, *error)?;
-            if error_definition.ty != mir::Type::Error
+            if error_definition.ty != mir::Type::ERROR
                 || !error_definition.owned
                 || !error_definition.synthetic
             {
@@ -3296,7 +3589,7 @@ fn validate_terminator(
                 }
             }
             let error = local_in(function, *error)?;
-            if error.ty != mir::Type::Error || !error.owned || !error.synthetic {
+            if error.ty != mir::Type::ERROR || !error.owned || !error.synthetic {
                 return Err(malformed_mir("checked I/O has an incompatible Error slot"));
             }
             block_in(function, *success)?;
@@ -3315,7 +3608,7 @@ fn validate_terminator(
             fallback,
         } => {
             let error = local_in(function, *error)?;
-            if error.ty != mir::Type::Error || !error.owned {
+            if error.ty != mir::Type::ERROR || !error.owned {
                 return Err(malformed_mir(
                     "Error dispatch does not own an Error carrier",
                 ));
@@ -3338,7 +3631,7 @@ fn validate_terminator(
         }
         mir::Terminator::PropagateError { error } => {
             let error = local_in(function, *error)?;
-            if error.ty != mir::Type::Error || !error.owned {
+            if error.ty != mir::Type::ERROR || !error.owned {
                 return Err(malformed_mir(
                     "checked propagation does not own an Error carrier",
                 ));
@@ -3377,7 +3670,7 @@ fn validate_checked_io_operation(
 }
 
 struct IndirectCallValidation<'a> {
-    callee: &'a mir::FunctionExpression,
+    callee: &'a mir::IndirectCallee,
     function_type: mir::FunctionTypeId,
     invocation_mode: mir::FunctionInvocationMode,
     args: &'a [mir::Rvalue],
@@ -3391,18 +3684,74 @@ fn validate_indirect_call(
     call: IndirectCallValidation<'_>,
 ) -> Result<(), BackendError> {
     let definition = function_type_in(program, call.function_type)?;
-    if call.callee.function_type() != call.function_type
-        || definition.invocation_mode != call.invocation_mode
-    {
+    if definition.invocation_mode != call.invocation_mode {
         return Err(malformed_mir(
             "indirect call disagrees with its structural function type",
         ));
     }
-    validate_function_expression(program, caller, call.callee)?;
-    match call.invocation_mode {
+    match call.callee {
+        mir::IndirectCallee::Closure(callee) => {
+            if callee.function_type() != call.function_type {
+                return Err(malformed_mir(
+                    "indirect closure disagrees with its structural function type",
+                ));
+            }
+            validate_closure_invocation(program, caller, callee, call.invocation_mode)?;
+        }
+        mir::IndirectCallee::InterfaceMethod {
+            receiver,
+            interface,
+            slot,
+        } => {
+            let method = program
+                .interface_types
+                .get(interface.0)
+                .and_then(|definition| definition.methods.get(*slot))
+                .ok_or_else(|| {
+                    malformed_mir("interface call selects an unknown requirement slot")
+                })?;
+            let expected_mode = if method.writable_receiver {
+                mir::FunctionInvocationMode::Writable
+            } else {
+                mir::FunctionInvocationMode::Readonly
+            };
+            if method.signature != call.function_type || call.invocation_mode != expected_mode {
+                return Err(malformed_mir(
+                    "interface call disagrees with its requirement signature",
+                ));
+            }
+            let local = local_in(caller, *receiver)?;
+            if local.ty != mir::Type::Interface(*interface)
+                || (method.writable_receiver && !local.writable)
+            {
+                return Err(malformed_mir(
+                    "interface call has an incompatible receiver view or access mode",
+                ));
+            }
+            if !matches!(call.args.first(), Some(mir::Rvalue::Interface(mir::InterfaceExpression {
+                interface: view, value: mir::InterfaceValue::Local { local, transfer: false },
+            })) if view == interface && local == receiver)
+            {
+                return Err(malformed_mir(
+                    "interface call must borrow its dispatch receiver as argument zero",
+                ));
+            }
+        }
+    }
+    validate_indirect_arguments(program, caller, call, definition)
+}
+
+fn validate_closure_invocation(
+    program: &mir::Program,
+    caller: &mir::Function,
+    callee: &mir::FunctionExpression,
+    invocation_mode: mir::FunctionInvocationMode,
+) -> Result<(), BackendError> {
+    validate_function_expression(program, caller, callee)?;
+    match invocation_mode {
         mir::FunctionInvocationMode::Readonly => {}
         mir::FunctionInvocationMode::Writable => {
-            let local = match call.callee {
+            let local = match callee {
                 mir::FunctionExpression::Local {
                     local,
                     transfer: false,
@@ -3426,13 +3775,22 @@ fn validate_indirect_call(
             }
         }
         mir::FunctionInvocationMode::Once => {
-            if function_expression_is_borrowed(call.callee) {
+            if function_expression_is_borrowed(callee) {
                 return Err(malformed_mir(
                     "once indirect call does not consume its function carrier",
                 ));
             }
         }
     }
+    Ok(())
+}
+
+fn validate_indirect_arguments(
+    program: &mir::Program,
+    caller: &mir::Function,
+    call: IndirectCallValidation<'_>,
+    definition: &mir::FunctionType,
+) -> Result<(), BackendError> {
     if call.args.len() != definition.parameters.len() {
         return Err(malformed_mir(format!(
             "indirect call expects {} arguments, got {}",
@@ -3450,6 +3808,13 @@ fn validate_indirect_call(
             )));
         }
         validate_rvalue(program, caller, argument)?;
+        require_tracked_interface_argument(
+            argument,
+            parameter.mode == mir::FunctionParameterMode::Take,
+        )?;
+        if parameter.mode == mir::FunctionParameterMode::Writable {
+            require_writable_interface_argument(program, caller, argument)?;
+        }
         if parameter.mode == mir::FunctionParameterMode::Take
             && parameter.ty.has_move_ownership()
             && argument.borrows_move_value()
@@ -3460,6 +3825,23 @@ fn validate_indirect_call(
             )));
         }
     }
+    let mut accesses = ClassLocalAccesses::default();
+    accesses.begin_call();
+    if let mir::IndirectCallee::Closure(callee) = call.callee {
+        collect_function_class_local_accesses(callee, &mut accesses);
+    }
+    collect_rvalue_args_class_local_accesses(call.args, &mut accesses);
+    accesses.accesses.push(ClassLocalAccess::Call(
+        CallTarget::Indirect(call.function_type),
+        call.args,
+    ));
+    validate_ordered_class_accesses(
+        program,
+        "indirect call",
+        &accesses,
+        &HashMap::new(),
+        &mut HashSet::new(),
+    )?;
     match (definition.return_type, call.result) {
         (mir::ReturnType::Void, None) => {}
         (mir::ReturnType::Value(expected), Some(result)) => {
@@ -3469,9 +3851,15 @@ fn validate_indirect_call(
                     "indirect call has an incompatible result slot",
                 ));
             }
-            if expected.has_move_ownership() && !result.owned {
+            let owned = expected.has_move_ownership()
+                && (definition.return_borrow.is_none()
+                    || matches!(
+                        expected,
+                        mir::Type::Function(_) | mir::Type::NullableFunction(_)
+                    ));
+            if expected.has_move_ownership() && result.owned != owned {
                 return Err(malformed_mir(
-                    "indirect call move result does not own its result slot",
+                    "indirect call result ownership disagrees with its returned-borrow contract",
                 ));
             }
         }
@@ -3485,7 +3873,7 @@ fn validate_indirect_call(
         (true, None) => {}
         (false, Some(error)) => {
             let error = local_in(caller, error)?;
-            if error.ty != mir::Type::Error || !error.owned || !error.synthetic {
+            if error.ty != mir::Type::ERROR || !error.owned || !error.synthetic {
                 return Err(malformed_mir(
                     "checked indirect call has an incompatible Error slot",
                 ));
@@ -3770,9 +4158,11 @@ fn validate_rvalue(
         mir::Rvalue::NullableMixed(value) => {
             validate_nullable_mixed_expression(program, function, value)
         }
-        mir::Rvalue::Error(value) => validate_error_expression(program, function, value),
-        mir::Rvalue::NullableError(value) => {
-            validate_nullable_error_expression(program, function, value)
+        mir::Rvalue::Interface(mir::InterfaceExpression { interface, value }) => {
+            validate_interface_value(program, function, *interface, value)
+        }
+        mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression { interface, value }) => {
+            validate_nullable_interface_value(program, function, *interface, value)
         }
         mir::Rvalue::Class(value) => validate_class_expression(program, function, value),
         mir::Rvalue::NullableClass(value) => {
@@ -4142,11 +4532,11 @@ fn validate_error_assignment_ownership(
     Ok(())
 }
 
-fn error_expression_is_borrowed(expression: &mir::ErrorExpression) -> bool {
+fn error_expression_is_borrowed(expression: &mir::InterfaceValue) -> bool {
     expression.is_borrowed()
 }
 
-fn nullable_error_expression_is_borrowed(expression: &mir::NullableErrorExpression) -> bool {
+fn nullable_error_expression_is_borrowed(expression: &mir::NullableInterfaceValue) -> bool {
     expression.is_borrowed()
 }
 
@@ -4164,44 +4554,105 @@ fn error_descriptor_in(
 fn validate_error_expression(
     program: &mir::Program,
     function: &mir::Function,
-    expression: &mir::ErrorExpression,
+    expression: &mir::InterfaceValue,
 ) -> Result<(), BackendError> {
+    validate_interface_value(program, function, mir::InterfaceTypeId::ERROR, expression)
+}
+
+fn validate_interface_upcast(
+    program: &mir::Program,
+    source: mir::InterfaceTypeId,
+    target: mir::InterfaceTypeId,
+    expected: mir::InterfaceTypeId,
+) -> Result<(), BackendError> {
+    let source = interface_in(program, source)?;
+    if target != expected || !source.ancestors.contains(&target) {
+        return Err(malformed_mir(
+            "interface upcast does not name a declared ancestor view",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_shared_interface_projection(
+    function: &mir::Function,
+    local: mir::LocalId,
+    interface: mir::InterfaceTypeId,
+    nullable: bool,
+) -> Result<(), BackendError> {
+    let ty = local_in(function, local)?.ty;
+    let allowed = matches!(
+        ty,
+        mir::Type::SharedReference(_)
+            | mir::Type::ReadonlySharedReferenceAccess(_)
+            | mir::Type::WritableSharedReferenceAccess(_)
+    ) || (nullable
+        && matches!(
+            ty,
+            mir::Type::NullableSharedReference(_)
+                | mir::Type::NullableReadonlySharedReferenceAccess(_)
+                | mir::Type::NullableWritableSharedReferenceAccess(_)
+        ));
+    if allowed && ty.shared_interface() == Some(interface) {
+        Ok(())
+    } else {
+        Err(malformed_mir(
+            "interface projection requires a matching strong handle or access lease",
+        ))
+    }
+}
+
+fn validate_interface_value(
+    program: &mir::Program,
+    function: &mir::Function,
+    interface: mir::InterfaceTypeId,
+    expression: &mir::InterfaceValue,
+) -> Result<(), BackendError> {
+    interface_in(program, interface)?;
+    let expected = mir::Type::Interface(interface);
     match expression {
-        mir::ErrorExpression::Local { local, transfer } => {
+        mir::InterfaceValue::SharedPayload { local } => validate_shared_interface_projection(function, *local, interface, false),
+        mir::InterfaceValue::NarrowedLocal { local, interface: target, transfer } => {
+            if *target != interface {
+                return Err(malformed_mir("narrowed interface result has a different view"));
+            }
+            validate_nominal_local(function, *local, *transfer)
+        }
+        mir::InterfaceValue::Upcast { source, interface: target } => {
+            validate_interface_upcast(program, source.interface, *target, interface)?;
+            validate_interface_value(program, function, source.interface, &source.value)
+        }
+        mir::InterfaceValue::Local { local, transfer } => {
             let definition = local_in(function, *local)?;
-            if definition.ty != mir::Type::Error || (*transfer && !definition.owned) {
+            if definition.ty != expected || (*transfer && !definition.owned) {
                 return Err(malformed_mir("Error expression uses an incompatible local"));
             }
             Ok(())
         }
-        mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer } => {
+        mir::InterfaceValue::NullableLocalAssumeNonNull { local, transfer } => {
             let definition = local_in(function, *local)?;
-            if definition.ty != mir::Type::NullableError || (*transfer && !definition.owned) {
+            if definition.ty != mir::Type::NullableInterface(interface)
+                || (*transfer && !definition.owned)
+            {
                 return Err(malformed_mir(
                     "nonnull Error expression uses an incompatible nullable local",
                 ));
             }
             Ok(())
         }
-        mir::ErrorExpression::FromClass { object, descriptor } => {
-            let descriptor = error_descriptor_in(program, *descriptor)?;
-            if object.class() != descriptor.class {
+        mir::InterfaceValue::FromClass { object, vtable } => {
+            let table = interface_vtable_in(program, *vtable)?;
+            if table.implementing_type != mir::ImplementingType::Class(object.class()) || table.interface != interface {
                 return Err(malformed_mir(
-                    "Error erasure descriptor does not match its concrete class",
+                    "interface conversion does not match its implementing type and view",
                 ));
             }
             validate_class_expression(program, function, object)
         }
-        mir::ErrorExpression::FromNullableClass { object, descriptor } => {
-            let descriptor = error_descriptor_in(program, *descriptor)?;
-            if object.class() != descriptor.class {
-                return Err(malformed_mir(
-                    "nullable Error erasure descriptor does not match its concrete class",
-                ));
-            }
-            validate_nullable_class_expression(program, function, object)
-        }
-        mir::ErrorExpression::Property {
+        mir::InterfaceValue::FromNullableClass { .. } => Err(malformed_mir(
+            "nullable class conversion cannot produce a non-null interface without a presence proof",
+        )),
+        mir::InterfaceValue::Property {
             object,
             property,
             transfer,
@@ -4212,22 +4663,22 @@ fn validate_error_expression(
                     "Error property transfer uses a readonly receiver",
                 ));
             }
-            validate_property_operand(program, function, *object, *property, mir::Type::Error)
+            validate_property_operand(program, function, *object, *property, expected)
         }
-        mir::ErrorExpression::Call {
+        mir::InterfaceValue::Call {
             function: callee,
             args,
             return_borrow,
         } => {
             let callee = function_in(program, *callee)?;
-            if callee.return_type != mir::ReturnType::Value(mir::Type::Error)
+            if callee.return_type != mir::ReturnType::Value(expected)
                 || *return_borrow != infer_function_return_borrow(program, callee)?
             {
                 return Err(malformed_mir("Error call has an incompatible result"));
             }
             validate_call_args(program, function, callee, args)
         }
-        mir::ErrorExpression::CollectionIndex {
+        mir::InterfaceValue::CollectionIndex {
             collection,
             index,
             positional,
@@ -4238,7 +4689,7 @@ fn validate_error_expression(
                 return Err(malformed_mir("Error index source is not a collection"));
             };
             let collection = collection_in(program, collection)?;
-            if collection.value != mir::Type::Error {
+            if collection.value != expected {
                 return Err(malformed_mir("Error collection element type mismatch"));
             }
             validate_collection_element_access(
@@ -4251,32 +4702,56 @@ fn validate_error_expression(
                 *positional,
             )
         }
-        mir::ErrorExpression::MixedPayload { mixed, .. } => {
-            validate_mixed_payload_operand(function, *mixed, mir::MixedTag::Error, mir::Type::Error)
-        }
     }
 }
 
-fn validate_nullable_error_expression(
+fn validate_nullable_interface_value(
     program: &mir::Program,
     function: &mir::Function,
-    expression: &mir::NullableErrorExpression,
+    interface: mir::InterfaceTypeId,
+    expression: &mir::NullableInterfaceValue,
 ) -> Result<(), BackendError> {
+    interface_in(program, interface)?;
+    let expected = mir::Type::NullableInterface(interface);
     match expression {
-        mir::NullableErrorExpression::Null => Ok(()),
-        mir::NullableErrorExpression::Error(value) => {
-            validate_error_expression(program, function, value)
+        mir::NullableInterfaceValue::SharedPayload { local } => {
+            validate_shared_interface_projection(function, *local, interface, true)
         }
-        mir::NullableErrorExpression::Local { local, transfer } => {
+        mir::NullableInterfaceValue::Upcast {
+            source,
+            interface: target,
+        } => {
+            validate_interface_upcast(program, source.interface, *target, interface)?;
+            validate_nullable_interface_value(program, function, source.interface, &source.value)
+        }
+        mir::NullableInterfaceValue::Null => Ok(()),
+        mir::NullableInterfaceValue::Present(mir::InterfaceValue::FromNullableClass {
+            object,
+            vtable,
+        }) => {
+            let table = interface_vtable_in(program, *vtable)?;
+            if table.implementing_type != mir::ImplementingType::Class(object.class())
+                || table.interface != interface
+            {
+                return Err(malformed_mir(
+                    "nullable interface conversion does not match its implementing type and view",
+                ));
+            }
+            validate_nullable_class_expression(program, function, object)
+        }
+        mir::NullableInterfaceValue::Present(value) => {
+            validate_interface_value(program, function, interface, value)
+        }
+        mir::NullableInterfaceValue::Local { local, transfer } => {
             let definition = local_in(function, *local)?;
-            if definition.ty != mir::Type::NullableError || (*transfer && !definition.owned) {
+            if definition.ty != expected || (*transfer && !definition.owned) {
                 return Err(malformed_mir(
                     "nullable Error expression uses an incompatible local",
                 ));
             }
             Ok(())
         }
-        mir::NullableErrorExpression::Property {
+        mir::NullableInterfaceValue::Property {
             object,
             property,
             transfer,
@@ -4287,21 +4762,15 @@ fn validate_nullable_error_expression(
                     "nullable Error property transfer uses a readonly receiver",
                 ));
             }
-            validate_property_operand(
-                program,
-                function,
-                *object,
-                *property,
-                mir::Type::NullableError,
-            )
+            validate_property_operand(program, function, *object, *property, expected)
         }
-        mir::NullableErrorExpression::Call {
+        mir::NullableInterfaceValue::Call {
             function: callee,
             args,
             return_borrow,
         } => {
             let callee = function_in(program, *callee)?;
-            if callee.return_type != mir::ReturnType::Value(mir::Type::NullableError)
+            if callee.return_type != mir::ReturnType::Value(expected)
                 || *return_borrow != infer_function_return_borrow(program, callee)?
             {
                 return Err(malformed_mir(
@@ -4310,7 +4779,7 @@ fn validate_nullable_error_expression(
             }
             validate_call_args(program, function, callee, args)
         }
-        mir::NullableErrorExpression::DictionaryGet {
+        mir::NullableInterfaceValue::DictionaryGet {
             collection,
             key,
             access,
@@ -4319,10 +4788,10 @@ fn validate_nullable_error_expression(
             function,
             *collection,
             key,
-            mir::Type::Error,
+            mir::Type::Interface(interface),
             *access,
         ),
-        mir::NullableErrorExpression::CollectionIndex {
+        mir::NullableInterfaceValue::CollectionIndex {
             collection,
             index,
             positional,
@@ -4335,10 +4804,7 @@ fn validate_nullable_error_expression(
                 ));
             };
             let collection = collection_in(program, collection)?;
-            if !matches!(
-                collection.value,
-                mir::Type::Error | mir::Type::NullableError
-            ) {
+            if collection.value != expected && collection.value != mir::Type::Interface(interface) {
                 return Err(malformed_mir(
                     "nullable Error collection element type mismatch",
                 ));
@@ -4688,21 +5154,13 @@ fn validate_shared_reference_expression(
     function: &mir::Function,
     expression: &mir::SharedReferenceExpression,
 ) -> Result<(), BackendError> {
-    let class = expression.class();
-    class_in(program, class)?;
+    let class = expression.payload();
+    validate_writable_shared_payload(program, class)?;
     match expression {
         mir::SharedReferenceExpression::New {
-            class: expected,
+            payload: expected,
             value,
-        } => {
-            if value.class() != *expected {
-                return Err(malformed_mir(
-                    "shared construction payload class does not match its handle",
-                ));
-            }
-            validate_class_expression(program, function, value)?;
-            require_owned_class_expression(value, "shared construction")
-        }
+        } => validate_shared_construction(program, function, *expected, value),
         mir::SharedReferenceExpression::Local {
             local, transfer, ..
         } => {
@@ -4759,7 +5217,7 @@ fn validate_shared_reference_expression(
             validate_call_args(program, function, callee, args)
         }
         mir::SharedReferenceExpression::Share { value, .. } => {
-            if value.class() != class {
+            if value.payload() != class {
                 return Err(malformed_mir("share changes payload class"));
             }
             validate_shared_reference_expression(program, function, value)
@@ -4770,7 +5228,7 @@ fn validate_shared_reference_expression(
             transfer,
             ..
         } => {
-            if left.class() != class || right.class() != class {
+            if left.payload() != class || right.payload() != class {
                 return Err(malformed_mir("shared coalesce changes payload class"));
             }
             if *transfer && (left.owned_temporary().is_none() || right.owned_temporary().is_none())
@@ -4815,8 +5273,8 @@ fn validate_weak_reference_expression(
     function: &mir::Function,
     expression: &mir::WeakReferenceExpression,
 ) -> Result<(), BackendError> {
-    let class = expression.class();
-    class_in(program, class)?;
+    let class = expression.payload();
+    validate_writable_shared_payload(program, class)?;
     match expression {
         mir::WeakReferenceExpression::Local {
             local, transfer, ..
@@ -4872,7 +5330,7 @@ fn validate_weak_reference_expression(
             validate_call_args(program, function, callee, args)
         }
         mir::WeakReferenceExpression::Create { value, .. } => {
-            if value.class() != class {
+            if value.payload() != class {
                 return Err(malformed_mir(
                     "weak-reference creation changes payload class",
                 ));
@@ -4885,7 +5343,7 @@ fn validate_weak_reference_expression(
             transfer,
             ..
         } => {
-            if left.class() != class || right.class() != class {
+            if left.payload() != class || right.payload() != class {
                 return Err(malformed_mir("weak coalesce changes payload class"));
             }
             if *transfer && (left.owned_temporary().is_none() || right.owned_temporary().is_none())
@@ -4930,12 +5388,12 @@ fn validate_nullable_shared_reference_expression(
     function: &mir::Function,
     expression: &mir::NullableSharedReferenceExpression,
 ) -> Result<(), BackendError> {
-    let class = expression.class();
-    class_in(program, class)?;
+    let class = expression.payload();
+    validate_writable_shared_payload(program, class)?;
     match expression {
         mir::NullableSharedReferenceExpression::Null(_) => Ok(()),
         mir::NullableSharedReferenceExpression::Shared(value) => {
-            if value.class() != class {
+            if value.payload() != class {
                 return Err(malformed_mir("nullable shared value changes payload class"));
             }
             validate_shared_reference_expression(program, function, value)
@@ -4982,19 +5440,19 @@ fn validate_nullable_shared_reference_expression(
             validate_call_args(program, function, callee, args)
         }
         mir::NullableSharedReferenceExpression::Acquire { value, .. } => {
-            if value.class() != class {
+            if value.payload() != class {
                 return Err(malformed_mir("weak acquisition changes payload class"));
             }
             validate_weak_reference_expression(program, function, value)
         }
         mir::NullableSharedReferenceExpression::NullSafeShare { value, .. } => {
-            if value.class() != class {
+            if value.payload() != class {
                 return Err(malformed_mir("null-safe share changes payload class"));
             }
             validate_nullable_shared_reference_expression(program, function, value)
         }
         mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
-            if value.class() != class {
+            if value.payload() != class {
                 return Err(malformed_mir(
                     "null-safe weak acquisition changes payload class",
                 ));
@@ -5007,7 +5465,7 @@ fn validate_nullable_shared_reference_expression(
             transfer,
             ..
         } => {
-            if left.class() != class || right.class() != class {
+            if left.payload() != class || right.payload() != class {
                 return Err(malformed_mir(
                     "nullable shared coalesce changes payload class",
                 ));
@@ -5074,12 +5532,12 @@ fn validate_nullable_weak_reference_expression(
     function: &mir::Function,
     expression: &mir::NullableWeakReferenceExpression,
 ) -> Result<(), BackendError> {
-    let class = expression.class();
-    class_in(program, class)?;
+    let class = expression.payload();
+    validate_writable_shared_payload(program, class)?;
     match expression {
         mir::NullableWeakReferenceExpression::Null(_) => Ok(()),
         mir::NullableWeakReferenceExpression::Weak(value) => {
-            if value.class() != class {
+            if value.payload() != class {
                 return Err(malformed_mir("nullable weak value changes payload class"));
             }
             validate_weak_reference_expression(program, function, value)
@@ -5125,7 +5583,7 @@ fn validate_nullable_weak_reference_expression(
             validate_call_args(program, function, callee, args)
         }
         mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
-            if value.class() != class {
+            if value.payload() != class {
                 return Err(malformed_mir(
                     "null-safe weak creation changes payload class",
                 ));
@@ -5138,7 +5596,7 @@ fn validate_nullable_weak_reference_expression(
             transfer,
             ..
         } => {
-            if left.class() != class || right.class() != class {
+            if left.payload() != class || right.payload() != class {
                 return Err(malformed_mir(
                     "nullable weak coalesce changes payload class",
                 ));
@@ -5200,13 +5658,6 @@ fn validate_nullable_weak_reference_expression(
     }
 }
 
-fn writable_payload_type(payload: mir::WritableSharedPayload) -> mir::Type {
-    match payload {
-        mir::WritableSharedPayload::Class(class) => mir::Type::Class(class),
-        mir::WritableSharedPayload::Collection(collection) => mir::Type::Collection(collection),
-    }
-}
-
 fn validate_writable_shared_property(
     program: &mir::Program,
     function: &mir::Function,
@@ -5254,6 +5705,20 @@ fn validate_writable_collection_index(
     validate_rvalue(program, function, index)
 }
 
+fn validate_shared_construction(
+    program: &mir::Program,
+    function: &mir::Function,
+    payload: mir::SharedPayload,
+    value: &mir::Rvalue,
+) -> Result<(), BackendError> {
+    if value.ty() != payload.ty() || value.borrows_move_value() {
+        return Err(malformed_mir(
+            "shared construction requires an owned payload matching its handle",
+        ));
+    }
+    validate_rvalue(program, function, value)
+}
+
 fn validate_writable_shared_reference_expression(
     program: &mir::Program,
     function: &mir::Function,
@@ -5263,12 +5728,7 @@ fn validate_writable_shared_reference_expression(
     validate_writable_shared_payload(program, payload)?;
     match expression {
         mir::WritableSharedReferenceExpression::New { value, .. } => {
-            if value.ty() != writable_payload_type(payload) {
-                return Err(malformed_mir(
-                    "writable shared construction payload does not match its handle",
-                ));
-            }
-            validate_rvalue(program, function, value)
+            validate_shared_construction(program, function, payload, value)
         }
         mir::WritableSharedReferenceExpression::Local {
             local, transfer, ..
@@ -5933,10 +6393,15 @@ fn validate_mixed_expression(
             }
             validate_class_expression(program, function, value)
         }
-        mir::MixedExpression::BoxError { value } => {
-            validate_error_expression(program, function, value)?;
-            if error_expression_is_borrowed(value) {
-                return Err(malformed_mir("mixed box borrows an Error payload"));
+        mir::MixedExpression::BoxInterface {
+            value,
+            payload_owned,
+        } => {
+            validate_interface_value(program, function, value.interface, &value.value)?;
+            if *payload_owned == value.value.is_borrowed() {
+                return Err(malformed_mir(
+                    "mixed interface box ownership disagrees with its carrier expression",
+                ));
             }
             Ok(())
         }
@@ -6171,11 +6636,11 @@ fn validate_collection_expression(
             access, writable, ..
         } => {
             let expected = if *writable {
-                mir::Type::WritableSharedReferenceAccess(mir::WritableSharedPayload::Collection(
+                mir::Type::WritableSharedReferenceAccess(mir::SharedPayload::Collection(
                     definition.id,
                 ))
             } else {
-                mir::Type::ReadonlySharedReferenceAccess(mir::WritableSharedPayload::Collection(
+                mir::Type::ReadonlySharedReferenceAccess(mir::SharedPayload::Collection(
                     definition.id,
                 ))
             };
@@ -6919,6 +7384,15 @@ fn require_owned_class_expression(
     destination: &str,
 ) -> Result<(), BackendError> {
     match expression {
+        mir::ClassExpression::InterfacePayload { transfer: true, .. } => Ok(()),
+        mir::ClassExpression::InterfacePayload {
+            transfer: false, ..
+        } => Err(malformed_mir(format!(
+            "{destination} receives a borrowed interface payload"
+        ))),
+        mir::ClassExpression::InterfaceReceiver { .. } => Err(malformed_mir(format!(
+            "{destination} receives a borrowed interface receiver"
+        ))),
         mir::ClassExpression::Local { transfer: true, .. }
         | mir::ClassExpression::Call {
             return_borrow: None,
@@ -7069,6 +7543,20 @@ fn infer_function_return_borrow(
     let (reachable, _) = reachable_blocks_and_predecessors(function, true)?;
     for block in function.blocks.iter().filter(|block| reachable[block.id.0]) {
         let candidate = match &block.terminator {
+            mir::Terminator::Return(mir::Rvalue::Interface(expression)) => Some(
+                infer_interface_return_borrow(program, function, &expression.value)?,
+            ),
+            mir::Terminator::Return(mir::Rvalue::NullableInterface(expression)) => {
+                if matches!(expression.value, mir::NullableInterfaceValue::Null) {
+                    None
+                } else {
+                    Some(infer_nullable_interface_return_borrow(
+                        program,
+                        function,
+                        &expression.value,
+                    )?)
+                }
+            }
             mir::Terminator::Return(mir::Rvalue::Class(expression)) => Some(
                 infer_expression_return_borrow(program, function, expression)?,
             ),
@@ -7433,6 +7921,12 @@ fn infer_rvalue_return_borrow(
     source: &mir::Rvalue,
 ) -> Result<Option<mir::ReturnBorrow>, BackendError> {
     match source {
+        mir::Rvalue::Interface(source) => {
+            infer_interface_return_borrow(program, function, &source.value)
+        }
+        mir::Rvalue::NullableInterface(source) => {
+            infer_nullable_interface_return_borrow(program, function, &source.value)
+        }
         mir::Rvalue::Class(source) => infer_expression_return_borrow(program, function, source),
         mir::Rvalue::NullableClass(source) => {
             infer_nullable_expression_return_borrow(program, function, source)
@@ -7447,6 +7941,99 @@ fn infer_rvalue_return_borrow(
             infer_nullable_mixed_expression_return_borrow(program, function, source)
         }
         _ => Err(malformed_mir("borrowed call source is not a move value")),
+    }
+}
+
+fn infer_interface_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    value: &mir::InterfaceValue,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    if !value.is_borrowed() {
+        return Ok(None);
+    }
+    match value {
+        mir::InterfaceValue::SharedPayload { local } => {
+            infer_local_return_borrow(program, function, *local)
+        }
+        mir::InterfaceValue::Upcast { source, .. } => {
+            infer_interface_return_borrow(program, function, &source.value)
+        }
+        mir::InterfaceValue::NarrowedLocal { local, .. }
+        | mir::InterfaceValue::Local { local, .. }
+        | mir::InterfaceValue::NullableLocalAssumeNonNull { local, .. } => {
+            infer_local_return_borrow(program, function, *local)
+        }
+        mir::InterfaceValue::FromClass { object, .. } => {
+            infer_expression_return_borrow(program, function, object)
+        }
+        mir::InterfaceValue::FromNullableClass { object, .. } => {
+            infer_nullable_expression_return_borrow(program, function, object)
+        }
+        mir::InterfaceValue::Property { object: local, .. }
+        | mir::InterfaceValue::CollectionIndex {
+            collection: local, ..
+        } => Ok(
+            infer_local_return_borrow(program, function, *local)?.map(|borrow| mir::ReturnBorrow {
+                writable: false,
+                ..borrow
+            }),
+        ),
+        mir::InterfaceValue::Call {
+            function: callee,
+            args,
+            return_borrow,
+            ..
+        } => match return_borrow {
+            Some(borrow) => infer_borrowed_rvalue_source(program, function, *callee, args, *borrow),
+            None => Ok(None),
+        },
+    }
+}
+
+fn infer_nullable_interface_return_borrow(
+    program: &mir::Program,
+    function: &mir::Function,
+    value: &mir::NullableInterfaceValue,
+) -> Result<Option<mir::ReturnBorrow>, BackendError> {
+    if !value.is_borrowed() {
+        return Ok(None);
+    }
+    match value {
+        mir::NullableInterfaceValue::SharedPayload { local } => {
+            infer_local_return_borrow(program, function, *local)
+        }
+        mir::NullableInterfaceValue::Upcast { source, .. } => {
+            infer_nullable_interface_return_borrow(program, function, &source.value)
+        }
+        mir::NullableInterfaceValue::Present(value) => {
+            infer_interface_return_borrow(program, function, value)
+        }
+        mir::NullableInterfaceValue::Local { local, .. } => {
+            infer_local_return_borrow(program, function, *local)
+        }
+        mir::NullableInterfaceValue::Property { object: local, .. }
+        | mir::NullableInterfaceValue::DictionaryGet {
+            collection: local, ..
+        }
+        | mir::NullableInterfaceValue::CollectionIndex {
+            collection: local, ..
+        } => Ok(
+            infer_local_return_borrow(program, function, *local)?.map(|borrow| mir::ReturnBorrow {
+                writable: false,
+                ..borrow
+            }),
+        ),
+        mir::NullableInterfaceValue::Call {
+            function: callee,
+            args,
+            return_borrow,
+            ..
+        } => match return_borrow {
+            Some(borrow) => infer_borrowed_rvalue_source(program, function, *callee, args, *borrow),
+            None => Ok(None),
+        },
+        mir::NullableInterfaceValue::Null => Ok(None),
     }
 }
 
@@ -7562,7 +8149,7 @@ fn infer_mixed_expression_return_borrow(
         | mir::MixedExpression::BoxValue(_)
         | mir::MixedExpression::BoxString { .. }
         | mir::MixedExpression::BoxClass { .. }
-        | mir::MixedExpression::BoxError { .. }
+        | mir::MixedExpression::BoxInterface { .. }
         | mir::MixedExpression::BoxPayloadEnum { .. }
         | mir::MixedExpression::BoxFunction { .. }
         | mir::MixedExpression::CollectionIndex { transfer: true, .. } => Ok(None),
@@ -7639,6 +8226,18 @@ fn infer_expression_return_borrow(
     expression: &mir::ClassExpression,
 ) -> Result<Option<mir::ReturnBorrow>, BackendError> {
     match expression {
+        mir::ClassExpression::InterfacePayload {
+            local, transfer, ..
+        } => {
+            if *transfer {
+                Ok(None)
+            } else {
+                infer_local_return_borrow(program, function, *local)
+            }
+        }
+        mir::ClassExpression::InterfaceReceiver { receiver, .. } => {
+            Ok(borrow_from_parameter(function, *receiver))
+        }
         mir::ClassExpression::Local {
             local,
             transfer: false,
@@ -7731,6 +8330,15 @@ fn infer_synthetic_local_return_borrow(
                 continue;
             }
             let (borrow, recursive) = match value {
+                mir::Rvalue::Interface(_) | mir::Rvalue::NullableInterface(_) => {
+                    if escaping_class_local_borrows(program, value)?.contains(&local) {
+                        return Err(malformed_mir(format!(
+                            "borrowed local{} has a recursive assignment",
+                            local.0
+                        )));
+                    }
+                    (infer_rvalue_return_borrow(program, function, value)?, false)
+                }
                 mir::Rvalue::Class(expression) => (
                     infer_expression_return_borrow(program, function, expression)?,
                     class_expression_accesses_local(expression, local),
@@ -7780,6 +8388,43 @@ fn infer_synthetic_local_return_borrow(
                         args,
                         return_borrow,
                     )?,
+                    None => None,
+                };
+                merge_synthetic_local_borrow(&mut inferred, borrow, local)?;
+            }
+        }
+        if let mir::Terminator::IndirectCall {
+            function_type,
+            args,
+            result: Some(target),
+            ..
+        }
+        | mir::Terminator::CheckedIndirectCall {
+            function_type,
+            args,
+            result: Some(target),
+            ..
+        } = &block.terminator
+        {
+            if *target == local {
+                let contract = function_type_in(program, *function_type)?;
+                let borrow = match contract.return_borrow {
+                    Some(return_borrow) => {
+                        let mir::BorrowSource::Parameter(index) = return_borrow.source else {
+                            return Err(malformed_mir(
+                                "indirect returned borrow has no explicit parameter source",
+                            ));
+                        };
+                        let source = args.get(index).ok_or_else(|| {
+                            malformed_mir("indirect returned borrow source is missing")
+                        })?;
+                        infer_rvalue_return_borrow(program, function, source)?.map(|borrow| {
+                            mir::ReturnBorrow {
+                                writable: borrow.writable && return_borrow.writable,
+                                ..borrow
+                            }
+                        })
+                    }
                     None => None,
                 };
                 merge_synthetic_local_borrow(&mut inferred, borrow, local)?;
@@ -7855,6 +8500,130 @@ fn borrow_from_parameter(
     })
 }
 
+fn require_writable_interface_argument(
+    program: &mir::Program,
+    function: &mir::Function,
+    value: &mir::Rvalue,
+) -> Result<(), BackendError> {
+    match value {
+        mir::Rvalue::Interface(value) => {
+            require_writable_interface_value(program, function, &value.value)
+        }
+        mir::Rvalue::NullableInterface(value) => {
+            require_writable_nullable_interface_value(program, function, &value.value)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn require_writable_interface_value(
+    program: &mir::Program,
+    function: &mir::Function,
+    value: &mir::InterfaceValue,
+) -> Result<(), BackendError> {
+    let writable = match value {
+        mir::InterfaceValue::SharedPayload { local } => {
+            let definition = local_in(function, *local)?;
+            definition.writable
+                && matches!(definition.ty, mir::Type::WritableSharedReferenceAccess(_))
+        }
+        mir::InterfaceValue::Upcast { source, .. } => {
+            return require_writable_interface_value(program, function, &source.value)
+        }
+        mir::InterfaceValue::FromClass { object, .. } => {
+            return require_writable_class_expression(program, function, object, "interface view")
+        }
+        mir::InterfaceValue::FromNullableClass { object, .. } => {
+            return require_writable_nullable_class_expression(
+                program,
+                function,
+                object,
+                "interface view",
+            )
+        }
+        mir::InterfaceValue::NarrowedLocal {
+            local, transfer, ..
+        }
+        | mir::InterfaceValue::Local { local, transfer }
+        | mir::InterfaceValue::NullableLocalAssumeNonNull { local, transfer } => {
+            !transfer && local_in(function, *local)?.writable
+        }
+        mir::InterfaceValue::Property {
+            object, property, ..
+        } => {
+            let object = local_in(function, *object)?;
+            let mir::Type::Class(class) = object.ty else {
+                return Err(malformed_mir("interface property receiver is not a class"));
+            };
+            object.writable && property_in(program, class, *property)?.writable
+        }
+        mir::InterfaceValue::CollectionIndex { collection, .. } => {
+            local_in(function, *collection)?.writable
+        }
+        mir::InterfaceValue::Call { return_borrow, .. } => {
+            return_borrow.is_none_or(|borrow| borrow.writable)
+        }
+    };
+    if writable {
+        Ok(())
+    } else {
+        Err(malformed_mir(
+            "interface view requires a writable source path",
+        ))
+    }
+}
+
+fn require_writable_nullable_interface_value(
+    program: &mir::Program,
+    function: &mir::Function,
+    value: &mir::NullableInterfaceValue,
+) -> Result<(), BackendError> {
+    let writable = match value {
+        mir::NullableInterfaceValue::SharedPayload { local } => {
+            let definition = local_in(function, *local)?;
+            definition.writable
+                && matches!(
+                    definition.ty,
+                    mir::Type::WritableSharedReferenceAccess(_)
+                        | mir::Type::NullableWritableSharedReferenceAccess(_)
+                )
+        }
+        mir::NullableInterfaceValue::Upcast { source, .. } => {
+            return require_writable_nullable_interface_value(program, function, &source.value)
+        }
+        mir::NullableInterfaceValue::Present(value) => {
+            return require_writable_interface_value(program, function, value)
+        }
+        mir::NullableInterfaceValue::Local { local, transfer } => {
+            !transfer && local_in(function, *local)?.writable
+        }
+        mir::NullableInterfaceValue::Property {
+            object, property, ..
+        } => {
+            let object = local_in(function, *object)?;
+            let mir::Type::Class(class) = object.ty else {
+                return Err(malformed_mir(
+                    "nullable interface property receiver is not a class",
+                ));
+            };
+            object.writable && property_in(program, class, *property)?.writable
+        }
+        mir::NullableInterfaceValue::Call { return_borrow, .. } => {
+            return_borrow.is_none_or(|borrow| borrow.writable)
+        }
+        mir::NullableInterfaceValue::Null
+        | mir::NullableInterfaceValue::DictionaryGet { .. }
+        | mir::NullableInterfaceValue::CollectionIndex { .. } => false,
+    };
+    if writable {
+        Ok(())
+    } else {
+        Err(malformed_mir(
+            "nullable interface view requires a writable source path",
+        ))
+    }
+}
+
 fn require_writable_class_expression(
     program: &mir::Program,
     function: &mir::Function,
@@ -7862,6 +8631,12 @@ fn require_writable_class_expression(
     destination: &str,
 ) -> Result<(), BackendError> {
     let writable = match expression {
+        mir::ClassExpression::InterfacePayload {
+            local, transfer, ..
+        } => !transfer && local_in(function, *local)?.writable,
+        mir::ClassExpression::InterfaceReceiver { receiver, .. } => {
+            local_in(function, *receiver)?.writable
+        }
         mir::ClassExpression::Local {
             local,
             transfer: false,
@@ -7974,6 +8749,8 @@ fn require_writable_nullable_class_expression(
 
 fn class_expression_transfers_receiver(expression: &mir::ClassExpression) -> bool {
     match expression {
+        mir::ClassExpression::InterfacePayload { transfer, .. } => *transfer,
+        mir::ClassExpression::InterfaceReceiver { .. } => false,
         mir::ClassExpression::Local { transfer, .. }
         | mir::ClassExpression::NullableLocalAssumeNonNull { transfer, .. }
         | mir::ClassExpression::Coalesce { transfer, .. } => *transfer,
@@ -8031,15 +8808,24 @@ enum ClassLocalAccess<'a> {
     PropertyBorrow(mir::LocalId, crate::class_layout::PropertyId),
     Transfer(mir::LocalId),
     BeginCall,
-    Call(mir::FunctionId, &'a [mir::Rvalue], usize),
+    Call(CallTarget, &'a [mir::Rvalue]),
+}
+
+#[derive(Clone, Copy)]
+enum CallTarget {
+    Direct {
+        function: mir::FunctionId,
+        parameter_offset: usize,
+    },
+    Indirect(mir::FunctionTypeId),
 }
 
 #[derive(Default)]
 struct ClassLocalAccesses<'a> {
     accesses: Vec<ClassLocalAccess<'a>>,
-    nullable_assumptions: Vec<mir::LocalId>,
-    mixed_assumptions: Vec<(mir::LocalId, mir::MixedTag)>,
-    class_assumptions: Vec<(mir::LocalId, crate::class_layout::ClassId)>,
+    nullable_assumptions: Vec<(usize, mir::LocalId)>,
+    mixed_assumptions: Vec<(usize, mir::LocalId, mir::MixedTag)>,
+    nominal_assumptions: Vec<(usize, mir::LocalId, mir::Type)>,
 }
 
 impl<'a> ClassLocalAccesses<'a> {
@@ -8057,18 +8843,33 @@ impl<'a> ClassLocalAccesses<'a> {
     }
 
     fn call(&mut self, function: mir::FunctionId, args: &'a [mir::Rvalue]) {
-        self.accesses
-            .push(ClassLocalAccess::Call(function, args, 0));
+        self.accesses.push(ClassLocalAccess::Call(
+            CallTarget::Direct {
+                function,
+                parameter_offset: 0,
+            },
+            args,
+        ));
     }
 
     fn constructor_call(&mut self, function: mir::FunctionId, args: &'a [mir::Rvalue]) {
-        self.accesses
-            .push(ClassLocalAccess::Call(function, args, 1));
+        self.accesses.push(ClassLocalAccess::Call(
+            CallTarget::Direct {
+                function,
+                parameter_offset: 1,
+            },
+            args,
+        ));
     }
 
     fn method_call(&mut self, function: mir::FunctionId, args: &'a [mir::Rvalue]) {
-        self.accesses
-            .push(ClassLocalAccess::Call(function, args, 1));
+        self.accesses.push(ClassLocalAccess::Call(
+            CallTarget::Direct {
+                function,
+                parameter_offset: 1,
+            },
+            args,
+        ));
     }
 
     fn begin_call(&mut self) {
@@ -8076,33 +8877,29 @@ impl<'a> ClassLocalAccesses<'a> {
     }
 
     fn assume_nullable_present(&mut self, local: mir::LocalId) {
-        self.nullable_assumptions.push(local);
+        self.nullable_assumptions.push((self.accesses.len(), local));
     }
 
     fn assume_mixed_tag(&mut self, local: mir::LocalId, tag: mir::MixedTag) {
-        self.mixed_assumptions.push((local, tag));
+        self.mixed_assumptions
+            .push((self.accesses.len(), local, tag));
     }
 
     fn assume_class(&mut self, local: mir::LocalId, class: crate::class_layout::ClassId) {
-        self.class_assumptions.push((local, class));
+        self.nominal_assumptions
+            .push((self.accesses.len(), local, mir::Type::Class(class)));
     }
 
     fn iter(&self) -> impl Iterator<Item = ClassLocalAccess<'a>> + '_ {
         self.accesses.iter().copied()
     }
 
-    fn nullable_assumptions(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
+    fn nullable_assumptions(&self) -> impl Iterator<Item = (usize, mir::LocalId)> + '_ {
         self.nullable_assumptions.iter().copied()
     }
 
-    fn mixed_assumptions(&self) -> impl Iterator<Item = (mir::LocalId, mir::MixedTag)> + '_ {
+    fn mixed_assumptions(&self) -> impl Iterator<Item = (usize, mir::LocalId, mir::MixedTag)> + '_ {
         self.mixed_assumptions.iter().copied()
-    }
-
-    fn class_assumptions(
-        &self,
-    ) -> impl Iterator<Item = (mir::LocalId, crate::class_layout::ClassId)> + '_ {
-        self.class_assumptions.iter().copied()
     }
 
     fn borrowed(&self) -> impl Iterator<Item = mir::LocalId> + '_ {
@@ -8112,7 +8909,7 @@ impl<'a> ClassLocalAccesses<'a> {
             }
             ClassLocalAccess::Transfer(_)
             | ClassLocalAccess::BeginCall
-            | ClassLocalAccess::Call(_, _, _) => None,
+            | ClassLocalAccess::Call(_, _) => None,
         })
     }
 
@@ -8122,7 +8919,7 @@ impl<'a> ClassLocalAccesses<'a> {
             ClassLocalAccess::Borrow(_)
             | ClassLocalAccess::PropertyBorrow(_, _)
             | ClassLocalAccess::BeginCall
-            | ClassLocalAccess::Call(_, _, _) => None,
+            | ClassLocalAccess::Call(_, _) => None,
         })
     }
 
@@ -8134,7 +8931,7 @@ impl<'a> ClassLocalAccesses<'a> {
             ClassLocalAccess::Borrow(_)
             | ClassLocalAccess::Transfer(_)
             | ClassLocalAccess::BeginCall
-            | ClassLocalAccess::Call(_, _, _) => None,
+            | ClassLocalAccess::Call(_, _) => None,
         })
     }
 }
@@ -8190,8 +8987,10 @@ fn collect_rvalue_class_local_accesses<'a>(
         mir::Rvalue::NullableMixed(value) => {
             collect_nullable_mixed_class_local_accesses(value, accesses)
         }
-        mir::Rvalue::Error(value) => collect_error_class_local_accesses(value, accesses),
-        mir::Rvalue::NullableError(value) => {
+        mir::Rvalue::Interface(mir::InterfaceExpression { value, .. }) => {
+            collect_error_class_local_accesses(value, accesses)
+        }
+        mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression { value, .. }) => {
             collect_nullable_error_class_local_accesses(value, accesses)
         }
         mir::Rvalue::Class(value) => collect_class_expression_local_accesses(value, accesses),
@@ -8378,303 +9177,152 @@ fn collect_shared_reference_class_local_accesses<'a>(
     value: &'a mir::SharedReferenceExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    match value {
-        mir::SharedReferenceExpression::New { value, .. } => {
-            collect_class_expression_local_accesses(value, accesses)
-        }
-        mir::SharedReferenceExpression::Call { function, args, .. } => {
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
-        }
-        mir::SharedReferenceExpression::Share { value, .. } => {
-            collect_shared_reference_class_local_accesses(value, accesses)
-        }
-        mir::SharedReferenceExpression::Coalesce { left, right, .. } => {
-            collect_nullable_shared_reference_class_local_accesses(left, accesses);
-            collect_shared_reference_class_local_accesses(right, accesses);
-        }
-        mir::SharedReferenceExpression::CollectionIndex { index, .. } => {
-            collect_rvalue_class_local_accesses(index, accesses)
-        }
-        mir::SharedReferenceExpression::NullableLocalAssumeNonNull { local, .. } => {
-            accesses.assume_nullable_present(*local)
-        }
-        mir::SharedReferenceExpression::Local { .. }
-        | mir::SharedReferenceExpression::Property { .. } => {}
-    }
+    collect_shared_handle_local_accesses(crate::native_shared::Expression::Strong(value), accesses);
 }
 
 fn collect_weak_reference_class_local_accesses<'a>(
     value: &'a mir::WeakReferenceExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    match value {
-        mir::WeakReferenceExpression::Call { function, args, .. } => {
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
-        }
-        mir::WeakReferenceExpression::Create { value, .. } => {
-            collect_shared_reference_class_local_accesses(value, accesses)
-        }
-        mir::WeakReferenceExpression::Coalesce { left, right, .. } => {
-            collect_nullable_weak_reference_class_local_accesses(left, accesses);
-            collect_weak_reference_class_local_accesses(right, accesses);
-        }
-        mir::WeakReferenceExpression::CollectionIndex { index, .. } => {
-            collect_rvalue_class_local_accesses(index, accesses)
-        }
-        mir::WeakReferenceExpression::NullableLocalAssumeNonNull { local, .. } => {
-            accesses.assume_nullable_present(*local)
-        }
-        mir::WeakReferenceExpression::Local { .. }
-        | mir::WeakReferenceExpression::Property { .. } => {}
-    }
+    collect_shared_handle_local_accesses(crate::native_shared::Expression::Weak(value), accesses);
 }
 
 fn collect_nullable_shared_reference_class_local_accesses<'a>(
     value: &'a mir::NullableSharedReferenceExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    match value {
-        mir::NullableSharedReferenceExpression::Shared(value) => {
-            collect_shared_reference_class_local_accesses(value, accesses)
-        }
-        mir::NullableSharedReferenceExpression::Call { function, args, .. } => {
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
-        }
-        mir::NullableSharedReferenceExpression::Acquire { value, .. } => {
-            collect_weak_reference_class_local_accesses(value, accesses)
-        }
-        mir::NullableSharedReferenceExpression::NullSafeShare { value, .. } => {
-            collect_nullable_shared_reference_class_local_accesses(value, accesses)
-        }
-        mir::NullableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
-            collect_nullable_weak_reference_class_local_accesses(value, accesses)
-        }
-        mir::NullableSharedReferenceExpression::Coalesce { left, right, .. } => {
-            collect_nullable_shared_reference_class_local_accesses(left, accesses);
-            collect_nullable_shared_reference_class_local_accesses(right, accesses);
-        }
-        mir::NullableSharedReferenceExpression::DictionaryGet { key, .. } => {
-            collect_rvalue_class_local_accesses(key, accesses)
-        }
-        mir::NullableSharedReferenceExpression::CollectionIndex { index, .. } => {
-            collect_rvalue_class_local_accesses(index, accesses)
-        }
-        mir::NullableSharedReferenceExpression::Null(_)
-        | mir::NullableSharedReferenceExpression::Local { .. }
-        | mir::NullableSharedReferenceExpression::Property { .. } => {}
-    }
+    collect_shared_handle_local_accesses(
+        crate::native_shared::Expression::NullableStrong(value),
+        accesses,
+    );
 }
 
 fn collect_nullable_weak_reference_class_local_accesses<'a>(
     value: &'a mir::NullableWeakReferenceExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    match value {
-        mir::NullableWeakReferenceExpression::Weak(value) => {
-            collect_weak_reference_class_local_accesses(value, accesses)
-        }
-        mir::NullableWeakReferenceExpression::Call { function, args, .. } => {
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
-        }
-        mir::NullableWeakReferenceExpression::NullSafeCreate { value, .. } => {
-            collect_nullable_shared_reference_class_local_accesses(value, accesses)
-        }
-        mir::NullableWeakReferenceExpression::Coalesce { left, right, .. } => {
-            collect_nullable_weak_reference_class_local_accesses(left, accesses);
-            collect_nullable_weak_reference_class_local_accesses(right, accesses);
-        }
-        mir::NullableWeakReferenceExpression::DictionaryGet { key, .. } => {
-            collect_rvalue_class_local_accesses(key, accesses)
-        }
-        mir::NullableWeakReferenceExpression::CollectionIndex { index, .. } => {
-            collect_rvalue_class_local_accesses(index, accesses)
-        }
-        mir::NullableWeakReferenceExpression::Null(_)
-        | mir::NullableWeakReferenceExpression::Local { .. }
-        | mir::NullableWeakReferenceExpression::Property { .. } => {}
-    }
+    collect_shared_handle_local_accesses(
+        crate::native_shared::Expression::NullableWeak(value),
+        accesses,
+    );
 }
 
 fn collect_writable_shared_class_local_accesses<'a>(
     value: &'a mir::WritableSharedReferenceExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    match value {
-        mir::WritableSharedReferenceExpression::New { value, .. } => {
-            collect_rvalue_class_local_accesses(value, accesses)
-        }
-        mir::WritableSharedReferenceExpression::Call { function, args, .. } => {
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
-        }
-        mir::WritableSharedReferenceExpression::Share { value, .. } => {
-            collect_writable_shared_class_local_accesses(value, accesses)
-        }
-        mir::WritableSharedReferenceExpression::Coalesce { left, right, .. } => {
-            collect_nullable_writable_shared_class_local_accesses(left, accesses);
-            collect_writable_shared_class_local_accesses(right, accesses);
-        }
-        mir::WritableSharedReferenceExpression::CollectionIndex { index, .. } => {
-            collect_rvalue_class_local_accesses(index, accesses)
-        }
-        mir::WritableSharedReferenceExpression::NullableLocalAssumeNonNull { local, .. } => {
-            accesses.assume_nullable_present(*local)
-        }
-        mir::WritableSharedReferenceExpression::Local { .. }
-        | mir::WritableSharedReferenceExpression::Property { .. } => {}
-    }
+    collect_shared_handle_local_accesses(
+        crate::native_shared::Expression::WritableStrong(value),
+        accesses,
+    );
 }
 
 fn collect_writable_weak_class_local_accesses<'a>(
     value: &'a mir::WritableWeakReferenceExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    match value {
-        mir::WritableWeakReferenceExpression::Call { function, args, .. } => {
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
-        }
-        mir::WritableWeakReferenceExpression::Create { value, .. } => {
-            collect_writable_shared_class_local_accesses(value, accesses)
-        }
-        mir::WritableWeakReferenceExpression::Coalesce { left, right, .. } => {
-            collect_nullable_writable_weak_class_local_accesses(left, accesses);
-            collect_writable_weak_class_local_accesses(right, accesses);
-        }
-        mir::WritableWeakReferenceExpression::CollectionIndex { index, .. } => {
-            collect_rvalue_class_local_accesses(index, accesses)
-        }
-        mir::WritableWeakReferenceExpression::NullableLocalAssumeNonNull { local, .. } => {
-            accesses.assume_nullable_present(*local)
-        }
-        mir::WritableWeakReferenceExpression::Local { .. }
-        | mir::WritableWeakReferenceExpression::Property { .. } => {}
-    }
+    collect_shared_handle_local_accesses(
+        crate::native_shared::Expression::WritableWeak(value),
+        accesses,
+    );
 }
 
 fn collect_nullable_writable_shared_class_local_accesses<'a>(
     value: &'a mir::NullableWritableSharedReferenceExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    match value {
-        mir::NullableWritableSharedReferenceExpression::Strong(value) => {
-            collect_writable_shared_class_local_accesses(value, accesses)
-        }
-        mir::NullableWritableSharedReferenceExpression::Call { function, args, .. } => {
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
-        }
-        mir::NullableWritableSharedReferenceExpression::Acquire { value, .. } => {
-            collect_writable_weak_class_local_accesses(value, accesses)
-        }
-        mir::NullableWritableSharedReferenceExpression::NullSafeShare { value, .. } => {
-            collect_nullable_writable_shared_class_local_accesses(value, accesses)
-        }
-        mir::NullableWritableSharedReferenceExpression::NullSafeAcquire { value, .. } => {
-            collect_nullable_writable_weak_class_local_accesses(value, accesses)
-        }
-        mir::NullableWritableSharedReferenceExpression::Coalesce { left, right, .. } => {
-            collect_nullable_writable_shared_class_local_accesses(left, accesses);
-            collect_nullable_writable_shared_class_local_accesses(right, accesses);
-        }
-        mir::NullableWritableSharedReferenceExpression::DictionaryGet { key, .. } => {
-            collect_rvalue_class_local_accesses(key, accesses)
-        }
-        mir::NullableWritableSharedReferenceExpression::Null(_)
-        | mir::NullableWritableSharedReferenceExpression::Local { .. }
-        | mir::NullableWritableSharedReferenceExpression::Property { .. } => {}
-    }
+    collect_shared_handle_local_accesses(
+        crate::native_shared::Expression::NullableWritableStrong(value),
+        accesses,
+    );
 }
 
 fn collect_nullable_writable_weak_class_local_accesses<'a>(
     value: &'a mir::NullableWritableWeakReferenceExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    match value {
-        mir::NullableWritableWeakReferenceExpression::Weak(value) => {
-            collect_writable_weak_class_local_accesses(value, accesses)
-        }
-        mir::NullableWritableWeakReferenceExpression::Call { function, args, .. } => {
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
-        }
-        mir::NullableWritableWeakReferenceExpression::NullSafeCreate { value, .. } => {
-            collect_nullable_writable_shared_class_local_accesses(value, accesses)
-        }
-        mir::NullableWritableWeakReferenceExpression::Coalesce { left, right, .. } => {
-            collect_nullable_writable_weak_class_local_accesses(left, accesses);
-            collect_nullable_writable_weak_class_local_accesses(right, accesses);
-        }
-        mir::NullableWritableWeakReferenceExpression::DictionaryGet { key, .. } => {
-            collect_rvalue_class_local_accesses(key, accesses)
-        }
-        mir::NullableWritableWeakReferenceExpression::Null(_)
-        | mir::NullableWritableWeakReferenceExpression::Local { .. }
-        | mir::NullableWritableWeakReferenceExpression::Property { .. } => {}
-    }
+    collect_shared_handle_local_accesses(
+        crate::native_shared::Expression::NullableWritableWeak(value),
+        accesses,
+    );
 }
 
 fn collect_shared_access_class_local_accesses<'a>(
     value: &'a mir::SharedReferenceAccessExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    match value {
-        mir::SharedReferenceAccessExpression::Call { function, args, .. } => {
-            accesses.begin_call();
-            collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
-        }
-        mir::SharedReferenceAccessExpression::Acquire { value, .. } => {
-            collect_writable_shared_class_local_accesses(value, accesses)
-        }
-        mir::SharedReferenceAccessExpression::CollectionIndex { index, .. } => {
-            collect_rvalue_class_local_accesses(index, accesses)
-        }
-        mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull { local, .. } => {
-            accesses.assume_nullable_present(*local)
-        }
-        mir::SharedReferenceAccessExpression::Local { .. }
-        | mir::SharedReferenceAccessExpression::Property { .. } => {}
-    }
+    collect_shared_handle_local_accesses(crate::native_shared::Expression::Access(value), accesses);
 }
 
 fn collect_nullable_shared_access_class_local_accesses<'a>(
     value: &'a mir::NullableSharedReferenceAccessExpression,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
-    match value {
-        mir::NullableSharedReferenceAccessExpression::Access(value) => {
-            collect_shared_access_class_local_accesses(value, accesses)
+    collect_shared_handle_local_accesses(
+        crate::native_shared::Expression::NullableAccess(value),
+        accesses,
+    );
+}
+
+fn collect_shared_handle_local_accesses<'a>(
+    value: crate::native_shared::Expression<'a>,
+    accesses: &mut ClassLocalAccesses<'a>,
+) {
+    use crate::native_shared::{Expression as E, Operation as O};
+    let assumed = match value {
+        E::Strong(mir::SharedReferenceExpression::NullableLocalAssumeNonNull { local, .. })
+        | E::Weak(mir::WeakReferenceExpression::NullableLocalAssumeNonNull { local, .. })
+        | E::WritableStrong(mir::WritableSharedReferenceExpression::NullableLocalAssumeNonNull {
+            local,
+            ..
+        })
+        | E::WritableWeak(mir::WritableWeakReferenceExpression::NullableLocalAssumeNonNull {
+            local,
+            ..
+        })
+        | E::Access(mir::SharedReferenceAccessExpression::NullableLocalAssumeNonNull {
+            local,
+            ..
+        }) => Some(*local),
+        _ => None,
+    };
+    if let Some(local) = assumed {
+        accesses.assume_nullable_present(local);
+    }
+    match value.operation() {
+        O::New { value, .. } => collect_rvalue_class_local_accesses(value, accesses),
+        O::Null => {}
+        O::Present(value) | O::Runtime { value, .. } => {
+            collect_shared_handle_local_accesses(value, accesses)
         }
-        mir::NullableSharedReferenceAccessExpression::Call { function, args, .. } => {
+        O::Local { local, transfer } => {
+            if transfer {
+                accesses.transfer(local);
+            } else {
+                accesses.borrow(local);
+            }
+        }
+        O::Property { object, property } => accesses.borrow_property(object, property),
+        O::Call { function, args } => {
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
-            accesses.call(*function, args);
+            accesses.call(function, args);
         }
-        mir::NullableSharedReferenceAccessExpression::NullSafeAcquire { value, .. } => {
-            collect_nullable_writable_shared_class_local_accesses(value, accesses)
+        O::Coalesce { left, right, .. } => {
+            collect_shared_handle_local_accesses(left, accesses);
+            collect_shared_handle_local_accesses(right, accesses);
         }
-        mir::NullableSharedReferenceAccessExpression::CollectionIndex { index, .. } => {
-            collect_rvalue_class_local_accesses(index, accesses)
+        O::Index {
+            collection, index, ..
         }
-        mir::NullableSharedReferenceAccessExpression::CollectionGet { key, .. } => {
-            collect_rvalue_class_local_accesses(key, accesses)
+        | O::Get {
+            collection,
+            key: index,
+            ..
+        } => {
+            accesses.borrow(collection);
+            collect_rvalue_class_local_accesses(index, accesses);
         }
-        mir::NullableSharedReferenceAccessExpression::Null { .. }
-        | mir::NullableSharedReferenceAccessExpression::Local { .. }
-        | mir::NullableSharedReferenceAccessExpression::Property { .. } => {}
     }
 }
 
@@ -8774,8 +9422,8 @@ fn collect_mixed_class_local_accesses<'a>(
         mir::MixedExpression::BoxClass { value, .. } => {
             collect_class_expression_local_accesses(value, accesses)
         }
-        mir::MixedExpression::BoxError { value } => {
-            collect_error_class_local_accesses(value, accesses)
+        mir::MixedExpression::BoxInterface { value, .. } => {
+            collect_error_class_local_accesses(&value.value, accesses)
         }
         mir::MixedExpression::BoxPayloadEnum { value } => {
             collect_payload_enum_class_local_accesses(value, accesses)
@@ -8798,28 +9446,48 @@ fn collect_mixed_class_local_accesses<'a>(
 }
 
 fn collect_error_class_local_accesses<'a>(
-    value: &'a mir::ErrorExpression,
+    value: &'a mir::InterfaceValue,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
-        mir::ErrorExpression::FromClass { object, .. } => {
+        mir::InterfaceValue::SharedPayload { local } => accesses.borrow(*local),
+        mir::InterfaceValue::NarrowedLocal {
+            local,
+            interface,
+            transfer,
+        } => {
+            accesses.nominal_assumptions.push((
+                accesses.accesses.len(),
+                *local,
+                mir::Type::Interface(*interface),
+            ));
+            if *transfer {
+                accesses.transfer(*local);
+            } else {
+                accesses.borrow(*local);
+            }
+        }
+        mir::InterfaceValue::Upcast { source, .. } => {
+            collect_error_class_local_accesses(&source.value, accesses)
+        }
+        mir::InterfaceValue::FromClass { object, .. } => {
             collect_class_expression_local_accesses(object, accesses)
         }
-        mir::ErrorExpression::FromNullableClass { object, .. } => {
+        mir::InterfaceValue::FromNullableClass { object, .. } => {
             collect_nullable_class_local_accesses(object, accesses)
         }
-        mir::ErrorExpression::Property {
+        mir::InterfaceValue::Property {
             object, property, ..
         } => accesses.borrow_property(*object, *property),
-        mir::ErrorExpression::Call { function, args, .. } => {
+        mir::InterfaceValue::Call { function, args, .. } => {
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
         }
-        mir::ErrorExpression::CollectionIndex { index, .. } => {
+        mir::InterfaceValue::CollectionIndex { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
         }
-        mir::ErrorExpression::NullableLocalAssumeNonNull { local, transfer } => {
+        mir::InterfaceValue::NullableLocalAssumeNonNull { local, transfer } => {
             accesses.assume_nullable_present(*local);
             if *transfer {
                 accesses.transfer(*local);
@@ -8827,31 +9495,48 @@ fn collect_error_class_local_accesses<'a>(
                 accesses.borrow(*local);
             }
         }
-        mir::ErrorExpression::Local { .. } | mir::ErrorExpression::MixedPayload { .. } => {}
+        mir::InterfaceValue::Local { local, transfer } => {
+            if *transfer {
+                accesses.transfer(*local);
+            } else {
+                accesses.borrow(*local);
+            }
+        }
     }
 }
 
 fn collect_nullable_error_class_local_accesses<'a>(
-    value: &'a mir::NullableErrorExpression,
+    value: &'a mir::NullableInterfaceValue,
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
-        mir::NullableErrorExpression::Error(value) => {
+        mir::NullableInterfaceValue::SharedPayload { local } => accesses.borrow(*local),
+        mir::NullableInterfaceValue::Upcast { source, .. } => {
+            collect_nullable_error_class_local_accesses(&source.value, accesses)
+        }
+        mir::NullableInterfaceValue::Present(value) => {
             collect_error_class_local_accesses(value, accesses)
         }
-        mir::NullableErrorExpression::Property {
+        mir::NullableInterfaceValue::Property {
             object, property, ..
         } => accesses.borrow_property(*object, *property),
-        mir::NullableErrorExpression::Call { function, args, .. } => {
+        mir::NullableInterfaceValue::Call { function, args, .. } => {
             accesses.begin_call();
             collect_rvalue_args_class_local_accesses(args, accesses);
             accesses.call(*function, args);
         }
-        mir::NullableErrorExpression::DictionaryGet { key, .. }
-        | mir::NullableErrorExpression::CollectionIndex { index: key, .. } => {
+        mir::NullableInterfaceValue::DictionaryGet { key, .. }
+        | mir::NullableInterfaceValue::CollectionIndex { index: key, .. } => {
             collect_rvalue_class_local_accesses(key, accesses)
         }
-        mir::NullableErrorExpression::Null | mir::NullableErrorExpression::Local { .. } => {}
+        mir::NullableInterfaceValue::Local { local, transfer } => {
+            if *transfer {
+                accesses.transfer(*local);
+            } else {
+                accesses.borrow(*local);
+            }
+        }
+        mir::NullableInterfaceValue::Null => {}
     }
 }
 
@@ -9122,13 +9807,24 @@ fn collect_class_expression_local_accesses<'a>(
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
-        mir::ClassExpression::Local { class, local, .. }
+        mir::ClassExpression::InterfacePayload { class, local, .. }
+        | mir::ClassExpression::Local { class, local, .. }
         | mir::ClassExpression::NullableLocalAssumeNonNull { class, local, .. } => {
             accesses.assume_class(*local, *class);
         }
         _ => {}
     }
     match value {
+        mir::ClassExpression::InterfaceReceiver { receiver, .. } => accesses.borrow(*receiver),
+        mir::ClassExpression::InterfacePayload {
+            local, transfer, ..
+        } => {
+            if *transfer {
+                accesses.transfer(*local);
+            } else {
+                accesses.borrow(*local);
+            }
+        }
         mir::ClassExpression::Local {
             local,
             transfer: true,
@@ -9189,8 +9885,17 @@ fn collect_class_expression_local_accesses<'a>(
         mir::ClassExpression::CollectionIndex { index, .. } => {
             collect_rvalue_class_local_accesses(index, accesses)
         }
-        mir::ClassExpression::MixedPayload { class, mixed, .. } => {
-            accesses.assume_mixed_tag(*mixed, mir::MixedTag::Class(*class));
+        mir::ClassExpression::MixedPayload {
+            class,
+            mixed,
+            transfer,
+        } => {
+            accesses.assume_class(*mixed, *class);
+            if *transfer {
+                accesses.transfer(*mixed);
+            } else {
+                accesses.borrow(*mixed);
+            }
         }
         mir::ClassExpression::SharedPayload { reference, .. } => {
             collect_shared_reference_class_local_accesses(reference, accesses)
@@ -9206,7 +9911,7 @@ fn class_expression_accesses_local(expression: &mir::ClassExpression, local: mir
         ClassLocalAccess::Borrow(accessed)
         | ClassLocalAccess::Transfer(accessed)
         | ClassLocalAccess::PropertyBorrow(accessed, _) => accessed == local,
-        ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _, _) => false,
+        ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _) => false,
     });
     accesses_local
 }
@@ -9221,7 +9926,7 @@ fn nullable_class_expression_accesses_local(
         ClassLocalAccess::Borrow(accessed)
         | ClassLocalAccess::Transfer(accessed)
         | ClassLocalAccess::PropertyBorrow(accessed, _) => accessed == local,
-        ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _, _) => false,
+        ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _) => false,
     });
     accesses_local
 }
@@ -9231,6 +9936,7 @@ fn collect_bool_class_local_accesses<'a>(
     accesses: &mut ClassLocalAccesses<'a>,
 ) {
     match value {
+        mir::BoolExpression::NominalIs { local, .. } => accesses.borrow(*local),
         mir::BoolExpression::Use { operand } => {
             collect_operand_class_local_accesses(operand, accesses);
         }
@@ -9254,7 +9960,7 @@ fn collect_bool_class_local_accesses<'a>(
             collect_nullable_scalar_class_local_accesses(value, accesses);
         }
         mir::BoolExpression::NullableErrorIsPresent(value) => {
-            collect_nullable_error_class_local_accesses(value, accesses);
+            collect_nullable_error_class_local_accesses(&value.value, accesses);
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
             collect_nullable_class_local_accesses(value, accesses);
@@ -9523,12 +10229,12 @@ fn collect_statement_class_local_accesses(statement: &mir::Statement) -> ClassLo
             collect_rvalue_class_local_accesses(value, &mut accesses);
         }
         mir::Statement::CollectionClear { .. } => {}
+        mir::Statement::EnsureErrorOrigin { error, .. } => accesses.borrow(*error),
+        mir::Statement::ExtractErrorObject { error, .. } => accesses.transfer(*error),
         mir::Statement::EchoStringLiteral(_)
         | mir::Statement::DropClass { .. }
         | mir::Statement::DropString { .. }
         | mir::Statement::DropMixed { .. }
-        | mir::Statement::EnsureErrorOrigin { .. }
-        | mir::Statement::ExtractErrorObject { .. }
         | mir::Statement::DropError { .. }
         | mir::Statement::DropCollection { .. }
         | mir::Statement::DropPayloadEnum { .. }
@@ -9560,10 +10266,27 @@ fn collect_terminator_class_local_accesses(terminator: &mir::Terminator) -> Clas
             collect_rvalue_args_class_local_accesses(args, &mut accesses);
             accesses.call(*function, args);
         }
-        mir::Terminator::IndirectCall { callee, args, .. }
-        | mir::Terminator::CheckedIndirectCall { callee, args, .. } => {
-            collect_function_class_local_accesses(callee, &mut accesses);
+        mir::Terminator::IndirectCall {
+            callee,
+            function_type,
+            args,
+            ..
+        }
+        | mir::Terminator::CheckedIndirectCall {
+            callee,
+            function_type,
+            args,
+            ..
+        } => {
+            accesses.begin_call();
+            if let mir::IndirectCallee::Closure(callee) = callee {
+                collect_function_class_local_accesses(callee, &mut accesses);
+            }
             collect_rvalue_args_class_local_accesses(args, &mut accesses);
+            accesses.accesses.push(ClassLocalAccess::Call(
+                CallTarget::Indirect(*function_type),
+                args,
+            ));
         }
         mir::Terminator::CheckedConstruct {
             properties,
@@ -9583,11 +10306,9 @@ fn collect_terminator_class_local_accesses(terminator: &mir::Terminator) -> Clas
         mir::Terminator::CheckedIo { operation, .. } => {
             collect_checked_io_class_local_accesses(operation, &mut accesses);
         }
-        mir::Terminator::ReturnVoid
-        | mir::Terminator::Unreachable
-        | mir::Terminator::Jump(_)
-        | mir::Terminator::ErrorSwitch { .. }
-        | mir::Terminator::PropagateError { .. } => {}
+        mir::Terminator::ErrorSwitch { error, .. } => accesses.borrow(*error),
+        mir::Terminator::PropagateError { error } => accesses.transfer(*error),
+        mir::Terminator::ReturnVoid | mir::Terminator::Unreachable | mir::Terminator::Jump(_) => {}
     }
     accesses
 }
@@ -9685,25 +10406,24 @@ fn apply_class_local_state(
         }
     }
     match statement {
-        mir::Statement::AssignLocal { target, .. }
-            if matches!(
-                local_in(function, *target)?.ty,
-                mir::Type::Class(_) | mir::Type::NullableClass(_)
-            ) =>
-        {
+        mir::Statement::AssignLocal { target, .. } => {
             moved.remove(target);
         }
         mir::Statement::AssignLocalGroup { targets, .. } => {
             for target in targets {
-                if matches!(
-                    local_in(function, *target)?.ty,
-                    mir::Type::Class(_) | mir::Type::NullableClass(_)
-                ) {
-                    moved.remove(target);
-                }
+                moved.remove(target);
             }
         }
-        mir::Statement::DropClass { local, .. } => {
+        mir::Statement::ExtractErrorObject { target, .. } => {
+            moved.remove(target);
+        }
+        mir::Statement::DropClass { local, .. }
+        | mir::Statement::DropError { local }
+        | mir::Statement::DropSharedReference { local, .. }
+        | mir::Statement::DropWeakReference { local, .. }
+        | mir::Statement::DropWritableSharedReference { local, .. }
+        | mir::Statement::DropWritableWeakReference { local, .. }
+        | mir::Statement::DropSharedReferenceAccess { local, .. } => {
             moved.insert(*local);
         }
         _ => {}
@@ -9723,7 +10443,7 @@ fn apply_class_local_accesses(
                 (local, "uses")
             }
             ClassLocalAccess::Transfer(local) => (local, "transfers"),
-            ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _, _) => continue,
+            ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _) => continue,
         };
         if validate && moved.contains(&local) {
             return Err(malformed_mir(format!(
@@ -9755,12 +10475,9 @@ fn validate_nullable_presence(
             apply_nullable_presence_statement(program, function, statement, &mut present)?;
         }
 
-        apply_nullable_class_call_effects(
-            program,
-            function,
-            &collect_terminator_class_local_accesses(&block.terminator),
-            &mut present,
-        )?;
+        invalidate_terminator_proofs(program, &block.terminator, |local| {
+            present.remove(&local);
+        })?;
 
         match &block.terminator {
             mir::Terminator::Jump(target) => {
@@ -9840,6 +10557,7 @@ fn validate_nullable_presence(
         };
         for statement in &block.statements {
             validate_nullable_assumptions(
+                program,
                 function,
                 &collect_statement_class_local_accesses(statement),
                 &present,
@@ -9847,6 +10565,7 @@ fn validate_nullable_presence(
             apply_nullable_presence_statement(program, function, statement, &mut present)?;
         }
         validate_nullable_assumptions(
+            program,
             function,
             &collect_terminator_class_local_accesses(&block.terminator),
             &present,
@@ -9870,8 +10589,12 @@ fn validate_mixed_tag_proofs(
             continue;
         };
         for statement in &block.statements {
-            apply_mixed_tag_statement(function, statement, &mut tags)?;
+            apply_mixed_tag_statement(program, function, statement, &mut tags)?;
         }
+
+        invalidate_terminator_proofs(program, &block.terminator, |local| {
+            tags.remove(&local);
+        })?;
 
         match &block.terminator {
             mir::Terminator::Jump(target) => {
@@ -9956,7 +10679,7 @@ fn validate_mixed_tag_proofs(
                 &collect_statement_class_local_accesses(statement),
                 &tags,
             )?;
-            apply_mixed_tag_statement(function, statement, &mut tags)?;
+            apply_mixed_tag_statement(program, function, statement, &mut tags)?;
         }
         validate_mixed_tag_assumptions(
             program,
@@ -9974,7 +10697,7 @@ fn validate_class_refinement_proofs(
     function: &mir::Function,
 ) -> Result<(), BackendError> {
     let mut entries = vec![None; function.blocks.len()];
-    entries[function.entry_block.0] = Some(HashMap::new());
+    entries[function.entry_block.0] = Some(HashSet::new());
     let mut pending = VecDeque::from([function.entry_block]);
 
     while let Some(block_id) = pending.pop_front() {
@@ -9983,8 +10706,12 @@ fn validate_class_refinement_proofs(
             continue;
         };
         for statement in &block.statements {
-            apply_class_refinement_statement(function, statement, &mut refinements)?;
+            apply_class_refinement_statement(program, statement, &mut refinements)?;
         }
+
+        invalidate_terminator_proofs(program, &block.terminator, |local| {
+            refinements.retain(|(root, _)| *root != local)
+        })?;
 
         match &block.terminator {
             mir::Terminator::Jump(target) => {
@@ -10069,7 +10796,7 @@ fn validate_class_refinement_proofs(
                 &collect_statement_class_local_accesses(statement),
                 &refinements,
             )?;
-            apply_class_refinement_statement(function, statement, &mut refinements)?;
+            apply_class_refinement_statement(program, statement, &mut refinements)?;
         }
         validate_class_refinement_assumptions(
             program,
@@ -10083,7 +10810,7 @@ fn validate_class_refinement_proofs(
 }
 
 fn validate_payload_case_proofs(
-    _program: &mir::Program,
+    program: &mir::Program,
     function: &mir::Function,
 ) -> Result<(), BackendError> {
     let mut entries = vec![None; function.blocks.len()];
@@ -10096,8 +10823,12 @@ fn validate_payload_case_proofs(
             continue;
         };
         for statement in &block.statements {
-            apply_payload_case_statement(function, statement, &mut cases)?;
+            apply_payload_case_statement(program, function, statement, &mut cases)?;
         }
+
+        invalidate_terminator_proofs(program, &block.terminator, |local| {
+            cases.remove(&local);
+        })?;
 
         match &block.terminator {
             mir::Terminator::Jump(target) => {
@@ -10184,7 +10915,7 @@ fn validate_payload_case_proofs(
                     )));
                 }
             }
-            apply_payload_case_statement(function, statement, &mut cases)?;
+            apply_payload_case_statement(program, function, statement, &mut cases)?;
         }
     }
 
@@ -10240,7 +10971,7 @@ fn validate_assertion_collection_contract(
                     mir::Type::NullableScalar(_)
                         | mir::Type::NullableString
                         | mir::Type::NullableMixed
-                        | mir::Type::NullableError
+                        | mir::Type::NullableInterface(_)
                         | mir::Type::NullableClass(_)
                         | mir::Type::NullableSharedReference(_)
                         | mir::Type::NullableWeakReference(_)
@@ -10332,14 +11063,14 @@ fn validate_throw_assertion_contract(
         Some(mir::AssertionOperandPlan::Local { local, .. }) => local,
         _ => unreachable!(),
     };
-    let valid_callee = |callee: &mir::FunctionExpression| {
+    let valid_callee = |callee: &mir::IndirectCallee| {
         matches!(
             callee,
-            mir::FunctionExpression::Local {
+            mir::IndirectCallee::Closure(mir::FunctionExpression::Local {
                 function_type,
                 local,
                 transfer,
-            } if *function_type == subject_type
+            }) if *function_type == subject_type
                 && *local == subject_local
                 && *transfer == (subject.invocation_mode == mir::FunctionInvocationMode::Once)
         )
@@ -10362,7 +11093,7 @@ fn validate_throw_assertion_contract(
                 && *function_type == subject_type
                 && *invocation_mode == subject.invocation_mode
                 && args.is_empty()
-                && error.ty == mir::Type::Error
+                && error.ty == mir::Type::ERROR
                 && error.owned
                 && success != failure
         }
@@ -10415,7 +11146,14 @@ fn validate_throw_assertion_contract(
         return Err(malformed_mir("throw assertion inspector must return void"));
     }
     match parameter.ty {
-        mir::Type::Error => Ok(()),
+        mir::Type::Interface(interface)
+            if interface == mir::InterfaceTypeId::ERROR
+                || interface_in(program, interface)?
+                    .ancestors
+                    .contains(&mir::InterfaceTypeId::ERROR) =>
+        {
+            Ok(())
+        }
         mir::Type::Class(class) if class_in(program, class)?.error_descriptor.is_some() => Ok(()),
         _ => Err(malformed_mir(
             "throw assertion inspector parameter must be Error or a concrete Error class",
@@ -10990,11 +11728,15 @@ fn rvalue_reads_collection_value_at(
             positional,
             remove,
         })
-        | mir::Rvalue::Error(mir::ErrorExpression::CollectionIndex {
-            collection,
-            index,
-            positional,
-            remove,
+        | mir::Rvalue::Interface(mir::InterfaceExpression {
+            value:
+                mir::InterfaceValue::CollectionIndex {
+                    collection,
+                    index,
+                    positional,
+                    remove,
+                },
+            ..
         })
         | mir::Rvalue::SharedReference(mir::SharedReferenceExpression::CollectionIndex {
             collection,
@@ -11114,10 +11856,14 @@ fn rvalue_reads_collection_value_at(
             key,
             access,
         })
-        | mir::Rvalue::NullableError(mir::NullableErrorExpression::DictionaryGet {
-            collection,
-            key,
-            access,
+        | mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression {
+            value:
+                mir::NullableInterfaceValue::DictionaryGet {
+                    collection,
+                    key,
+                    access,
+                },
+            ..
         })
         | mir::Rvalue::NullableClass(mir::NullableClassExpression::DictionaryGet {
             collection,
@@ -11463,11 +12209,11 @@ fn validate_list_algorithm_cfg(
         || success != plan.callback_success
         || !matches!(
             callee,
-            mir::FunctionExpression::Local {
+            mir::IndirectCallee::Closure(mir::FunctionExpression::Local {
                 function_type,
                 local,
                 transfer: false,
-            } if *function_type == plan.callback_type && *local == plan.callback
+            }) if *function_type == plan.callback_type && *local == plan.callback
         )
     {
         return Err(malformed_mir(
@@ -11821,7 +12567,7 @@ fn validate_finalizer_plan(
             mir::StructuredExitKind::CheckedError { error } => {
                 let error_id = error;
                 let error = local_in(function, error_id)?;
-                if error.ty != mir::Type::Error || !error.owned {
+                if error.ty != mir::Type::ERROR || !error.owned {
                     return Err(malformed_mir(
                         "checked-error finalizer exit does not own an Error carrier",
                     ));
@@ -11943,7 +12689,7 @@ fn validate_finalizer_replacements(
             ));
         }
         let replacement_error = local_in(function, replacement.replacement_error)?;
-        if replacement_error.ty != mir::Type::Error
+        if replacement_error.ty != mir::Type::ERROR
             || !replacement_error.owned
             || !replacement_error.synthetic
         {
@@ -11960,10 +12706,10 @@ fn validate_finalizer_replacements(
                     statement,
                     mir::Statement::AssignLocal {
                         target,
-                        value: mir::Rvalue::Error(mir::ErrorExpression::Local {
+                        value: mir::Rvalue::Interface(mir::InterfaceExpression { value: mir::InterfaceValue::Local {
                             transfer: true,
                             ..
-                        }),
+                        }, .. }),
                     } if *target == replacement.replacement_error
                 )
             })
@@ -12041,10 +12787,10 @@ fn validate_finalizer_replacements(
                 matches!(
                     statement,
                     mir::Statement::AssignLocal {
-                        value: mir::Rvalue::Error(mir::ErrorExpression::Local {
+                        value: mir::Rvalue::Interface(mir::InterfaceExpression { value: mir::InterfaceValue::Local {
                             local,
                             transfer: true,
-                        }),
+                        }, .. }),
                         ..
                     } if *local == replacement.replacement_error
                 )
@@ -12417,17 +13163,12 @@ fn merge_definite_mixed_tags(
 }
 
 fn merge_definite_class_refinements(
-    destination: &mut Option<HashMap<mir::LocalId, crate::class_layout::ClassId>>,
-    incoming: &HashMap<mir::LocalId, crate::class_layout::ClassId>,
+    destination: &mut Option<HashSet<(mir::LocalId, mir::Type)>>,
+    incoming: &HashSet<(mir::LocalId, mir::Type)>,
 ) -> bool {
     match destination {
         Some(current) => {
-            let merged = current
-                .iter()
-                .filter_map(|(local, class)| {
-                    (incoming.get(local) == Some(class)).then_some((*local, *class))
-                })
-                .collect::<HashMap<_, _>>();
+            let merged = current.intersection(incoming).copied().collect();
             if *current == merged {
                 false
             } else {
@@ -12469,10 +13210,18 @@ fn merge_definite_payload_cases(
 }
 
 fn apply_payload_case_statement(
+    program: &mir::Program,
     function: &mir::Function,
     statement: &mir::Statement,
     cases: &mut HashMap<mir::LocalId, crate::enums::EnumCaseId>,
 ) -> Result<(), BackendError> {
+    invalidate_call_proofs(
+        program,
+        &collect_statement_class_local_accesses(statement),
+        |local| {
+            cases.remove(&local);
+        },
+    )?;
     match statement {
         mir::Statement::AssignLocal { target, .. } => {
             if matches!(
@@ -12492,7 +13241,15 @@ fn apply_payload_case_statement(
                 }
             }
         }
-        mir::Statement::BindPayloadEnumFields { targets, .. } => {
+        mir::Statement::BindPayloadEnumFields {
+            source,
+            mode,
+            targets,
+            ..
+        } => {
+            if *mode == mir::MatchBindingMode::ConsumedArm {
+                cases.remove(source);
+            }
             for target in targets {
                 cases.remove(target);
             }
@@ -12557,6 +13314,9 @@ fn apply_nullable_presence_statement(
                 (mir::Type::NullableCollection(_), mir::Rvalue::NullableCollection(value)) => {
                     nullable_collection_expression_is_present(value, present)
                 }
+                (mir::Type::NullableInterface(_), mir::Rvalue::NullableInterface(value)) => {
+                    nullable_interface_expression_is_present(&value.value, present)
+                }
                 _ => return Ok(()),
             };
             if value_is_present {
@@ -12580,6 +13340,9 @@ fn apply_nullable_presence_statement(
                 (mir::Type::NullableCollection(_), mir::Rvalue::NullableCollection(value)) => {
                     nullable_collection_expression_is_present(value, present)
                 }
+                (mir::Type::NullableInterface(_), mir::Rvalue::NullableInterface(value)) => {
+                    nullable_interface_expression_is_present(&value.value, present)
+                }
                 _ => return Ok(()),
             };
             for target in targets {
@@ -12590,7 +13353,9 @@ fn apply_nullable_presence_statement(
                 }
             }
         }
-        mir::Statement::DropClass { local, .. } | mir::Statement::DropCollection { local, .. } => {
+        mir::Statement::DropClass { local, .. }
+        | mir::Statement::DropCollection { local, .. }
+        | mir::Statement::DropError { local } => {
             present.remove(local);
         }
         _ => {}
@@ -12599,10 +13364,18 @@ fn apply_nullable_presence_statement(
 }
 
 fn apply_mixed_tag_statement(
+    program: &mir::Program,
     function: &mir::Function,
     statement: &mir::Statement,
     tags: &mut HashMap<mir::LocalId, mir::MixedTag>,
 ) -> Result<(), BackendError> {
+    invalidate_call_proofs(
+        program,
+        &collect_statement_class_local_accesses(statement),
+        |local| {
+            tags.remove(&local);
+        },
+    )?;
     match statement {
         mir::Statement::AssignLocal { target, .. } => {
             if matches!(
@@ -12631,31 +13404,26 @@ fn apply_mixed_tag_statement(
 }
 
 fn apply_class_refinement_statement(
-    function: &mir::Function,
+    program: &mir::Program,
     statement: &mir::Statement,
-    refinements: &mut HashMap<mir::LocalId, crate::class_layout::ClassId>,
+    refinements: &mut HashSet<(mir::LocalId, mir::Type)>,
 ) -> Result<(), BackendError> {
+    invalidate_call_proofs(
+        program,
+        &collect_statement_class_local_accesses(statement),
+        |local| refinements.retain(|(root, _)| *root != local),
+    )?;
     match statement {
         mir::Statement::AssignLocal { target, .. } => {
-            if matches!(
-                local_in(function, *target)?.ty,
-                mir::Type::Class(_) | mir::Type::NullableClass(_)
-            ) {
-                refinements.remove(target);
-            }
+            refinements.retain(|(local, _)| local != target);
         }
         mir::Statement::AssignLocalGroup { targets, .. } => {
-            for target in targets {
-                if matches!(
-                    local_in(function, *target)?.ty,
-                    mir::Type::Class(_) | mir::Type::NullableClass(_)
-                ) {
-                    refinements.remove(target);
-                }
-            }
+            refinements.retain(|(local, _)| !targets.contains(local));
         }
-        mir::Statement::DropClass { local, .. } => {
-            refinements.remove(local);
+        mir::Statement::DropClass { local, .. }
+        | mir::Statement::DropError { local }
+        | mir::Statement::DropMixed { local } => {
+            refinements.retain(|(source, _)| source != local);
         }
         _ => {}
     }
@@ -12692,15 +13460,34 @@ fn apply_mixed_tag_condition(
 fn apply_class_refinement_condition(
     condition: &mir::BoolExpression,
     when_true: bool,
-    refinements: &mut HashMap<mir::LocalId, crate::class_layout::ClassId>,
+    refinements: &mut HashSet<(mir::LocalId, mir::Type)>,
 ) {
     match condition {
+        mir::BoolExpression::MixedIs {
+            mixed,
+            tag: mir::MixedTag::Class(class),
+        } => {
+            if let Some(local) = mixed_expression_local(mixed) {
+                if when_true {
+                    refinements.insert((local, mir::Type::Class(*class)));
+                } else {
+                    refinements.remove(&(local, mir::Type::Class(*class)));
+                }
+            }
+        }
+        mir::BoolExpression::NominalIs { local, target } => {
+            if when_true {
+                refinements.insert((*local, *target));
+            } else {
+                refinements.remove(&(*local, *target));
+            }
+        }
         mir::BoolExpression::ClassIs { value, target } => {
             if let Some(local) = class_is_expression_local(value) {
                 if when_true {
-                    refinements.insert(local, *target);
+                    refinements.insert((local, mir::Type::Class(*target)));
                 } else {
-                    refinements.remove(&local);
+                    refinements.remove(&(local, mir::Type::Class(*target)));
                 }
             }
         }
@@ -12742,7 +13529,7 @@ fn validate_mixed_tag_assumptions(
     accesses: &ClassLocalAccesses<'_>,
     tags: &HashMap<mir::LocalId, mir::MixedTag>,
 ) -> Result<(), BackendError> {
-    for (local, tag) in accesses.mixed_assumptions() {
+    for (position, local, tag) in accesses.mixed_assumptions() {
         let proven = tags.get(&local);
         let valid = proven == Some(&tag)
             || matches!(
@@ -12750,7 +13537,7 @@ fn validate_mixed_tag_assumptions(
                 (Some(mir::MixedTag::Class(actual)), mir::MixedTag::Class(target))
                     if class_is_subtype(program, *actual, target)
             );
-        if !valid {
+        if !valid || proof_invalidated_before(program, accesses, position, local)? {
             return Err(malformed_mir(format!(
                 "{} local local{} is unboxed as {tag} without a dominating exact `is` proof",
                 local_in(function, local)?.ty,
@@ -12765,48 +13552,122 @@ fn validate_class_refinement_assumptions(
     program: &mir::Program,
     function: &mir::Function,
     accesses: &ClassLocalAccesses<'_>,
-    refinements: &HashMap<mir::LocalId, crate::class_layout::ClassId>,
+    refinements: &HashSet<(mir::LocalId, mir::Type)>,
 ) -> Result<(), BackendError> {
-    for (local, target) in accesses.class_assumptions() {
-        let source = match local_in(function, local)?.ty {
-            mir::Type::Class(class) | mir::Type::NullableClass(class) => class,
-            _ => continue,
-        };
-        if class_is_subtype(program, source, target) {
+    for &(position, local, target) in &accesses.nominal_assumptions {
+        let source = local_in(function, local)?.ty;
+        if nominal_type_implies(program, source, target) {
             continue;
         }
         let valid = refinements
-            .get(&local)
-            .is_some_and(|proven| class_is_subtype(program, *proven, target));
-        if !valid {
+            .iter()
+            .any(|(root, proven)| *root == local && nominal_type_implies(program, *proven, target));
+        if !valid || proof_invalidated_before(program, accesses, position, local)? {
             return Err(malformed_mir(format!(
-                "{} local local{} is narrowed to class#{} without a dominating hierarchy `is` proof",
+                "{} local local{} is narrowed to {} without a dominating hierarchy `is` proof",
                 local_in(function, local)?.ty,
                 local.0,
-                target.0,
+                target,
             )));
         }
     }
     Ok(())
 }
 
+fn nominal_type_implies(program: &mir::Program, source: mir::Type, target: mir::Type) -> bool {
+    match (source, target) {
+        (mir::Type::Class(source), mir::Type::Class(target)) => {
+            class_is_subtype(program, source, target)
+        }
+        (mir::Type::Class(source), mir::Type::Interface(target)) => program
+            .interface_vtable(mir::ImplementingType::Class(source), target)
+            .is_some(),
+        (mir::Type::Interface(source), mir::Type::Interface(target)) => {
+            source == target
+                || program.interface_types[source.0]
+                    .ancestors
+                    .contains(&target)
+        }
+        // Class-local projections separately require the nullable presence proof.
+        (mir::Type::NullableClass(source), mir::Type::Class(target)) => {
+            class_is_subtype(program, source, target)
+        }
+        _ => false,
+    }
+}
+
+fn validate_nominal_local(
+    function: &mir::Function,
+    local: mir::LocalId,
+    transfer: bool,
+) -> Result<(), BackendError> {
+    let definition = local_in(function, local)?;
+    if !matches!(
+        definition.ty,
+        mir::Type::Class(_)
+            | mir::Type::NullableClass(_)
+            | mir::Type::Interface(_)
+            | mir::Type::NullableInterface(_)
+            | mir::Type::Mixed
+            | mir::Type::NullableMixed
+    ) || (transfer && !definition.owned)
+    {
+        return Err(malformed_mir(
+            "nominal projection uses an incompatible local or transfers a borrow",
+        ));
+    }
+    Ok(())
+}
+
 fn apply_nullable_class_call_effects(
     program: &mir::Program,
-    function: &mir::Function,
+    _function: &mir::Function,
     accesses: &ClassLocalAccesses<'_>,
     present: &mut HashSet<mir::LocalId>,
 ) -> Result<(), BackendError> {
+    invalidate_call_proofs(program, accesses, |local| {
+        present.remove(&local);
+    })
+}
+
+fn invalidate_call_proofs(
+    program: &mir::Program,
+    accesses: &ClassLocalAccesses<'_>,
+    mut invalidate: impl FnMut(mir::LocalId),
+) -> Result<(), BackendError> {
     for access in accesses.iter() {
-        let ClassLocalAccess::Call(callee, args, parameter_offset) = access else {
+        let ClassLocalAccess::Call(callee, args) = access else {
             continue;
         };
-        for (local, mode) in borrowed_class_call_locals(program, callee, args, parameter_offset)? {
-            if matches!(mode, ClassBorrowMode::Writable)
-                && matches!(local_in(function, local)?.ty, mir::Type::NullableClass(_))
-            {
-                present.remove(&local);
+        for (local, mode) in borrowed_call_locals(program, callee, args)? {
+            if matches!(mode, ClassBorrowMode::Writable) {
+                invalidate(local);
             }
         }
+    }
+    Ok(())
+}
+
+fn invalidate_terminator_proofs(
+    program: &mir::Program,
+    terminator: &mir::Terminator,
+    mut invalidate: impl FnMut(mir::LocalId),
+) -> Result<(), BackendError> {
+    invalidate_call_proofs(
+        program,
+        &collect_terminator_class_local_accesses(terminator),
+        &mut invalidate,
+    )?;
+    let (result, error) = match terminator {
+        mir::Terminator::CheckedCall { result, error, .. }
+        | mir::Terminator::CheckedIndirectCall { result, error, .. }
+        | mir::Terminator::CheckedIo { result, error, .. } => (*result, Some(*error)),
+        mir::Terminator::IndirectCall { result, .. } => (*result, None),
+        mir::Terminator::CheckedConstruct { result, error, .. } => (Some(*result), Some(*error)),
+        _ => (None, None),
+    };
+    for local in result.into_iter().chain(error) {
+        invalidate(local);
     }
     Ok(())
 }
@@ -12850,6 +13711,29 @@ fn nullable_collection_expression_is_present(
             nullable_collection_expression_is_present(left, present)
                 || nullable_collection_expression_is_present(right, present)
         }
+    }
+}
+
+fn nullable_interface_expression_is_present(
+    value: &mir::NullableInterfaceValue,
+    present: &HashSet<mir::LocalId>,
+) -> bool {
+    match value {
+        mir::NullableInterfaceValue::SharedPayload { local } => present.contains(local),
+        mir::NullableInterfaceValue::Upcast { source, .. } => {
+            nullable_interface_expression_is_present(&source.value, present)
+        }
+        mir::NullableInterfaceValue::Present(mir::InterfaceValue::FromNullableClass {
+            object,
+            ..
+        }) => nullable_class_expression_is_present(object, present),
+        mir::NullableInterfaceValue::Present(_) => true,
+        mir::NullableInterfaceValue::Local { local, .. } => present.contains(local),
+        mir::NullableInterfaceValue::Null
+        | mir::NullableInterfaceValue::Property { .. }
+        | mir::NullableInterfaceValue::Call { .. }
+        | mir::NullableInterfaceValue::DictionaryGet { .. }
+        | mir::NullableInterfaceValue::CollectionIndex { .. } => false,
     }
 }
 
@@ -12912,13 +13796,16 @@ fn apply_nullable_presence_condition(
     present: &mut HashSet<mir::LocalId>,
 ) {
     match condition {
+        mir::BoolExpression::NominalIs { local, .. } if when_true => {
+            present.insert(*local);
+        }
         mir::BoolExpression::NullableScalarIsPresent(value) => {
             if let mir::NullableScalarExpression::Local { local, .. } = value.as_ref() {
                 set_nullable_presence(*local, when_true, present);
             }
         }
         mir::BoolExpression::NullableErrorIsPresent(value) => {
-            if let mir::NullableErrorExpression::Local { local, .. } = value.as_ref() {
+            if let mir::NullableInterfaceValue::Local { local, .. } = &value.value {
                 set_nullable_presence(*local, when_true, present);
             }
         }
@@ -13054,20 +13941,52 @@ fn nullable_payload_enum_presence_local(
     }
 }
 
+fn proof_invalidated_before(
+    program: &mir::Program,
+    accesses: &ClassLocalAccesses<'_>,
+    position: usize,
+    local: mir::LocalId,
+) -> Result<bool, BackendError> {
+    // A proof must survive evaluation of earlier operands, not merely dominate
+    // the containing statement. Later calls do not invalidate an earlier read.
+    for access in &accesses.accesses[..position] {
+        if let ClassLocalAccess::Call(callee, args) = access {
+            if borrowed_call_locals(program, *callee, args)?
+                .iter()
+                .any(|(written, mode)| {
+                    *written == local && matches!(mode, ClassBorrowMode::Writable)
+                })
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn validate_nullable_assumptions(
+    program: &mir::Program,
     function: &mir::Function,
     accesses: &ClassLocalAccesses<'_>,
     present: &HashSet<mir::LocalId>,
 ) -> Result<(), BackendError> {
-    let property_receivers = accesses.property_borrowed().filter_map(|(local, _)| {
-        matches!(
-            local_in(function, local).ok()?.ty,
-            mir::Type::NullableClass(_)
-        )
-        .then_some(local)
-    });
-    for local in accesses.nullable_assumptions().chain(property_receivers) {
-        if !present.contains(&local) {
+    let property_receivers = accesses
+        .iter()
+        .enumerate()
+        .filter_map(|(position, access)| {
+            let ClassLocalAccess::PropertyBorrow(local, _) = access else {
+                return None;
+            };
+            matches!(
+                local_in(function, local).ok()?.ty,
+                mir::Type::NullableClass(_)
+            )
+            .then_some((position, local))
+        });
+    for (position, local) in accesses.nullable_assumptions().chain(property_receivers) {
+        if !present.contains(&local)
+            || proof_invalidated_before(program, accesses, position, local)?
+        {
             return Err(malformed_mir(format!(
                 "{} local local{} is assumed non-null without a dominating presence proof",
                 local_in(function, local)?.ty,
@@ -13151,6 +14070,14 @@ fn class_local_state_on_edge(
     let mut state = moved.clone();
     let terminator = &block_in(function, predecessor)?.terminator;
     let initialized = match terminator {
+        mir::Terminator::CheckedCall { error, failure, .. }
+        | mir::Terminator::CheckedIndirectCall { error, failure, .. }
+        | mir::Terminator::CheckedConstruct { error, failure, .. }
+        | mir::Terminator::CheckedIo { error, failure, .. }
+            if *failure == target =>
+        {
+            Some(*error)
+        }
         mir::Terminator::IndirectCall {
             result,
             continuation,
@@ -13171,12 +14098,7 @@ fn class_local_state_on_edge(
         _ => None,
     };
     if let Some(local) = initialized {
-        if matches!(
-            local_in(function, local)?.ty,
-            mir::Type::Class(_) | mir::Type::NullableClass(_)
-        ) {
-            state.remove(&local);
-        }
+        state.remove(&local);
     }
     Ok(state)
 }
@@ -13195,6 +14117,41 @@ fn validate_class_expression(
         return Err(malformed_mir(format!("unknown class#{}", class.0)));
     };
     match expression {
+        mir::ClassExpression::InterfacePayload {
+            local, transfer, ..
+        } => {
+            if !matches!(
+                local_in(function, *local)?.ty,
+                mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+            ) {
+                return Err(malformed_mir(
+                    "interface payload projection uses a non-interface local",
+                ));
+            }
+            validate_nominal_local(function, *local, *transfer)
+        }
+        mir::ClassExpression::InterfaceReceiver {
+            class,
+            receiver,
+            vtable,
+        } => {
+            let table = interface_vtable_in(program, *vtable)?;
+            if table.implementing_type != mir::ImplementingType::Class(*class)
+                || function.params.first() != Some(receiver)
+                || local_in(function, *receiver)?.ty != mir::Type::Interface(table.interface)
+                || local_in(function, *receiver)?.owned
+                || !table.methods.contains(&function.id)
+                || program
+                    .interface_vtables
+                    .iter()
+                    .any(|other| other.id != *vtable && other.methods.contains(&function.id))
+            {
+                return Err(malformed_mir(
+                    "interface payload projection has no exact entry-vtable proof",
+                ));
+            }
+            Ok(())
+        }
         mir::ClassExpression::Local {
             local, transfer, ..
         } => {
@@ -13254,7 +14211,7 @@ fn validate_class_expression(
             mir::Type::Class(class),
         ),
         mir::ClassExpression::SharedPayload { reference, .. } => {
-            if reference.class() != class {
+            if reference.payload() != mir::SharedPayload::Class(class) {
                 return Err(malformed_mir(
                     "shared-reference payload projection changes class",
                 ));
@@ -13265,9 +14222,9 @@ fn validate_class_expression(
             access, writable, ..
         } => {
             let expected = if *writable {
-                mir::Type::WritableSharedReferenceAccess(mir::WritableSharedPayload::Class(class))
+                mir::Type::WritableSharedReferenceAccess(mir::SharedPayload::Class(class))
             } else {
-                mir::Type::ReadonlySharedReferenceAccess(mir::WritableSharedPayload::Class(class))
+                mir::Type::ReadonlySharedReferenceAccess(mir::SharedPayload::Class(class))
             };
             if local_in(function, *access)?.ty != expected {
                 return Err(malformed_mir(
@@ -13930,10 +14887,10 @@ fn class_accesses_may_mutate_local(
     receiver: mir::LocalId,
 ) -> Result<bool, BackendError> {
     for access in accesses.iter() {
-        let ClassLocalAccess::Call(callee, args, parameter_offset) = access else {
+        let ClassLocalAccess::Call(callee, args) = access else {
             continue;
         };
-        if borrowed_class_call_locals(program, callee, args, parameter_offset)?
+        if borrowed_call_locals(program, callee, args)?
             .into_iter()
             .any(|(local, mode)| local == receiver && matches!(mode, ClassBorrowMode::Writable))
         {
@@ -14306,7 +15263,7 @@ fn terminator_observes_property(
             .any(|value| rvalue_observes_property(value, receiver, property)),
         mir::Terminator::IndirectCall { callee, args, .. }
         | mir::Terminator::CheckedIndirectCall { callee, args, .. } => {
-            function_observes_property(callee, receiver, property)
+            matches!(callee, mir::IndirectCallee::Closure(callee) if function_observes_property(callee, receiver, property))
                 || args
                     .iter()
                     .any(|value| rvalue_observes_property(value, receiver, property))
@@ -14387,8 +15344,10 @@ fn rvalue_observes_property(
         mir::Rvalue::NullableMixed(value) => {
             nullable_mixed_observes_property(value, receiver, property)
         }
-        mir::Rvalue::Error(value) => error_observes_property(value, receiver, property),
-        mir::Rvalue::NullableError(value) => {
+        mir::Rvalue::Interface(mir::InterfaceExpression { value, .. }) => {
+            error_observes_property(value, receiver, property)
+        }
+        mir::Rvalue::NullableInterface(mir::NullableInterfaceExpression { value, .. }) => {
             nullable_error_observes_property(value, receiver, property)
         }
         mir::Rvalue::Class(value) => class_observes_property(value, receiver, property),
@@ -14762,7 +15721,7 @@ fn shared_reference_observes_property(
 ) -> bool {
     match value {
         mir::SharedReferenceExpression::New { value, .. } => {
-            class_observes_property(value, receiver, property)
+            rvalue_observes_property(value, receiver, property)
         }
         mir::SharedReferenceExpression::Property {
             object,
@@ -15010,8 +15969,8 @@ fn mixed_observes_property(
         mir::MixedExpression::BoxClass { value, .. } => {
             class_observes_property(value, receiver, property)
         }
-        mir::MixedExpression::BoxError { value } => {
-            error_observes_property(value, receiver, property)
+        mir::MixedExpression::BoxInterface { value, .. } => {
+            error_observes_property(&value.value, receiver, property)
         }
         mir::MixedExpression::BoxPayloadEnum { value } => {
             payload_enum_observes_property(value, receiver, property)
@@ -15032,56 +15991,64 @@ fn mixed_observes_property(
 }
 
 fn error_observes_property(
-    value: &mir::ErrorExpression,
+    value: &mir::InterfaceValue,
     receiver: mir::LocalId,
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match value {
-        mir::ErrorExpression::FromClass { object, .. } => {
+        mir::InterfaceValue::SharedPayload { .. } => false,
+        mir::InterfaceValue::Upcast { source, .. } => {
+            error_observes_property(&source.value, receiver, property)
+        }
+        mir::InterfaceValue::FromClass { object, .. } => {
             class_observes_property(object, receiver, property)
         }
-        mir::ErrorExpression::FromNullableClass { object, .. } => {
+        mir::InterfaceValue::FromNullableClass { object, .. } => {
             nullable_class_observes_property(object, receiver, property)
         }
-        mir::ErrorExpression::Property {
+        mir::InterfaceValue::Property {
             object,
             property: observed,
             ..
         } => *object == receiver && *observed == property,
-        mir::ErrorExpression::Call { args, .. } => args
+        mir::InterfaceValue::Call { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
-        mir::ErrorExpression::CollectionIndex { index, .. } => {
+        mir::InterfaceValue::CollectionIndex { index, .. } => {
             rvalue_observes_property(index, receiver, property)
         }
-        mir::ErrorExpression::Local { .. }
-        | mir::ErrorExpression::NullableLocalAssumeNonNull { .. }
-        | mir::ErrorExpression::MixedPayload { .. } => false,
+        mir::InterfaceValue::NarrowedLocal { .. }
+        | mir::InterfaceValue::Local { .. }
+        | mir::InterfaceValue::NullableLocalAssumeNonNull { .. } => false,
     }
 }
 
 fn nullable_error_observes_property(
-    value: &mir::NullableErrorExpression,
+    value: &mir::NullableInterfaceValue,
     receiver: mir::LocalId,
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match value {
-        mir::NullableErrorExpression::Error(value) => {
+        mir::NullableInterfaceValue::SharedPayload { .. } => false,
+        mir::NullableInterfaceValue::Upcast { source, .. } => {
+            nullable_error_observes_property(&source.value, receiver, property)
+        }
+        mir::NullableInterfaceValue::Present(value) => {
             error_observes_property(value, receiver, property)
         }
-        mir::NullableErrorExpression::Property {
+        mir::NullableInterfaceValue::Property {
             object,
             property: observed,
             ..
         } => *object == receiver && *observed == property,
-        mir::NullableErrorExpression::Call { args, .. } => args
+        mir::NullableInterfaceValue::Call { args, .. } => args
             .iter()
             .any(|value| rvalue_observes_property(value, receiver, property)),
-        mir::NullableErrorExpression::DictionaryGet { key, .. }
-        | mir::NullableErrorExpression::CollectionIndex { index: key, .. } => {
+        mir::NullableInterfaceValue::DictionaryGet { key, .. }
+        | mir::NullableInterfaceValue::CollectionIndex { index: key, .. } => {
             rvalue_observes_property(key, receiver, property)
         }
-        mir::NullableErrorExpression::Null | mir::NullableErrorExpression::Local { .. } => false,
+        mir::NullableInterfaceValue::Null | mir::NullableInterfaceValue::Local { .. } => false,
     }
 }
 
@@ -15291,7 +16258,11 @@ fn class_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match value {
-        mir::ClassExpression::Local { local, .. }
+        mir::ClassExpression::InterfaceReceiver {
+            receiver: local, ..
+        } => *local == receiver,
+        mir::ClassExpression::InterfacePayload { local, .. }
+        | mir::ClassExpression::Local { local, .. }
         | mir::ClassExpression::NullableLocalAssumeNonNull { local, .. } => *local == receiver,
         mir::ClassExpression::Property {
             object,
@@ -15335,6 +16306,7 @@ fn bool_observes_property(
     property: crate::class_layout::PropertyId,
 ) -> bool {
     match value {
+        mir::BoolExpression::NominalIs { local, .. } => *local == receiver,
         mir::BoolExpression::Use { operand } => {
             operand_observes_property(operand, receiver, property)
         }
@@ -15355,7 +16327,7 @@ fn bool_observes_property(
             nullable_scalar_observes_property(value, receiver, property)
         }
         mir::BoolExpression::NullableErrorIsPresent(value) => {
-            nullable_error_observes_property(value, receiver, property)
+            nullable_error_observes_property(&value.value, receiver, property)
         }
         mir::BoolExpression::NullableClassIsPresent(value) => {
             nullable_class_observes_property(value, receiver, property)
@@ -15624,6 +16596,15 @@ fn validate_call_args_shape(
     callee: &mir::Function,
     args: &[mir::Rvalue],
 ) -> Result<(), BackendError> {
+    if program
+        .interface_vtables
+        .iter()
+        .any(|table| table.methods.contains(&callee.id))
+    {
+        return Err(malformed_mir(
+            "interface entry thunk must be reached through its checked vtable",
+        ));
+    }
     let lifecycle_call = program.classes.iter().find_map(|class| {
         (class.constructor == Some(callee.id))
             .then_some((class.id, "__construct"))
@@ -15721,9 +16702,29 @@ fn validate_call_args_for_params(
         )?;
         let class_like_parameter = matches!(
             parameter_type,
-            mir::Type::Class(_) | mir::Type::NullableClass(_)
+            mir::Type::Class(_)
+                | mir::Type::NullableClass(_)
+                | mir::Type::Interface(_)
+                | mir::Type::NullableInterface(_)
         );
         let promoted_transfer = promoted_transfers.is_some_and(|indices| indices.contains(&index));
+        require_tracked_interface_argument(
+            argument,
+            parameter_definition.owned || promoted_transfer,
+        )?;
+        if matches!(
+            parameter_type,
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+        ) {
+            if (parameter_definition.owned || promoted_transfer) && argument.borrows_move_value() {
+                return Err(malformed_mir(
+                    "owning interface parameter receives a borrowed view",
+                ));
+            }
+            if parameter_definition.writable {
+                require_writable_interface_argument(program, caller, argument)?;
+            }
+        }
         if matches!(parameter_type, mir::Type::Class(_)) {
             let mir::Rvalue::Class(expression) = argument else {
                 unreachable!("class parameter type was checked against its argument")
@@ -15846,6 +16847,25 @@ fn validate_call_args_for_params(
     Ok(())
 }
 
+fn require_tracked_interface_argument(
+    argument: &mir::Rvalue,
+    taken: bool,
+) -> Result<(), BackendError> {
+    if !taken
+        && matches!(
+            argument.ty(),
+            mir::Type::Interface(_) | mir::Type::NullableInterface(_)
+        )
+        && !argument.is_null_value()
+        && !argument.borrows_move_value()
+    {
+        return Err(malformed_mir(
+            "borrowed interface argument requires a tracked temporary owner",
+        ));
+    }
+    Ok(())
+}
+
 fn require_owned_synthetic_argument_temp(
     caller: &mir::Function,
     local: mir::LocalId,
@@ -15918,13 +16938,11 @@ fn validate_ordered_class_accesses(
             ClassLocalAccess::BeginCall => {
                 call_entry_borrows.push(property_borrows.clone());
             }
-            ClassLocalAccess::Call(function, args, parameter_offset) => {
+            ClassLocalAccess::Call(callee, args) => {
                 let entry_borrows = call_entry_borrows
                     .pop()
                     .ok_or_else(|| malformed_mir("class access call marker is unbalanced"))?;
-                for (local, mode) in
-                    borrowed_class_call_locals(program, function, args, parameter_offset)?
-                {
+                for (local, mode) in borrowed_call_locals(program, callee, args)? {
                     if transfers.contains(&local) {
                         return Err(class_access_error(
                             operation,
@@ -15969,13 +16987,283 @@ fn escaping_class_local_borrows(
     argument: &mir::Rvalue,
 ) -> Result<Vec<mir::LocalId>, BackendError> {
     match argument {
+        mir::Rvalue::Mixed(expression) => escaping_mixed_local_borrows(program, expression),
+        mir::Rvalue::NullableMixed(expression) => {
+            escaping_nullable_mixed_local_borrows(program, expression)
+        }
+        mir::Rvalue::Interface(expression) => {
+            escaping_interface_local_borrows(program, &expression.value)
+        }
+        mir::Rvalue::NullableInterface(expression) => {
+            escaping_nullable_interface_local_borrows(program, &expression.value)
+        }
         mir::Rvalue::Class(expression) => {
             escaping_class_expression_local_borrows(program, expression)
         }
         mir::Rvalue::NullableClass(expression) => {
             escaping_nullable_class_expression_local_borrows(program, expression)
         }
+        mir::Rvalue::Collection(value) => escaping_collection_local_borrows(program, value),
+        mir::Rvalue::NullableCollection(value) => {
+            escaping_nullable_collection_local_borrows(program, value)
+        }
+        _ => match crate::native_shared::Expression::from_rvalue(argument) {
+            Some(value) => escaping_shared_local_borrows(program, value),
+            None => Ok(Vec::new()),
+        },
+    }
+}
+
+fn escaping_collection_local_borrows(
+    program: &mir::Program,
+    value: &mir::CollectionExpression,
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    use mir::CollectionExpression as E;
+    match value {
+        E::Local {
+            local,
+            transfer: false,
+            ..
+        }
+        | E::Index {
+            source: local,
+            transfer: false,
+            ..
+        }
+        | E::Property { object: local, .. }
+        | E::SharedAccessPayload { access: local, .. } => Ok(vec![*local]),
+        E::Call {
+            function,
+            args,
+            return_borrow: Some(borrow),
+            ..
+        } => escaping_class_local_borrows(
+            program,
+            borrowed_call_rvalue_source(program, *function, args, *borrow)?,
+        ),
         _ => Ok(Vec::new()),
+    }
+}
+
+fn escaping_nullable_collection_local_borrows(
+    program: &mir::Program,
+    value: &mir::NullableCollectionExpression,
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    use mir::NullableCollectionExpression as E;
+    match value {
+        E::Collection(value) => escaping_collection_local_borrows(program, value),
+        E::Local {
+            local,
+            transfer: false,
+            ..
+        }
+        | E::Property { object: local, .. } => Ok(vec![*local]),
+        E::Call {
+            function,
+            args,
+            return_borrow: Some(borrow),
+            ..
+        } => escaping_class_local_borrows(
+            program,
+            borrowed_call_rvalue_source(program, *function, args, *borrow)?,
+        ),
+        E::Coalesce {
+            left,
+            right,
+            transfer: false,
+            ..
+        } => {
+            let mut locals = escaping_nullable_collection_local_borrows(program, left)?;
+            extend_unique_locals(
+                &mut locals,
+                escaping_nullable_collection_local_borrows(program, right)?,
+            );
+            Ok(locals)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn escaping_shared_local_borrows(
+    program: &mir::Program,
+    value: crate::native_shared::Expression<'_>,
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    use crate::native_shared::Operation;
+    if value.owned() {
+        return Ok(Vec::new());
+    }
+    match value.operation() {
+        Operation::Local { local, .. }
+        | Operation::Property { object: local, .. }
+        | Operation::Index {
+            collection: local, ..
+        }
+        | Operation::Get {
+            collection: local, ..
+        } => Ok(vec![local]),
+        Operation::Present(value) => escaping_shared_local_borrows(program, value),
+        Operation::Call { function, args } => match function_in(program, function)?.return_borrow {
+            Some(borrow) => escaping_class_local_borrows(
+                program,
+                borrowed_call_rvalue_source(program, function, args, borrow)?,
+            ),
+            None => Ok(Vec::new()),
+        },
+        Operation::Coalesce { left, right, .. } => {
+            let mut locals = escaping_shared_local_borrows(program, left)?;
+            extend_unique_locals(&mut locals, escaping_shared_local_borrows(program, right)?);
+            Ok(locals)
+        }
+        Operation::New { .. } | Operation::Null | Operation::Runtime { .. } => Ok(Vec::new()),
+    }
+}
+
+fn escaping_mixed_local_borrows(
+    program: &mir::Program,
+    value: &mir::MixedExpression,
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    match value {
+        mir::MixedExpression::Local {
+            local,
+            transfer: false,
+        }
+        | mir::MixedExpression::Property { object: local, .. }
+        | mir::MixedExpression::CollectionIndex {
+            collection: local,
+            transfer: false,
+            ..
+        } => Ok(vec![*local]),
+        mir::MixedExpression::BoxClass {
+            value,
+            payload_owned: false,
+        } => escaping_class_expression_local_borrows(program, value),
+        mir::MixedExpression::BoxInterface {
+            value,
+            payload_owned: false,
+        } => escaping_interface_local_borrows(program, &value.value),
+        mir::MixedExpression::Call {
+            function,
+            args,
+            return_borrow: Some(borrow),
+        } => escaping_class_local_borrows(
+            program,
+            borrowed_call_rvalue_source(program, *function, args, *borrow)?,
+        ),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn escaping_nullable_mixed_local_borrows(
+    program: &mir::Program,
+    value: &mir::NullableMixedExpression,
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    match value {
+        mir::NullableMixedExpression::Mixed(value) => escaping_mixed_local_borrows(program, value),
+        mir::NullableMixedExpression::Local {
+            local,
+            transfer: false,
+        }
+        | mir::NullableMixedExpression::Property { object: local, .. } => Ok(vec![*local]),
+        mir::NullableMixedExpression::Call {
+            function,
+            args,
+            return_borrow: Some(borrow),
+        } => escaping_class_local_borrows(
+            program,
+            borrowed_call_rvalue_source(program, *function, args, *borrow)?,
+        ),
+        mir::NullableMixedExpression::Coalesce {
+            left,
+            right,
+            transfer: false,
+        } => {
+            let mut locals = escaping_nullable_mixed_local_borrows(program, left)?;
+            extend_unique_locals(
+                &mut locals,
+                escaping_nullable_mixed_local_borrows(program, right)?,
+            );
+            Ok(locals)
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn escaping_interface_local_borrows(
+    program: &mir::Program,
+    value: &mir::InterfaceValue,
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    if !value.is_borrowed() {
+        return Ok(Vec::new());
+    }
+    match value {
+        mir::InterfaceValue::SharedPayload { local } => Ok(vec![*local]),
+        mir::InterfaceValue::Upcast { source, .. } => {
+            escaping_interface_local_borrows(program, &source.value)
+        }
+        mir::InterfaceValue::FromClass { object, .. } => {
+            escaping_class_expression_local_borrows(program, object)
+        }
+        mir::InterfaceValue::FromNullableClass { object, .. } => {
+            escaping_nullable_class_expression_local_borrows(program, object)
+        }
+        mir::InterfaceValue::NarrowedLocal { local, .. }
+        | mir::InterfaceValue::Local { local, .. }
+        | mir::InterfaceValue::NullableLocalAssumeNonNull { local, .. }
+        | mir::InterfaceValue::Property { object: local, .. }
+        | mir::InterfaceValue::CollectionIndex {
+            collection: local, ..
+        } => Ok(vec![*local]),
+        mir::InterfaceValue::Call {
+            function,
+            args,
+            return_borrow,
+            ..
+        } => match return_borrow {
+            Some(borrow) => escaping_class_local_borrows(
+                program,
+                borrowed_call_rvalue_source(program, *function, args, *borrow)?,
+            ),
+            None => Ok(Vec::new()),
+        },
+    }
+}
+
+fn escaping_nullable_interface_local_borrows(
+    program: &mir::Program,
+    value: &mir::NullableInterfaceValue,
+) -> Result<Vec<mir::LocalId>, BackendError> {
+    if !value.is_borrowed() {
+        return Ok(Vec::new());
+    }
+    match value {
+        mir::NullableInterfaceValue::SharedPayload { local } => Ok(vec![*local]),
+        mir::NullableInterfaceValue::Upcast { source, .. } => {
+            escaping_nullable_interface_local_borrows(program, &source.value)
+        }
+        mir::NullableInterfaceValue::Present(value) => {
+            escaping_interface_local_borrows(program, value)
+        }
+        mir::NullableInterfaceValue::Local { local, .. }
+        | mir::NullableInterfaceValue::Property { object: local, .. }
+        | mir::NullableInterfaceValue::DictionaryGet {
+            collection: local, ..
+        }
+        | mir::NullableInterfaceValue::CollectionIndex {
+            collection: local, ..
+        } => Ok(vec![*local]),
+        mir::NullableInterfaceValue::Call {
+            function,
+            args,
+            return_borrow,
+            ..
+        } => match return_borrow {
+            Some(borrow) => escaping_class_local_borrows(
+                program,
+                borrowed_call_rvalue_source(program, *function, args, *borrow)?,
+            ),
+            None => Ok(Vec::new()),
+        },
+        mir::NullableInterfaceValue::Null => Ok(Vec::new()),
     }
 }
 
@@ -15984,6 +17272,24 @@ fn escaping_class_expression_local_borrows(
     expression: &mir::ClassExpression,
 ) -> Result<Vec<mir::LocalId>, BackendError> {
     match expression {
+        mir::ClassExpression::InterfacePayload {
+            local, transfer, ..
+        } => Ok(if *transfer { Vec::new() } else { vec![*local] }),
+        mir::ClassExpression::InterfaceReceiver { receiver, .. } => Ok(vec![*receiver]),
+        mir::ClassExpression::MixedPayload {
+            mixed: local,
+            transfer: false,
+            ..
+        }
+        | mir::ClassExpression::CollectionIndex {
+            collection: local,
+            transfer: false,
+            ..
+        } => Ok(vec![*local]),
+        mir::ClassExpression::SharedPayload { reference, .. } => escaping_shared_local_borrows(
+            program,
+            crate::native_shared::Expression::Strong(reference),
+        ),
         mir::ClassExpression::Local {
             local,
             transfer: false,
@@ -16025,9 +17331,8 @@ fn escaping_class_expression_local_borrows(
         }
         | mir::ClassExpression::New { .. }
         | mir::ClassExpression::Coalesce { transfer: true, .. }
-        | mir::ClassExpression::CollectionIndex { .. }
-        | mir::ClassExpression::MixedPayload { .. }
-        | mir::ClassExpression::SharedPayload { .. } => Ok(Vec::new()),
+        | mir::ClassExpression::CollectionIndex { transfer: true, .. }
+        | mir::ClassExpression::MixedPayload { transfer: true, .. } => Ok(Vec::new()),
         mir::ClassExpression::SharedAccessPayload { access, .. } => Ok(vec![*access]),
     }
 }
@@ -16041,7 +17346,12 @@ fn escaping_nullable_class_expression_local_borrows(
         mir::NullableClassExpression::Class(expression) => {
             escaping_class_expression_local_borrows(program, expression)
         }
-        mir::NullableClassExpression::SharedPayload { .. } => Ok(Vec::new()),
+        mir::NullableClassExpression::SharedPayload { reference, .. } => {
+            escaping_shared_local_borrows(
+                program,
+                crate::native_shared::Expression::NullableStrong(reference),
+            )
+        }
         mir::NullableClassExpression::Local {
             local,
             transfer: false,
@@ -16153,6 +17463,18 @@ fn validate_condition(
     condition: &mir::BoolExpression,
 ) -> Result<(), BackendError> {
     match condition {
+        mir::BoolExpression::NominalIs { local, target } => {
+            match target {
+                mir::Type::Class(class) => {
+                    class_in(program, *class)?;
+                }
+                mir::Type::Interface(interface) => {
+                    interface_in(program, *interface)?;
+                }
+                _ => return Err(malformed_mir("nominal type test has a non-nominal target")),
+            }
+            validate_nominal_local(function, *local, false)
+        }
         mir::BoolExpression::Use { operand } => validate_bool_operand(program, function, operand),
         mir::BoolExpression::Compare { op, left, right } => {
             if left.ty() != right.ty() {
@@ -16239,7 +17561,7 @@ fn validate_condition(
             validate_nullable_mixed_expression(program, function, value)
         }
         mir::BoolExpression::NullableErrorIsPresent(value) => {
-            validate_nullable_error_expression(program, function, value)
+            validate_nullable_interface_value(program, function, value.interface, &value.value)
         }
         mir::BoolExpression::NullablePayloadEnumIsPresent(value) => {
             validate_nullable_payload_enum_expression(program, function, value)
@@ -17104,7 +18426,7 @@ fn validate_nullable_class_expression(
     match expression {
         mir::NullableClassExpression::Null(_) => Ok(()),
         mir::NullableClassExpression::SharedPayload { reference, .. } => {
-            if reference.class() != class {
+            if reference.payload() != mir::SharedPayload::Class(class) {
                 return Err(malformed_mir(
                     "nullable shared payload projection changes class",
                 ));
@@ -17252,7 +18574,7 @@ fn validate_null_safe_call(
         mir::Type::Scalar(ty) => mir::Type::NullableScalar(ty),
         mir::Type::String => mir::Type::NullableString,
         mir::Type::Mixed => mir::Type::NullableMixed,
-        mir::Type::Error => mir::Type::NullableError,
+        mir::Type::Interface(interface) => mir::Type::NullableInterface(interface),
         mir::Type::Class(class) => mir::Type::NullableClass(class),
         mir::Type::SharedReference(class) => mir::Type::NullableSharedReference(class),
         mir::Type::WeakReference(class) => mir::Type::NullableWeakReference(class),
@@ -17281,7 +18603,7 @@ fn validate_null_safe_call(
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
         | mir::Type::NullableMixed
-        | mir::Type::NullableError
+        | mir::Type::NullableInterface(_)
         | mir::Type::NullableClass(_)
         | mir::Type::NullableCollection(_)
         | mir::Type::NullableFunction(_)
@@ -17431,7 +18753,16 @@ fn validate_format_expression(
             ));
         }
         let call_borrows = call
-            .map(|(callee, args)| borrowed_class_call_locals(program, callee, args, 0))
+            .map(|(function, args)| {
+                borrowed_call_locals(
+                    program,
+                    CallTarget::Direct {
+                        function,
+                        parameter_offset: 0,
+                    },
+                    args,
+                )
+            })
             .transpose()?
             .unwrap_or_default();
         if matches!(argument, mir::FormatArgument::ClassDisplay(_)) {
@@ -17504,33 +18835,59 @@ fn format_argument_call(
     }
 }
 
-fn borrowed_class_call_locals(
+fn borrowed_call_locals(
     program: &mir::Program,
-    callee: mir::FunctionId,
+    callee: CallTarget,
     args: &[mir::Rvalue],
-    parameter_offset: usize,
 ) -> Result<Vec<(mir::LocalId, ClassBorrowMode)>, BackendError> {
-    let callee = function_in(program, callee)?;
     let mut borrows = Vec::new();
-    for (argument, parameter) in args.iter().zip(callee.params.iter().skip(parameter_offset)) {
-        let parameter = local_in(callee, *parameter)?;
-        if !matches!(
-            parameter.ty,
-            mir::Type::Class(_) | mir::Type::NullableClass(_)
-        ) || parameter.owned
-        {
+    for (index, argument) in args.iter().enumerate() {
+        let mode = match callee {
+            CallTarget::Direct {
+                function,
+                parameter_offset,
+            } => {
+                let function = function_in(program, function)?;
+                let Some(parameter) = function.params.get(index + parameter_offset) else {
+                    continue;
+                };
+                let parameter = local_in(function, *parameter)?;
+                if parameter.owned {
+                    mir::FunctionParameterMode::Take
+                } else if parameter.writable {
+                    mir::FunctionParameterMode::Writable
+                } else {
+                    mir::FunctionParameterMode::Readonly
+                }
+            }
+            CallTarget::Indirect(function_type) => {
+                let definition = function_type_in(program, function_type)?;
+                let Some(parameter) = definition.parameters.get(index) else {
+                    continue;
+                };
+                parameter.mode
+            }
+        };
+        if mode == mir::FunctionParameterMode::Take {
             continue;
         }
-        let mode = if parameter.writable {
+        let mode = if mode == mir::FunctionParameterMode::Writable {
             ClassBorrowMode::Writable
         } else {
             ClassBorrowMode::Readonly
         };
+        let mut argument_locals = HashSet::new();
         for local in escaping_class_local_borrows(program, argument)? {
-            if let Some((_, existing)) = borrows.iter_mut().find(|(borrowed, _)| *borrowed == local)
-            {
+            if !argument_locals.insert(local) {
+                continue;
+            }
+            if let Some((_, existing)) = borrows.iter().find(|(borrowed, _)| *borrowed == local) {
                 if mode.conflicts_with(*existing) {
-                    *existing = ClassBorrowMode::Writable;
+                    return Err(class_access_error(
+                        "call",
+                        "takes overlapping writable borrows of",
+                        local,
+                    ));
                 }
             } else {
                 borrows.push((local, mode));

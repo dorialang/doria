@@ -6,6 +6,195 @@ use crate::source::{QualifiedNameRef, Span};
 
 pub use crate::numeric::{FloatType, IntegerType};
 
+/// Preserve compiler-checked nominal kinds when substituting source type syntax.
+pub(crate) fn resolve_nominal_kinds<I>(
+    ty: ResolvedType,
+    enums: &HashMap<String, crate::enums::EnumType>,
+    interfaces: &HashMap<crate::types::InterfaceType<ResolvedType>, I>,
+) -> ResolvedType {
+    match ty {
+        ResolvedType::Nullable(inner) => {
+            ResolvedType::Nullable(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+        }
+        ResolvedType::TypedArray(inner) => {
+            ResolvedType::TypedArray(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+        }
+        ResolvedType::List(inner) => {
+            ResolvedType::List(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+        }
+        ResolvedType::Set(inner) => {
+            ResolvedType::Set(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+        }
+        ResolvedType::SortedSet(inner) => {
+            ResolvedType::SortedSet(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+        }
+        ResolvedType::PriorityQueue(inner) => {
+            ResolvedType::PriorityQueue(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+        }
+        ResolvedType::Deque(inner) => {
+            ResolvedType::Deque(Box::new(resolve_nominal_kinds(*inner, enums, interfaces)))
+        }
+        ResolvedType::Dictionary(key, value) => ResolvedType::Dictionary(
+            Box::new(resolve_nominal_kinds(*key, enums, interfaces)),
+            Box::new(resolve_nominal_kinds(*value, enums, interfaces)),
+        ),
+        ResolvedType::SortedDictionary(key, value) => ResolvedType::SortedDictionary(
+            Box::new(resolve_nominal_kinds(*key, enums, interfaces)),
+            Box::new(resolve_nominal_kinds(*value, enums, interfaces)),
+        ),
+        ResolvedType::SharedHandle(kind, payload) => ResolvedType::SharedHandle(
+            kind,
+            Box::new(resolve_nominal_kinds(*payload, enums, interfaces)),
+        ),
+        ResolvedType::Class(class) => {
+            if class.arguments.is_empty() {
+                if let Some(definition) = enums.get(&class.name) {
+                    return ResolvedType::Enum(definition.clone());
+                }
+            }
+            let nominal = ClassType::new(
+                class.name,
+                class
+                    .arguments
+                    .into_iter()
+                    .map(|argument| resolve_nominal_kinds(argument, enums, interfaces))
+                    .collect(),
+            );
+            if interfaces.contains_key(&nominal) {
+                ResolvedType::Interface(nominal)
+            } else {
+                ResolvedType::Class(nominal)
+            }
+        }
+        ResolvedType::Function(mut function) => {
+            for parameter in &mut function.parameters {
+                parameter.ty = resolve_nominal_kinds(parameter.ty.clone(), enums, interfaces);
+            }
+            function.return_type = resolve_nominal_kinds(function.return_type, enums, interfaces);
+            function.checked_effects = function
+                .checked_effects
+                .into_iter()
+                .map(|effect| resolve_nominal_kinds(effect, enums, interfaces))
+                .collect();
+            ResolvedType::Function(function)
+        }
+        ty => ty,
+    }
+}
+
+/// Substitute checked type syntax before a lowering consumer resolves nominal IDs.
+pub(crate) fn resolved_type_ref_with_substitutions(
+    ty: &crate::types::TypeRef,
+    substitutions: &HashMap<String, ResolvedType>,
+) -> Option<ResolvedType> {
+    if let Some(grouped) = &ty.grouped {
+        let resolved = resolved_type_ref_with_substitutions(&grouped.inner, substitutions)?;
+        return Some(if ty.nullable {
+            nullable_of(resolved)
+        } else {
+            resolved
+        });
+    }
+    if let Some(function) = &ty.function {
+        let resolved = ResolvedType::Function(Box::new(crate::types::SemanticFunctionType {
+            invocation_mode: function.invocation_mode,
+            parameters: function
+                .parameters
+                .iter()
+                .map(|parameter| {
+                    Some(crate::types::SemanticFunctionParameter {
+                        ownership_mode: parameter.ownership_mode,
+                        ty: resolved_type_ref_with_substitutions(&parameter.ty, substitutions)?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            return_type: resolved_type_ref_with_substitutions(
+                &function.return_type,
+                substitutions,
+            )?,
+            checked_effects: if let Some(clause) = &function.throws_clause {
+                clause
+                    .entries
+                    .iter()
+                    .map(|effect| resolved_type_ref_with_substitutions(&effect.ty, substitutions))
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .filter(|effect| !crate::checked_effects::is_ambient_io_effect(effect))
+                    .collect()
+            } else {
+                Vec::new()
+            },
+            return_borrow: None,
+        }));
+        return Some(if ty.nullable {
+            nullable_of(resolved)
+        } else {
+            resolved
+        });
+    }
+    let mut plain = ty.clone();
+    plain.nullable = false;
+    let base = if plain.arguments.is_empty() {
+        if let Some(substitution) = substitutions.get(&plain.name) {
+            substitution.clone()
+        } else if let Some(integer) = IntegerType::from_source_name(&plain.name) {
+            ResolvedType::Integer(integer)
+        } else if let Some(float) = FloatType::from_source_name(&plain.name) {
+            ResolvedType::Float(float)
+        } else {
+            match plain.name.as_str() {
+                "void" => ResolvedType::Void,
+                "string" => ResolvedType::String,
+                "Bytes" => ResolvedType::Bytes,
+                "bool" => ResolvedType::Bool,
+                "mixed" => ResolvedType::Mixed,
+                "Error" => ResolvedType::Error,
+                _ => ResolvedType::Class(ClassType::new(plain.name, Vec::new())),
+            }
+        }
+    } else {
+        let arguments = plain
+            .type_arguments()
+            .map(|argument| resolved_type_ref_with_substitutions(argument, substitutions))
+            .collect::<Option<Vec<_>>>()?;
+        match plain.name.as_str() {
+            "[]" if arguments.len() == 1 => {
+                ResolvedType::TypedArray(Box::new(arguments[0].clone()))
+            }
+            "List" if arguments.len() == 1 => ResolvedType::List(Box::new(arguments[0].clone())),
+            "Dictionary" if arguments.len() == 2 => ResolvedType::Dictionary(
+                Box::new(arguments[0].clone()),
+                Box::new(arguments[1].clone()),
+            ),
+            "SortedDictionary" if arguments.len() == 2 => ResolvedType::SortedDictionary(
+                Box::new(arguments[0].clone()),
+                Box::new(arguments[1].clone()),
+            ),
+            "Set" if arguments.len() == 1 => ResolvedType::Set(Box::new(arguments[0].clone())),
+            "SortedSet" if arguments.len() == 1 => {
+                ResolvedType::SortedSet(Box::new(arguments[0].clone()))
+            }
+            "PriorityQueue" if arguments.len() == 1 => {
+                ResolvedType::PriorityQueue(Box::new(arguments[0].clone()))
+            }
+            "Deque" if arguments.len() == 1 => ResolvedType::Deque(Box::new(arguments[0].clone())),
+            name if arguments.len() == 1 => {
+                if let Some(kind) = crate::types::SharedHandleKind::from_source_name(name) {
+                    ResolvedType::SharedHandle(kind, Box::new(arguments[0].clone()))
+                } else {
+                    ResolvedType::Class(ClassType::new(plain.name, arguments))
+                }
+            }
+            _ => ResolvedType::Class(ClassType::new(plain.name, arguments)),
+        }
+    };
+    if ty.nullable {
+        Some(nullable_of(base))
+    } else {
+        Some(base)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeRef {
     pub name: String,
@@ -568,6 +757,213 @@ pub enum ResolvedType {
     Unsupported,
 }
 
+pub(crate) fn resolved_type_is_symbolic(ty: &ResolvedType) -> bool {
+    match ty {
+        ResolvedType::TypeParameter(_) => true,
+        ResolvedType::Function(function) => {
+            function
+                .parameters
+                .iter()
+                .any(|parameter| resolved_type_is_symbolic(&parameter.ty))
+                || resolved_type_is_symbolic(&function.return_type)
+                || function
+                    .checked_effects
+                    .iter()
+                    .any(resolved_type_is_symbolic)
+        }
+        ResolvedType::Nullable(inner)
+        | ResolvedType::TypedArray(inner)
+        | ResolvedType::List(inner)
+        | ResolvedType::Set(inner)
+        | ResolvedType::SortedSet(inner)
+        | ResolvedType::PriorityQueue(inner)
+        | ResolvedType::Deque(inner)
+        | ResolvedType::SharedHandle(_, inner) => resolved_type_is_symbolic(inner),
+        ResolvedType::Dictionary(key, value) | ResolvedType::SortedDictionary(key, value) => {
+            resolved_type_is_symbolic(key) || resolved_type_is_symbolic(value)
+        }
+        ResolvedType::Class(class) | ResolvedType::Interface(class) => {
+            class.arguments.iter().any(resolved_type_is_symbolic)
+        }
+        ResolvedType::Void
+        | ResolvedType::Integer(_)
+        | ResolvedType::Float(_)
+        | ResolvedType::String
+        | ResolvedType::Bytes
+        | ResolvedType::Bool
+        | ResolvedType::Null
+        | ResolvedType::Mixed
+        | ResolvedType::Error
+        | ResolvedType::Enum(_)
+        | ResolvedType::InterfaceSelf(_)
+        | ResolvedType::TraitSelf(_)
+        | ResolvedType::Unsupported => false,
+    }
+}
+
+/// Wrap `inner` in a nullable, collapsing `?(?X)` to `?X`. Substituting a `?T`
+/// field's parameter with a nullable argument must not yield a doubly-nullable
+/// type, which has no downstream representation.
+pub(crate) fn nullable_of(inner: ResolvedType) -> ResolvedType {
+    if matches!(inner, ResolvedType::Nullable(_)) {
+        inner
+    } else {
+        ResolvedType::Nullable(Box::new(inner))
+    }
+}
+
+/// Apply compiler-recorded generic bindings, preserving canonical nullable forms.
+/// Tooling uses this same operation when displaying specialized contracts.
+pub fn substitute_resolved_type(
+    ty: &ResolvedType,
+    substitutions: &HashMap<String, ResolvedType>,
+) -> ResolvedType {
+    match ty {
+        ResolvedType::TypeParameter(name) => substitutions
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| ty.clone()),
+        ResolvedType::Nullable(inner) => {
+            nullable_of(substitute_resolved_type(inner, substitutions))
+        }
+        ResolvedType::TypedArray(inner) => {
+            ResolvedType::TypedArray(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        ResolvedType::List(inner) => {
+            ResolvedType::List(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        ResolvedType::Dictionary(key, value) => ResolvedType::Dictionary(
+            Box::new(substitute_resolved_type(key, substitutions)),
+            Box::new(substitute_resolved_type(value, substitutions)),
+        ),
+        ResolvedType::Set(inner) => {
+            ResolvedType::Set(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        ResolvedType::SortedDictionary(key, value) => ResolvedType::SortedDictionary(
+            Box::new(substitute_resolved_type(key, substitutions)),
+            Box::new(substitute_resolved_type(value, substitutions)),
+        ),
+        ResolvedType::SortedSet(inner) => {
+            ResolvedType::SortedSet(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        ResolvedType::PriorityQueue(inner) => {
+            ResolvedType::PriorityQueue(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        ResolvedType::Deque(inner) => {
+            ResolvedType::Deque(Box::new(substitute_resolved_type(inner, substitutions)))
+        }
+        ResolvedType::Interface(interface) => ResolvedType::Interface(InterfaceType::new(
+            interface.name.clone(),
+            interface
+                .arguments
+                .iter()
+                .map(|argument| substitute_resolved_type(argument, substitutions))
+                .collect(),
+        )),
+        ResolvedType::Function(function) => {
+            ResolvedType::Function(Box::new(crate::types::SemanticFunctionType {
+                invocation_mode: function.invocation_mode,
+                parameters: function
+                    .parameters
+                    .iter()
+                    .map(|parameter| crate::types::SemanticFunctionParameter {
+                        ownership_mode: parameter.ownership_mode,
+                        ty: substitute_resolved_type(&parameter.ty, substitutions),
+                    })
+                    .collect(),
+                return_type: substitute_resolved_type(&function.return_type, substitutions),
+                checked_effects: function
+                    .checked_effects
+                    .iter()
+                    .map(|effect| substitute_resolved_type(effect, substitutions))
+                    .collect(),
+                return_borrow: function.return_borrow,
+            }))
+        }
+        ResolvedType::SharedHandle(kind, payload) => ResolvedType::SharedHandle(
+            *kind,
+            Box::new(substitute_resolved_type(payload, substitutions)),
+        ),
+        ResolvedType::Class(class) => ResolvedType::Class(ClassType::new(
+            class.name.clone(),
+            class
+                .arguments
+                .iter()
+                .map(|argument| substitute_resolved_type(argument, substitutions))
+                .collect(),
+        )),
+        ResolvedType::Void
+        | ResolvedType::Integer(_)
+        | ResolvedType::Float(_)
+        | ResolvedType::String
+        | ResolvedType::Bytes
+        | ResolvedType::Bool
+        | ResolvedType::Null
+        | ResolvedType::Mixed
+        | ResolvedType::Error
+        | ResolvedType::Enum(_)
+        | ResolvedType::InterfaceSelf(_)
+        | ResolvedType::TraitSelf(_)
+        | ResolvedType::Unsupported => ty.clone(),
+    }
+}
+
+#[cfg(test)]
+mod specialization_tests {
+    use super::*;
+
+    #[test]
+    fn substitutions_reach_every_runtime_type_constructor() {
+        let parameter = ResolvedType::TypeParameter("T".to_string());
+        let constructors: &[fn(ResolvedType) -> ResolvedType] = &[
+            |inner| ResolvedType::Nullable(Box::new(inner)),
+            |inner| ResolvedType::TypedArray(Box::new(inner)),
+            |inner| ResolvedType::List(Box::new(inner)),
+            |inner| ResolvedType::Dictionary(Box::new(inner.clone()), Box::new(inner)),
+            |inner| ResolvedType::SortedDictionary(Box::new(inner.clone()), Box::new(inner)),
+            |inner| ResolvedType::Set(Box::new(inner)),
+            |inner| ResolvedType::SortedSet(Box::new(inner)),
+            |inner| ResolvedType::PriorityQueue(Box::new(inner)),
+            |inner| ResolvedType::Deque(Box::new(inner)),
+            |inner| ResolvedType::Class(ClassType::new("Box", vec![inner])),
+            |inner| ResolvedType::Interface(InterfaceType::new("Read", vec![inner])),
+            |inner| {
+                ResolvedType::Function(Box::new(SemanticFunctionType {
+                    invocation_mode: FunctionInvocationMode::Readonly,
+                    parameters: vec![SemanticFunctionParameter {
+                        ownership_mode: FunctionTypeParameterMode::Take,
+                        ty: inner.clone(),
+                    }],
+                    return_type: inner.clone(),
+                    checked_effects: vec![inner],
+                    return_borrow: None,
+                }))
+            },
+        ];
+        let substitutions = HashMap::from([("T".to_string(), ResolvedType::String)]);
+        for outer in constructors {
+            for inner in constructors {
+                let symbolic = outer(inner(parameter.clone()));
+                assert!(resolved_type_is_symbolic(&symbolic), "{symbolic:?}");
+                let concrete = substitute_resolved_type(&symbolic, &substitutions);
+                let expected =
+                    substitute_resolved_type(&outer(inner(ResolvedType::String)), &HashMap::new());
+                assert_eq!(concrete, expected);
+                assert!(!resolved_type_is_symbolic(&concrete), "{concrete:?}");
+            }
+        }
+        for kind in SharedHandleKind::ALL {
+            let symbolic =
+                ResolvedType::SharedHandle(kind, Box::new(constructors[10](parameter.clone())));
+            assert!(resolved_type_is_symbolic(&symbolic));
+            assert_eq!(
+                substitute_resolved_type(&symbolic, &substitutions),
+                ResolvedType::SharedHandle(kind, Box::new(constructors[10](ResolvedType::String)))
+            );
+        }
+    }
+}
+
 pub(crate) fn resolved_type_complexity(ty: &ResolvedType) -> usize {
     match ty {
         ResolvedType::Nullable(inner)
@@ -642,6 +1038,10 @@ impl TypeRegistry {
 
     pub fn kind(&self, id: TypeId) -> &TypeKind {
         &self.kinds[id.0]
+    }
+
+    pub(crate) fn kinds(&self) -> &[TypeKind] {
+        &self.kinds
     }
 
     pub fn unknown(&mut self) -> TypeId {

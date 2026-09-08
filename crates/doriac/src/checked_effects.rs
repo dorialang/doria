@@ -6,6 +6,29 @@ use crate::types::ResolvedType;
 pub type EffectSiteMap = HashMap<Span, Vec<ResolvedType>>;
 pub type CatchTypeMap = HashMap<Span, ResolvedType>;
 
+/// Checked nominal coverage of a protected effect by a particular catch.
+/// Partial coverage keeps the unmatched path alive as well as the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CatchCoverage {
+    None,
+    Partial,
+    Complete,
+}
+
+pub type CatchCoverageMap = HashMap<Span, HashMap<ResolvedType, CatchCoverage>>;
+
+pub(crate) fn catch_coverage(
+    facts: &CatchCoverageMap,
+    catch: Span,
+    effect: &ResolvedType,
+) -> CatchCoverage {
+    facts
+        .get(&catch)
+        .and_then(|effects| effects.get(effect))
+        .copied()
+        .unwrap_or(CatchCoverage::None)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckedEffectClass {
     Required,
@@ -84,8 +107,4 @@ pub(crate) fn record_effect_site(
 
 pub(crate) fn effects_at(sites: &EffectSiteMap, span: Span) -> &[ResolvedType] {
     sites.get(&span).map(Vec::as_slice).unwrap_or_default()
-}
-
-pub(crate) fn effect_is_caught(effect: &ResolvedType, catch: &ResolvedType) -> bool {
-    catch == &ResolvedType::Error || catch == effect
 }

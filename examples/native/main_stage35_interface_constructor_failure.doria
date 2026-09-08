@@ -1,0 +1,22 @@
+interface Named { function name(): string; }
+class Name implements Named {
+    function __construct(string $text) {}
+    function name(): string { return $this->text; }
+    function __destruct() { try { echo "drop {$this->text};"; } catch (Error $error) {} }
+}
+class Failure implements Error { string $message = "failed"; }
+function fail(): Named throws Failure { throw new Failure(); }
+class Explicit {
+    Named $first = new Name("explicit");
+    Named $second = fail();
+    function __construct(parameter take Named $input) throws Failure {}
+    function __destruct() { try { echo "wrong;"; } catch (Error $error) {} }
+}
+class Implicit {
+    Named $first = new Name("implicit");
+    Named $second = new Name("second");
+}
+function main(): void {
+    try { let $value = new Explicit(new Name("input")); } catch (Failure $error) { echo "caught;"; }
+    { let $value = new Implicit(); echo "constructed;"; }
+}

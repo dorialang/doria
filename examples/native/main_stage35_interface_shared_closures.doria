@@ -1,0 +1,27 @@
+interface Named { function name(): string; }
+interface Read<T> extends Named { function read(): T; }
+class Name implements Read<int> {
+    function __construct(string $text) {}
+    function name(): string { return $this->text; }
+    function read(): int { return 7; }
+    function __destruct(): void { try { echo "drop;"; } catch (Error) {} }
+}
+function make(string $text): SharedReference<Read<int>> { return shared new Name($text); }
+function inspect(Named $value): void { echo $value->name(); }
+function main(): void {
+    let $owner = make("live");
+    let $read = fn() with ($owner) => $owner->name();
+    echo $read();
+    inspect($owner->referencedValue);
+    ?SharedReference<Read<int>> $maybe = $owner->share();
+    echo $maybe?->read() ?? 0;
+    let $weak = $maybe?->createWeakReference();
+    let $acquired = $weak?->acquire();
+    inspect(($acquired ?? make("unused"))->referencedValue);
+    ?SharedReference<Read<int>> $none = null;
+    echo $none?->name() ?? "absent";
+    inspect(($none ?? make("fallback"))->referencedValue);
+    let $taken = $owner->share();
+    let $consume = function(): string with (take $taken) { return $taken->name(); };
+    echo $consume();
+}

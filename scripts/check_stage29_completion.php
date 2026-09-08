@@ -76,7 +76,7 @@ $require($decisionPath, $decision, [
     'Native Testing Foundation Slices 1 through 3 are complete',
     'Foundation is complete',
     'Stage 34 is complete',
-    'Stage 35 Slice 1 is complete and Slice 2 is next',
+    'Stage 35 Slices 1 and 2 are complete and Slice 3 is next',
     'debug interpreter, Cranelift, LLVM, and PHP',
     'Decision 0122 implements owned-property move-in and writable replacement',
     'E0472 remains reachable only for the separate move-out boundary',

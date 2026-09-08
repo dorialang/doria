@@ -896,6 +896,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
     let given_preludes = HashMap::new();
     let checked_effect_sites = HashMap::new();
     let catch_error_types = HashMap::new();
+    let catch_coverage = HashMap::new();
     let binding_resolution = BindingResolution::default();
     let closures = HashMap::new();
     let callable_value_calls = HashMap::new();
@@ -912,6 +913,7 @@ pub fn check_program(program: &ast::Program) -> Vec<Diagnostic> {
             given_preludes: &given_preludes,
             checked_effect_sites: &checked_effect_sites,
             catch_error_types: &catch_error_types,
+            catch_coverage: &catch_coverage,
             binding_resolution: &binding_resolution,
             closures: &closures,
             callable_value_calls: &callable_value_calls,
@@ -931,6 +933,7 @@ pub(crate) struct OwnershipAnalysisContext<'a> {
     pub(crate) given_preludes: &'a HashMap<Span, crate::semantics::GivenSemanticInfo>,
     pub(crate) checked_effect_sites: &'a crate::checked_effects::EffectSiteMap,
     pub(crate) catch_error_types: &'a crate::checked_effects::CatchTypeMap,
+    pub(crate) catch_coverage: &'a crate::checked_effects::CatchCoverageMap,
     pub(crate) binding_resolution: &'a BindingResolution,
     pub(crate) closures: &'a HashMap<ClosureId, crate::semantics::ClosureSemanticInfo>,
     pub(crate) callable_value_calls: &'a HashMap<Span, crate::semantics::CallableValueCallInfo>,
@@ -951,6 +954,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         given_preludes,
         checked_effect_sites,
         catch_error_types,
+        catch_coverage,
         binding_resolution,
         closures,
         callable_value_calls,
@@ -1156,6 +1160,7 @@ pub(crate) fn check_program_with_inferred_move_returns(
         given_preludes,
         checked_effect_sites,
         catch_error_types,
+        catch_coverage,
         exception_scopes: Vec::new(),
         move_enum_names: move_enum_names.clone(),
         receiver_class: None,
@@ -1856,6 +1861,7 @@ struct Checker<'a> {
     given_preludes: &'a HashMap<Span, crate::semantics::GivenSemanticInfo>,
     checked_effect_sites: &'a crate::checked_effects::EffectSiteMap,
     catch_error_types: &'a crate::checked_effects::CatchTypeMap,
+    catch_coverage: &'a crate::checked_effects::CatchCoverageMap,
     exception_scopes: Vec<ExceptionScope>,
     move_enum_names: HashSet<String>,
     receiver_class: Option<String>,
@@ -2994,15 +3000,21 @@ impl Checker<'_> {
                 }
                 self.push_exception_scope(&before);
                 for catch in &statement.catches {
-                    let Some(catch_type) = self.catch_error_types.get(&catch.span) else {
+                    if !self.catch_error_types.contains_key(&catch.span) {
                         continue;
-                    };
+                    }
                     let mut caught_states = Vec::new();
                     let mut remaining = Vec::new();
                     for exit in unmatched_exits {
-                        if crate::checked_effects::effect_is_caught(&exit.effect, catch_type) {
-                            caught_states.push(exit.scopes);
-                        } else {
+                        let coverage = crate::checked_effects::catch_coverage(
+                            self.catch_coverage,
+                            catch.span,
+                            &exit.effect,
+                        );
+                        if coverage != crate::checked_effects::CatchCoverage::None {
+                            caught_states.push(exit.scopes.clone());
+                        }
+                        if coverage != crate::checked_effects::CatchCoverage::Complete {
                             remaining.push(exit);
                         }
                     }
@@ -4626,7 +4638,7 @@ impl Checker<'_> {
                 ..
             } => {
                 match self.flow_fact(left) {
-                    Some(Fact::NonNull | Fact::Exact(_)) => {
+                    Some(Fact::NonNull | Fact::Exact(_) | Fact::Constructed { .. }) => {
                         self.use_expr(left, scopes, mode);
                         return;
                     }
@@ -5266,7 +5278,9 @@ impl Checker<'_> {
         }
         match self.flow_fact(object) {
             Some(Fact::Null) => CallExecution::Never,
-            Some(Fact::NonNull | Fact::Exact(_)) => CallExecution::Always,
+            Some(Fact::NonNull | Fact::Exact(_) | Fact::Constructed { .. }) => {
+                CallExecution::Always
+            }
             None => CallExecution::Maybe,
         }
     }
@@ -6673,6 +6687,7 @@ fn resolved_type_is_move_type(
         | crate::types::ResolvedType::Error
         | crate::types::ResolvedType::Function(_)
         | crate::types::ResolvedType::Class(_)
+        | crate::types::ResolvedType::Interface(_)
         | crate::types::ResolvedType::SharedHandle(_, _)
         | crate::types::ResolvedType::TypedArray(_)
         | crate::types::ResolvedType::List(_)

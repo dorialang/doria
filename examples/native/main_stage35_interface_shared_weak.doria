@@ -1,0 +1,21 @@
+interface Named { function name(): string; }
+class Name implements Named {
+    function __construct(string $text) {}
+    function name(): string { return $this->text; }
+    function __destruct(): void { try { echo "drop;"; } catch (Error $error) {} }
+}
+function inspect(SharedReference<Named> $value): void { echo $value->name(); }
+function expired(): WeakReference<Named> {
+    SharedReference<Named> $owner = shared new Name("expired");
+    return $owner->createWeakReference();
+}
+function main(): void {
+    SharedReference<Named> $owner = shared new Name("live");
+    let $other = $owner->share();
+    inspect($other);
+    let $weak = $owner->createWeakReference();
+    let $acquired = $weak->acquire();
+    if ($acquired != null) { echo $acquired->name(); }
+    let $dead = expired();
+    if ($dead->acquire() == null) { echo "expired;"; }
+}

@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Accepted:** 2026-09-04
-- **Implementation Status:** Stage 35 Authority Accepted; Slice 1 Complete; Slice 2 Next
+- **Implementation Status:** Stage 35 Authority Accepted; Slices 1 And 2 Complete; Slice 3 Next
 - **Amends:** Decisions 0029, 0030, 0079, 0082, 0087, 0089, 0093, 0096, 0100, 0102, 0105, 0106, 0110, 0113, 0119, 0121, 0125, 0129, 0130, 0131, 0132, and 0133
 
 ## Context
@@ -724,8 +724,8 @@ redesign it.
 **Complete.** Implements complete lexer/parser/AST/source identity, interface and trait
 declaration graphs, interface inheritance, method compatibility, nominal
 conformance, incremental facts, diagnostics, and compiler-fact-based tooling.
-Interface value execution and trait composition remain precise pre-HIR
-unsupported boundaries.
+At Slice 1 delivery, interface execution and trait composition were precise
+pre-HIR boundaries; Slice 2 now retires only the interface-value boundary.
 
 Requirements have a distinct non-executable body form. Generic parent/use
 graphs retain source order, canonical specializations, and declaration origins;
@@ -742,10 +742,26 @@ or physical slot layout is delivered in this slice.
 
 ### Slice 2: Interface Runtime And Ownership
 
-Implement HIR/MIR carriers, static vtables, calls, conversions, dynamic drop,
-nullable/mixed/type-pattern behavior, Error and Displayable migration, all six
-shared-ownership families, and interpreter/Cranelift/LLVM/PHP parity. Core
-Cloneable/Iterable execution remains a Slice 3 boundary.
+**Complete.** HIR/MIR uses one data/vtable carrier for owned and borrowed
+interfaces, including Error. Checked conformance facts select static vtables
+and specialized ordinary entry thunks; concrete/constrained calls remain direct.
+Conversions retain the allocation and borrow root. Nullable/mixed patterns,
+properties, collections, generic closures, dynamic destruction, Error
+subinterfaces, and Displayable use the same checked representation. All six
+shared/weak/access families retain the interface view beside the existing
+control-block pointer, with access release before owner release.
+
+The interpreter, Cranelift, LLVM, and PHP preserve these ownership and checked
+outcome contracts. PHP roots live shared control blocks until their explicit
+final strong release and suppresses host-shutdown cleanup, preserving intentional
+strong cycles without invoking their Doria destructors. MIR validation rejects
+wrong slots, specializations, effects, unproved narrowing, moved owners, and
+views escaping their owner or lease.
+Durable `main_stage35_interface_*` fixtures cover the runtime cross-product;
+malformed-MIR tests and emitted-IR checks cover independent soundness and
+allocation/layout invariants. E0758 is retired and reserved; E0759 still owns
+Slice 3 core operations/public iteration, E0493 owns Slice 4 composition, and
+E0760 still rejects primitive erasure. Stage 35 remains in progress.
 
 ### Slice 3: Core Contracts And Public Iteration
 

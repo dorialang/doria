@@ -95,12 +95,12 @@ function check_stage34_inheritance(string $root): array
     }
     $require($paths['plan'], $files['plan'], [
         'Stage 34 — Single Class Inheritance — Complete',
-        'Stage 35 — Interfaces And Traits — In Progress; Slice 1 Complete; Slice 2 Next',
+        'Stage 35 — Interfaces And Traits — In Progress; Slices 1 And 2 Complete; Slice 3 Next',
         'Decision 0130',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
-        'Stage 35 Interfaces And Traits — In Progress; Slice 1 Complete; Slice 2 Next.',
+        'Stage 35 Interfaces And Traits — In Progress; Slices 1 And 2 Complete; Slice 3 Next.',
     ]);
     $forbid($paths['spec'], $files['spec'], [
         'parent lookup and dispatch are Stage 34 semantics and are currently diagnosed as unsupported',
@@ -158,7 +158,7 @@ function check_stage34_inheritance(string $root): array
         'function_virtual_slots',
         'class.ancestors.iter().rev()',
         'call_target_is_direct_parent',
-        'error_descriptors_covered_by',
+        'checked_effect_for_resolved',
     ]);
     $require($paths['validation'], $files['validation'], [
         'class.ancestors.contains(&target)',

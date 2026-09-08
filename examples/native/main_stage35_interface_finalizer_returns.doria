@@ -1,0 +1,25 @@
+interface Named { function name(): string; }
+class Name implements Named {
+    function __construct(string $text) {}
+    function name(): string { return $this->text; }
+    function __destruct() { try { echo "drop {$this->text};"; } catch (Error $error) {} }
+}
+class Failure implements Error { string $message = "failed"; }
+function fail(): void throws Failure { throw new Failure(); }
+function interrupted(): Named throws Failure {
+    try { return new Name("return"); } finally { echo "finally return;"; fail(); }
+}
+function interruptedWhen(): Named throws Failure {
+    return when (true) { return new Name("when"); }
+        else { return new Name("wrong"); }
+        finally { echo "finally when;"; fail(); };
+}
+function retained(): Named {
+    try { return new Name("retained"); } finally { echo "finally retained;"; }
+}
+function main(): void {
+    try { let $value = interrupted(); } catch (Failure $error) { echo "caught return;"; }
+    try { let $value = interruptedWhen(); } catch (Failure $error) { echo "caught when;"; }
+    let $value = retained();
+    echo $value->name() . ";";
+}

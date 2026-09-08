@@ -1,8 +1,8 @@
 #![cfg(feature = "llvm-backend")]
 
 use doriac::mir::{
-    BasicBlock, BlockId, FloatBinaryOp, FloatExpression, Function, FunctionId, Program, ReturnType,
-    Rvalue, ScalarType, Terminator, Type, ValueExpression,
+    self, BasicBlock, BlockId, FloatBinaryOp, FloatExpression, Function, FunctionId, Program,
+    ReturnType, Rvalue, ScalarType, Terminator, Type, ValueExpression,
 };
 use doriac::numeric::{FloatType, FloatValue};
 
@@ -12,6 +12,50 @@ fn assert_object(source: &str) {
     let object = doriac::codegen_llvm::lower_mir_to_object(&program)
         .expect("verified MIR should lower to an optimized LLVM object");
     assert!(!object.is_empty());
+}
+
+#[test]
+fn interface_ir_keeps_static_vtables_and_allocation_free_loop_dispatch() {
+    let program = doriac::lower_source_to_mir(
+        "interface-structure.doria",
+        include_str!("../../../examples/native/main_stage35_interface_structure.doria"),
+    )
+    .unwrap();
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program).unwrap();
+    assert!(
+        ir.contains("@__doria_interface_vtable_0 = internal constant"),
+        "{ir}"
+    );
+    assert!(
+        ir.contains("interface.method.field = getelementptr ptr, ptr"),
+        "{ir}"
+    );
+    assert!(ir.contains("%interface.method.entry("), "{ir}");
+    for function in program.functions.iter().filter(|function| {
+        ["concrete", "constrained", "erased", "repeat"]
+            .iter()
+            .any(|name| function.name.starts_with(name))
+    }) {
+        let symbol = doriac::native_abi::function_symbol(function);
+        let body = ir
+            .split("define ")
+            .find(|body| {
+                body.lines()
+                    .next()
+                    .is_some_and(|line| line.contains(&format!("@{symbol}(")))
+            })
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert!(
+            !body
+                .lines()
+                .any(|line| line.contains("call ") && line.contains("@dr_v2_class_allocate(")),
+            "{body}"
+        );
+    }
+    assert!(scan_alloca_placement(&ir).escaped.is_empty(), "{ir}");
 }
 
 #[test]
@@ -152,7 +196,11 @@ fn checked_error_ir_uses_status_out_slots_static_metadata_and_entry_scratch() {
     let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program)
         .expect("checked-error MIR should lower to LLVM IR");
 
-    assert!(ir.contains("@__doria_error_descriptor_0"), "{ir}");
+    assert!(
+        ir.contains("@__doria_interface_vtable_0 = internal constant"),
+        "{ir}"
+    );
+    assert!(!ir.contains("@__doria_error_descriptor_"), "{ir}");
     assert!(ir.contains("@__doria_error_origin_0"), "{ir}");
     assert!(
         ir.contains("define internal i8"),
@@ -175,8 +223,8 @@ fn checked_error_ir_uses_status_out_slots_static_metadata_and_entry_scratch() {
         "first-throw origin is not set conditionally:\n{ir}"
     );
     assert!(
-        ir.contains("error.descriptor") && ir.contains("icmp eq ptr"),
-        "exact catch does not compare descriptor identity:\n{ir}"
+        ir.contains("nominal.class.field") && ir.contains("class.ancestry.masked"),
+        "class catch does not test the interface carrier's nominal ancestry:\n{ir}"
     );
     for forbidden in [" invoke ", "landingpad", "personality", "resume "] {
         assert!(
@@ -655,6 +703,8 @@ fn rejects_malformed_mixed_width_float_mir_before_llvm_emission() {
         enums: vec![],
         classes: vec![],
         collection_types: vec![],
+        interface_types: vec![mir::InterfaceType::error()],
+        interface_vtables: Vec::new(),
         statics: vec![],
         error_descriptors: vec![],
         error_origins: vec![],

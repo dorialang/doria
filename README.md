@@ -148,7 +148,10 @@ runtime access-check cost.
 
 Interface requirements preserve receiver mutability, parameter ownership, and
 checked effects. Conformance is nominal: a class declares its contracts rather
-than acquiring them through matching method names. See the
+than acquiring them through matching method names. Owned interface values retain
+the concrete object's destruction, while borrowed views retain their source's
+lifetime and access capability. Error and Displayable use that same model,
+including shared interface payloads with explicit ownership and leases. See the
 [implementation plan](docs/doria-end-to-end-plan.md) for compiler coverage.
 
 ## What people build with it

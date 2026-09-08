@@ -3,6 +3,9 @@
 > **Stage 35 amendment:** Decision 0134 reuses this record's substitution law,
 > class descriptors, virtual implementations, hierarchy narrowing, and dynamic
 > drop to define nominal interface conformance and trait/class precedence.
+> Slice 2 implements interface runtime views of exact and open-class carriers,
+> including ancestor/sibling narrowing and Error-subinterface coverage. The
+> original headerless payload and dynamic destruction remain unchanged.
 
 - **Status:** Accepted
 - **Accepted:** 2026-09-01
@@ -320,7 +323,7 @@ compiled class ABI, or Stage 35/35a behavior.
   lifecycle-phase dispatch rather than one isolated class body.
 - Incremental fingerprints, compiler metadata clients, official editor tooling,
   active docs, parity matrices, examples, and mechanical guards must describe
-  Stage 34 as complete and Stage 35 Slice 1 as complete with Slice 2 next.
+  Stage 34 as complete and Stage 35 Slices 1 and 2 as complete with Slice 3 next.
 - The separate website later needs its class, override, parent construction,
   narrowing, Error hierarchy, performance, editor, and Stage-34 UAT surfaces
   synchronized; this compiler work does not modify that repository.

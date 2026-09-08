@@ -6,6 +6,11 @@
 
 Status: Accepted
 
+> **Interface runtime implementation:** Decision 0134 Slice 2 retains these
+> rules across class/interface and ancestor-interface views. A view preserves
+> its ultimate root, including a shared access lease; replacement or release of
+> that root invalidates every derived view. Conversion adds no owner or retain.
+
 ## Context
 
 Decision 0083 makes classes and the first ownership-bearing values uniquely

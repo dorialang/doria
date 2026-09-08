@@ -3,6 +3,14 @@
 > Documentation role: mechanical closure evidence for Decision 0106. This note
 > records implementation coverage; the decision remains the semantic authority.
 
+Historical snapshot: Decision 0134 Slice 2 supersedes this audit's class-only
+handle representation and blanket PHP refusal. Interface payload views now
+use two-word handles across all six families while retaining the same concrete
+allocation and control block; PHP implements their explicit counts and leases.
+The readonly family still owns class allocations, including interface views of
+those allocations. Current coverage is in `native-parity-matrix.md`; the table
+below records what Stage 25a verified, not a continuing interface restriction.
+
 The audit uses only these status values: **Implemented And Verified**,
 **Implementation Gap**, **Documentation Gap**, **Tooling Gap**, and
 **Intentionally Deferred By Accepted Authority**. A row is verified only when

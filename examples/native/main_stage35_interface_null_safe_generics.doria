@@ -1,0 +1,36 @@
+interface Select<T> {
+    function choose<U>(T $value, take U $other): U;
+    function absent<U>(): ?U;
+}
+class Selector implements Select<int> {
+    function choose<U>(int $value, take U $other): U { return $other; }
+    function absent<U>(): ?U { return null; }
+}
+function fromView(?Select<int> $view): ?string {
+    return $view?->choose(other: "interface", value: 1);
+}
+function fromClass(?Selector $view): ?int {
+    return ($view?->choose(value: 1, other: 7));
+}
+function fromShared(?SharedReference<Select<int>> $view): ?string {
+    return $view?->choose(value: 1, other: "shared");
+}
+function nullableResults(?Select<int> $view): void {
+    ?string $value = null;
+    ?string $kept = $view?->choose(value: 1, other: $value);
+    echo ($kept ?? "null") . "\n";
+    ?int $empty = $view?->absent();
+    echo ($empty == null ? "empty" : "wrong") . "\n";
+}
+function main(): void {
+    ?Select<int> $view = new Selector();
+    ?Selector $concrete = new Selector();
+    ?SharedReference<Select<int>> $shared = shared new Selector();
+    echo (fromView($view) ?? "missing") . "\n";
+    echo fromClass($concrete) ?? 0;
+    echo "\n";
+    echo (fromShared($shared) ?? "missing") . "\n";
+    nullableResults($view);
+    ?Select<int> $none = null;
+    echo (fromView($none) ?? "absent") . "\n";
+}

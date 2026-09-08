@@ -1176,13 +1176,13 @@ pub type DrMainIntArgsV2 = unsafe extern "C" fn(*const DrStackFrameV2, *mut DrCo
 pub type DrMainVoidArgsV2 = unsafe extern "C" fn(*const DrStackFrameV2, *mut DrCollectionV1);
 
 #[repr(C)]
-pub struct DrErrorCarrierV1 {
+pub struct DrInterfaceCarrierV1 {
     object: *mut u8,
-    descriptor: *const DrErrorDescriptorV1,
+    vtable: *const DrInterfaceVtableV1,
 }
 
 #[repr(C)]
-struct DrErrorDescriptorV1 {
+struct DrInterfaceVtableV1 {
     type_name: *const u8,
     type_name_length: usize,
     message_offset: usize,
@@ -1192,7 +1192,11 @@ struct DrErrorDescriptorV1 {
     assertion_offsets: usize,
     assertion_magic: usize,
     class_descriptor: *const u8,
+    interface_id: usize,
 }
+
+pub const DR_INTERFACE_CARRIER_SIZE: usize = mem::size_of::<DrInterfaceCarrierV1>();
+pub const DR_INTERFACE_VTABLE_HEADER_SIZE: usize = mem::size_of::<DrInterfaceVtableV1>();
 
 const ASSERTION_ERROR_DESCRIPTOR_MAGIC: usize = 0xA557_0004;
 const ASSERTION_ERROR_TYPE: &[u8] = b"Doria\\Std\\Test\\AssertionError";
@@ -1226,17 +1230,20 @@ struct DrErrorOriginV1 {
 }
 
 pub type DrMainCheckedIntV3 =
-    unsafe extern "C" fn(*const DrStackFrameV2, *mut i64, *mut DrErrorCarrierV1) -> u8;
+    unsafe extern "C" fn(*const DrStackFrameV2, *mut i64, *mut DrInterfaceCarrierV1) -> u8;
 pub type DrMainCheckedVoidV3 =
-    unsafe extern "C" fn(*const DrStackFrameV2, *mut DrErrorCarrierV1) -> u8;
+    unsafe extern "C" fn(*const DrStackFrameV2, *mut DrInterfaceCarrierV1) -> u8;
 pub type DrMainCheckedIntArgsV3 = unsafe extern "C" fn(
     *const DrStackFrameV2,
     *mut i64,
-    *mut DrErrorCarrierV1,
+    *mut DrInterfaceCarrierV1,
     *mut DrCollectionV1,
 ) -> u8;
-pub type DrMainCheckedVoidArgsV3 =
-    unsafe extern "C" fn(*const DrStackFrameV2, *mut DrErrorCarrierV1, *mut DrCollectionV1) -> u8;
+pub type DrMainCheckedVoidArgsV3 = unsafe extern "C" fn(
+    *const DrStackFrameV2,
+    *mut DrInterfaceCarrierV1,
+    *mut DrCollectionV1,
+) -> u8;
 
 /// Validates process arguments for an entrypoint that does not request the list.
 ///
@@ -2026,18 +2033,18 @@ pub unsafe extern "C" fn dr_v3_main_checked_void_args(
     }
 }
 
-const fn empty_error_carrier() -> DrErrorCarrierV1 {
-    DrErrorCarrierV1 {
+const fn empty_error_carrier() -> DrInterfaceCarrierV1 {
+    DrInterfaceCarrierV1 {
         object: ptr::null_mut(),
-        descriptor: ptr::null(),
+        vtable: ptr::null(),
     }
 }
 
-unsafe fn report_unhandled_error(error: DrErrorCarrierV1) -> i32 {
-    if error.object.is_null() || error.descriptor.is_null() {
+unsafe fn report_unhandled_error(error: DrInterfaceCarrierV1) -> i32 {
+    if error.object.is_null() || error.vtable.is_null() {
         emergency_runtime_panic();
     }
-    let descriptor = &*error.descriptor;
+    let descriptor = &*error.vtable;
     let message_slot = error.object.add(descriptor.message_offset) as *const *const DrStringV1;
     let message = *message_slot;
     if descriptor.type_name.is_null() || message.is_null() {
@@ -2064,7 +2071,7 @@ unsafe fn report_unhandled_error(error: DrErrorCarrierV1) -> i32 {
 
 unsafe fn assertion_facts(
     object: *mut u8,
-    descriptor: &DrErrorDescriptorV1,
+    descriptor: &DrInterfaceVtableV1,
 ) -> Option<AssertionFactsV4> {
     if descriptor.assertion_magic != ASSERTION_ERROR_DESCRIPTOR_MAGIC
         || descriptor.assertion_offsets == 0
@@ -2155,7 +2162,7 @@ unsafe fn render_runtime_assertion(
 }
 
 unsafe fn render_runtime_error(
-    descriptor: &DrErrorDescriptorV1,
+    descriptor: &DrInterfaceVtableV1,
     message: *const DrStringV1,
     origin: *const DrErrorOriginV1,
 ) {
@@ -3024,7 +3031,7 @@ impl Drop for PrivateRecordWriter<'_> {
 }
 
 unsafe fn write_runtime_error_record(
-    descriptor: &DrErrorDescriptorV1,
+    descriptor: &DrInterfaceVtableV1,
     message: *const DrStringV1,
     origin: *const DrErrorOriginV1,
 ) -> bool {
@@ -3097,7 +3104,7 @@ unsafe fn write_runtime_error_record(
 
 unsafe fn write_runtime_assertion_record(
     channel_path: &[u8],
-    descriptor: &DrErrorDescriptorV1,
+    descriptor: &DrInterfaceVtableV1,
     facts: &AssertionFactsV4,
     origin: *const DrErrorOriginV1,
 ) -> bool {

@@ -3,6 +3,8 @@
 > **Stage 35 amendment:** Decision 0134 unifies the Error carrier with general
 > interface values, permits Error subinterfaces, and preserves exact checked
 > effect transport, concrete identity, cleanup, and the stored-message exception.
+> Slice 2 implements this migration across all backends; the original Error-only
+> descriptor below is now the Error view of that general interface vtable.
 
 - **Status:** Accepted
 - **Accepted:** 2026-08-15
@@ -65,8 +67,9 @@ ordinary explicitly typed field. `Error` values expose only readonly `message`
 through the erased interface. Equality is object identity; hashing, ordering,
 and structural field comparison are not implied.
 
-Concrete Error classes may use existing class sharing. Decision 0134 assigns
-`SharedReference<Error>` to Stage 35 Slice 2's general erased-interface payload support.
+Concrete Error classes and Error subinterfaces use existing class sharing.
+Decision 0134 Slice 2 implements all six shared/weak/access families with
+interface payloads, preserving one concrete allocation and drop obligation.
 
 ## Runtime Representation
 
@@ -176,8 +179,8 @@ One centralized `covers(catch_type, thrown_type)` operation defines matching.
 Originally, a concrete catch matches exact concrete identity. Decision 0130
 supersedes that Stage 29 restriction: a parent Error catch covers descendants,
 as do parent `throws` contracts and typed `toThrow` inspectors. `catch (Error)`
-matches every checked error. Stage 35 may add general interface coverage by
-extending that operation. A parent catch makes later descendant catches unreachable. Duplicate exact
+matches every checked error. Decision 0134 Slice 2 extends that same operation
+to Error-subinterface coverage. A parent catch makes later descendant catches unreachable. Duplicate exact
 catches, every catch after `Error`, and catches proven unable to match any
 protected effect are unreachable. An open `Error` effect keeps concrete catches
 potentially reachable.
@@ -371,7 +374,7 @@ including ambient I/O, through the same propagation and cleanup model. Stages
 30 through 32 and the Decision 0123 corrective beat are complete. All three
 Stage 33 slices and Phase F are complete under Decisions 0126 through 0128;
 Native Testing Foundation Slices 1 through 3 are complete, the Native Testing
-Foundation is complete, and Stage 34 is complete and Stage 35 Slice 1 is complete and Slice 2 is next.
+Foundation is complete, and Stage 34 is complete and Stage 35 Slices 1 and 2 are complete and Slice 3 is next.
 
 ## Explicit Exclusions
 

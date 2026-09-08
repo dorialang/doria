@@ -1,0 +1,1 @@
+free;drop free;nullable;drop nullable;writable;drop writable;writable-nullable;drop writable-nullable;take;drop take;factory;drop factory;constructor;drop constructor;instance;drop instance;static;drop static;closure;drop closure;erased;drop erased;named;drop named;failure;drop failure;caught;drop later;later-caught;done

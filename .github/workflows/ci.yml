@@ -61,6 +61,12 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install PHP for compatibility parity and repository guards
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+
       - name: Install native leak checker
         run: |
           sudo apt-get update
@@ -190,6 +196,16 @@ jobs:
             valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
           done
 
+      - name: Leak-check interface runtime ownership with Cranelift
+        run: |
+          for source in examples/native/main_stage35_interface_*.doria; do
+            name=$(basename "$source" .doria)
+            # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
+            if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi
+            target/debug/doriac compile "$source" --out "build/native/${name}"
+            valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}"
+          done
+
       - name: Smoke signed and unsigned narrow-width native fixtures
         run: |
           cargo run -p doriac -- compile examples/native/main_integer_div_mod_42.doria --target native --out build/native/main_integer_div_mod_42
@@ -313,6 +329,12 @@ jobs:
         with:
           components: clippy
 
+      - name: Install PHP for compatibility parity
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          coverage: none
+
       - name: Configure MSVC developer environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -432,6 +454,8 @@ jobs:
           cargo test -p doriac --test cli_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage17_io_tests --features llvm-backend --locked --verbose
           cargo test -p doriac --test stage18_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --test stage35_runtime_tests --features llvm-backend --locked --verbose
+          cargo test -p doriac --lib --features llvm-backend --locked mir_lowering::interface::tests
 
       - name: Run complete interpreter, Cranelift, and LLVM parity manifest
         run: cargo test -p doriac --test native_mir_parity_tests --features llvm-backend --locked --verbose
@@ -517,6 +541,18 @@ jobs:
         run: |
           cargo run -p doriac --features llvm-backend -- compile examples/native/main_stage26a_grouped_locals.doria --release --out build/native/main_stage26a_grouped_locals_release
           valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 build/native/main_stage26a_grouped_locals_release
+
+      - name: Leak-check interface runtime ownership with LLVM
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for source in examples/native/main_stage35_interface_*.doria; do
+            name=$(basename "$source" .doria)
+            # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
+            if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi
+            target/debug/doriac compile "$source" --release --out "build/native/${name}_release"
+            valgrind --leak-check=full --show-leak-kinds=all --errors-for-leak-kinds=definite,indirect --track-origins=yes --error-exitcode=1 "build/native/${name}_release"
+          done
 
       - name: Smoke LLVM release profile and panic parity on Unix
         if: runner.os != 'Windows'

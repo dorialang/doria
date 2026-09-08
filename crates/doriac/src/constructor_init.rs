@@ -120,6 +120,7 @@ pub(crate) fn check_program(
     given_preludes: &GivenSemanticInfoMap,
     checked_effect_sites: &crate::checked_effects::EffectSiteMap,
     catch_error_types: &crate::checked_effects::CatchTypeMap,
+    catch_coverage: &crate::checked_effects::CatchCoverageMap,
 ) -> Analysis {
     let mut analysis = Analysis::default();
     for class in program.items.iter().filter_map(|item| match item {
@@ -131,6 +132,7 @@ pub(crate) fn check_program(
             given_preludes,
             checked_effect_sites,
             catch_error_types,
+            catch_coverage,
             &mut analysis,
         );
     }
@@ -142,6 +144,7 @@ fn check_class(
     given_preludes: &GivenSemanticInfoMap,
     checked_effect_sites: &crate::checked_effects::EffectSiteMap,
     catch_error_types: &crate::checked_effects::CatchTypeMap,
+    catch_coverage: &crate::checked_effects::CatchCoverageMap,
     analysis: &mut Analysis,
 ) {
     let constructor = class.members.iter().find_map(|member| match member {
@@ -220,6 +223,7 @@ fn check_class(
         given_preludes,
         checked_effect_sites,
         catch_error_types,
+        catch_coverage,
         &std::collections::HashSet::new(),
     );
     let result = solve_forward(

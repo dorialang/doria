@@ -1,0 +1,26 @@
+interface Duplicate { function duplicate(): self; function number(): int; }
+open class Base implements Duplicate {
+    open function duplicate(): self {
+        let writable $result = new Base();
+        if ($this->number() == 1) { $result = new Base(); }
+        if ($result is Base) { return $result; }
+        return new Base();
+    }
+    open function number(): int { return 1; }
+}
+class Child extends Base {
+    override function duplicate(): self { return new Child(); }
+    override function number(): int { return 2; }
+}
+open class Factory implements Duplicate {
+    function duplicate(): self { return makeFactory(); }
+    function number(): int { return 3; }
+}
+function makeFactory(): Factory { return new Factory(); }
+function duplicate(Duplicate $value): Duplicate { return $value->duplicate(); }
+function main(): void {
+    Duplicate $base = duplicate(new Base());
+    Duplicate $child = duplicate(new Child());
+    Duplicate $factory = duplicate(new Factory());
+    echo "{$base->number()}{$child->number()}{$factory->number()}";
+}

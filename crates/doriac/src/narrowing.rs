@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::ast::{
     Argument, Block, ClosureBody, ElseBranch, Expr, ForIncrement, ForInitializer, FunctionDecl,
@@ -15,6 +15,36 @@ pub enum Fact {
     NonNull,
     Null,
     Exact(TypeRef),
+    Constructed {
+        origins: BTreeSet<Span>,
+        tested: Option<TypeRef>,
+    },
+}
+
+impl Fact {
+    pub fn is_non_null(&self) -> bool {
+        !matches!(self, Self::Null)
+    }
+
+    pub(crate) fn tested_type(&self) -> Option<&TypeRef> {
+        match self {
+            Self::Exact(ty)
+            | Self::Constructed {
+                tested: Some(ty), ..
+            } => Some(ty),
+            _ => None,
+        }
+    }
+
+    fn refine_type(self, ty: TypeRef) -> Self {
+        match self {
+            Self::Constructed { origins, .. } => Self::Constructed {
+                origins,
+                tested: Some(ty),
+            },
+            _ => Self::Exact(ty),
+        }
+    }
 }
 
 pub type FactsByUse = HashMap<Span, Fact>;
@@ -794,9 +824,27 @@ fn join_fact(left: &Fact, right: &Fact) -> Option<Fact> {
     }
 
     match (left, right) {
-        (Fact::Exact(_), Fact::Exact(_))
-        | (Fact::Exact(_), Fact::NonNull)
-        | (Fact::NonNull, Fact::Exact(_)) => Some(Fact::NonNull),
+        (
+            Fact::Constructed {
+                origins: left,
+                tested: left_type,
+            },
+            Fact::Constructed {
+                origins: right,
+                tested: right_type,
+            },
+        ) => Some(Fact::Constructed {
+            origins: left.union(right).copied().collect(),
+            tested: (left_type == right_type)
+                .then(|| left_type.clone())
+                .flatten(),
+        }),
+        (left, right)
+            if left.tested_type().is_some() && left.tested_type() == right.tested_type() =>
+        {
+            Some(Fact::Exact(left.tested_type().unwrap().clone()))
+        }
+        (left, right) if left.is_non_null() && right.is_non_null() => Some(Fact::NonNull),
         _ => None,
     }
 }
@@ -1067,7 +1115,7 @@ fn kill_mutated_call_arguments(
         } => {
             kill_mutated_call_arguments(left, state, resolution, mutations);
             let left_fact = expression_fact(left, state, resolution, &resolution.nullability);
-            if matches!(left_fact, Some(Fact::NonNull | Fact::Exact(_))) {
+            if left_fact.as_ref().is_some_and(Fact::is_non_null) {
                 return;
             }
             if matches!(left_fact, Some(Fact::Null)) {
@@ -1271,7 +1319,7 @@ fn kill_arguments_for_modes(
 
 fn assume_non_null(expr: &Expr, state: &mut State, resolution: &Resolution) {
     if let Some(binding) = place_binding(expr, resolution) {
-        if !matches!(state.facts.get(&binding), Some(Fact::Exact(_))) {
+        if !state.facts.get(&binding).is_some_and(Fact::is_non_null) {
             state.facts.insert(binding, Fact::NonNull);
         }
     }
@@ -1288,7 +1336,7 @@ fn call_execution(
     }
     match expression_fact(receiver, state, resolution, &resolution.nullability) {
         Some(Fact::Null) => CallExecution::Never,
-        Some(Fact::NonNull | Fact::Exact(_)) => CallExecution::Always,
+        Some(Fact::NonNull | Fact::Exact(_) | Fact::Constructed { .. }) => CallExecution::Always,
         None => CallExecution::Maybe,
     }
 }
@@ -1326,10 +1374,13 @@ fn expression_fact(
         | Expr::ArrayRepeat { .. }
         | Expr::Index { .. }
         | Expr::Range { .. }
-        | Expr::New { .. }
         | Expr::This { .. }
         | Expr::Unary { .. }
         | Expr::IsType { .. } => Some(Fact::NonNull),
+        Expr::New { span, .. } => Some(Fact::Constructed {
+            origins: BTreeSet::from([*span]),
+            tested: None,
+        }),
         Expr::Closure(_) | Expr::CallableCall { .. } | Expr::Match { .. } | Expr::When(_) => None,
         Expr::Variable { .. } => variable_binding(value, resolution).and_then(|binding| {
             state.facts.get(&binding).cloned().or_else(|| {
@@ -1393,10 +1444,9 @@ fn expression_fact(
             let left = expression_fact(left, state, resolution, nullability);
             let right = expression_fact(right, state, resolution, nullability);
             match (left, right) {
-                (Some(exact @ Fact::Exact(_)), _) => Some(exact),
-                (Some(Fact::NonNull), _) => Some(Fact::NonNull),
+                (Some(fact), _) if fact.is_non_null() => Some(fact),
                 (Some(Fact::Null), selected) => selected,
-                (None, Some(Fact::NonNull | Fact::Exact(_))) => Some(Fact::NonNull),
+                (None, Some(fact)) if fact.is_non_null() => Some(Fact::NonNull),
                 _ => None,
             }
         }
@@ -1450,14 +1500,19 @@ fn apply_condition(condition: &Expr, truth: bool, state: &mut State, resolution:
                 _ => None,
             };
             if let Some(variable) = variable {
-                state
-                    .facts
-                    .insert(variable, if non_null { Fact::NonNull } else { Fact::Null });
+                if !non_null || !state.facts.get(&variable).is_some_and(Fact::is_non_null) {
+                    state
+                        .facts
+                        .insert(variable, if non_null { Fact::NonNull } else { Fact::Null });
+                }
             }
         }
         Expr::IsType { expr, ty, .. } if truth => {
             if let Some(variable) = place_binding(expr, resolution) {
-                state.facts.insert(variable, Fact::Exact(ty.clone()));
+                let previous = state.facts.remove(&variable).unwrap_or(Fact::NonNull);
+                state
+                    .facts
+                    .insert(variable, previous.refine_type(ty.clone()));
             }
         }
         _ => {}
@@ -1698,14 +1753,14 @@ fn collect_expr(
             let left_state = collect_expr(left, state, resolution, mutations, facts);
             let left_fact = expression_fact(left, &left_state, resolution, &resolution.nullability);
             let mut fallback_input = left_state.clone();
-            if !matches!(left_fact, Some(Fact::NonNull | Fact::Exact(_))) {
+            if !left_fact.as_ref().is_some_and(Fact::is_non_null) {
                 if let Some(binding) = place_binding(left, resolution) {
                     fallback_input.facts.insert(binding, Fact::Null);
                 }
             }
             let fallback = collect_expr(right, &fallback_input, resolution, mutations, facts);
             match left_fact {
-                Some(Fact::NonNull | Fact::Exact(_)) => left_state,
+                Some(Fact::NonNull | Fact::Exact(_) | Fact::Constructed { .. }) => left_state,
                 Some(Fact::Null) => fallback,
                 None => State {
                     reachable: left_state.reachable || fallback.reachable,
@@ -1951,7 +2006,10 @@ fn apply_match_pattern_fact(
             state.facts.insert(binding, Fact::Null);
         }
         crate::ast::MatchPattern::TypeBinding { ty, .. } => {
-            state.facts.insert(binding, Fact::Exact(ty.clone()));
+            let previous = state.facts.remove(&binding).unwrap_or(Fact::NonNull);
+            state
+                .facts
+                .insert(binding, previous.refine_type(ty.clone()));
         }
         crate::ast::MatchPattern::EnumCase { .. } => {
             state.facts.insert(binding, Fact::NonNull);
@@ -1970,7 +2028,10 @@ fn expression_class_name(
         Expr::This { .. } => resolution.current_class.clone(),
         Expr::Variable { .. } => {
             let binding = variable_binding(expr, resolution)?;
-            if let Some(Fact::Exact(ty)) = state.and_then(|state| state.facts.get(&binding)) {
+            if let Some(ty) = state
+                .and_then(|state| state.facts.get(&binding))
+                .and_then(Fact::tested_type)
+            {
                 return class_name_in(ty, resolution.current_class.as_deref().unwrap_or(&ty.name));
             }
             resolution.declaration_classes.get(&binding).cloned()
@@ -2046,8 +2107,11 @@ fn initial_value_fact(expr: &Expr) -> Option<Fact> {
         | Expr::Array { .. }
         | Expr::ArrayRepeat { .. }
         | Expr::Range { .. }
-        | Expr::New { .. }
         | Expr::Closure(_) => Some(Fact::NonNull),
+        Expr::New { span, .. } => Some(Fact::Constructed {
+            origins: BTreeSet::from([*span]),
+            tested: None,
+        }),
         _ => None,
     }
 }

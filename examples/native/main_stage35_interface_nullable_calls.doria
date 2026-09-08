@@ -1,0 +1,35 @@
+interface Named { function name(): string; }
+interface Detailed extends Named { function number(): int; }
+class Name implements Detailed {
+    function __construct(string $text) {}
+    function name(): string { return $this->text; }
+    function number(): int { return 42; }
+}
+interface Provider {
+    function get(int $marker): Detailed;
+    function count(): int;
+    function items(): List<int>;
+}
+class Source implements Provider {
+    function get(int $marker): Detailed { return new Name("value"); }
+    function count(): int { return 42; }
+    function items(): List<int> { return [1, 2]; }
+}
+function marker(): int { echo "argument"; return 1; }
+function source(bool $present): ?Provider { if ($present) { return new Source(); } return null; }
+function named(): Detailed { return new Name("direct"); }
+function display(?Named $value): void { if ($value != null) { echo $value->name(); } else { echo "absent"; } }
+function main(): void {
+    ?Provider $none = source(false);
+    display($none?->get(marker()));
+    echo $none?->count() ?? -1;
+    ?Provider $some = source(true);
+    display($some?->get(marker()));
+    echo $some?->count() ?? -1;
+    ?List<int> $items = $some?->items();
+    if ($items != null) { echo "{$items->count}"; }
+    ?Named $converted = named();
+    display($converted);
+    Named $fallback = $none?->get(marker()) ?? new Name("fallback");
+    display($fallback);
+}

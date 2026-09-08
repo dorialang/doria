@@ -1,0 +1,43 @@
+open class Failure implements Error
+{
+    function __construct(string $message) {}
+
+    function __destruct(): void
+    {
+        try { echo "base drop\n"; } catch (Doria\Std\Io\IoError) {}
+    }
+}
+
+class Missing extends Failure
+{
+    function __construct() { parent::__construct("missing"); }
+
+    function __destruct(): void
+    {
+        try { echo "child drop\n"; } catch (Doria\Std\Io\IoError) {}
+    }
+}
+
+function erase(take ?Failure $value): ?Error
+{
+    return $value;
+}
+
+function raise(take Failure $value): void throws Failure
+{
+    throw $value;
+}
+
+function main(): void
+{
+    let $absent = erase(null);
+    if ($absent == null) { echo "absent\n"; }
+
+    {
+        let $value = erase(new Missing());
+        if ($value != null) { echo "erased {$value->message}\n"; }
+    }
+
+    try { raise(new Missing()); }
+    catch (Missing $error) { echo "caught {$error->message}\n"; }
+}
