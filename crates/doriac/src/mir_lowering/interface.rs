@@ -2634,7 +2634,11 @@ function main(): void {
             include_str!("../../../../examples/native/main_stage35_interface_shared_storage.doria");
         let program = lower_checked_source(source);
         let output = crate::mir_interpreter::interpret(&program).unwrap();
-        assert_eq!(output.stdout, b"storedstoredstoredabsentdrop;", "{program}");
+        assert_eq!(
+            output.stdout,
+            include_bytes!("../../tests/fixtures/native_io/main_stage35_interface_shared_storage/expected_stdout"),
+            "{program}"
+        );
         assert_eq!(output.exit_status, 0);
         assert_native_output(&program, &output.stdout);
         assert_php_output(source, &output.stdout);
