@@ -17,6 +17,93 @@ class Cursor implements Iterator<int> {
 "#;
 
 #[test]
+fn nullable_collection_constraints_do_not_inherit_payload_conformance() {
+    let declarations = r#"
+class Key implements Hashable, Comparable<Key>, Cloneable {
+    function hash(): uint64 { return 0; }
+    function compare(Key $other): Ordering { return Ordering::Equal; }
+    function clone(): self { return new Key(); }
+}
+class GenericKey<T> implements Hashable, Comparable<GenericKey<T>> {
+    function hash(): uint64 { return 0; }
+    function compare(GenericKey<T> $other): Ordering { return Ordering::Equal; }
+}
+interface KeyView extends Hashable, Comparable<KeyView>, Cloneable {}
+"#;
+    for (container, contract) in [
+        ("Set<E>", "Hashable"),
+        ("Dictionary<E, int>", "Hashable"),
+        ("SortedSet<E>", "Comparable"),
+        ("SortedDictionary<E, int>", "Comparable"),
+        ("PriorityQueue<E>", "Comparable"),
+    ] {
+        for element in [
+            "int",
+            "string",
+            "bool",
+            "Key",
+            "GenericKey<int>",
+            "KeyView",
+            "T",
+        ] {
+            let generic = if element == "T" {
+                format!("<T implements {contract}>")
+            } else {
+                String::new()
+            };
+            for nullable in [false, true] {
+                let element = if nullable {
+                    format!("?{element}")
+                } else {
+                    element.to_owned()
+                };
+                let ty = container.replace('E', &element);
+                let source =
+                    format!("{declarations} function inspect{generic}({ty} $items): void {{}}");
+                let analysis = analyze(&source);
+                if nullable {
+                    assert!(
+                        analysis.diagnostics.iter().any(|diagnostic| {
+                            diagnostic.code == "E0523"
+                                && diagnostic.message.contains(&element)
+                                && diagnostic.message.contains(contract)
+                        }),
+                        "{ty}: {:?}",
+                        analysis.diagnostics
+                    );
+                } else {
+                    assert!(
+                        analysis.diagnostics.is_empty(),
+                        "{ty}: {:?}",
+                        analysis.diagnostics
+                    );
+                }
+            }
+        }
+    }
+    for body in [
+        "Set<?Key> $items = Set::from($source);",
+        "let $items = Set::from($source);",
+        "SortedSet<?Key> $items = SortedSet::from($source);",
+        "let $items = SortedSet::from($source);",
+        "PriorityQueue<?Key> $items = PriorityQueue::from($source);",
+        "let $items = PriorityQueue::from($source);",
+    ] {
+        let source = format!(
+            "{declarations} function main(): void {{ List<?Key> $source = [new Key()]; {body} }}"
+        );
+        let diagnostics = doriac::lower_source_to_mir("nullable-collection.doria", source)
+            .expect_err("nullable hash/order operands must be rejected before MIR");
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "E0523"),
+            "{body}: {diagnostics:?}"
+        );
+    }
+}
+
+#[test]
 fn retained_iterator_sources_follow_returns_aliases_and_forward_calls() {
     let source = format!(
         r#"{BORROWING_CURSOR}

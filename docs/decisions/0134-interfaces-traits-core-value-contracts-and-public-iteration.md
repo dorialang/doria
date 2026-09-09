@@ -312,6 +312,12 @@ across compiler/runtime versions. Hash collections apply private per-process
 keyed mixing for collision resistance. Shared-reference wrappers are not
 automatically Hashable.
 
+Nullable types do not inherit nominal `Hashable` or `Comparable` conformance
+from their payload. There is no implicit null hash or null ordering, so `?T`
+cannot satisfy a hash-key, set-element, sorted-key, or priority constraint merely
+because `T` does. Nullable equality and preserving duplication handle absence
+explicitly; they do not add such conformance.
+
 `Displayable::toString` remains the only class display contract and creates no
 implicit string assignment conversion, `__toString`, primitive method, or cast.
 Concrete and constrained calls remain static; interface-erased display uses the

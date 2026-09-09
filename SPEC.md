@@ -850,6 +850,12 @@ Generic classes are instantiated in type positions and construction expressions 
 
 Constraint declarations use `<T implements A, B>`, and constraints may themselves be generic. Compiler-known `Comparable`, `Hashable`, `Equatable`, and `Displayable` constraints are checked at instantiation without boxing primitives. Stage 35 Slice 1 implements nominal user-interface constraints and statically specializes their concrete method calls. Type parameters are invariant. Doria v1.0 has no default type arguments, compile-time value arguments, call-site turbofish, or runtime generic reflection.
 
+Nullable types do not inherit `Hashable` or `Comparable` conformance from their
+payload. Hash collections, sorted collections, and priority queues require the
+key or element type itself to satisfy the applicable contract. Nullable equality
+and preserving duplication have explicit absence handling, not a null hash or
+null ordering.
+
 ### Fixed-width integers
 
 Stage 13 implements these canonical integer types through semantic analysis, typed MIR, the debug interpreter, and Cranelift:

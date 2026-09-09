@@ -185,7 +185,13 @@ called with parentheses receive E0557, and withdrawn `List::from` /
 class error. The same suggestion data is reserved for future migration tooling;
 editors consume compiler fixes rather than maintaining another spelling table.
 
-The four no-literal forms use positional-only `Type::from(source)`. Direct bracket assignment is not their construction surface. Existing sources remain unchanged; Stage 26 copies `Copy` values (including retained immutable strings), while move values are inserted individually into an empty destination. A consuming conversion remains deferred.
+The four no-literal forms use positional-only `Type::from(source)`. Direct bracket assignment is not their construction surface. Existing sources remain unchanged; Copy values (including retained immutable strings) are copied, and Move values must be Cloneable and are cloned. A consuming conversion remains deferred.
+
+Nullable keys and elements do not inherit `Hashable` or `Comparable` from their
+payload. `Set` and `Dictionary` require a Hashable element or key;
+`SortedSet`, `SortedDictionary`, and `PriorityQueue` require a Comparable element
+or key. Nullable equality and duplication remain available where required by
+unconstrained element or value positions, but supply no null hash or ordering.
 
 ---
 

@@ -680,10 +680,6 @@ impl Checker<'_> {
         if !self.is_core_interface(name) {
             return false;
         }
-        let ty = match self.types.kind(ty) {
-            TypeKind::Nullable(inner) => *inner,
-            _ => ty,
-        };
         let arguments = if matches!(name, "Comparable" | "Equatable") {
             vec![ty]
         } else {
@@ -754,8 +750,18 @@ impl Checker<'_> {
         operation: crate::compiler_known_contracts::CoreValueOperation,
         span: Span,
     ) -> bool {
+        use crate::compiler_known_contracts::CoreValueOperation;
+
+        // Only equality and duplication define absence handling for nullable values.
         let ty = match self.types.kind(ty) {
-            TypeKind::Nullable(inner) => *inner,
+            TypeKind::Nullable(inner)
+                if matches!(
+                    operation,
+                    CoreValueOperation::Equal | CoreValueOperation::Clone
+                ) =>
+            {
+                *inner
+            }
             _ => ty,
         };
         if !self.has_core_contract(ty, operation.contract()) {
