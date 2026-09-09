@@ -54,7 +54,8 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("doriac-spawn-{}-{nonce}", std::process::id()));
         // Linux denies exec while an executable is open for writing, including
-        // scripts. Release that real lock on the first retry, without timing races.
+        // scripts. Releasing our handle need not clear all launch contention, so
+        // subsequent attempts use the production delay and bounded retry policy.
         fs::write(&path, b"#!/bin/sh\nprintf 'ran once\\n'\nexit 42\n").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         let mut writer = Some(OpenOptions::new().write(true).open(&path).unwrap());
@@ -69,13 +70,16 @@ mod tests {
                 attempts += 1;
                 command.spawn()
             },
-            |_| drop(writer.take()),
+            |delay| {
+                drop(writer.take());
+                std::thread::sleep(delay);
+            },
         );
         drop(writer);
         let output = result.and_then(|child| child.wait_with_output());
         fs::remove_file(path).unwrap();
         let output = output.expect("the unlocked executable should run");
-        assert_eq!(attempts, 2);
+        assert!((2..=MAX_ATTEMPTS).contains(&attempts), "{attempts}");
         assert_eq!(output.status.code(), Some(42));
         assert_eq!(output.stdout, b"ran once\n");
         assert!(output.stderr.is_empty());
