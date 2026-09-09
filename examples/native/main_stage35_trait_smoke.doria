@@ -6,7 +6,11 @@ trait HasTitle
     function render(): string { return $this->formatPrefix() . $this->title; }
 }
 trait CompactFormatting { function format(): string { return "compact"; } }
-trait VerboseFormatting { function format(): string { return "verbose"; } }
+trait RequiresFormatting { function format(): string; }
+trait VerboseFormatting {
+    uses RequiresFormatting;
+    function format(): string { return "verbose"; }
+}
 class Report implements Renderable
 {
     uses HasTitle, CompactFormatting, VerboseFormatting {

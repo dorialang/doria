@@ -129,6 +129,61 @@ fn unsatisfied_or_incompatible_requirements_are_not_runtime_members() {
 }
 
 #[test]
+fn exclusions_preserve_bodyless_requirements_in_direct_and_nested_traits() {
+    for traits in [
+        "trait B { function value(): string; }",
+        "trait Required<T> { function value(): T; } trait B { uses Required<string>; }",
+        "trait Required<T> { function value(): T; } trait B { uses Required<string>; function value(): int { return 2; } }",
+    ] {
+        let source = format!(
+            "trait A {{ function value(): int {{ return 1; }} }} {traits}
+             class C {{ uses A, B {{ A::value insteadof B; }} }}"
+        );
+        let (_, analysis) = doriac::analyze_source_for_ide("requirements.doria", &source).unwrap();
+        let obligation = analysis.info.composition.obligations.iter()
+            .find(|obligation| obligation.class == "C" && obligation.requirement.name == "value")
+            .expect("excluded edges must retain their bodyless contracts");
+        assert!(!obligation.failures.is_empty());
+        assert!(analysis.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "E0757" && diagnostic.message.contains("does not satisfy its trait contract")
+                && diagnostic.related.iter().any(|related| related.span == obligation.origin.authored_declaration)
+        }), "{:?}", analysis.diagnostics);
+    }
+}
+
+#[test]
+fn internal_requirements_keep_declaring_class_access() {
+    assert_eq!(
+        run(r#"
+trait Required { internal function value(): int; function read(): int { return $this->value(); } }
+open class Base { function value(): int { return 1; } }
+class Inherited extends Base { uses Required; }
+class Local { uses Required; internal function value(): int { return 2; } }
+function main(): void { echo (new Inherited())->read(); echo (new Local())->read(); }
+"#),
+        "12"
+    );
+    for required_access in ["internal ", ""] {
+        let source = format!(
+            "open class Base {{ internal function value(): int {{ return 1; }} }}
+             trait Required {{ {required_access}function value(): int; }}
+             class Child extends Base {{ uses Required; }}"
+        );
+        let (_, analysis) = doriac::analyze_source_for_ide("internal.doria", &source).unwrap();
+        assert!(
+            analysis.diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == "E0757"
+                    && diagnostic
+                        .message
+                        .contains("does not supply required trait method")
+            }),
+            "{:?}",
+            analysis.diagnostics
+        );
+    }
+}
+
+#[test]
 fn two_composers_and_aliases_keep_independent_expression_and_closure_identities() {
     assert_eq!(
         run(r#"

@@ -401,6 +401,7 @@ impl Composer<'_> {
                         for (index, (candidate_edge, candidate)) in candidates.iter().enumerate() {
                             if same_type(candidate_edge, &edge)
                                 && member_name(&candidate.member) == adaptation.method.text
+                                && matches!(&candidate.member, ClassMember::Method(method) if method.body.as_block().is_some())
                             {
                                 found = true;
                                 let subject = candidate.alias.unwrap_or(candidate.authored_name);
