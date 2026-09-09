@@ -1,0 +1,34 @@
+class Book
+{
+    function __construct(string $title) {}
+    function __destruct() { try { echo "drop {$this->title}\n"; } catch (Error) {} }
+}
+
+class BookCursor implements Iterator<Book>
+{
+    writable int $position = 0;
+    function __construct(take List<Book> $source) {}
+    function __destruct() { try { echo "cursor released\n"; } catch (Error) {} }
+    function hasCurrent(): bool { return $this->position < $this->source->count; }
+    function getCurrent(): Book { return $this->source[$this->position]; }
+    writable function advance(): void
+    {
+        $this->position = match ($this->position) { 0 => 1, default => 2 };
+    }
+}
+
+function makeCursor(): Iterator<Book>
+{
+    let $books = [new Book("one"), new Book("two")];
+    return new BookCursor($books);
+}
+
+function main(): void
+{
+    let writable $cursor = makeCursor();
+    while ($cursor->hasCurrent()) {
+        echo $cursor->getCurrent()->title . "\n";
+        $cursor->advance();
+    }
+    echo "factory source still alive\n";
+}

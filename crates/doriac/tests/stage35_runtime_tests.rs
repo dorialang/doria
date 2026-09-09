@@ -433,6 +433,20 @@ fn public_foreach_acquires_once_advances_on_continue_and_preserves_move_elements
 }
 
 #[test]
+fn owning_iterator_return_preserves_source_and_reverse_element_cleanup() {
+    let source =
+        include_str!("../../../examples/native/main_stage35_interface_owning_iteration.doria");
+    let program = doriac::lower_source_to_mir("owning-iteration.doria", source).unwrap();
+    doriac::mir_validation::validate_program(&program).unwrap();
+    assert_eq!(
+        doriac::mir_interpreter::interpret(&program).unwrap().stdout,
+        include_bytes!(
+            "fixtures/native_io/main_stage35_interface_owning_iteration/expected_stdout"
+        )
+    );
+}
+
+#[test]
 fn public_iteration_preserves_redeclared_requirement_identity() {
     let source = r#"
 interface Values extends Iterable<int> {

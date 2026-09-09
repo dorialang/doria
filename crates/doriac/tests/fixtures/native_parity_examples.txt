@@ -347,6 +347,7 @@ examples/native/main_stage35_interface_membership.doria
 examples/native/main_stage35_interface_nullable_duplication.doria
 examples/native/main_stage35_interface_preserving_from.doria
 examples/native/main_stage35_interface_public_iteration.doria
+examples/native/main_stage35_interface_owning_iteration.doria
 examples/native/main_stage35_interface_builtin_iteration.doria
 examples/native/main_stage35_interface_hash_set.doria
 examples/native/main_stage35_interface_set_algebra.doria
