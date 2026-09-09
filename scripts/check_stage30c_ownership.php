@@ -87,8 +87,8 @@ function check_stage30c_ownership(string $root): array
     ]);
 
     $require($ownershipPath, $ownership, [
-        'pub enum ClosureBorrowRoot',
-        'pub enum ClosureValueProvenance',
+        'pub enum BorrowRoot',
+        'pub enum ValueProvenance',
         'pub enum CaptureAcquisitionKind',
         'pub struct ClosureOwnershipInfo',
         'pub release_order: Vec<usize>',

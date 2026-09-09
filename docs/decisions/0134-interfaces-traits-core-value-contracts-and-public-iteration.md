@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Accepted:** 2026-09-04
-- **Implementation Status:** Stage 35 Authority Accepted; Slices 1 And 2 Complete; Slice 3 Next
+- **Implementation Status:** Stage 35 Authority Accepted; Slices 1, 2, And 3 Complete; Slice 4 Next
 - **Amends:** Decisions 0029, 0030, 0079, 0082, 0087, 0089, 0093, 0096, 0100, 0102, 0105, 0106, 0110, 0113, 0119, 0121, 0125, 0129, 0130, 0131, 0132, and 0133
 
 ## Context
@@ -355,9 +355,10 @@ Cloneable:
 - `List::filter`, which preserves the source and output elements.
 
 Consuming operations and operations whose callback creates fresh results do not
-need Cloneable. Because `clone` is nonthrowing in the checked-effect system,
-there is no open-ended dynamic checked Error set; allocation panic remains
-abort-only under existing rules.
+need Cloneable. `clone` declares no authored checked Error set; Decision 0123's
+automatic AmbientIo and TestAssertion effects still propagate through generated
+duplication and clean initialized results. Allocation panic remains abort-only
+under existing rules.
 
 ## Public Iteration
 
@@ -422,8 +423,8 @@ runtime locking, or allocation. It does not authorize general borrowed fields
 in arbitrary classes; the retained-source facility is scoped to iterator
 carriers here.
 
-The following accepted example belongs to Stage 35 Slice 3, not the implemented
-Slices 1 and 2. The accessor is `getCurrent()`, replacing the earlier `current()`
+The following example is implemented by Stage 35 Slice 3.
+The accessor is `getCurrent()`, replacing the earlier `current()`
 spelling; it remains a method, not a Stage 36 property hook.
 
 ```doria
@@ -843,16 +844,37 @@ wrong slots, specializations, effects, unproved narrowing, moved owners, and
 views escaping their owner or lease.
 Durable `main_stage35_interface_*` fixtures cover the runtime cross-product;
 malformed-MIR tests and emitted-IR checks cover independent soundness and
-allocation/layout invariants. E0758 is retired and reserved; E0759 still owns
-Slice 3 core operations/public iteration, E0493 owns Slice 4 composition, and
+allocation/layout invariants. E0758 is retired and reserved; Slice 3 also retires
+E0759 after implementing core operations/public iteration. E0493 owns Slice 4 composition, and
 E0760 still rejects primitive erasure. Stage 35 remains in progress.
 
 ### Slice 3: Core Contracts And Public Iteration
 
-Implement Comparable, Equatable, Hashable, Cloneable, the accepted Copy-to-
-Cloneable widening, Iterable/Iterator loans, user-defined value-only `foreach`,
-and optimized built-in integration. Generalized first-binding and mutable public
-iteration remain out of scope.
+Comparable, Equatable, Hashable, Cloneable, Ordering, preserving duplication,
+and public Iterable/Iterator execution use checked canonical contract plans.
+Generated user operations remain ordinary or checked calls; raw collection
+storage neither invokes user callbacks nor loses their automatic effects.
+Full typed slots preserve nullable values, class/interface identity, and drop.
+
+Fill, existing-source `::from`, Set/SortedSet algebra, and List filter copy or
+clone only the required destination values; input owners remain unchanged.
+Checked exits clean partial destinations and preserve existing collection
+ownership. Primitive/string paths retain direct operations and no boxing.
+
+Retained constructor `borrow` sources and current-element provenance survive
+generic forwarding, interface erasure, and capture. Public foreach acquires
+once and advances the same cursor on continue; crossing exits drop it and end
+the source loan. Direct built-in loops retain their existing indexed plans.
+Collection erasure uses the existing two-word carrier without a wrapper or
+payload copy. A shared MIR storage proof puts one-shot nonescaping built-in
+cursors in fixed function-frame storage; returned/repeated or escaping cursor
+acquisitions retain heap storage. No per-element adapter allocation is required.
+
+The interpreter, Cranelift, LLVM, and PHP consume the checked operations and
+ownership model. PHP implements explicit collection algorithms and cleanup,
+not host loose comparison or host clone semantics. E0759 is retired/reserved;
+trait composition remains E0493 and primitive erasure remains E0760.
+Generalized first-binding and mutable public iteration remain out of scope.
 
 ### Slice 4: Trait Composition
 

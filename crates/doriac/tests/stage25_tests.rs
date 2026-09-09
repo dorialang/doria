@@ -747,11 +747,11 @@ function main(): void {}
 }
 
 #[test]
-fn comparable_constraints_enable_relational_operators() {
+fn primitive_comparable_specializations_preserve_relational_operators() {
     let mir = doriac::lower_source_to_mir(
         "stage25-comparable.doria",
         r#"
-function maximum<T implements Comparable<T>>(T $left, T $right): T
+function maximum<T implements Comparable<T>>(take T $left, take T $right): T
 {
     if ($left >= $right) { return $left; }
     return $right;
@@ -759,7 +759,7 @@ function maximum<T implements Comparable<T>>(T $left, T $right): T
 function main(): int { return maximum(42, 7); }
 "#,
     )
-    .expect("Comparable<T> should guarantee relational operators");
+    .expect("integer specializations should preserve relational operators");
     let output = doriac::mir_interpreter::interpret(&mir)
         .expect("the specialized comparison should execute");
     assert_eq!(output.exit_status, 42);

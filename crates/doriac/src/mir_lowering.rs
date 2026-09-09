@@ -18,7 +18,11 @@ use crate::types::{
 };
 use crate::{hir, mir};
 
+mod core_collection;
+mod core_ordered;
+mod core_value;
 mod interface;
+mod iteration;
 
 #[derive(Default)]
 struct ClassIds {
@@ -155,6 +159,13 @@ impl NativeTypeRegistry {
             comparator,
         });
         self.ids.insert(signature, id);
+        if comparator == Some(mir::CollectionComparator::Core) {
+            self.intern(
+                mir::CollectionKind::List,
+                None,
+                mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+            );
+        }
         id
     }
 
@@ -223,6 +234,61 @@ impl NativeTypeRegistry {
         }
         Ok(())
     }
+
+    fn register_collection_interfaces(&mut self, classes: &ClassIds, semantic: &SemanticInfo) {
+        let mut iterables = self.interface_ids.iter()
+            .filter(|(ty, _)| ty.name == "Iterable" && ty.arguments.len() == 1 && semantic.contracts.interface_specializations.iter().any(|fact|
+                fact.specialization == **ty && fact.requirements.iter().any(|requirement| requirement.origins.iter().any(|origin|
+                    crate::compiler_known_contracts::IterationOperation::from_requirement(origin.declaration) == Some(crate::compiler_known_contracts::IterationOperation::Acquire)))))
+            .map(|(ty, id)| (ty.clone(), *id)).collect::<Vec<_>>();
+        iterables.sort_by_key(|(_, id)| id.0);
+        for (ty, iterable) in iterables {
+            let iterator_type = crate::types::InterfaceType::new("Iterator", ty.arguments.clone());
+            let Some(iterator) = self.interface_ids.get(&iterator_type).copied() else {
+                continue;
+            };
+            let Some(element) = intern_resolved_collection_types(&ty.arguments[0], classes, self)
+            else {
+                continue;
+            };
+            for collection in &self.types {
+                if collection.value != element
+                    || matches!(
+                        collection.kind,
+                        mir::CollectionKind::Bytes | mir::CollectionKind::PriorityQueue
+                    )
+                {
+                    continue;
+                }
+                for (implementing_type, interface) in [
+                    (mir::ImplementingType::Collection(collection.id), iterable),
+                    (
+                        mir::ImplementingType::CollectionIterator(collection.id),
+                        iterator,
+                    ),
+                ] {
+                    let key = (implementing_type, interface);
+                    if self.interface_vtable_ids.contains_key(&key) {
+                        continue;
+                    }
+                    let id = mir::InterfaceVtableId(self.interface_vtables.len());
+                    self.interface_vtable_ids.insert(key, id);
+                    self.interface_vtables.push(mir::InterfaceVtable {
+                        id,
+                        implementing_type,
+                        interface,
+                        conformance_origin: crate::compiler_known_contracts::interfaces()
+                            .find(|item| item.name == "Iterable")
+                            .expect("canonical Iterable declaration")
+                            .span,
+                        ancestors: Vec::new(),
+                        methods: Vec::new(),
+                        error_descriptor: None,
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn checked_effect_for_resolved(
@@ -275,6 +341,7 @@ fn collection_comparator(ty: mir::Type) -> Option<mir::CollectionComparator> {
         ),
         mir::Type::Scalar(mir::ScalarType::Bool) => Some(mir::CollectionComparator::Bool),
         mir::Type::String => Some(mir::CollectionComparator::StringBytes),
+        mir::Type::Class(_) | mir::Type::Interface(_) => Some(mir::CollectionComparator::Core),
         _ => None,
     }
 }
@@ -1350,19 +1417,19 @@ fn lower_program_impl(
         &mut method_signatures,
         &mut callable_signatures,
     );
-    interface::register_methods(
-        &program.semantic_info,
-        &interface_calls,
-        &class_ids,
-        &mut collection_registry,
-    )?;
-
     for ty in program.semantic_info.expression_types.values() {
         let _ = intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
     }
     for ty in program.semantic_info.type_test_types.values() {
         let _ = intern_resolved_collection_types(ty, &class_ids, &mut collection_registry);
     }
+    collection_registry.register_collection_interfaces(&class_ids, &program.semantic_info);
+    interface::register_methods(
+        &program.semantic_info,
+        &interface_calls,
+        &class_ids,
+        &mut collection_registry,
+    )?;
 
     let source = program
         .selected_entry_source_id()
@@ -1703,6 +1770,7 @@ fn lower_program_impl(
                         })?,
                         writable: property.writable,
                         promoted: property.promoted,
+                        borrowed_source: property.borrowed_source,
                     })
                 })
                 .collect::<DiagnosticResult<Vec<_>>>()?;
@@ -2878,7 +2946,71 @@ fn lower_function(
     if !signature.checked_effects.is_empty() {
         context.pop_error_target();
     }
-    let (locals, blocks) = context.finish(metrics);
+    let (locals, mut blocks) = context.finish(metrics);
+    let retained = inputs.semantic_info.retained_callables.get(&function.span);
+    let source_parameter = |source: crate::symbols::BorrowSource| match source {
+        crate::symbols::BorrowSource::Receiver => params[0],
+        crate::symbols::BorrowSource::Parameter(index) => {
+            params[index + usize::from(receiver.is_some())]
+        }
+    };
+    let promotions = class
+        .and_then(|class| {
+            inputs
+                .semantic_info
+                .classes
+                .iter()
+                .find(|definition| definition.id == class)
+        })
+        .filter(|_| function.name == "__construct")
+        .map(|class| {
+            class
+                .properties
+                .iter()
+                .filter(|property| {
+                    property.borrowed_source && property.declaring_class == class.declaration_name
+                })
+                .filter_map(|property| {
+                    function
+                        .params
+                        .iter()
+                        .position(|parameter| parameter.name == property.name)
+                        .map(|index| (property.id, params[index + 1]))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if retained.is_some() || !promotions.is_empty() {
+        blocks[0].statements.insert(
+            0,
+            mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(
+                mir::RetainedSourcesPlan {
+                    returns: retained
+                        .into_iter()
+                        .flat_map(|info| &info.returns)
+                        .map(|source| mir::RetainedSource {
+                            local: source_parameter(source.source),
+                            inherited: source.inherited,
+                        })
+                        .collect(),
+                    constructs: retained
+                        .into_iter()
+                        .flat_map(|info| &info.constructs)
+                        .map(|source| mir::RetainedSource {
+                            local: source_parameter(source.source),
+                            inherited: source.inherited,
+                        })
+                        .collect(),
+                    independent_parameters: retained
+                        .into_iter()
+                        .flat_map(|info| &info.requires_independent)
+                        .map(|source| source_parameter(*source))
+                        .collect(),
+                    promotions,
+                },
+            )),
+        );
+    }
 
     Ok(mir::Function {
         id: signature.id,
@@ -3475,7 +3607,7 @@ fn lower_constructor_phase_initializers(
             })?;
             let value = if property.promoted {
                 let parameter = context.lookup_local(&property.name, span)?;
-                read_local_as_rvalue(parameter, property_type, true)
+                read_local_as_rvalue(parameter, property_type, !property.borrowed_source)
             } else {
                 let initializer = context
                     .property_initializers
@@ -3802,6 +3934,14 @@ fn lower_expression_statement(
     span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if let Some(value) = iteration::builtin_acquire(expr, context)? {
+        lower_discarded_rvalue(value, context);
+        return Ok(());
+    }
+    if let Some(value) = core_value::primitive_call(expr, context)? {
+        lower_discarded_rvalue(value, context);
+        return Ok(());
+    }
     if let Some(plan) = interface::call_plan(expr, context)? {
         let _ = interface::materialize_call(expr, plan, false, context)?;
         return Ok(());
@@ -3834,38 +3974,55 @@ fn lower_expression_statement(
         object,
         method,
         args,
+        span,
+        null_safe: false,
+    } = expr
+    {
+        if lower_collection_method_statement(object, method, args, *span, context)? {
+            return Ok(());
+        }
+    }
+    let collection_call = match expr {
+        hir::Expr::MethodCall {
+            object,
+            null_safe: false,
+            ..
+        } => {
+            matches!(
+                context.expression_type(object),
+                Ok(mir::Type::Collection(_))
+            )
+        }
+        hir::Expr::StaticCall { .. } => {
+            matches!(context.expression_type(expr), Ok(mir::Type::Collection(_)))
+        }
+        _ => false,
+    };
+    if collection_call {
+        if let Ok(ty) = context.expression_type(expr) {
+            let value = lower_rvalue_as_expected(expr, ty, context)?;
+            lower_discarded_rvalue(value, context);
+            return Ok(());
+        }
+    }
+    if let hir::Expr::MethodCall {
+        object,
+        method,
+        args,
         span: call_span,
         null_safe,
     } = expr
     {
-        if !*null_safe && lower_collection_method_statement(object, method, args, context)? {
-            return Ok(());
-        }
-        let statement = if *null_safe {
+        if *null_safe {
             let (_, signature) = lookup_null_safe_method(object, method, *call_span, context)?;
-            if !signature.checked_effects.is_empty() {
-                let _ = discarded_call_statement("method", signature.clone(), Vec::new(), span)?;
-                let _ = materialize_checked_null_safe_signature_call(
-                    object, method, signature, args, *call_span, None, context,
-                )?;
-                return Ok(());
-            }
-            let (object, signature, args) =
-                lower_null_safe_method_call(object, method, args, *call_span, context)?;
-            discarded_null_safe_call_statement(object, signature, args, span)?
+            let _ = materialize_null_safe_signature_call(
+                object, method, signature, args, *call_span, None, context,
+            )?;
         } else {
             let (signature, args) =
                 lower_instance_method_call(object, method, args, *call_span, context)?;
-            if !signature.checked_effects.is_empty() {
-                let _ = discarded_call_statement("method", signature.clone(), args.clone(), span)?;
-                let _ = materialize_checked_signature_call(
-                    signature, args, *call_span, false, context,
-                )?;
-                return Ok(());
-            }
-            discarded_call_statement("method", signature, args, span)?
-        };
-        context.push_statement(statement);
+            let _ = materialize_signature_call(signature, args, *call_span, false, context)?;
+        }
         return Ok(());
     }
     if let hir::Expr::StaticCall {
@@ -3878,15 +4035,7 @@ fn lower_expression_statement(
     {
         let (signature, args) =
             lower_static_method_call(class_name, method, args, *call_span, context)?;
-        if !signature.checked_effects.is_empty() {
-            let _ =
-                discarded_call_statement("static method", signature.clone(), args.clone(), span)?;
-            let _ =
-                materialize_checked_signature_call(signature, args, *call_span, false, context)?;
-            return Ok(());
-        }
-        let statement = discarded_call_statement("static method", signature, args, span)?;
-        context.push_statement(statement);
+        let _ = materialize_signature_call(signature, args, *call_span, false, context)?;
         return Ok(());
     }
     let hir::Expr::FunctionCall {
@@ -3953,20 +4102,7 @@ fn lower_expression_statement(
     } else {
         let signature = context.lookup_function(name, *call_span)?;
         let lowered = lower_call_args(name, args, signature.clone(), *call_span, context)?;
-        if signature.checked_effects.is_empty() {
-            context.push_statement(discarded_call_statement(
-                "function", signature, lowered, *call_span,
-            )?);
-        } else {
-            let _ = discarded_call_statement(
-                "function",
-                signature.clone(),
-                lowered.clone(),
-                *call_span,
-            )?;
-            let _ =
-                materialize_checked_signature_call(signature, lowered, *call_span, false, context)?;
-        }
+        let _ = materialize_signature_call(signature, lowered, *call_span, false, context)?;
     }
     Ok(())
 }
@@ -4155,7 +4291,7 @@ fn lower_assertion_statement(
             actual.expect("checked expectation has an actual operand"),
             expected,
             assertion.span,
-            &context.collection_registry,
+            context,
         )?;
         if assertion.negated {
             condition = mir::BoolExpression::Not(Box::new(condition));
@@ -4828,11 +4964,35 @@ fn assertion_condition(
     actual: mir::AssertionOperandPlan,
     expected: Option<mir::AssertionOperandPlan>,
     span: Span,
-    collection_registry: &NativeTypeRegistry,
+    context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<mir::BoolExpression> {
     use crate::assertions::AssertionMatcher as Matcher;
     use mir::AssertionOperandPlan::Local;
 
+    if matcher == Matcher::Equal {
+        if let (
+            Local {
+                local: left,
+                ty: left_ty,
+            },
+            Some(Local {
+                local: right,
+                ty: right_ty,
+            }),
+        ) = (actual, expected)
+        {
+            if matches!(non_null_match_type(left_ty).0, mir::Type::Class(_)) {
+                return core_value::lower_local_equality(
+                    (left, left_ty),
+                    (right, right_ty),
+                    false,
+                    span,
+                    context,
+                );
+            }
+        }
+    }
+    let collection_registry = &context.collection_registry;
     let comparison = match matcher {
         Matcher::Null => assertion_operand_is_null(actual, span)?,
         Matcher::True | Matcher::False => {
@@ -5002,15 +5162,19 @@ fn assertion_condition(
                 Local { local, ty } => local_rvalue(local, ty, false),
                 mir::AssertionOperandPlan::Null => null_rvalue_for_type(expected_type, span)?,
             };
-            mir::BoolExpression::CollectionHas {
+            let definition = definition.clone();
+            core_value::membership(
                 collection,
-                value: Box::new(value),
-                op: if matcher == Matcher::DictionaryHasValue {
+                &definition,
+                value,
+                if matcher == Matcher::DictionaryHasValue {
                     mir::CollectionMembershipOp::ContainsValue
                 } else {
                     mir::CollectionMembershipOp::Contains
                 },
-            }
+                span,
+                context,
+            )?
         }
         Matcher::Throws => unreachable!("throw assertions use checked-call control flow"),
         Matcher::Fail => unreachable!("fail has no success condition"),
@@ -6164,6 +6328,16 @@ fn lower_foreach_statement(
     return_type: mir::ReturnType,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<()> {
+    if context
+        .semantic_info
+        .foreach_loops
+        .get(&foreach.span)
+        .is_some_and(|plan| {
+            plan.iterable_family == crate::semantics::ForeachIterableFamily::PublicIterable
+        })
+    {
+        return iteration::lower_foreach(foreach, return_type, context);
+    }
     if let Some((start, end, inclusive)) = grouped_range_parts(&foreach.iterable) {
         if foreach.first_binding.is_some() {
             return Err(vec![unsupported(
@@ -6375,6 +6549,7 @@ fn lower_collection_foreach_in_scope(
         else_block: exit_block,
     });
 
+    context.current_block = Some(body_block);
     let offset = collection_offset_rvalue(index_local);
     // The key is only read when something actually consumes it. Computing it for
     // every dictionary iteration costs a read per element that a values-only
@@ -6384,12 +6559,11 @@ fn lower_collection_foreach_in_scope(
     {
         definition
             .key
-            .map(|key_type| collection_key_at_rvalue(collection, offset.clone(), key_type))
+            .map(|key_type| collection_key_at_rvalue(collection, offset.clone(), key_type, context))
             .transpose()?
     } else {
         None
     };
-    context.current_block = Some(body_block);
     if let Some(target) = first_local {
         let value = match foreach.iteration_kind {
             crate::semantics::ForeachIterationKind::SequenceIndex => offset.clone(),
@@ -6410,13 +6584,7 @@ fn lower_collection_foreach_in_scope(
             // an unordered one, once per element, for a value already known to
             // sit at this index: keys and values are parallel arrays and every
             // mutation moves them together.
-            collection_value_rvalue(
-                collection,
-                offset.clone(),
-                offset.clone(),
-                definition.value,
-                true,
-            )?
+            core_collection::value_at(collection, index_local, definition.value, context)?
         }
     };
     context.push_statement(mir::Statement::AssignLocal {
@@ -6558,7 +6726,21 @@ fn collection_key_at_rvalue(
     collection: mir::LocalId,
     offset: mir::Rvalue,
     ty: mir::Type,
+    context: &mut LoweringContext<'_>,
 ) -> DiagnosticResult<mir::Rvalue> {
+    let mir::Type::Collection(id) = context.local_type(collection) else {
+        return Err(vec![unsupported(
+            Span::default(),
+            "collection key has no concrete collection",
+        )]);
+    };
+    if context.collection_type(id).uses_core_operations() {
+        let position = match offset.direct_place_local() {
+            Some(local) => local,
+            None => core_value::materialize_value(offset, context).0,
+        };
+        return Ok(core_collection::key_at(collection, position, ty, context));
+    }
     match ty {
         mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
             scalar,
@@ -7400,7 +7582,11 @@ impl<'semantic> LoweringContext<'semantic> {
                             continue;
                         };
                         match plan {
-                            mir::ControlFlowPlan::Assertion(_) => {}
+                            mir::ControlFlowPlan::Assertion(_)
+                            | mir::ControlFlowPlan::RetainedSources(_)
+                            | mir::ControlFlowPlan::CoreValue(_)
+                            | mir::ControlFlowPlan::ElementDuplication(_)
+                            | mir::ControlFlowPlan::CollectionBuild(_) => {}
                             mir::ControlFlowPlan::When(plan) => {
                                 metrics.when_expression_count += 1;
                                 metrics.else_when_branch_count +=
@@ -7411,7 +7597,8 @@ impl<'semantic> LoweringContext<'semantic> {
                                 metrics.given_predicate_count += plan.predicates.len();
                             }
                             mir::ControlFlowPlan::DoWhile(_) => metrics.do_while_count += 1,
-                            mir::ControlFlowPlan::Foreach(_) => {}
+                            mir::ControlFlowPlan::Foreach(_)
+                            | mir::ControlFlowPlan::PublicForeach(_) => {}
                             mir::ControlFlowPlan::ListAlgorithm(_) => {}
                             mir::ControlFlowPlan::Finalizer(plan) => {
                                 metrics.finalizer_count += 1;
@@ -9124,12 +9311,12 @@ fn lower_var_decl(decl: &hir::VarDecl, context: &mut LoweringContext) -> Diagnos
         return Ok(());
     }
     if ty == mir::Type::Mixed {
-        let value = lower_mixed_expression(&decl.initializer, true, context)?;
-        let owned = value.ownership() != mir::MixedOwnership::None;
+        let value = mir::Rvalue::Mixed(lower_mixed_expression(&decl.initializer, true, context)?);
+        let owned = !value.borrows_move_value();
         let local = context.declare_user_local_owned(name, decl.writable, ty, owned);
         context.push_statement(mir::Statement::AssignLocal {
             target: local,
-            value: mir::Rvalue::Mixed(value),
+            value,
         });
         return Ok(());
     }
@@ -9834,7 +10021,12 @@ fn lower_assignment(
                 IntegerType::Int64,
             )));
         let index = lower_rvalue_as_expected(index, index_type, context)?;
+        let index = core_value::materialize_value(index, context);
         let value = lower_rvalue_as_expected(&assignment.value, info.value, context)?;
+        let index = local_rvalue(index.0, index.1, true);
+        if info.key.is_some() && info.uses_core_operations() {
+            return core_collection::set(collection, &info, index, value, *span, context);
+        }
         context.push_statement(mir::Statement::AssignCollectionIndex {
             positional: false,
             collection,
@@ -10344,6 +10536,7 @@ fn lower_nullable_string_expression(
                 );
                 let (local, _, _) = materialize_null_safe_call(
                     receiver,
+                    context.coalesce_selection(object),
                     false,
                     None,
                     *span,
@@ -11715,72 +11908,6 @@ fn lower_byte_file_write_statement(
     Ok(true)
 }
 
-fn discarded_call_statement(
-    kind: &str,
-    signature: FunctionSignature,
-    args: Vec<mir::Rvalue>,
-    span: Span,
-) -> DiagnosticResult<mir::Statement> {
-    let statement = match signature.return_type {
-        mir::ReturnType::Void => mir::Statement::CallVoid {
-            function: signature.id,
-            args,
-            span,
-        },
-        mir::ReturnType::Value(
-            mir::Type::Class(_)
-            | mir::Type::NullableClass(_)
-            | mir::Type::Collection(_)
-            | mir::Type::Mixed
-            | mir::Type::NullableMixed,
-        ) if signature.return_borrow.is_some() => mir::Statement::CallBorrowed {
-            function: signature.id,
-            args,
-            span,
-        },
-        mir::ReturnType::Value(_) => {
-            return Err(vec![unsupported(
-                span,
-                format!("non-void {kind} call cannot be used as a statement"),
-            )]);
-        }
-    };
-    Ok(statement)
-}
-
-fn discarded_null_safe_call_statement(
-    object: mir::NullableClassExpression,
-    signature: FunctionSignature,
-    args: Vec<mir::Rvalue>,
-    span: Span,
-) -> DiagnosticResult<mir::Statement> {
-    let supported = matches!(signature.return_type, mir::ReturnType::Void)
-        || matches!(
-            signature.return_type,
-            mir::ReturnType::Value(
-                mir::Type::Class(_)
-                    | mir::Type::NullableClass(_)
-                    | mir::Type::Collection(_)
-                    | mir::Type::Interface(_)
-                    | mir::Type::NullableInterface(_)
-                    | mir::Type::Mixed
-                    | mir::Type::NullableMixed
-            )
-        ) && signature.return_borrow.is_some();
-    if !supported {
-        return Err(vec![unsupported(
-            span,
-            "non-void method call cannot be used as a statement",
-        )]);
-    }
-    Ok(mir::Statement::CallNullSafe {
-        object,
-        function: signature.id,
-        args,
-        span,
-    })
-}
-
 fn lower_integer_call(
     name: &str,
     args: &[hir::Argument],
@@ -12435,6 +12562,12 @@ fn string_intrinsic_signature(
     };
 
     let (parameters, names, defaults, result) = match kind {
+        Kind::Hash => (
+            vec![string],
+            vec!["text"],
+            vec![None],
+            mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::UInt64)),
+        ),
         Kind::GraphemeLength | Kind::ByteLength => (vec![string], vec!["text"], vec![None], int),
         Kind::AssertionQuote => (vec![string], vec!["text"], vec![None], string),
         Kind::AssertionDifference => (
@@ -12623,6 +12756,7 @@ fn string_intrinsic_signature(
 const fn string_intrinsic_name(kind: mir::StringIntrinsicKind) -> &'static str {
     use mir::StringIntrinsicKind as Kind;
     match kind {
+        Kind::Hash => "<hash>",
         Kind::GraphemeLength => "length",
         Kind::ByteLength => "byteLength",
         Kind::IsEmpty => "isEmpty",
@@ -14750,7 +14884,21 @@ fn lower_condition(
             | hir::BinaryOp::LessEqual
             | hir::BinaryOp::Greater
             | hir::BinaryOp::GreaterEqual => {
-                if matches!(unparenthesized_place(left), hir::Expr::Null { .. })
+                if matches!(op, hir::BinaryOp::Equal | hir::BinaryOp::NotEqual)
+                    && !matches!(unparenthesized_place(right), hir::Expr::Null { .. })
+                    && matches!(
+                        non_null_match_type(context.expression_type(left)?).0,
+                        mir::Type::Class(_)
+                    )
+                {
+                    core_value::lower_equality(
+                        left,
+                        right,
+                        *op == hir::BinaryOp::NotEqual,
+                        expr.span(),
+                        context,
+                    )
+                } else if matches!(unparenthesized_place(left), hir::Expr::Null { .. })
                     || matches!(unparenthesized_place(right), hir::Expr::Null { .. })
                 {
                     lower_null_comparison(left, op, right, context)
@@ -14953,11 +15101,7 @@ fn lower_condition(
                     } else {
                         lower_rvalue_as_borrowed(value, value_type, context)?
                     };
-                    return Ok(mir::BoolExpression::CollectionHas {
-                        collection,
-                        value: Box::new(value),
-                        op,
-                    });
+                    return core_value::membership(collection, &info, value, op, *span, context);
                 }
             }
             let (signature, args) =
@@ -15632,8 +15776,8 @@ fn lower_concrete_is_presence(
         ))),
         mir::Type::NullableScalar(_)
         | mir::Type::NullableString
-        | mir::Type::NullableMixed
         | mir::Type::NullableClass(_)
+        | mir::Type::NullableMixed
         | mir::Type::NullableSharedReference(_)
         | mir::Type::NullableWeakReference(_)
         | mir::Type::NullableWritableSharedReference(_)
@@ -15770,6 +15914,20 @@ fn materialize_callable_scalar_result(
     expr: &hir::Expr,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<(mir::LocalId, mir::ScalarType)>> {
+    if let Some(value) = core_value::primitive_call(expr, context)? {
+        let mir::Type::Scalar(scalar) = value.ty() else {
+            return Err(vec![unsupported(
+                expr.span(),
+                "primitive contract must return a scalar",
+            )]);
+        };
+        let local = context.declare_checked_call_slot(value.ty(), false);
+        context.push_statement(mir::Statement::AssignLocal {
+            target: local,
+            value,
+        });
+        return Ok(Some((local, scalar)));
+    }
     let hir::Expr::CallableCall(call) = expr else {
         return Ok(None);
     };
@@ -16142,6 +16300,15 @@ fn lower_interface_expression(
         let vtable = context.class_interface_vtable(class, interface, expr.span())?;
         return Ok(mir::InterfaceValue::FromClass {
             object: Box::new(lower_class_expression(expr, class, transfer, context)?),
+            vtable,
+        });
+    }
+    if let mir::Type::Collection(collection) = context.expression_type(expr)? {
+        let vtable = interface::collection_vtable(collection, interface, expr.span(), context)?;
+        return Ok(mir::InterfaceValue::FromCollection {
+            value: Box::new(mir::Rvalue::Collection(lower_collection_expression(
+                expr, collection, transfer, context,
+            )?)),
             vtable,
         });
     }
@@ -16581,6 +16748,22 @@ fn lower_nullable_interface_expression(
                     expr, class, transfer, context,
                 )?),
                 vtable: context.class_interface_vtable(class, interface, expr.span())?,
+            },
+        )),
+        mir::Type::Collection(collection) => Ok(mir::NullableInterfaceValue::Present(
+            mir::InterfaceValue::FromCollection {
+                value: Box::new(mir::Rvalue::Collection(lower_collection_expression(
+                    expr, collection, transfer, context,
+                )?)),
+                vtable: interface::collection_vtable(collection, interface, expr.span(), context)?,
+            },
+        )),
+        mir::Type::NullableCollection(collection) => Ok(mir::NullableInterfaceValue::Present(
+            mir::InterfaceValue::FromCollection {
+                value: Box::new(mir::Rvalue::NullableCollection(
+                    lower_nullable_collection_expression(expr, collection, transfer, context)?,
+                )),
+                vtable: interface::collection_vtable(collection, interface, expr.span(), context)?,
             },
         )),
         _ => Err(vec![unsupported(
@@ -17311,6 +17494,25 @@ fn materialize_checked_call(
     if let Some(plan) = interface::call_plan(expr, context)? {
         return interface::materialize_call(expr, plan, consume_result, context);
     }
+    if let hir::Expr::MethodCall { object, .. } = expr {
+        if matches!(
+            context.expression_type(object)?,
+            mir::Type::Collection(_)
+                | mir::Type::NullableCollection(_)
+                | mir::Type::ReadonlySharedReferenceAccess(mir::SharedPayload::Collection(_))
+                | mir::Type::WritableSharedReferenceAccess(mir::SharedPayload::Collection(_))
+                | mir::Type::NullableReadonlySharedReferenceAccess(mir::SharedPayload::Collection(
+                    _
+                ))
+                | mir::Type::NullableWritableSharedReferenceAccess(mir::SharedPayload::Collection(
+                    _
+                ))
+        ) {
+            // Collection lowering expands its selected operations into checked
+            // calls. Its aggregate effect site is not itself a class method.
+            return Ok(None);
+        }
+    }
     if crate::checked_effects::effects_at(&context.semantic_info.checked_effect_sites, expr.span())
         .is_empty()
     {
@@ -17350,7 +17552,7 @@ fn materialize_checked_call(
                 return Ok(None);
             }
             let result_type = context.expression_type(expr)?;
-            return materialize_checked_null_safe_signature_call(
+            return materialize_null_safe_signature_call(
                 object,
                 method,
                 signature,
@@ -17615,6 +17817,12 @@ fn materialize_checked_rvalue(
     consume_result: bool,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<mir::Rvalue>> {
+    if let Some(value) = core_collection::expression(expr, expected, consume_result, context)? {
+        return Ok(Some(value));
+    }
+    if let Some(value) = iteration::builtin_acquire(expr, context)? {
+        return Ok(Some(value));
+    }
     if let hir::Expr::ListAlgorithmCall(call) = expr {
         let (local, ty) = materialize_list_algorithm_call(call, context)?;
         if ty != expected {
@@ -17972,6 +18180,8 @@ fn materialize_list_algorithm_call(
 
     context.current_block = Some(after_callback);
     let mut filter_selected = None;
+    let mut filter_append = None;
+    let mut filter_duplicate = None;
     match call.kind {
         hir::ListAlgorithmKind::Map => {
             let output = output.expect("map has an output List");
@@ -18005,6 +18215,14 @@ fn materialize_list_algorithm_call(
                 else_block: update,
             });
             context.current_block = Some(selected);
+            let element = if element_type.has_move_ownership() {
+                let value = core_value::duplicate(element, call.span, context)?;
+                filter_duplicate = value.direct_place_local();
+                value
+            } else {
+                element
+            };
+            filter_append = context.current_block;
             context.push_statement(mir::Statement::CollectionAdd {
                 collection: output,
                 value: element,
@@ -18068,6 +18286,8 @@ fn materialize_list_algorithm_call(
                 callback_result: callback_result.map(|(local, _)| local),
                 callback_failure,
                 filter_selected,
+                filter_append,
+                filter_duplicate,
                 setup,
                 header,
                 body,
@@ -18086,6 +18306,40 @@ fn materialize_list_algorithm_call(
             (accumulator.expect("reduce accumulator exists"), result_type)
         }
     })
+}
+
+fn materialize_signature_call(
+    signature: FunctionSignature,
+    args: Vec<mir::Rvalue>,
+    span: Span,
+    consume_result: bool,
+    context: &mut LoweringContext,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    if !signature.checked_effects.is_empty() {
+        return materialize_checked_signature_call(signature, args, span, consume_result, context);
+    }
+    match signature.return_type {
+        mir::ReturnType::Void => {
+            context.push_statement(mir::Statement::CallVoid {
+                function: signature.id,
+                args,
+                span,
+            });
+            Ok(None)
+        }
+        mir::ReturnType::Value(ty) => {
+            let value =
+                interface::direct_call_result(ty, signature.id, args, signature.return_borrow);
+            let owned = signature.return_borrow.is_none() && user_local_type_owns_value(ty);
+            let local = context.declare_checked_call_slot(ty, owned);
+            context.push_statement(mir::Statement::AssignLocal {
+                target: local,
+                value,
+            });
+            track_checked_result(local, ty, owned, context);
+            Ok(Some((local, ty, owned && consume_result)))
+        }
+    }
 }
 
 fn materialize_checked_signature_call(
@@ -18129,7 +18383,7 @@ fn materialize_checked_signature_call(
     }
 }
 
-fn materialize_checked_null_safe_signature_call(
+fn materialize_null_safe_signature_call(
     object: &hir::Expr,
     method: &str,
     signature: FunctionSignature,
@@ -18138,7 +18392,6 @@ fn materialize_checked_null_safe_signature_call(
     result: Option<(mir::Type, bool)>,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
-    debug_assert!(!signature.checked_effects.is_empty());
     let class = signature
         .method_class
         .expect("null-safe checked call must have a method class");
@@ -18146,9 +18399,11 @@ fn materialize_checked_null_safe_signature_call(
         .semantic_info
         .writable_object_paths
         .contains(&object.span());
+    let selection = context.coalesce_selection(object);
     let object = lower_nullable_payload_expression(object, class, context)?;
     materialize_null_safe_call(
         mir::Rvalue::NullableClass(object),
+        selection,
         receiver_writable,
         signature.return_borrow,
         span,
@@ -18165,13 +18420,7 @@ fn materialize_checked_null_safe_signature_call(
                 },
             ));
             checked_args.extend(args);
-            materialize_checked_signature_call(
-                signature,
-                checked_args,
-                span,
-                result.is_some(),
-                context,
-            )
+            materialize_signature_call(signature, checked_args, span, result.is_some(), context)
         },
         context,
     )
@@ -18180,6 +18429,7 @@ fn materialize_checked_null_safe_signature_call(
 #[allow(clippy::too_many_arguments)]
 fn materialize_null_safe_call(
     object: mir::Rvalue,
+    selection: CoalesceSelection,
     receiver_writable: bool,
     return_borrow: Option<mir::ReturnBorrow>,
     span: Span,
@@ -18208,6 +18458,16 @@ fn materialize_null_safe_call(
         let local = context.declare_checked_call_slot(ty, owned);
         (local, ty, owned, consume)
     });
+    if selection == CoalesceSelection::Right {
+        if let Some((target, ty, owned, _)) = result {
+            context.push_statement(mir::Statement::AssignLocal {
+                target,
+                value: null_rvalue_for_type(ty, span)?,
+            });
+            track_checked_result(target, ty, owned, context);
+        }
+        return Ok(result.map(|(local, ty, owned, consume)| (local, ty, owned && consume)));
+    }
     let present = context.create_block();
     let absent = context.create_block();
     let merge = context.create_block();
@@ -19573,6 +19833,13 @@ fn lower_collection_expression(
                 "difference" => mir::SetAlgebraOp::Difference,
                 _ => unreachable!(),
             };
+            if context.collection_type(expected).uses_core_hash() {
+                return core_collection::set_algebra(left, right, expected, op, *span, context);
+            }
+            if context.collection_type(expected).comparator == Some(mir::CollectionComparator::Core)
+            {
+                return core_collection::set_algebra(left, right, expected, op, *span, context);
+            }
             Ok(mir::CollectionExpression::From {
                 collection: expected,
                 source: left,
@@ -19582,6 +19849,9 @@ fn lower_collection_expression(
         }
         hir::Expr::Array { elements, .. } => {
             let collection = context.collection_type(expected).clone();
+            if collection.uses_core_hash() && collection.key.is_some() && !elements.is_empty() {
+                return core_collection::literal(expected, elements, context);
+            }
             let entries = elements
                 .iter()
                 .map(|element| {
@@ -19616,6 +19886,9 @@ fn lower_collection_expression(
         }
         hir::Expr::ArrayRepeat { value, count, .. } => {
             let collection = context.collection_type(expected).clone();
+            if let Some(value) = core_value::fill(value, count, expected, context)? {
+                return Ok(value);
+            }
             Ok(mir::CollectionExpression::Fill {
                 collection: expected,
                 value: Box::new(lower_rvalue_as_expected(value, collection.value, context)?),
@@ -19674,6 +19947,9 @@ fn lower_collection_expression(
                     format!("{class_name}::from expects one argument"),
                 )]);
             };
+            if let Some(result) = core_value::preserving_from(source, expected, context)? {
+                return Ok(result);
+            }
             if let hir::Expr::Array { elements, .. } = source {
                 let collection = context.collection_type(expected).clone();
                 let entries = elements
@@ -19922,6 +20198,29 @@ fn collection_remove_at_rvalue(
     ty: mir::Type,
 ) -> DiagnosticResult<mir::Rvalue> {
     match ty {
+        mir::Type::NullableClass(class) => Ok(mir::Rvalue::NullableClass(
+            mir::NullableClassExpression::DictionaryGet {
+                class,
+                collection,
+                key: Box::new(index),
+                access: mir::NullableCollectionAccess::RemoveAt,
+            },
+        )),
+        mir::Type::NullableScalar(ty) => Ok(mir::Rvalue::NullableScalar(
+            mir::NullableScalarExpression::DictionaryGet {
+                ty,
+                collection,
+                key: Box::new(index),
+                access: mir::NullableCollectionAccess::RemoveAt,
+            },
+        )),
+        mir::Type::NullableString => Ok(mir::Rvalue::NullableString(
+            mir::NullableStringExpression::DictionaryGet {
+                collection,
+                key: Box::new(index),
+                access: mir::NullableCollectionAccess::RemoveAt,
+            },
+        )),
         mir::Type::Scalar(scalar) => Ok(mir::Rvalue::Value(value_expression_from_operand(
             scalar,
             mir::Operand::CollectionIndex {
@@ -20108,10 +20407,7 @@ fn collection_remove_at_rvalue(
         mir::Type::ClosureEnvironment(_) => {
             unreachable!("closure environments are not source collection elements")
         }
-        mir::Type::NullableScalar(_)
-        | mir::Type::NullableString
-        | mir::Type::NullableMixed
-        | mir::Type::NullableClass(_)
+        mir::Type::NullableMixed
         | mir::Type::NullableCollection(_)
         | mir::Type::NullableWritableSharedReference(_)
         | mir::Type::NullableWritableWeakReference(_) => Err(vec![unsupported(
@@ -20516,7 +20812,7 @@ fn lower_null_safe_collection_scalar(
 
     context.current_block = Some(present_block);
     let collection = lower_present_collection_access(receiver, context);
-    let value = operation.lower(collection, &definition, expected, context)?;
+    let value = operation.lower(collection, &definition, expected, expr.span(), context)?;
     context.push_statement(mir::Statement::AssignLocal {
         target: result,
         value: mir::Rvalue::NullableScalar(value),
@@ -20638,6 +20934,7 @@ impl NullableCollectionScalarOperation<'_> {
         collection: mir::LocalId,
         definition: &mir::CollectionType,
         expected: mir::ScalarType,
+        span: Span,
         context: &mut LoweringContext,
     ) -> DiagnosticResult<mir::NullableScalarExpression> {
         match self {
@@ -20706,14 +21003,8 @@ impl NullableCollectionScalarOperation<'_> {
                 ))
             }
             Self::Method("indexOf", [value]) => {
-                Ok(mir::NullableScalarExpression::CollectionIndexOf {
-                    collection,
-                    value: Box::new(lower_rvalue_as_borrowed(
-                        &value.value,
-                        definition.value,
-                        context,
-                    )?),
-                })
+                let value = lower_rvalue_as_borrowed(&value.value, definition.value, context)?;
+                core_value::index_of(collection, value, span, context)
             }
             Self::Method(method, [argument]) => {
                 let op = match *method {
@@ -20734,11 +21025,9 @@ impl NullableCollectionScalarOperation<'_> {
                     lower_rvalue_as_borrowed(&argument.value, value_type, context)?
                 };
                 Ok(mir::NullableScalarExpression::Value(
-                    mir::ValueExpression::Bool(mir::BoolExpression::CollectionHas {
-                        collection,
-                        value: Box::new(value),
-                        op,
-                    }),
+                    mir::ValueExpression::Bool(core_value::membership(
+                        collection, definition, value, op, span, context,
+                    )?),
                 ))
             }
             _ => unreachable!("operation was checked before lowering"),
@@ -20778,14 +21067,13 @@ fn lower_list_index_of(
     let [value] = args.as_slice() else {
         return Ok(None);
     };
-    Ok(Some(mir::NullableScalarExpression::CollectionIndexOf {
+    let value = lower_rvalue_as_borrowed(&value.value, definition.value, context)?;
+    Ok(Some(core_value::index_of(
         collection,
-        value: Box::new(lower_rvalue_as_borrowed(
-            &value.value,
-            definition.value,
-            context,
-        )?),
-    }))
+        value,
+        expr.span(),
+        context,
+    )?))
 }
 
 fn lower_bytes_local(
@@ -20930,6 +21218,7 @@ fn lower_collection_method_statement(
     object: &hir::Expr,
     method: &str,
     args: &[hir::Argument],
+    span: Span,
     context: &mut LoweringContext,
 ) -> DiagnosticResult<bool> {
     let Ok((collection, collection_type)) = lower_collection_local(object, context) else {
@@ -20937,6 +21226,29 @@ fn lower_collection_method_statement(
     };
     let info = context.collection_type(collection_type).clone();
     match (info.kind, method, args) {
+        (mir::CollectionKind::PriorityQueue, "push", [value]) if info.uses_core_operations() => {
+            let value = lower_rvalue_as_expected(&value.value, info.value, context)?;
+            core_ordered::push(collection, &info, value, span, context)?;
+        }
+        (mir::CollectionKind::Set | mir::CollectionKind::SortedSet, "add" | "remove", [value])
+            if info.uses_core_operations() =>
+        {
+            let op = if method == "add" {
+                mir::CollectionMembershipOp::Add
+            } else {
+                mir::CollectionMembershipOp::Remove
+            };
+            let value = if method == "add" {
+                lower_rvalue_as_expected(&value.value, info.value, context)?
+            } else {
+                lower_rvalue_as_borrowed(&value.value, info.value, context)?
+            };
+            let result = core_value::membership(collection, &info, value, op, span, context)?;
+            lower_discarded_rvalue(
+                mir::Rvalue::Value(mir::ValueExpression::Bool(result)),
+                context,
+            );
+        }
         (
             mir::CollectionKind::List
             | mir::CollectionKind::Dictionary
@@ -20995,13 +21307,15 @@ fn lower_collection_method_statement(
             context.push_statement(statement);
         }
         (mir::CollectionKind::List, "remove", [value]) => {
-            let value = mir::Rvalue::Value(mir::ValueExpression::Bool(
-                mir::BoolExpression::CollectionHas {
-                    collection,
-                    value: Box::new(lower_rvalue_as_borrowed(&value.value, info.value, context)?),
-                    op: mir::CollectionMembershipOp::Remove,
-                },
-            ));
+            let value = lower_rvalue_as_borrowed(&value.value, info.value, context)?;
+            let value = mir::Rvalue::Value(mir::ValueExpression::Bool(core_value::membership(
+                collection,
+                &info,
+                value,
+                mir::CollectionMembershipOp::Remove,
+                span,
+                context,
+            )?));
             lower_discarded_rvalue(value, context);
         }
         (
@@ -21010,10 +21324,18 @@ fn lower_collection_method_statement(
             [key, value],
         ) => {
             let key_type = info.key.expect("dictionary collection has a key type");
+            let key = lower_rvalue_as_expected(&key.value, key_type, context)?;
+            let key = core_value::materialize_value(key, context);
+            let value = lower_rvalue_as_expected(&value.value, info.value, context)?;
+            let key = local_rvalue(key.0, key.1, true);
+            if info.uses_core_operations() {
+                core_collection::set(collection, &info, key, value, span, context)?;
+                return Ok(true);
+            }
             let statement = mir::Statement::CollectionSet {
                 collection,
-                key: lower_rvalue_as_expected(&key.value, key_type, context)?,
-                value: lower_rvalue_as_expected(&value.value, info.value, context)?,
+                key,
+                value,
             };
             context.push_statement(statement);
         }
@@ -21033,6 +21355,11 @@ fn lower_collection_method_statement(
             "remove",
             [_],
         ) => {
+            if let Some(key_type) = info.key.filter(|_| info.uses_core_operations()) {
+                let key = lower_rvalue_as_borrowed(&args[0].value, key_type, context)?;
+                core_collection::discard_removed(collection, &info, key, span, context)?;
+                return Ok(true);
+            }
             let Some((collection, key, value_type, access)) =
                 lower_dictionary_get(object, method, args, context)?
             else {
@@ -21040,6 +21367,12 @@ fn lower_collection_method_statement(
             };
             let value =
                 nullable_collection_access_rvalue(collection, key, value_type, access, object)?;
+            let value =
+                if info.kind == mir::CollectionKind::PriorityQueue && info.uses_core_operations() {
+                    core_ordered::pop(collection, &info, value.ty(), span, true, context)?
+                } else {
+                    value
+                };
             lower_discarded_rvalue(value, context);
         }
         _ => return Ok(false),
@@ -24112,26 +24445,24 @@ fn lower_property_place(
             }
         },
     };
-    if matches!(
-        context.local_type(object_local),
-        mir::Type::Mixed | mir::Type::NullableMixed
-    ) {
-        let Some((mixed, mir::Type::Class(class))) = context.exact_mixed_local(object) else {
-            return Err(vec![unsupported(
-                object.span(),
-                "mixed property access requires exact class narrowing",
-            )]);
-        };
-        let projected = context.declare_borrowed_temp(mir::Type::Class(class), false);
-        context.push_statement(mir::Statement::AssignLocal {
-            target: projected,
-            value: mir::Rvalue::Class(mir::ClassExpression::MixedPayload {
-                mixed,
-                class,
-                transfer: false,
-            }),
-        });
-        object_local = projected;
+    if let mir::Type::Class(class) = context.expression_type(object)? {
+        if context.local_type(object_local) != mir::Type::Class(class)
+            && context
+                .narrowed_nominal_local(object, mir::Type::Class(class))
+                .is_some()
+        {
+            let value = lower_class_expression(object, class, false, context)?;
+            let writable = context
+                .semantic_info
+                .writable_object_paths
+                .contains(&object.span());
+            let projected = context.declare_borrowed_temp(mir::Type::Class(class), writable);
+            context.push_statement(mir::Statement::AssignLocal {
+                target: projected,
+                value: mir::Rvalue::Class(value),
+            });
+            object_local = projected;
+        }
     }
     let class = match context.local_type(object_local) {
         mir::Type::Class(class) | mir::Type::NullableClass(class) => class,

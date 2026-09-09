@@ -263,7 +263,16 @@ fn run_emitted_with_assertion_outcome(
     )
     .and_then(|child| child.wait_with_output())
     .expect("run executable");
-    let payload = fs::read(&outcome).expect("assertion outcome");
+    let payload = fs::read(&outcome).unwrap_or_else(|error| {
+        panic!(
+            "assertion outcome {} from {}: {error}; status {}, stdout {:?}, stderr {:?}",
+            outcome.display(),
+            path.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    });
     let _ = fs::remove_file(path);
     let _ = fs::remove_file(outcome);
     (output, payload)
@@ -326,7 +335,14 @@ fn assert_behavioral_output(source: &str, expected_stdout: &[u8], include_php: b
             ))
             .unwrap_or_else(|error| panic!("{profile:?} dispatcher: {error:?}"));
             let output = run_emitted(native);
-            assert_eq!(output.status.code(), Some(0), "{profile:?}");
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{profile:?}: status {}, stdout {:?}, stderr {:?}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             assert_eq!(output.stdout, expected_stdout, "{profile:?}");
             assert!(
                 output.stderr.is_empty(),
@@ -1348,6 +1364,46 @@ it("collection matcher matrix", function (): void {
 }
 
 #[test]
+fn core_contract_matchers_reuse_language_equality_and_collection_lookup() {
+    let source = r#"
+use Doria\Std\Test\{expect, it};
+
+internal class Key implements Equatable<Key>, Hashable, Comparable<Key>, Cloneable
+{
+    function __construct(int $value) {}
+    function equals(Key $other): bool { return $this->value == $other->value; }
+    function hash(): uint64 { return 18446744073709551615; }
+    function compare(Key $other): Ordering
+    {
+        if ($this->value < $other->value) { return Ordering::Less; }
+        if ($this->value > $other->value) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+    function clone(): self { return new Key($this->value); }
+}
+
+it("canonical value operations", function (): void {
+    List<Key> $list = [new Key(1), new Key(2)];
+    let $set = Set::from($list);
+    let $sorted = SortedSet::from($list);
+    let $queue = PriorityQueue::from($list);
+    Dictionary<Key, Key> $map = [new Key(1) => new Key(2)];
+    expect(new Key(1))->toEqual(new Key(1));
+    expect(new Key(1))->not->toEqual(new Key(2));
+    expect($list)->toContain(new Key(2));
+    expect($set)->toContain(new Key(1));
+    expect($sorted)->toContain(new Key(2));
+    expect($queue)->toContain(new Key(1));
+    expect($map)->toHaveKey(new Key(1));
+    expect($map)->not->toHaveKey(new Key(3));
+    expect($map)->toHaveValue(new Key(2));
+    echo "core matchers ok\n";
+});
+"#;
+    assert_behavioral_output_on_every_enabled_backend(source, b"core matchers ok\n");
+}
+
+#[test]
 fn slice_three_throw_matchers_intercept_checked_errors_exactly() {
     let source = r#"
 use Doria\Std\Test\{expect, fail, it};
@@ -2204,6 +2260,43 @@ it("reports", function (): void {
             String::from_utf8_lossy(&output.stderr)
         );
         assert_v4(&payload);
+    }
+}
+
+#[test]
+fn uint64_assertions_preserve_order_and_failure_presentation() {
+    assert_behavioral_output_on_every_enabled_backend(
+        r#"
+use Doria\Std\Test\{expect, it};
+it("unsigned order", function (): void {
+    uint64 $maximum = 18446744073709551615;
+    uint64 $high = 9223372036854775808;
+    uint64 $zero = 0;
+    expect($maximum)->toBeGreaterThan($high);
+    expect($maximum)->toBeGreaterThanOrEqual($maximum);
+    expect($zero)->toBeLessThan($high);
+    expect($high)->toBeLessThanOrEqual($maximum);
+    expect($high)->not->toBeLessThan($zero);
+    echo "unsigned\n";
+});
+"#,
+        b"unsigned\n",
+    );
+    for assertion in [
+        "expect($maximum)->toEqual($zero);",
+        "List<uint64> $actual = [$maximum]; expect($actual)->toContain($zero);",
+    ] {
+        let source = format!(
+            r#"
+use Doria\Std\Test\{{expect, it}};
+it("unsigned presentation", function (): void {{
+    uint64 $maximum = 18446744073709551615;
+    uint64 $zero = 0;
+    {assertion}
+}});
+"#
+        );
+        assert_behavioral_failure_on_every_enabled_backend(&source, &["18446744073709551615"]);
     }
 }
 

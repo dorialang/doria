@@ -10,6 +10,53 @@ fn diagnostic(source: &str, code: &str) -> doriac::diagnostics::Diagnostic {
 }
 
 #[test]
+fn copy_sources_survive_owning_mixed_boundaries() {
+    for (ty, value) in [
+        ("bool", "true"),
+        ("int8", "127"),
+        ("uint8", "255"),
+        ("int16", "32767"),
+        ("uint16", "65535"),
+        ("int32", "2147483647"),
+        ("uint32", "4294967295"),
+        ("int", "9223372036854775807"),
+        ("uint64", "18446744073709551615"),
+        ("float32", "1.5"),
+        ("float", "1.5"),
+        ("string", "\"source\""),
+    ] {
+        let source = format!(
+            r#"
+class Holder {{ writable mixed $value = null; }}
+function consume(take mixed $value): void {{}}
+function copy({ty} $source): {ty} {{
+    mixed $local = $source;
+    writable mixed $replacement = null;
+    $replacement = $source;
+    consume($source);
+    let writable $holder = new Holder();
+    $holder->value = $source;
+    List<mixed> $items = [$source];
+    return $source;
+}}
+function main(): void {{ {ty} $source = {value}; let $copy = copy($source); }}
+"#
+        );
+        let mir = doriac::lower_source_to_mir("copy-into-mixed.doria", &source)
+            .unwrap_or_else(|errors| panic!("{ty}: {errors:?}"));
+        doriac::mir_interpreter::interpret(&mir)
+            .unwrap_or_else(|errors| panic!("{ty}: {errors:?}"));
+    }
+    assert_eq!(
+        diagnostic(
+            "class Box {} function main(): void { let $source = new Box(); mixed $box = $source; mixed $again = $source; }",
+            "E0470",
+        ).code,
+        "E0470"
+    );
+}
+
+#[test]
 fn collection_and_typed_array_surface_checks_and_lowers_to_shared_mir() {
     for (path, source) in [
         (

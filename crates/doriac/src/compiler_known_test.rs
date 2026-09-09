@@ -161,6 +161,7 @@ pub fn augment_program(program: &Program) -> Program {
     }
     let span = Span::in_source(crate::compiler_known_io::SYNTHETIC_SOURCE_ID, 6, 7);
     let property = |ty: &str, name: &str, access| Param {
+        borrow_span: None,
         constructor_role: ConstructorParameterRole::Promoted {
             access,
             access_span: None,

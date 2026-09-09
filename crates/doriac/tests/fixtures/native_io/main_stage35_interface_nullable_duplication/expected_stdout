@@ -1,0 +1,25 @@
+absent
+absent
+clone 1
+clone 1
+item 1
+item 1
+drop 1
+drop 1
+drop 1
+clone 2
+selected absent
+selected 2
+clone 3
+clone 3
+erased 2
+drop 3
+drop 3
+drop 3
+false
+clone 4
+true
+drop 4
+drop 4
+drop 2
+drop 2

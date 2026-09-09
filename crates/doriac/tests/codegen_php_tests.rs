@@ -915,16 +915,6 @@ function mask(int $left, int $right): int
             "fixed-width Doria bitwise semantics for `&`",
         ),
         (
-            "uint64 maximum",
-            r#"
-function maximum(): uint64
-{
-    return 18446744073709551615;
-}
-"#,
-            "integer literal `18446744073709551615` outside PHP's signed integer range",
-        ),
-        (
             "checked conversion",
             r#"
 function convert(): void
@@ -2903,7 +2893,7 @@ fn php_backend_rejects_noncanonical_float_display_in_checked_formats() {
 }
 
 #[test]
-fn php_backend_keeps_stage17_frontend_rejections_and_uint64_honesty() {
+fn php_backend_keeps_stage17_frontend_rejections() {
     for source in [
         "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { print(\"x\"); }",
         "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { let $format = \"%d\"; echo sprintf($format, 1); }",
@@ -2911,13 +2901,6 @@ fn php_backend_keeps_stage17_frontend_rejections_and_uint64_honesty() {
         doriac::compile_source_to_php("test.doria", source)
             .expect_err("invalid Doria must fail before PHP lowering");
     }
-
-    let error = doriac::compile_source_to_php(
-        "test.doria",
-        "function main(): void throws Doria\\Std\\Io\\IoError, Doria\\Std\\Io\\InvalidUtf8Error { uint64 $value = 18446744073709551615; echo sprintf(\"%d\", $value); }",
-    )
-    .expect_err("PHP must reject uint64 formatting it cannot preserve");
-    assert!(error.iter().any(|diagnostic| diagnostic.code == "B1301"));
 }
 
 #[test]
@@ -3398,7 +3381,7 @@ function read(?Label $left, ?Label $right): ?string
 }
 
 #[test]
-fn php_backend_rejects_unimplemented_stage23_runtime_surfaces_consistently() {
+fn php_collection_boundaries_distinguish_implemented_search_from_deferred_operations() {
     for (name, source) in [
         (
             "list indexOf",
@@ -3473,8 +3456,41 @@ function main(): void throws Doria\Std\Io\IoError, Doria\Std\Io\InvalidUtf8Error
 "#,
         ),
     ] {
+        let expected = match name {
+            "list indexOf" => Some("0"),
+            "list remove" => Some(""),
+            "dictionary containsValue" => Some("true"),
+            _ => None,
+        };
+        if let Some(expected) = expected {
+            let php = doriac::compile_source_to_php("search.doria", source).unwrap();
+            let output = Command::new("php")
+                .args([
+                    "-r",
+                    &format!(
+                        "{}\n{}();",
+                        php.strip_prefix("<?php").unwrap(),
+                        php_function_name("main")
+                    ),
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "{name}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output.stdout, expected.as_bytes(), "{name}");
+            continue;
+        }
         let diagnostics = doriac::compile_source_to_php("stage23.doria", source)
-            .expect_err("PHP must reject Stage 23 runtime behavior it cannot preserve");
+            .err()
+            .unwrap_or_else(|| panic!("PHP accepted unsupported {name}"));
         assert_eq!(diagnostics[0].code, "B2301", "{name}: {diagnostics:?}");
         assert!(
             diagnostics[0].message.contains("native") && diagnostics[0].message.contains("debug"),
@@ -3918,7 +3934,11 @@ fn php_entry_boundary_uses_main_effective_checked_effects() {
     let nonthrowing =
         doriac::compile_source_to_php("nonthrowing-main.doria", "function main(): void {}")
             .expect("clause-free nonthrowing main should compile");
-    assert!(!nonthrowing.contains("catch (__DoriaCheckedError"));
+    let entry = nonthrowing
+        .rsplit_once("if (isset($_SERVER['SCRIPT_FILENAME'])")
+        .unwrap()
+        .1;
+    assert!(!entry.contains("catch (__DoriaCheckedError"));
 
     let inferred = doriac::compile_source_to_php(
         "inferred-main.doria",

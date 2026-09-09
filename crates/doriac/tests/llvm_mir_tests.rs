@@ -59,6 +59,46 @@ fn interface_ir_keeps_static_vtables_and_allocation_free_loop_dispatch() {
 }
 
 #[test]
+fn local_collection_cursor_uses_entry_storage_and_returned_cursor_uses_heap() {
+    let program = doriac::lower_source_to_mir(
+        "cursor-storage.doria",
+        include_str!("../../../examples/native/main_stage35_interface_stack_cursor.doria"),
+    )
+    .unwrap();
+    let ir = doriac::codegen_llvm::lower_mir_to_llvm_ir(&program).unwrap();
+    for (name, heap) in [("inspect", false), ("cursor", true)] {
+        let function = program
+            .functions
+            .iter()
+            .find(|function| function.name.starts_with(name))
+            .unwrap();
+        let symbol = doriac::native_abi::function_symbol(function);
+        let body = ir
+            .split("define ")
+            .find(|body| {
+                body.lines()
+                    .next()
+                    .is_some_and(|line| line.contains(&format!("@{symbol}(")))
+            })
+            .unwrap()
+            .split("\n}")
+            .next()
+            .unwrap();
+        assert_eq!(
+            body.lines()
+                .any(|line| line.contains("call ")
+                    && line.contains("@dr_v1_collection_iterator_new(")),
+            heap,
+            "{body}"
+        );
+        if !heap {
+            assert!(body.contains("iterator.state = alloca"), "{body}");
+        }
+    }
+    assert!(scan_alloca_placement(&ir).escaped.is_empty(), "{ir}");
+}
+
+#[test]
 fn closure_ir_keeps_descriptors_static_and_environment_allocations_escape_selected() {
     let local = doriac::lower_source_to_mir(
         "llvm-local-closure.doria",

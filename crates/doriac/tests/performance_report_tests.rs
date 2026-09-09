@@ -514,15 +514,14 @@ fn enum_fixture_reports_additive_structural_counts_without_a_schema_bump() {
         serde_json::from_slice(&fs::read(directory.join("performance.json")).expect("report"))
             .expect("JSON");
     assert_eq!(report["schemaVersion"], 1);
-    // The report describes the complete semantic/MIR program, including only
-    // compiler-known declarations that this source actually requires.
-    assert_eq!(report["metrics"]["enumCount"], 6);
-    assert_eq!(report["metrics"]["unitEnumCount"], 1);
+    // The complete nominal registry includes the compiler-known Ordering enum.
+    assert_eq!(report["metrics"]["enumCount"], 7);
+    assert_eq!(report["metrics"]["unitEnumCount"], 2);
     assert_eq!(report["metrics"]["backedEnumCount"], 2);
     assert_eq!(report["metrics"]["payloadEnumCount"], 3);
     assert_eq!(report["metrics"]["copyPayloadEnumCount"], 2);
     assert_eq!(report["metrics"]["movePayloadEnumCount"], 1);
-    assert_eq!(report["metrics"]["enumCaseCount"], 10);
+    assert_eq!(report["metrics"]["enumCaseCount"], 13);
     assert_eq!(report["metrics"]["enumPayloadFieldCount"], 6);
     assert!(report["metrics"]["maximumPayloadEnumSize"]
         .as_u64()

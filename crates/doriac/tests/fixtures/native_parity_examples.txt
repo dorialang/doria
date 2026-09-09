@@ -1,5 +1,4 @@
 # Durable executable source of truth for accepted native behavior.
-# Highest covered stage: Stage 34
 examples/native/main_add_overflow_panic.doria
 examples/native/main_ambient_io_callbacks.doria
 examples/native/main_ambient_io_fallible_finalizers.doria
@@ -338,3 +337,22 @@ examples/native/main_stage35_interface_shared_closures.doria
 examples/native/main_stage35_interface_argument_cleanup.doria
 examples/native/main_stage35_interface_strong_cycles.doria
 examples/native/main_stage35_interface_null_safe_generics.doria
+examples/native/main_stage35_interface_core_calls.doria
+examples/native/main_stage35_interface_clone_failure.doria
+examples/native/main_stage35_interface_uint64.doria
+examples/native/main_stage35_interface_equality.doria
+examples/native/main_stage35_interface_fill.doria
+examples/native/main_stage35_interface_filter.doria
+examples/native/main_stage35_interface_membership.doria
+examples/native/main_stage35_interface_nullable_duplication.doria
+examples/native/main_stage35_interface_preserving_from.doria
+examples/native/main_stage35_interface_public_iteration.doria
+examples/native/main_stage35_interface_builtin_iteration.doria
+examples/native/main_stage35_interface_hash_set.doria
+examples/native/main_stage35_interface_set_algebra.doria
+examples/native/main_stage35_interface_ordered_collections.doria
+examples/native/main_stage35_interface_collection_failures.doria
+examples/native/main_stage35_interface_stack_cursor.doria
+examples/native/main_stage35_interface_hash_dictionary.doria
+examples/native/main_stage35_interface_iteration_flow.doria
+examples/native/main_stage35_interface_primitive_contracts.doria

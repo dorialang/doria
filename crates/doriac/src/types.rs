@@ -1026,6 +1026,12 @@ impl TypeRegistry {
     }
 
     pub fn intern(&mut self, kind: TypeKind) -> TypeId {
+        // Nullable adds absence to a type; applying it again adds no state.
+        if let TypeKind::Nullable(inner) = &kind {
+            if matches!(self.kind(*inner), TypeKind::Nullable(_) | TypeKind::Null) {
+                return *inner;
+            }
+        }
         if let Some(id) = self.ids.get(&kind) {
             return *id;
         }

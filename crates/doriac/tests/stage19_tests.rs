@@ -680,17 +680,17 @@ fn owning_dictionary_literals_move_their_values() {
 }
 
 #[test]
-fn user_class_dictionary_keys_wait_for_hashable_conformance() {
+fn user_class_dictionary_keys_require_hashable_conformance() {
     let diagnostics = doriac::check_source(
         "dictionary-class-key.doria",
         "class Guard {} function route(take Guard $guard): void { Dictionary<Guard, int> $payload = [$guard => 1]; }",
     )
-    .expect_err("user-defined Hashable conformance is deferred to Stage 35");
+    .expect_err("a class without Hashable cannot be a dictionary key");
     assert!(diagnostics.iter().any(|diagnostic| {
         diagnostic.code == "E0523"
             && diagnostic
                 .message
-                .contains("requires Stage 35 user-defined `Hashable` conformance")
+                .contains("does not conform to `Hashable`")
     }));
 }
 

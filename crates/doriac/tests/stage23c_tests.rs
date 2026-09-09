@@ -83,7 +83,7 @@ function main(): void
 }
 
 #[test]
-fn move_elements_name_the_cloneable_gate() {
+fn move_elements_require_cloneable_for_preserving_fill() {
     let errors = diagnostics(
         r#"
 class Token { function __construct() {} }
@@ -95,10 +95,8 @@ function main(): void
     );
     assert!(errors.iter().any(|diagnostic| {
         diagnostic.code == "E0528"
-            && diagnostic.message.contains("Stage 23c")
-            && diagnostic.message.contains("decision 0102")
-            && diagnostic.message.contains("Cloneable")
-            && diagnostic.message.contains("Stage 35")
+            && diagnostic.message.contains("requires Cloneable")
+            && !diagnostic.message.contains("not yet supported")
     }));
 }
 

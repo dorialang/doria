@@ -125,7 +125,7 @@ $require($decisionPath, $decision, [
     'Native Testing Foundation Slices 1 through 3 are complete',
     'Foundation is complete',
     'Stage 34 is complete',
-    'Stage 35 Slices 1 and 2 are complete and Slice 3 is next',
+    'Stage 35 Slices 1, 2, and 3 are complete and Slice 4 is next',
 ]);
 
 foreach ([$planPath => $plan, $pipelinePath => $pipeline] as $path => $contents) {

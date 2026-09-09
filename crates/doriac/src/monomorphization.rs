@@ -198,7 +198,7 @@ fn specialize_callable_instances(
             .get(class_type)
             .and_then(|class| methods.get(&(*class, method_name.clone())))
             .copied(),
-        CallableTarget::ConstrainedMethod { .. } => unreachable!("specialized target is concrete"),
+        CallableTarget::ConstrainedMethod { .. } => None,
         CallableTarget::InterfaceMethod { .. } => None,
     };
     let arguments = specialization

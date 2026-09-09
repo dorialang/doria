@@ -47,6 +47,22 @@ pub fn lower_program_with_semantics(
             Err(diagnostic) => diagnostics.push(diagnostic),
         }
     }
+    for item in &crate::compiler_known_contracts::declarations().items {
+        if let ast::Item::Enum(declaration) = item {
+            let mut declaration = lower_enum(declaration);
+            declaration.global_id = Some(crate::names::GlobalSymbolId {
+                owner: crate::names::GlobalSymbolOwner::CompilerKnown(
+                    crate::names::CompilerSymbolIdentity::Prelude(declaration.name.clone()),
+                ),
+                qualified_name: declaration.name.clone(),
+            });
+            declaration.package = crate::names::PackageIdentity::CompilerKnown;
+            declaration.source_identity = crate::names::SourceIdentity(
+                crate::compiler_known_contracts::SOURCE_NAME.to_string(),
+            );
+            items.push(hir::Item::Enum(declaration));
+        }
+    }
     if !diagnostics.is_empty() {
         return Err(diagnostics);
     }
@@ -174,12 +190,14 @@ fn apply_global_identities(
             *source_identity = context.source.clone();
             *package = context.package.clone();
         }
-        *global_id = semantic_info
+        if let Some(declaration) = semantic_info
             .global_symbols
             .declarations
             .iter()
             .find(|declaration| declaration.declaration_span == span)
-            .map(|declaration| declaration.id.clone());
+        {
+            *global_id = Some(declaration.id.clone());
+        }
     }
 }
 
@@ -848,6 +866,7 @@ fn lower_type_param(
 
 fn lower_param(param: &ast::Param, class_name: Option<ClassContext<'_>>) -> hir::Param {
     hir::Param {
+        borrow: param.borrow_span.is_some(),
         constructor_role: match param.constructor_role {
             ast::ConstructorParameterRole::Ordinary => hir::ConstructorParameterRole::Ordinary,
             ast::ConstructorParameterRole::Promoted { access, .. } => {

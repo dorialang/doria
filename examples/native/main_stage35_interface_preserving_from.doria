@@ -1,0 +1,32 @@
+class Parcel implements Cloneable
+{
+    function __construct(int $id) {}
+    function clone(): self
+    {
+        echo "clone {$this->id}\n";
+        return new Parcel($this->id);
+    }
+    function __destruct()
+    {
+        try { echo "drop {$this->id}\n"; } catch (Error $error) {}
+    }
+}
+
+function copyParcels<T implements Cloneable>(List<T> $source): Deque<T>
+{
+    return Deque::from($source);
+}
+
+function main(): void
+{
+    List<Parcel> $source = [new Parcel(1), new Parcel(2)];
+    let $copy = copyParcels($source);
+    foreach ($copy as Parcel $parcel) { echo "copy {$parcel->id}\n"; }
+    foreach ($source as Parcel $parcel) { echo "source {$parcel->id}\n"; }
+    let $temporary = Deque::from([new Parcel(3)]);
+    foreach ($temporary as Parcel $parcel) { echo "temporary {$parcel->id}\n"; }
+    Dictionary<string, Parcel> $mapping = ["z" => new Parcel(4), "a" => new Parcel(5)];
+    let $sorted = SortedDictionary::from($mapping);
+    foreach ($sorted as string $key => Parcel $parcel) { echo "sorted {$key}:{$parcel->id}\n"; }
+    foreach ($mapping as string $key => Parcel $parcel) { echo "mapping {$key}:{$parcel->id}\n"; }
+}

@@ -323,7 +323,7 @@ fn mir_validation_rejects_corrupt_traversal_results_and_checked_cleanup() {
     let error = doriac::mir_validation::validate_program(&result)
         .expect_err("missing predicate result must fail");
     assert!(
-        error.message.contains("Copy-preserving shape"),
+        error.message.contains("invalid preserving shape"),
         "{}",
         error.message
     );

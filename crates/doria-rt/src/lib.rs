@@ -390,6 +390,56 @@ pub unsafe extern "C" fn dr_v2_collection_fill_word(
     )
 }
 
+/// Allocates a sequence whose live length begins at zero. Generated code
+/// initializes owned elements in order; cleanup visits only the live prefix.
+///
+/// # Safety
+///
+/// `current_frame` is null or a live frame chain, `fixed` is a canonical bool,
+/// and generated code must not append beyond the reserved fixed capacity.
+#[no_mangle]
+pub unsafe extern "C" fn dr_v5_collection_construction_capacity(
+    current_frame: *const DrStackFrameV2,
+    count: i64,
+    fixed: u8,
+    value_width: u8,
+    aggregate: u8,
+    keyed: u8,
+    kind: u8,
+    comparator: u8,
+) -> *mut DrCollectionV1 {
+    if count < 0 {
+        panic_signed_fact(
+            current_frame,
+            b"P1311",
+            doria_diagnostic_catalogue::COLLECTION_FILL_COUNT_FACT.as_bytes(),
+            count,
+        );
+    }
+    collection::construction_capacity(
+        current_frame,
+        count as usize,
+        fixed != 0,
+        value_width,
+        aggregate != 0,
+        keyed != 0,
+        kind,
+        comparator,
+    )
+}
+
+/// Publishes the key of the last initialized entry in an unfinished collection.
+///
+/// # Safety
+/// `collection` must be live, keyed, unfinished, and have an initialized final value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dr_v5_collection_initialize_key(
+    collection: *mut DrCollectionV1,
+    key: u64,
+) {
+    collection::initialize_key(collection, key);
+}
+
 /// Allocates a sequence containing `count` retained references to `value`.
 ///
 /// # Safety
@@ -3786,6 +3836,19 @@ pub unsafe extern "C" fn dr_v1_string_length(string: *const DrStringV1) -> usize
 /// `string` must identify a live doria-rt string.
 pub unsafe extern "C" fn dr_v1_string_byte_length(string: *const DrStringV1) -> usize {
     (*string).byte_length
+}
+
+#[no_mangle]
+/// Computes the primitive Hashable result over exact UTF-8 bytes.
+///
+/// # Safety
+/// `string` must identify a live doria-rt string.
+pub unsafe extern "C" fn dr_v1_string_hash(string: *const DrStringV1) -> u64 {
+    core::slice::from_raw_parts(string_bytes(string), (*string).byte_length)
+        .iter()
+        .fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        })
 }
 
 #[no_mangle]

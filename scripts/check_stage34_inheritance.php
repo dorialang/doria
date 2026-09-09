@@ -95,12 +95,12 @@ function check_stage34_inheritance(string $root): array
     }
     $require($paths['plan'], $files['plan'], [
         'Stage 34 — Single Class Inheritance — Complete',
-        'Stage 35 — Interfaces And Traits — In Progress; Slices 1 And 2 Complete; Slice 3 Next',
+        'Stage 35 — Interfaces And Traits — In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next',
         'Decision 0130',
     ]);
     $require($paths['pipeline'], $files['pipeline'], [
         'Stage 34 Single Class Inheritance — Complete.',
-        'Stage 35 Interfaces And Traits — In Progress; Slices 1 And 2 Complete; Slice 3 Next.',
+        'Stage 35 Interfaces And Traits — In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next.',
     ]);
     $forbid($paths['spec'], $files['spec'], [
         'parent lookup and dispatch are Stage 34 semantics and are currently diagnosed as unsupported',

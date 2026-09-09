@@ -1,0 +1,29 @@
+class Book
+{
+    function __construct(string $title) {}
+}
+
+function cursor<T implements Iterable<Book>>(T $books): Iterator<Book>
+{
+    return $books->iterator();
+}
+
+function inspect<T implements Iterable<Book>>(T $books): void
+{
+    let writable $direct = $books->iterator();
+    while ($direct->hasCurrent()) {
+        echo "{$direct->getCurrent()->title}\n";
+        $direct->advance();
+    }
+}
+
+function main(): void
+{
+    List<Book> $books = [new Book("one"), new Book("two")];
+    inspect($books);
+    let writable $returned = cursor($books);
+    while ($returned->hasCurrent()) {
+        echo "again {$returned->getCurrent()->title}\n";
+        $returned->advance();
+    }
+}

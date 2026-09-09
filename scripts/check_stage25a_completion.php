@@ -37,7 +37,6 @@ if ($kindBlockStart === false || $kindBlockEnd === false) {
 
 $semantics = $read('crates/doriac/src/semantics.rs');
 foreach ([
-    'kind == SharedHandleKind::SharedReference && property == "referencedValue"',
     'kind != SharedHandleKind::SharedReference || property != "referencedValue"',
     'SharedHandleKind::WritableSharedReference => (',
     'SharedHandleKind::WeakReference | SharedHandleKind::WritableWeakReference => (',
@@ -45,6 +44,11 @@ foreach ([
     if (!str_contains($semantics, $needle)) {
         $failures[] = "semantics.rs: missing Stage 25a member rule `{$needle}`";
     }
+}
+
+$tests = $read('crates/doriac/tests/stage25a_tests.rs');
+if (!str_contains($tests, 'fn shared_collection_properties_use_the_payload_member_contract()')) {
+    $failures[] = 'Stage 25a tests: missing shared collection property contract coverage';
 }
 
 $runtime = $read('crates/doria-rt/src/lib.rs');

@@ -1,0 +1,12 @@
+hash 3:true
+equal 3:true
+sorted 3:true
+push 3:true
+pop 3:true
+q1q2q3
+clone set true
+clone map true
+clone queue true
+compare queue true
+source 3:1
+done true

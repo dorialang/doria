@@ -176,6 +176,7 @@ fn build_module<'ctx>(
         &target_data,
         program,
         &class_drop_functions,
+        &collection_drop_functions,
         &class_descriptors,
         &functions,
         &interface_vtables,
@@ -618,6 +619,7 @@ fn define_interface_metadata<'ctx>(
     target_data: &TargetData,
     program: &mir::Program,
     class_drop_functions: &[FunctionValue<'ctx>],
+    collection_drop_functions: &[FunctionValue<'ctx>],
     class_descriptors: &[GlobalValue<'ctx>],
     functions: &[FunctionValue<'ctx>],
     interface_vtables: &[GlobalValue<'ctx>],
@@ -626,9 +628,101 @@ fn define_interface_metadata<'ctx>(
     let word = context.ptr_sized_int_type(target_data, None);
     for table in &program.interface_vtables {
         let mir::ImplementingType::Class(class_id) = table.implementing_type else {
-            return Err(malformed_mir(
-                "collection interface vtable requires Stage 35 Slice 3",
-            ));
+            let (collection, cursor) = match table.implementing_type {
+                mir::ImplementingType::Collection(collection) => (collection, false),
+                mir::ImplementingType::CollectionIterator(collection) => (collection, true),
+                _ => unreachable!(),
+            };
+            let drop = if cursor {
+                module
+                    .get_function(crate::native_abi::COLLECTION_ITERATOR_DROP)
+                    .unwrap_or_else(|| {
+                        module.add_function(
+                            crate::native_abi::COLLECTION_ITERATOR_DROP,
+                            context
+                                .void_type()
+                                .fn_type(&[pointer.into(), pointer.into()], false),
+                            None,
+                        )
+                    })
+            } else {
+                collection_drop_functions[collection.0]
+            }
+            .as_global_value()
+            .as_pointer_value();
+            let prefix = format!("__doria_interface_vtable_{}", table.id.0);
+            let name = format!(
+                "{}collection#{}",
+                if cursor { "iterator " } else { "" },
+                collection.0
+            );
+            let type_name = define_bytes(
+                context,
+                module,
+                name.as_bytes(),
+                &format!("{prefix}_type_name"),
+            );
+            let ancestry = define_bytes(
+                context,
+                module,
+                &vec![0; program.classes.len().div_ceil(8).max(1)],
+                &format!("{prefix}_ancestry"),
+            );
+            let mut views = vec![pointer.const_null(); program.interface_types.len()];
+            for view in program
+                .interface_vtables
+                .iter()
+                .filter(|view| view.implementing_type == table.implementing_type)
+            {
+                views[view.interface.0] = interface_vtables[view.id.0].as_pointer_value();
+            }
+            let views = pointer.const_array(&views);
+            let view_global = module.add_global(views.get_type(), None, &format!("{prefix}_views"));
+            view_global.set_initializer(&views);
+            view_global.set_constant(true);
+            view_global.set_linkage(Linkage::Internal);
+            let descriptor_type = class_descriptor_type(context, target_data);
+            let descriptor = module.add_global(descriptor_type, None, &format!("{prefix}_type"));
+            descriptor.set_initializer(
+                &descriptor_type.const_named_struct(&[
+                    pointer.const_null().into(),
+                    word.const_int(
+                        u64::MAX - (collection.0 as u64 * 2 + u64::from(cursor)),
+                        false,
+                    )
+                    .into(),
+                    drop.into(),
+                    pointer.const_null().into(),
+                    ancestry.into(),
+                    view_global.as_pointer_value().into(),
+                ]),
+            );
+            descriptor.set_constant(true);
+            descriptor.set_linkage(Linkage::Internal);
+            let methods = table
+                .methods
+                .iter()
+                .map(|id| functions[id.0].as_global_value().as_pointer_value())
+                .collect::<Vec<_>>();
+            let initializer = interface_vtable_type(context, target_data, methods.len())
+                .const_named_struct(&[
+                    type_name.into(),
+                    word.const_int(name.len() as u64, false).into(),
+                    word.const_zero().into(),
+                    drop.into(),
+                    word.const_zero().into(),
+                    word.const_zero().into(),
+                    word.const_zero().into(),
+                    word.const_zero().into(),
+                    descriptor.as_pointer_value().into(),
+                    word.const_int(table.interface.0 as u64, false).into(),
+                    pointer.const_array(&methods).into(),
+                ]);
+            let global = interface_vtables[table.id.0];
+            global.set_initializer(&initializer);
+            global.set_constant(true);
+            global.set_linkage(Linkage::Internal);
+            continue;
         };
         let class = class_definition(program, class_id)?;
         let descriptor = table
@@ -1191,6 +1285,7 @@ fn define_function<'ctx>(
         local_slots,
         closure_environment_slots,
         closure_bound_fields: HashMap::new(),
+        stack_collection_iterators: HashMap::new(),
         borrow_home_addresses,
         writable_parameter_addresses,
         blocks,
@@ -1204,6 +1299,12 @@ fn define_function<'ctx>(
         deferred_class_temporary_drops: Vec::new(),
     };
     lowerer.retain_string_parameters()?;
+    for plan in crate::mir_validation::stack_collection_iterators(program, function) {
+        let storage = lowerer.entry_alloca(error_carrier_type(context), "iterator.state")?;
+        lowerer
+            .stack_collection_iterators
+            .insert(plan.source, (plan.cursor, storage));
+    }
     build(
         lowerer
             .builder
@@ -1263,6 +1364,7 @@ fn define_class_drop_functions<'ctx>(
             local_slots: Vec::new(),
             closure_environment_slots: Vec::new(),
             closure_bound_fields: HashMap::new(),
+            stack_collection_iterators: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
@@ -1320,6 +1422,7 @@ fn define_collection_drop_functions<'ctx>(
             local_slots: Vec::new(),
             closure_environment_slots: Vec::new(),
             closure_bound_fields: HashMap::new(),
+            stack_collection_iterators: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
@@ -1381,6 +1484,7 @@ fn define_closure_drop_functions<'ctx>(
             local_slots: Vec::new(),
             closure_environment_slots: Vec::new(),
             closure_bound_fields: HashMap::new(),
+            stack_collection_iterators: HashMap::new(),
             borrow_home_addresses: HashMap::new(),
             writable_parameter_addresses: HashMap::new(),
             blocks: Vec::new(),
@@ -1876,6 +1980,7 @@ struct FunctionLowerer<'ctx, 'program> {
     local_slots: Vec<Option<PointerValue<'ctx>>>,
     closure_environment_slots: Vec<Option<PointerValue<'ctx>>>,
     closure_bound_fields: HashMap<mir::LocalId, BoundClosureField<'ctx>>,
+    stack_collection_iterators: HashMap<mir::LocalId, (mir::LocalId, PointerValue<'ctx>)>,
     borrow_home_addresses: HashMap<mir::LocalId, PointerValue<'ctx>>,
     writable_parameter_addresses: HashMap<mir::LocalId, PointerValue<'ctx>>,
     blocks: Vec<BasicBlock<'ctx>>,
@@ -3276,6 +3381,16 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         debug_assert!(self.deferred_class_temporary_drops.is_empty());
         self.defer_class_temporary_drops = true;
         match statement {
+            mir::Statement::AdvanceCollectionIterator { receiver, .. } => {
+                let cursor = self.collection_pointer(*receiver)?;
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                self.call_runtime(
+                    crate::native_abi::COLLECTION_ITERATOR_ADVANCE,
+                    &[pointer.into()],
+                    None,
+                    &[cursor.into()],
+                )?;
+            }
             mir::Statement::BindClosureEnvironment {
                 environment,
                 bindings,
@@ -4060,6 +4175,10 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 key,
                 value,
             } => self.lower_collection_set(*collection, key, value, false)?,
+            mir::Statement::CoreCollection {
+                collection,
+                operation,
+            } => self.lower_core_collection_operation(*collection, operation)?,
             mir::Statement::AssignCollectionIndex {
                 positional,
                 collection,
@@ -4201,7 +4320,13 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     self.builder
                         .build_store(slot, error_carrier_type(self.context).const_zero()),
                 )?;
-                self.drop_error_value(value)?;
+                if !self
+                    .stack_collection_iterators
+                    .values()
+                    .any(|(cursor, _)| cursor == local)
+                {
+                    self.drop_error_value(value)?;
+                }
             }
             mir::Statement::DropSharedReference { local, .. } => {
                 let pointer = self.context.ptr_type(AddressSpace::default());
@@ -5709,9 +5834,12 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         };
         let definition = self.collection_definition(collection_type)?.clone();
         let key_type = match access {
-            mir::NullableCollectionAccess::Get
-            | mir::NullableCollectionAccess::Index
-            | mir::NullableCollectionAccess::Remove => definition
+            mir::NullableCollectionAccess::Get | mir::NullableCollectionAccess::Remove => {
+                definition
+                    .key
+                    .ok_or_else(|| malformed_mir("dictionary access has no key type"))?
+            }
+            mir::NullableCollectionAccess::Index => definition
                 .key
                 .ok_or_else(|| malformed_mir("dictionary access has no key type"))?,
             _ => mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
@@ -5787,13 +5915,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
             self.copy_payload_bytes(destination, raw, ty, false)?;
         }
-        let mutating = matches!(
-            access,
-            mir::NullableCollectionAccess::Remove
-                | mir::NullableCollectionAccess::Pop
-                | mir::NullableCollectionAccess::PopFront
-                | mir::NullableCollectionAccess::PopBack
-        );
+        let mutating = access.removes_element();
         if !mutating && matches!(mode, mir::PayloadEnumUseMode::Copy) {
             self.retain_payload_enum_at(result, ty, true)?;
         }
@@ -7273,6 +7395,40 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 }
                 Ok(value)
             }
+            mir::InterfaceValue::FromCollection { value, vtable } => {
+                let object = self.lower_rvalue(value)?.into_pointer_value();
+                let table = self.interface_vtable_address(*vtable)?;
+                let present = build(self.builder.build_is_not_null(object, "collection.present"))?;
+                let table = build(self.builder.build_select(
+                    present,
+                    table,
+                    self.context.ptr_type(AddressSpace::default()).const_null(),
+                    "collection.view",
+                ))?
+                .into_pointer_value();
+                self.error_value(object, table)
+            }
+            mir::InterfaceValue::NewCollectionIterator { source, vtable } => {
+                let source_value = self.collection_pointer(*source)?;
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                let object = if let Some((_, storage)) =
+                    self.stack_collection_iterators.get(source).copied()
+                {
+                    let state = self.error_value(source_value, pointer.const_null())?;
+                    build(self.builder.build_store(storage, state))?;
+                    storage
+                } else {
+                    self.call_runtime(
+                        crate::native_abi::COLLECTION_ITERATOR_NEW,
+                        &[pointer.into(), pointer.into()],
+                        Some(pointer.into()),
+                        &[self.current_frame.into(), source_value.into()],
+                    )?
+                    .expect("cursor allocation result")
+                    .into_pointer_value()
+                };
+                self.error_value(object, self.interface_vtable_address(*vtable)?)
+            }
             mir::InterfaceValue::FromClass { object, vtable } => {
                 let class = object.class();
                 let value = self.lower_class_expression(object)?;
@@ -7558,6 +7714,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         key: &mir::Rvalue,
         access: mir::NullableCollectionAccess,
     ) -> Result<StructValue<'ctx>, BackendError> {
+        if access == mir::NullableCollectionAccess::Index {
+            return self.lower_error_collection_index(collection, key, false, false);
+        }
         let pointer = self.context.ptr_type(AddressSpace::default());
         let local = local_in(self.function, collection)?;
         let mir::Type::Collection(collection_type) = local.ty else {
@@ -8629,6 +8788,23 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let pointer = self.context.ptr_type(AddressSpace::default());
         let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
         match expression {
+            mir::CollectionExpression::InterfaceReceiver { receiver, .. }
+            | mir::CollectionExpression::IteratorSource { receiver, .. } => {
+                let payload = self.collection_pointer(*receiver)?;
+                if matches!(expression, mir::CollectionExpression::IteratorSource { .. }) {
+                    Ok(self
+                        .call_runtime(
+                            crate::native_abi::COLLECTION_ITERATOR_SOURCE,
+                            &[pointer.into()],
+                            Some(pointer.into()),
+                            &[payload.into()],
+                        )?
+                        .expect("cursor source result")
+                        .into_pointer_value())
+                } else {
+                    Ok(payload)
+                }
+            }
             mir::CollectionExpression::StringIntrinsic(call) => {
                 Ok(self.lower_string_intrinsic_call(call)?.into_pointer_value())
             }
@@ -8649,6 +8825,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 entries,
             } => {
                 let definition = self.collection_definition(*collection)?.clone();
+                if definition.uses_core_operations() {
+                    if !entries.is_empty() {
+                        return Err(malformed_mir(
+                            "core collection literal lacks explicit comparison and insertion plans",
+                        ));
+                    }
+                    return self.lower_core_collection_new(&definition, usize_type.const_zero());
+                }
                 if let Some((ty, nullable)) = Self::payload_enum_storage(definition.value) {
                     return self.lower_payload_enum_collection_literal(
                         &definition,
@@ -8889,6 +9073,104 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                     )?;
                 }
                 Ok(result)
+            }
+            mir::CollectionExpression::FinishConstruction { collection, source } => {
+                let value =
+                    self.lower_collection_expression(&mir::CollectionExpression::Local {
+                        collection: *collection,
+                        local: *source,
+                        transfer: true,
+                        assume_non_null: false,
+                    })?;
+                if self
+                    .collection_definition(*collection)?
+                    .uses_core_operations()
+                {
+                    return Ok(value);
+                }
+                self.call_runtime(
+                    COLLECTION_STAGE26_FINALIZE,
+                    &[pointer.into()],
+                    None,
+                    &[value.into()],
+                )?;
+                Ok(value)
+            }
+            mir::CollectionExpression::ConstructionCapacity {
+                collection,
+                count,
+                count_span,
+            } => {
+                let definition = self.collection_definition(*collection)?.clone();
+                let count = self.lower_integer_expression(count)?;
+                self.set_active_panic_site(*count_span)?;
+                if definition.uses_core_operations() {
+                    return self.lower_core_collection_new(&definition, count);
+                }
+                let fixed = self.context.i8_type().const_int(
+                    u64::from(definition.kind == mir::CollectionKind::TypedArray),
+                    false,
+                );
+                let aggregate_storage =
+                    type_uses_two_word_collection_storage(self.program, definition.value);
+                let pointer_width = self.target_data.get_pointer_byte_size(None) as u8;
+                let width = if aggregate_storage {
+                    Some(pointer_width * 2)
+                } else {
+                    collection_value_width(definition.value, pointer_width)
+                }
+                .ok_or_else(|| {
+                    malformed_mir("sequence initialization requires a word-sized element")
+                })?;
+                let width = self.context.i8_type().const_int(u64::from(width), false);
+                let aggregate = self
+                    .context
+                    .i8_type()
+                    .const_int(u64::from(aggregate_storage), false);
+                let keyed = self
+                    .context
+                    .i8_type()
+                    .const_int(u64::from(definition.key.is_some()), false);
+                let kind = self.context.i8_type().const_int(
+                    u64::from(stage26_collection_kind(definition.kind).unwrap_or(0)),
+                    false,
+                );
+                let comparator = self.context.i8_type().const_int(
+                    u64::from(
+                        definition
+                            .comparator
+                            .map(collection_comparator_code)
+                            .unwrap_or(COLLECTION_COMPARE_WORD),
+                    ),
+                    false,
+                );
+                Ok(self
+                    .call_runtime(
+                        crate::native_abi::COLLECTION_CONSTRUCTION_CAPACITY,
+                        &[
+                            pointer.into(),
+                            self.context.i64_type().into(),
+                            self.context.i8_type().into(),
+                            self.context.i8_type().into(),
+                            self.context.i8_type().into(),
+                            self.context.i8_type().into(),
+                            self.context.i8_type().into(),
+                            self.context.i8_type().into(),
+                        ],
+                        Some(pointer.into()),
+                        &[
+                            self.current_frame.into(),
+                            count.into(),
+                            fixed.into(),
+                            width.into(),
+                            aggregate.into(),
+                            keyed.into(),
+                            kind.into(),
+                            comparator.into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("sequence allocation produced no result"))?
+                    .into_pointer_value())
             }
             mir::CollectionExpression::Fill {
                 collection,
@@ -9511,17 +9793,25 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             return Err(malformed_mir("nullable collection access type mismatch"));
         }
         let key_type = match access {
-            mir::NullableCollectionAccess::Get
-            | mir::NullableCollectionAccess::Index
-            | mir::NullableCollectionAccess::Remove => definition
-                .key
-                .ok_or_else(|| malformed_mir("dictionary access has no key type"))?,
+            mir::NullableCollectionAccess::Get | mir::NullableCollectionAccess::Remove => {
+                definition
+                    .key
+                    .ok_or_else(|| malformed_mir("dictionary access has no key type"))?
+            }
+            mir::NullableCollectionAccess::Index => {
+                definition
+                    .key
+                    .unwrap_or(mir::Type::Scalar(mir::ScalarType::Integer(
+                        IntegerType::Int64,
+                    )))
+            }
             mir::NullableCollectionAccess::First
             | mir::NullableCollectionAccess::Last
             | mir::NullableCollectionAccess::Pop
             | mir::NullableCollectionAccess::PopFront
             | mir::NullableCollectionAccess::PopBack
-            | mir::NullableCollectionAccess::At => {
+            | mir::NullableCollectionAccess::At
+            | mir::NullableCollectionAccess::RemoveAt => {
                 mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64))
             }
         };
@@ -9530,6 +9820,28 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         let key_word = self.value_to_collection_word(key_value, key_type)?;
         let found = self.entry_alloca(self.context.i8_type(), "dictionary.get.found")?;
         let removed_key = self.entry_alloca(self.context.i64_type(), "dictionary.removed.key")?;
+        if access == mir::NullableCollectionAccess::Index && !definition.kind.is_dictionary() {
+            self.call_runtime(
+                COLLECTION_VALUE_AT,
+                &[
+                    pointer.into(),
+                    pointer.into(),
+                    self.context.i64_type().into(),
+                ],
+                Some(self.context.i64_type().into()),
+                &[
+                    self.current_frame.into(),
+                    collection.into(),
+                    key_value.into(),
+                ],
+            )?;
+        }
+        let access =
+            if access == mir::NullableCollectionAccess::Index && !definition.kind.is_dictionary() {
+                mir::NullableCollectionAccess::At
+            } else {
+                access
+            };
         if access == mir::NullableCollectionAccess::Index {
             let present = self.entry_alloca(self.context.i8_type(), "dictionary.index.present")?;
             let word = self
@@ -9649,6 +9961,21 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         op: mir::CollectionMutationOp,
     ) -> Result<(), BackendError> {
         let pointer = self.context.ptr_type(AddressSpace::default());
+        if op == mir::CollectionMutationOp::Initialize {
+            if let Some(key) = index {
+                let key_value = self.lower_rvalue(key)?;
+                let key_word = self.value_to_collection_word(key_value, key.ty())?;
+                self.lower_collection_add(collection, value, None, op)?;
+                let destination = self.collection_pointer(collection)?;
+                self.call_runtime(
+                    crate::native_abi::COLLECTION_INITIALIZE_KEY,
+                    &[pointer.into(), self.context.i64_type().into()],
+                    None,
+                    &[destination.into(), key_word.into()],
+                )?;
+                return Ok(());
+            }
+        }
         let local = local_in(self.function, collection)?;
         let mir::Type::Collection(collection_type) = local.ty else {
             return Err(malformed_mir("collection add uses non-collection local"));
@@ -9755,6 +10082,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             && matches!(
                 op,
                 mir::CollectionMutationOp::Add
+                    | mir::CollectionMutationOp::Initialize
                     | mir::CollectionMutationOp::InsertAt
                     | mir::CollectionMutationOp::PushFront
                     | mir::CollectionMutationOp::PushBack
@@ -9974,6 +10302,277 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             )?;
         }
         Ok(())
+    }
+
+    fn lower_core_collection_operation(
+        &mut self,
+        collection: mir::LocalId,
+        operation: &mir::CoreCollectionOperation,
+    ) -> Result<(), BackendError> {
+        use crate::native_abi::{
+            CORE_COLLECTION_HASH_NEXT, CORE_COLLECTION_HASH_POSITION, CORE_COLLECTION_INSERT,
+            CORE_COLLECTION_KEY_AT, CORE_COLLECTION_REMOVE, CORE_COLLECTION_SWAP,
+        };
+        use mir::CoreCollectionOperation as Op;
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let int = self.context.i64_type();
+        let receiver = self.collection_pointer(collection)?;
+        let address = |local| local_slot(&self.local_slots, local);
+        let integer = |local| -> Result<IntValue<'ctx>, BackendError> {
+            Ok(
+                build(self.builder.build_load(int, address(local)?, "core.index"))?
+                    .into_int_value(),
+            )
+        };
+        match operation {
+            Op::RequireKey { position } => {
+                let missing = build(self.builder.build_int_compare(
+                    IntPredicate::SLT,
+                    integer(*position)?,
+                    int.const_zero(),
+                    "missing.key",
+                ))?;
+                self.lower_panic_if_code_at_active_site(missing, "P1312")?;
+            }
+            Op::Insert {
+                position,
+                key,
+                value,
+                hash,
+            } => {
+                self.call_runtime(
+                    CORE_COLLECTION_INSERT,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        int.into(),
+                        pointer.into(),
+                        pointer.into(),
+                        int.into(),
+                    ],
+                    None,
+                    &[
+                        self.current_frame.into(),
+                        receiver.into(),
+                        integer(*position)?.into(),
+                        key.map(address)
+                            .transpose()?
+                            .unwrap_or(pointer.const_null())
+                            .into(),
+                        address(*value)?.into(),
+                        hash.map(integer)
+                            .transpose()?
+                            .unwrap_or(int.const_zero())
+                            .into(),
+                    ],
+                )?;
+                for local in operation.transfers() {
+                    let definition = local_in(self.function, local)?;
+                    if definition.owned {
+                        build(
+                            self.builder.build_store(
+                                address(local)?,
+                                llvm_type(
+                                    self.context,
+                                    self.target_data,
+                                    self.program,
+                                    definition.ty,
+                                )
+                                .const_zero(),
+                            ),
+                        )?;
+                    }
+                }
+            }
+            Op::Remove {
+                position,
+                key,
+                value,
+            } => {
+                self.call_runtime(
+                    CORE_COLLECTION_REMOVE,
+                    &[
+                        pointer.into(),
+                        pointer.into(),
+                        int.into(),
+                        pointer.into(),
+                        pointer.into(),
+                    ],
+                    None,
+                    &[
+                        self.current_frame.into(),
+                        receiver.into(),
+                        integer(*position)?.into(),
+                        key.map(address)
+                            .transpose()?
+                            .unwrap_or(pointer.const_null())
+                            .into(),
+                        address(*value)?.into(),
+                    ],
+                )?;
+            }
+            Op::Swap { left, right } => {
+                self.call_runtime(
+                    CORE_COLLECTION_SWAP,
+                    &[pointer.into(), pointer.into(), int.into(), int.into()],
+                    None,
+                    &[
+                        self.current_frame.into(),
+                        receiver.into(),
+                        integer(*left)?.into(),
+                        integer(*right)?.into(),
+                    ],
+                )?;
+            }
+            Op::KeyAt { position, target } => {
+                let source = self
+                    .call_runtime(
+                        CORE_COLLECTION_KEY_AT,
+                        &[pointer.into(), pointer.into(), int.into()],
+                        Some(pointer.into()),
+                        &[
+                            self.current_frame.into(),
+                            receiver.into(),
+                            integer(*position)?.into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("core key read produced no address"))?
+                    .into_pointer_value();
+                let ty = local_in(self.function, *target)?.ty;
+                let value = build(self.builder.build_load(
+                    llvm_type(self.context, self.target_data, self.program, ty),
+                    source,
+                    "core.key",
+                ))?;
+                build(self.builder.build_store(address(*target)?, value))?;
+            }
+            Op::ValueAt { position, target }
+            | Op::Exchange {
+                position,
+                previous: target,
+                ..
+            } => {
+                let byte = self.context.i8_type();
+                let source = self
+                    .call_runtime(
+                        COLLECTION_AGGREGATE_VALUE_AT,
+                        &[
+                            pointer.into(),
+                            pointer.into(),
+                            int.into(),
+                            byte.into(),
+                            byte.into(),
+                        ],
+                        Some(pointer.into()),
+                        &[
+                            self.current_frame.into(),
+                            receiver.into(),
+                            integer(*position)?.into(),
+                            byte.const_int(1, false).into(),
+                            byte.const_int(u64::from(COLLECTION_COMPARE_WORD), false)
+                                .into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("core value read produced no address"))?
+                    .into_pointer_value();
+                let ty = llvm_type(
+                    self.context,
+                    self.target_data,
+                    self.program,
+                    local_in(self.function, *target)?.ty,
+                );
+                let value = build(self.builder.build_load(ty, source, "core.value"))?;
+                build(self.builder.build_store(address(*target)?, value))?;
+                if let Op::Exchange { value, .. } = operation {
+                    let replacement = build(self.builder.build_load(
+                        ty,
+                        address(*value)?,
+                        "core.replacement",
+                    ))?;
+                    build(self.builder.build_store(source, replacement))?;
+                    if local_in(self.function, *value)?.owned {
+                        build(self.builder.build_store(address(*value)?, ty.const_zero()))?;
+                    }
+                }
+            }
+            Op::HashNext {
+                hash,
+                previous,
+                target,
+            } => {
+                let slot = self
+                    .call_runtime(
+                        CORE_COLLECTION_HASH_NEXT,
+                        &[pointer.into(), int.into(), int.into()],
+                        Some(int.into()),
+                        &[
+                            receiver.into(),
+                            integer(*hash)?.into(),
+                            integer(*previous)?.into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("core hash probe produced no result"))?;
+                build(self.builder.build_store(address(*target)?, slot))?;
+            }
+            Op::HashPosition { slot, target } => {
+                let position = self
+                    .call_runtime(
+                        CORE_COLLECTION_HASH_POSITION,
+                        &[pointer.into(), int.into()],
+                        Some(int.into()),
+                        &[receiver.into(), integer(*slot)?.into()],
+                    )?
+                    .ok_or_else(|| backend_failure("core hash position produced no result"))?;
+                build(self.builder.build_store(address(*target)?, position))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn lower_core_collection_new(
+        &self,
+        definition: &mir::CollectionType,
+        capacity: IntValue<'ctx>,
+    ) -> Result<PointerValue<'ctx>, BackendError> {
+        let pointer = self.context.ptr_type(AddressSpace::default());
+        let usize_type = self.context.ptr_sized_int_type(self.target_data, None);
+        let byte = self.context.i8_type();
+        let pointer_bytes = self.target_data.get_pointer_byte_size(None);
+        let layout =
+            native_closure_abi::value_layout(self.program, definition.value, pointer_bytes);
+        let key_size = definition
+            .key
+            .map(|ty| native_closure_abi::value_layout(self.program, ty, pointer_bytes).size)
+            .unwrap_or(0);
+        self.call_runtime(
+            crate::native_abi::CORE_COLLECTION_NEW,
+            &[
+                pointer.into(),
+                usize_type.into(),
+                usize_type.into(),
+                usize_type.into(),
+                usize_type.into(),
+                byte.into(),
+                byte.into(),
+            ],
+            Some(pointer.into()),
+            &[
+                self.current_frame.into(),
+                capacity.into(),
+                usize_type.const_int(u64::from(key_size), false).into(),
+                usize_type.const_int(u64::from(layout.size), false).into(),
+                usize_type.const_int(u64::from(layout.align), false).into(),
+                byte.const_int(
+                    u64::from(stage26_collection_kind(definition.kind).unwrap_or(0)),
+                    false,
+                )
+                .into(),
+                byte.const_int(u64::from(definition.uses_core_hash()), false)
+                    .into(),
+            ],
+        )?
+        .map(|value| value.into_pointer_value())
+        .ok_or_else(|| backend_failure("core collection allocation produced no result"))
     }
 
     fn lower_collection_set(
@@ -11192,7 +11791,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             ))?
             .into_struct_value();
             self.drop_function_carrier(value)?;
-        } else if type_uses_two_word_collection_storage(self.program, definition.value) {
+        } else if definition.uses_core_operations()
+            || type_uses_two_word_collection_storage(self.program, definition.value)
+        {
             let index = if usize_type.get_bit_width() == 64 {
                 current
             } else {
@@ -11282,21 +11883,38 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
             self.drop_stored_value(value, stored_value_type)?;
         }
         if let Some(key_type) = definition.key {
-            let key_word = self
-                .call_runtime(
-                    COLLECTION_KEY_AT,
-                    &[pointer.into(), pointer.into(), usize_type.into()],
-                    Some(self.context.i64_type().into()),
-                    &[
-                        self.current_frame.into(),
-                        cleanup_collection.into(),
-                        current.into(),
-                    ],
-                )?
-                .ok_or_else(|| backend_failure("collection key read produced no result"))?
-                .into_int_value();
-            let key = self.collection_word_to_value(key_word, key_type)?;
-            self.drop_stored_value(key, key_type)?;
+            if definition.uses_core_operations() {
+                let address = self
+                    .call_runtime(
+                        crate::native_abi::CORE_COLLECTION_KEY_AT,
+                        &[pointer.into(), pointer.into(), usize_type.into()],
+                        Some(pointer.into()),
+                        &[
+                            self.current_frame.into(),
+                            cleanup_collection.into(),
+                            current.into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("core key cleanup has no address"))?
+                    .into_pointer_value();
+                self.drop_value_at_address(address, key_type)?;
+            } else {
+                let key_word = self
+                    .call_runtime(
+                        COLLECTION_KEY_AT,
+                        &[pointer.into(), pointer.into(), usize_type.into()],
+                        Some(self.context.i64_type().into()),
+                        &[
+                            self.current_frame.into(),
+                            cleanup_collection.into(),
+                            current.into(),
+                        ],
+                    )?
+                    .ok_or_else(|| backend_failure("collection key read produced no result"))?
+                    .into_int_value();
+                let key = self.collection_word_to_value(key_word, key_type)?;
+                self.drop_stored_value(key, key_type)?;
+            }
         }
         build(self.builder.build_store(index_slot, current))?;
         build(self.builder.build_unconditional_branch(header))?;
@@ -12668,13 +13286,7 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 let (present, payload) =
                     self.lower_dictionary_get(*collection, key, mir::Type::String, *access)?;
                 let payload = payload.into_pointer_value();
-                let payload = if matches!(
-                    access,
-                    mir::NullableCollectionAccess::Remove
-                        | mir::NullableCollectionAccess::Pop
-                        | mir::NullableCollectionAccess::PopFront
-                        | mir::NullableCollectionAccess::PopBack
-                ) {
+                let payload = if access.removes_element() {
                     payload
                 } else {
                     self.retain_string(payload)?
@@ -13170,6 +13782,14 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         };
 
         let result: BasicValueEnum<'ctx> = match call.kind {
+            Kind::Hash => self
+                .call_runtime(
+                    crate::native_abi::STRING_HASH,
+                    &[pointer.into()],
+                    Some(i64_type.into()),
+                    &[argument(0)?.into()],
+                )?
+                .ok_or_else(|| backend_failure("String hash runtime call produced no result"))?,
             Kind::GraphemeLength | Kind::ByteLength => {
                 let name = if call.kind == Kind::GraphemeLength {
                     STRING_GRAPHEME_LENGTH
@@ -15420,6 +16040,9 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
                 .transpose()?
                 .unwrap_or(0);
             for property in phase_definition.properties[first_property..].iter().rev() {
+                if property.borrowed_source && property.ty.has_move_ownership() {
+                    continue;
+                }
                 let address = self.lower_property_address_from_value(object, property.id)?;
                 match property.ty {
                     mir::Type::Interface(_) | mir::Type::NullableInterface(_) => {
@@ -16673,6 +17296,19 @@ impl<'ctx> FunctionLowerer<'ctx, '_> {
         operand: &mir::Operand,
     ) -> Result<IntValue<'ctx>, BackendError> {
         match operand {
+            mir::Operand::CollectionIteratorPosition { receiver, .. } => {
+                let cursor = self.collection_pointer(*receiver)?;
+                let pointer = self.context.ptr_type(AddressSpace::default());
+                Ok(self
+                    .call_runtime(
+                        crate::native_abi::COLLECTION_ITERATOR_POSITION,
+                        &[pointer.into()],
+                        Some(self.context.i64_type().into()),
+                        &[cursor.into()],
+                    )?
+                    .expect("cursor position result")
+                    .into_int_value())
+            }
             mir::Operand::StringIntrinsic(call) => {
                 Ok(self.lower_string_intrinsic_call(call)?.into_int_value())
             }
@@ -19147,6 +19783,9 @@ fn collection_header_type<'ctx>(
             word.into(),    // value_stride
             word.into(),    // value_alignment
             byte.into(),    // aggregate
+            word.into(),    // key_stride
+            pointer.into(), // hashes
+            byte.into(),    // hashed
         ],
         false,
     )

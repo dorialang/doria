@@ -48,7 +48,7 @@ drop glue, and indirect execution through Cranelift and LLVM. Stage 30f emits
 PHP compatibility closures from the same semantic and validated MIR authority
 through explicit carriers, environments, and stable places. Stage 30g adds
 explicit semantic and HIR List algorithm plans plus validated MIR traversal CFG
-for `map`, Copy-only `filter`, and writable-accumulator `reduce`. The debug
+for `map`, Copy-or-Cloneable `filter`, and writable-accumulator `reduce`. The debug
 interpreter, Cranelift, LLVM, and PHP compatibility execute the supported
 surface with exact callback effects, readonly source traversal, and checked
 partial-state cleanup. Stage 30h completes the accepted mixed function-value
@@ -74,7 +74,7 @@ Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Complete; Stage 33 Slice 3 �
 Stage 33 — Complete; Phase F — Complete
 Native Testing Foundation Slices 1 Through 3 — Complete; Foundation — Complete
 Stage 34 — Complete
-Stage 35 — In Progress; Slices 1 And 2 Complete; Slice 3 Next
+Stage 35 — In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping
@@ -468,15 +468,18 @@ source remains unchanged, and the callback error propagates.
 #### `filter`
 
 ```text
-filter(function(T): bool predicate): List<T> effects(predicate) where T: Copy
-filter(writable function writable(T): bool predicate): List<T> effects(predicate) where T: Copy
+filter(function(T): bool predicate): List<T> effects(predicate) where T: Copy-or-Cloneable
+filter(writable function writable(T): bool predicate): List<T> effects(predicate) where T: Copy-or-Cloneable
 ```
 
 The callback is readonly- or writable-repeatable and nonescaping, using the
 matching readonly or exclusive function-value borrow.
 The readonly receiver remains unchanged. Elements are tested in insertion order
-and selected Copy values enter a new ordered list. Move-element preserving
-filter waits for `Cloneable`; Stage 30 adds no consuming filter or borrowed view.
+and selected values enter a new ordered list. Stage 35 Slice 3 implements
+Decision 0134's widening: selected Move values are cloned once in traversal
+order; rejected values are not cloned. The ordinary checked execution profile
+includes automatic effects of cloning, with partial-output cleanup on failure.
+No consuming filter or borrowed view is added.
 
 #### `reduce`
 
@@ -608,8 +611,7 @@ Stage 30 gate and does not convert missing evidence into a pass.
 - implicit equality, hashing, ordering, display, cloning, or dynamic reflection;
 - PHP callable arrays;
 - function values in shared-reference payloads or owned static properties;
-- Move-element preserving filter before `Cloneable`, consuming filters, and
-  filter views;
+- consuming filters and filter views;
 - higher-order algorithms on non-List collections; and
 - general Iterable or Iterator algorithms.
 

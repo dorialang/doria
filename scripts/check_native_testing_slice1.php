@@ -38,7 +38,7 @@ $required = [
         'Native Testing Foundation Slice 2 - Complete',
         'Native Testing Foundation Slice 3 - Complete',
         'Stage 34 Single Class Inheritance - Complete',
-        'Stage 35 Interfaces And Traits - In Progress; Slices 1 And 2 Complete; Slice 3 Next',
+        'Stage 35 Interfaces And Traits - In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next',
         'no runtime registration',
         'no Baton source parsing',
     ],

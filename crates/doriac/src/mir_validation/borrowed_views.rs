@@ -5,16 +5,33 @@ use super::*;
 #[derive(Clone, PartialEq, Eq)]
 struct State {
     roots: Vec<HashSet<mir::LocalId>>,
+    loans: Vec<HashSet<mir::RetainedSource>>,
     ended: HashSet<mir::LocalId>,
 }
 
 impl State {
-    fn new(function: &mir::Function) -> Self {
+    fn new(program: &mir::Program, function: &mir::Function) -> Self {
         Self {
             roots: function
                 .locals
                 .iter()
                 .map(|local| HashSet::from([local.id]))
+                .collect(),
+            loans: function
+                .locals
+                .iter()
+                .map(|local| {
+                    if function.params.contains(&local.id)
+                        && retained::carries_source(program, local.ty)
+                    {
+                        HashSet::from([mir::RetainedSource {
+                            local: local.id,
+                            inherited: true,
+                        }])
+                    } else {
+                        HashSet::new()
+                    }
+                })
                 .collect(),
             ended: HashSet::new(),
         }
@@ -23,7 +40,11 @@ impl State {
     fn end(&mut self, local: mir::LocalId) {
         self.ended.insert(local);
         for (index, roots) in self.roots.iter().enumerate() {
-            if roots.contains(&local) {
+            if roots.contains(&local)
+                || self.loans[index]
+                    .iter()
+                    .any(|loan| !loan.inherited && loan.local == local)
+            {
                 self.ended.insert(mir::LocalId(index));
             }
         }
@@ -44,18 +65,60 @@ impl State {
         program: &mir::Program,
         value: &mir::Rvalue,
     ) -> Result<HashSet<mir::LocalId>, BackendError> {
-        Ok(escaping_class_local_borrows(program, value)?
+        let mut sources = escaping_class_local_borrows(program, value)?;
+        if value.borrows_move_value() {
+            sources.extend(value.direct_place_local());
+        }
+        Ok(sources
             .into_iter()
             .flat_map(|local| self.roots[local.0].iter().copied())
             .collect())
     }
 
+    fn conflicts(&self, local: mir::LocalId) -> Result<(), BackendError> {
+        if self.loans.iter().enumerate().any(|(index, loans)| {
+            !self.ended.contains(&mir::LocalId(index))
+                && loans
+                    .iter()
+                    .any(|loan| !loan.inherited && self.roots[local.0].contains(&loan.local))
+        }) {
+            return Err(malformed_mir(format!(
+                "source local{} is mutated or ended while an iterator retains it",
+                local.0
+            )));
+        }
+        Ok(())
+    }
+
     fn accesses(
         &mut self,
         program: &mir::Program,
+        function: &mir::Function,
         accesses: &ClassLocalAccesses<'_>,
         checking: bool,
     ) -> Result<(), BackendError> {
+        if checking {
+            for value in &accesses.independent_values {
+                retained::validate_independent(
+                    function,
+                    &retained::value_sources(program, value, &self.roots, &self.loans)?,
+                )?;
+            }
+            for local in &accesses.resource_reads {
+                if self.ended.contains(local) {
+                    return Err(malformed_mir(
+                        "resource view is used after its source ownership ended",
+                    ));
+                }
+            }
+            for local in accesses
+                .collection_mutations
+                .iter()
+                .chain(&accesses.resource_transfers)
+            {
+                self.conflicts(*local)?;
+            }
+        }
         for access in accesses.iter() {
             match access {
                 ClassLocalAccess::Borrow(local)
@@ -68,22 +131,43 @@ impl State {
                         )));
                     }
                     if matches!(access, ClassLocalAccess::Transfer(_)) {
+                        if checking {
+                            self.conflicts(local)?;
+                        }
                         self.end(local);
                     }
                 }
-                ClassLocalAccess::Call(callee, args) if checking => {
+                ClassLocalAccess::Call(callee, args) => {
+                    if checking {
+                        retained::validate_call_inputs(
+                            program,
+                            function,
+                            callee,
+                            args,
+                            &self.roots,
+                            &self.loans,
+                        )?;
+                    }
                     let mut borrows = HashMap::new();
+                    let mut mutated = HashSet::new();
                     for (local, mode) in borrowed_call_locals(program, callee, args)? {
-                        if self.ended.contains(&local) {
+                        if matches!(mode, ClassBorrowMode::Writable) {
+                            if checking {
+                                self.conflicts(local)?;
+                            }
+                            mutated.extend(self.roots[local.0].iter().copied());
+                        }
+                        if checking && self.ended.contains(&local) {
                             return Err(malformed_mir(format!(
                                 "view local{} is used after its source ownership ended",
                                 local.0
                             )));
                         }
                         for root in &self.roots[local.0] {
-                            if borrows
-                                .get(root)
-                                .is_some_and(|previous| mode.conflicts_with(*previous))
+                            if checking
+                                && borrows
+                                    .get(root)
+                                    .is_some_and(|previous| mode.conflicts_with(*previous))
                             {
                                 return Err(class_access_error(
                                     "call through borrowed views",
@@ -94,9 +178,23 @@ impl State {
                             borrows.insert(*root, mode);
                         }
                     }
+                    for local in &function.locals {
+                        if !local.owned
+                            && !function.params.contains(&local.id)
+                            && !mutated.contains(&local.id)
+                            && self.roots[local.id.0]
+                                .iter()
+                                .any(|root| mutated.contains(root))
+                        {
+                            self.ended.insert(local.id);
+                        }
+                    }
                 }
-                ClassLocalAccess::BeginCall | ClassLocalAccess::Call(_, _) => {}
+                ClassLocalAccess::BeginCall => {}
             }
+        }
+        for local in &accesses.resource_transfers {
+            self.end(*local);
         }
         Ok(())
     }
@@ -121,6 +219,12 @@ impl State {
             }
         }
         let assignment = match statement {
+            mir::Statement::CoreCollection {
+                collection,
+                operation:
+                    mir::CoreCollectionOperation::KeyAt { target, .. }
+                    | mir::CoreCollectionOperation::ValueAt { target, .. },
+            } => Some((*target, self.roots[collection.0].clone())),
             mir::Statement::AssignLocal { target, value }
                 if !local_in(function, *target)?.owned =>
             {
@@ -145,15 +249,102 @@ impl State {
             }
             _ => None,
         };
+        let assigned_loans = if let mir::Statement::AssignLocal { value, .. } = statement {
+            retained::value_sources(program, value, &self.roots, &self.loans)?
+        } else {
+            HashSet::new()
+        };
+        if checking {
+            if let mir::Statement::CoreCollection {
+                collection,
+                operation,
+            } = statement
+            {
+                if operation.mutates() {
+                    self.conflicts(*collection)?;
+                }
+                for input in operation.transfers() {
+                    retained::validate_independent(function, &self.loans[input.0])?;
+                }
+            }
+            for source in &assigned_loans {
+                if !source.inherited && self.ended.contains(&source.local) {
+                    return Err(malformed_mir("iterator retains an ended source owner"));
+                }
+            }
+            let stored = match statement {
+                mir::Statement::AssignProperty {
+                    property, value, ..
+                } if !property_in(program, property.class, *property)?.borrowed_source => {
+                    Some(value)
+                }
+                mir::Statement::CollectionAdd { value, op, .. }
+                    if *op != mir::CollectionMutationOp::Remove =>
+                {
+                    Some(value)
+                }
+                mir::Statement::CollectionSet { value, .. }
+                | mir::Statement::AssignCollectionIndex { value, .. }
+                | mir::Statement::AssignStatic { value, .. } => Some(value),
+                _ => None,
+            };
+            if let Some(value) = stored {
+                retained::validate_independent(
+                    function,
+                    &retained::value_sources(program, value, &self.roots, &self.loans)?,
+                )?;
+            }
+            if let mir::Statement::CollectionSet { key, .. } = statement {
+                retained::validate_independent(
+                    function,
+                    &retained::value_sources(program, key, &self.roots, &self.loans)?,
+                )?;
+            }
+            match statement {
+                mir::Statement::CollectionAdd { collection, .. }
+                | mir::Statement::CollectionSet { collection, .. }
+                | mir::Statement::AssignCollectionIndex { collection, .. }
+                | mir::Statement::CollectionClear { collection, .. } => {
+                    self.conflicts(*collection)?
+                }
+                mir::Statement::AssignProperty { object, .. } => self.conflicts(*object)?,
+                _ => {}
+            }
+        }
         self.accesses(
             program,
+            function,
             &collect_statement_class_local_accesses(statement),
             checking,
         )?;
         if let Some((target, roots)) = assignment {
+            if checking {
+                self.conflicts(target)?;
+            }
             self.assign(target, roots);
+            self.loans[target.0] = assigned_loans;
         }
         match statement {
+            mir::Statement::CoreCollection { operation, .. } => {
+                if !matches!(
+                    operation,
+                    mir::CoreCollectionOperation::KeyAt { .. }
+                        | mir::CoreCollectionOperation::ValueAt { .. }
+                ) {
+                    for target in operation.outputs() {
+                        if checking {
+                            self.conflicts(target)?;
+                        }
+                        let roots = if local_in(function, target)?.owned {
+                            HashSet::from([target])
+                        } else {
+                            HashSet::new()
+                        };
+                        self.assign(target, roots);
+                        self.loans[target.0].clear();
+                    }
+                }
+            }
             mir::Statement::AssignLocalGroup { targets, .. } => {
                 for target in targets {
                     self.assign(*target, HashSet::new());
@@ -165,12 +356,18 @@ impl State {
             mir::Statement::DropClass { local, .. }
             | mir::Statement::DropError { local }
             | mir::Statement::DropMixed { local }
+            | mir::Statement::DropFunction { local, .. }
             | mir::Statement::DropCollection { local, .. }
             | mir::Statement::DropSharedReference { local, .. }
             | mir::Statement::DropWeakReference { local, .. }
             | mir::Statement::DropWritableSharedReference { local, .. }
             | mir::Statement::DropWritableWeakReference { local, .. }
-            | mir::Statement::DropSharedReferenceAccess { local, .. } => self.end(*local),
+            | mir::Statement::DropSharedReferenceAccess { local, .. } => {
+                if checking {
+                    self.conflicts(*local)?;
+                }
+                self.end(*local);
+            }
             _ => {}
         }
         Ok(())
@@ -246,7 +443,51 @@ impl State {
             } else {
                 HashSet::new()
             };
+            let loans = match terminator {
+                mir::Terminator::CheckedConstruct {
+                    constructor,
+                    args,
+                    success,
+                    ..
+                } if *success == target => retained::call_sources(
+                    program,
+                    *constructor,
+                    args,
+                    true,
+                    &state.roots,
+                    &state.loans,
+                )?,
+                mir::Terminator::CheckedCall {
+                    function: callee,
+                    args,
+                    success,
+                    ..
+                } if *success == target => retained::call_sources(
+                    program,
+                    *callee,
+                    args,
+                    false,
+                    &state.roots,
+                    &state.loans,
+                )?,
+                mir::Terminator::IndirectCall {
+                    callee,
+                    args,
+                    continuation: success,
+                    ..
+                }
+                | mir::Terminator::CheckedIndirectCall {
+                    callee,
+                    args,
+                    success,
+                    ..
+                } if *success == target => {
+                    retained::indirect_sources(program, callee, args, &state.roots, &state.loans)?
+                }
+                _ => HashSet::new(),
+            };
             state.assign(result, roots);
+            state.loans[result.0] = loans;
         }
         Ok(state)
     }
@@ -257,7 +498,7 @@ pub(super) fn validate(
     function: &mir::Function,
 ) -> Result<(), BackendError> {
     let mut entries = vec![None::<State>; function.blocks.len()];
-    entries[function.entry_block.0] = Some(State::new(function));
+    entries[function.entry_block.0] = Some(State::new(program, function));
     let mut pending = VecDeque::from([function.entry_block]);
     while let Some(id) = pending.pop_front() {
         let mut state = entries[id.0].clone().expect("reachable view state");
@@ -267,6 +508,7 @@ pub(super) fn validate(
         }
         state.accesses(
             program,
+            function,
             &collect_terminator_class_local_accesses(&block.terminator),
             false,
         )?;
@@ -281,6 +523,9 @@ pub(super) fn validate(
                     let before = existing.clone();
                     for (roots, incoming) in existing.roots.iter_mut().zip(outgoing.roots) {
                         roots.extend(incoming);
+                    }
+                    for (loans, incoming) in existing.loans.iter_mut().zip(outgoing.loans) {
+                        loans.extend(incoming);
                     }
                     existing.ended.extend(outgoing.ended);
                     *existing != before
@@ -298,8 +543,22 @@ pub(super) fn validate(
         for statement in &block.statements {
             state.statement(program, function, statement, true)?;
         }
+        if let mir::Terminator::Return(value) = &block.terminator {
+            retained::validate_return(
+                function,
+                &retained::value_sources(program, value, &state.roots, &state.loans)?,
+            )?;
+        }
+        retained::validate_indirect_inputs(
+            program,
+            function,
+            &block.terminator,
+            &state.roots,
+            &state.loans,
+        )?;
         state.accesses(
             program,
+            function,
             &collect_terminator_class_local_accesses(&block.terminator),
             true,
         )?;

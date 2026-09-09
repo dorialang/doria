@@ -60,7 +60,7 @@ foreach ($paths as $key => $path) {
 $require($paths['decision'], $files['decision'], [
     '# Decision 0134:',
     '**Status:** Accepted',
-    '**Implementation Status:** Stage 35 Authority Accepted; Slices 1 And 2 Complete; Slice 3 Next',
+    '**Implementation Status:** Stage 35 Authority Accepted; Slices 1, 2, And 3 Complete; Slice 4 Next',
     'interface Equatable<T>',
     'function equals(T $other): bool;',
     'function hash(): uint64;',
@@ -87,11 +87,11 @@ $require($paths['decision'], $files['decision'], [
 ]);
 
 $require($paths['plan'], $files['plan'], [
-    'Stage 35 — Interfaces And Traits — In Progress; Slices 1 And 2 Complete; Slice 3 Next',
+    'Stage 35 — Interfaces And Traits — In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next',
     'Slice 1 — Complete: Grammar, Graphs, And Conformance',
     'Slice 2 — Complete: Interface Runtime And Ownership',
-    'Slice 3 — Next: Core Contracts And Public Iteration',
-    'Slice 4 — Scheduled: Trait Composition',
+    'Slice 3 — Complete: Core Contracts And Public Iteration',
+    'Slice 4 — Next: Trait Composition',
     'Slice 5 — Scheduled: Cross-Repository Closure',
 ]);
 
@@ -101,8 +101,8 @@ $require($paths['pipeline'], $files['pipeline'], [
     'Stage 35 Authority — Accepted',
     'Stage 35 Slice 1 Grammar, Graphs, And Conformance — Complete',
     'Stage 35 Slice 2 Interface Runtime And Ownership — Complete',
-    'Stage 35 Slice 3 Core Contracts And Public Iteration — Next',
-    'Stage 35 Slice 4 Trait Composition — Scheduled',
+    'Stage 35 Slice 3 Core Contracts And Public Iteration — Complete',
+    'Stage 35 Slice 4 Trait Composition — Next',
     'Stage 35 Slice 5 Cross-Repository Closure — Scheduled',
     'Stage 35 — In Progress',
 ]);
@@ -140,6 +140,9 @@ $require($paths['collectionsAudit'], $files['collectionsAudit'], [
 ]);
 
 $staleStatus = [
+    'Slices 1 And 2 Complete; Slice 3 Next',
+    'Slice 3 is not delivered yet',
+    'core operations and public iteration: Slice 3 / E0759',
     'Slice 1 Complete; Slice 2 Next',
     'Stage 35 Slice 1 is complete and Slice 2 is next',
     'interface-typed values and general interface dispatch remain deferred',
@@ -173,6 +176,11 @@ $require('crates/doriac/tests/stage35_runtime_tests.rs', $read('crates/doriac/te
     'durable_interface_fixtures_preserve_php_execution_and_cleanup',
     'interface_dispatch_rejects_slot_receiver_and_entry_abi_mismatches',
     'interface_carrier_validation_rejects_unknown_and_mismatched_views',
+    'generated_core_calls_require_nominal_selection_and_owned_duplication',
+    'retained_iterator_mir_keeps_source_ownership_and_validates_lifetimes',
+    'public_foreach_acquires_once_advances_on_continue_and_preserves_move_elements',
+    'collection_core_failures_preserve_existing_owners_and_clean_partial_results',
+    'local_collection_cursors_use_fixed_frame_storage_without_changing_returned_cursors',
 ]);
 
 foreach ($files as $key => $contents) {
@@ -192,8 +200,7 @@ $forbid($paths['stdlib'], $files['stdlib'], ['`current(): T`']);
 
 $require($paths['readme'], $files['readme'], [
     'currently provides `map`, `filter`',
-    '`filter` currently',
-    'preserves Copy elements',
+    'preserves Copy-or-Cloneable elements',
 ]);
 
 foreach ([

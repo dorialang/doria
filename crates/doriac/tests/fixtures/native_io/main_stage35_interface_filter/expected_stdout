@@ -1,0 +1,16 @@
+visit 1
+clone 1
+visit 2
+visit 3
+clone 3
+selected 1
+selected 3
+drop 3
+drop 1
+source 1
+source 2
+source 3
+a
+drop 3
+drop 2
+drop 1

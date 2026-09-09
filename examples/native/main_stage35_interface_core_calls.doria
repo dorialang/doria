@@ -1,0 +1,46 @@
+class Key implements Comparable<Key>, Equatable<Key>, Hashable, Cloneable
+{
+    function __construct(int $value) {}
+
+    function compare(Key $other): Ordering
+    {
+        if ($this->value < $other->value) { return Ordering::Less; }
+        if ($this->value > $other->value) { return Ordering::Greater; }
+        return Ordering::Equal;
+    }
+
+    function equals(Key $other): bool { return $this->value == $other->value; }
+    function hash(): uint64 { return 18446744073709551615; }
+    function clone(): self { return new Key($this->value); }
+}
+
+function label(Ordering $order): string
+{
+    return match ($order) {
+        Ordering::Less => "less",
+        Ordering::Equal => "equal",
+        Ordering::Greater => "greater",
+    };
+}
+
+function constrained<T implements Comparable<T>, Equatable<T>, Hashable, Cloneable>(T $left, T $right): void
+{
+    let $copy = $left->clone();
+    echo label($copy->compare($right)) . " {$copy->equals($left)} {$copy->hash()}\n";
+}
+
+function compareErased(Comparable<Key> $left, Key $right): Ordering { return $left->compare($right); }
+function equalsErased(Equatable<Key> $left, Key $right): bool { return $left->equals($right); }
+function hashErased(Hashable $key): uint64 { return $key->hash(); }
+function cloneErased(Cloneable $key): Cloneable { return $key->clone(); }
+
+function main(): void
+{
+    let $one = new Key(1);
+    let $two = new Key(2);
+    echo label($one->compare($two)) . " " . label($two->compare($one)) . " " . label($one->compare($one)) . "\n";
+    constrained($one, $two);
+    echo label(compareErased($two, $one)) . " {equalsErased($one, $one)} {hashErased($two)}\n";
+    let $copy = cloneErased($two);
+    if ($copy is Key) { echo "cloned {$copy->value}\n"; }
+}

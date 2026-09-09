@@ -254,7 +254,8 @@ pub fn resolved_facts_use_canonical_io(facts: &GlobalSymbolFacts) -> bool {
             GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::StandardIo(_))
         )
         || matches!(&reference.symbol_id.owner,
-            GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::Prelude(name)) if name == "Displayable")
+            GlobalSymbolOwner::CompilerKnown(CompilerSymbolIdentity::Prelude(name))
+                if crate::compiler_known_contracts::interfaces().any(|interface| interface.name == *name))
     })
 }
 
@@ -366,6 +367,7 @@ fn error_class(name: &str, properties: &[(&str, &str, bool)], span: Span) -> Ite
     let params = properties
         .iter()
         .map(|(ty, property, nullable)| Param {
+            borrow_span: None,
             constructor_role: ConstructorParameterRole::Promoted {
                 access: MemberAccess::External,
                 access_span: None,

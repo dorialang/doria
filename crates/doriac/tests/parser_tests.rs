@@ -575,12 +575,17 @@ fn structural_lowering_preserves_stage_13_operator_variants() {
 }
 
 #[test]
-fn direct_lowering_preserves_contract_facts_without_runtime_declarations() {
+fn direct_lowering_keeps_interfaces_in_contract_facts_and_ordering_executable() {
     let ast = doriac::parse_source("test.doria", "interface Printable {}")
         .expect("accepted interface declaration should parse");
     let hir =
         doriac::lowering::lower_program(&ast).expect("declarations are compile-time material");
-    assert!(hir.items.is_empty());
+    assert!(matches!(
+        hir.items.as_slice(),
+        [doriac::hir::Item::Enum(declaration)]
+            if declaration.name == "Ordering"
+                && declaration.span.source == doriac::compiler_known_contracts::SOURCE_ID
+    ));
     assert_eq!(hir.semantic_info.contracts.interfaces[0].name, "Printable");
 }
 

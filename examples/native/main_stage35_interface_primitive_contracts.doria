@@ -1,0 +1,36 @@
+function same<T implements Equatable<T>>(T $left, T $right): bool
+{
+    return $left->equals(other: $right);
+}
+
+function order<T implements Comparable<T>>(T $left, T $right): Ordering
+{
+    return $left->compare(other: $right);
+}
+
+function hashValue<T implements Hashable>(T $value): uint64
+{
+    return $value->hash();
+}
+
+function label(Ordering $value): string
+{
+    return match ($value) {
+        Ordering::Less => "L",
+        Ordering::Equal => "E",
+        Ordering::Greater => "G",
+    };
+}
+
+function main(): void
+{
+    echo same(7, 7) . " " . same(7, 8) . " " . same(true, false) . " " .
+        same(1.5, 1.5) . " " . same("text", "text") . "\n";
+    uint64 $high = 18446744073709551615;
+    uint64 $low = 1;
+    echo label(order(-7, 7)) . label(order(7, 7)) . label(order($high, $low)) .
+        label(order(false, true)) . label(order("a", "b")) . "\n";
+    echo hashValue(-1) . " " . hashValue($high) . " " . hashValue(true) . " " .
+        hashValue(false) . " " . hashValue("") . "\n";
+    echo hashValue("hello") . "\n";
+}

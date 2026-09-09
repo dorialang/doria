@@ -1,0 +1,35 @@
+class Key implements Equatable<Key>
+{
+    function __construct(int $value) {}
+
+    function equals(Key $other): bool
+    {
+        echo "compare {$this->value}:{$other->value}\n";
+        return $this->value == $other->value;
+    }
+}
+
+function main(): void
+{
+    writable List<Key> $keys = [new Key(1), new Key(2), new Key(2)];
+    echo ($keys->indexOf(new Key(2)) ?? -1) . "\n";
+    echo $keys->remove(new Key(2)) . "\n";
+    foreach ($keys as Key $key) { echo "left {$key->value}\n"; }
+    echo $keys->contains(new Key(3)) . "\n";
+    $keys->remove(new Key(1));
+    foreach ($keys as Key $key) { echo "remaining {$key->value}\n"; }
+
+    writable List<?Key> $nullable = [null, new Key(7)];
+    echo ($nullable->indexOf(null) ?? -1) . "\n";
+    echo $nullable->contains(new Key(7)) . "\n";
+    echo $nullable->remove(new Key(7)) . "\n";
+    echo $nullable->remove(null) . "\n";
+    echo $nullable->remove(null) . "\n";
+    Key[] $array = [new Key(4)];
+    echo $array->contains(new Key(4)) . "\n";
+    Dictionary<string, Key> $dictionary = ["one" => new Key(1)];
+    echo $dictionary->containsValue(new Key(1)) . "\n";
+    writable Deque<Key> $deque = Deque::from([]);
+    $deque->pushBack(new Key(8));
+    echo $deque->contains(new Key(8)) . "\n";
+}

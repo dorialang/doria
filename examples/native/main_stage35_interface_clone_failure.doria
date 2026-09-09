@@ -1,0 +1,37 @@
+class Item implements Cloneable
+{
+    function __construct(int $id) {}
+
+    function clone(): self
+    {
+        echo "clone {$this->id}\n";
+        if ($this->id == 2) { read_file("stage35-missing-clone-input.txt"); }
+        return new Item($this->id);
+    }
+
+    function __destruct(): void
+    {
+        try { echo "drop {$this->id}\n"; } catch (Error $error) {}
+    }
+}
+
+function main(): void
+{
+    List<Item> $source = [new Item(1), new Item(2), new Item(3)];
+    try {
+        let $selected = $source->filter(fn(Item $item) => true);
+    } catch (Error $error) { echo "clone failed\n"; }
+    try {
+        let $selected = $source->filter(function (Item $item): bool {
+            if ($item->id == 2) { read_file("stage35-missing-clone-input.txt"); }
+            return true;
+        });
+    } catch (Error $error) { echo "predicate failed\n"; }
+    try {
+        let $copy = Deque::from($source);
+    } catch (Error $error) { echo "from failed\n"; }
+    try {
+        let $copy = SortedDictionary::from(["a" => new Item(1), "b" => new Item(2)]);
+    } catch (Error $error) { echo "sorted from failed\n"; }
+    foreach ($source as Item $item) { echo "source {$item->id}\n"; }
+}

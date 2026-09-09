@@ -113,7 +113,7 @@ function check_closure_capture_authority(string $root): array
         '**Stage 30 Closure Authority — Accepted And Implemented; Stage 30 — Complete.**',
         'Missing, duplicate, wrong-mode, unused, moved, and insufficient-lifetime captures',
         'Function types preserve checked effects',
-        '`List<T>` alone receives `map`, Copy-only preserving `filter`, and writable-accumulator `reduce`',
+        '`List<T>` alone receives `map`, Copy-or-Cloneable preserving `filter`, and writable-accumulator `reduce`',
         'Copy/Move values have no implicit exception',
     ]);
     $forbid($planPath, $plan, [

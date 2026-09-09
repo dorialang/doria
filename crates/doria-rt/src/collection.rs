@@ -1,6 +1,8 @@
 use core::mem;
 use core::ptr;
 
+mod core_ops;
+
 use crate::{
     allocate, deallocate, dr_v2_panic_code, dr_v2_panic_index_out_of_bounds, DrStackFrameV2,
     DrStringV1,
@@ -67,6 +69,11 @@ pub struct DrCollectionV1 {
     value_stride: usize,
     value_alignment: usize,
     aggregate: u8,
+    // Core-contract operations store complete keys and cached user hashes
+    // inline. User code executes in MIR, never inside a runtime callback.
+    key_stride: usize,
+    hashes: *mut u64,
+    hashed: u8,
 }
 
 pub const DR_COLLECTION_LENGTH_OFFSET: usize = mem::offset_of!(DrCollectionV1, length);
@@ -86,6 +93,68 @@ pub const DR_COLLECTION_VALUE_ALIGNMENT_OFFSET: usize =
 pub const DR_COLLECTION_AGGREGATE_OFFSET: usize = mem::offset_of!(DrCollectionV1, aggregate);
 pub const DR_COLLECTION_SIZE: usize = mem::size_of::<DrCollectionV1>();
 pub const DR_COLLECTION_ALIGN: usize = mem::align_of::<DrCollectionV1>();
+
+#[repr(C)]
+pub struct DrCollectionIteratorV1 {
+    source: *const DrCollectionV1,
+    position: usize,
+}
+
+/// # Safety
+/// `source` must remain live and readonly until the returned cursor is dropped.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dr_v1_collection_iterator_new(
+    frame: *const DrStackFrameV2,
+    source: *const DrCollectionV1,
+) -> *mut DrCollectionIteratorV1 {
+    let cursor =
+        allocate(mem::size_of::<DrCollectionIteratorV1>()).cast::<DrCollectionIteratorV1>();
+    if cursor.is_null() {
+        dr_v2_panic_code(frame, b"P1206".as_ptr(), 5, ptr::null(), 0);
+    }
+    cursor.write(DrCollectionIteratorV1 {
+        source,
+        position: 0,
+    });
+    cursor
+}
+
+/// # Safety
+/// `cursor` must be a live cursor allocated by `dr_v1_collection_iterator_new`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dr_v1_collection_iterator_drop(
+    _frame: *const DrStackFrameV2,
+    cursor: *mut DrCollectionIteratorV1,
+) {
+    deallocate(cursor.cast());
+}
+
+/// # Safety
+/// `cursor` and its borrowed source must remain live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dr_v1_collection_iterator_source(
+    cursor: *const DrCollectionIteratorV1,
+) -> *const DrCollectionV1 {
+    (*cursor).source
+}
+
+/// # Safety
+/// `cursor` must be live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dr_v1_collection_iterator_position(
+    cursor: *const DrCollectionIteratorV1,
+) -> usize {
+    (*cursor).position
+}
+
+/// # Safety
+/// The caller must have exclusive cursor access and a live readonly source loan.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dr_v1_collection_iterator_advance(cursor: *mut DrCollectionIteratorV1) {
+    if (*cursor).position < (*(*cursor).source).length {
+        (*cursor).position += 1;
+    }
+}
 
 fn valid_value_width(width: u8) -> bool {
     matches!(width, 1 | 2 | 4 | 8 | 16)
@@ -240,14 +309,29 @@ unsafe fn grow(collection: *mut DrCollectionV1) {
     (*collection).values = values;
 
     if (*collection).keyed != 0 {
-        let keys = allocate_words(next);
+        let keys =
+            allocate_values_with_frame(ptr::null(), next, (*collection).key_stride).cast::<u64>();
         if (*collection).length != 0 {
-            ptr::copy_nonoverlapping((*collection).keys, keys, (*collection).length);
+            ptr::copy_nonoverlapping(
+                (*collection).keys.cast::<u8>(),
+                keys.cast::<u8>(),
+                (*collection).length * (*collection).key_stride,
+            );
         }
         if !(*collection).keys.is_null() {
             deallocate((*collection).keys.cast::<u8>());
         }
         (*collection).keys = keys;
+    }
+    if (*collection).hashed != 0 {
+        let hashes = allocate_words(next);
+        if (*collection).length != 0 {
+            ptr::copy_nonoverlapping((*collection).hashes, hashes, (*collection).length);
+        }
+        if !(*collection).hashes.is_null() {
+            deallocate((*collection).hashes.cast());
+        }
+        (*collection).hashes = hashes;
     }
     (*collection).capacity = next;
     if (*collection).kind == KIND_DEQUE {
@@ -301,6 +385,9 @@ unsafe fn new_with_frame(
             value_stride: usize::from(value_width),
             value_alignment: usize::from(value_width).min(mem::align_of::<u64>()),
             aggregate: 0,
+            key_stride: mem::size_of::<u64>(),
+            hashes: ptr::null_mut(),
+            hashed: 0,
         },
     );
     collection
@@ -359,6 +446,9 @@ pub unsafe fn new_aggregate(
             value_stride,
             value_alignment,
             aggregate: 1,
+            key_stride: mem::size_of::<u64>(),
+            hashes: ptr::null_mut(),
+            hashed: 0,
         },
     );
     collection
@@ -450,6 +540,46 @@ pub unsafe fn fill_word(
     collection
 }
 
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn construction_capacity(
+    frame: *const DrStackFrameV2,
+    count: usize,
+    fixed: bool,
+    value_width: u8,
+    aggregate: bool,
+    keyed: bool,
+    kind: u8,
+    comparator: u8,
+) -> *mut DrCollectionV1 {
+    let collection = if aggregate {
+        new_aggregate(
+            frame,
+            count,
+            keyed,
+            true,
+            usize::from(value_width),
+            mem::align_of::<u64>(),
+            kind,
+            comparator,
+        )
+    } else {
+        new_with_frame(frame, count, keyed, true, value_width)
+    };
+    (*collection).length = 0;
+    (*collection).fixed = u8::from(fixed);
+    (*collection).kind = kind;
+    (*collection).comparator = comparator;
+    (*collection).finalized = 0;
+    collection
+}
+
+pub unsafe fn initialize_key(collection: *mut DrCollectionV1, key: u64) {
+    if (*collection).keyed == 0 || (*collection).length == 0 || (*collection).finalized != 0 {
+        collection_panic(b"P1001");
+    }
+    *(*collection).keys.add((*collection).length - 1) = key;
+}
+
 pub unsafe fn fill_string(
     frame: *const DrStackFrameV2,
     value: *mut DrStringV1,
@@ -480,6 +610,10 @@ pub unsafe fn free(collection: *mut DrCollectionV1) {
 }
 
 unsafe fn free_storage(collection: *mut DrCollectionV1) {
+    if !(*collection).hashes.is_null() {
+        deallocate((*collection).hashes.cast());
+        (*collection).hashes = ptr::null_mut();
+    }
     if !(*collection).keys.is_null() {
         deallocate((*collection).keys.cast::<u8>());
         (*collection).keys = ptr::null_mut();
@@ -549,6 +683,9 @@ pub unsafe fn detach_for_cleanup(
             value_stride: (*detached).value_stride,
             value_alignment: (*detached).value_alignment,
             aggregate: (*detached).aggregate,
+            key_stride: (*detached).key_stride,
+            hashes: ptr::null_mut(),
+            hashed: (*detached).hashed,
         },
     );
 }
@@ -574,9 +711,11 @@ pub unsafe fn finish_detached_cleanup(
         (*collection).capacity = (*detached).capacity;
         (*collection).keys = (*detached).keys;
         (*collection).values = (*detached).values;
+        (*collection).hashes = (*detached).hashes;
         (*detached).capacity = 0;
         (*detached).keys = ptr::null_mut();
         (*detached).values = ptr::null_mut();
+        (*detached).hashes = ptr::null_mut();
     }
     free_storage(detached);
 }
@@ -884,7 +1023,7 @@ pub unsafe fn finalize_stage26(collection: *mut DrCollectionV1) {
                 }
             }
         }
-        KIND_DEQUE => {}
+        KIND_LEGACY | KIND_DEQUE => {}
         _ => collection_panic(b"P1001"),
     }
     (*collection).finalized = 1;
@@ -1278,6 +1417,10 @@ pub unsafe fn aggregate_nullable_access_into(
                 Some(())
             }
         }
+        8 => {
+            aggregate_remove_at_into(ptr::null(), collection, key as usize, destination);
+            Some(())
+        }
         _ => collection_panic(b"P1001"),
     };
     if copied.is_some() {
@@ -1352,6 +1495,7 @@ const INDEX_MIN_SLOTS: usize = 16;
 /// never matches, which is what the linear scan already did.
 unsafe fn hash_word(word: u64, kind: u8) -> usize {
     let bits = match kind {
+        core_ops::COMPARE_CORE => word ^ core_ops::hash_seed(),
         COMPARE_STRING => return hash_string(word as *const DrStringV1),
         COMPARE_FLOAT32 => {
             let value = f32::from_bits(word as u32);
@@ -1409,7 +1553,9 @@ fn word_equality_is_exact(kind: u8) -> bool {
 /// The word an index entry compares against: the key for a dictionary, the
 /// value for a set.
 unsafe fn indexed_word(collection: *const DrCollectionV1, position: usize, keyed: bool) -> u64 {
-    if keyed {
+    if (*collection).hashed != 0 {
+        *(*collection).hashes.add(position)
+    } else if keyed {
         *(*collection).keys.add(position)
     } else {
         read_value(collection, position)
@@ -1940,6 +2086,14 @@ pub unsafe fn nullable_access(
                 read_value(collection, index)
             }
         }
+        8 => {
+            let index = key as usize;
+            if index >= (*collection).length {
+                collection_bounds_panic(ptr::null(), index, (*collection).length);
+            }
+            *found = u8::from(read_present(collection, index));
+            remove_at(ptr::null(), collection, index)
+        }
         _ => collection_panic(b"P1001"),
     }
 }
@@ -2307,6 +2461,56 @@ mod tests {
             reset_after_cleanup(collection);
             reset_after_cleanup(collection);
             assert_eq!((*collection).length, 0);
+            free(collection);
+        }
+    }
+
+    #[test]
+    fn construction_finalization_preserves_sequence_storage_and_presence() {
+        unsafe {
+            for fixed in [false, true] {
+                let collection = construction_capacity(
+                    ptr::null(),
+                    3,
+                    fixed,
+                    16,
+                    false,
+                    false,
+                    KIND_LEGACY,
+                    COMPARE_UNSIGNED_64,
+                );
+                push_nullable(collection, false, 0);
+                push_nullable(collection, true, 42);
+                let values = (*collection).values;
+                finalize_stage26(collection);
+                assert_eq!((*collection).values, values);
+                assert_eq!((*collection).fixed, u8::from(fixed));
+                assert_eq!((*collection).finalized, 1);
+                assert_eq!(length(collection), 2);
+                assert!(!read_present(collection, 0));
+                assert!(read_present(collection, 1));
+                assert_eq!(read_value(collection, 1), 42);
+                free(collection);
+            }
+            let collection = construction_capacity(
+                ptr::null(),
+                1,
+                true,
+                16,
+                true,
+                false,
+                KIND_LEGACY,
+                COMPARE_UNSIGNED_64,
+            );
+            aggregate_push_slot(collection)
+                .cast::<[u64; 2]>()
+                .write([7, 11]);
+            finalize_stage26(collection);
+            assert_eq!(
+                value_address(collection, 0).cast::<[u64; 2]>().read(),
+                [7, 11]
+            );
+            assert_eq!(length(collection), 1);
             free(collection);
         }
     }

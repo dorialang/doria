@@ -61,6 +61,27 @@ fn interpret(source: &str) -> doriac::mir_interpreter::InterpreterOutput {
 }
 
 #[test]
+fn numeric_constant_and_static_checks_preserve_declared_literal_context() {
+    let source = r#"
+const uint64 HIGH = 9223372036854775808;
+class Limits {
+    const uint64 MAXIMUM = 18446744073709551615;
+    static uint64 $maximum = 18446744073709551615;
+    const float32 FRACTION = 1.5;
+}
+function main(): void {
+    echo HIGH . " " . Limits::MAXIMUM . " " . Limits::maximum . " " . Limits::FRACTION . "\n";
+}
+"#;
+    assert_eq!(
+        interpret(source).stdout,
+        b"9223372036854775808 18446744073709551615 18446744073709551615 1.5\n"
+    );
+    assert_diagnostic("const uint8 LIMIT = 256;", "E0417");
+    assert_diagnostic("class Limits { const uint64 LIMIT = -1; }", "E0417");
+}
+
+#[test]
 fn parses_constants_static_members_and_explicit_method_identity() {
     let program = doriac::parse_source(
         "surface.doria",

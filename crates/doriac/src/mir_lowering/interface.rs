@@ -14,8 +14,27 @@ pub(super) struct MethodKey {
 
 #[derive(Clone)]
 pub(super) struct CallPlan {
-    slot: usize,
+    pub(super) slot: usize,
     signature: FunctionSignature,
+}
+
+pub(super) fn collection_vtable(
+    collection: mir::CollectionTypeId,
+    interface: mir::InterfaceTypeId,
+    span: Span,
+    context: &LoweringContext<'_>,
+) -> DiagnosticResult<mir::InterfaceVtableId> {
+    context
+        .collection_registry
+        .interface_vtable_ids
+        .get(&(mir::ImplementingType::Collection(collection), interface))
+        .copied()
+        .ok_or_else(|| {
+            vec![unsupported(
+                span,
+                "collection has no checked implementation of this interface",
+            )]
+        })
 }
 
 pub(super) fn convert_value(
@@ -35,6 +54,23 @@ pub(super) fn convert_value(
                 .contains(&interface)
     };
     let value = match value {
+        value @ (mir::Rvalue::Collection(_) | mir::Rvalue::NullableCollection(_)) => {
+            let (mir::Type::Collection(collection), source_nullable) =
+                non_null_match_type(value.ty())
+            else {
+                unreachable!()
+            };
+            if source_nullable && !nullable {
+                return Err(vec![unsupported(
+                    span,
+                    "nullable collection requires a presence proof before interface conversion",
+                )]);
+            }
+            mir::InterfaceValue::FromCollection {
+                vtable: collection_vtable(collection, interface, span, context)?,
+                value: Box::new(value),
+            }
+        }
         mir::Rvalue::Class(object) => mir::InterfaceValue::FromClass {
             vtable: context.class_interface_vtable(object.class(), interface, span)?,
             object: Box::new(object),
@@ -92,17 +128,33 @@ pub(super) fn call_plan(
     if !matches!(expr, hir::Expr::MethodCall { .. }) {
         return Ok(None);
     }
+    call_plan_at(expr.span(), context)
+}
+
+pub(super) fn call_plan_at(
+    span: Span,
+    context: &LoweringContext<'_>,
+) -> DiagnosticResult<Option<(mir::InterfaceTypeId, CallPlan)>> {
+    let target = context
+        .semantic_info
+        .call_targets
+        .get(&span)
+        .and_then(|target| {
+            target.specialize(|ty| substitute_resolved_type(ty, &context.type_substitutions))
+        });
+    call_plan_target(span, target, context)
+}
+
+pub(super) fn call_plan_target(
+    span: Span,
+    target: Option<CallableTarget>,
+    context: &LoweringContext<'_>,
+) -> DiagnosticResult<Option<(mir::InterfaceTypeId, CallPlan)>> {
     let Some(CallableTarget::InterfaceMethod {
         interface,
         requirement,
         ..
-    }) = context
-        .semantic_info
-        .call_targets
-        .get(&expr.span())
-        .and_then(|target| {
-            target.specialize(|ty| substitute_resolved_type(ty, &context.type_substitutions))
-        })
+    }) = target
     else {
         return Ok(None);
     };
@@ -115,13 +167,13 @@ pub(super) fn call_plan(
             vec![Diagnostic::new(
                 "I2401",
                 "checked interface call has no native interface specialization",
-                expr.span(),
+                span,
             )]
         })?;
     let key = MethodKey {
         interface,
         requirement,
-        arguments: context.specialization_arguments(expr.span()),
+        arguments: context.specialization_arguments(span),
     };
     context
         .collection_registry
@@ -133,9 +185,45 @@ pub(super) fn call_plan(
             vec![Diagnostic::new(
                 "I2401",
                 "checked interface call has no specialized requirement slot",
-                expr.span(),
+                span,
             )]
         })
+}
+
+pub(super) fn materialize_lowered_call(
+    receiver: mir::Rvalue,
+    args: Vec<mir::Rvalue>,
+    (interface, plan): (mir::InterfaceTypeId, CallPlan),
+    span: Span,
+    consume_result: bool,
+    context: &mut LoweringContext<'_>,
+) -> DiagnosticResult<Option<(mir::LocalId, mir::Type, bool)>> {
+    let definition = context.collection_registry.function_types[context
+        .collection_registry
+        .interface_types[interface.0]
+        .methods[plan.slot]
+        .signature
+        .0]
+        .clone();
+    let local = context.declare_borrowed_temp(mir::Type::Interface(interface), false);
+    context.push_statement(mir::Statement::AssignLocal {
+        target: local,
+        value: receiver,
+    });
+    let mut lowered = vec![local_rvalue(local, mir::Type::Interface(interface), false)];
+    lowered.extend(args);
+    emit_indirect_call(
+        mir::IndirectCallee::InterfaceMethod {
+            receiver: local,
+            interface,
+            slot: plan.slot,
+        },
+        &definition,
+        lowered,
+        span,
+        consume_result,
+        context,
+    )
 }
 
 pub(super) fn materialize_call(
@@ -174,6 +262,7 @@ pub(super) fn materialize_call(
         };
         return materialize_null_safe_call(
             receiver,
+            context.coalesce_selection(object),
             writable,
             definition.return_borrow,
             *span,
@@ -337,13 +426,6 @@ pub(super) fn register_methods(
     registry: &mut NativeTypeRegistry,
 ) -> DiagnosticResult<()> {
     for fact in &semantic.contracts.interface_specializations {
-        if crate::compiler_known_contracts::requires_core_execution(&fact.specialization.name)
-            || fact.ancestors.iter().any(|ancestor| {
-                crate::compiler_known_contracts::requires_core_execution(&ancestor.name)
-            })
-        {
-            continue;
-        }
         let Some(interface) = registry.interface_ids.get(&fact.specialization).copied() else {
             continue;
         };
@@ -562,6 +644,11 @@ pub(super) fn build_entries(
     for index in 0..registry.interface_vtables.len() {
         let table = registry.interface_vtables[index].clone();
         let mir::ImplementingType::Class(class) = table.implementing_type else {
+            for method in registry.interface_types[table.interface.0].methods.clone() {
+                let id = mir::FunctionId(functions.len());
+                functions.push(build_collection_entry(id, &table, &method, registry)?);
+                registry.interface_vtables[index].methods.push(id);
+            }
             continue;
         };
         let conformance = semantic.contracts.conformances.iter().find(|fact| {
@@ -641,6 +728,177 @@ pub(super) fn build_entries(
     Ok(())
 }
 
+fn build_collection_entry(
+    id: mir::FunctionId,
+    table: &mir::InterfaceVtable,
+    method: &mir::InterfaceMethod,
+    registry: &NativeTypeRegistry,
+) -> DiagnosticResult<mir::Function> {
+    use crate::compiler_known_contracts::IterationOperation as Op;
+    let operation = Op::from_requirement(method.requirement).expect("canonical collection adapter");
+    let contract = &registry.function_types[method.signature.0];
+    let (mir::ImplementingType::Collection(collection)
+    | mir::ImplementingType::CollectionIterator(collection)) = table.implementing_type
+    else {
+        unreachable!()
+    };
+    let receiver = mir::LocalId(0);
+    let source = mir::LocalId(1);
+    let mut locals = vec![mir::Local {
+        id: receiver,
+        name: "__receiver".into(),
+        ty: mir::Type::Interface(table.interface),
+        writable: operation == Op::Advance,
+        owned: false,
+        synthetic: true,
+    }];
+    let mut statements = Vec::new();
+    if operation != Op::Advance {
+        locals.push(mir::Local {
+            id: source,
+            name: "__source".into(),
+            ty: mir::Type::Collection(collection),
+            writable: false,
+            owned: false,
+            synthetic: true,
+        });
+        statements.push(mir::Statement::AssignLocal {
+            target: source,
+            value: mir::Rvalue::Collection(if operation == Op::Acquire {
+                mir::CollectionExpression::InterfaceReceiver {
+                    collection,
+                    receiver,
+                    vtable: table.id,
+                }
+            } else {
+                mir::CollectionExpression::IteratorSource {
+                    collection,
+                    receiver,
+                    vtable: table.id,
+                }
+            }),
+        });
+    }
+    let position = mir::IntegerExpression::Use {
+        ty: IntegerType::Int64,
+        operand: mir::Operand::CollectionIteratorPosition {
+            receiver,
+            vtable: table.id,
+        },
+    };
+    let terminator = match operation {
+        Op::Acquire => {
+            let mir::ReturnType::Value(mir::Type::Interface(iterator)) = contract.return_type
+            else {
+                unreachable!()
+            };
+            statements.insert(
+                0,
+                mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(
+                    mir::RetainedSourcesPlan {
+                        returns: vec![mir::RetainedSource {
+                            local: receiver,
+                            inherited: false,
+                        }],
+                        constructs: Vec::new(),
+                        independent_parameters: Vec::new(),
+                        promotions: Vec::new(),
+                    },
+                )),
+            );
+            let vtable = registry.interface_vtable_ids[&(
+                mir::ImplementingType::CollectionIterator(collection),
+                iterator,
+            )];
+            mir::Terminator::Return(mir::Rvalue::interface(
+                iterator,
+                mir::InterfaceValue::NewCollectionIterator { source, vtable },
+            ))
+        }
+        Op::HasCurrent => mir::Terminator::Return(mir::Rvalue::Value(mir::ValueExpression::Bool(
+            mir::BoolExpression::Compare {
+                op: mir::CompareOp::Less,
+                left: Box::new(mir::ValueExpression::Integer(position)),
+                right: Box::new(mir::ValueExpression::Integer(mir::IntegerExpression::Use {
+                    ty: IntegerType::Int64,
+                    operand: mir::Operand::CollectionLength(source),
+                })),
+            },
+        ))),
+        Op::GetCurrent => {
+            let index = mir::Rvalue::Value(mir::ValueExpression::Integer(position));
+            let definition = &registry.types[collection.0];
+            let value = if definition.uses_core_operations() {
+                let position = mir::LocalId(locals.len());
+                locals.push(mir::Local {
+                    id: position,
+                    name: "__position".into(),
+                    ty: mir::Type::Scalar(mir::ScalarType::Integer(IntegerType::Int64)),
+                    writable: false,
+                    owned: false,
+                    synthetic: true,
+                });
+                statements.push(mir::Statement::AssignLocal {
+                    target: position,
+                    value: index,
+                });
+                let target = mir::LocalId(locals.len());
+                locals.push(mir::Local {
+                    id: target,
+                    name: "__element".into(),
+                    ty: definition.value,
+                    writable: false,
+                    owned: false,
+                    synthetic: true,
+                });
+                statements.push(mir::Statement::CoreCollection {
+                    collection: source,
+                    operation: mir::CoreCollectionOperation::ValueAt { position, target },
+                });
+                local_rvalue(target, definition.value, false)
+            } else {
+                collection_value_rvalue(source, index.clone(), index, definition.value, true)?
+            };
+            mir::Terminator::Return(value)
+        }
+        Op::Advance => {
+            statements.push(mir::Statement::AdvanceCollectionIterator {
+                receiver,
+                vtable: table.id,
+            });
+            mir::Terminator::ReturnVoid
+        }
+    };
+    Ok(mir::Function {
+        id,
+        name: format!("<collection#{}>::{}", collection.0, method.name),
+        source_span: method.requirement,
+        method: None,
+        virtual_slot: None,
+        receiver_mode: None,
+        closure: None,
+        params: vec![receiver],
+        parameter_modes: contract
+            .parameters
+            .iter()
+            .map(|parameter| parameter.mode)
+            .collect(),
+        return_type: contract.return_type,
+        return_borrow: contract.return_borrow,
+        required_checked_effects: contract.checked_effects.clone(),
+        ambient_checked_effects: contract.ambient_checked_effects.clone(),
+        test_assertion_checked_effects: contract.test_assertion_checked_effects.clone(),
+        checked_effects: contract.complete_checked_effects(),
+        locals,
+        blocks: vec![mir::BasicBlock {
+            id: mir::BlockId(0),
+            statements,
+            terminator,
+        }],
+        entry_block: mir::BlockId(0),
+    })
+}
+
 fn build_entry(
     id: mir::FunctionId,
     table: &mir::InterfaceVtable,
@@ -669,6 +927,43 @@ fn build_entry(
         .collect::<Vec<_>>();
     let params = locals.iter().map(|local| local.id).collect::<Vec<_>>();
     let mut statements = Vec::new();
+    if let Some(plan) = implementation.blocks[implementation.entry_block.0]
+        .statements
+        .iter()
+        .find_map(|statement| match statement {
+            mir::Statement::ControlFlowPlan(mir::ControlFlowPlan::RetainedSources(plan)) => {
+                Some(plan)
+            }
+            _ => None,
+        })
+    {
+        let remap = |local| {
+            params[implementation
+                .params
+                .iter()
+                .position(|parameter| *parameter == local)
+                .expect("retained input parameter")]
+        };
+        statements.push(mir::Statement::ControlFlowPlan(
+            mir::ControlFlowPlan::RetainedSources(mir::RetainedSourcesPlan {
+                returns: plan
+                    .returns
+                    .iter()
+                    .map(|source| mir::RetainedSource {
+                        local: remap(source.local),
+                        inherited: source.inherited,
+                    })
+                    .collect(),
+                constructs: Vec::new(),
+                independent_parameters: plan
+                    .independent_parameters
+                    .iter()
+                    .map(|local| remap(*local))
+                    .collect(),
+                promotions: Vec::new(),
+            }),
+        ));
+    }
     let mut args = vec![mir::Rvalue::Class(
         mir::ClassExpression::InterfaceReceiver {
             class,
@@ -846,7 +1141,7 @@ fn build_entry(
     })
 }
 
-fn direct_call_result(
+pub(super) fn direct_call_result(
     ty: mir::Type,
     function: mir::FunctionId,
     args: Vec<mir::Rvalue>,

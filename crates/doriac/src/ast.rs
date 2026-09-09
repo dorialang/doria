@@ -463,6 +463,7 @@ pub struct TypeParamDecl {
 pub struct Param {
     pub constructor_role: ConstructorParameterRole,
     pub role_and_mode_prefix_span: Span,
+    pub borrow_span: Option<Span>,
     pub take: bool,
     pub take_span: Option<Span>,
     pub writable: bool,

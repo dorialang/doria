@@ -1,0 +1,22 @@
+class Key implements Hashable, Equatable<Key>
+{
+    function __construct(int $value) {}
+    function hash(): uint64 { return 18446744073709551615; }
+    function equals(Key $other): bool { return $this->value == $other->value; }
+    function __destruct()
+    {
+        try { echo "drop {$this->value}\n"; } catch (Error $error) {}
+    }
+}
+
+function main(): void
+{
+    writable Set<Key> $keys = Set::from([]);
+    echo $keys->add(new Key(1));
+    echo $keys->add(new Key(2));
+    echo $keys->add(new Key(1));
+    echo $keys->contains(new Key(2));
+    echo $keys->contains(new Key(3));
+    echo $keys->remove(new Key(1));
+    foreach ($keys as Key $key) { echo "kept {$key->value}\n"; }
+}

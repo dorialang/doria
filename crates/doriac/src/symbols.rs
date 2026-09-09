@@ -180,6 +180,7 @@ impl MemberKind {
 pub struct PropertyInfo {
     pub access: MemberAccess,
     pub writable: bool,
+    pub borrowed_source: bool,
     pub ty: TypeId,
     pub init_state: PropertyInitState,
     pub declaration_span: Span,

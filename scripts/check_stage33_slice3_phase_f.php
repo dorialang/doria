@@ -63,7 +63,7 @@ function check_stage33_slice3_phase_f(string $root): array
         'Stage 33 and Phase F are complete',
         'Native Testing Foundation',
         'Stage 34 is complete',
-        'Stage 35 Slices 1 and 2 are complete and Slice 3 is next',
+        'Stage 35 Slices 1, 2, and 3 are complete and Slice 4 is next',
     ]);
     $require($paths['protocol'], $files['protocol'], [
         '--schema-version 2',

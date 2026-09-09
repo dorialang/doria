@@ -474,6 +474,7 @@ fn linker_arguments(
             // The entry glue's `CommandLineToArgvW` therefore has to be named
             // here; shell32 is not in the default library set.
             OsString::from("shell32.lib"),
+            OsString::from("bcrypt.lib"),
         ];
     }
 
@@ -485,6 +486,7 @@ fn linker_arguments(
     ];
     if windows {
         arguments.push(OsString::from("-lshell32"));
+        arguments.push(OsString::from("-lbcrypt"));
     }
     arguments
 }
@@ -527,6 +529,7 @@ mod tests {
                 OsString::from("/SUBSYSTEM:CONSOLE"),
                 OsString::from("kernel32.lib"),
                 OsString::from("shell32.lib"),
+                OsString::from("bcrypt.lib"),
             ]
         );
     }
@@ -555,6 +558,7 @@ mod tests {
                 OsString::from("/SUBSYSTEM:CONSOLE"),
                 OsString::from("kernel32.lib"),
                 OsString::from("shell32.lib"),
+                OsString::from("bcrypt.lib"),
             ]
         );
     }
@@ -579,6 +583,7 @@ mod tests {
                 OsString::from("-o"),
                 OsString::from("main.exe"),
                 OsString::from("-lshell32"),
+                OsString::from("-lbcrypt"),
             ]
         );
     }
@@ -603,6 +608,7 @@ mod tests {
                 OsString::from("-o"),
                 OsString::from("main.exe"),
                 OsString::from("-lshell32"),
+                OsString::from("-lbcrypt"),
             ]
         );
         assert_eq!(default_linker(false), "cc");

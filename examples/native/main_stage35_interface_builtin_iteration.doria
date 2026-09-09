@@ -1,0 +1,54 @@
+class Book
+{
+    function __construct(string $title) {}
+    function __destruct() { try { echo "drop {$this->title}\n"; } catch (Error) {} }
+}
+
+function strings(Iterable<string> $source): void
+{
+    foreach ($source as string $value) { echo $value; }
+    echo "\n";
+}
+
+function integers(Iterable<?int> $source): void
+{
+    foreach ($source as ?int $value) { echo ($value ?? -1) . " "; }
+    echo "\n";
+}
+
+function cursor<T implements Iterable<string>>(T $source): Iterator<string>
+{
+    return $source->iterator();
+}
+
+function moveOwner(take Iterable<Book> $source): Iterable<Book> { return $source; }
+function optional(bool $present): ?Iterable<string>
+{
+    ?List<string> $source = $present ? ["present"] : null;
+    return $source;
+}
+
+function main(): void
+{
+    List<string> $list = ["a", "b"];
+    strings($list);
+    strings($list);
+    string[] $array = ["c", "d"];
+    strings($array);
+    Dictionary<string, string> $dictionary = ["second" => "e", "first" => "f"];
+    strings($dictionary);
+    strings(Set::from(["g", "g", "h"]));
+    strings(SortedSet::from(["j", "i"]));
+    strings(SortedDictionary::from(["second" => "l", "first" => "k"]));
+    strings(Deque::from(["m", "n"]));
+    List<?int> $nullable = [null, 0, 2];
+    integers($nullable);
+    { let writable $cursor = cursor($list); echo $cursor->getCurrent(); $cursor->advance(); echo $cursor->getCurrent() . "\n"; }
+    let $maybe = optional(true);
+    if ($maybe is Iterable<string>) { strings($maybe); }
+    let $absent = optional(false);
+    if ($absent == null) { echo "absent\n"; }
+    Iterable<Book> $books = moveOwner([new Book("one"), new Book("two")]);
+    foreach ($books as Book $book) { echo $book->title . "\n"; }
+    echo "done\n";
+}
