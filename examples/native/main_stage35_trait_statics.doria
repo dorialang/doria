@@ -1,0 +1,33 @@
+trait Counter
+{
+    static writable float $count = 0.0;
+    const float STEP = 2.0;
+    static function advance(float $amount = 2.0): float { self::count += $amount; return self::count; }
+    function tick(): float { return self::advance(self::STEP); }
+    function make(): self { return new self(); }
+}
+class Left { uses Counter; }
+class Right { uses Counter { Counter::advance as next; } }
+class Typed<T> { uses Counter; }
+open class Base { uses Counter; }
+class Derived extends Base {}
+open class GenericBase<T>
+{
+    static writable float $count = 0.0;
+    const float STEP = 1.0;
+    function tick(): float { self::count += self::STEP; return self::count; }
+}
+class GenericChild<T> extends GenericBase<T> {}
+function main(): void
+{
+    echo (Left::advance() == 2.0) . " " . (Left::advance(amount: 3.0) == 5.0) . " " . (Right::next() == 2.0) . "\n";
+    let $numbers = new Typed<int>();
+    let $words = new Typed<string>();
+    echo ($numbers->tick() == 2.0) . " " . ($words->tick() == 2.0) . " " . ($numbers->tick() == 4.0) . "\n";
+    let $child = new Derived();
+    let $base = $child->make();
+    echo ($base->tick() == 2.0) . " " . (Base::advance() == 4.0) . "\n";
+    let $first = new GenericChild<int>();
+    let $second = new GenericChild<string>();
+    echo ($first->tick() == 1.0) . " " . ($second->tick() == 1.0) . " " . ($first->tick() == 2.0) . "\n";
+}

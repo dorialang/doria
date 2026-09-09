@@ -4,6 +4,8 @@ class Token
     {
     }
 
+    function readId(): int throws Doria\Std\Io\IoError { return $this->id; }
+
     function __destruct()
     {
         try {
@@ -31,4 +33,6 @@ function main(): void
     if ($taken != null) {
         echo "taken {$taken->id}\n";
     }
+    writable List<Token> $temporary = [new Token(4)];
+    echo "temporary {$temporary->removeAt(0)->readId()}\n";
 }

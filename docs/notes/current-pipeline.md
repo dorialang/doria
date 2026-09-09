@@ -9,13 +9,18 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 
 ## Active
 
+- Stage 35 Slice 4 implements recursive generic trait composition, method
+  requirements and adaptations, deterministic instance layout and per-composer
+  static cells. One compiler-owned plan feeds ordinary class semantics and all
+  backends; effective member identities retain their authored source origins.
+  E0493 is retired and reserved. Slice 5 Cross-Repository Closure is next;
+  Stage 35 remains in progress.
 - Stage 35 Slice 3 implements canonical value equality/hash/order/clone,
   Copy-or-Cloneable preserving collections, and public iteration. Promoted
   `borrow` constructor parameters retain readonly sources; `getCurrent()` lends
   an element without consuming it. Source and element loans survive forwarding,
   erasure, captures, and checked exits. Built-in loops remain direct; bounded
-  nonescaping built-in cursors have fixed-frame storage. Trait composition is
-  Slice 4, next; Stage 35 remains in progress. Hash-key stability remains an
+  nonescaping built-in cursors have fixed-frame storage. Hash-key stability remains an
   author obligation, including shared or external state; violations must not
   compromise memory safety.
 - Earlier checkpoint validation exposed intermittent Native Testing failures:
@@ -78,7 +83,7 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
   accepted semantic or performance architecture. Stage 36a owns the initial
   cross-platform stream benchmark and memory-regression gate; Stage 43 later
   continues and broadens it.
-- `parent::member()` is implemented as direct immediate-parent resolution, including constructor, instance, static, constant, and static-property forms permitted by Decision 0130. Trait-local `self::member` remains accepted grammar with a Stage 35 semantic boundary. `Foo::$prop` and `static::` are permanent errors with precise fixes.
+- `parent::member()` is implemented as direct immediate-parent resolution, including constructor, instance, static, constant, and static-property forms permitted by Decision 0130. Decision 0134 Slice 4 binds trait-local `self::member` to its composing class before backend emission. `Foo::$prop` and `static::` are permanent errors with precise fixes.
 - Native remains one target: direct compile/run uses the Cranelift fast profile, while `--release` selects LLVM 18 over the same validated typed MIR.
 - Both native profiles keep loop-body stack use constant. Every LLVM scratch slot — the flags and out-parameters the dictionary, set, list, string-search, and parse lowerings use to return `?T` — is allocated in its function's entry block, because LLVM treats an allocation anywhere else as a dynamic stack allocation that moves the stack pointer when it executes and is not reclaimed until the function returns. Cranelift stack slots are function-scoped by construction and were never affected. `llvm_mir_tests` asserts the placement on the module the backend emits before optimization, and `native_mir_parity_tests` runs those loop bodies two million times on every enabled profile and asserts a clean exit with exact output.
 - Ordinary expression interpolation of primitive/string values lowers through the existing ordered MIR string and display operations consumed by all three execution paths.
@@ -255,13 +260,13 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 - Post-Stage-34 Constructor Parameter Roles Corrective Beat — Complete.
 - Post-Stage-34 Indexed Foreach And Scalar Display Corrective Beat — Complete.
 - Post-Stage-34 Explicit Foreach Binding Types Corrective Beat — Complete.
-- Stage 35 Interfaces And Traits — In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next.
+- Stage 35 Interfaces And Traits — In Progress; Slices 1, 2, 3, And 4 Complete; Slice 5 Next.
   - Stage 35 Authority — Accepted.
   - Stage 35 Slice 1 Grammar, Graphs, And Conformance — Complete.
   - Stage 35 Slice 2 Interface Runtime And Ownership — Complete.
   - Stage 35 Slice 3 Core Contracts And Public Iteration — Complete.
-  - Stage 35 Slice 4 Trait Composition — Next.
-  - Stage 35 Slice 5 Cross-Repository Closure — Scheduled.
+  - Stage 35 Slice 4 Trait Composition — Complete.
+  - Stage 35 Slice 5 Cross-Repository Closure — Next.
   - Stage 35 — In Progress.
 - Stage 35a — Optimizer Contracts, Dispatch, And Escape Audit — Scheduled.
 - Stage 36 Property Hooks — Scheduled.
@@ -276,7 +281,6 @@ Documentation role: working note. This file prevents duplicated in-flight work. 
 ## Deferred
 
 - Runtime-initialized and owned statics until separately accepted lifetime/concurrency decisions.
-- Trait composition and trait-local member execution until Stage 35 Slice 4; Decision 0134 fixes their accepted grammar and semantics.
 - Growable/slice/search `Bytes` members until a future method-surface decision.
 - Writable match and writable payload patterns are rejected for Doria v1; Decision 0134 Slice 2 executes nominal interface `is` and borrow-preserving or explicitly consuming type patterns.
 - Collection `is`, plus boxing collections, typed arrays, or `Bytes` into `mixed`, until their authored implementation slices. Class subtype and nominal interface tests are implemented.

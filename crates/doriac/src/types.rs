@@ -529,7 +529,11 @@ impl fmt::Display for TypeRef {
         }
 
         if self.arguments.is_empty() {
-            write!(formatter, "{}", self.name)
+            write!(
+                formatter,
+                "{}",
+                crate::trait_composition::authored_type_parameter_name(&self.name)
+            )
         } else {
             let args = self
                 .arguments
@@ -1077,7 +1081,9 @@ impl TypeRegistry {
             TypeKind::Unknown => "Unknown".to_string(),
             TypeKind::Heterogeneous => "heterogeneous".to_string(),
             TypeKind::EmptyCollection => "[]".to_string(),
-            TypeKind::TypeParameter(name) => name.clone(),
+            TypeKind::TypeParameter(name) => {
+                crate::trait_composition::authored_type_parameter_name(name).to_owned()
+            }
             TypeKind::Function(function) => self.display_function(function),
             TypeKind::Enum(enum_type) => enum_type.name.clone(),
             TypeKind::Class(class) | TypeKind::Interface(class) => {

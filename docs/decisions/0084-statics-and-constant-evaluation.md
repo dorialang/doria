@@ -60,8 +60,9 @@ The grammar accepts generalized `parent::member()` in Stage 20 so editor and LSP
 parsing follow the accepted language clock. Decision 0130 now implements direct
 immediate-parent lookup for accessible constants, static properties, static
 methods, instance methods, and constructor chaining. Statics remain nonvirtual
-and retain declaring-class storage. Trait methods preserve `self::member`
-structurally, while trait composition remains a Stage 35 semantic feature.
+and retain declaring-class storage. Decision 0134 Slice 4 binds trait
+`self::member` to the composing class and keeps static storage separate for
+each composing class specialization.
 
 `static::` is permanently invalid and receives a machine-applicable fix that
 replaces only `static` with `self`. Doria has no late static binding: `static` is
@@ -234,4 +235,4 @@ editor grammars, examples, parity fixtures, tests, and language documentation.
   semantics.
 
 Decision 0130 retires the Stage-34 unsupported route for valid parent access;
-the Stage-35 trait boundary remains.
+Decision 0134 Slice 4 retires the trait-composition boundary.

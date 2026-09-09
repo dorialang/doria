@@ -196,7 +196,7 @@ fn generic_diamond_edits_invalidate_transitive_cross_package_conformance() {
 }
 
 #[test]
-fn trait_adaptations_and_uses_are_signature_dependencies_without_flattening() {
+fn trait_adaptations_and_uses_invalidate_composed_consumers() {
     let document = plan(vec![package(
         "acme/app",
         &["main.doria", "Formatting.doria", "Record.doria"],
@@ -221,8 +221,11 @@ fn trait_adaptations_and_uses_are_signature_dependencies_without_flattening() {
     let mut session = CompilationSession::new();
     let initial = session.load_graph(&document, &provider).unwrap();
     let analysis = session.analyze_graph(&initial.graph);
-    assert_eq!(analysis.diagnostics.len(), 1, "{:?}", analysis.diagnostics);
-    assert_eq!(analysis.diagnostics[0].code, "E0493");
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
     assert!(analysis
         .semantic_dependency_edges
         .iter()
@@ -243,4 +246,66 @@ fn trait_adaptations_and_uses_are_signature_dependencies_without_flattening() {
         .last_facts()
         .invalidated_sources
         .contains("acme/app:main.doria"));
+    provider.insert(
+        "acme/app",
+        "Formatting.doria",
+        "trait Formatting { function format(): string { return \"changed body\"; } }",
+    );
+    let changed = session.load_graph(&document, &provider).unwrap();
+    let analysis = session.analyze_graph(&changed.graph);
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
+    assert!(session
+        .last_facts()
+        .declaration_changed_sources
+        .contains("acme/app:Formatting.doria"));
+    assert!(session
+        .last_facts()
+        .invalidated_sources
+        .contains("acme/app:Record.doria"));
+    assert!(session
+        .last_facts()
+        .invalidated_sources
+        .contains("acme/app:main.doria"));
+}
+
+#[test]
+fn trait_bodies_preserve_definition_site_names_across_packages_and_edits() {
+    let mut document = plan(vec![
+        package(
+            "acme/app",
+            &["main.doria", "Record.doria"],
+            &["acme/format"],
+        ),
+        package("acme/format", &["Formatting.doria", "prefix.doria"], &[]),
+    ]);
+    document.plan.packages[0].namespace_mappings[0].prefix = "App\\".into();
+    document.plan.packages[1].namespace_mappings[0].prefix = "Format\\".into();
+    let mut provider = InMemorySourceProvider::new();
+    provider.insert("acme/app", "main.doria", "namespace App; function main(): void { echo (new Record())->text(); } function prefix(): string { return \"wrong:\"; }");
+    provider.insert("acme/app", "Record.doria", "namespace App; use Format\\Formatting as Imported; class Record { uses Imported { Imported::format as text; } }");
+    provider.insert(
+        "acme/format",
+        "prefix.doria",
+        "namespace Format; internal function prefix(): string { return \"right:\"; }",
+    );
+    let mut session = CompilationSession::new();
+    for (declaration, expected) in [
+        ("trait Formatting { string $suffix = \"one\"; function format(): string { return prefix() . $this->suffix; } }", "right:one"),
+        ("trait Formatting { string $suffix = \"two\"; function format(): string { return prefix() . $this->suffix; } }", "right:two"),
+        ("trait Formatting { string $suffix = \"two\"; function format(string $tail = \"!\"): string { return prefix() . $this->suffix . $tail; } }", "right:two!"),
+    ] {
+        provider.insert("acme/format", "Formatting.doria", format!("namespace Format; {declaration}"));
+        let loaded = session.load_graph(&document, &provider).unwrap();
+        let analysis = session.analyze_graph(&loaded.graph);
+        assert!(analysis.diagnostics.is_empty(), "{:?}", analysis.diagnostics);
+        let mir = doriac::lower_compilation_graph_to_mir(&loaded.graph).unwrap();
+        let output = doriac::mir_interpreter::interpret(&mir).unwrap();
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+        assert!(session.last_facts().invalidated_sources.contains("acme/app:Record.doria"));
+        assert!(session.last_facts().invalidated_sources.contains("acme/app:main.doria"));
+    }
 }

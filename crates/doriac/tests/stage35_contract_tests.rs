@@ -882,7 +882,7 @@ class Value implements Both { function copy(): self { return new Value(); } }
 }
 
 #[test]
-fn unused_traits_are_compile_time_declarations_and_composition_defers_conformance() {
+fn unused_traits_are_compile_time_declarations_and_composition_checks_conformance() {
     let declarations = r#"
 interface Renderable { function render(): string; }
 trait Formatting<T> {
@@ -892,7 +892,7 @@ trait Formatting<T> {
 trait Nested { uses Formatting<int>; }
 "#;
     assert!(analyze(declarations).diagnostics.is_empty());
-    let source = format!("{declarations} class Value implements Renderable {{ uses Nested; function format(): string {{ return $this->render(); }} }}");
+    let source = format!("{declarations} class Value implements Renderable {{ uses Nested; function dependency(int $value): void {{}} function format(): string {{ return $this->render(); }} }}");
     let analysis = analyze(&source);
     assert_eq!(
         analysis
@@ -900,17 +900,17 @@ trait Nested { uses Formatting<int>; }
             .iter()
             .map(|diagnostic| diagnostic.code)
             .collect::<Vec<_>>(),
-        ["E0493"],
+        Vec::<&str>::new(),
         "{:?}",
         analysis.diagnostics
     );
     assert_eq!(
         analysis.info.contracts.conformances[0].status,
-        ConformanceStatus::DeferredComposition
+        ConformanceStatus::Checked
     );
     assert!(analysis.info.contracts.conformances[0].implementations[0]
         .implementation
-        .is_none());
+        .is_some());
 }
 
 #[test]
@@ -1032,7 +1032,11 @@ fn requirement_and_trait_attributes_stay_authored_once_in_every_schema() {
 #[Tag] trait Formatting {
     #[Tag] function format(#[Tag] int $value): string { return "value"; }
 }
-class Report implements Renderable { function render(int $value): string { return "report"; } }
+class Report implements Renderable {
+    uses Formatting { Formatting::format as additional; }
+    function render(int $value): string { return $this->additional($value); }
+}
+class OtherReport { uses Formatting; }
 "#;
     let analysis = analyze(source);
     assert!(
@@ -1299,8 +1303,11 @@ fn invalid_contract_operations_are_language_errors_not_future_execution() {
 fn trait_adaptations_resolve_canonical_specializations_and_exact_method_tokens() {
     let source = "trait Formatting<T> { function format(T $value): string { return \"value\"; } } class Record { uses Formatting<int> { Formatting<int64>::format as text; } }";
     let analysis = analyze(source);
-    assert_eq!(analysis.diagnostics.len(), 1, "{:?}", analysis.diagnostics);
-    assert_eq!(analysis.diagnostics[0].code, "E0493");
+    assert!(
+        analysis.diagnostics.is_empty(),
+        "{:?}",
+        analysis.diagnostics
+    );
     assert_eq!(analysis.info.contracts.member_references.len(), 1);
     let reference = &analysis.info.contracts.member_references[0];
     assert_eq!(&source[reference.span.start..reference.span.end], "format");
@@ -1340,5 +1347,8 @@ fn decidably_invalid_adaptations_do_not_receive_composition_boundaries() {
         "{:?}",
         analysis.diagnostics
     );
-    assert!(analysis.info.contracts.boundaries.is_empty());
+    assert!(!analysis
+        .diagnostics
+        .iter()
+        .any(|diagnostic| diagnostic.code == "E0493"));
 }

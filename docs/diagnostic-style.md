@@ -73,11 +73,12 @@ redundant `open override` may offer exact modifier edits; signature, receiver,
 return, default, generic, and checked-effect incompatibilities require review
 unless the only safe edit is mechanically certain. Do not expose descriptor,
 carrier, thunk, slot, or vtable vocabulary as the user's mistake. Decision 0134's
-accepted trait composition remains a Slice 4 implementation
-boundary rather than invalid Doria. Interface runtime, core value operations,
-and public iteration are implemented; E0758/E0759 remain reserved. Diagnostics name the
-precise remaining Stage 35 slice and never reinterpret accepted syntax as a
-permanent language rejection.
+trait composition is implemented in Slice 4. Interface runtime, core value
+operations, and public iteration are implemented; E0493/E0758/E0759 remain
+reserved. A composed-member diagnostic retains the authored location and relates
+it to the composing class/use. Missing override guidance asks for a class-authored
+wrapper, never a forbidden trait modifier or a guessed automatic implementation.
+Slice 5 is a closure checkpoint, not an unsupported-execution boundary.
 
 ## Suggested fixes
 

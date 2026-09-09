@@ -9,7 +9,6 @@ pub struct ContractFacts {
     pub interface_specializations: Vec<InterfaceSpecializationFacts>,
     pub traits: Vec<TraitFacts>,
     pub conformances: Vec<ConformanceFacts>,
-    pub boundaries: Vec<SupportBoundary>,
     pub member_references: Vec<ContractMemberReference>,
     pub compositions: Vec<CompositionFacts>,
 }
@@ -88,7 +87,6 @@ pub struct TraitFacts {
 pub enum ConformanceStatus {
     Checked,
     Invalid,
-    DeferredComposition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,42 +104,6 @@ pub struct ConformanceFacts {
     pub origin: Span,
     pub status: ConformanceStatus,
     pub implementations: Vec<RequirementImplementation>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PendingContractOperation {
-    TraitComposition,
-}
-
-impl PendingContractOperation {
-    pub fn slice(self) -> u8 {
-        match self {
-            Self::TraitComposition => 4,
-        }
-    }
-
-    pub fn diagnostic(self, span: Span) -> Diagnostic {
-        let (code, description) = match self {
-            Self::TraitComposition => ("E0493", "trait composition"),
-        };
-        Diagnostic::unsupported_stage(
-            code,
-            format!(
-                "{description} is not yet supported; it requires Stage 35 Slice {}",
-                self.slice()
-            ),
-            span,
-        )
-        .with_title(match self {
-            Self::TraitComposition => "Trait Composition Is Not Yet Supported",
-        })
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SupportBoundary {
-    pub operation: PendingContractOperation,
-    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
@@ -585,6 +547,7 @@ impl Checker<'_> {
         };
         if self.type_is_symbolic(receiver)
             || self.class_requires_trait_composition(&class_type.name)
+            || !self.class_composition_is_valid(&class_type.name)
         {
             return None;
         }
@@ -764,7 +727,9 @@ impl Checker<'_> {
             }
             _ => ty,
         };
-        if !self.has_core_contract(ty, operation.contract()) {
+        if matches!(self.types.kind(ty), TypeKind::Class(class) if !self.class_composition_is_valid(&class.name))
+            || !self.has_core_contract(ty, operation.contract())
+        {
             return false;
         }
         let Some((target, method)) = self.select_contract_method(ty, operation.method(), span)
@@ -877,9 +842,7 @@ impl Checker<'_> {
     ) {
         for (span, foreach) in self.foreach_loops.clone() {
             if foreach.iterable_family == ForeachIterableFamily::PublicIterable
-                && span.source == declaration.source
-                && span.start >= declaration.start
-                && span.end <= declaration.end
+                && declaration.contains(span)
             {
                 self.specialize_constrained_method(span, substitutions);
                 let ty = self.types.intern_resolved(&foreach.iterable_type);
@@ -890,10 +853,7 @@ impl Checker<'_> {
             }
         }
         for (span, calls) in self.core_operation_calls.clone() {
-            if span.source == declaration.source
-                && span.start >= declaration.start
-                && span.end <= declaration.end
-            {
+            if declaration.contains(span) {
                 for call in calls {
                     let template = self.types.intern_resolved(&call.receiver_type);
                     let ty = self.substitute_type_id(template, substitutions);
@@ -904,10 +864,7 @@ impl Checker<'_> {
             }
         }
         for (span, left, right) in self.pending_relational_comparisons.clone() {
-            if span.source == declaration.source
-                && span.start >= declaration.start
-                && span.end <= declaration.end
-            {
+            if declaration.contains(span) {
                 let left = self.substitute_type_id(left, substitutions);
                 let right = self.substitute_type_id(right, substitutions);
                 if !self.type_is_symbolic(left) && !self.type_is_symbolic(right) {
@@ -983,25 +940,6 @@ impl Checker<'_> {
         });
         visiting.remove(name);
         found
-    }
-
-    pub(super) fn report_contract_boundary(
-        &mut self,
-        operation: PendingContractOperation,
-        span: Span,
-    ) {
-        if !self
-            .contracts
-            .boundaries
-            .iter()
-            .any(|boundary| boundary.operation == operation && boundary.span == span)
-        {
-            self.contracts
-                .boundaries
-                .push(SupportBoundary { operation, span });
-        }
-        // Pending execution is not a semantic error. Publish its diagnostic only
-        // after checking, so it cannot suppress effect or ownership facts.
     }
 
     pub(super) fn collect_interface_declarations(&mut self) {
@@ -1615,6 +1553,7 @@ impl Checker<'_> {
                         r#type: self.types.resolved(parameter.ty),
                         take: parameter.take,
                         writable: parameter.writable,
+                        borrow: false,
                         has_default: false,
                     })
                     .collect(),
@@ -1655,6 +1594,7 @@ impl Checker<'_> {
     }
 
     pub(super) fn check_nominal_conformances(&mut self) {
+        self.check_composed_method_obligations();
         loop {
             let invalid = self
                 .contracts
@@ -1700,7 +1640,8 @@ impl Checker<'_> {
                 continue;
             };
             let conformances = self.class_interface_closure(&class, &mut HashSet::new());
-            let deferred = self.class_requires_trait_composition(&class.name);
+            let composition_valid = !self.class_requires_trait_composition(&class.name)
+                && self.class_composition_is_valid(&class.name);
             for (interface, origin) in conformances.entries {
                 let legacy_diagnostic = matches!(interface.name.as_str(), "Displayable" | "Error")
                     && self.diagnostics.iter().any(|diagnostic| {
@@ -1717,13 +1658,8 @@ impl Checker<'_> {
                     implementing_type: self.types.resolved(implementing_type),
                     interface: self.resolved_interface(&interface),
                     origin,
-                    status: if !conformances.valid
-                        || !requirements.valid
-                        || !self.class_composition_is_valid(&class.name)
-                    {
+                    status: if !conformances.valid || !requirements.valid || !composition_valid {
                         ConformanceStatus::Invalid
-                    } else if deferred {
-                        ConformanceStatus::DeferredComposition
                     } else if requirements.valid && !legacy_diagnostic {
                         ConformanceStatus::Checked
                     } else {
@@ -1748,7 +1684,7 @@ impl Checker<'_> {
                         failures: Vec::new(),
                         exact_dynamic_return: None,
                     };
-                    if !deferred && requirements.valid {
+                    if composition_valid && requirements.valid {
                         if let Some(method) = method {
                             implementation.implementation = Some(method.declaration);
                             implementation.failures =
@@ -2001,11 +1937,12 @@ impl Checker<'_> {
         }
     }
 
-    fn find_concrete_contract_method(
+    pub(super) fn find_concrete_contract_method(
         &mut self,
         class: &ClassType<TypeId>,
         name: &str,
     ) -> Option<MethodInfo> {
+        let root = class.name.clone();
         let mut current = Some(class.clone());
         let mut visited = HashSet::new();
         while let Some(class) = current {
@@ -2018,7 +1955,9 @@ impl Checker<'_> {
                 .and_then(|class| class.methods.get(name))
                 .cloned()
             {
-                return Some(self.specialize_method_for_class(&method, &class));
+                if class.name == root || method.access == MemberAccess::External {
+                    return Some(self.specialize_method_for_class(&method, &class));
+                }
             }
             current = self.specialized_parent_type(&class);
         }
@@ -2139,10 +2078,13 @@ impl Checker<'_> {
         false
     }
 
-    fn class_composition_is_valid(&self, class: &str) -> bool {
+    pub(super) fn class_composition_is_valid(&self, class: &str) -> bool {
         let mut current = Some(class);
         let mut visited = HashSet::new();
         while let Some(name) = current {
+            if self.composition.invalid_classes.contains(name) {
+                return false;
+            }
             if !visited.insert(name) {
                 return false;
             }
@@ -2161,6 +2103,167 @@ impl Checker<'_> {
                 .map(|parent| parent.name.as_str());
         }
         true
+    }
+
+    // Later body, hierarchy, initialization, and ownership checks must revoke
+    // provisional composition facts before any consumer can treat them as final.
+    pub(super) fn invalidate_erroneous_compositions(&mut self) {
+        if self.composition.classes.is_empty() {
+            return;
+        }
+        for diagnostic in &self.diagnostics {
+            if diagnostic.severity != crate::diagnostics::DiagnosticSeverity::Error {
+                continue;
+            }
+            if let Some(origin) = self.composition.origin(diagnostic.span) {
+                self.composition
+                    .invalid_classes
+                    .insert(origin.composing_class.clone());
+            } else {
+                for item in &self.program.items {
+                    if let Item::Class(class) = item {
+                        if class.span.contains(diagnostic.span) {
+                            self.composition.invalid_classes.insert(class.name.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for origin in &self.composition.origins {
+            if self
+                .contracts
+                .traits
+                .iter()
+                .any(|facts| facts.name == origin.trait_type.name && !facts.valid)
+            {
+                self.composition
+                    .invalid_classes
+                    .insert(origin.composing_class.clone());
+            }
+        }
+        let invalid = self
+            .classes
+            .keys()
+            .filter(|name| !self.class_composition_is_valid(name))
+            .cloned()
+            .collect::<HashSet<_>>();
+        for fact in &mut self.contracts.conformances {
+            if matches!(&fact.implementing_type, ResolvedType::Class(class) if invalid.contains(&class.name))
+            {
+                fact.status = ConformanceStatus::Invalid;
+                for implementation in &mut fact.implementations {
+                    implementation.implementation = None;
+                }
+            }
+        }
+        self.core_operation_calls.retain(|_, calls| {
+            calls.retain(|call| !matches!(&call.receiver_type, ResolvedType::Class(class) if invalid.contains(&class.name)));
+            !calls.is_empty()
+        });
+        for target in self.call_targets.values_mut() {
+            if let CallableTarget::ConstrainedMethod {
+                implementations, ..
+            } = target
+            {
+                implementations.retain(|implementation| !matches!(&implementation.receiver, ResolvedType::Class(class) if invalid.contains(&class.name)));
+            }
+        }
+    }
+
+    fn check_composed_method_obligations(&mut self) {
+        for (index, obligation) in self.composition.obligations.clone().into_iter().enumerate() {
+            let parameters = self
+                .program
+                .items
+                .iter()
+                .find_map(|item| match item {
+                    Item::Class(class) if class.name == obligation.class => {
+                        Some(class.type_params.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            self.type_parameter_scopes
+                .push(type_parameter_scope(&parameters));
+            let required = &obligation.requirement;
+            let signature = self.resolve_function_signature(required, Some(&obligation.class));
+            let contract = MethodInfo {
+                declaration: required.span,
+                access: required.access,
+                is_static: required.is_static,
+                receiver_mode: (!required.is_static).then_some(if required.writable_this {
+                    ReceiverMode::Writable
+                } else {
+                    ReceiverMode::Readonly
+                }),
+                return_borrow: signature.return_borrow,
+                is_open: false,
+                is_override: false,
+                virtual_root: None,
+                enclosing_type_bindings: HashMap::new(),
+                type_params: signature.type_params,
+                params: signature.params,
+                return_ty: signature.return_ty,
+                checked_effects: signature.checked_effects,
+            };
+            let class_type = self.symbolic_class_type(&obligation.class);
+            let method = self
+                .class_type(class_type)
+                .and_then(|class| self.find_concrete_contract_method(&class, &required.name));
+            let failure = if let Some(method) = method {
+                let failures = self.method_contract_failures(&method, &contract);
+                self.composition.obligations[index].implementation = Some(method.declaration);
+                self.composition.obligations[index].failures = failures.clone();
+                (!failures.is_empty()).then(|| {
+                    Diagnostic::new(
+                        "E0757",
+                        format!(
+                            "`{}::{}` does not satisfy its trait contract: {}",
+                            obligation.class,
+                            required.name,
+                            failures
+                                .iter()
+                                .map(|failure| failure.description())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        method.declaration,
+                    )
+                    .with_title("Trait Method Contract Mismatch")
+                    .with_related(
+                        obligation.origin.authored_declaration,
+                        "the trait contract is declared here",
+                    )
+                })
+            } else {
+                Some(
+                    Diagnostic::new(
+                        "E0757",
+                        format!(
+                            "class `{}` does not supply required trait method `{}`",
+                            obligation.class, required.name
+                        ),
+                        obligation
+                            .origin
+                            .paths
+                            .first()
+                            .and_then(|path| path.first())
+                            .copied()
+                            .unwrap_or(required.span),
+                    )
+                    .with_title("Trait Requirement Is Not Implemented")
+                    .with_related(
+                        obligation.origin.authored_declaration,
+                        "the required method is declared here",
+                    ),
+                )
+            };
+            if let Some(failure) = failure {
+                self.composition.invalid_classes.insert(obligation.class);
+                self.diagnostics.push(failure);
+            }
+            self.type_parameter_scopes.pop();
+        }
     }
 
     pub(super) fn collect_trait_declarations(&mut self) {
@@ -2315,12 +2418,6 @@ impl Checker<'_> {
                         uses: edges,
                         valid,
                     });
-                    if valid {
-                        self.report_contract_boundary(
-                            PendingContractOperation::TraitComposition,
-                            composition.span,
-                        );
-                    }
                 }
             }
             self.type_parameter_scopes.pop();
@@ -2738,7 +2835,7 @@ impl Checker<'_> {
         }) {
             failures.push(ContractMismatch::CheckedEffects);
         }
-        if method.access != MemberAccess::External {
+        if required.access == MemberAccess::External && method.access != MemberAccess::External {
             failures.push(ContractMismatch::Accessibility);
         }
         if method.is_static != required.is_static {

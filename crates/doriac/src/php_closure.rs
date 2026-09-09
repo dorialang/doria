@@ -324,7 +324,7 @@ fn allocate_helper_name(
     unreachable!("a collision-free generated PHP helper name must exist")
 }
 
-fn callable_classes(program: &hir::Program) -> HashMap<usize, String> {
+fn callable_classes(program: &hir::Program) -> HashMap<crate::source::Span, String> {
     program
         .items
         .iter()
@@ -334,7 +334,7 @@ fn callable_classes(program: &hir::Program) -> HashMap<usize, String> {
         })
         .flat_map(|class| {
             class.members.iter().filter_map(|member| match member {
-                ClassMember::Method(method) => Some((method.span.start, class.name.clone())),
+                ClassMember::Method(method) => Some((method.span, class.name.clone())),
                 _ => None,
             })
         })
@@ -343,7 +343,7 @@ fn callable_classes(program: &hir::Program) -> HashMap<usize, String> {
 
 fn closure_owner_classes(
     program: &hir::Program,
-    callable_classes: &HashMap<usize, String>,
+    callable_classes: &HashMap<crate::source::Span, String>,
 ) -> HashMap<ClosureId, Option<String>> {
     program
         .semantic_info
@@ -365,8 +365,8 @@ fn closure_owner_classes(
                     None => break None,
                 };
                 match owner {
-                    LexicalOwner::Callable(start) => {
-                        break callable_classes.get(&start).cloned();
+                    LexicalOwner::Callable(span) => {
+                        break callable_classes.get(&span).cloned();
                     }
                     LexicalOwner::TopLevel => break None,
                     LexicalOwner::Closure(_) => {}
@@ -696,9 +696,9 @@ pub(crate) fn binding_declared_in_span(
         .values()
         .find(|declaration| {
             declaration.name == name
-                && declaration.span.is_some_and(|declared| {
-                    declared.start >= span.start && declared.end <= span.end
-                })
+                && declaration
+                    .span
+                    .is_some_and(|declared| span.contains(declared))
         })
         .map(|declaration| declaration.id)
 }

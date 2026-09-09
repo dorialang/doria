@@ -1,11 +1,17 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct SourceId(pub u32);
 
+/// A compiler-owned expansion of authored syntax. Zero denotes source syntax.
+/// Locations remain real byte ranges; this identity separates semantic facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ExpansionId(pub u32);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Span {
     pub source: SourceId,
     pub start: usize,
     pub end: usize,
+    pub expansion: ExpansionId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -61,19 +67,45 @@ impl Span {
     }
 
     pub fn in_source(source: SourceId, start: usize, end: usize) -> Self {
-        Self { source, start, end }
+        Self {
+            source,
+            start,
+            end,
+            expansion: ExpansionId::default(),
+        }
     }
 
     pub fn at(self, start: usize, end: usize) -> Self {
-        Self::in_source(self.source, start, end)
+        Self { start, end, ..self }
+    }
+
+    /// Use only for source presentation/navigation, never semantic lookup.
+    pub const fn authored(self) -> Self {
+        Self {
+            expansion: ExpansionId(0),
+            ..self
+        }
+    }
+
+    pub const fn in_expansion(self, expansion: ExpansionId) -> Self {
+        Self { expansion, ..self }
+    }
+
+    pub fn contains(self, other: Span) -> bool {
+        self.source == other.source
+            && self.expansion == other.expansion
+            && self.start <= other.start
+            && other.end <= self.end
     }
 
     pub fn merge(self, other: Span) -> Span {
         debug_assert_eq!(self.source, other.source);
+        debug_assert_eq!(self.expansion, other.expansion);
         Span {
             source: self.source,
             start: self.start.min(other.start),
             end: self.end.max(other.end),
+            expansion: self.expansion,
         }
     }
 }

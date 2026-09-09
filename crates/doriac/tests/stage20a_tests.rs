@@ -31,7 +31,7 @@ fn copy_scalar_defaults_are_folded_by_callable_and_parameter_identity() {
         hir.semantic_info
             .parameter_defaults
             .get(&ParameterDefaultKey {
-                function_start: selected.span.start,
+                function: selected.span,
                 parameter_index: 0,
             }),
         Some(ConstValue::Integer(value)) if value.signed_value() == 3

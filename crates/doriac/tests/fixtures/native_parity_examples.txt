@@ -357,3 +357,11 @@ examples/native/main_stage35_interface_stack_cursor.doria
 examples/native/main_stage35_interface_hash_dictionary.doria
 examples/native/main_stage35_interface_iteration_flow.doria
 examples/native/main_stage35_interface_primitive_contracts.doria
+examples/native/main_stage35_trait_smoke.doria
+examples/native/main_stage35_trait_generic.doria
+examples/native/main_stage35_trait_layout.doria
+examples/native/main_stage35_trait_statics.doria
+examples/native/main_stage35_trait_temporary_receivers.doria
+examples/native/main_stage35_trait_failure.doria
+examples/native/main_stage35_trait_inheritance_core.doria
+examples/native/main_stage35_trait_iteration.doria

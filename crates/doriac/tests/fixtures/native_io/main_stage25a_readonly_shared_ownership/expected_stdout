@@ -8,6 +8,8 @@ inspect fallback
 inspect chained
 payload
 drop payload
+2
+drop checked payload
 inspect root
 inspect root
 inspect root

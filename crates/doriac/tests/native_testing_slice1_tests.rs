@@ -8,6 +8,7 @@ use doriac::source_provider::InMemorySourceProvider;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const PACKAGE: &str = "acme/tests";
@@ -193,18 +194,57 @@ fn assert_malformed_assertion_mir(program: &doriac::mir::Program, expected: &str
 }
 
 fn temporary_path(extension: &str) -> PathBuf {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("time after epoch")
         .as_nanos();
-    let mut path = std::env::temp_dir().join(format!(
-        "doriac-native-testing-{}-{nanos}",
-        std::process::id()
-    ));
-    if !extension.is_empty() {
-        path.set_extension(extension);
+    loop {
+        let sequence = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let mut path = std::env::temp_dir().join(format!(
+            "doriac-native-testing-{}-{nanos}-{sequence}",
+            std::process::id()
+        ));
+        if !extension.is_empty() {
+            path.set_extension(extension);
+        }
+        match fs::File::create_new(&path) {
+            Ok(_) => return path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("reserve temporary file {}: {error}", path.display()),
+        }
     }
-    path
+}
+
+#[test]
+fn temporary_artifacts_are_reserved_independently_across_threads() {
+    let workers = (0..8)
+        .map(|_| {
+            std::thread::spawn(|| {
+                (0..32)
+                    .map(|_| {
+                        let path = temporary_path("out");
+                        assert_eq!(
+                            fs::File::create_new(&path).unwrap_err().kind(),
+                            std::io::ErrorKind::AlreadyExists
+                        );
+                        path
+                    })
+                    .collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let paths = workers
+        .into_iter()
+        .flat_map(|worker| worker.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        paths.iter().collect::<std::collections::HashSet<_>>().len(),
+        paths.len()
+    );
+    for path in paths {
+        fs::remove_file(path).unwrap();
+    }
 }
 
 fn run_emitted(output: doriac::backend::BackendOutput) -> std::process::Output {
@@ -2462,7 +2502,12 @@ it("enum facts", function (): void { expect(State::Ready)->toEqual(State::Waitin
     let published = fs::read(&outcome).ok();
     let _ = fs::remove_file(&outcome);
     assert_eq!(output.status.code(), Some(70));
-    assert!(published.is_none(), "oversized V4 record was published");
+    // The harness reserves an empty outcome file; rejection must publish no bytes.
+    assert_eq!(
+        published.as_deref(),
+        Some(b"".as_slice()),
+        "oversized V4 record was published"
+    );
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("Error[R1001]: Assertion Failed"),
         "{}",

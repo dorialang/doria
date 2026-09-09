@@ -74,7 +74,7 @@ Stage 33 Slice 1 — Complete; Stage 33 Slice 2 — Complete; Stage 33 Slice 3 �
 Stage 33 — Complete; Phase F — Complete
 Native Testing Foundation Slices 1 Through 3 — Complete; Foundation — Complete
 Stage 34 — Complete
-Stage 35 — In Progress; Slices 1, 2, And 3 Complete; Slice 4 Next
+Stage 35 — In Progress; Slices 1, 2, 3, And 4 Complete; Slice 5 Next
 ```
 
 ## Accepted Amendment: Parenthesized Type Grouping

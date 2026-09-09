@@ -103,7 +103,7 @@ lowering are implemented. Stage 32 is complete under Decision 0125. Stage 33
 Slices 1 through 3 and Phase F are complete under Decisions 0126 through 0128;
 Native Testing Foundation Slices 1 through 3 are complete, the foundation is
 complete, and Stage 34 is complete. Decision 0134 accepts Stage 35 authority and
-Slices 1, 2, and 3 are complete and Slice 4 is next. Decision 0124
+Slices 1, 2, 3, and 4 are complete and Slice 5 is next. Decision 0124
 separately binds the Pre-Stage-45 Doria-native port, parity and release cutover,
 and the unsuffixed
 `2026.03.1` blocker. Stage 30 is complete and E0641 remains historical and

@@ -88,8 +88,9 @@ Stage 18 activated only concrete `Displayable`. Decision 0134 Slices 1 and 2
 supersede that implementation boundary with nominal declaration graphs and
 general interface execution. Erased, inherited, narrowed, nullable-proven, and
 shared-interface Displayable paths invoke the checked requirement exactly once.
-This adds no implicit string assignment conversion; trait composition remains
-Slice 4, and default methods or structural conformance are not accepted.
+This adds no implicit string assignment conversion. Decision 0134 Slice 4 now
+supplies checked trait implementations; default methods and structural
+conformance are not accepted.
 
 ### Backend boundary
 

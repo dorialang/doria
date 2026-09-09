@@ -87,7 +87,7 @@ statements in Stage 35.
 Slice 1 emits interface requirement, trait method, and parameter applications
 once from their authored targets. Schemas 1, 2, and 3 and processor protocol 1
 are unchanged. Immutable compiler contract facts expose requirement origins,
-conformance status, selected declarations, and pending-slice boundaries for
+conformance status, selected declarations, and composition origins for
 tooling; they do not constitute a runtime layout or flattened attribute table.
 
 Slice 2 adds private executable interface vtables, entry thunks, and exact
@@ -95,6 +95,11 @@ specializations. These never become authored metadata targets or public
 reflection tables. Requirement definitions and implementation navigation retain
 the original package/source identities; schemas 1-3 and processor protocol 1
 are unchanged.
+
+Slice 4 gives each composed member a private expansion identity while retaining
+its authored source span. Multiple composers, generic substitutions, and aliases
+do not duplicate attribute applications. Metadata continues to walk authored
+targets; effective class members are exclusively an executable/tooling view.
 
 Schema version 2 contains every schema-version-1 field plus `callables`. Each
 callable records one canonical attribute-target-compatible identity, name, kind,

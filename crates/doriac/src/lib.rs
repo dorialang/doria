@@ -56,6 +56,7 @@ pub mod source_provider;
 pub mod string_literal;
 pub mod symbols;
 pub mod testing;
+pub mod trait_composition;
 pub mod types;
 
 pub const TOOLCHAIN_VERSION: &str = env!("DORIA_TOOLCHAIN_VERSION");

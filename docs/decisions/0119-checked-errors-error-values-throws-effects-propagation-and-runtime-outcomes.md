@@ -374,7 +374,7 @@ including ambient I/O, through the same propagation and cleanup model. Stages
 30 through 32 and the Decision 0123 corrective beat are complete. All three
 Stage 33 slices and Phase F are complete under Decisions 0126 through 0128;
 Native Testing Foundation Slices 1 through 3 are complete, the Native Testing
-Foundation is complete, and Stage 34 is complete and Stage 35 Slices 1, 2, and 3 are complete and Slice 4 is next.
+Foundation is complete, and Stage 34 is complete and Stage 35 Slices 1, 2, 3, and 4 are complete and Slice 5 is next.
 
 ## Explicit Exclusions
 

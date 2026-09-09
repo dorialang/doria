@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Accepted:** 2026-09-04
-- **Implementation Status:** Stage 35 Authority Accepted; Slices 1, 2, And 3 Complete; Slice 4 Next
+- **Implementation Status:** Stage 35 Authority Accepted; Slices 1, 2, 3, And 4 Complete; Slice 5 Next
 - **Amends:** Decisions 0029, 0030, 0079, 0082, 0087, 0089, 0093, 0096, 0100, 0102, 0105, 0106, 0110, 0113, 0119, 0121, 0125, 0129, 0130, 0131, 0132, and 0133
 
 ## Context
@@ -816,19 +816,22 @@ redesign it.
 declaration graphs, interface inheritance, method compatibility, nominal
 conformance, incremental facts, diagnostics, and compiler-fact-based tooling.
 At Slice 1 delivery, interface execution and trait composition were precise
-pre-HIR boundaries; Slice 2 now retires only the interface-value boundary.
+pre-HIR boundaries. Slice 2 retired the interface-value boundary; Slices 3 and
+4 subsequently retired the core-operation and trait-composition boundaries.
 
 Requirements have a distinct non-executable body form. Generic parent/use
 graphs retain source order, canonical specializations, and declaration origins;
 cycles terminate by declaration identity. Stage-34 callable substitution is
-shared by overrides and conformance. Trait-dependent obligations remain deferred,
-never checked by pretending a flattened member exists. Concrete generic calls
+shared by overrides and conformance. At Slice 1, trait-dependent obligations
+remained deferred, never checked by pretending a flattened member existed.
+Slice 4 now resolves them against final composed members. Concrete generic calls
 record their selected implementation in semantic facts before MIR lowering.
 
 The durable concrete and generic-conformance fixtures cover existing native
 method execution; PHP uses that same concrete path. Invalid declarations use
 E0749-E0757, interface erasure E0758, core execution E0759, and primitive
-erasure E0760. Trait composition retains E0493. No interface runtime primitive
+erasure E0760. Trait composition retained E0493 at that checkpoint; Slice 4
+retires and reserves it. No interface runtime primitive
 or physical slot layout is delivered in this slice.
 
 ### Slice 2: Interface Runtime And Ownership
@@ -851,7 +854,7 @@ views escaping their owner or lease.
 Durable `main_stage35_interface_*` fixtures cover the runtime cross-product;
 malformed-MIR tests and emitted-IR checks cover independent soundness and
 allocation/layout invariants. E0758 is retired and reserved; Slice 3 also retires
-E0759 after implementing core operations/public iteration. E0493 owns Slice 4 composition, and
+E0759 after implementing core operations/public iteration. Slice 4 retires E0493, and
 E0760 still rejects primitive erasure. Stage 35 remains in progress.
 
 ### Slice 3: Core Contracts And Public Iteration
@@ -879,14 +882,70 @@ acquisitions retain heap storage. No per-element adapter allocation is required.
 The interpreter, Cranelift, LLVM, and PHP consume the checked operations and
 ownership model. PHP implements explicit collection algorithms and cleanup,
 not host loose comparison or host clone semantics. E0759 is retired/reserved;
-trait composition remains E0493 and primitive erasure remains E0760.
+Slice 4 retires E0493 for trait composition; primitive erasure remains E0760.
 Generalized first-binding and mutable public iteration remain out of scope.
 
 ### Slice 4: Trait Composition
 
-Implement generic recursive flattening, requirements, adaptations, precedence,
-layout/init/drop/static state, inheritance/interface integration, private
-attribute origins, incremental invalidation, all backends, and official tooling.
+**Complete.** One compiler-owned composition plan expands canonical generic
+trait uses before ordinary class checking. It deduplicates identical diamond
+origins at their first lexical position, retains all paths, resolves adaptations
+before discarding excluded candidates, and checks requirements and displaced
+signatures against final class/parent members. Class-authored precedence does
+not hide unresolved conflicts between unrelated traits.
+
+Effective members carry a private expansion identity in addition to their real
+authored source span. Composer substitutions, aliases, closures, call targets,
+effects, ownership, and return provenance therefore cannot overwrite another
+composer's facts. Definition-site global identities remain canonical; `self`
+and `$this` bind to the composer. Properties use ordinary parent-prefix,
+lexical-expansion, then promoted-field layout, per-instance initialization,
+and reverse destruction. Static cells belong to each composing specialization.
+
+Final HIR/MIR contains ordinary class operations, not executable traits.
+Independent class-plan validation checks source/origin identity, substitutions,
+aliases, requirements, and physical order before HIR; existing MIR checks retain
+ownership, layout, callable ABI, effects, and provenance invariants. No backend
+flattener, trait object, header, or call allocation is introduced. PHP consumes
+the same final member set rather than host trait precedence.
+
+Public attributes remain authored once under schemas 1/2/3 and processor
+protocol 1. Private origin and final-member facts support language-server
+completion, navigation, and conservative rename across multiple composers.
+Trait body changes invalidate dependent composers as well as signature/use/
+adaptation changes. E0493 is retired and reserved. Trait lifecycle methods,
+trait `open`/`override`/`parent::`, general borrowed fields, and property hooks
+remain outside the accepted trait surface; Slice 5 is not an execution fence.
+
+#### Invalidated elsewhere
+
+The pre-edit audit found class layout, callable/effect maps, closure identities,
+monomorphization, narrowing, attributes, and tooling keyed by authored spans or
+walking authored class members. The post-edit pipeline distinguishes expansion
+identity from displayed source identity, preserves authored metadata, and feeds
+final checked members to all executable consumers. E0493/DeferredComposition
+expectations and active Slice-4-pending claims are retired.
+
+The executable audit also corrected generic static targets that retained only
+a class name, missing concrete parent dependencies, and raw-offset binding/core-
+operation/effect lookups. Static targets retain their checked owner arguments;
+parent types enter the existing specialization worklist; effective span lookups
+include source and expansion identity.
+
+Linux leak validation exposed an ordinary checked-call lowering gap: owned
+temporary method receivers were left inline without a cleanup owner. Both
+composed and class-authored calls now materialize those receivers in the
+existing statement-owned local scope before arguments, preserving cleanup on
+success, argument failure, method failure, and borrowed chains. Borrowed receiver
+expressions also evaluate before arguments without acquiring ownership.
+Shared-payload receivers retain a temporary shared handle, never ownership of
+the projected class payload.
+
+Official tooling must pin the delivered compiler revision and consume its
+composition facts. The separately owned website needs synchronization in both
+`doria-website/src/Docs/Guide/Content/<release>/` and
+`doria-website/src/Docs/Api/Content/<release>/`, plus its interfaces-and-traits
+playground example. No website source or release lock is changed by this slice.
 
 ### Slice 5: Cross-Repository Closure
 

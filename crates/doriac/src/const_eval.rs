@@ -118,7 +118,7 @@ struct PayloadCaseSchema {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ParameterDefaultKey {
-    pub function_start: usize,
+    pub function: Span,
     pub parameter_index: usize,
 }
 

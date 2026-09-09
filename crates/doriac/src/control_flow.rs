@@ -276,12 +276,10 @@ impl Builder<'_> {
                     NodeAction::Statement(Stmt::Throw(statement.clone())),
                     &incoming,
                 );
-                let has_checked_effect = self.checked_effect_sites.iter().any(|(span, effects)| {
-                    statement.span.source == span.source
-                        && statement.span.start <= span.start
-                        && span.end <= statement.span.end
-                        && !effects.is_empty()
-                });
+                let has_checked_effect = self
+                    .checked_effect_sites
+                    .iter()
+                    .any(|(span, effects)| statement.span.contains(*span) && !effects.is_empty());
                 if has_checked_effect {
                     self.connect_checked_effects(statement.span, &incoming, Some(value));
                 } else {
@@ -769,17 +767,11 @@ impl Builder<'_> {
         let sites = self
             .checked_effect_sites
             .iter()
-            .filter(|(span, _)| {
-                action_span.source == span.source
-                    && action_span.start <= span.start
-                    && span.end <= action_span.end
-            })
+            .filter(|(span, _)| action_span.contains(**span))
             .map(|(span, effects)| (*span, effects.clone()))
             .collect::<Vec<_>>();
         for (site_span, effects) in sites {
-            let completed = completed_action.filter(|_| {
-                site_span.start == action_span.start && site_span.end == action_span.end
-            });
+            let completed = completed_action.filter(|_| site_span == action_span);
             let sources = completed
                 .map(|node| vec![node])
                 .unwrap_or_else(|| before_action.to_vec());

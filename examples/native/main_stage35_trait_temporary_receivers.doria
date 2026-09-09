@@ -1,0 +1,53 @@
+class Failure implements Error { function __construct(string $message) {} }
+
+trait Work
+{
+    static writable bool $seen = false;
+    writable bool $called = false;
+    function value<T>(take T $value): T throws Failure { return $value; }
+    function inspect(): self { self::seen = true; return $this; }
+    writable function fail(): void throws Failure
+    {
+        $this->called = true;
+        throw new Failure("method");
+    }
+}
+
+class Worker
+{
+    uses Work;
+    function __construct(string $name) {}
+    function __destruct() { try { echo "drop {$this->name};"; } catch (Error) {} }
+}
+
+class Plain
+{
+    function __construct(string $name) {}
+    function value(): int throws Failure { return 3; }
+    function __destruct() { try { echo "drop {$this->name};"; } catch (Error) {} }
+}
+
+function failingArgument(): int throws Failure { throw new Failure("argument"); }
+function observedArgument(): int throws Failure
+{
+    if (Worker::seen) { return 2; }
+    return 99;
+}
+
+function main(): void
+{
+    echo (new Worker("success"))->value(value: 1);
+    try {
+        (new Worker("method"))->fail();
+    } catch (Failure) {
+        echo "caught method;";
+    }
+    try {
+        (new Worker("argument"))->value(failingArgument());
+    } catch (Failure) {
+        echo "caught argument;";
+    }
+    echo (new Worker("chain"))->inspect()->value(observedArgument());
+    echo (new Plain("plain"))->value();
+    echo "\n";
+}

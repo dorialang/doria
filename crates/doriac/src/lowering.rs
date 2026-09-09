@@ -28,13 +28,20 @@ pub fn lower_program_with_semantics(
     program: &ast::Program,
     semantic_info: crate::semantics::SemanticInfo,
 ) -> DiagnosticResult<hir::Program> {
-    if !semantic_info.contracts.boundaries.is_empty() {
-        return Err(semantic_info
-            .contracts
-            .boundaries
+    if let Err(details) = semantic_info.composition.validate(program) {
+        let span = program
+            .items
             .iter()
-            .map(|boundary| boundary.operation.diagnostic(boundary.span))
-            .collect());
+            .find_map(|item| match item {
+                ast::Item::Class(class) => Some(class.span),
+                _ => None,
+            })
+            .unwrap_or(crate::source::Span::new(0, 0));
+        return Err(vec![Diagnostic::internal_compiler_error(
+            "invalid checked trait composition",
+            details,
+            span,
+        )]);
     }
     let mut items = Vec::with_capacity(program.items.len());
     let mut diagnostics = Vec::new();
@@ -42,6 +49,17 @@ pub fn lower_program_with_semantics(
         if matches!(item, ast::Item::Interface(_) | ast::Item::Trait(_)) {
             continue;
         }
+        let composed;
+        let item = if let ast::Item::Class(class) = item {
+            if let Some(class) = semantic_info.composition.class(&class.name) {
+                composed = ast::Item::Class(class.clone());
+                &composed
+            } else {
+                item
+            }
+        } else {
+            item
+        };
         match lower_item(item) {
             Ok(item) => items.push(item),
             Err(diagnostic) => diagnostics.push(diagnostic),
@@ -735,12 +753,11 @@ fn lower_class_member(
             hir::ClassMember::Constant(lower_constant(constant, Some(class_name)))
         }
         ast::ClassMember::Uses(composition) => {
-            return Err(Diagnostic::new(
-                "E0493",
-                "trait composition is not yet supported; it requires Stage 35 Slice 4",
+            return Err(Diagnostic::internal_compiler_error(
+                "unresolved trait use entered executable lowering",
+                "checked composition must replace every uses entry with final members",
                 composition.span,
-            )
-            .with_title("Trait Composition Is Not Yet Supported"))
+            ))
         }
     })
 }

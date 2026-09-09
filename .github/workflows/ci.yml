@@ -198,7 +198,7 @@ jobs:
 
       - name: Leak-check interface runtime ownership with Cranelift
         run: |
-          for source in examples/native/main_stage35_interface_*.doria; do
+          for source in examples/native/main_stage35_interface_*.doria examples/native/main_stage35_trait_*.doria; do
             name=$(basename "$source" .doria)
             # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
             if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi
@@ -547,7 +547,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          for source in examples/native/main_stage35_interface_*.doria; do
+          for source in examples/native/main_stage35_interface_*.doria examples/native/main_stage35_trait_*.doria; do
             name=$(basename "$source" .doria)
             # Intentional strong cycles are execution-parity fixtures, not leak-free fixtures.
             if [ "$name" = main_stage35_interface_strong_cycles ]; then continue; fi
